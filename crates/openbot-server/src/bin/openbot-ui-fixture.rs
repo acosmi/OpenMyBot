@@ -2452,6 +2452,54 @@ impl FixtureThreads {
                         field: "fixture_unknown_thread",
                     },
                 )?;
+                // Read-only synthetic history, not tool dispatch or effect execution.
+                // An unpaired result exercises the existing missing-name/error presentation.
+                snapshot.messages.extend([
+                    ThreadHistoryMessage {
+                        selected_skill_slugs: Vec::new(),
+                        id: "fixture-p3-tool-history-calls".to_owned(),
+                        role: ThreadHistoryRole::Assistant,
+                        content: String::new(),
+                        agent_id: Some(BotId::new("bot-0")),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_error_code: None,
+                        tool_calls: Some(vec![
+                            serde_json::json!({
+                                "id":"fixture-p3-tool-recorded",
+                                "type":"function",
+                                "function":{"name":"fixtureRecordedHistory","arguments":{}}
+                            }),
+                            serde_json::json!({
+                                "id":"fixture-p3-tool-waiting",
+                                "type":"function",
+                                "function":{"name":"fixtureWaitingHistory","arguments":{}}
+                            }),
+                        ]),
+                    },
+                    ThreadHistoryMessage {
+                        selected_skill_slugs: Vec::new(),
+                        id: "fixture-p3-tool-history-recorded".to_owned(),
+                        role: ThreadHistoryRole::Tool,
+                        content: "Read-only synthetic history result.".to_owned(),
+                        agent_id: Some(BotId::new("bot-0")),
+                        tool_call_id: Some("fixture-p3-tool-recorded".to_owned()),
+                        tool_name: Some("fixtureRecordedHistory".to_owned()),
+                        tool_error_code: None,
+                        tool_calls: None,
+                    },
+                    ThreadHistoryMessage {
+                        selected_skill_slugs: Vec::new(),
+                        id: "fixture-p3-tool-history-unnamed".to_owned(),
+                        role: ThreadHistoryRole::Tool,
+                        content: "Read-only history result with no recorded tool name.".to_owned(),
+                        agent_id: Some(BotId::new("bot-0")),
+                        tool_call_id: Some("fixture-p3-tool-unnamed".to_owned()),
+                        tool_name: None,
+                        tool_error_code: None,
+                        tool_calls: None,
+                    },
+                ]);
                 snapshot.active_run_id = Some(RunId::new(FIXTURE_UNKNOWN_RUN));
                 snapshot.active_run_state = Some(ThreadForegroundRunState::ReconciliationRequired);
                 snapshot.active_run_cancellable = false;
