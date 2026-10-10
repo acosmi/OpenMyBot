@@ -1860,3 +1860,6 @@ This finite scope ends at creation, registration admission and the two controlle
 
 
 2026-10-10 — UI5-P3 original-run fact observation labels now read the active locale reactively, so a mounted blocked/unblocked fact can follow language changes. This presentation change preserves the observed clock, terminal identity, backend read intent and empty action contract. Source implementation is prepared in an isolated worktree; targeted verification and independent review remain pending, with production/native/oracle and full acceptance still open.
+
+
+2026-10-10 — UI5-P3 the existing attempt-row missing-record label now also observes live locale changes. Both reactive label changes preserve original attempt status, nullable commit facts, page generations, terminal binding and read-only behavior. Source-only continuation: new directed verification, independent exact-candidate review and mounted runtime evidence remain pending; all native, production, oracle and full-package debt remains open.
