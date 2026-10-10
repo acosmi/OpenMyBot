@@ -1866,3 +1866,6 @@ This finite scope ends at creation, registration admission and the two controlle
 
 
 2026-10-10 — UI5-P3 mounted tool transcript cards now also read the active locale for the unknown-tool fallback and recorded, waiting or error status. Named tool labels and recorded facts keep their original content; details navigation and submission behavior are unchanged. These presentation fixes remain an isolated source candidate pending directed compilation, current independent review and mounted browser validation.
+
+
+2026-10-10T08:18:16.746126+00:00 UI5-P3: adds an explicitly enabled synthetic original-run facts fixture using the existing reconciliation and receipt read contracts. It remains disabled by default and rejects PostgreSQL, auth-journey and foreign request identities; no writer, dispatch, unlock or production capability is added. The fixture source passed independent review, and all three changed Rust files pass Rust 1.98 formatting and diff checks after four formatter-only repairs. Exact-candidate compilation, mounted bilingual checks and publication remain pending; tool-card labels are not yet exercised by this fixture. Production, native and independent visual-reference acceptance remain open.

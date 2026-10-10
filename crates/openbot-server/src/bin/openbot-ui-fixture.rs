@@ -30,11 +30,12 @@ use openbot_application::{
     MemoryAdministration, MemoryAdministrationError, MemoryControlRequest, MemoryPageRequest,
     MutateMemoryRequest, OpenBotApplication, PeopleAdministration, PeoplePageRequest,
     PeoplePortError, PortError, RecallMemoriesRequest, RememberMemoryRequest, RoutingAuditRecord,
-    SandboxedComponentAdministration, SandboxedComponentAdministrationError,
-    SandboxedComponentDraft, ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError,
-    ThreadEventSubscription, ThreadHistoryRequest, ToolApprovalAdministration,
-    ToolApprovalAdministrationError, ToolApprovalPresentation, ToolApprovalRequest,
-    UiPreferenceAdministration, UiPreferenceAdministrationError, UpdateMemoryControlRequest,
+    RunEffectReceiptsRequest, RunReconciliationRequest, SandboxedComponentAdministration,
+    SandboxedComponentAdministrationError, SandboxedComponentDraft, ThreadConversationRequest,
+    ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription, ThreadHistoryRequest,
+    ToolApprovalAdministration, ToolApprovalAdministrationError, ToolApprovalPresentation,
+    ToolApprovalRequest, UiPreferenceAdministration, UiPreferenceAdministrationError,
+    UpdateMemoryControlRequest,
 };
 use openbot_contracts::agent::{
     AgentConnectionTestRequest, AgentConnectionVerdict, AgentLifecycleReceipt, AgentLifecycleState,
@@ -76,6 +77,11 @@ use openbot_contracts::memory::{
     MemoryRecord, MemoryScope, MemorySensitivity, MemorySource, MemoryStatus,
 };
 use openbot_contracts::people::{CurrentUser, PeoplePage, Person};
+use openbot_contracts::reconciliation::{
+    RunEffectReceipt, RunEffectReceiptFact, RunEffectReceiptsSnapshot, RunReconciliationAttempt,
+    RunReconciliationAttemptStatus, RunReconciliationCursor, RunReconciliationSnapshot,
+    RunReconciliationStatus, validate_page,
+};
 use openbot_contracts::sandboxed::{
     PublishedSandboxedComponent, PublishedSandboxedComponents, SandboxedComponentRecord,
     SandboxedComponents,
@@ -112,6 +118,9 @@ const FIXTURE_APPROVAL_THREAD: &str = "550e8400-e29b-81d4-a716-446655440001";
 const FIXTURE_CHOICE_THREAD: &str = "550e8400-e29b-81d4-a716-446655440002";
 const FIXTURE_APPROVAL_RUN: &str = "fixture-decision-run-approval";
 const FIXTURE_CHOICE_RUN: &str = "fixture-decision-run-choice";
+const FIXTURE_UNKNOWN_RUN: &str = "fixture-channel-unknown-run";
+const FIXTURE_UNKNOWN_TERMINAL: u64 = 12;
+const FIXTURE_UNKNOWN_FACTS_ENV: &str = "OPENBOT_UI_CHANNEL_UNKNOWN_FACTS_FIXTURE";
 const FIXTURE_GOOGLE_DRIVE_SERVER: &str = "google-drive";
 const FIXTURE_GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 const FIXTURE_ACTIVITY_FOLLOW_UP: &str =
@@ -2163,6 +2172,7 @@ impl PeopleAdministration for FixturePeople {
 struct FixtureThreads {
     inner: Arc<FixtureThreadsInner>,
     channels: FixtureChannels,
+    channel_unknown_facts_fixture: bool,
 }
 
 struct FixtureThreadsInner {
@@ -2424,7 +2434,70 @@ impl FixtureThreads {
                 fail_activity_follow_up_once: AtomicBool::new(true),
             }),
             channels,
+            channel_unknown_facts_fixture: false,
         }
+    }
+
+    // Synthetic presentation seed only: no remember, dispatch, unlock or tool execution.
+    fn with_channel_unknown_facts(mut self, enabled: bool) -> Result<Self, ThreadDirectoryError> {
+        if enabled {
+            {
+                let mut snapshots = self
+                    .inner
+                    .snapshots
+                    .lock()
+                    .map_err(|_| ThreadDirectoryError::Unavailable)?;
+                let snapshot = snapshots.get_mut(FIXTURE_EXISTING_THREAD).ok_or(
+                    ThreadDirectoryError::Corrupt {
+                        field: "fixture_unknown_thread",
+                    },
+                )?;
+                snapshot.active_run_id = Some(RunId::new(FIXTURE_UNKNOWN_RUN));
+                snapshot.active_run_state = Some(ThreadForegroundRunState::ReconciliationRequired);
+                snapshot.active_run_cancellable = false;
+                snapshot.last_event_sequence = Some(FIXTURE_UNKNOWN_TERMINAL);
+            }
+            // Register the seed's original terminal for normal replay; do not publish a new event.
+            self.inner
+                .events
+                .lock()
+                .map_err(|_| ThreadDirectoryError::Unavailable)?
+                .insert(
+                    FIXTURE_EXISTING_THREAD.to_owned(),
+                    vec![ThreadRunEvent {
+                        thread_id: ThreadId::new(FIXTURE_EXISTING_THREAD),
+                        run_id: RunId::new(FIXTURE_UNKNOWN_RUN),
+                        event_sequence: FIXTURE_UNKNOWN_TERMINAL,
+                        event_type: ThreadRunEventKind::ReconciliationRequired,
+                        payload: serde_json::json!({"status":"reconciliation_required"}),
+                        terminal: true,
+                        created_at: fixture_unknown_facts_time() + Duration::seconds(2),
+                    }],
+                );
+            self.channel_unknown_facts_fixture = true;
+        }
+        Ok(self)
+    }
+
+    fn ensure_unknown_facts_request(
+        &self,
+        request: &RunReconciliationRequest,
+    ) -> Result<(), ThreadDirectoryError> {
+        if !self.channel_unknown_facts_fixture {
+            return Err(ThreadDirectoryError::Unavailable);
+        }
+        if request.deployment.as_str() != FIXTURE_DEPLOYMENT
+            || request.tenant.as_str() != FIXTURE_TENANT
+            || request.actor.as_str() != FIXTURE_ACTOR
+            || request.auth_generation != AuthGeneration::new(1)
+            || request.thread.as_str() != FIXTURE_EXISTING_THREAD
+            || request.run.as_str() != FIXTURE_UNKNOWN_RUN
+        {
+            return Err(ThreadDirectoryError::NotVisible);
+        }
+        validate_page(request.after, Some(request.limit))
+            .map_err(|_| ThreadDirectoryError::InvalidInput { field: "page" })?;
+        Ok(())
     }
 
     fn proof(&self) -> Result<serde_json::Value, ()> {
@@ -2861,6 +2934,82 @@ impl ThreadDirectory for FixtureThreads {
             thread_id,
             run_id,
             state: ThreadRunCancellationState::Requested,
+        })
+    }
+
+    async fn run_reconciliation(
+        &self,
+        request: RunReconciliationRequest,
+    ) -> Result<RunReconciliationSnapshot, ThreadDirectoryError> {
+        self.ensure_unknown_facts_request(&request)?;
+        let position = RunReconciliationCursor {
+            call_sequence: 2,
+            attempt_sequence: 1,
+        };
+        let created_at = fixture_unknown_facts_time();
+        let attempts = if request.after.is_none_or(|after| position > after) {
+            vec![RunReconciliationAttempt {
+                tool_call_id: "fixture-unknown-call".to_owned(),
+                call_sequence: position.call_sequence,
+                attempt_id: "fixture-unknown-attempt".to_owned(),
+                attempt_sequence: position.attempt_sequence,
+                status: RunReconciliationAttemptStatus::ReconciliationRequired,
+                recorded_commit_state: None,
+                created_at,
+                started_at: Some(created_at),
+                finished_at: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(RunReconciliationSnapshot {
+            thread_id: request.thread,
+            run_id: request.run,
+            status: RunReconciliationStatus::ReconciliationRequired,
+            terminal_event_sequence: FIXTURE_UNKNOWN_TERMINAL,
+            observed_at: created_at + Duration::seconds(2),
+            foreground_blocked: true,
+            attempts,
+            next: None,
+            available_actions: [],
+        })
+    }
+
+    async fn run_effect_receipts(
+        &self,
+        request: RunEffectReceiptsRequest,
+    ) -> Result<RunEffectReceiptsSnapshot, ThreadDirectoryError> {
+        self.ensure_unknown_facts_request(&request)?;
+        let position = RunReconciliationCursor {
+            call_sequence: 2,
+            attempt_sequence: 1,
+        };
+        let created_at = fixture_unknown_facts_time();
+        let receipts = if request.after.is_none_or(|after| position > after) {
+            // A registered synthetic positive fact, not a call to the Memory write port.
+            vec![RunEffectReceipt {
+                receipt_id: "fixture-unknown-memory-receipt".to_owned(),
+                tool_call_id: "fixture-unknown-call".to_owned(),
+                call_sequence: position.call_sequence,
+                attempt_id: "fixture-unknown-attempt".to_owned(),
+                attempt_sequence: position.attempt_sequence,
+                fact: RunEffectReceiptFact::MemoryCreated,
+                recorded_at: created_at + Duration::seconds(1),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(RunEffectReceiptsSnapshot {
+            thread_id: request.thread,
+            run_id: request.run,
+            status: RunReconciliationStatus::ReconciliationRequired,
+            terminal_event_sequence: FIXTURE_UNKNOWN_TERMINAL,
+            observed_at: created_at + Duration::seconds(3),
+            // This separate later observation neither edits the seed nor releases its slot.
+            foreground_blocked: false,
+            receipts,
+            next: None,
+            available_actions: [],
         })
     }
 
@@ -3620,6 +3769,40 @@ fn auth_journey_enabled() -> Result<bool, Box<dyn Error>> {
     }
 }
 
+fn fixture_unknown_facts_time() -> OffsetDateTime {
+    // Fixed synthetic registration time: 2026-10-02T00:00:00Z.
+    OffsetDateTime::from_unix_timestamp(1_790_899_200)
+        .expect("fixed synthetic date is representable")
+}
+
+fn channel_unknown_facts_fixture_enabled(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<bool, std::io::Error> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == std::ffi::OsStr::new("1") => Ok(true),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OPENBOT_UI_CHANNEL_UNKNOWN_FACTS_FIXTURE must be exactly 1 when present",
+        )),
+    }
+}
+
+fn validate_channel_unknown_facts_fixture_mode(
+    enabled: bool,
+    approval_mode: &str,
+    auth_mode: &str,
+    auth_journey: bool,
+) -> Result<(), std::io::Error> {
+    if enabled && (approval_mode != "memory" || auth_mode != "fixed" || auth_journey) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Synthetic channel Unknown facts require Memory/fixed mode without the auth journey",
+        ));
+    }
+    Ok(())
+}
+
 fn home_skills_fixture_enabled(value: Option<&std::ffi::OsStr>) -> Result<bool, std::io::Error> {
     match value {
         None => Ok(false),
@@ -3774,6 +3957,20 @@ fn is_auth_journey_protected_path(path: &str) -> bool {
 async fn main() -> Result<(), Box<dyn Error>> {
     let (dist, port) = arguments()?;
     let auth_journey = auth_journey_enabled()?;
+    let channel_unknown_facts_fixture = channel_unknown_facts_fixture_enabled(
+        std::env::var_os(FIXTURE_UNKNOWN_FACTS_ENV).as_deref(),
+    )?;
+    // Reject this synthetic opt-in before PostgreSQL assembly or any listening socket.
+    validate_channel_unknown_facts_fixture_mode(
+        channel_unknown_facts_fixture,
+        if std::env::var_os(FIXTURE_APPROVAL_DATABASE_URL).is_some() {
+            "postgres"
+        } else {
+            "memory"
+        },
+        "fixed",
+        auth_journey,
+    )?;
     let home_skills_fixture =
         home_skills_fixture_enabled(std::env::var_os(FIXTURE_HOME_SKILLS_ENV).as_deref())?;
     let model_picker_fixture = fixture_model_connections::enabled(
@@ -3825,6 +4022,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         mode: approval_mode,
         auth_mode,
     } = assemble_approval_fixture(now, &context).await?;
+    validate_channel_unknown_facts_fixture_mode(
+        channel_unknown_facts_fixture,
+        approval_mode,
+        auth_mode,
+        auth_journey,
+    )?;
     validate_home_skills_fixture_mode(home_skills_fixture, approval_mode, auth_mode, auth_journey)?;
     fixture_model_connections::validate_mode(
         model_picker_fixture,
@@ -3855,7 +4058,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let channels = FixtureChannels::new(now);
     let home_channel_probe = channels.clone();
-    let threads = FixtureThreads::new(channels.clone());
+    let threads = FixtureThreads::new(channels.clone())
+        .with_channel_unknown_facts(channel_unknown_facts_fixture)?;
     let bot_thread_probe = threads.clone();
     let memory = FixtureMemory::new(tenant, actor.clone(), now);
     let connections = FixtureConnections::new(actor, port, now);
