@@ -200,7 +200,7 @@ fn bind_terminal(terminal: RwSignal<Option<u64>>, sequence: u64) -> Result<(), A
 #[component]
 fn FactObservation(observed: time::OffsetDateTime, blocked: bool, terminal: u64) -> impl IntoView {
     let i18n = use_i18n();
-    view! { <p class="ob-page-intro"><time>{format_time(observed)}</time> " · " <code>{terminal}</code> " · " {if blocked { t_string!(i18n, admin.unknown_blocked).to_owned() } else { t_string!(i18n, admin.unknown_unblocked_fact).to_owned() }}</p> }
+    view! { <p class="ob-page-intro"><time>{format_time(observed)}</time> " · " <code>{terminal}</code> " · " {move || if blocked { t_string!(i18n, admin.unknown_blocked).to_owned() } else { t_string!(i18n, admin.unknown_unblocked_fact).to_owned() }}</p> }
 }
 fn format_time(time: time::OffsetDateTime) -> String {
     time.format(&time::format_description::well_known::Rfc3339)
