@@ -1863,3 +1863,6 @@ This finite scope ends at creation, registration admission and the two controlle
 
 
 2026-10-10 — UI5-P3 the existing attempt-row missing-record label now also observes live locale changes. Both reactive label changes preserve original attempt status, nullable commit facts, page generations, terminal binding and read-only behavior. Source-only continuation: new directed verification, independent exact-candidate review and mounted runtime evidence remain pending; all native, production, oracle and full-package debt remains open.
+
+
+2026-10-10 — UI5-P3 mounted tool transcript cards now also read the active locale for the unknown-tool fallback and recorded, waiting or error status. Named tool labels and recorded facts keep their original content; details navigation and submission behavior are unchanged. These presentation fixes remain an isolated source candidate pending directed compilation, current independent review and mounted browser validation.
