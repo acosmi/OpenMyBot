@@ -29,6 +29,7 @@ use crate::shell::{
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+    crate::locale_policy::provide_startup_locale();
     view! {
         <I18nContextProvider set_lang_attr_on_html=true enable_cookie=false>
             <Title text="Wrok Bot" />
