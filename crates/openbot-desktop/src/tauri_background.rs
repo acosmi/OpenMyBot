@@ -1629,6 +1629,15 @@ pub(crate) async fn prepare_desktop_local_runtime(
             cleanup_assembly(data_plane, assembly, DesktopLocalRuntimeError::Application).await,
         );
     }
+    if assembly
+        .thread_history_authority
+        .enroll_original_registry(&data_plane.artifact_dataset_owner())
+        .is_err()
+    {
+        return Err(
+            cleanup_assembly(data_plane, assembly, DesktopLocalRuntimeError::Application).await,
+        );
+    }
     if !custom_model_catalog_provenance.matches_installation(data_plane.authority())
         || assembly
             .custom_model_catalog_inventory
@@ -1711,6 +1720,19 @@ pub(crate) async fn prepare_desktop_local_runtime(
     }
     #[cfg(target_os = "macos")]
     if current_identity_source
+        .install_thread_history_authority(&assembly.thread_history_authority)
+        .is_err()
+    {
+        return Err(cleanup_agent_host(
+            data_plane,
+            assembly,
+            agent_host,
+            DesktopLocalRuntimeError::Host,
+        )
+        .await);
+    }
+    #[cfg(target_os = "macos")]
+    if current_identity_source
         .install_custom_model_catalog_inventory(&assembly.custom_model_catalog_inventory)
         .is_err()
     {
@@ -1740,8 +1762,23 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 }
             };
             #[cfg(target_os = "macos")]
+            let protocol = match protocol
+                .with_custom_model_catalog_identity_source(current_identity_source.clone())
+            {
+                Ok(protocol) => protocol,
+                Err(_) => {
+                    return Err(cleanup_agent_host(
+                        data_plane,
+                        assembly,
+                        agent_host,
+                        DesktopLocalRuntimeError::Host,
+                    )
+                    .await);
+                }
+            };
+            #[cfg(target_os = "macos")]
             let protocol =
-                match protocol.with_custom_model_catalog_identity_source(current_identity_source) {
+                match protocol.with_thread_history_identity_source(current_identity_source) {
                     Ok(protocol) => protocol,
                     Err(_) => {
                         return Err(cleanup_agent_host(

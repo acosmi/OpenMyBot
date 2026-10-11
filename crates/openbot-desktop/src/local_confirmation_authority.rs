@@ -22,6 +22,9 @@ pub(crate) struct PostgresLocalConfirmationAuthority {
     remember_preferences: std::sync::OnceLock<
         std::sync::Weak<openbot_infra::approval_preferences::PostgresRememberPreferenceRepository>,
     >,
+    thread_history_authority: std::sync::OnceLock<
+        std::sync::Weak<openbot_infra::thread_history_authority::PostgresThreadHistoryAuthority>,
+    >,
 }
 
 #[cfg(feature = "desktop-local-runtime")]
@@ -42,6 +45,7 @@ impl PostgresLocalConfirmationAuthority {
             pool,
             artifact_read_authority: std::sync::OnceLock::new(),
             remember_preferences: std::sync::OnceLock::new(),
+            thread_history_authority: std::sync::OnceLock::new(),
             custom_model_catalog_inventory: std::sync::OnceLock::new(),
         }
     }
@@ -93,6 +97,22 @@ impl PostgresLocalConfirmationAuthority {
             .set(std::sync::Arc::downgrade(repository))
             .map_err(|_| openbot_contracts::HostRequestBindingError::Unavailable)
     }
+    pub(crate) fn install_thread_history_authority(
+        &self,
+        authority: &std::sync::Arc<
+            openbot_infra::thread_history_authority::PostgresThreadHistoryAuthority,
+        >,
+    ) -> Result<(), openbot_contracts::HostRequestBindingError> {
+        let original = self.installation.auth_context();
+        if self.thread_history_authority.get().is_some()
+            || !authority.matches_pool_scope(&self.pool, original.deployment(), original.tenant())
+        {
+            return Err(openbot_contracts::HostRequestBindingError::Unavailable);
+        }
+        self.thread_history_authority
+            .set(std::sync::Arc::downgrade(authority))
+            .map_err(|_| openbot_contracts::HostRequestBindingError::Unavailable)
+    }
 
     pub(crate) fn enroll_custom_model_catalog_window_issuer(
         &self,
@@ -128,6 +148,23 @@ impl PostgresLocalConfirmationAuthority {
             return Err(openbot_contracts::HostRequestBindingError::Unavailable);
         }
         repository.enroll_host_issuer(issuer)
+    }
+    pub(crate) fn enroll_thread_history_window_issuer(
+        &self,
+        issuer: &openbot_contracts::RequestBindingIssuer,
+    ) -> Result<(), openbot_contracts::HostRequestBindingError> {
+        let authority = self
+            .thread_history_authority
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(openbot_contracts::HostRequestBindingError::Unavailable)?;
+        let original = self.installation.auth_context();
+        if !authority.matches_pool_scope(&self.pool, original.deployment(), original.tenant())
+            || !issuer.observation().is_current()
+        {
+            return Err(openbot_contracts::HostRequestBindingError::Unavailable);
+        }
+        authority.enroll_host_issuer(issuer)
     }
 
     pub(crate) fn artifact_read_lifecycle(
@@ -445,6 +482,62 @@ impl openbot_contracts::HostRequestBindingGuard for PostgresLocalConfirmationAut
             Box::new(factory),
         )
     }
+    fn borrow_thread_history_host_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        target: &'a dyn openbot_contracts::request_binding::ThreadHistoryHostTarget,
+        deadline: std::time::Instant,
+    ) -> Result<
+        openbot_contracts::request_binding::ThreadHistoryHostObservation<'a>,
+        openbot_contracts::HostRequestBindingError,
+    > {
+        use openbot_contracts::request_binding::{
+            HostRequestBindingError, HostRequestBindingKind, ThreadHistoryHostObservation,
+        };
+        let installation = self.installation.auth_context();
+        if !auth.is_single_user()
+            || auth.deployment() != installation.deployment()
+            || auth.tenant() != installation.tenant()
+            || auth.actor() != installation.actor()
+            || auth.roles() != installation.roles()
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let authority = self
+            .thread_history_authority
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        if !authority.matches_pool_scope(
+            &self.pool,
+            installation.deployment(),
+            installation.tenant(),
+        ) || !authority.matches_host_target(target, auth)
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let binding = auth
+            .request_binding()
+            .ok_or(HostRequestBindingError::Missing)?;
+        if binding.kind() != HostRequestBindingKind::DesktopWindow {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let factory = LocalThreadHistoryTail {
+            authority: std::sync::Arc::downgrade(&authority),
+            pool: self.pool.clone(),
+            installation: self.installation.clone(),
+            original: auth.clone(),
+        };
+        openbot_contracts::request_binding::ThreadHistoryHostTailWitness::verify_current(
+            &factory, auth, deadline,
+        )?;
+        ThreadHistoryHostObservation::from_trusted_host(
+            HostRequestBindingKind::DesktopWindow,
+            binding.identity().clone(),
+            None,
+            Box::new(factory),
+        )
+    }
     fn verify_source_run_artifact_ids_current_before<'a>(
         &'a self,
         auth: &'a AuthContext,
@@ -665,6 +758,16 @@ struct LocalRememberPreferenceTail {
     installation: openbot_infra::auth::single_user::desktop_local::DesktopLocalAuthority,
     original: AuthContext,
 }
+
+#[cfg(feature = "desktop-local-runtime")]
+#[derive(Clone)]
+struct LocalThreadHistoryTail {
+    authority:
+        std::sync::Weak<openbot_infra::thread_history_authority::PostgresThreadHistoryAuthority>,
+    pool: openbot_infra::db::pool::DatabasePool,
+    installation: openbot_infra::auth::single_user::desktop_local::DesktopLocalAuthority,
+    original: AuthContext,
+}
 #[cfg(feature = "desktop-local-runtime")]
 impl openbot_contracts::request_binding::RememberPreferenceHostTailFactory
     for LocalRememberPreferenceTail
@@ -682,6 +785,27 @@ impl openbot_contracts::request_binding::RememberPreferenceHostTailFactory
             return Err(openbot_contracts::HostRequestBindingError::NotCurrent);
         }
         openbot_contracts::request_binding::RememberPreferenceHostTailWitness::verify_current(
+            self, auth, deadline,
+        )?;
+        Ok(Box::new(self.clone()))
+    }
+}
+
+#[cfg(feature = "desktop-local-runtime")]
+impl openbot_contracts::request_binding::ThreadHistoryHostTailFactory for LocalThreadHistoryTail {
+    fn witness(
+        &self,
+        auth: &AuthContext,
+        session: Option<openbot_contracts::request_binding::ThreadHistorySessionFacts>,
+        deadline: std::time::Instant,
+    ) -> Result<
+        Box<dyn openbot_contracts::request_binding::ThreadHistoryHostTailWitness>,
+        openbot_contracts::HostRequestBindingError,
+    > {
+        if session.is_some() {
+            return Err(openbot_contracts::HostRequestBindingError::NotCurrent);
+        }
+        openbot_contracts::request_binding::ThreadHistoryHostTailWitness::verify_current(
             self, auth, deadline,
         )?;
         Ok(Box::new(self.clone()))
@@ -722,6 +846,48 @@ impl openbot_contracts::request_binding::RememberPreferenceHostTailWitness
             installation.deployment(),
             installation.tenant(),
         ) {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "desktop-local-runtime")]
+impl openbot_contracts::request_binding::ThreadHistoryHostTailWitness for LocalThreadHistoryTail {
+    fn verify_current(
+        &self,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), openbot_contracts::HostRequestBindingError> {
+        use openbot_contracts::request_binding::{HostRequestBindingError, HostRequestBindingKind};
+        if auth != &self.original
+            || !self
+                .original
+                .request_binding()
+                .zip(auth.request_binding())
+                .is_some_and(|(a, b)| {
+                    a.identity().same_binding(b.identity())
+                        && b.kind() == HostRequestBindingKind::DesktopWindow
+                })
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let authority = self
+            .authority
+            .upgrade()
+            .ok_or(HostRequestBindingError::NotCurrent)?;
+        let installation = self.installation.auth_context();
+        if !authority.matches_pool_scope(
+            &self.pool,
+            installation.deployment(),
+            installation.tenant(),
+        ) {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        if std::time::Instant::now() >= deadline {
             return Err(HostRequestBindingError::Unavailable);
         }
         Ok(())

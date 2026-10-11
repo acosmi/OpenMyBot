@@ -201,6 +201,8 @@ pub mod tenant;
 #[cfg(feature = "server-runtime")]
 pub mod thread_directory;
 #[cfg(feature = "server-runtime")]
+pub mod thread_history_authority;
+#[cfg(feature = "server-runtime")]
 pub mod thread_id;
 #[cfg(any(feature = "server-runtime", feature = "desktop-local"))]
 pub mod thread_listener;
