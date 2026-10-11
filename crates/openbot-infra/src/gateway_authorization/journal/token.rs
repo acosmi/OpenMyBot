@@ -780,7 +780,7 @@ async fn run_fence(current: &Current<'_>, mut control: FenceControl) -> FenceRes
             result = &mut control.call_end => Ok(result.unwrap_or(FenceEnd::CallAbandoned)),
         }
     }).await;
-    let end = ended.as_ref().copied().unwrap_or_else(|e| gate_end(e));
+    let end = ended.as_ref().copied().unwrap_or_else(gate_end);
     let before = current::verify_tail(tail.as_ref(), current.auth, &gate);
     let (rollback, terminal_failure) = match current.terminal(&gate, tx.rollback(), false).await {
         Ok(ack) => (ack, None),
