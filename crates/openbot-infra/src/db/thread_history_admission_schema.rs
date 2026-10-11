@@ -504,6 +504,28 @@ fn erase_checked_oid_fields(v: &mut Value) {
         _ => {}
     }
 }
+fn sort_foreign_operator_multisets(v: &mut Value) -> Result<(), InfraError> {
+    // Each complete operator row carries its family and ordinal. Preserve every
+    // field and duplicate while comparing this unordered metadata multiset.
+    // The original raw facts and all positional catalogue arrays remain intact.
+    let constraints = v
+        .get_mut("constraints")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| corrupt("thread_history_admission_schema_invalid"))?;
+    for constraint in constraints {
+        let operators = constraint
+            .get_mut("foreignEqualityOperators")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| corrupt("thread_history_admission_schema_invalid"))?;
+        let mut keyed = std::mem::take(operators)
+            .into_iter()
+            .map(|value| canonical_bytes(&value).map(|key| (key, value)))
+            .collect::<Result<Vec<_>, _>>()?;
+        keyed.sort_by(|left, right| left.0.cmp(&right.0));
+        *operators = keyed.into_iter().map(|(_, value)| value).collect();
+    }
+    Ok(())
+}
 fn sort_top_level_multisets(v: &mut Value) -> Result<(), InfraError> {
     // Never sort column order, conkey/confkey, opclasses/collations, argument order
     // or proconfig. Only unordered top-level object multisets are canonically sorted.
@@ -1093,6 +1115,7 @@ fn normalize_owner_relative(
         json!("thread-history-admission-schema-v1"),
     );
     erase_checked_oid_fields(&mut raw);
+    sort_foreign_operator_multisets(&mut raw)?;
     sort_top_level_multisets(&mut raw)?;
     Ok(canonical_value(
         &json!({"format":"thread-history-admission-observation-v1","schema":raw,"tableAclStates":table_acl_states,"rawFacts":raw_facts}),

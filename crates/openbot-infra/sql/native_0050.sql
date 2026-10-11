@@ -265,6 +265,7 @@ DO $thread_history_postcondition$
 DECLARE
  v_raw jsonb; v_matches boolean;
  v_schema jsonb; v_acl jsonb; v_raw_acl jsonb; v_state jsonb;
+ v_expected_schema jsonb;
  v_row jsonb; v_col jsonb; v_anchor jsonb; v_table jsonb;
  v_class jsonb; v_collation jsonb; v_index jsonb; v_ref jsonb;
  v_function jsonb; v_constraint jsonb;
@@ -1025,14 +1026,33 @@ NOT EXISTS (
    ) child
   ) SELECT path FROM walk WHERE path[cardinality(path)] IN('oidRaw','ownerOidRaw','indexOidRaw','constraintOidRaw') ORDER BY cardinality(path) DESC
  LOOP v_schema:=v_schema #- v_path; END LOOP;
- IF v_schema->>'format' IS DISTINCT FROM v_expected->'schema'->>'format' OR
-    EXISTS((SELECT k FROM jsonb_object_keys(v_schema) k) EXCEPT ALL (SELECT k FROM jsonb_object_keys(v_expected->'schema') k)) OR
-    EXISTS((SELECT k FROM jsonb_object_keys(v_expected->'schema') k) EXCEPT ALL (SELECT k FROM jsonb_object_keys(v_schema) k)) THEN
+ -- Compare full operator rows as multisets; family and ordinal stay in each row.
+ -- The raw capture and the independently registered literal remain unchanged.
+ v_expected_schema:=v_expected->'schema';
+ FOR v_row,v_pos IN SELECT value,ordinality FROM jsonb_array_elements(v_schema->'constraints') WITH ORDINALITY LOOP
+  IF jsonb_typeof(v_row->'foreignEqualityOperators') IS DISTINCT FROM 'array' THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_admission_schema_invalid';
+  END IF;
+  SELECT coalesce(jsonb_agg(o.value ORDER BY o.value::text COLLATE pg_catalog."C"),'[]'::jsonb)
+  INTO v_col FROM jsonb_array_elements(v_row->'foreignEqualityOperators') o(value);
+  v_schema:=jsonb_set(v_schema,ARRAY['constraints',(v_pos-1)::text,'foreignEqualityOperators'],v_col);
+ END LOOP;
+ FOR v_row,v_pos IN SELECT value,ordinality FROM jsonb_array_elements(v_expected_schema->'constraints') WITH ORDINALITY LOOP
+  IF jsonb_typeof(v_row->'foreignEqualityOperators') IS DISTINCT FROM 'array' THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_admission_schema_invalid';
+  END IF;
+  SELECT coalesce(jsonb_agg(o.value ORDER BY o.value::text COLLATE pg_catalog."C"),'[]'::jsonb)
+  INTO v_col FROM jsonb_array_elements(v_row->'foreignEqualityOperators') o(value);
+  v_expected_schema:=jsonb_set(v_expected_schema,ARRAY['constraints',(v_pos-1)::text,'foreignEqualityOperators'],v_col);
+ END LOOP;
+ IF v_schema->>'format' IS DISTINCT FROM v_expected_schema->>'format' OR
+    EXISTS((SELECT k FROM jsonb_object_keys(v_schema) k) EXCEPT ALL (SELECT k FROM jsonb_object_keys(v_expected_schema) k)) OR
+    EXISTS((SELECT k FROM jsonb_object_keys(v_expected_schema) k) EXCEPT ALL (SELECT k FROM jsonb_object_keys(v_schema) k)) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_admission_schema_invalid';
  END IF;
  FOREACH v_key IN ARRAY ARRAY['relations','constraints','indexes','triggers','functions'] LOOP
-  IF EXISTS((SELECT x FROM jsonb_array_elements(v_schema->v_key) x) EXCEPT ALL (SELECT x FROM jsonb_array_elements(v_expected->'schema'->v_key) x)) OR
-     EXISTS((SELECT x FROM jsonb_array_elements(v_expected->'schema'->v_key) x) EXCEPT ALL (SELECT x FROM jsonb_array_elements(v_schema->v_key) x)) THEN
+  IF EXISTS((SELECT x FROM jsonb_array_elements(v_schema->v_key) x) EXCEPT ALL (SELECT x FROM jsonb_array_elements(v_expected_schema->v_key) x)) OR
+     EXISTS((SELECT x FROM jsonb_array_elements(v_expected_schema->v_key) x) EXCEPT ALL (SELECT x FROM jsonb_array_elements(v_schema->v_key) x)) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_admission_schema_invalid';
   END IF;
  END LOOP;
