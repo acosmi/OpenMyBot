@@ -409,7 +409,10 @@ mod tests {
         assert_eq!(AuditEventType::parse("computer.action_allowed "), None);
         assert_eq!(AuditEventType::parse(""), None);
         assert_eq!(AuditEventType::parse("anything.at.all"), None);
-        assert_eq!(AuditEventType::parse("gateway_authorization_code_admitted "), None);
+        assert_eq!(
+            AuditEventType::parse("gateway_authorization_code_admitted "),
+            None
+        );
     }
 
     #[test]

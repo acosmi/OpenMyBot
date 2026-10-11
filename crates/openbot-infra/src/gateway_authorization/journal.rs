@@ -34,9 +34,9 @@ mod authority_sql;
 mod callback;
 mod current;
 mod registration;
-mod token;
 #[cfg(test)]
 mod tests;
+mod token;
 
 pub use callback::{
     CallbackErrorKind, CallbackStage, GatewayAuthorizationCallbackError,
@@ -396,7 +396,9 @@ impl GatewayAuthorizationTokenError {
     }
     /// Original transport-minted facts, retaining absence of an observed snapshot.
     #[must_use]
-    pub const fn transport_snapshot(&self) -> Option<crate::gateway_transport::GatewayAttemptSnapshot> {
+    pub const fn transport_snapshot(
+        &self,
+    ) -> Option<crate::gateway_transport::GatewayAttemptSnapshot> {
         self.snapshot
     }
     /// Original code-write COMMIT or failed-write ROLLBACK acknowledgement.
@@ -430,7 +432,11 @@ impl fmt::Debug for GatewayAuthorizationTokenError {
 }
 impl fmt::Display for GatewayAuthorizationTokenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GatewayAuthorizationTokenError({:?},{:?})", self.stage, self.kind)
+        write!(
+            f,
+            "GatewayAuthorizationTokenError({:?},{:?})",
+            self.stage, self.kind
+        )
     }
 }
 impl std::error::Error for GatewayAuthorizationTokenError {}
@@ -1312,8 +1318,7 @@ impl GatewayAuthorizationJournal {
             .journal
             .upgrade()
             .ok_or_else(|| Error::new(Kind::Unavailable))?;
-        if !std::ptr::eq(self, original.as_ref())
-            || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+        if !std::ptr::eq(self, original.as_ref()) || !Weak::ptr_eq(&binding.runtime, &self.runtime)
         {
             return Err(Error::new(Kind::Refused));
         }
@@ -1349,7 +1354,10 @@ impl GatewayAuthorizationJournal {
             || i64::try_from(auth.auth_generation().get()).ok() != Some(row.auth_generation)
             || row.installation_id != runtime.installation_id
             || row.runtime_epoch != runtime.runtime_epoch
-            || row.client_id.as_deref().is_none_or(|v| !super::initial::valid_client_id(v))
+            || row
+                .client_id
+                .as_deref()
+                .is_none_or(|v| !super::initial::valid_client_id(v))
             || row.enrollment_id != Some(reservation.id)
             || reservation.id.get_version_num() != 7
             || row.registration_admitted_at.is_none()
@@ -1400,8 +1408,7 @@ impl GatewayAuthorizationJournal {
             .journal
             .upgrade()
             .ok_or_else(|| Error::new(Kind::Unavailable))?;
-        if !std::ptr::eq(self, original.as_ref())
-            || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+        if !std::ptr::eq(self, original.as_ref()) || !Weak::ptr_eq(&binding.runtime, &self.runtime)
         {
             return Err(Error::new(Kind::Refused));
         }
@@ -1437,7 +1444,10 @@ impl GatewayAuthorizationJournal {
             || i64::try_from(auth.auth_generation().get()).ok() != Some(row.auth_generation)
             || row.installation_id != runtime.installation_id
             || row.runtime_epoch != runtime.runtime_epoch
-            || row.client_id.as_deref().is_none_or(|v| !super::initial::valid_client_id(v))
+            || row
+                .client_id
+                .as_deref()
+                .is_none_or(|v| !super::initial::valid_client_id(v))
             || row.enrollment_id != Some(reservation.id)
             || reservation.id.get_version_num() != 7
             || row.registration_admitted_at.is_none()
@@ -1455,7 +1465,9 @@ impl GatewayAuthorizationJournal {
         }
         drop(runtime);
         let valid_phase = match phase {
-            TokenGatePhase::Registered => row.phase == "registered" && row.code_admitted_at.is_none(),
+            TokenGatePhase::Registered => {
+                row.phase == "registered" && row.code_admitted_at.is_none()
+            }
             TokenGatePhase::CodeAdmitted => {
                 row.phase == "code_admitted"
                     && row.code_admitted_at.is_some_and(|t| {
@@ -1469,18 +1481,26 @@ impl GatewayAuthorizationJournal {
             return Err(Error::new(Kind::Refused));
         }
         match &dispatched.witness {
-            InitialReplyWitness::Code { metadata, binding: reply_binding, start, redirect_uri, .. }
-                if metadata.sdk_metadata().issuer == row.issuer
-                    && reply_binding.server_url.as_str() == row.issuer
-                    && row.client_id.as_deref() == Some(reply_binding.client_id.as_str())
-                    && super::initial::valid_client_id(&reply_binding.client_id)
-                    && redirect_uri.as_str() == row.redirect_uri
-                    && start.original.mono >= binding.flow.start.mono
-                    && start.original.wall >= binding.flow.start.wall
-                    && start.original.mono <= dispatched.budget.http_entered_at => {}
+            InitialReplyWitness::Code {
+                metadata,
+                binding: reply_binding,
+                start,
+                redirect_uri,
+                ..
+            } if metadata.sdk_metadata().issuer == row.issuer
+                && reply_binding.server_url.as_str() == row.issuer
+                && row.client_id.as_deref() == Some(reply_binding.client_id.as_str())
+                && super::initial::valid_client_id(&reply_binding.client_id)
+                && redirect_uri.as_str() == row.redirect_uri
+                && start.original.mono >= binding.flow.start.mono
+                && start.original.wall >= binding.flow.start.wall
+                && start.original.mono <= dispatched.budget.http_entered_at => {}
             _ => return Err(Error::new(Kind::Refused)),
         }
-        dispatched.budget.check(&dispatched.clock).map_err(initial_error)?;
+        dispatched
+            .budget
+            .check(&dispatched.clock)
+            .map_err(initial_error)?;
         let gate = OperationGate {
             journal: self,
             auth,
@@ -1506,8 +1526,7 @@ impl GatewayAuthorizationJournal {
             .journal
             .upgrade()
             .ok_or_else(|| Error::new(Kind::Unavailable))?;
-        if !std::ptr::eq(self, original.as_ref())
-            || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+        if !std::ptr::eq(self, original.as_ref()) || !Weak::ptr_eq(&binding.runtime, &self.runtime)
         {
             return Err(Error::new(Kind::Refused));
         }
@@ -1543,7 +1562,10 @@ impl GatewayAuthorizationJournal {
             || i64::try_from(auth.auth_generation().get()).ok() != Some(row.auth_generation)
             || row.installation_id != runtime.installation_id
             || row.runtime_epoch != runtime.runtime_epoch
-            || row.client_id.as_deref().is_none_or(|v| !super::initial::valid_client_id(v))
+            || row
+                .client_id
+                .as_deref()
+                .is_none_or(|v| !super::initial::valid_client_id(v))
             || row.enrollment_id != Some(reservation.id)
             || reservation.id.get_version_num() != 7
             || row.registration_admitted_at.is_none()
@@ -1574,7 +1596,11 @@ impl GatewayAuthorizationJournal {
         {
             return Err(Error::new(Kind::Refused));
         }
-        tokens.resources.budget.check(&tokens.resources.clock).map_err(initial_error)?;
+        tokens
+            .resources
+            .budget
+            .check(&tokens.resources.clock)
+            .map_err(initial_error)?;
         let gate = OperationGate {
             journal: self,
             auth,
@@ -1733,10 +1759,15 @@ fn code_admitted_row(old: &Row, stamp: OffsetDateTime) -> Result<Row, Error> {
     if old.phase != "registered"
         || old.journal_schema != 1
         || old.attempt_id.get_version_num() != 7
-        || old.client_id.as_deref().is_none_or(|v| !super::initial::valid_client_id(v))
+        || old
+            .client_id
+            .as_deref()
+            .is_none_or(|v| !super::initial::valid_client_id(v))
         || old.enrollment_id.is_none_or(|id| id.get_version_num() != 7)
         || old.registration_admitted_at.is_none()
-        || old.registration_admitted_at.is_some_and(|t| t < old.created_at || t > old.updated_at)
+        || old
+            .registration_admitted_at
+            .is_some_and(|t| t < old.created_at || t > old.updated_at)
         || old.code_admitted_at.is_some()
         || old.updated_at < old.created_at
         || old.updated_at >= old.expires_at

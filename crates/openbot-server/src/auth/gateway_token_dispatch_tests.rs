@@ -1,19 +1,18 @@
 //! Genuine token consumer cases with original Server Host, owned PG/TLS and three ACK stages.
 use super::*;
-use fixture::{Fixture, PgTerminalAckGate, TerminalStage, harness, ACTOR, DEP, TENANT};
-use openbot_infra::db::tables::gateway_authorization_attempts::Row as AttemptRow;
 use base64::Engine as _;
-use sha2::Digest as _;
+use fixture::{ACTOR, DEP, Fixture, PgTerminalAckGate, TENANT, TerminalStage, harness};
+use openbot_infra::db::tables::gateway_authorization_attempts::Row as AttemptRow;
 use openbot_infra::{
-    GatewayAuthorizationCallbackError,
-    GatewayAuthorizationCallbackWaitOwner,
+    GatewayAuthorizationCallbackError, GatewayAuthorizationCallbackWaitOwner,
     GatewayAuthorizationCancellationToken as CancellationToken, GatewayAuthorizationJournal,
     GatewayAuthorizationJournalAck as Ack, GatewayAuthorizationJournalRuntimeOwner,
-    GatewayAuthorizationVerifiedCodeOwner, GatewayAuthorizationTokenOwner,
     GatewayAuthorizationTokenError, GatewayAuthorizationTokenKind as TokenKind,
-    GatewayAuthorizationTokenStage as TokenStage, GatewayAuthorizationTokenReplyReason as ReplyReason,
+    GatewayAuthorizationTokenOwner, GatewayAuthorizationTokenReplyReason as ReplyReason,
+    GatewayAuthorizationTokenStage as TokenStage, GatewayAuthorizationVerifiedCodeOwner,
 };
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use std::{
     future::Future,
     pin::Pin,
@@ -213,24 +212,48 @@ async fn finish_code<F: Future<Output = CallbackResult>>(
 
 type TokenResult = Result<GatewayAuthorizationTokenOwner, GatewayAuthorizationTokenError>;
 fn rejected(result: TokenResult) -> Result<GatewayAuthorizationTokenError, String> {
-    result.err().ok_or_else(|| "token unexpectedly returned an opaque owner".into())
+    result
+        .err()
+        .ok_or_else(|| "token unexpectedly returned an opaque owner".into())
 }
 fn token_posts(f: &Fixture) -> Result<Vec<Value>, String> {
-    Ok(f.posts()?.into_iter().filter(|v| v["path"] == "/oauth/desktop/token").collect())
+    Ok(f.posts()?
+        .into_iter()
+        .filter(|v| v["path"] == "/oauth/desktop/token")
+        .collect())
 }
 fn no_token(f: &Fixture) -> Result<(), String> {
-    check(token_posts(f)?.is_empty(), "zero token POST, setup registration counted separately")
+    check(
+        token_posts(f)?.is_empty(),
+        "zero token POST, setup registration counted separately",
+    )
 }
-fn history(error: &GatewayAuthorizationTokenError, write: Ack, readback: Ack, send: Ack) -> Result<(), String> {
-    check(error.code_write_ack() == write && error.code_readback_ack() == readback && error.token_send_rollback_ack() == send,
-        "three actual original terminal ACKs retain their independent histories")
+fn history(
+    error: &GatewayAuthorizationTokenError,
+    write: Ack,
+    readback: Ack,
+    send: Ack,
+) -> Result<(), String> {
+    check(
+        error.code_write_ack() == write
+            && error.code_readback_ack() == readback
+            && error.token_send_rollback_ack() == send,
+        "three actual original terminal ACKs retain their independent histories",
+    )
 }
 fn error_kind(error: &GatewayAuthorizationTokenError, expected: TokenKind) -> Result<(), String> {
-    check(error.kind() == expected, &format!("closed token kind expected {expected:?}, got {error:?}"))
+    check(
+        error.kind() == expected,
+        &format!("closed token kind expected {expected:?}, got {error:?}"),
+    )
 }
 async fn verified_on(
-    f: &Fixture, journal: &Arc<GatewayAuthorizationJournal>, auth: &AuthContext,
-    sink: &GatewayCallbackUrlSink, parent: CancellationToken, deadline: Instant,
+    f: &Fixture,
+    journal: &Arc<GatewayAuthorizationJournal>,
+    auth: &AuthContext,
+    sink: &GatewayCallbackUrlSink,
+    parent: CancellationToken,
+    deadline: Instant,
 ) -> Result<(GatewayAuthorizationVerifiedCodeOwner, CallbackInput), String> {
     let (wait, input) = start_on(f, journal, auth, sink, parent, deadline).await?;
     let mut callback = Box::pin(journal.wait_callback(auth, wait));
@@ -238,10 +261,21 @@ async fn verified_on(
     Ok((owner, input))
 }
 async fn verified(
-    f: &Fixture, parent: CancellationToken, deadline: Instant,
-) -> Result<(AuthContext, GatewayAuthorizationVerifiedCodeOwner, CallbackInput), String> {
+    f: &Fixture,
+    parent: CancellationToken,
+    deadline: Instant,
+) -> Result<
+    (
+        AuthContext,
+        GatewayAuthorizationVerifiedCodeOwner,
+        CallbackInput,
+    ),
+    String,
+> {
     let sink = GatewayCallbackUrlSink::new();
-    f.resolver.install_gateway_callback_url_sink(Arc::clone(&sink)).map_err(|e| format!("{e:?}"))?;
+    f.resolver
+        .install_gateway_callback_url_sink(Arc::clone(&sink))
+        .map_err(|e| format!("{e:?}"))?;
     let auth = f.auth().await?;
     let (owner, input) = verified_on(f, &f.journal, &auth, &sink, parent, deadline).await?;
     Ok((auth, owner, input))
@@ -250,55 +284,136 @@ fn token_wire(f: &Fixture, input: &CallbackInput) -> Result<(), String> {
     let posts = token_posts(f)?;
     check(posts.len() == 1, "one actual original token POST")?;
     let wire = &posts[0];
-    check(wire["authorization"] == Value::Null, "token POST has no bearer")?;
+    check(
+        wire["authorization"] == Value::Null,
+        "token POST has no bearer",
+    )?;
     let raw = wire["body"].as_str().ok_or("missing actual SDK form")?;
-    let form: Vec<_> = url::form_urlencoded::parse(raw.as_bytes()).into_owned().collect();
-    let expected = ["grant_type", "client_id", "code", "redirect_uri", "code_verifier"];
-    check(form.len() == 5 && expected.iter().all(|key| form.iter().filter(|(k, _)| k == key).count() == 1), "exact five original SDK form keys")?;
+    let form: Vec<_> = url::form_urlencoded::parse(raw.as_bytes())
+        .into_owned()
+        .collect();
+    let expected = [
+        "grant_type",
+        "client_id",
+        "code",
+        "redirect_uri",
+        "code_verifier",
+    ];
+    check(
+        form.len() == 5
+            && expected
+                .iter()
+                .all(|key| form.iter().filter(|(k, _)| k == key).count() == 1),
+        "exact five original SDK form keys",
+    )?;
     let get = |key: &str| form.iter().find(|(k, _)| k == key).unwrap().1.as_str();
-    check(get("grant_type") == "authorization_code" && get("client_id") == "owned-registration-client"
-        && get("code") == "owned-token-code" && get("redirect_uri") == *input.redirect,
-        "independent fixed code/client/grant and original runtime-port redirect")?;
+    check(
+        get("grant_type") == "authorization_code"
+            && get("client_id") == "owned-registration-client"
+            && get("code") == "owned-token-code"
+            && get("redirect_uri") == *input.redirect,
+        "independent fixed code/client/grant and original runtime-port redirect",
+    )?;
     let verifier = get("code_verifier");
-    check(verifier.len() == 43 && verifier.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
-        "original verifier grammar, no replacement RNG")?;
+    check(
+        verifier.len() == 43
+            && verifier
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+        "original verifier grammar, no replacement RNG",
+    )?;
     let parsed = url::Url::parse(&input.url).map_err(|e| e.to_string())?;
-    let challenge = parsed.query_pairs().find(|(k, _)| k == "code_challenge").ok_or("missing original challenge")?.1.into_owned();
-    let independent = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
-    check(independent == challenge, "independent SHA256/base64url equals original URL challenge")?;
+    let challenge = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "code_challenge")
+        .ok_or("missing original challenge")?
+        .1
+        .into_owned();
+    let independent = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    check(
+        independent == challenge,
+        "independent SHA256/base64url equals original URL challenge",
+    )?;
     let headers = wire["headers"].as_array().ok_or("wire headers missing")?;
-    let media: Vec<_> = headers.iter().filter(|h| h[0].as_str().is_some_and(|s| s.eq_ignore_ascii_case("content-type"))).collect();
-    check(media.len() == 1 && media[0][1] == "application/x-www-form-urlencoded", "one actual original form media")?;
+    let media: Vec<_> = headers
+        .iter()
+        .filter(|h| {
+            h[0].as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("content-type"))
+        })
+        .collect();
+    check(
+        media.len() == 1 && media[0][1] == "application/x-www-form-urlencoded",
+        "one actual original form media",
+    )?;
     Ok(())
 }
-async fn code_success(f: &Fixture, old: &AttemptRow, owner: &GatewayAuthorizationTokenOwner, input: &CallbackInput) -> Result<(), String> {
+async fn code_success(
+    f: &Fixture,
+    old: &AttemptRow,
+    owner: &GatewayAuthorizationTokenOwner,
+    input: &CallbackInput,
+) -> Result<(), String> {
     let next = f.row(old.attempt_id).await?;
-    let stamp = next.code_admitted_at.ok_or("code admission timestamp missing")?;
+    let stamp = next
+        .code_admitted_at
+        .ok_or("code admission timestamp missing")?;
     let mut expected = old.clone();
     expected.phase = "code_admitted".into();
     expected.code_admitted_at = Some(stamp);
     expected.updated_at = stamp;
-    check(next == expected && stamp >= old.updated_at && stamp < old.expires_at,
-        "three changed and seventeen original columns, original UUID/client pair and PG floor bound")?;
+    check(
+        next == expected && stamp >= old.updated_at && stamp < old.expires_at,
+        "three changed and seventeen original columns, original UUID/client pair and PG floor bound",
+    )?;
     let audits = f.audits().await?;
-    check(audits.len() == 4 && audits[3] == json!({
-        "journal_schema":1,"attempt_id":old.attempt_id.to_string(),"phase":"code_admitted","outcome_code":null
-    }), "original typed four-fact code admission audit")?;
+    check(
+        audits.len() == 4
+            && audits[3]
+                == json!({
+                    "journal_schema":1,"attempt_id":old.attempt_id.to_string(),"phase":"code_admitted","outcome_code":null
+                }),
+        "original typed four-fact code admission audit",
+    )?;
     token_wire(f, input)?;
     let debug = format!("{owner:?}");
-    for secret in [ACTOR, "owned-access-token", "owned-refresh-token", "owned-token-code", "owned-registration-client", &f.issuer()] {
-        check(!debug.contains(secret), "opaque six-guard owner has static redaction")?;
+    for secret in [
+        ACTOR,
+        "owned-access-token",
+        "owned-refresh-token",
+        "owned-token-code",
+        "owned-registration-client",
+        &f.issuer(),
+    ] {
+        check(
+            !debug.contains(secret),
+            "opaque six-guard owner has static redaction",
+        )?;
     }
-    check(debug.contains("GatewayAuthorizationTokenOwner"), "opaque owner retained")?;
+    check(
+        debug.contains("GatewayAuthorizationTokenOwner"),
+        "opaque owner retained",
+    )?;
     Ok(())
 }
-async fn body_pending<F: Future<Output = TokenResult>>(f: &Fixture, call: &mut Pin<Box<F>>) -> Result<(), String> {
+async fn body_pending<F: Future<Output = TokenResult>>(
+    f: &Fixture,
+    call: &mut Pin<Box<F>>,
+) -> Result<(), String> {
     let observed = async {
         let until = Instant::now() + Duration::from_secs(5);
         loop {
-            if f.events()?.iter().any(|v| v["event"] == "headers_sent" && v["path"] == "/oauth/desktop/token")
-                && token_posts(f)?.len() == 1 { return Ok::<(), String>(()); }
-            if Instant::now() >= until { return Err("token headers event not observed".into()); }
+            if f.events()?
+                .iter()
+                .any(|v| v["event"] == "headers_sent" && v["path"] == "/oauth/desktop/token")
+                && token_posts(f)?.len() == 1
+            {
+                return Ok::<(), String>(());
+            }
+            if Instant::now() >= until {
+                return Err("token headers event not observed".into());
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     };
@@ -307,7 +422,13 @@ async fn body_pending<F: Future<Output = TokenResult>>(f: &Fixture, call: &mut P
     tokio::select! { biased; result = &mut *call => return Err(format!("token escaped withheld body: {result:?}")), () = tokio::task::yield_now() => {}, }
     Ok(())
 }
-async fn token_ack_case(cfg: openbot_infra::db::pool::DatabaseConfig, stage: TerminalStage, discard: bool, late: bool, tail: bool) -> Result<(), String> {
+async fn token_ack_case(
+    cfg: openbot_infra::db::pool::DatabaseConfig,
+    stage: TerminalStage,
+    discard: bool,
+    late: bool,
+    tail: bool,
+) -> Result<(), String> {
     let relay = PgTerminalAckGate::new(&cfg, stage, discard).await;
     let f = Fixture::new(relay.config.clone(), 1).await?;
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -317,33 +438,80 @@ async fn token_ack_case(cfg: openbot_infra::db::pool::DatabaseConfig, stage: Ter
     let factory = f.factory(Some("/oauth/desktop/register"))?;
     let mut call = Box::pin(f.journal.dispatch_token(&auth, verified, &factory));
     tokio::select! { biased; () = relay.held() => {}, value = &mut call => return Err(format!("token missed original ACK stage: {value:?}")), }
-    if tail { f.disarm_host(); }
-    if late {
-        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline + Duration::from_millis(150))).await;
+    if tail {
+        f.disarm_host();
     }
-    if !discard { relay.release_original_ack().await; }
+    if late {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            deadline + Duration::from_millis(150),
+        ))
+        .await;
+    }
+    if !discard {
+        relay.release_original_ack().await;
+    }
     let error = rejected(call.await)?;
-    let selected = if discard { Ack::Unknown } else if late { Ack::Late } else { Ack::Timely };
+    let selected = if discard {
+        Ack::Unknown
+    } else if late {
+        Ack::Late
+    } else {
+        Ack::Timely
+    };
     match stage {
         TerminalStage::CodeCommit => {
             history(&error, selected, Ack::NotAttempted, Ack::NotAttempted)?;
-            error_kind(&error, if discard { TokenKind::CommitUnknown } else if late { TokenKind::CommitAcknowledgedAfterDeadline } else { TokenKind::BeforeDispatchRefused })?;
+            error_kind(
+                &error,
+                if discard {
+                    TokenKind::CommitUnknown
+                } else if late {
+                    TokenKind::CommitAcknowledgedAfterDeadline
+                } else {
+                    TokenKind::BeforeDispatchRefused
+                },
+            )?;
             no_token(&f)?;
         }
         TerminalStage::CodeReadbackRollback => {
             history(&error, Ack::Timely, selected, Ack::NotAttempted)?;
-            error_kind(&error, if discard { TokenKind::CleanupUnknown } else if late { TokenKind::RollbackAcknowledgedAfterDeadline } else { TokenKind::BeforeDispatchRefused })?;
+            error_kind(
+                &error,
+                if discard {
+                    TokenKind::CleanupUnknown
+                } else if late {
+                    TokenKind::RollbackAcknowledgedAfterDeadline
+                } else {
+                    TokenKind::BeforeDispatchRefused
+                },
+            )?;
             no_token(&f)?;
         }
         TerminalStage::TokenSendRollback => {
             history(&error, Ack::Timely, Ack::Timely, selected)?;
-            error_kind(&error, if late { TokenKind::RollbackAcknowledgedAfterDeadline } else if discard { TokenKind::CleanupUnknown } else { TokenKind::TokenUnknown })?;
-            check(token_posts(&f)?.len() == 1, "one actual token POST even when send ACK unknown")?;
+            error_kind(
+                &error,
+                if late {
+                    TokenKind::RollbackAcknowledgedAfterDeadline
+                } else if discard {
+                    TokenKind::CleanupUnknown
+                } else {
+                    TokenKind::TokenUnknown
+                },
+            )?;
+            check(
+                token_posts(&f)?.len() == 1,
+                "one actual token POST even when send ACK unknown",
+            )?;
         }
     }
     let next = f.row(old.attempt_id).await?;
-    check(next.phase == "code_admitted" && next.client_id == old.client_id && next.enrollment_id == old.enrollment_id,
-        "later durable row never upgrades original ACK facts")?;
+    check(
+        next.phase == "code_admitted"
+            && next.client_id == old.client_id
+            && next.enrollment_id == old.enrollment_id,
+        "later durable row never upgrades original ACK facts",
+    )?;
     relay.assert_target(usize::from(!discard));
     f.finish().await?;
     relay.stop().await;
@@ -389,20 +557,50 @@ async fn r02_token_singleuser() {
         let (runtime, journal) = f.fresh_pair()?;
         let single = f.single(&journal).await?;
         let sink = GatewayCallbackUrlSink::new();
-        single.install_gateway_callback_url_sink(Arc::clone(&sink)).map_err(|e| format!("{e:?}"))?;
-        let auth = single.resolve(&http::Request::builder().uri("/owned-token").body(()).unwrap().into_parts().0).await.map_err(|e| e.to_string())?;
-        check(auth.actor().as_str() == "dev-local-user", "genuine verified local admin principal")?;
-        let (verified, input) = verified_on(&f, &journal, &auth, &sink, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+        single
+            .install_gateway_callback_url_sink(Arc::clone(&sink))
+            .map_err(|e| format!("{e:?}"))?;
+        let auth = single
+            .resolve(
+                &http::Request::builder()
+                    .uri("/owned-token")
+                    .body(())
+                    .unwrap()
+                    .into_parts()
+                    .0,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        check(
+            auth.actor().as_str() == "dev-local-user",
+            "genuine verified local admin principal",
+        )?;
+        let (verified, input) = verified_on(
+            &f,
+            &journal,
+            &auth,
+            &sink,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await?;
         let old = f.rows().await?.remove(0);
-        check(old.owner_user_id == "dev-local-user", "same Pool single-user journal owner")?;
+        check(
+            old.owner_user_id == "dev-local-user",
+            "same Pool single-user journal owner",
+        )?;
         let factory = f.factory(Some("/oauth/desktop/register"))?;
-        let owner = journal.dispatch_token(&auth, verified, &factory).await.map_err(|e| e.to_string())?;
+        let owner = journal
+            .dispatch_token(&auth, verified, &factory)
+            .await
+            .map_err(|e| e.to_string())?;
         code_success(&f, &old, &owner, &input).await?;
         drop(owner);
         single.close_request_bindings();
         runtime.close();
         f.finish().await
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -412,17 +610,26 @@ async fn r03_token_sdk_form() {
     harness::with_temp_database(&admin, "tok_r03", |cfg| async move {
         let f = Fixture::new(cfg, 2).await?;
         let parent = CancellationToken::new();
-        let (auth, verified, input) = verified(&f, parent.clone(), Instant::now() + Duration::from_secs(60)).await?;
-        check(!parent.is_cancelled(), "original SDK child exit did not cancel original parent")?;
+        let (auth, verified, input) =
+            verified(&f, parent.clone(), Instant::now() + Duration::from_secs(60)).await?;
+        check(
+            !parent.is_cancelled(),
+            "original SDK child exit did not cancel original parent",
+        )?;
         let old = f.rows().await?.remove(0);
         let factory = f.factory(Some("/oauth/desktop/register"))?;
-        let owner = f.journal.dispatch_token(&auth, verified, &factory).await.map_err(|e| e.to_string())?;
+        let owner = f
+            .journal
+            .dispatch_token(&auth, verified, &factory)
+            .await
+            .map_err(|e| e.to_string())?;
         token_wire(&f, &input)?;
         code_success(&f, &old, &owner, &input).await?;
         check(!parent.is_cancelled(), "token capture kept original parent")?;
         drop(owner);
         f.finish().await
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -432,56 +639,145 @@ async fn r04_token_foreign() {
     for vector in 0..5 {
         harness::with_temp_database(&admin, &format!("tok_r04_{vector}"), |cfg| async move {
             let f = Fixture::new(cfg, 2).await?;
-            let (auth, verified, _input) = verified(&f, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+            let (auth, verified, _input) = verified(
+                &f,
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?;
             let baseline = f.network_point()?;
             let direct = f.direct().await?;
-            let pool = if vector == 0 { direct.clone() } else { f.pool.clone() };
-            let dep = if vector == 1 { "foreign-deployment" } else { DEP };
-            let tenant = if vector == 2 { "foreign-tenant" } else { TENANT };
-            let (runtime, foreign) = fixture::fresh_pair(pool, DeploymentId::new(dep), TenantId::new(tenant))?;
+            let pool = if vector == 0 {
+                direct.clone()
+            } else {
+                f.pool.clone()
+            };
+            let dep = if vector == 1 {
+                "foreign-deployment"
+            } else {
+                DEP
+            };
+            let tenant = if vector == 2 {
+                "foreign-tenant"
+            } else {
+                TENANT
+            };
+            let (runtime, foreign) =
+                fixture::fresh_pair(pool, DeploymentId::new(dep), TenantId::new(tenant))?;
             let factory = f.factory(Some("/oauth/desktop/register"))?;
             let error = if vector == 4 {
-                let resolver = Arc::new(PostgresSessionAuthResolver::new(f.pool.clone(), b"owned-journal-session-hash-key",
-                    openbot_infra::auth::config::default_session_lifetime(), DeploymentId::new(DEP), TenantId::new(TENANT)).map_err(|e| e.to_string())?);
-                resolver.install_gateway_authorization_journal(&foreign).map_err(|e| format!("{e:?}"))?;
-                let replacement = resolver.resolve(&http::Request::builder().uri("/owned-token").header("cookie",format!("openbot_session={}", fixture::COOKIE)).body(()).unwrap().into_parts().0).await.map_err(|e| e.to_string())?;
-                rejected(f.journal.dispatch_token(&replacement, verified, &factory).await)?
-            } else { rejected(foreign.dispatch_token(&auth, verified, &factory).await)? };
+                let resolver = Arc::new(
+                    PostgresSessionAuthResolver::new(
+                        f.pool.clone(),
+                        b"owned-journal-session-hash-key",
+                        openbot_infra::auth::config::default_session_lifetime(),
+                        DeploymentId::new(DEP),
+                        TenantId::new(TENANT),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+                resolver
+                    .install_gateway_authorization_journal(&foreign)
+                    .map_err(|e| format!("{e:?}"))?;
+                let replacement = resolver
+                    .resolve(
+                        &http::Request::builder()
+                            .uri("/owned-token")
+                            .header("cookie", format!("openbot_session={}", fixture::COOKIE))
+                            .body(())
+                            .unwrap()
+                            .into_parts()
+                            .0,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                rejected(
+                    f.journal
+                        .dispatch_token(&replacement, verified, &factory)
+                        .await,
+                )?
+            } else {
+                rejected(foreign.dispatch_token(&auth, verified, &factory).await)?
+            };
             error_kind(&error, TokenKind::BeforeDispatchRefused)?;
-            history(&error, Ack::NotAttempted, Ack::NotAttempted, Ack::NotAttempted)?;
-            check(f.network_point()? == baseline, "foreign original Pool/scope/issuer/runtime performs no new DNS/socket/POST")?;
+            history(
+                &error,
+                Ack::NotAttempted,
+                Ack::NotAttempted,
+                Ack::NotAttempted,
+            )?;
+            check(
+                f.network_point()? == baseline,
+                "foreign original Pool/scope/issuer/runtime performs no new DNS/socket/POST",
+            )?;
             no_token(&f)?;
             runtime.close();
             direct.close();
             f.finish().await
-        }).await;
+        })
+        .await;
     }
     // A genuine Server verified owner still refuses the existing default Host
     // binding. This negative Desktop vector never creates another verified code.
     harness::with_temp_database(&admin, "tok_r04_default", |cfg| async move {
         let f = Fixture::new(cfg, 2).await?;
-        let (auth, verified, _) = verified(&f, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+        let (auth, verified, _) = verified(
+            &f,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await?;
         let baseline = f.network_point()?;
-        use openbot_contracts::request_binding::{HostRequestBindingError, HostRequestBindingGuard, HostRequestBindingKind, RequestBindingOwnerLease};
+        use openbot_contracts::request_binding::{
+            HostRequestBindingError, HostRequestBindingGuard, HostRequestBindingKind,
+            RequestBindingOwnerLease,
+        };
         struct DefaultGuard;
         impl HostRequestBindingGuard for DefaultGuard {
-            fn verify_current<'a>(&'a self, _: &'a AuthContext) -> Pin<Box<dyn Future<Output=Result<(),HostRequestBindingError>> + Send + 'a>> {
+            fn verify_current<'a>(
+                &'a self,
+                _: &'a AuthContext,
+            ) -> Pin<Box<dyn Future<Output = Result<(), HostRequestBindingError>> + Send + 'a>>
+            {
                 Box::pin(async { Ok(()) })
             }
         }
-        let (lease, issuer) = RequestBindingOwnerLease::for_trusted_host(HostRequestBindingKind::DesktopWindow);
-        let binding = issuer.bind_desktop_window(&auth, "owned-token-default-desktop-negative".into(), 1, Arc::new(DefaultGuard)).map_err(|e| format!("{e:?}"))?;
-        let replacement = auth.clone().with_verified_request_binding(binding).map_err(|e| format!("{e:?}"))?;
+        let (lease, issuer) =
+            RequestBindingOwnerLease::for_trusted_host(HostRequestBindingKind::DesktopWindow);
+        let binding = issuer
+            .bind_desktop_window(
+                &auth,
+                "owned-token-default-desktop-negative".into(),
+                1,
+                Arc::new(DefaultGuard),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+        let replacement = auth
+            .clone()
+            .with_verified_request_binding(binding)
+            .map_err(|e| format!("{e:?}"))?;
         let factory = f.factory(Some("/oauth/desktop/register"))?;
-        let error = rejected(f.journal.dispatch_token(&replacement, verified, &factory).await)?;
+        let error = rejected(
+            f.journal
+                .dispatch_token(&replacement, verified, &factory)
+                .await,
+        )?;
         error_kind(&error, TokenKind::BeforeDispatchRefused)?;
-        history(&error, Ack::NotAttempted, Ack::NotAttempted, Ack::NotAttempted)?;
-        check(f.network_point()? == baseline, "default Host performs no new DNS/socket/POST")?;
+        history(
+            &error,
+            Ack::NotAttempted,
+            Ack::NotAttempted,
+            Ack::NotAttempted,
+        )?;
+        check(
+            f.network_point()? == baseline,
+            "default Host performs no new DNS/socket/POST",
+        )?;
         no_token(&f)?;
         drop(lease);
         f.finish().await
-    }).await;
-
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -491,7 +787,12 @@ async fn r05_token_revoked() {
     for vector in 0..6 {
         harness::with_temp_database(&admin, &format!("tok_r05_{vector}"), |cfg| async move {
             let f = Fixture::new(cfg, 2).await?;
-            let (auth, verified, _) = verified(&f, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+            let (auth, verified, _) = verified(
+                &f,
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?;
             let old = f.rows().await?.remove(0);
             if vector < 4 {
                 let client = f.pool.get().await.map_err(|e| e.to_string())?;
@@ -502,14 +803,28 @@ async fn r05_token_revoked() {
                     _ => "DELETE FROM public.sessions WHERE id='owned-journal-session'",
                 };
                 client.batch_execute(sql).await.map_err(|e| e.to_string())?;
-            } else if vector == 4 { f.disarm_host(); } else { f.runtime.as_ref().unwrap().close(); }
+            } else if vector == 4 {
+                f.disarm_host();
+            } else {
+                f.runtime.as_ref().unwrap().close();
+            }
             let factory = f.factory(Some("/oauth/desktop/register"))?;
             let error = rejected(f.journal.dispatch_token(&auth, verified, &factory).await)?;
-            check(matches!(error.kind(), TokenKind::BeforeDispatchRefused | TokenKind::Unavailable), "actual revocation closed refusal")?;
+            check(
+                matches!(
+                    error.kind(),
+                    TokenKind::BeforeDispatchRefused | TokenKind::Unavailable
+                ),
+                "actual revocation closed refusal",
+            )?;
             no_token(&f)?;
-            check(f.row(old.attempt_id).await? == old, "preadmission revoked chain cannot write code or handoff")?;
+            check(
+                f.row(old.attempt_id).await? == old,
+                "preadmission revoked chain cannot write code or handoff",
+            )?;
             f.finish().await
-        }).await;
+        })
+        .await;
     }
 }
 
@@ -526,7 +841,12 @@ async fn r06_token_cas_drift() {
     ] {
         harness::with_temp_database(&admin, "tok_r06_drift", |cfg| async move {
             let f = Fixture::new(cfg, 2).await?;
-            let (auth, verified, _) = verified(&f, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+            let (auth, verified, _) = verified(
+                &f,
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?;
             let old = f.rows().await?.remove(0);
             let client = f.pool.get().await.map_err(|e| e.to_string())?;
             client.batch_execute(sql).await.map_err(|e| e.to_string())?;
@@ -538,10 +858,13 @@ async fn r06_token_cas_drift() {
             error_kind(&error, TokenKind::BeforeDispatchRefused)?;
             history(&error, Ack::Timely, Ack::NotAttempted, Ack::NotAttempted)?;
             no_token(&f)?;
-            check(f.row(old.attempt_id).await? == drift && f.audits().await? == audit_before,
-                "legal actual full-row mismatch rolls back with no CAS or audit effect")?;
+            check(
+                f.row(old.attempt_id).await? == drift && f.audits().await? == audit_before,
+                "legal actual full-row mismatch rolls back with no CAS or audit effect",
+            )?;
             f.finish().await
-        }).await;
+        })
+        .await;
     }
 }
 
@@ -627,8 +950,15 @@ async fn r08_token_audit_fail() {
 #[ignore = "requires Root-frozen owned PostgreSQL, TLS and original ACK runtime"]
 async fn r09_token_commit_ack() {
     let admin = harness::admin_config("token-r09");
-    for (discard, late, tail) in [(true, false, false), (false, true, false), (false, false, true)] {
-        harness::with_temp_database(&admin, "tok_r09", |cfg| token_ack_case(cfg, TerminalStage::CodeCommit, discard, late, tail)).await;
+    for (discard, late, tail) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        harness::with_temp_database(&admin, "tok_r09", |cfg| {
+            token_ack_case(cfg, TerminalStage::CodeCommit, discard, late, tail)
+        })
+        .await;
     }
 }
 
@@ -636,8 +966,21 @@ async fn r09_token_commit_ack() {
 #[ignore = "requires Root-frozen owned PostgreSQL, TLS and original ACK runtime"]
 async fn r10_token_ro_ack() {
     let admin = harness::admin_config("token-r10");
-    for (discard, late, tail) in [(true, false, false), (false, true, false), (false, false, true)] {
-        harness::with_temp_database(&admin, "tok_r10_ack", |cfg| token_ack_case(cfg, TerminalStage::CodeReadbackRollback, discard, late, tail)).await;
+    for (discard, late, tail) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        harness::with_temp_database(&admin, "tok_r10_ack", |cfg| {
+            token_ack_case(
+                cfg,
+                TerminalStage::CodeReadbackRollback,
+                discard,
+                late,
+                tail,
+            )
+        })
+        .await;
     }
     for vector in 0..3 {
         harness::with_temp_database(&admin, &format!("tok_r10_drift_{vector}"), |cfg| async move {
@@ -681,22 +1024,40 @@ async fn r11_token_old10_done() {
     harness::with_temp_database(&admin, "tok_r11", |cfg| async move {
         let f = Fixture::new(cfg, 2).await?;
         let sink = GatewayCallbackUrlSink::new();
-        f.resolver.install_gateway_callback_url_sink(Arc::clone(&sink)).map_err(|e| format!("{e:?}"))?;
+        f.resolver
+            .install_gateway_callback_url_sink(Arc::clone(&sink))
+            .map_err(|e| format!("{e:?}"))?;
         let auth = f.auth().await?;
-        let (wait, input) = start_on(&f, &f.journal, &auth, &sink, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+        let (wait, input) = start_on(
+            &f,
+            &f.journal,
+            &auth,
+            &sink,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await?;
         let old = f.rows().await?.remove(0);
         let completed = Instant::now();
         tokio::time::sleep(Duration::from_secs(11)).await;
-        check(completed.elapsed() > Duration::from_secs(10), "actual completed registration stage exceeds original ten seconds")?;
+        check(
+            completed.elapsed() > Duration::from_secs(10),
+            "actual completed registration stage exceeds original ten seconds",
+        )?;
         let mut callback = Box::pin(f.journal.wait_callback(&auth, wait));
         let verified = finish_code(&mut callback, &input, "owned-token-code").await?;
         drop(callback);
         let factory = f.factory(Some("/oauth/desktop/register"))?;
-        let owner = f.journal.dispatch_token(&auth, verified, &factory).await.map_err(|e| e.to_string())?;
+        let owner = f
+            .journal
+            .dispatch_token(&auth, verified, &factory)
+            .await
+            .map_err(|e| e.to_string())?;
         code_success(&f, &old, &owner, &input).await?;
         drop(owner);
         f.finish().await
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -781,8 +1142,15 @@ async fn r13_token_send_ack() {
 #[ignore = "requires Root-frozen owned PostgreSQL, TLS and original ACK runtime"]
 async fn r14_token_send_unknown() {
     let admin = harness::admin_config("token-r14");
-    for (discard, late, tail) in [(true, false, false), (false, true, false), (false, false, true)] {
-        harness::with_temp_database(&admin, "tok_r14", |cfg| token_ack_case(cfg, TerminalStage::TokenSendRollback, discard, late, tail)).await;
+    for (discard, late, tail) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        harness::with_temp_database(&admin, "tok_r14", |cfg| {
+            token_ack_case(cfg, TerminalStage::TokenSendRollback, discard, late, tail)
+        })
+        .await;
     }
 }
 
@@ -955,29 +1323,56 @@ async fn r17_token_status() {
 async fn r18_token_reply_bounds() {
     let admin = harness::admin_config("token-r18");
     let vectors = [
-        (json!({"headers":[["Content-Type","text/plain"]]}), TokenKind::ProtocolInvalid(ReplyReason::MediaType)),
-        (json!({"headers":[["Content-Type","application/json"],["Content-Type","application/json"]]}), TokenKind::ProtocolInvalid(ReplyReason::MediaType)),
-        (json!({"raw":"{\"access_token\":\"a\",\"access_token\":\"b\"}"}), TokenKind::ProtocolInvalid(ReplyReason::DuplicateKey)),
-        (json!({"raw":"{\"access_token\":\"a\",\"id_token\":\"owned-forbidden-secret\"}"}), TokenKind::ProtocolInvalid(ReplyReason::ForbiddenSecretKey)),
+        (
+            json!({"headers":[["Content-Type","text/plain"]]}),
+            TokenKind::ProtocolInvalid(ReplyReason::MediaType),
+        ),
+        (
+            json!({"headers":[["Content-Type","application/json"],["Content-Type","application/json"]]}),
+            TokenKind::ProtocolInvalid(ReplyReason::MediaType),
+        ),
+        (
+            json!({"raw":"{\"access_token\":\"a\",\"access_token\":\"b\"}"}),
+            TokenKind::ProtocolInvalid(ReplyReason::DuplicateKey),
+        ),
+        (
+            json!({"raw":"{\"access_token\":\"a\",\"id_token\":\"owned-forbidden-secret\"}"}),
+            TokenKind::ProtocolInvalid(ReplyReason::ForbiddenSecretKey),
+        ),
         (json!({"raw":" ".repeat(65537)}), TokenKind::TokenUnknown),
     ];
     for (index, (settings, expected)) in vectors.into_iter().enumerate() {
         harness::with_temp_database(&admin, &format!("tok_r18_{index}"), |cfg| async move {
             let f = Fixture::new(cfg, 2).await?;
             f.configure(&settings)?;
-            let (auth, verified, _) = verified(&f, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+            let (auth, verified, _) = verified(
+                &f,
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?;
             let factory = f.factory(Some("/oauth/desktop/register"))?;
             let error = rejected(f.journal.dispatch_token(&auth, verified, &factory).await)?;
             error_kind(&error, expected)?;
             history(&error, Ack::Timely, Ack::Timely, Ack::Timely)?;
-            check(token_posts(&f)?.len() == 1 && !format!("{error:?}").contains("owned-forbidden-secret"), "reachable closed rejection retains no secret body")?;
+            check(
+                token_posts(&f)?.len() == 1
+                    && !format!("{error:?}").contains("owned-forbidden-secret"),
+                "reachable closed rejection retains no secret body",
+            )?;
             if index == 4 {
                 // Content-Length=65537 is refused by original SafeHttp before
                 // headers return. It proves that boundary, not reply-cursor polls.
-                check(error.transport_snapshot().is_some_and(|s| s.may_have_sent() && s.response_status().is_none()), "original over-limit transport facts")?;
+                check(
+                    error
+                        .transport_snapshot()
+                        .is_some_and(|s| s.may_have_sent() && s.response_status().is_none()),
+                    "original over-limit transport facts",
+                )?;
             }
             f.finish().await
-        }).await;
+        })
+        .await;
     }
 }
 
@@ -1040,35 +1435,66 @@ async fn r20_token_drop_isolate() {
     harness::with_temp_database(&admin, "tok_r20_drop", |cfg| async move {
         let f = Fixture::new(cfg, 2).await?;
         f.configure(&json!({"hold_body":true}))?;
-        let (auth, verified, _) = verified(&f, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
+        let (auth, verified, _) = verified(
+            &f,
+            CancellationToken::new(),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await?;
         let factory = f.factory(Some("/oauth/desktop/register"))?;
         let mut call = Box::pin(f.journal.dispatch_token(&auth, verified, &factory));
         body_pending(&f, &mut call).await?;
-        check(token_posts(&f)?.len() == 1, "active partial caller has one actual POST")?;
+        check(
+            token_posts(&f)?.len() == 1,
+            "active partial caller has one actual POST",
+        )?;
         drop(call);
         f.release_body()?;
         let until = Instant::now() + Duration::from_secs(5);
         while !f.response_finished()? {
-            if Instant::now() >= until { return Err("dropped original owned peer did not end".into()); }
+            if Instant::now() >= until {
+                return Err("dropped original owned peer did not end".into());
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         f.finish().await
-    }).await;
+    })
+    .await;
     for (index, raw) in [
-        (0, "{\"access_token\":\"owned-access-token\",\"token_type\":\"Bearer\",\"expires_in\":59,\"refresh_token\":\"owned-refresh-token\",\"scope\":\"ai account\"}"),
-        (1, "{\"access_token\":\"owned-second-access\",\"token_type\":\"Bearer\",\"expires_in\":59,\"refresh_token\":\"owned-second-refresh\",\"scope\":\"ai account\"}"),
+        (
+            0,
+            "{\"access_token\":\"owned-access-token\",\"token_type\":\"Bearer\",\"expires_in\":59,\"refresh_token\":\"owned-refresh-token\",\"scope\":\"ai account\"}",
+        ),
+        (
+            1,
+            "{\"access_token\":\"owned-second-access\",\"token_type\":\"Bearer\",\"expires_in\":59,\"refresh_token\":\"owned-second-refresh\",\"scope\":\"ai account\"}",
+        ),
     ] {
-        harness::with_temp_database(&admin, &format!("tok_r20_chain_{index}"), |cfg| async move {
-            let f = Fixture::new(cfg, 2).await?;
-            f.configure(&json!({"raw":raw}))?;
-            let (auth, verified, input) = verified(&f, CancellationToken::new(), Instant::now() + Duration::from_secs(60)).await?;
-            let old = f.rows().await?.remove(0);
-            let factory = f.factory(Some("/oauth/desktop/register"))?;
-            let owner = f.journal.dispatch_token(&auth, verified, &factory).await.map_err(|e| e.to_string())?;
-            code_success(&f, &old, &owner, &input).await?;
-            drop(owner);
-            f.finish().await
-        }).await;
+        harness::with_temp_database(
+            &admin,
+            &format!("tok_r20_chain_{index}"),
+            |cfg| async move {
+                let f = Fixture::new(cfg, 2).await?;
+                f.configure(&json!({"raw":raw}))?;
+                let (auth, verified, input) = verified(
+                    &f,
+                    CancellationToken::new(),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .await?;
+                let old = f.rows().await?.remove(0);
+                let factory = f.factory(Some("/oauth/desktop/register"))?;
+                let owner = f
+                    .journal
+                    .dispatch_token(&auth, verified, &factory)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                code_success(&f, &old, &owner, &input).await?;
+                drop(owner);
+                f.finish().await
+            },
+        )
+        .await;
     }
     // Each real chain has its own transport-owned outcomes and bounded controls.
     // Caller Drop does not publish asynchronous ACKs or individual driver joins.
@@ -1278,9 +1704,14 @@ mod fixture {
         }
         pub(super) fn release_headers(&self) -> Result<(), String> {
             std::fs::write(
-                self.tls.as_ref().ok_or("owned TLS absent")?.root.join("release_headers"),
+                self.tls
+                    .as_ref()
+                    .ok_or("owned TLS absent")?
+                    .root
+                    .join("release_headers"),
                 b"owned",
-            ).map_err(|e| e.to_string())
+            )
+            .map_err(|e| e.to_string())
         }
         pub(super) fn release_body(&self) -> Result<(), String> {
             std::fs::write(
@@ -1405,7 +1836,9 @@ mod fixture {
             if captures.iter().any(|x| {
                 !matches!(x["method"].as_str(), Some("GET" | "POST"))
                     || x["authorization"] != Value::Null
-                    || (x["method"] == "POST" && x["path"] != "/oauth/desktop/register" && x["path"] != "/oauth/desktop/token")
+                    || (x["method"] == "POST"
+                        && x["path"] != "/oauth/desktop/register"
+                        && x["path"] != "/oauth/desktop/token")
             }) {
                 return Err("unexpected journal TLS dispatch".into());
             }
@@ -1414,8 +1847,14 @@ mod fixture {
             eprintln!(
                 "GATEWAY_TOKEN_FIXTURE setup_discovery_gets={} registration_posts={} token_posts={} pool_closed={} individual_production_driver_join=UNPROVEN",
                 captures.iter().filter(|v| v["method"] == "GET").count(),
-                captures.iter().filter(|v| v["method"] == "POST" && v["path"] == "/oauth/desktop/register").count(),
-                captures.iter().filter(|v| v["method"] == "POST" && v["path"] == "/oauth/desktop/token").count(),
+                captures
+                    .iter()
+                    .filter(|v| v["method"] == "POST" && v["path"] == "/oauth/desktop/register")
+                    .count(),
+                captures
+                    .iter()
+                    .filter(|v| v["method"] == "POST" && v["path"] == "/oauth/desktop/token")
+                    .count(),
                 self.pool.is_closed()
             );
             closed
@@ -1666,9 +2105,7 @@ mod fixture {
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
-                eprintln!(
-                    "GATEWAY_TOKEN_OWNED_TLS fallback_kill=true natural_stop_unproven=true"
-                );
+                eprintln!("GATEWAY_TOKEN_OWNED_TLS fallback_kill=true natural_stop_unproven=true");
             }
             if let Some(reader) = self.stdout_reader.take() {
                 let _ = reader.join();
@@ -2159,12 +2596,18 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
                         original_read_only = query.contains("READ ONLY");
                     }
                     if let Some(sql) = pg_statement(tag, &bytes) {
-                        if std::str::from_utf8(sql).is_ok_and(|s| s.contains("/* gateway_authorization_code_admitted */")) {
+                        if std::str::from_utf8(sql)
+                            .is_ok_and(|s| s.contains("/* gateway_authorization_code_admitted */"))
+                        {
                             token_code_seen = true;
                         }
-                        let bits = if matches!(client_state.stage, TerminalStage::TokenSendRollback) && !token_readback_finished {
+                        let bits = if matches!(client_state.stage, TerminalStage::TokenSendRollback)
+                            && !token_readback_finished
+                        {
                             0
-                        } else { client_state.stage.sql_bits(sql) };
+                        } else {
+                            client_state.stage.sql_bits(sql)
+                        };
                         stage_bits |= bits;
                         if stage_bits == client_state.stage.complete_bits() && !seen_stage {
                             if !original_begin
@@ -2186,7 +2629,11 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
                     if tag == b'Q' && bytes.eq_ignore_ascii_case(b"COMMIT\0") && token_code_seen {
                         token_code_committed = true;
                     }
-                    if tag == b'Q' && bytes.eq_ignore_ascii_case(b"ROLLBACK\0") && original_read_only && token_code_committed {
+                    if tag == b'Q'
+                        && bytes.eq_ignore_ascii_case(b"ROLLBACK\0")
+                        && original_read_only
+                        && token_code_committed
+                    {
                         token_readback_finished = true;
                     }
                     if tag == b'Q' && seen_stage {

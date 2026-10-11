@@ -105,7 +105,9 @@ pub(super) async fn append_code_admitted_audit(
 ) -> Result<(), Error> {
     if next.phase != "code_admitted"
         || next.code_admitted_at != Some(next.updated_at)
-        || next.registration_admitted_at.is_none_or(|t| t > next.updated_at)
+        || next
+            .registration_admitted_at
+            .is_none_or(|t| t > next.updated_at)
         || next.outcome_code.is_some()
         || next.finished_at.is_some()
     {

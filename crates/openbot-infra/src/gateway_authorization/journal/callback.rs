@@ -239,13 +239,12 @@ pub(super) fn take_verified_for_token(
     auth: &AuthContext,
     owner: GatewayAuthorizationVerifiedCodeOwner,
 ) -> Result<super::TokenCaptureOwner, super::GatewayAuthorizationTokenError> {
+    use super::super::{InitialError, ReplyInvalidReason};
     use super::{
-        GatewayAuthorizationTokenError as TokenError,
-        GatewayAuthorizationTokenKind as TokenKind,
+        GatewayAuthorizationTokenError as TokenError, GatewayAuthorizationTokenKind as TokenKind,
         GatewayAuthorizationTokenReplyReason as TokenReason,
         GatewayAuthorizationTokenStage as TokenStage,
     };
-    use super::super::{InitialError, ReplyInvalidReason};
     // Original full20/current/Flow validation uses initial=None. The completed
     // registration 10s stage is neither checked nor renewed. No transport
     // execute future has been constructed or polled in this whole producer.
@@ -297,7 +296,10 @@ pub(super) fn take_verified_for_token(
         Ok(value) => value,
         Err(mut invalid) => {
             zeroize::Zeroize::zeroize(&mut invalid);
-            return Err(TokenError::new(TokenStage::Capture, TokenKind::RequestMismatch));
+            return Err(TokenError::new(
+                TokenStage::Capture,
+                TokenKind::RequestMismatch,
+            ));
         }
     };
     let input = super::super::token_code_input_same_clock(
@@ -307,7 +309,8 @@ pub(super) fn take_verified_for_token(
         original_redirect_uri,
         _verifier,
         &clock,
-    ).map_err(|error| {
+    )
+    .map_err(|error| {
         let kind = match error {
             InitialError::RequestMismatch => TokenKind::RequestMismatch,
             InitialError::Cancelled => TokenKind::Cancelled,
@@ -1295,9 +1298,10 @@ pub(super) async fn wait_callback(
                         Poll::<Result<(), CallbackError>>::Pending
                     }) {
                         Ok(Some(result)) => result,
-                        Ok(None) => Poll::Ready(Err(
-                            CallbackError::new(CallbackErrorKind::Deadline).with_readback(ack)
-                        )),
+                        Ok(None) => Poll::Ready(Err(CallbackError::new(
+                            CallbackErrorKind::Deadline,
+                        )
+                        .with_readback(ack))),
                         Err(error) => Poll::Ready(Err(error.with_readback(ack))),
                     }
                 }

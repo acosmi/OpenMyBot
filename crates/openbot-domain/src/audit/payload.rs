@@ -1104,7 +1104,10 @@ mod tests {
             ),
             (AuditGatewayAuthorizationPhase::Closed, "closed"),
             (AuditGatewayAuthorizationPhase::Registered, "registered"),
-            (AuditGatewayAuthorizationPhase::CodeAdmitted, "code_admitted"),
+            (
+                AuditGatewayAuthorizationPhase::CodeAdmitted,
+                "code_admitted",
+            ),
         ] {
             let payload = AuditPayload::from_facts([
                 AuditFact::GatewayAuthorizationJournalSchema,
