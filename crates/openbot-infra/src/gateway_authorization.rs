@@ -106,6 +106,9 @@ enum InitialReplyWitness {
         metadata: GatewayDesktopMetadata,
         binding: OwnedTokenBinding,
         start: CodeTokenStart,
+        code: Zeroizing<String>,
+        redirect_uri: Zeroizing<String>,
+        code_verifier: Zeroizing<String>,
     },
 }
 
@@ -129,6 +132,19 @@ struct DispatchedInitialOwner {
     clock: ClockOwner,
     sdk_exit_child: CancellationToken,
     transfer: RegistrationTransferWitness,
+}
+
+// Only the Code whole-transfer path constructs this non-replayable witness.
+struct CodeTransferWitness {
+    _private: (),
+}
+
+struct CodeDispatchedInitialOwner {
+    witness: InitialReplyWitness,
+    budget: InitialBudget,
+    clock: ClockOwner,
+    sdk_exit_child: CancellationToken,
+    transfer: CodeTransferWitness,
 }
 
 #[allow(dead_code, reason = "Pending token consumption")]
@@ -254,6 +270,8 @@ redacted_debug! {
     PreparedInitialOwner => "PreparedInitialOwner([redacted])",
     RegistrationTransferWitness => "RegistrationTransferWitness([redacted])",
     DispatchedInitialOwner => "DispatchedInitialOwner([redacted])",
+    CodeTransferWitness => "CodeTransferWitness([redacted])",
+    CodeDispatchedInitialOwner => "CodeDispatchedInitialOwner([redacted])",
     ParsedTokenFields => "ParsedTokenFields([redacted])",
     CheckedExpiry => "CheckedExpiry([redacted])",
     ReplyResources => "ReplyResources([redacted])",
@@ -399,6 +417,24 @@ fn owned_code_input(
     )
 }
 
+fn token_code_input_same_clock(
+    metadata: GatewayDesktopMetadata,
+    client_id: Zeroizing<String>,
+    code: Zeroizing<String>,
+    original_redirect_uri: Zeroizing<String>,
+    code_verifier: Zeroizing<String>,
+    clock: &ClockOwner,
+) -> Result<OwnedInitialInput, InitialError> {
+    initial::owned_code_input_with_clock(
+        metadata,
+        client_id,
+        code,
+        original_redirect_uri,
+        code_verifier,
+        Arc::clone(clock),
+    )
+}
+
 async fn prepare_initial(
     input: OwnedInitialInput,
     original_parent_budget: InitialParentBudget,
@@ -462,6 +498,72 @@ fn transfer_registration_request(
         clock: prepared.clock,
         sdk_exit_child: prepared.sdk_exit_child,
         transfer: RegistrationTransferWitness { _private: () },
+    };
+    dispatched.budget.check(&dispatched.clock)?;
+    Ok((request, dispatched))
+}
+
+// Consume the same captured Code request once, retaining its original guards.
+fn transfer_code_request(
+    mut prepared: PreparedInitialOwner,
+) -> Result<(acosmi::HttpRequest, CodeDispatchedInitialOwner), InitialError> {
+    if !prepared.sdk_exit_child.is_cancelled() {
+        return Err(InitialError::RequestMismatch);
+    }
+    let budget = prepared
+        .budget
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    budget.check(&prepared.clock)?;
+    let request = prepared
+        .request
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    let witness = prepared
+        .witness
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    let InitialReplyWitness::Code {
+        metadata,
+        binding,
+        start,
+        code,
+        redirect_uri,
+        code_verifier,
+    } = witness
+    else {
+        return Err(InitialError::RequestMismatch);
+    };
+    // Move all five original String guards through the existing validator.
+    let kind = OwnedInitialKind::Code(OwnedCodeInput {
+        metadata,
+        client_id: binding.client_id,
+        code,
+        redirect_uri,
+        code_verifier,
+        server_url: binding.server_url,
+    });
+    initial::validate_request(&request, &kind)?;
+    budget.check(&prepared.clock)?;
+    let OwnedInitialKind::Code(code) = kind else {
+        return Err(InitialError::RequestMismatch);
+    };
+    let dispatched = CodeDispatchedInitialOwner {
+        witness: InitialReplyWitness::Code {
+            metadata: code.metadata,
+            binding: OwnedTokenBinding {
+                client_id: code.client_id,
+                server_url: code.server_url,
+            },
+            start,
+            code: code.code,
+            redirect_uri: code.redirect_uri,
+            code_verifier: code.code_verifier,
+        },
+        budget,
+        clock: prepared.clock,
+        sdk_exit_child: prepared.sdk_exit_child,
+        transfer: CodeTransferWitness { _private: () },
     };
     dispatched.budget.check(&dispatched.clock)?;
     Ok((request, dispatched))

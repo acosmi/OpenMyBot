@@ -3273,3 +3273,6 @@ mod gateway_authorization_journal_tests;
 mod gateway_callback_rendezvous_tests;
 #[cfg(test)]
 mod gateway_registration_dispatch_tests;
+
+#[cfg(test)]
+mod gateway_token_dispatch_tests;

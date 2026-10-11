@@ -286,6 +286,8 @@ pub enum AuditGatewayAuthorizationPhase {
     Closed,
     /// The original registration reply was committed and exactly read back.
     Registered,
+    /// The original code admission was committed with its original typed audit.
+    CodeAdmitted,
 }
 
 impl AuditGatewayAuthorizationPhase {
@@ -297,6 +299,7 @@ impl AuditGatewayAuthorizationPhase {
             Self::RegistrationAdmitted => "registration_admitted",
             Self::Closed => "closed",
             Self::Registered => "registered",
+            Self::CodeAdmitted => "code_admitted",
         }
     }
 }
@@ -1101,6 +1104,7 @@ mod tests {
             ),
             (AuditGatewayAuthorizationPhase::Closed, "closed"),
             (AuditGatewayAuthorizationPhase::Registered, "registered"),
+            (AuditGatewayAuthorizationPhase::CodeAdmitted, "code_admitted"),
         ] {
             let payload = AuditPayload::from_facts([
                 AuditFact::GatewayAuthorizationJournalSchema,
@@ -1159,6 +1163,7 @@ mod tests {
             ),
             AuditFact::GatewayAuthorizationPhase(AuditGatewayAuthorizationPhase::Closed),
             AuditFact::GatewayAuthorizationPhase(AuditGatewayAuthorizationPhase::Registered),
+            AuditFact::GatewayAuthorizationPhase(AuditGatewayAuthorizationPhase::CodeAdmitted),
         ] {
             let field = fact.field();
             assert_eq!(

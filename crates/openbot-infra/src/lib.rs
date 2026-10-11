@@ -140,6 +140,8 @@ pub use gateway_authorization::journal::{
     CreatedAttemptOwner, GatewayAuthorizationCallbackError, GatewayAuthorizationCallbackWaitOwner,
     GatewayAuthorizationJournal, GatewayAuthorizationJournalAck, GatewayAuthorizationJournalError,
     GatewayAuthorizationJournalErrorKind, GatewayAuthorizationJournalRuntimeOwner,
+    GatewayAuthorizationTokenError, GatewayAuthorizationTokenKind, GatewayAuthorizationTokenOwner,
+    GatewayAuthorizationTokenReplyReason, GatewayAuthorizationTokenStage,
     GatewayAuthorizationVerifiedCodeOwner, RegisteredAttemptOwner, RegistrationAdmissionReceipt,
     RegistrationDispatchError, RegistrationDispatchKind,
 };
