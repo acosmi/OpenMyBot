@@ -799,7 +799,7 @@ async fn r05_token_revoked() {
                 let sql = match vector {
                     0 => "UPDATE public.users SET auth_generation=8 WHERE id='owned-journal-owner'",
                     1 => "DELETE FROM public.user_roles WHERE user_id='owned-journal-owner'",
-                    2 => "INSERT INTO public.revoked_access(email) VALUES('journal@example.test')",
+                    2 => "INSERT INTO public.revoked_access(email,revoked_by) VALUES('journal@example.test','owned-journal-owner')",
                     _ => "DELETE FROM public.sessions WHERE id='owned-journal-session'",
                 };
                 client.batch_execute(sql).await.map_err(|e| e.to_string())?;
