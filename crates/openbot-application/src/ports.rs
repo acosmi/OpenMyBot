@@ -183,6 +183,8 @@ pub struct ChannelCreateScope {
     pub tenant: TenantId,
     /// Verified creator and sole initial channel member.
     pub actor: ActorId,
+    /// Original authenticated generation, rechecked by the native creation transaction.
+    pub auth_generation: AuthGeneration,
     /// Whether verified roles include administrator for private-Agent access.
     pub admin: bool,
 }

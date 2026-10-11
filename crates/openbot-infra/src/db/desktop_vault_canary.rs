@@ -655,6 +655,9 @@ pub async fn verify_pre_upgrade_layout(
         if ledger.latest_version() >= native::NATIVE_0048_VERSION {
             super::gateway_authorization_schema::verify(&client).await?;
         }
+        if ledger.latest_version() >= native::NATIVE_0049_VERSION {
+            super::thread_origin_schema::verify(&client).await?;
+        }
         Ok(ValidatedDesktopVaultLayout {
             native_version: ledger.latest_version(),
         })
@@ -700,6 +703,8 @@ fn registered_public_schema(native_version: i32) -> Result<SchemaFacts, InfraErr
         native::NATIVE_0047_VERSION => PUBLIC_0046,
         //0048 adds only the internal attempt journal; the public oracle stays0046.
         native::NATIVE_0048_VERSION => PUBLIC_0046,
+        //0049 adds only historical internal origin facts; public remains0046.
+        native::NATIVE_0049_VERSION => PUBLIC_0046,
         _ => {
             return Err(InfraError::repository_invariant(
                 "desktop_vault_native_schema_unregistered",

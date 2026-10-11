@@ -205,6 +205,8 @@ pub mod thread_id;
 #[cfg(any(feature = "server-runtime", feature = "desktop-local"))]
 pub mod thread_listener;
 #[cfg(feature = "server-runtime")]
+pub(crate) mod thread_origin;
+#[cfg(feature = "server-runtime")]
 pub mod tool_approval;
 #[cfg(feature = "server-runtime")]
 pub mod ui_preferences;

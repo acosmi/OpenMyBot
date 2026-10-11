@@ -1383,6 +1383,14 @@ async fn apply_begin(
         .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
 
     let existing_thread = load_thread(transaction, request).await?;
+    crate::db::native::validate_thread_origin_in_transaction(transaction)
+        .await
+        .map_err(origin_error)?;
+    if existing_thread.is_some() {
+        crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
+            .await
+            .map_err(origin_error)?;
+    }
     if existing_thread
         .as_ref()
         .is_some_and(|state| state.status == "deleted")
@@ -1858,6 +1866,14 @@ async fn insert_thread(
     request: &BeginThreadRunRequest,
     now: OffsetDateTime,
 ) -> Result<(), ThreadDirectoryError> {
+    crate::thread_origin::current_native_actor(
+        transaction,
+        request.actor.as_str(),
+        request.auth_generation,
+    )
+    .await
+    .map_err(origin_error)?
+    .ok_or(ThreadDirectoryError::NotVisible)?;
     let command = &request.command;
     let (anchor_kind, anchor_id) = match &command.anchor {
         ThreadRunAnchor::DirectBot => ("direct_bot", command.bot_id.as_str()),
@@ -1881,6 +1897,13 @@ async fn insert_thread(
         )
         .await
         .map_err(|error| write_error("创建 native thread 失败", error))?;
+    crate::thread_origin::record_new_native(
+        transaction,
+        command.thread_id.as_str(),
+        crate::thread_origin::NativeOriginKind::BeginV1,
+    )
+    .await
+    .map_err(origin_error)?;
     transaction
         .execute(
             "INSERT INTO public.thread_memberships(thread_id,user_id,created_at) \
@@ -1976,6 +1999,16 @@ where
         .map_err(|_| ThreadDirectoryError::Corrupt { field })
 }
 
+fn origin_error(error: InfraError) -> ThreadDirectoryError {
+    tracing::warn!(error = %error, "Thread historical origin verification failed");
+    match error {
+        InfraError::Connect { .. } | InfraError::Query { .. } => ThreadDirectoryError::Unavailable,
+        _ => ThreadDirectoryError::Corrupt {
+            field: "thread_origin",
+        },
+    }
+}
+
 fn unavailable(context: &'static str, error: tokio_postgres::Error) -> ThreadDirectoryError {
     tracing::error!(
         sqlstate = error.code().map_or("none", SqlState::code),
@@ -2019,6 +2052,14 @@ async fn apply_begin_v2(
         .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
 
     let existing_thread = load_thread_v2(transaction, request).await?;
+    crate::db::native::validate_thread_origin_in_transaction(transaction)
+        .await
+        .map_err(origin_error)?;
+    if existing_thread.is_some() {
+        crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
+            .await
+            .map_err(origin_error)?;
+    }
     if existing_thread
         .as_ref()
         .is_some_and(|state| state.status == "deleted")
@@ -2395,6 +2436,14 @@ async fn insert_thread_v2(
     request: &BeginThreadRunV2Request,
     now: OffsetDateTime,
 ) -> Result<(), ThreadDirectoryError> {
+    crate::thread_origin::current_native_actor(
+        transaction,
+        request.actor.as_str(),
+        request.auth_generation,
+    )
+    .await
+    .map_err(origin_error)?
+    .ok_or(ThreadDirectoryError::NotVisible)?;
     let command = &request.command;
     let (anchor_kind, anchor_id) = match &command.anchor {
         ThreadRunAnchor::DirectBot => ("direct_bot", command.bot_id.as_str()),
@@ -2418,6 +2467,13 @@ async fn insert_thread_v2(
         )
         .await
         .map_err(|error| write_error("创建 native thread 失败", error))?;
+    crate::thread_origin::record_new_native(
+        transaction,
+        command.thread_id.as_str(),
+        crate::thread_origin::NativeOriginKind::BeginV2,
+    )
+    .await
+    .map_err(origin_error)?;
     transaction
         .execute(
             "INSERT INTO public.thread_memberships(thread_id,user_id,created_at) \

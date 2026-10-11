@@ -1,0 +1,1003 @@
+{
+  "allowedTableAclStates": [
+    {
+      "aclIsNull": true,
+      "rawAcl": null
+    },
+    {
+      "aclIsNull": false,
+      "rawAcl": [
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "DELETE"
+        },
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "INSERT"
+        },
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "MAINTAIN"
+        },
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "REFERENCES"
+        },
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "SELECT"
+        },
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "TRIGGER"
+        },
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "TRUNCATE"
+        },
+        {
+          "grantable": false,
+          "grantee": "original_threads_owner",
+          "grantor": "original_threads_owner",
+          "privilege": "UPDATE"
+        }
+      ]
+    }
+  ],
+  "format": "thread-origins-oracle-v1",
+  "schema": {
+    "constraints": [
+      {
+        "columns": [
+          {
+            "attributeNumber": 1,
+            "name": "thread_id",
+            "ordinal": 1
+          },
+          {
+            "attributeNumber": 2,
+            "name": "deployment_id",
+            "ordinal": 2
+          },
+          {
+            "attributeNumber": 3,
+            "name": "tenant_id",
+            "ordinal": 3
+          },
+          {
+            "attributeNumber": 4,
+            "name": "creator_actor_id",
+            "ordinal": 4
+          },
+          {
+            "attributeNumber": 6,
+            "name": "anchor_id",
+            "ordinal": 5
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((((octet_length(thread_id) >= 1) AND (octet_length(thread_id) <= 512)) AND (thread_id !~ '[\u0001-\u001f-]'::text) AND ((octet_length(deployment_id) >= 1) AND (octet_length(deployment_id) <= 512)) AND (deployment_id !~ '[\u0001-\u001f-]'::text) AND ((octet_length(tenant_id) >= 1) AND (octet_length(tenant_id) <= 512)) AND (tenant_id !~ '[\u0001-\u001f-]'::text) AND ((octet_length(creator_actor_id) >= 1) AND (octet_length(creator_actor_id) <= 512)) AND (creator_actor_id !~ '[\u0001-\u001f-]'::text) AND ((octet_length(anchor_id) >= 1) AND (octet_length(anchor_id) <= 512)) AND (anchor_id !~ '[\u0001-\u001f-]'::text)))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_identity_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 1,
+            "name": "thread_id",
+            "ordinal": 1
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (thread_id)",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "p",
+        "local": true,
+        "name": "thread_origins_pkey",
+        "namespace": "openbot_internal",
+        "noInherit": true,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": {
+          "name": "thread_origins_pkey",
+          "schema": "openbot_internal"
+        },
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 11,
+            "name": "import_bundle_id",
+            "ordinal": 1
+          },
+          {
+            "attributeNumber": 13,
+            "name": "import_signing_key_id",
+            "ordinal": 2
+          },
+          {
+            "attributeNumber": 12,
+            "name": "import_payload_sha256",
+            "ordinal": 3
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((import_bundle_id IS NULL) OR (((octet_length(import_bundle_id) >= 1) AND (octet_length(import_bundle_id) <= 512)) AND (import_bundle_id !~ '[\u0001-\u001f-]'::text) AND ((octet_length(import_signing_key_id) >= 1) AND (octet_length(import_signing_key_id) <= 512)) AND (import_signing_key_id !~ '[\u0001-\u001f-]'::text) AND (import_payload_sha256 ~ '^[0-9a-f]{64}$'::text))))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_import_identity_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 14,
+            "name": "import_thread_checksum",
+            "ordinal": 1
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((import_thread_checksum IS NULL) OR ((jsonb_typeof(import_thread_checksum) = 'object'::text) AND (import_thread_checksum ?& ARRAY['projectionHash'::text, 'messageCount'::text, 'messageHash'::text, 'eventCount'::text, 'eventHash'::text, 'terminalStateHash'::text, 'memoryCount'::text, 'memoryHash'::text, 'sampleRenderHash'::text]) AND ((import_thread_checksum - ARRAY['projectionHash'::text, 'messageCount'::text, 'messageHash'::text, 'eventCount'::text, 'eventHash'::text, 'terminalStateHash'::text, 'memoryCount'::text, 'memoryHash'::text, 'sampleRenderHash'::text]) = '{}'::jsonb) AND (jsonb_typeof((import_thread_checksum -> 'projectionHash'::text)) = 'string'::text) AND ((import_thread_checksum ->> 'projectionHash'::text) ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((import_thread_checksum -> 'messageHash'::text)) = 'string'::text) AND ((import_thread_checksum ->> 'messageHash'::text) ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((import_thread_checksum -> 'eventHash'::text)) = 'string'::text) AND ((import_thread_checksum ->> 'eventHash'::text) ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((import_thread_checksum -> 'terminalStateHash'::text)) = 'string'::text) AND ((import_thread_checksum ->> 'terminalStateHash'::text) ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((import_thread_checksum -> 'memoryHash'::text)) = 'string'::text) AND ((import_thread_checksum ->> 'memoryHash'::text) ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((import_thread_checksum -> 'sampleRenderHash'::text)) = 'string'::text) AND ((import_thread_checksum ->> 'sampleRenderHash'::text) ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((import_thread_checksum -> 'messageCount'::text)) = 'number'::text) AND (((import_thread_checksum ->> 'messageCount'::text))::numeric >= '0'::numeric) AND (((import_thread_checksum ->> 'messageCount'::text))::numeric <= '18446744073709551615'::numeric) AND (trunc(((import_thread_checksum ->> 'messageCount'::text))::numeric) = ((import_thread_checksum ->> 'messageCount'::text))::numeric) AND (jsonb_typeof((import_thread_checksum -> 'eventCount'::text)) = 'number'::text) AND (((import_thread_checksum ->> 'eventCount'::text))::numeric >= '0'::numeric) AND (((import_thread_checksum ->> 'eventCount'::text))::numeric <= '18446744073709551615'::numeric) AND (trunc(((import_thread_checksum ->> 'eventCount'::text))::numeric) = ((import_thread_checksum ->> 'eventCount'::text))::numeric) AND (jsonb_typeof((import_thread_checksum -> 'memoryCount'::text)) = 'number'::text) AND (((import_thread_checksum ->> 'memoryCount'::text))::numeric >= '0'::numeric) AND (((import_thread_checksum ->> 'memoryCount'::text))::numeric <= '18446744073709551615'::numeric) AND (trunc(((import_thread_checksum ->> 'memoryCount'::text))::numeric) = ((import_thread_checksum ->> 'memoryCount'::text))::numeric))))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_import_checksum_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 5,
+            "name": "anchor_kind",
+            "ordinal": 1
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((anchor_kind = ANY (ARRAY['direct_bot'::text, 'channel'::text])))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_anchor_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 7,
+            "name": "thread_created_at",
+            "ordinal": 1
+          },
+          {
+            "attributeNumber": 10,
+            "name": "recorded_at",
+            "ordinal": 2
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((isfinite(thread_created_at) AND isfinite(recorded_at)))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_time_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 8,
+            "name": "origin_kind",
+            "ordinal": 1
+          },
+          {
+            "attributeNumber": 11,
+            "name": "import_bundle_id",
+            "ordinal": 2
+          },
+          {
+            "attributeNumber": 12,
+            "name": "import_payload_sha256",
+            "ordinal": 3
+          },
+          {
+            "attributeNumber": 13,
+            "name": "import_signing_key_id",
+            "ordinal": 4
+          },
+          {
+            "attributeNumber": 14,
+            "name": "import_thread_checksum",
+            "ordinal": 5
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((((origin_kind = 'maintenance_import'::text) AND (import_bundle_id IS NOT NULL) AND (import_payload_sha256 IS NOT NULL) AND (import_signing_key_id IS NOT NULL) AND (import_thread_checksum IS NOT NULL)) OR ((origin_kind <> 'maintenance_import'::text) AND (import_bundle_id IS NULL) AND (import_payload_sha256 IS NULL) AND (import_signing_key_id IS NULL) AND (import_thread_checksum IS NULL))))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_import_presence_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 8,
+            "name": "origin_kind",
+            "ordinal": 1
+          },
+          {
+            "attributeNumber": 5,
+            "name": "anchor_kind",
+            "ordinal": 2
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((origin_kind <> 'private_agent_channel'::text) OR (anchor_kind = 'channel'::text)))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_channel_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 8,
+            "name": "origin_kind",
+            "ordinal": 1
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((origin_kind = ANY (ARRAY['native_begin_v1'::text, 'native_begin_v2'::text, 'private_agent_channel'::text, 'maintenance_import'::text])))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_kind_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      },
+      {
+        "columns": [
+          {
+            "attributeNumber": 9,
+            "name": "origin_schema",
+            "ordinal": 1
+          }
+        ],
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((origin_schema = 1))",
+        "foreignEqualityOperators": [],
+        "hasParent": false,
+        "inheritanceCount": 0,
+        "kind": "c",
+        "local": true,
+        "name": "thread_origins_schema_check",
+        "namespace": "openbot_internal",
+        "noInherit": false,
+        "reference": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "supportingIndex": null,
+        "validated": true
+      }
+    ],
+    "format": "thread-origins-schema-v1",
+    "functions": [
+      {
+        "acl": [
+          {
+            "grantable": false,
+            "grantee": "PUBLIC",
+            "grantor": "original_threads_owner",
+            "privilege": "EXECUTE"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "EXECUTE"
+          }
+        ],
+        "aclIsNull": true,
+        "allArgumentTypes": [],
+        "allArgumentTypesIsNull": true,
+        "argumentDefaults": null,
+        "argumentModes": null,
+        "argumentNames": null,
+        "binary": null,
+        "configuration": null,
+        "cost": 100,
+        "defaultArgumentCount": 0,
+        "definition": "CREATE OR REPLACE FUNCTION openbot_internal.prevent_thread_origin_mutation()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_origin_mutation_refused';\nEND;\n$function$\n",
+        "identity": {
+          "arguments": "",
+          "name": "prevent_thread_origin_mutation",
+          "schema": "openbot_internal"
+        },
+        "inputArgumentCount": 0,
+        "inputTypes": [],
+        "isSyncFunction": false,
+        "kind": "f",
+        "language": "plpgsql",
+        "leakproof": false,
+        "ownerRef": "original_threads_owner",
+        "parallel": "u",
+        "rawAcl": null,
+        "returnType": {
+          "formatted": "trigger",
+          "name": "trigger",
+          "schema": "pg_catalog"
+        },
+        "rows": 0,
+        "securityDefiner": false,
+        "setReturning": false,
+        "source": "\nBEGIN\n RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_origin_mutation_refused';\nEND;\n",
+        "sqlBody": null,
+        "strict": false,
+        "supportFunction": null,
+        "transformTypes": [],
+        "transformTypesIsNull": true,
+        "variadicType": null,
+        "volatility": "v"
+      }
+    ],
+    "indexes": [
+      {
+        "accessMethod": "btree",
+        "aclIsNull": true,
+        "attributeCount": 1,
+        "checkXmin": {
+          "predicate": "pg17_hot_runtime_boolean_v1"
+        },
+        "clustered": false,
+        "collations": [
+          {
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "ordinal": 1
+          }
+        ],
+        "definition": "CREATE UNIQUE INDEX thread_origins_pkey ON openbot_internal.thread_origins USING btree (thread_id)",
+        "exclusion": false,
+        "expressions": null,
+        "identity": {
+          "name": "thread_origins_pkey",
+          "schema": "openbot_internal"
+        },
+        "immediate": true,
+        "keyCount": 1,
+        "keys": "1",
+        "kind": "i",
+        "live": true,
+        "nullsNotDistinct": false,
+        "operatorClasses": [
+          {
+            "accessMethod": "btree",
+            "default": true,
+            "family": {
+              "name": "text_ops",
+              "schema": "pg_catalog"
+            },
+            "inputType": "text",
+            "keyType": null,
+            "name": "text_ops",
+            "ordinal": 1,
+            "schema": "pg_catalog"
+          }
+        ],
+        "options": null,
+        "optionsPerKey": "0",
+        "ownerIsOriginal": true,
+        "persistence": "p",
+        "predicate": null,
+        "primary": true,
+        "rawAcl": null,
+        "ready": true,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "replicaIdentity": false,
+        "unique": true,
+        "valid": true
+      }
+    ],
+    "relations": [
+      {
+        "accessMethod": "heap",
+        "acl": [
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "DELETE"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "INSERT"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "MAINTAIN"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "REFERENCES"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "SELECT"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "TRIGGER"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "TRUNCATE"
+          },
+          {
+            "grantable": false,
+            "grantee": "original_threads_owner",
+            "grantor": "original_threads_owner",
+            "privilege": "UPDATE"
+          }
+        ],
+        "attributeCount": 14,
+        "checkCount": 9,
+        "columns": [
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "thread_id",
+            "notNull": true,
+            "ordinal": 1,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "deployment_id",
+            "notNull": true,
+            "ordinal": 2,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "tenant_id",
+            "notNull": true,
+            "ordinal": 3,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "creator_actor_id",
+            "notNull": true,
+            "ordinal": 4,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "anchor_kind",
+            "notNull": true,
+            "ordinal": 5,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "anchor_id",
+            "notNull": true,
+            "ordinal": 6,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": null,
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "thread_created_at",
+            "notNull": true,
+            "ordinal": 7,
+            "type": {
+              "formatted": "timestamp with time zone",
+              "modifier": -1,
+              "name": "timestamptz",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "origin_kind",
+            "notNull": true,
+            "ordinal": 8,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": null,
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "origin_schema",
+            "notNull": true,
+            "ordinal": 9,
+            "type": {
+              "formatted": "smallint",
+              "modifier": -1,
+              "name": "int2",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": null,
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "recorded_at",
+            "notNull": true,
+            "ordinal": 10,
+            "type": {
+              "formatted": "timestamp with time zone",
+              "modifier": -1,
+              "name": "timestamptz",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "import_bundle_id",
+            "notNull": false,
+            "ordinal": 11,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "import_payload_sha256",
+            "notNull": false,
+            "ordinal": 12,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": {
+              "deterministic": true,
+              "encoding": -1,
+              "name": "C",
+              "provider": "c",
+              "schema": "pg_catalog"
+            },
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "import_signing_key_id",
+            "notNull": false,
+            "ordinal": 13,
+            "type": {
+              "formatted": "text",
+              "modifier": -1,
+              "name": "text",
+              "schema": "pg_catalog"
+            }
+          },
+          {
+            "acl": [],
+            "aclIsNull": true,
+            "collation": null,
+            "default": null,
+            "dimensions": 0,
+            "generated": "",
+            "identity": "",
+            "inheritanceCount": 0,
+            "local": true,
+            "name": "import_thread_checksum",
+            "notNull": false,
+            "ordinal": 14,
+            "type": {
+              "formatted": "jsonb",
+              "modifier": -1,
+              "name": "jsonb",
+              "schema": "pg_catalog"
+            }
+          }
+        ],
+        "droppedAttributes": [],
+        "forceRowSecurity": false,
+        "identity": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "inheritanceChildren": [],
+        "inheritanceParents": [],
+        "kind": "r",
+        "options": null,
+        "ownerIsOriginal": true,
+        "partition": false,
+        "persistence": "p",
+        "policies": [],
+        "replicaIdentity": "d",
+        "rowSecurity": false,
+        "rules": []
+      }
+    ],
+    "triggers": [
+      {
+        "argumentCount": 0,
+        "argumentsHex": "",
+        "columns": "",
+        "conditionIsNull": true,
+        "conditionTreeRaw": null,
+        "constraint": null,
+        "constraintIndex": null,
+        "constraintRelation": null,
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CREATE TRIGGER thread_origins_no_truncate BEFORE TRUNCATE ON openbot_internal.thread_origins FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.prevent_thread_origin_mutation()",
+        "enabled": "O",
+        "function": {
+          "arguments": "",
+          "kind": "f",
+          "name": "prevent_thread_origin_mutation",
+          "schema": "openbot_internal"
+        },
+        "hasParent": false,
+        "internal": false,
+        "name": "thread_origins_no_truncate",
+        "newTransition": null,
+        "oldTransition": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "type": 34
+      },
+      {
+        "argumentCount": 0,
+        "argumentsHex": "",
+        "columns": "",
+        "conditionIsNull": true,
+        "conditionTreeRaw": null,
+        "constraint": null,
+        "constraintIndex": null,
+        "constraintRelation": null,
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CREATE TRIGGER thread_origins_no_update_delete BEFORE DELETE OR UPDATE ON openbot_internal.thread_origins FOR EACH ROW EXECUTE FUNCTION openbot_internal.prevent_thread_origin_mutation()",
+        "enabled": "O",
+        "function": {
+          "arguments": "",
+          "kind": "f",
+          "name": "prevent_thread_origin_mutation",
+          "schema": "openbot_internal"
+        },
+        "hasParent": false,
+        "internal": false,
+        "name": "thread_origins_no_update_delete",
+        "newTransition": null,
+        "oldTransition": null,
+        "relation": {
+          "name": "thread_origins",
+          "schema": "openbot_internal"
+        },
+        "type": 27
+      }
+    ]
+  }
+}
