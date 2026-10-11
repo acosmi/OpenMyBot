@@ -916,6 +916,7 @@ mod tests {
                     deployment: DeploymentId::new("openbot-test"),
                     tenant: TenantId::new("tenant-test"),
                     actor: ActorId::new("u1"),
+                    auth_generation: openbot_contracts::auth::AuthGeneration::new(1),
                     admin: false,
                 },
                 agent_ids: vec![BotId::new("agent-a"), BotId::new("agent-z")],
