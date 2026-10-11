@@ -1872,6 +1872,8 @@ fn complete_raw_attribute_keys(v: &Value) -> Result<(), InfraError> {
         .collect(),
     )
 }
+// This private catalog checker keeps each independent raw fact explicit.
+#[allow(clippy::too_many_arguments)]
 fn check_class_storage(
     v: &Value,
     name: &str,

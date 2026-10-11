@@ -1235,10 +1235,6 @@ pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {
 pub(crate) async fn verify_schema_legacy0050(client: &Client) -> Result<(), InfraError> {
     compare_registered(&observation_on(client).await?)
 }
-/// Whole0051 on the original transaction; never checks out, repairs or closes it.
-pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
-    super::thread_history_writer_schema::verify_in_transaction(tx).await
-}
 pub(crate) async fn verify_legacy0050_in_transaction(
     tx: &Transaction<'_>,
 ) -> Result<(), InfraError> {
