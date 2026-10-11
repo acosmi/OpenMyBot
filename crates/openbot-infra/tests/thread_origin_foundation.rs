@@ -52,7 +52,7 @@ use openbot_infra::{
         thread_origin_schema as origin_schema,
     },
     intelligence_import::PostgresIntelligenceImportStore,
-    repo::{ChannelRepo, ThreadRepo},
+    repo::{ChannelRepo, thread::ThreadRepo},
     run_runtime::{DEFAULT_DISPATCH_CLAIM_DURATION, PostgresRunRuntime},
     thread_directory::{DEFAULT_THREAD_LEASE_DURATION, PostgresThreadDirectory},
 };
