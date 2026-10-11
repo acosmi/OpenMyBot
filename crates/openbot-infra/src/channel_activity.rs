@@ -2,8 +2,9 @@
 
 use crate::db::{InfraError, RowDecodeError};
 use openbot_contracts::command::ChannelActivityEvent;
-use openbot_contracts::ids::{BotId, ChannelId, MessageId, ThreadId};
+use openbot_contracts::ids::{BotId, ChannelId, ThreadId};
 use openbot_domain::audit::hash::Sha256Digest;
+use openbot_domain::thread::MessageId;
 use time::OffsetDateTime;
 use tokio_postgres::{Row, Transaction};
 

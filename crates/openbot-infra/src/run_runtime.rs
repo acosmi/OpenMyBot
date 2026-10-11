@@ -2261,7 +2261,7 @@ async fn finish_run_in_transaction(
     if !assistant_text.is_empty() {
         crate::channel_activity::record_from_message(
             transaction,
-            &openbot_contracts::ids::MessageId::new(assistant_message_id(lease.run_id())),
+            &openbot_domain::thread::MessageId::new(assistant_message_id(lease.run_id())),
         )
         .await
         .map_err(history_writer_error)?;
