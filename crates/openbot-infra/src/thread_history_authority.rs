@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use openbot_contracts::artifacts::is_valid_artifact_identity;
 use openbot_contracts::auth::{AuthContext, AuthContextBuilder, AuthGeneration, Role};
-use openbot_contracts::ids::{DeploymentId, TenantId, ThreadId, ThreadIdentity};
+use openbot_contracts::ids::thread::ThreadIdentity;
+use openbot_contracts::ids::{DeploymentId, TenantId, ThreadId};
 use openbot_contracts::request_binding::{
     HostRequestBindingError, HostRequestBindingKind, RequestBindingIssuer,
     ThreadHistoryHostObservation, ThreadHistoryHostTailWitness, ThreadHistoryHostTarget,
