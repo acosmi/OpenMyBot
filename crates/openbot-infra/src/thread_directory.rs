@@ -2054,7 +2054,14 @@ async fn apply_begin_v2(
     let existing_thread = load_thread_v2(transaction, request).await?;
     crate::db::native::validate_thread_origin_in_transaction(transaction)
         .await
-        .map_err(origin_error)?;
+        .map_err(|error| match error {
+            InfraError::RepositoryInvariant {
+                code: "thread_origin_native_prefix_invalid",
+            } => ThreadDirectoryError::Corrupt {
+                field: "model_dataset_binding",
+            },
+            error => origin_error(error),
+        })?;
     if existing_thread.is_some() {
         crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
             .await
