@@ -1004,13 +1004,20 @@ async fn local_m04_original_lineage_faults(
         if let Some(denied) = denied {
             // Do not count an expired/unbound window's401, parser400 or unrelated
             // permission refusal as a model/dataset fault producer.
-            eprintln!("CUSTOM_V2_LOCAL_M04_RESPONSE branch={fault:?} status={}",denied.status());
+            eprintln!(
+                "CUSTOM_V2_LOCAL_M04_RESPONSE branch={fault:?} status={}",
+                denied.status()
+            );
             require(
                 denied.status() == StatusCode::SERVICE_UNAVAILABLE,
                 "owned Local lineage fault did not reach the production dependency rejection",
             )?;
             let error: Value = serde_json::from_slice(denied.body()).map_err(|e| e.to_string())?;
-            let observed_code=if error["code"]=="dependency_unavailable" {"dependency_unavailable"} else {"unexpected_public_code"};
+            let observed_code = if error["code"] == "dependency_unavailable" {
+                "dependency_unavailable"
+            } else {
+                "unexpected_public_code"
+            };
             eprintln!("CUSTOM_V2_LOCAL_M04_ERROR branch={fault:?} code={observed_code}");
             require(
                 error["code"] == "dependency_unavailable",

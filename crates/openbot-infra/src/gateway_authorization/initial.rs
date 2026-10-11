@@ -226,7 +226,9 @@ async fn capture_helper<F: Future>(
         if let Some(error) = state.error {
             return Poll::Ready(Err(error));
         }
-        if state.executions == 1 && let Some(captured) = state.captured.take() {
+        if state.executions == 1
+            && let Some(captured) = state.captured.take()
+        {
             return Poll::Ready(Ok(captured));
         }
         if producer.is_ready() {

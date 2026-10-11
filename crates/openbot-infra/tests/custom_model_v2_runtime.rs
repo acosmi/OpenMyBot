@@ -1251,7 +1251,9 @@ impl TerminalStage {
     fn command(self) -> &'static [u8] {
         match self {
             Self::NewCommit => b"COMMIT\0",
-            Self::ExactReplayRollback | Self::ClassifierRollback | Self::StartRollback => b"ROLLBACK\0",
+            Self::ExactReplayRollback | Self::ClassifierRollback | Self::StartRollback => {
+                b"ROLLBACK\0"
+            }
         }
     }
     fn sql_bits(self, sql: &[u8]) -> u8 {
@@ -2196,7 +2198,6 @@ async fn v2_exact_durable_replay_original_rollback_ack_loss_is_closure_unproven(
     .await;
 }
 
-
 // This single-request fixture is used only by the new start-rollback cases.
 // Existing TlsFixture and its historical abort_all tail are unchanged.
 #[derive(Default)]
@@ -2419,7 +2420,10 @@ async fn start_backend_absent_and_same_pool_context_positive(
         if absent {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "original start backend absence deadline");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "original start backend absence deadline"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     drop(client);
@@ -2457,7 +2461,11 @@ async fn original_after_adapter_rollback_ack_case(config: DatabaseConfig, known_
     });
     let retrying = retried(observed.clone());
     let states = OriginalTransactionStates::default();
-    let mut future = Box::pin(retrying.start(request.clone()).with_subscriber(states.clone()));
+    let mut future = Box::pin(
+        retrying
+            .start(request.clone())
+            .with_subscriber(states.clone()),
+    );
     tokio::select! {
         _ = &mut future => panic!("original provider start ended before its actual rollback ACK was held"),
         () = proxy.held() => {}
@@ -2508,7 +2516,10 @@ async fn original_after_adapter_rollback_ack_case(config: DatabaseConfig, known_
         // Successful transfer plus production's unchanged branch and captured
         // C/Z establish timely ACK; no fake private timely enum is constructed.
         let session = result.unwrap();
-        assert_eq!(events(session).await.last(), Some(&ProviderEvent::Completed));
+        assert_eq!(
+            events(session).await.last(),
+            Some(&ProviderEvent::Completed)
+        );
         assert!(states.states.lock().unwrap().is_empty());
         assert!(!original.snapshot().retirement_requested);
         assert!(!original.snapshot().connection_destroyed);
@@ -2519,7 +2530,10 @@ async fn original_after_adapter_rollback_ack_case(config: DatabaseConfig, known_
             .await
             .unwrap()
             .get(0);
-        assert_eq!(same_backend as usize, proxy.state.original_backend_pid.load(Ordering::SeqCst));
+        assert_eq!(
+            same_backend as usize,
+            proxy.state.original_backend_pid.load(Ordering::SeqCst)
+        );
         drop(client);
     }
     assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
@@ -2540,7 +2554,8 @@ async fn original_after_adapter_rollback_ack_case(config: DatabaseConfig, known_
 
 #[tokio::test]
 #[ignore = "requires explicitly owned PG, single-request TLS and terminal relay; selected include-ignored only"]
-async fn v2_original_rollback_ack_after_adapter_timely_returns_session_and_reuses_original_client() {
+async fn v2_original_rollback_ack_after_adapter_timely_returns_session_and_reuses_original_client()
+{
     let admin = harness::admin_config("v2_start_rollback_timely");
     harness::with_temp_database(&admin, "v2startrollbacktimely", |config| async move {
         original_after_adapter_rollback_ack_case(config, false).await;
