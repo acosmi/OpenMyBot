@@ -774,7 +774,7 @@ async fn s11_complete_schema_acl_function_and_ri_tamper_refuses_without_repair()
         let mutations=[
             "ALTER TABLE openbot_internal.thread_history_heads RENAME COLUMN phase TO wrong_phase",
             "ALTER TABLE openbot_internal.thread_history_heads ADD COLUMN unexpected text",
-            "ALTER TABLE openbot_internal.thread_history_heads ALTER COLUMN deployment_id DROP NOT NULL",
+            "ALTER TABLE openbot_internal.thread_history_heads ALTER COLUMN phase DROP NOT NULL",
             "ALTER TABLE openbot_internal.thread_history_heads ALTER COLUMN recorded_at SET DEFAULT now()",
             "ALTER TABLE openbot_internal.thread_history_clear_intents ALTER COLUMN recorded_at DROP DEFAULT",
             "ALTER TABLE openbot_internal.thread_history_heads ALTER COLUMN tenant_id TYPE text COLLATE \"default\"",
