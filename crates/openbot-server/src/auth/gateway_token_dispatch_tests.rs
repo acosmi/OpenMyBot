@@ -1118,10 +1118,14 @@ async fn r13_token_send_ack() {
         let factory = f.factory(Some("/oauth/desktop/register"))?;
         let mut call = Box::pin(f.journal.dispatch_token(&auth, verified, &factory));
         tokio::select! { biased; () = relay.held() => {}, value = &mut call => return Err(format!("token became visible before original send ACK: {value:?}")), }
-        check(token_posts(&f)?.len() == 1 && f.row(old.attempt_id).await?.phase == "code_admitted", "one actual POST with confirmed code write/readback")?;
+        let observer = f.direct().await?;
+        let client = observer.get().await.map_err(|e| e.to_string())?;
+        let row = client.query_one("SELECT * FROM openbot_internal.gateway_authorization_attempts WHERE attempt_id=$1", &[&old.attempt_id]).await.map_err(|e| e.to_string())?;
+        let held_row = AttemptRow::try_from(&row).map_err(|e| e.to_string())?;
+        check(token_posts(&f)?.len() == 1 && held_row.phase == "code_admitted", "one actual POST with confirmed code write/readback")?;
+        drop(client);
         relay.release_original_ack().await;
         body_pending(&f, &mut call).await?;
-        let observer = f.direct().await?;
         let client = observer.get().await.map_err(|e| e.to_string())?;
         let activity = client.query_opt("SELECT state FROM pg_stat_activity WHERE pid=$1", &[&relay.original_pid()]).await.map_err(|e| e.to_string())?;
         check(activity.is_none_or(|r| r.get::<_, String>(0) != "idle in transaction"), "original send transaction ended before lazy body release")?;
