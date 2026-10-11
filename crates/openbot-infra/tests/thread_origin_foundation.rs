@@ -586,14 +586,17 @@ where
 }
 async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     let mut c = p.get().await.map_err(|e| e.to_string())?;
-    if version == 49 {
+    if version == 50 {
         require(
             fresh::apply(&mut c).await.map_err(|e| e.to_string())?
                 == fresh::FreshApplyOutcome::Applied(native::ApplyOutcome::Applied),
-            "fresh49 did not apply",
+            "fresh50 did not apply",
         )?;
     } else {
-        require(matches!(version, 47 | 48), "unregistered historical prefix")?;
+        require(
+            matches!(version, 47 | 48 | 49),
+            "unregistered historical prefix",
+        )?;
         baseline::apply(&c).await.map_err(|e| e.to_string())?;
         require(
             native::apply_through(&mut c, version)
@@ -606,7 +609,7 @@ async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     Ok(())
 }
 async fn provision(p: &pool::DatabasePool) -> TestResult {
-    initialize(p, 49).await?;
+    initialize(p, 50).await?;
     let c = p.get().await.map_err(|e| e.to_string())?;
     c.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES
         ('origin-a','origin-a@example.test',7),('origin-b','origin-b@example.test',7),
@@ -840,7 +843,12 @@ async fn check_oracle(c: &Client) -> TestResult<Value> {
             && observed["rawFacts"]["ownerAnchorRaw"]["ownerOidRaw"].is_string(),
         "actual full raw facts/original owner OID absent",
     )?;
-    origin_schema::verify(c).await.map_err(|e| e.to_string())?;
+    let ledger = native::validate_known_prefix(c, 49)
+        .await
+        .map_err(|e| e.to_string())?;
+    if ledger.latest_version() != 49 {
+        origin_schema::verify(c).await.map_err(|e| e.to_string())?;
+    }
     Ok(observed)
 }
 
@@ -896,7 +904,7 @@ async fn o01_fresh49_origin_schema_and_portable_acl() {
         c.batch_execute(&format!("CREATE ROLE \"{name}\" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;GRANT CREATE ON DATABASE \"{database}\" TO \"{name}\";GRANT USAGE,CREATE ON SCHEMA public TO \"{name}\";SET ROLE \"{name}\";")).await.map_err(|e|e.to_string())?;
         let result=async{
             baseline::apply(&c).await.map_err(|e|e.to_string())?;
-            native::apply(&mut c).await.map_err(|e|e.to_string())?;
+            native::apply_through(&mut c,49).await.map_err(|e|e.to_string())?;
             let original_oid:String=c.query_one("SELECT relowner::text FROM pg_class WHERE oid='public.threads'::regclass",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
             require(original_oid!="10","owner O was not actually distinct from PG bootstrap")?;
             check_oracle(&c).await?;
@@ -931,29 +939,30 @@ async fn o02_historical48_upgrade49_and_exact_prefix_replay() {
         require(native::apply_through(&mut c,48).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,"explicit historical48 replay failed")?;
         let absent:bool=c.query_one("SELECT to_regclass('openbot_internal.thread_origins') IS NULL",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
         require(absent,"historical48 replay unexpectedly created49")?;
-        require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"actual48->49 did not apply")?;
+        require(native::apply_through(&mut c,49).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"actual48->49 did not apply")?;
         let r=c.query_one("SELECT count(*),max(version) FROM openbot_internal.schema_migrations",&[]).await.map_err(|e|e.to_string())?;
         require(r.try_get::<_,i64>(0).map_err(|e|e.to_string())?==37&&r.try_get::<_,i32>(1).map_err(|e|e.to_string())?==49,"current ledger not37/49")?;
         let unchanged:Value=c.query_one("SELECT jsonb_agg(jsonb_build_array(version,name,checksum) ORDER BY version) FROM openbot_internal.schema_migrations WHERE version<=48",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
         require(old_ledger==unchanged,"migration altered original13..48 ledger")?;
         require(schema_facts::fetch(&c).await.map_err(|e|e.to_string())?==public_before,"49 altered public typed schema")?;
-        desktop_vault_canary::verify_current_layout(&p).await.map_err(|e|e.to_string())?;
+        require(desktop_vault_canary::verify_pre_upgrade_layout(&p).await.map_err(|e|e.to_string())?.native_version()==49,"historical49 canary not recognized")?;
+        require(desktop_vault_canary::verify_current_layout(&p).await.is_err(),"historical49 accepted current50")?;
         check_oracle(&c).await?;
         c.batch_execute("CREATE TABLE openbot_internal.owned_origin_ddl_observations(tag text);CREATE FUNCTION openbot_internal.owned_origin_ddl_probe() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO openbot_internal.owned_origin_ddl_observations SELECT command_tag FROM pg_event_trigger_ddl_commands(); END$$;CREATE EVENT TRIGGER owned_origin_ddl_probe ON ddl_command_end EXECUTE FUNCTION openbot_internal.owned_origin_ddl_probe();TRUNCATE openbot_internal.owned_origin_ddl_observations;").await.map_err(|e|e.to_string())?;
-        require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,"exact49 replay did not return AlreadyApplied")?;
+        require(native::apply_through(&mut c,49).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,"exact49 replay did not return AlreadyApplied")?;
         let ddl:i64=c.query_one("SELECT count(*) FROM openbot_internal.owned_origin_ddl_observations",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
         require(ddl==0,"current49 replay issued actual object DDL")?;
         for mutation in ["DELETE FROM openbot_internal.schema_migrations WHERE version=46",
             "UPDATE openbot_internal.schema_migrations SET name='known47_wrong' WHERE version=47",
             "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=47",
-            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(50,'unknown50',repeat('b',64))",
+            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(51,'unknown51',repeat('b',64))",
             "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(12,'extra12',repeat('c',64))"]{
             c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
             c.batch_execute(mutation).await.map_err(|e|e.to_string())?;
-            let refused=origin_schema::verify(&c).await;
+            let refused=native::validate_known_prefix(&c,49).await;
             c.batch_execute("ROLLBACK").await.map_err(|e|e.to_string())?;
             require(matches!(refused,Err(InfraError::NativeMigration(_))|Err(InfraError::RepositoryInvariant{..})),"exact current prefix drift lost its structural classification")?;
-            origin_schema::verify(&c).await.map_err(|e|e.to_string())?;
+            check_oracle(&c).await?;
         }
         Ok(())
     }).await;

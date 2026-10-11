@@ -228,6 +228,13 @@ impl Fixture {
             .map_err(|error| error.to_string())
     }
 
+    async fn tamper_thread_identity(&self, sql: &str) -> Result<(), String> {
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tamper_owned_thread_identity(&tx, sql, &[]).await?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     fn runtime(&self) -> Result<PostgresRunRuntime, String> {
         PostgresRunRuntime::new(
             self.pool.clone(),
@@ -583,6 +590,45 @@ async fn source_wrong_namespace_generation_or_missing_selection_is_uniformly_not
     .await;
 }
 
+// Privileged corruption control is confined to this owned disposable test DB.
+// Probe the real guard for every change/restore and re-enable it in the same transaction.
+async fn tamper_owned_thread_identity(
+    tx: &tokio_postgres::Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<(), String> {
+    const REGISTERED_GUARD: &str = "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+        WHERE tgrelid='public.threads'::regclass \
+        AND tgname='threads_history_protect_identity_update' AND NOT tgisinternal";
+    let before: String = tx.query_one(REGISTERED_GUARD, &[]).await
+        .map_err(|e| e.to_string())?.get(0);
+    if before != "O" {
+        return Err("owned Thread identity guard was not registered and normally enabled".to_owned());
+    }
+    tx.batch_execute("SAVEPOINT owned_thread_identity_probe").await
+        .map_err(|e| e.to_string())?;
+    let ordinary = tx.execute(sql, params).await;
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_thread_identity_probe; RELEASE SAVEPOINT owned_thread_identity_probe")
+        .await.map_err(|e| e.to_string())?;
+    let refused = ordinary.as_ref().err().and_then(|e| e.as_db_error())
+        .is_some_and(|e| e.code().code() == "55000"
+            && e.message() == "thread_history_state_binding_invalid");
+    if !refused {
+        return Err("ordinary Thread identity DML was not refused by the registered guard".to_owned());
+    }
+    tx.batch_execute("ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update")
+        .await.map_err(|e| e.to_string())?;
+    let changed = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
+    tx.batch_execute("ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update")
+        .await.map_err(|e| e.to_string())?;
+    let after: String = tx.query_one(REGISTERED_GUARD, &[]).await
+        .map_err(|e| e.to_string())?.get(0);
+    if changed == 0 || after != "O" {
+        return Err("owned Thread identity tamper did not change a row and restore its guard".to_owned());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an owned disposable PostgreSQL through OPENBOT_TEST_DATABASE_URL"]
 async fn source_direct_current_role_deny_membership_profile_package_and_thread_are_rechecked() {
@@ -610,9 +656,20 @@ async fn source_direct_current_role_deny_membership_profile_package_and_thread_a
             ("UPDATE public.runs SET bot_id='bot-b'",
              "UPDATE public.runs SET bot_id='bot-a'", "source selected Bot no longer matches direct anchor"),
         ] {
-            fixture.sql(change).await?;
+            let corrupts_thread_identity = matches!(change,
+                "UPDATE public.threads SET tenant_id='other-tenant'"
+                | "UPDATE public.threads SET deployment_id='other-deployment'");
+            if corrupts_thread_identity {
+                fixture.tamper_thread_identity(change).await?;
+            } else {
+                fixture.sql(change).await?;
+            }
             fixture.expect_current_invisible(reason).await?;
-            fixture.sql(restore).await?;
+            if corrupts_thread_identity {
+                fixture.tamper_thread_identity(restore).await?;
+            } else {
+                fixture.sql(restore).await?;
+            }
             fixture.observe().await?;
         }
         fixture.sql("UPDATE public.agent_profiles SET visibility='private' WHERE agent_id='bot-a';
