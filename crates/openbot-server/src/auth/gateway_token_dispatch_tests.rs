@@ -1340,7 +1340,7 @@ async fn r18_token_reply_bounds() {
             TokenKind::ProtocolInvalid(ReplyReason::DuplicateKey),
         ),
         (
-            json!({"raw":"{\"access_token\":\"a\",\"id_token\":\"owned-forbidden-secret\"}"}),
+            json!({"raw":"{\"access_token\":\"a\",\"client_secret\":\"owned-forbidden-secret\"}"}),
             TokenKind::ProtocolInvalid(ReplyReason::ForbiddenSecretKey),
         ),
         (json!({"raw":" ".repeat(65537)}), TokenKind::TokenUnknown),
