@@ -414,6 +414,7 @@ impl Fixture {
             .finish_run(&lease, lease.next_event_sequence(), RunTerminal::Completed)
             .await
             .map_err(|e| e.to_string())
+            .map(|_| ())
     }
     async fn origin(&self, j: &str) -> Result<Value> {
         self.pool
