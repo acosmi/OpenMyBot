@@ -355,7 +355,7 @@ impl RemoteInterruptCoordinator for PostgresRemoteInterruptCoordinator {
             .map_err(query_unavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT d.run_id,d.interrupt_id,d.state,d.response_status,d.response_payload, \
+                "SELECT d.run_id,d.thread_id,d.interrupt_id,d.state,d.response_status,d.response_payload, \
                         d.expires_at,clock_timestamp() AS now \
                    FROM public.remote_agent_interrupts d \
                    JOIN public.runs r ON r.run_id=d.run_id AND r.thread_id=d.thread_id \
@@ -431,6 +431,15 @@ impl RemoteInterruptCoordinator for PostgresRemoteInterruptCoordinator {
             transaction.commit().await.map_err(commit_unknown)?;
             return Err(RemoteInterruptError::Stale);
         }
+        if payload.is_some() {
+            let thread: String = decode(&row, "thread_id")?;
+            crate::thread_history_writer::require_open(
+                &transaction,
+                &openbot_contracts::ids::ThreadId::new(thread),
+            )
+            .await
+            .map_err(remote_writer_error)?;
+        }
         let state = match status {
             ProviderRemoteResumeStatus::Resolved => "resolved",
             ProviderRemoteResumeStatus::Cancelled => "cancelled",
@@ -501,6 +510,22 @@ async fn load_active_scope(
     owner: &str,
     lease: &RunExecutionLease,
 ) -> Result<ActiveScope, RemoteInterruptError> {
+    let actual=transaction.query_opt(
+        "SELECT t.thread_id FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id WHERE r.run_id=$1 FOR SHARE OF r,t NOWAIT",
+        &[&lease.run_id().as_str()],
+    ).await.map_err(query_unavailable)?.ok_or(RemoteInterruptError::Stale)?;
+    let actual_thread: String = decode(&actual, "thread_id")?;
+    if actual_thread != lease.thread_id().as_str() {
+        return Err(RemoteInterruptError::Stale);
+    }
+    crate::thread_history_writer::require_open(
+        transaction,
+        &openbot_contracts::ids::ThreadId::new(actual_thread),
+    )
+    .await
+    .map_err(remote_writer_error)?;
+    // Original SERIALIZABLE isolation is retained. Full current authority and
+    // lease facts below are re-observed in a distinct statement after admission.
     let row = transaction
         .query_opt(
             "SELECT r.thread_id,r.bot_id,r.actor_id,r.fencing_token,r.status, \
@@ -521,7 +546,7 @@ async fn load_active_scope(
                JOIN public.threads t ON t.thread_id=r.thread_id \
                JOIN public.thread_leases l ON l.thread_id=t.thread_id \
                JOIN public.users u ON u.id=r.actor_id \
-              WHERE r.run_id=$1 FOR UPDATE OF r,l,u",
+              WHERE r.run_id=$1 FOR UPDATE OF r,t,l,u",
             &[&lease.run_id().as_str()],
         )
         .await
@@ -689,7 +714,25 @@ fn unavailable(error: crate::db::pool::PoolError) -> RemoteInterruptError {
     RemoteInterruptError::Unavailable
 }
 
+fn remote_writer_error(error: crate::db::InfraError) -> RemoteInterruptError {
+    if crate::thread_history_writer::is_closed(&error) {
+        return RemoteInterruptError::Stale;
+    }
+    tracing::warn!(error=%error,"Remote interrupt history writer admission failed");
+    match error {
+        crate::db::InfraError::Connect { .. } | crate::db::InfraError::Query { .. } => {
+            RemoteInterruptError::Unavailable
+        }
+        _ => RemoteInterruptError::Corrupt {
+            field: "thread_history_writer",
+        },
+    }
+}
+
 fn query_unavailable(error: tokio_postgres::Error) -> RemoteInterruptError {
+    if crate::thread_history_writer::is_closed_query(&error) {
+        return RemoteInterruptError::Stale;
+    }
     tracing::warn!(error = %error, "remote interrupt query unavailable");
     RemoteInterruptError::Unavailable
 }

@@ -1282,6 +1282,15 @@ async fn append_chunk_in_transaction(
         return Err(RunRuntimeError::StaleLease);
     };
     validate_lease_identity(&locked, lease)?;
+    crate::thread_history_writer::require_open(transaction, lease.thread_id())
+        .await
+        .map_err(history_writer_error)?;
+    // Consume a fresh original RC Run/Thread/lease joint after H admission.
+    // Existing physical row locks and H SHARE remain on this same transaction.
+    let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
+        return Err(RunRuntimeError::StaleLease);
+    };
+    validate_lease_identity(&locked, lease)?;
     if locked.next_event_seq > expected {
         return replay_event(
             transaction,
@@ -1350,6 +1359,15 @@ async fn append_remote_projection_in_transaction(
 ) -> Result<RunWriteReceipt, RunRuntimeError> {
     let expected = sequence_i64(expected_sequence)?;
     let payload = projection.journal_payload();
+    let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
+        return Err(RunRuntimeError::StaleLease);
+    };
+    validate_lease_identity(&locked, lease)?;
+    crate::thread_history_writer::require_open(transaction, lease.thread_id())
+        .await
+        .map_err(history_writer_error)?;
+    // Consume a fresh original RC Run/Thread/lease joint after H admission.
+    // Existing physical row locks and H SHARE remain on this same transaction.
     let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
         return Err(RunRuntimeError::StaleLease);
     };
@@ -1437,6 +1455,15 @@ async fn append_tool_exchange_in_transaction(
         "resultHash":Sha256Digest::of(exchange.result().as_bytes()).to_hex(),
         "errorCode":exchange.error_code(),
     });
+    let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
+        return Err(RunRuntimeError::StaleLease);
+    };
+    validate_lease_identity(&locked, lease)?;
+    crate::thread_history_writer::require_open(transaction, lease.thread_id())
+        .await
+        .map_err(history_writer_error)?;
+    // Consume a fresh original RC Run/Thread/lease joint after H admission.
+    // Existing physical row locks and H SHARE remain on this same transaction.
     let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
         return Err(RunRuntimeError::StaleLease);
     };
@@ -2118,8 +2145,18 @@ async fn finish_run_in_transaction(
         return Err(RunRuntimeError::StaleLease);
     };
     validate_lease_identity(&locked, lease)?;
+    let disposition =
+        crate::thread_history_writer::lock_thread_write_disposition(transaction, lease.thread_id())
+            .await
+            .map_err(history_writer_error)?;
+    // Consume a fresh original RC Run/Thread/lease joint after H admission.
+    // Existing physical row locks and H SHARE remain on this same transaction.
+    let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
+        return Err(RunRuntimeError::StaleLease);
+    };
+    validate_lease_identity(&locked, lease)?;
     if locked.next_event_seq > expected || is_terminal_status(&locked.status) {
-        return replay_terminal(transaction, lease, expected_sequence, terminal)
+        return replay_terminal(transaction, lease, expected_sequence, terminal, disposition)
             .await?
             .ok_or(RunRuntimeError::Conflict);
     }
@@ -2135,7 +2172,12 @@ async fn finish_run_in_transaction(
     let thread_event = locked.thread_next_event_seq;
     let next_run = checked_increment(expected, "next_event_sequence")?;
     let next_thread = checked_increment(thread_event, "thread_next_event_sequence")?;
-    let assistant_text = aggregate_text_chunks(transaction, lease.run_id()).await?;
+    let assistant_text = match disposition {
+        crate::thread_history_writer::OpenOrClosed::Open => {
+            aggregate_text_chunks(transaction, lease.run_id()).await?
+        }
+        crate::thread_history_writer::OpenOrClosed::Closed => String::new(),
+    };
     scrub_reasoning_chunks(transaction, lease.run_id()).await?;
     scrub_remote_projections(transaction, lease.run_id()).await?;
     retire_remote_interrupts(transaction, lease.run_id(), now).await?;
@@ -2217,15 +2259,12 @@ async fn finish_run_in_transaction(
         .await
         .map_err(|error| write_error("推进 terminal thread sequence", error))?;
     if !assistant_text.is_empty() {
-        crate::channel_activity::record_for_thread(
+        crate::channel_activity::record_from_message(
             transaction,
-            lease.thread_id(),
-            &assistant_text,
-            Some(lease.bot_id()),
-            now,
+            &openbot_contracts::ids::MessageId::new(assistant_message_id(lease.run_id())),
         )
         .await
-        .map_err(|error| write_error("更新 assistant channel activity", error))?;
+        .map_err(history_writer_error)?;
     }
     release_lease(transaction, lease.thread_id(), now).await?;
     notify_thread(transaction).await?;
@@ -2519,6 +2558,7 @@ async fn replay_terminal(
     lease: &RunExecutionLease,
     expected_sequence: u64,
     terminal: RunTerminal,
+    disposition: crate::thread_history_writer::OpenOrClosed,
 ) -> Result<Option<RunWriteReceipt>, RunRuntimeError> {
     let expected = sequence_i64(expected_sequence)?;
     let payload = terminal_payload(terminal);
@@ -2535,6 +2575,39 @@ async fn replay_terminal(
         return Ok(None);
     };
     let message_id = assistant_message_id(lease.run_id());
+    if disposition == crate::thread_history_writer::OpenOrClosed::Closed {
+        // Fixed terminal payload and source identity/sequence are enough to replay
+        // the original receipt. No assistant content, search text or chunk is read.
+        let current=transaction.query_opt(
+            "SELECT run_id FROM public.runs WHERE run_id=$1 AND thread_id=$2 AND bot_id=$3 AND actor_id=$4 AND status=$5 AND terminal_event_seq=$6 AND error_code IS NOT DISTINCT FROM $7",
+            &[&lease.run_id().as_str(),&lease.thread_id().as_str(),&lease.bot_id().as_str(),&lease.actor_id().as_str(),&terminal.as_str(),&expected,&terminal.error_code().map(RunFailureCode::as_str)],
+        ).await.map_err(|error|unavailable("核对closed terminal Run元数据",error))?;
+        if current.is_none() {
+            return Err(RunRuntimeError::Corrupt {
+                field: "terminal_run_binding",
+            });
+        }
+        let row=transaction.query_opt(
+            "SELECT seq,thread_id,run_id,role,actor_id FROM public.messages WHERE message_id=$1",
+            &[&message_id],
+        ).await.map_err(|error|unavailable("核对closed terminal assistant身份元数据",error))?;
+        receipt.message_sequence = row
+            .map(|row| {
+                if decode::<String>(&row, "thread_id")? != lease.thread_id().as_str()
+                    || decode::<Option<String>>(&row, "run_id")?.as_deref()
+                        != Some(lease.run_id().as_str())
+                    || decode::<String>(&row, "role")? != "assistant"
+                    || decode::<Option<String>>(&row, "actor_id")?.is_some()
+                {
+                    return Err(RunRuntimeError::Corrupt {
+                        field: "terminal_assistant_message",
+                    });
+                }
+                sequence_u64(decode(&row, "seq")?, "message_sequence")
+            })
+            .transpose()?;
+        return Ok(Some(receipt));
+    }
     let materialized = transaction
         .query_opt(
             "SELECT seq,content FROM public.messages \
@@ -2784,6 +2857,21 @@ where
         .map_err(|_| RunRuntimeError::Corrupt { field: column })
 }
 
+fn history_writer_error(error: crate::db::InfraError) -> RunRuntimeError {
+    if crate::thread_history_writer::is_closed(&error) {
+        return RunRuntimeError::StaleLease;
+    }
+    tracing::warn!(error=%error,"Run history writer admission failed");
+    match error {
+        crate::db::InfraError::Connect { .. } | crate::db::InfraError::Query { .. } => {
+            RunRuntimeError::Unavailable
+        }
+        _ => RunRuntimeError::Corrupt {
+            field: "thread_history_writer",
+        },
+    }
+}
+
 fn unavailable(context: &'static str, error: tokio_postgres::Error) -> RunRuntimeError {
     tracing::error!(
         sqlstate = error.code().map_or("none", SqlState::code),
@@ -2795,6 +2883,9 @@ fn unavailable(context: &'static str, error: tokio_postgres::Error) -> RunRuntim
 }
 
 fn write_error(context: &'static str, error: tokio_postgres::Error) -> RunRuntimeError {
+    if crate::thread_history_writer::is_closed_query(&error) {
+        return RunRuntimeError::StaleLease;
+    }
     tracing::error!(
         sqlstate = error.code().map_or("none", SqlState::code),
         connection_closed = error.is_closed(),

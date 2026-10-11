@@ -1,7 +1,7 @@
 //! Complete catalog observation of one-J durable history-state and Thread ID retention.
 //! The observer preserves original OIDs/ACLs and never derives or widens its independent oracle.
 
-use super::{InfraError, RowDecodeError, native};
+use super::{InfraError, RowDecodeError};
 use serde_json::{Value, json};
 use tokio_postgres::{Client, GenericClient, Transaction};
 
@@ -1224,17 +1224,23 @@ fn compare_registered(observation: &ThreadHistoryAdmissionSchemaFacts) -> Result
 pub async fn capture(client: &Client) -> Result<ThreadHistoryAdmissionSchemaFacts, InfraError> {
     observation_on(client).await
 }
-/// Require exact current50/38 and the entire independent0050 schema on this same Client.
+/// Require exact current51/39 and the entire independent0051 schema on this same Client.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0050_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0050_VERSION)?;
-    verify_schema(client).await
+    super::thread_history_writer_schema::verify(client).await
 }
 /// Schema-only helper after the caller proves its original exact native prefix.
 pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {
+    super::thread_history_writer_schema::verify_schema(client).await
+}
+pub(crate) async fn verify_schema_legacy0050(client: &Client) -> Result<(), InfraError> {
     compare_registered(&observation_on(client).await?)
 }
-/// Pure0050 on the original transaction; never checks out, repairs or closes it.
+/// Whole0051 on the original transaction; never checks out, repairs or closes it.
 pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
+    super::thread_history_writer_schema::verify_in_transaction(tx).await
+}
+pub(crate) async fn verify_legacy0050_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<(), InfraError> {
     compare_registered(&observation_on(tx).await?)
 }

@@ -241,6 +241,12 @@ async fn import_thread_transaction(
     }
     validate_targets(transaction, request).await?;
     insert_thread(transaction, request).await?;
+    crate::thread_history_writer::require_open(
+        transaction,
+        &ThreadId::new(&request.thread.thread_id),
+    )
+    .await
+    .map_err(import_writer_error)?;
     insert_memberships(transaction, request).await?;
     insert_runs(transaction, request).await?;
     insert_messages(transaction, request).await?;
@@ -1464,6 +1470,23 @@ fn validate_hash(value: &str) -> Result<(), IntelligenceImportError> {
     }
 }
 
+fn import_writer_error(error: crate::db::InfraError) -> IntelligenceImportError {
+    if crate::thread_history_writer::is_closed(&error) {
+        return IntelligenceImportError::Conflict {
+            field: "thread_history_closed",
+        };
+    }
+    tracing::warn!(error=%error,"Import history writer admission failed");
+    match error {
+        crate::db::InfraError::Connect { .. } | crate::db::InfraError::Query { .. } => {
+            IntelligenceImportError::Unavailable
+        }
+        _ => IntelligenceImportError::Corrupt {
+            field: "thread_history_writer",
+        },
+    }
+}
+
 fn import_origin_error(error: crate::db::InfraError) -> IntelligenceImportError {
     tracing::warn!(error = %error, "import historical origin verification failed");
     match error {
@@ -1526,6 +1549,11 @@ fn unavailable(context: &'static str, error: tokio_postgres::Error) -> Intellige
 }
 
 fn write_error(context: &'static str, error: tokio_postgres::Error) -> IntelligenceImportError {
+    if crate::thread_history_writer::is_closed_query(&error) {
+        return IntelligenceImportError::Conflict {
+            field: "thread_history_closed",
+        };
+    }
     tracing::error!(
         sqlstate = error.code().map_or("none", SqlState::code),
         connection_closed = error.is_closed(),

@@ -597,34 +597,93 @@ async fn tamper_owned_thread_identity(
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<(), String> {
-    const REGISTERED_GUARD: &str = "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
-        WHERE tgrelid='public.threads'::regclass \
-        AND tgname='threads_history_protect_identity_update' AND NOT tgisinternal";
-    let before: String = tx.query_one(REGISTERED_GUARD, &[]).await
-        .map_err(|e| e.to_string())?.get(0);
-    if before != "O" {
-        return Err("owned Thread identity guard was not registered and normally enabled".to_owned());
+    const NEW_GUARDS: [&str; 3] = [
+        "threads_history_body_before_update",
+        "threads_history_canonical_before",
+        "threads_history_source_final",
+    ];
+    const OLD: &str = "threads_history_protect_identity_update";
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned registered Thread guard {guard} was not normally enabled"
+            ));
+        }
     }
-    tx.batch_execute("SAVEPOINT owned_thread_identity_probe").await
+    tx.batch_execute("SAVEPOINT owned_current_identity_probe")
+        .await
         .map_err(|e| e.to_string())?;
     let ordinary = tx.execute(sql, params).await;
-    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_thread_identity_probe; RELEASE SAVEPOINT owned_thread_identity_probe")
-        .await.map_err(|e| e.to_string())?;
-    let refused = ordinary.as_ref().err().and_then(|e| e.as_db_error())
-        .is_some_and(|e| e.code().code() == "55000"
-            && e.message() == "thread_history_state_binding_invalid");
-    if !refused {
-        return Err("ordinary Thread identity DML was not refused by the registered guard".to_owned());
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_current_identity_probe; RELEASE SAVEPOINT owned_current_identity_probe").await.map_err(|e|e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && matches!(
+                    e.message(),
+                    "thread_history_state_binding_invalid"
+                        | "thread_history_writer_binding_invalid"
+                        | "thread_history_writer_source_mutation_refused"
+                )
+        })
+    {
+        return Err("ordinary current Thread identity DML was not explicitly refused".into());
     }
-    tx.batch_execute("ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update")
-        .await.map_err(|e| e.to_string())?;
+    // Suppress only these owned fixture events BEFORE corrupting DML. Re-enabling
+    // at COMMIT cannot remove an already queued deferred event; none is bypassed.
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads DISABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    tx.batch_execute("SAVEPOINT owned_original50_identity_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let original = tx.execute(sql, params).await;
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_original50_identity_probe; RELEASE SAVEPOINT owned_original50_identity_probe").await.map_err(|e|e.to_string())?;
+    if !original
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000" && e.message() == "thread_history_state_binding_invalid"
+        })
+    {
+        return Err("original0050 single identity guard control lost its exact refusal".into());
+    }
+    tx.batch_execute(
+        "ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let changed = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
-    tx.batch_execute("ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update")
-        .await.map_err(|e| e.to_string())?;
-    let after: String = tx.query_one(REGISTERED_GUARD, &[]).await
-        .map_err(|e| e.to_string())?.get(0);
-    if changed == 0 || after != "O" {
-        return Err("owned Thread identity tamper did not change a row and restore its guard".to_owned());
+    tx.batch_execute(
+        "ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads ENABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned Thread guard {guard} was not restored before product entry"
+            ));
+        }
+    }
+    if changed == 0 {
+        return Err("owned identity control changed no row".into());
     }
     Ok(())
 }

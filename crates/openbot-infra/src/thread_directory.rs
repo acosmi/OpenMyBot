@@ -1433,6 +1433,11 @@ async fn apply_begin(
         }
     };
 
+    crate::thread_history_writer::require_open(transaction, &command.thread_id)
+        .await
+        .map_err(writer_error)?;
+    // Re-observe the original authority in a fresh statement after actual admission.
+    // H is retained on this same transaction; it grants neither visibility nor a lease.
     // Check visible state before a competing lease can hide a damaged projection.
     let active = checked_thread_occupancy(transaction, &command.thread_id).await?;
 
@@ -1458,6 +1463,11 @@ async fn apply_begin(
         return Err(ThreadDirectoryError::LeaseConflict);
     }
 
+    crate::model_runtime::validate_actor(transaction, request).await?;
+    skills::validate_actor(transaction, request).await?;
+    if !target_visible(transaction, request).await? {
+        return Err(ThreadDirectoryError::NotVisible);
+    }
     let skill_snapshots = skills::resolve(transaction, request).await?;
     let model_snapshot = crate::model_runtime::resolve(transaction, request).await?;
     let user_message_seq = state
@@ -1679,16 +1689,10 @@ async fn apply_begin(
         )
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
-    if let ThreadRunAnchor::Channel { channel_id } = &command.anchor {
-        crate::channel_activity::record_for_channel(
-            transaction,
-            channel_id,
-            &command.message,
-            None,
-            now,
-        )
-        .await
-        .map_err(|error| unavailable("更新 user channel activity 失败", error))?;
+    if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
+        crate::channel_activity::record_from_message(transaction, message.id())
+            .await
+            .map_err(writer_error)?;
     }
     transaction
         .query_one("SELECT pg_notify('openbot_thread_events','')", &[])
@@ -1999,6 +2003,19 @@ where
         .map_err(|_| ThreadDirectoryError::Corrupt { field })
 }
 
+fn writer_error(error: InfraError) -> ThreadDirectoryError {
+    if crate::thread_history_writer::is_closed(&error) {
+        return ThreadDirectoryError::NotVisible;
+    }
+    tracing::warn!(error=%error,"Thread history writer admission failed");
+    match error {
+        InfraError::Connect { .. } | InfraError::Query { .. } => ThreadDirectoryError::Unavailable,
+        _ => ThreadDirectoryError::Corrupt {
+            field: "thread_history_writer",
+        },
+    }
+}
+
 fn origin_error(error: InfraError) -> ThreadDirectoryError {
     tracing::warn!(error = %error, "Thread historical origin verification failed");
     match error {
@@ -2020,6 +2037,9 @@ fn unavailable(context: &'static str, error: tokio_postgres::Error) -> ThreadDir
 }
 
 fn write_error(context: &'static str, error: tokio_postgres::Error) -> ThreadDirectoryError {
+    if crate::thread_history_writer::is_closed_query(&error) {
+        return ThreadDirectoryError::NotVisible;
+    }
     tracing::error!(
         sqlstate = error.code().map_or("none", SqlState::code),
         connection_closed = error.is_closed(),
@@ -2105,6 +2125,11 @@ async fn apply_begin_v2(
         }
     };
 
+    crate::thread_history_writer::require_open(transaction, &command.thread_id)
+        .await
+        .map_err(writer_error)?;
+    // Re-observe the original authority in a fresh statement after actual admission.
+    // H is retained on this same transaction; it grants neither visibility nor a lease.
     // Check visible state before a competing lease can hide a damaged projection.
     let active = checked_thread_occupancy(transaction, &command.thread_id).await?;
 
@@ -2130,6 +2155,8 @@ async fn apply_begin_v2(
         return Err(ThreadDirectoryError::LeaseConflict);
     }
 
+    crate::model_runtime::validate_actor_v2(transaction, request).await?;
+    crate::model_runtime::validate_target_v2(transaction, request).await?;
     let skill_snapshots = skills::resolve_v2(transaction, request).await?;
     let model_snapshot = crate::model_runtime::resolve_v2(transaction, request).await?;
     let dataset = model_transaction
@@ -2366,16 +2393,10 @@ async fn apply_begin_v2(
         )
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
-    if let ThreadRunAnchor::Channel { channel_id } = &command.anchor {
-        crate::channel_activity::record_for_channel(
-            transaction,
-            channel_id,
-            &command.message,
-            None,
-            now,
-        )
-        .await
-        .map_err(|error| unavailable("更新 user channel activity 失败", error))?;
+    if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
+        crate::channel_activity::record_from_message(transaction, message.id())
+            .await
+            .map_err(writer_error)?;
     }
     transaction
         .query_one("SELECT pg_notify('openbot_thread_events','')", &[])

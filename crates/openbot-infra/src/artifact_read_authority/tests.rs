@@ -2459,39 +2459,174 @@ async fn actual_owned_pg_current_read_and_sync_fd_tail() {
 
 // Privileged corruption control is confined to this owned disposable test DB.
 // Probe the real guard for every change/restore and re-enable it in the same transaction.
+
+// Finite privileged joint corruption in this disposable test DB. Ordinary
+// open direct-source metadata changes stay ordinary DML; missing actual Run or
+// referenced canonical mutations first prove their precise new55000 refusal.
+async fn tamper_owned_message_joint(
+    tx: &tokio_postgres::Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<(), String> {
+    const GUARDS: [&str; 3] = [
+        "messages_history_body_before",
+        "messages_history_canonical_before",
+        "messages_history_source_final",
+    ];
+    for guard in GUARDS {
+        let state:String=tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.messages'::regclass AND tgname=$1 AND NOT tgisinternal",&[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!("owned message guard {guard} was not enabled"));
+        }
+    }
+    tx.batch_execute("SAVEPOINT owned_message_joint_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let ordinary = tx.execute(sql, params).await;
+    if matches!(&ordinary,Ok(n) if *n>0) {
+        tx.batch_execute("RELEASE SAVEPOINT owned_message_joint_probe")
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_message_joint_probe; RELEASE SAVEPOINT owned_message_joint_probe").await.map_err(|e|e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && matches!(
+                    e.message(),
+                    "thread_history_writer_binding_invalid"
+                        | "thread_history_writer_source_mutation_refused"
+                )
+        })
+    {
+        return Err(
+            "message joint control did not encounter its explicit registered refusal".into(),
+        );
+    }
+    for guard in GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.messages DISABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    let n = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
+    for guard in GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.messages ENABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    for guard in GUARDS {
+        let state:String=tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.messages'::regclass AND tgname=$1 AND NOT tgisinternal",&[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "message guard {guard} was not restored before natural COMMIT/product reader"
+            ));
+        }
+    }
+    if n == 0 {
+        return Err("owned message corruption changed no row".into());
+    }
+    Ok(())
+}
 async fn tamper_owned_thread_identity(
     tx: &tokio_postgres::Transaction<'_>,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<(), String> {
-    const REGISTERED_GUARD: &str = "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
-        WHERE tgrelid='public.threads'::regclass \
-        AND tgname='threads_history_protect_identity_update' AND NOT tgisinternal";
-    let before: String = tx.query_one(REGISTERED_GUARD, &[]).await
-        .map_err(|e| e.to_string())?.get(0);
-    if before != "O" {
-        return Err("owned Thread identity guard was not registered and normally enabled".to_owned());
+    const NEW_GUARDS: [&str; 3] = [
+        "threads_history_body_before_update",
+        "threads_history_canonical_before",
+        "threads_history_source_final",
+    ];
+    const OLD: &str = "threads_history_protect_identity_update";
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned registered Thread guard {guard} was not normally enabled"
+            ));
+        }
     }
-    tx.batch_execute("SAVEPOINT owned_thread_identity_probe").await
+    tx.batch_execute("SAVEPOINT owned_current_identity_probe")
+        .await
         .map_err(|e| e.to_string())?;
     let ordinary = tx.execute(sql, params).await;
-    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_thread_identity_probe; RELEASE SAVEPOINT owned_thread_identity_probe")
-        .await.map_err(|e| e.to_string())?;
-    let refused = ordinary.as_ref().err().and_then(|e| e.as_db_error())
-        .is_some_and(|e| e.code().code() == "55000"
-            && e.message() == "thread_history_state_binding_invalid");
-    if !refused {
-        return Err("ordinary Thread identity DML was not refused by the registered guard".to_owned());
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_current_identity_probe; RELEASE SAVEPOINT owned_current_identity_probe").await.map_err(|e|e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && matches!(
+                    e.message(),
+                    "thread_history_state_binding_invalid"
+                        | "thread_history_writer_binding_invalid"
+                        | "thread_history_writer_source_mutation_refused"
+                )
+        })
+    {
+        return Err("ordinary current Thread identity DML was not explicitly refused".into());
     }
-    tx.batch_execute("ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update")
-        .await.map_err(|e| e.to_string())?;
+    // Suppress only these owned fixture events BEFORE corrupting DML. Re-enabling
+    // at COMMIT cannot remove an already queued deferred event; none is bypassed.
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads DISABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    tx.batch_execute("SAVEPOINT owned_original50_identity_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let original = tx.execute(sql, params).await;
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_original50_identity_probe; RELEASE SAVEPOINT owned_original50_identity_probe").await.map_err(|e|e.to_string())?;
+    if !original
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000" && e.message() == "thread_history_state_binding_invalid"
+        })
+    {
+        return Err("original0050 single identity guard control lost its exact refusal".into());
+    }
+    tx.batch_execute(
+        "ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let changed = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
-    tx.batch_execute("ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update")
-        .await.map_err(|e| e.to_string())?;
-    let after: String = tx.query_one(REGISTERED_GUARD, &[]).await
-        .map_err(|e| e.to_string())?.get(0);
-    if changed == 0 || after != "O" {
-        return Err("owned Thread identity tamper did not change a row and restore its guard".to_owned());
+    tx.batch_execute(
+        "ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads ENABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned Thread guard {guard} was not restored before product entry"
+            ));
+        }
+    }
+    if changed == 0 {
+        return Err("owned identity control changed no row".into());
     }
     Ok(())
 }
@@ -2545,7 +2680,12 @@ impl SourceMutation {
     fn lock_sql(self) -> &'static str {
         match self {
             // Acquire the ALTER TRIGGER table lock before releasing the real final query.
-            Self::ThreadTenant => "LOCK TABLE public.sessions,public.threads IN ACCESS EXCLUSIVE MODE",
+            Self::ThreadTenant => {
+                "LOCK TABLE public.sessions,public.threads IN ACCESS EXCLUSIVE MODE"
+            }
+            Self::MessageRole | Self::MessageActor | Self::MessageRun => {
+                "LOCK TABLE public.sessions,public.messages IN ACCESS EXCLUSIVE MODE"
+            }
             Self::OperationPayload => {
                 "LOCK TABLE public.sessions,openbot_internal.artifact_save_operations IN ACCESS EXCLUSIVE MODE"
             }
@@ -2566,9 +2706,9 @@ impl SourceMutation {
             Self::ChannelMembership => tx.batch_execute("DELETE FROM public.channel_memberships WHERE user_id='read-owner'").await.map_err(|e| e.to_string()),
             Self::ChannelAssignment => tx.batch_execute("DELETE FROM public.channel_agents WHERE channel_id='read-channel'").await.map_err(|e| e.to_string()),
             Self::PackageTenant => tx.batch_execute("UPDATE public.channels SET package_id='00000000-0000-4000-8000-000000000051'; UPDATE public.deployment_packages SET tenant_id='foreign'").await.map_err(|e| e.to_string()),
-            Self::MessageRole => tx.batch_execute("UPDATE public.messages SET role='assistant'").await.map_err(|e| e.to_string()),
-            Self::MessageActor => tx.batch_execute("UPDATE public.messages SET actor_id='read-other'").await.map_err(|e| e.to_string()),
-            Self::MessageRun => tx.batch_execute("UPDATE public.messages SET run_id='another-run'").await.map_err(|e| e.to_string()),
+            Self::MessageRole => tamper_owned_message_joint(tx, "UPDATE public.messages SET role='assistant'", &[]).await,
+            Self::MessageActor => tamper_owned_message_joint(tx, "UPDATE public.messages SET actor_id='read-other'", &[]).await,
+            Self::MessageRun => tamper_owned_message_joint(tx, "UPDATE public.messages SET run_id='another-run'", &[]).await,
             Self::MessageDelete => tx.batch_execute("DELETE FROM public.messages").await.map_err(|e| e.to_string()),
             // Closed corruption controls only in this disposable DB. Restore the registered
             // trigger in the same transaction before the real controller COMMIT ACK.

@@ -1065,7 +1065,7 @@ async fn foundation_desktop_current_facts(
         .await
         .unwrap();
     let expected_public: openbot_infra::db::schema_facts::SchemaFacts =
-        serde_json::from_str(include_str!("../../../fixtures/db/schema-0050.json")).unwrap();
+        serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json")).unwrap();
     assert_eq!(public, expected_public);
     openbot_infra::db::custom_model_catalog_schema::verify(&client)
         .await
@@ -1088,7 +1088,7 @@ async fn foundation_desktop_current_facts(
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL 17 binaries and independently captured native46 oracles"]
 async fn foundation_original45_desktop_canary_upgrades_and_current_fresh_matches() {
-    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0050_VERSION);
+    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0051_VERSION);
     let DesktopFixture {
         database,
         installation,
@@ -1440,17 +1440,46 @@ async fn foundation_original45_desktop_canary_upgrades_and_current_fresh_matches
     let upgraded_ledger = foundation_desktop_ledger(&database).await;
     assert_eq!(&upgraded_ledger[..old_ledger.len()], old_ledger.as_slice());
     let current_tail = [
-        (native::NATIVE_0046_VERSION, native::NATIVE_0046_NAME, native::NATIVE_0046_SQL),
-        (native::NATIVE_0047_VERSION, native::NATIVE_0047_NAME, native::NATIVE_0047_SQL),
-        (native::NATIVE_0048_VERSION, native::NATIVE_0048_NAME, native::NATIVE_0048_SQL),
-        (native::NATIVE_0049_VERSION, native::NATIVE_0049_NAME, native::NATIVE_0049_SQL),
-        (native::NATIVE_0050_VERSION, native::NATIVE_0050_NAME, native::NATIVE_0050_SQL),
+        (
+            native::NATIVE_0046_VERSION,
+            native::NATIVE_0046_NAME,
+            native::NATIVE_0046_SQL,
+        ),
+        (
+            native::NATIVE_0047_VERSION,
+            native::NATIVE_0047_NAME,
+            native::NATIVE_0047_SQL,
+        ),
+        (
+            native::NATIVE_0048_VERSION,
+            native::NATIVE_0048_NAME,
+            native::NATIVE_0048_SQL,
+        ),
+        (
+            native::NATIVE_0049_VERSION,
+            native::NATIVE_0049_NAME,
+            native::NATIVE_0049_SQL,
+        ),
+        (
+            native::NATIVE_0050_VERSION,
+            native::NATIVE_0050_NAME,
+            native::NATIVE_0050_SQL,
+        ),
+        (
+            native::NATIVE_0051_VERSION,
+            native::NATIVE_0051_NAME,
+            native::NATIVE_0051_SQL,
+        ),
     ];
     assert_eq!(upgraded_ledger.len(), old_ledger.len() + current_tail.len());
-    for (row, (version, name, sql)) in upgraded_ledger[old_ledger.len()..].iter().zip(current_tail) {
+    for (row, (version, name, sql)) in upgraded_ledger[old_ledger.len()..].iter().zip(current_tail)
+    {
         assert_eq!(row.0, version);
         assert_eq!(row.1, name);
-        assert_eq!(row.2, openbot_domain::audit::hash::Sha256Digest::of(sql.as_bytes()).to_hex());
+        assert_eq!(
+            row.2,
+            openbot_domain::audit::hash::Sha256Digest::of(sql.as_bytes()).to_hex()
+        );
     }
     let last = upgraded_ledger.last().unwrap();
     let ddl_after = foundation_desktop_ddl_facts(&database).await;
@@ -1597,9 +1626,9 @@ async fn foundation_original45_desktop_canary_upgrades_and_current_fresh_matches
     let fresh_ledger = foundation_desktop_ledger(&fresh_database).await;
     assert_eq!(
         fresh_ledger.iter().map(|row| row.0).collect::<Vec<_>>(),
-        (13..=native::NATIVE_0050_VERSION).collect::<Vec<_>>()
+        (13..=native::NATIVE_0051_VERSION).collect::<Vec<_>>()
     );
-    assert_eq!(fresh_ledger.last().unwrap().1, native::NATIVE_0050_NAME);
+    assert_eq!(fresh_ledger.last().unwrap().1, native::NATIVE_0051_NAME);
     assert_eq!(fresh_ledger.last().unwrap().2, last.2);
     drop(fresh_canary);
     fresh_database.close();
