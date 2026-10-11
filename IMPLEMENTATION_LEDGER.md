@@ -1896,6 +1896,15 @@ Earlier holds/failures and LLVM strip/libtest diagnostics remain recorded; produ
 
 2026-10-10: The independently reviewed formatting changes cover 17 registered regions in five backend Rust files (15 unified diff hunks). The original review contains 17 focused format checks on the earlier base; those results retain that identity. This maintenance candidate uses actual main 30dd25dd8aac8f52d97c47edd925e5865d2152b9 after Task029 / PR #175 delivery, preserves every other main tree object, and appends only this execution fact to the public ledger. Five complete stdin/stdout Rust 1.98 format comparisons on the composed candidate and independent publication review are required before publication. The change has no runtime capability credit; backend work and its remaining tasks continue.
 
+
+### V7-IMPL-030 — internal gateway callback rendezvous
+
+Product commit `b3d007870f8ca4f7d04fc7f846554a94c37b2086` adds the bounded callback listener, strict callback parser, original attempt ownership and same-poll authority/deadline checks. The real Server authorization path is validated with an owned test destination; the production authorization URL destination remains disabled.
+
+Independent finite code and actual validation passed for the eight product files: 22 new cases and 24 affected registration regressions, six directed strict Clippy builds, exact formatting checks and the SDK dependency guard. The callback cancellation regression exercises a complete fixed response and refusal in the same original business poll. An additional old-version control build stopped at its disk guard before any test ran; it has zero test or negative-control credit. Its original failure is retained and it is outside the required current-candidate acceptance boundary.
+
+This entry records finite product acceptance. Token exchange, enrollment, account bridging and complete recovery remain open. Production browser consumption, continuous connection observations and individual driver joins have no new acceptance credit.
+
 2026-10-08 — UI5-P2 Conversation ModelPicker fixture Source preparation: the existing testkit-only, explicitly enabled synthetic ModelPicker fixture now includes one empty active channel for the owned public assistant. The existing authenticated channel-detail read can mount its Conversation model picker without creating a thread or run. The default fixture, model write rejection and production capability boundaries are unchanged. Targeted Rust 1.98 formatting of this fixture file completed without further byte changes. Directed tests, build checks, fixture Host build and browser acceptance for this change are NOTRUN.
 
 2026-10-08 — UI5-P4 Agent detail Retry and scope cancellation were delivered by PR #170, normally merged as 4b93e7e87efb7f9be1c670110604e7962e098104 from b31cd9e47efc357673923af6cb0054aefbfcd0e9 after finite independent acceptance. Full UI, production, native OS, PostgreSQL, visual oracle and pixel acceptance remain open.

@@ -136,11 +136,12 @@ pub mod gateway_authority;
 mod gateway_authorization;
 #[cfg(feature = "server-runtime")]
 pub use gateway_authorization::journal::{
-    ClosedAttemptReceipt, ControlledCloseReason, CreatedAttemptOwner, GatewayAuthorizationJournal,
-    GatewayAuthorizationJournalAck, GatewayAuthorizationJournalError,
+    CallbackErrorKind, CallbackStage, ClosedAttemptReceipt, ControlledCloseReason,
+    CreatedAttemptOwner, GatewayAuthorizationCallbackError, GatewayAuthorizationCallbackWaitOwner,
+    GatewayAuthorizationJournal, GatewayAuthorizationJournalAck, GatewayAuthorizationJournalError,
     GatewayAuthorizationJournalErrorKind, GatewayAuthorizationJournalRuntimeOwner,
-    RegisteredAttemptOwner, RegistrationAdmissionReceipt, RegistrationDispatchError,
-    RegistrationDispatchKind,
+    GatewayAuthorizationVerifiedCodeOwner, RegisteredAttemptOwner, RegistrationAdmissionReceipt,
+    RegistrationDispatchError, RegistrationDispatchKind,
 };
 #[cfg(feature = "server-runtime")]
 pub use tokio_util::sync::CancellationToken as GatewayAuthorizationCancellationToken;

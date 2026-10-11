@@ -288,12 +288,99 @@ pub trait GatewayAuthorizationHostTailFactory: Send + Sync {
     ) -> Result<Box<dyn GatewayAuthorizationHostTailWitness>, HostRequestBindingError>;
 }
 
+/// One synchronous callback URL handoff through the original enrolled Host.
+/// Implementing this port does not mint a matching issuer or current authority.
+pub trait GatewayAuthorizationCallbackUrlPort: Send + Sync {
+    /// Consume one opaque invocation, without returning URL or callback resources.
+    fn handoff(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        invocation: GatewayAuthorizationCallbackUrlInvocation<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError>;
+}
+
+/// The original Host's fixed synchronous URL destination; no asynchronous escape.
+pub trait GatewayAuthorizationCallbackUrlReceiver: Send + Sync {
+    /// Borrow one URL for this call only, without a permission or browser grant.
+    fn accept_url(&self, url: &str) -> Result<(), HostRequestBindingError>;
+}
+
+/// An inseparable one-use URL invocation borrowed from the original issuer.
+/// There is no resource getter, cloning or serialization interface.
+pub struct GatewayAuthorizationCallbackUrlInvocation<'a> {
+    issuer: &'a RequestBindingIssuer,
+    identity: &'a HostRequestBindingIdentity,
+    url: &'a str,
+}
+
+impl RequestBindingIssuer {
+    /// Lend one armed callback URL only for this current original Server identity.
+    /// This constructor alone does not prove the SDK producer's lineage.
+    pub fn gateway_callback_url_invocation<'a>(
+        &'a self,
+        identity: &'a HostRequestBindingIdentity,
+        url: &'a str,
+    ) -> Result<GatewayAuthorizationCallbackUrlInvocation<'a>, HostRequestBindingError> {
+        let invocation = GatewayAuthorizationCallbackUrlInvocation {
+            issuer: self,
+            identity,
+            url,
+        };
+        invocation.check(self, identity)?;
+        Ok(invocation)
+    }
+}
+
+impl GatewayAuthorizationCallbackUrlInvocation<'_> {
+    fn check(
+        &self,
+        original_issuer: &RequestBindingIssuer,
+        original_identity: &HostRequestBindingIdentity,
+    ) -> Result<(), HostRequestBindingError> {
+        if !matches!(
+            self.identity.kind,
+            HostRequestBindingKind::ServerSession | HostRequestBindingKind::ServerSingleUserOwner
+        ) || !self.issuer.observation().is_current()
+            || !original_issuer.observation().is_current()
+            || !self.issuer.owns_identity(self.identity)
+            || !original_issuer.owns_identity(self.identity)
+            || !self.identity.same_binding(original_identity)
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        Ok(())
+    }
+
+    /// Consume the whole invocation and borrow its URL only within the same issuer.
+    /// Original current state and the full binding are rechecked after the receiver.
+    pub fn deliver_to(
+        self,
+        original_issuer: &RequestBindingIssuer,
+        original_identity: &HostRequestBindingIdentity,
+        receiver: &dyn GatewayAuthorizationCallbackUrlReceiver,
+    ) -> Result<(), HostRequestBindingError> {
+        self.check(original_issuer, original_identity)?;
+        let result = receiver.accept_url(self.url);
+        self.check(original_issuer, original_identity)?;
+        result
+    }
+}
+
+impl fmt::Debug for GatewayAuthorizationCallbackUrlInvocation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GatewayAuthorizationCallbackUrlInvocation(<redacted>)")
+    }
+}
+
 /// Borrowed original Server Host identity and epoch, without keeping its owner alive.
 pub struct GatewayAuthorizationHostObservation<'a> {
     kind: HostRequestBindingKind,
     identity: HostRequestBindingIdentity,
     epoch: Option<BorrowedServerSessionEpoch<'a>>,
     factory: Box<dyn GatewayAuthorizationHostTailFactory + 'a>,
+    callback_port: Option<Box<dyn GatewayAuthorizationCallbackUrlPort + 'a>>,
 }
 
 impl<'a> GatewayAuthorizationHostObservation<'a> {
@@ -319,7 +406,66 @@ impl<'a> GatewayAuthorizationHostObservation<'a> {
             identity,
             epoch,
             factory,
+            callback_port: None,
         })
+    }
+
+    /// Attach the real producer's synchronous callback port after the original checks.
+    pub fn with_callback_port(
+        kind: HostRequestBindingKind,
+        identity: HostRequestBindingIdentity,
+        epoch: Option<BorrowedServerSessionEpoch<'a>>,
+        factory: Box<dyn GatewayAuthorizationHostTailFactory + 'a>,
+        callback_port: Box<dyn GatewayAuthorizationCallbackUrlPort + 'a>,
+    ) -> Result<Self, HostRequestBindingError> {
+        let mut observation = Self::from_trusted_host(kind, identity, epoch, factory)?;
+        observation.callback_port = Some(callback_port);
+        Ok(observation)
+    }
+
+    fn check_callback_binding(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let binding = auth
+            .request_binding()
+            .ok_or(HostRequestBindingError::Missing)?;
+        if !matches!(
+            self.kind,
+            HostRequestBindingKind::ServerSession | HostRequestBindingKind::ServerSingleUserOwner
+        ) || self.identity.owner.closed.load(Ordering::SeqCst)
+            || self.identity.facts != AuthFacts::of(auth)
+            || !self.identity.same_binding(binding.identity())
+            || !target.matches_auth(auth)
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        Ok(())
+    }
+
+    /// Consume one callback invocation through this original current borrowed Host.
+    /// A default observation has no port and refuses only this handoff.
+    pub fn handoff_callback_url(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        invocation: GatewayAuthorizationCallbackUrlInvocation<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        self.check_callback_binding(auth, target, deadline)?;
+        invocation.check(invocation.issuer, &self.identity)?;
+        let port = self
+            .callback_port
+            .as_ref()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let result = port.handoff(auth, target, invocation, deadline);
+        self.check_callback_binding(auth, target, deadline)?;
+        result
     }
 
     /// Closed original Host kind, without a current authorization conclusion.

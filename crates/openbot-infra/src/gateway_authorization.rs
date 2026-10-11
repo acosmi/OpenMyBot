@@ -162,6 +162,12 @@ struct OwnedRegistrationReply {
     resources: ReplyResources,
 }
 
+struct CallbackPkceMaterial {
+    state: Zeroizing<String>,
+    verifier: Zeroizing<String>,
+    challenge: Zeroizing<String>,
+}
+
 #[allow(dead_code, reason = "Pending token consumption")]
 struct TokenSetGuard {
     sdk: acosmi::TokenSet,
@@ -252,6 +258,7 @@ redacted_debug! {
     CheckedExpiry => "CheckedExpiry([redacted])",
     ReplyResources => "ReplyResources([redacted])",
     OwnedRegistrationReply => "OwnedRegistrationReply([redacted])",
+    CallbackPkceMaterial => "CallbackPkceMaterial([redacted])",
     TokenSetGuard => "TokenSetGuard([redacted])",
     InitialReply => "InitialReply([redacted])",
 }
@@ -302,6 +309,77 @@ fn owned_registration_input(
     original_redirect_uri: Zeroizing<String>,
 ) -> Result<OwnedInitialInput, InitialError> {
     initial::owned_registration_input(metadata, original_redirect_uri)
+}
+
+fn callback_registration_input(
+    metadata: GatewayDesktopMetadata,
+    original_redirect_uri: Zeroizing<String>,
+    original_clock: &ClockOwner,
+) -> Result<OwnedInitialInput, InitialError> {
+    let mut input = owned_registration_input(metadata, original_redirect_uri)?;
+    input.clock = Arc::clone(original_clock);
+    Ok(input)
+}
+
+fn callback_pkce_material() -> Result<CallbackPkceMaterial, InitialError> {
+    let state = Zeroizing::new(acosmi::generate_state());
+    let verifier = Zeroizing::new(acosmi::generate_code_verifier());
+    let challenge = Zeroizing::new(acosmi::code_challenge(&verifier));
+    for value in [&state, &verifier, &challenge] {
+        if value.len() != 43
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(InitialError::RequestMismatch);
+        }
+    }
+    Ok(CallbackPkceMaterial {
+        state,
+        verifier,
+        challenge,
+    })
+}
+
+fn callback_authorization_endpoint_allowed(endpoint: &url::Url) -> bool {
+    !(endpoint.query().is_some_and(|query| !query.is_empty()) || endpoint.fragment().is_some())
+}
+
+fn callback_authorization_url(
+    reply: &OwnedRegistrationReply,
+    pkce: &CallbackPkceMaterial,
+) -> Result<Zeroizing<String>, InitialError> {
+    let metadata = reply.resources.metadata.sdk_metadata();
+    let endpoint = url::Url::parse(&metadata.authorization_endpoint)
+        .map_err(|_| InitialError::RequestMismatch)?;
+    if !callback_authorization_endpoint_allowed(&endpoint) {
+        return Err(InitialError::RequestMismatch);
+    }
+    let options = acosmi::LoginOptions {
+        skip_browser: true,
+        login_hint: None,
+        login_method: None,
+        org_uuid: None,
+        expires_in: None,
+        success_redirect_url: None,
+    };
+    let scopes = ["ai".to_owned(), "account".to_owned()];
+    let authorization_url = Zeroizing::new(
+        acosmi::auth::auth::build_desktop_authorization_url(
+            metadata,
+            &reply.client_id,
+            &reply.original_redirect_uri,
+            &pkce.challenge,
+            &pkce.state,
+            &scopes,
+            &options,
+        )
+        .map_err(|_| InitialError::RequestMismatch)?,
+    );
+    if authorization_url.len() > 2048 {
+        return Err(InitialError::RequestMismatch);
+    }
+    Ok(authorization_url)
 }
 
 #[allow(dead_code, reason = "Pending code-grant consumption")]
