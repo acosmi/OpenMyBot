@@ -217,6 +217,134 @@ impl fmt::Debug for GatewayAuthorizationVerifiedCodeOwner {
     }
 }
 
+// Callback-private lineage: only the genuine whole Verified producer mints it.
+pub(super) struct TokenCaptureWitness {
+    _private: (),
+}
+
+// STD198_CODE_GUARD_MOVE: the only unarmed interval is the synchronous standard
+// library allocation move/UTF-8 check and immediate replacement guard. Both
+// branches rearm before returning; no SDK/freed-memory/full-erasure claim follows.
+pub(super) fn move_code_storage(
+    mut code: Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<String>, Zeroizing<Vec<u8>>> {
+    match String::from_utf8(std::mem::take(&mut *code)) {
+        Ok(value) => Ok(Zeroizing::new(value)),
+        Err(error) => Err(Zeroizing::new(error.into_bytes())),
+    }
+}
+
+pub(super) fn take_verified_for_token(
+    journal: &Arc<GatewayAuthorizationJournal>,
+    auth: &AuthContext,
+    owner: GatewayAuthorizationVerifiedCodeOwner,
+) -> Result<super::TokenCaptureOwner, super::GatewayAuthorizationTokenError> {
+    use super::super::{InitialError, ReplyInvalidReason};
+    use super::{
+        GatewayAuthorizationTokenError as TokenError, GatewayAuthorizationTokenKind as TokenKind,
+        GatewayAuthorizationTokenReplyReason as TokenReason,
+        GatewayAuthorizationTokenStage as TokenStage,
+    };
+    // Original full20/current/Flow validation uses initial=None. The completed
+    // registration 10s stage is neither checked nor renewed. No transport
+    // execute future has been constructed or polled in this whole producer.
+    current_sync(journal, auth, &owner._registered).map_err(|error| {
+        let kind = match error.kind() {
+            CallbackErrorKind::Refused | CallbackErrorKind::Journal(Kind::Refused) => {
+                TokenKind::BeforeDispatchRefused
+            }
+            CallbackErrorKind::Cancelled | CallbackErrorKind::Journal(Kind::Cancelled) => {
+                TokenKind::Cancelled
+            }
+            CallbackErrorKind::Deadline | CallbackErrorKind::Journal(Kind::Deadline) => {
+                TokenKind::Deadline
+            }
+            CallbackErrorKind::Unavailable
+            | CallbackErrorKind::Journal(_)
+            | CallbackErrorKind::Registration(_)
+            | CallbackErrorKind::CallbackIo
+            | CallbackErrorKind::AuthorizationDenied
+            | CallbackErrorKind::AuthorizationRejected
+            | CallbackErrorKind::ReadbackUnproven
+            | CallbackErrorKind::RollbackAcknowledgedAfterDeadline => TokenKind::Unavailable,
+        };
+        // This current observation starts no transaction. None of the old
+        // callback/registration ACKs are copied into the three token slots.
+        TokenError::new(TokenStage::Capture, kind)
+    })?;
+    let GatewayAuthorizationVerifiedCodeOwner {
+        _registered,
+        _code,
+        _verifier,
+    } = owner;
+    let RegisteredAttemptOwner {
+        reply,
+        binding,
+        reservation,
+    } = _registered;
+    let super::super::OwnedRegistrationReply {
+        client_id,
+        original_redirect_uri,
+        resources,
+    } = reply;
+    let super::super::ReplyResources {
+        metadata,
+        budget: _completed_registration_budget,
+        clock,
+    } = resources;
+    let code = match move_code_storage(_code) {
+        Ok(value) => value,
+        Err(mut invalid) => {
+            zeroize::Zeroize::zeroize(&mut invalid);
+            return Err(TokenError::new(
+                TokenStage::Capture,
+                TokenKind::RequestMismatch,
+            ));
+        }
+    };
+    let input = super::super::token_code_input_same_clock(
+        metadata,
+        client_id,
+        code,
+        original_redirect_uri,
+        _verifier,
+        &clock,
+    )
+    .map_err(|error| {
+        let kind = match error {
+            InitialError::RequestMismatch => TokenKind::RequestMismatch,
+            InitialError::Cancelled => TokenKind::Cancelled,
+            InitialError::Deadline => TokenKind::Deadline,
+            InitialError::ProducerEnded => TokenKind::ProducerEnded,
+            InitialError::HttpStatus(status) => TokenKind::HttpStatus(status),
+            InitialError::BodyTransport => TokenKind::BodyTransport,
+            InitialError::ProtocolInvalid(reason) => TokenKind::ProtocolInvalid(match reason {
+                ReplyInvalidReason::JsonSyntax => TokenReason::JsonSyntax,
+                ReplyInvalidReason::UnknownKey => TokenReason::UnknownKey,
+                ReplyInvalidReason::DuplicateKey => TokenReason::DuplicateKey,
+                ReplyInvalidReason::ForbiddenSecretKey => TokenReason::ForbiddenSecretKey,
+                ReplyInvalidReason::FieldShape => TokenReason::FieldShape,
+                ReplyInvalidReason::HeaderLimit => TokenReason::HeaderLimit,
+                ReplyInvalidReason::MediaType => TokenReason::MediaType,
+                ReplyInvalidReason::BodyLimit => TokenReason::BodyLimit,
+                ReplyInvalidReason::FieldLimit => TokenReason::FieldLimit,
+                ReplyInvalidReason::ScopeShape => TokenReason::ScopeShape,
+                ReplyInvalidReason::TokenType => TokenReason::TokenType,
+                ReplyInvalidReason::ExpiryInteger => TokenReason::ExpiryInteger,
+                ReplyInvalidReason::ClockOrExpiry => TokenReason::ClockOrExpiry,
+                ReplyInvalidReason::ReplyBinding => TokenReason::ReplyBinding,
+            }),
+        };
+        TokenError::new(TokenStage::Capture, kind)
+    })?;
+    Ok(super::TokenCaptureOwner {
+        input,
+        binding,
+        reservation,
+        capture: TokenCaptureWitness { _private: () },
+    })
+}
+
 #[derive(Clone, Copy)]
 enum QueryKey {
     State,

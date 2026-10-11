@@ -182,6 +182,24 @@ pub(super) fn owned_code_input(
     original_redirect_uri: Zeroizing<String>,
     code_verifier: Zeroizing<String>,
 ) -> Result<OwnedInitialInput, InitialError> {
+    owned_code_input_with_clock(
+        metadata,
+        client_id,
+        code,
+        original_redirect_uri,
+        code_verifier,
+        Arc::new(SystemClock),
+    )
+}
+
+pub(super) fn owned_code_input_with_clock(
+    metadata: GatewayDesktopMetadata,
+    client_id: Zeroizing<String>,
+    code: Zeroizing<String>,
+    original_redirect_uri: Zeroizing<String>,
+    code_verifier: Zeroizing<String>,
+    clock: ClockOwner,
+) -> Result<OwnedInitialInput, InitialError> {
     if !valid_client_id(&client_id)
         || !(1..=16_377).contains(&code.len())
         || !code.bytes().all(|byte| byte.is_ascii_graphic())
@@ -204,7 +222,7 @@ pub(super) fn owned_code_input(
             code_verifier,
             server_url,
         }),
-        clock: Arc::new(SystemClock),
+        clock,
     })
 }
 
@@ -314,6 +332,9 @@ pub(super) async fn prepare_initial(
                 server_url: code.server_url,
             },
             start: start.ok_or(InitialError::RequestMismatch)?,
+            code: code.code,
+            redirect_uri: code.redirect_uri,
+            code_verifier: code.code_verifier,
         },
     };
     let CapturedRequest {
