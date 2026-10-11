@@ -1,4 +1,3 @@
--- PRIVATE DRAFT ONLY / authorGO false / NOTRUN.
 -- native0050: durable same-J state and prospective Thread identity retention.
 -- No body-writer closure, public close producer, deletion action, ACK or Ready.
 DO $thread_history_owner$
@@ -916,7 +915,7 @@ NOT EXISTS (
    IF NOT FOUND OR v_col->>'schema' IS DISTINCT FROM 'pg_catalog' OR v_col->>'name' IS DISTINCT FROM '=' OR v_col->>'resultType' IS DISTINCT FROM 'boolean' OR
       (v_col->>'oidRaw')::pg_catalog.oid IS DISTINCT FROM (v_anchor->>'oidRaw')::pg_catalog.oid OR
       (v_col->'function'->>'oidRaw')::pg_catalog.oid IS DISTINCT FROM (v_anchor->'function'->>'oidRaw')::pg_catalog.oid OR
-      (v_col->'function'-'oidRaw') IS DISTINCT FROM (v_anchor->'function'-'oidRaw') THEN
+      ((v_col->'function')-'oidRaw') IS DISTINCT FROM ((v_anchor->'function')-'oidRaw') THEN
     RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_admission_schema_invalid';
    END IF;
   END LOOP;
