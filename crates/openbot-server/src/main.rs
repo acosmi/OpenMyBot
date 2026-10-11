@@ -537,6 +537,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
         pool.close();
         return Err(startup_error("model_dataset_binding").into());
     }
+    let thread_history_enrollment = application_assembly
+        .thread_history_authority
+        .enroll_original_registry(&artifact_datasets)
+        .and_then(|()| {
+            if let Some(resolver) = &remember_session_resolver {
+                resolver.install_thread_history_authority(
+                    &application_assembly.thread_history_authority,
+                )
+            } else if let Some(resolver) = &remember_single_user_resolver {
+                resolver.install_thread_history_authority(
+                    &application_assembly.thread_history_authority,
+                    &pool,
+                )
+            } else {
+                Err(openbot_contracts::HostRequestBindingError::Unavailable)
+            }
+        });
+    if thread_history_enrollment.is_err() {
+        auth.close_request_bindings();
+        let _ = application_assembly
+            .application
+            .close_public_artifact_reads();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(reads) = &artifact_read_lifecycle {
+            reads.close();
+            let _ack = reads.drain().await;
+        }
+        application_assembly.shutdown().await;
+        policy_listener.stop().await;
+        pool.close();
+        return Err(startup_error("thread_history").into());
+    }
     if let Some(resolver) = &remember_session_resolver {
         resolver
             .install_custom_model_catalog_inventory(

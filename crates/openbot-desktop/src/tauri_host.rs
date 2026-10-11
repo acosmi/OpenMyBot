@@ -78,6 +78,11 @@ use openbot_contracts::request_binding::{
     RequestBindingOwnerObservation, SourceRunArtifactIdsCurrentCheck,
     SourceRunArtifactIdsCurrentTarget, VerifiedHostRequestBinding,
 };
+
+use openbot_contracts::request_binding::{
+    ThreadHistoryHostObservation, ThreadHistoryHostTailFactory, ThreadHistoryHostTailWitness,
+    ThreadHistoryHostTarget, ThreadHistorySessionFacts,
+};
 use openbot_contracts::sandboxed::{
     SandboxedComponentRevisionRequest, SaveSandboxedComponentRequest,
 };
@@ -612,6 +617,53 @@ impl HostRequestBindingGuard for WindowRequestBindingGuard {
             }),
         )
     }
+    fn borrow_thread_history_host_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        target: &'a dyn ThreadHistoryHostTarget,
+        deadline: Instant,
+    ) -> Result<ThreadHistoryHostObservation<'a>, HostRequestBindingError> {
+        self.check_window(auth)?;
+        if deadline <= Instant::now() {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let binding = auth
+            .request_binding()
+            .ok_or(HostRequestBindingError::Missing)?;
+        if !self
+            .issuer
+            .matches_desktop_window_epoch(binding.identity(), &self.label, self.id)
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        // The enrolled real Local source lends its Thread observer attachment. Its async
+        // current guard and an upstream Remote binding do not authorize this operation.
+        let source = self
+            .source
+            .as_ref()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let inner = source.borrow_thread_history_host_before(auth, target, deadline)?;
+        self.check_window(auth)?;
+        if inner.kind() != HostRequestBindingKind::DesktopWindow
+            || !inner.identity().same_binding(binding.identity())
+            || inner.server_session_epoch().is_some()
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        if deadline <= Instant::now() {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        ThreadHistoryHostObservation::from_trusted_host(
+            HostRequestBindingKind::DesktopWindow,
+            binding.identity().clone(),
+            None,
+            Box::new(WindowThreadHistoryTailFactory {
+                window: self.repository_tail_source(),
+                original: binding.identity().clone(),
+                inner,
+            }),
+        )
+    }
 
     fn verify_source_run_artifact_ids_current_before<'a>(
         &'a self,
@@ -983,6 +1035,11 @@ struct WindowRememberPreferenceTailFactory<'a> {
     original: HostRequestBindingIdentity,
     inner: RememberPreferenceHostObservation<'a>,
 }
+struct WindowThreadHistoryTailFactory<'a> {
+    window: WindowRequestBindingGuard,
+    original: HostRequestBindingIdentity,
+    inner: ThreadHistoryHostObservation<'a>,
+}
 impl RememberPreferenceHostTailFactory for WindowRememberPreferenceTailFactory<'_> {
     fn witness(
         &self,
@@ -1010,13 +1067,73 @@ impl RememberPreferenceHostTailFactory for WindowRememberPreferenceTailFactory<'
         Ok(Box::new(witness))
     }
 }
+impl ThreadHistoryHostTailFactory for WindowThreadHistoryTailFactory<'_> {
+    fn witness(
+        &self,
+        auth: &AuthContext,
+        session: Option<ThreadHistorySessionFacts>,
+        deadline: Instant,
+    ) -> Result<Box<dyn ThreadHistoryHostTailWitness>, HostRequestBindingError> {
+        self.window.check_window(auth)?;
+        if !auth
+            .request_binding()
+            .is_some_and(|binding| self.original.same_binding(binding.identity()))
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        if deadline <= Instant::now() {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let inner = self.inner.witness(auth, session, deadline)?;
+        let witness = WindowThreadHistoryTail {
+            window: self.window.repository_tail_source(),
+            original: self.original.clone(),
+            inner,
+        };
+        witness.verify_current(auth, deadline)?;
+        Ok(Box::new(witness))
+    }
+}
 
 struct WindowRememberPreferenceTail {
     window: WindowRequestBindingGuard,
     original: HostRequestBindingIdentity,
     inner: Box<dyn RememberPreferenceHostTailWitness>,
 }
+struct WindowThreadHistoryTail {
+    window: WindowRequestBindingGuard,
+    original: HostRequestBindingIdentity,
+    inner: Box<dyn ThreadHistoryHostTailWitness>,
+}
 impl RememberPreferenceHostTailWitness for WindowRememberPreferenceTail {
+    fn verify_current(
+        &self,
+        auth: &AuthContext,
+        deadline: Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        self.window.check_window(auth)?;
+        if !auth.request_binding().is_some_and(|binding| {
+            self.original.same_binding(binding.identity())
+                && self.window.issuer.matches_desktop_window_epoch(
+                    binding.identity(),
+                    &self.window.label,
+                    self.window.id,
+                )
+        }) {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        if deadline <= Instant::now() {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        self.inner.verify_current(auth, deadline)?;
+        self.window.check_window(auth)?;
+        if deadline <= Instant::now() {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        Ok(())
+    }
+}
+impl ThreadHistoryHostTailWitness for WindowThreadHistoryTail {
     fn verify_current(
         &self,
         auth: &AuthContext,
@@ -1319,6 +1436,27 @@ impl DesktopTauriProtocol {
             return Err(HostRequestBindingError::Unavailable);
         }
         source.enroll_custom_model_catalog_window_issuer(&self.request_binding_issuer)?;
+        Ok(self.with_current_identity_source(source))
+    }
+
+    #[cfg(all(feature = "desktop-local-runtime", target_os = "macos"))]
+    pub(crate) fn with_thread_history_identity_source(
+        self,
+        source: Arc<crate::local_confirmation_authority::PostgresLocalConfirmationAuthority>,
+    ) -> Result<Self, HostRequestBindingError> {
+        let expected: Arc<dyn HostRequestBindingGuard> = source.clone();
+        if self
+            .current_identity_source
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, &expected))
+            || self
+                .local_capability_authority
+                .as_ref()
+                .is_some_and(|current| !Arc::ptr_eq(current, &source))
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        source.enroll_thread_history_window_issuer(&self.request_binding_issuer)?;
         Ok(self.with_current_identity_source(source))
     }
 
@@ -8814,3 +8952,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
+#[path = "tauri_host/thread_history_management_local_tests.rs"]
+mod thread_history_management_local_tests;
