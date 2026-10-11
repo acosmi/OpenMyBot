@@ -547,7 +547,7 @@ impl Fixture {
             users: [("legacy-creator".into(), A.into())].into_iter().collect(),
             bots: [("legacy-bot".into(), BOT.into())].into_iter().collect(),
             channels: Default::default(),
-            claimed_thread_ids: Default::default(),
+            claimed_thread_ids: [j.clone()].into_iter().collect(),
         };
         let report = import_intelligence_bundle(
             &PostgresIntelligenceImportStore::new(self.pool.clone()),
