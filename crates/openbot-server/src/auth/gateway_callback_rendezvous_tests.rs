@@ -316,11 +316,19 @@ async fn r01_listener_before_any_create() {
     harness::with_temp_database(&admin, "cb_r01", |cfg| async move {
         let f = Fixture::new(cfg, 2).await?;
         let (_auth, wait, input) = start(&f).await?;
-        let stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, input.port)).await.map_err(|e| e.to_string())?;
-        check(stream.peer_addr().map_err(|e| e.to_string())?.port() == input.port, "positive original nonzero IPv4 listener")?;
-        drop(stream); drop(wait); absent(input.port).await?;
+        let stream = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, input.port))
+            .await
+            .map_err(|e| e.to_string())?;
+        check(
+            stream.peer_addr().map_err(|e| e.to_string())?.port() == input.port,
+            "positive original nonzero IPv4 listener",
+        )?;
+        drop(stream);
+        drop(wait);
+        absent(input.port).await?;
         f.finish().await
-    }).await;
+    })
+    .await;
     harness::with_temp_database(&admin, "cb_r01_bind_refusal", |cfg| async move {
         let relay = PgTerminalAckGate::new(&cfg, TerminalStage::RegisteredReadbackRollback, false).await;
         let f = match Fixture::new(relay.config.clone(), 1).await {
@@ -1499,7 +1507,10 @@ fn r10_inventory<const N: usize>(
         raw.ends_with(b"\0\n"),
         "r10 lsof field/set terminators incomplete",
     )?;
-    check(matches!(N, 1 | 5), "only original five-peer or owned one-peer observation")?;
+    check(
+        matches!(N, 1 | 5),
+        "only original five-peer or owned one-peer observation",
+    )?;
     let known: BTreeSet<_> = peers.iter().copied().collect();
     check(
         known.len() == N && !known.contains(&0) && !known.contains(&port),
@@ -1629,7 +1640,10 @@ fn r10_inventory<const N: usize>(
     let listener = if N == 5 {
         Some(listener.ok_or("r10 listener absent")?)
     } else {
-        check(listener.is_none(), "r16 matched callback listener must already be absent")?;
+        check(
+            listener.is_none(),
+            "r16 matched callback listener must already be absent",
+        )?;
         None
     };
     Ok(R10Inventory {
@@ -1914,6 +1928,53 @@ async fn r10_peer_tail(mut peer: TcpStream, deadline: Instant) -> Result<Vec<u8>
     Ok(raw)
 }
 
+// Test-only synchronous waker interleaving: retain the original Tokio waker
+// and original parent. No synthetic Host, owner, or production hook is used.
+struct R10CancelOnControlledWake {
+    original_waker: std::task::Waker,
+    original_parent: CancellationToken,
+    poll_thread: std::thread::ThreadId,
+    active: std::sync::atomic::AtomicBool,
+    armed: std::sync::atomic::AtomicBool,
+    hits: std::sync::atomic::AtomicUsize,
+}
+impl R10CancelOnControlledWake {
+    fn cancel_and_forward(&self) {
+        use std::sync::atomic::Ordering;
+        if std::thread::current().id() == self.poll_thread
+            && self.active.load(Ordering::SeqCst)
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Disarm before cancellation: the original cancelled future can
+            // synchronously wake this same wrapper again.
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.original_parent.cancel();
+        }
+        self.original_waker.wake_by_ref();
+    }
+}
+impl std::task::Wake for R10CancelOnControlledWake {
+    fn wake(self: Arc<Self>) {
+        self.cancel_and_forward();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.cancel_and_forward();
+    }
+}
+struct R10BusinessPollGuard<'a> {
+    wake: &'a R10CancelOnControlledWake,
+}
+impl Drop for R10BusinessPollGuard<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.wake.active.store(false, Ordering::SeqCst);
+        self.wake.armed.store(false, Ordering::SeqCst);
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Root-frozen owned PostgreSQL and TLS runtimes"]
 async fn r10_bounded_slow_and_concurrent_terminal() {
@@ -1991,6 +2052,97 @@ async fn r10_bounded_slow_and_concurrent_terminal() {
             check(f.row(original.attempt_id).await? == original && f.posts()?.len() == 1,
                 "r10 no callback write/close/re-registration/reservation renewal")?;
             eprintln!("R10_FINITE two snapshots only; all socket states preserved; pure capacity/CODE no-poll lemma separate; continuous negative/backlog/production driver joins UNPROVEN");
+            Ok(())
+        }.await;
+        let cleanup = f.finish().await;
+        relay.stop().await;
+        result.and(cleanup)
+    }).await;
+    harness::with_temp_database(&admin, "cb_r10_wake", |cfg| async move {
+        let relay = PgTerminalAckGate::new(&cfg, TerminalStage::RegisteredReadbackRollback, false).await;
+        let f = match Fixture::new(relay.config.clone(), 1).await {
+            Ok(value) => value,
+            Err(error) => { relay.stop().await; return Err(error); }
+        };
+        let result = async {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let sink = GatewayCallbackUrlSink::new();
+            f.resolver.install_gateway_callback_url_sink(Arc::clone(&sink)).map_err(|e| format!("{e:?}"))?;
+            let auth = f.auth().await?;
+            let parent = CancellationToken::new();
+            // One original parent/caller cap, supplied once before setup/start.
+            let original_caller_cap = Instant::now() + Duration::from_secs(60);
+            let (wait, input) = start_on(&f, &f.journal, &auth, &sink, parent.clone(), original_caller_cap).await?;
+            let original = f.rows().await?.remove(0);
+            relay.arm_original(&f).await;
+            let mut call = Box::pin(f.journal.wait_callback(&auth, wait));
+            let proof_cap = (Instant::now() + Duration::from_secs(10)).min(original_caller_cap);
+            let mut peer = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, input.port)).await.map_err(|e| e.to_string())?;
+            peer.write_all(&input.request(&input.query("r10-original-synchronous-write-wake"))).await.map_err(|e| e.to_string())?;
+            tokio::select! { biased;
+                () = relay.held() => {},
+                value = &mut call => return Err(format!("r10 wake callback escaped original RO ACK: {value:?}")),
+            }
+            // Forwarded ACK and this driver yield do not prove owner consumption.
+            relay.release_original_ack().await;
+            check(!parent.is_cancelled() && Instant::now() < proof_cap,
+                "r10 wake original parent/cap live before the only armed poll")?;
+            // Exactly one business poll. The wrapper is armed only inside it;
+            // no later poll may repair an ACK-not-ready or write-boundary miss.
+            let (poll, wake) = std::future::poll_fn(|cx| {
+                let wake = Arc::new(R10CancelOnControlledWake {
+                    original_waker: cx.waker().clone(),
+                    original_parent: parent.clone(),
+                    poll_thread: std::thread::current().id(),
+                    active: AtomicBool::new(true),
+                    armed: AtomicBool::new(true),
+                    hits: AtomicUsize::new(0),
+                });
+                let waker = std::task::Waker::from(Arc::clone(&wake));
+                let mut context = std::task::Context::from_waker(&waker);
+                let guard = R10BusinessPollGuard { wake: &wake };
+                let poll = call.as_mut().poll(&mut context);
+                drop(guard);
+                std::task::Poll::Ready((poll, wake))
+            }).await;
+            check(wake.hits.load(Ordering::SeqCst) == 1 && parent.is_cancelled()
+                && !wake.active.load(Ordering::SeqCst) && !wake.armed.load(Ordering::SeqCst)
+                && Instant::now() < proof_cap,
+                "r10 wake same-thread active poll cancelled original parent once within original cap")?;
+            // Keep the business future unpolled. Independent full literal bytes
+            // distinguish an actual successful write wake from an earlier wake.
+            let raw = tokio::time::timeout_at(tokio::time::Instant::from_std(proof_cap), async {
+                let mut raw = Vec::with_capacity(4096);
+                loop {
+                    check(raw.len() < 4096, "r10 wake independent static header bound")?;
+                    let mut byte = [0_u8; 1];
+                    peer.read_exact(&mut byte).await.map_err(|e| format!("r10 wake own header: {e}"))?;
+                    raw.push(byte[0]);
+                    if raw.ends_with(b"\r\n\r\n") { break; }
+                }
+                let mut body = [0_u8; 18]; // Handwritten Callback received. byte count.
+                peer.read_exact(&mut body).await.map_err(|e| format!("r10 wake own literal body: {e}"))?;
+                raw.extend_from_slice(&body);
+                response(&raw, 200, b"Callback received.")?;
+                Ok::<_, String>(raw)
+            }).await.map_err(|_| "r10 single armed poll did not establish full literal write boundary within original cap")??;
+            check(!raw.is_empty() && Instant::now() < proof_cap,
+                "r10 wake independent full static200 established while original cap live")?;
+            let error = match poll {
+                std::task::Poll::Ready(Err(error)) => error,
+                std::task::Poll::Ready(Ok(_)) => return Err("r10 synchronous write wake returned Verified after original cancellation".into()),
+                std::task::Poll::Pending => return Err("r10 synchronous write wake stayed Pending in the same original poll after full literal static200".into()),
+            };
+            callback_refusal(&error, CallbackErrorKind::Cancelled, Ack::Timely)?;
+            drop(call);
+            no_callback_reply(&mut peer).await?;
+            drop(peer);
+            absent(input.port).await?;
+            relay.assert_target(1);
+            relay.end_callback_sql_window(1);
+            check(f.row(original.attempt_id).await? == original && f.posts()?.len() == 1,
+                "r10 synchronous wake retains original full row/reservation and one POST; no retry or ControlledClose")?;
+            eprintln!("R10_SYNCHRONOUS_WRITE_WAKE original_parent_cancel_hits=1 same_business_poll=ReadyErr_Callback_Cancelled original_RO_ACK=Timely independent_literal_static200_18B=true original_cap_live=true; no_second_business_poll=true positive_and_old_negative_execution_separately_attributed=true");
             Ok(())
         }.await;
         let cleanup = f.finish().await;

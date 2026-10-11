@@ -934,8 +934,10 @@ fn poll_response(
                         if written != 0 && written <= state.bytes.len() - state.offset =>
                     {
                         state.offset += written;
-                        cx.waker().wake_by_ref();
-                        Some(Poll::Pending)
+                        checked_poll(journal, auth, registered, Some(cap), || {
+                            cx.waker().wake_by_ref();
+                            Poll::<Result<(), std::io::Error>>::Pending
+                        })?
                     }
                     Some(Poll::Ready(Ok(_))) => Some(Poll::Ready(Err(std::io::Error::from(
                         std::io::ErrorKind::WriteZero,
@@ -1016,8 +1018,13 @@ fn poll_connection(
                 }
                 None => {}
             }
-            cx.waker().wake_by_ref();
-            Ok(ProbeProgress::Pending)
+            match checked_poll(journal, auth, registered, Some(connection.cap), || {
+                cx.waker().wake_by_ref();
+                Poll::<()>::Pending
+            })? {
+                None => Ok(ProbeProgress::Closed),
+                Some(_) => Ok(ProbeProgress::Pending),
+            }
         }
         ConnectionPhase::Response(state) => {
             match poll_response(
@@ -1225,7 +1232,14 @@ pub(super) async fn wait_callback(
                             )));
                         };
                         *slot = Some(OwnedConnection::new(stream, cap));
-                        cx.waker().wake_by_ref();
+                        match checked_poll(journal, auth, &registered, Some(cap), || {
+                            cx.waker().wake_by_ref();
+                            Poll::<()>::Pending
+                        }) {
+                            Err(error) => return Poll::Ready(Err(error)),
+                            Ok(None) => *slot = None,
+                            Ok(Some(_)) => {}
+                        }
                     }
                     Ok(Some(Poll::Pending)) => {}
                     Ok(None) => {
