@@ -1046,10 +1046,10 @@ fn normalize_owner_relative(
         .as_array_mut()
         .ok_or_else(|| corrupt("relations"))?
     {
-        let null = r["aclIsNull"].as_bool().ok_or_else(|| corrupt("acl"))?;
+        let acl_is_null = r["aclIsNull"].as_bool().ok_or_else(|| corrupt("acl"))?;
         let acl = relative_acl(&r["acl"], owner)?;
-        let state = json!({"aclIsNull":null,"rawAcl":if null {Value::Null} else {relative_acl(&r["rawAcl"],owner)?}});
-        if null {
+        let state = json!({"aclIsNull":acl_is_null,"rawAcl":if acl_is_null {Value::Null} else {relative_acl(&r["rawAcl"],owner)?}});
+        if acl_is_null {
             require(r["rawAcl"].is_null())?;
         }
         table_acl_states.push(json!({"relation":{"schema":r["identity"]["schema"],"name":r["identity"]["name"]},"state":state}));
