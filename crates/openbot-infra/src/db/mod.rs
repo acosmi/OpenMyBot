@@ -37,6 +37,7 @@ pub(crate) mod occupancy;
 pub mod pool;
 pub mod schema_facts;
 pub mod tables;
+pub mod thread_origin_schema;
 pub mod types;
 
 mod error;

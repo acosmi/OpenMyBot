@@ -27,6 +27,7 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), S
             "INSERT INTO public.users(id,email) VALUES
                ('actor','actor@example.test'),('other','other@example.test'),
                ('admin','admin@example.test');
+             INSERT INTO public.user_roles(user_id,role) VALUES ('actor','user'),('admin','admin');
              INSERT INTO public.deployment_packages(tenant_id,source_path,checksum) VALUES
                ('tenant-a','/tenant-a','checksum-a'),('tenant-b','/tenant-b','checksum-b');
              INSERT INTO public.agents(id,name,type,configuration,package_id) VALUES
@@ -61,6 +62,7 @@ fn request(actor: &str, admin: bool, agents: &[&str]) -> ChannelCreateRequest {
             deployment: DeploymentId::new("dep-a"),
             tenant: TenantId::new("tenant-a"),
             actor: ActorId::new(actor),
+            auth_generation: openbot_contracts::auth::AuthGeneration::new(0),
             admin,
         },
         agent_ids: agents.iter().map(|id| BotId::new(*id)).collect(),
