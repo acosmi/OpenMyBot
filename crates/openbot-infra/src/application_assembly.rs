@@ -56,6 +56,7 @@ use crate::runtime_capability_facts::{
 use crate::sandboxed_components::PostgresSandboxedComponentAdministration;
 use crate::store::plugin_user_credential::PostgresOwnedCredentialRetirer;
 use crate::thread_directory::{DEFAULT_THREAD_LEASE_DURATION, PostgresThreadDirectory};
+use crate::thread_history_authority::PostgresThreadHistoryAuthority;
 use crate::thread_id::mint_thread_id;
 use crate::thread_listener::ThreadListenerDatabase;
 use crate::tool_approval::PostgresToolApprovalCoordinator;
@@ -153,6 +154,8 @@ impl core::fmt::Debug for PostgresApplicationAssemblyInput {
 
 /// Shared assembly output plus the background/lifecycle adapters its host must retain.
 pub struct PostgresApplicationAssembly {
+    /// One original current history observer shared with the actual host enrollment.
+    pub thread_history_authority: Arc<PostgresThreadHistoryAuthority>,
     /// Same once-enrolled original dataset binding used by every V2 consumer.
     pub model_dataset_binding: Arc<PostgresModelDatasetBinding>,
     pub custom_model_catalog_inventory: Arc<PostgresCustomModelCatalogInventory>,
@@ -433,6 +436,10 @@ pub async fn assemble_postgres_application(
         )
         .map_err(|_| fail("model_connections"))?,
     );
+    let thread_history_authority = Arc::new(
+        PostgresThreadHistoryAuthority::new(pool.clone(), deployment.clone(), tenant.clone())
+            .map_err(|_| fail("thread_history_authority"))?,
+    );
     let custom_model_catalog_inventory = Arc::new(
         PostgresCustomModelCatalogInventory::new(pool.clone(), deployment.clone(), tenant.clone())
             .map_err(|_| fail("custom_model_catalog"))?,
@@ -524,6 +531,7 @@ pub async fn assemble_postgres_application(
     let application: Arc<dyn ApplicationService> = Arc::new(application);
     let mcp_revocation_reconciler = McpRevocationReconciler::start(mcp_connections.clone());
     Ok(PostgresApplicationAssembly {
+        thread_history_authority,
         model_dataset_binding,
         custom_model_catalog_inventory,
         runtime_capability_facts,
