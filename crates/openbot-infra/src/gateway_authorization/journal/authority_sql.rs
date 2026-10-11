@@ -65,6 +65,87 @@ const CAS_REGISTERED: &str = r"/* gateway_authorization_registered */
  AND created_at=$16 AND expires_at=$17 AND updated_at=$18
  AND finished_at IS NOT DISTINCT FROM $19 AND outcome_code IS NOT DISTINCT FROM $20";
 
+const CAS_CODE_ADMITTED: &str = r"/* gateway_authorization_code_admitted */
+ UPDATE openbot_internal.gateway_authorization_attempts
+ SET phase='code_admitted',code_admitted_at=$21,updated_at=$21
+ WHERE attempt_id=$1 AND journal_schema=$2 AND deployment_id=$3 AND tenant_id=$4
+ AND owner_user_id=$5 AND auth_generation=$6 AND installation_id=$7 AND runtime_epoch=$8
+ AND issuer=$9 AND redirect_uri=$10 AND phase=$11
+ AND client_id IS NOT DISTINCT FROM $12 AND enrollment_id IS NOT DISTINCT FROM $13
+ AND registration_admitted_at IS NOT DISTINCT FROM $14 AND code_admitted_at IS NOT DISTINCT FROM $15
+ AND created_at=$16 AND expires_at=$17 AND updated_at=$18
+ AND finished_at IS NOT DISTINCT FROM $19 AND outcome_code IS NOT DISTINCT FROM $20";
+
+pub(super) async fn cas_code_admitted(
+    tx: &Transaction<'_>,
+    old: &Row,
+    next: &Row,
+    gate: &OperationGate<'_>,
+) -> Result<(), Error> {
+    if *next != super::code_admitted_row(old, next.updated_at)? {
+        return Err(Error::new(Kind::Refused));
+    }
+    let mut params = old.as_sql_params();
+    params.push(&next.updated_at);
+    let count = gate
+        .io(tx.execute(CAS_CODE_ADMITTED, &params), observation_error)
+        .await?;
+    if count != 1 {
+        return Err(Error::new(Kind::Refused));
+    }
+    Ok(())
+}
+
+pub(super) async fn append_code_admitted_audit(
+    tx: &Transaction<'_>,
+    auth: &AuthContext,
+    next: &Row,
+    key: &SecretBytes,
+    gate: &OperationGate<'_>,
+) -> Result<(), Error> {
+    if next.phase != "code_admitted"
+        || next.code_admitted_at != Some(next.updated_at)
+        || next
+            .registration_admitted_at
+            .is_none_or(|t| t > next.updated_at)
+        || next.outcome_code.is_some()
+        || next.finished_at.is_some()
+    {
+        return Err(Error::new(Kind::Refused));
+    }
+    let attempt = next.attempt_id.to_string();
+    let payload = AuditPayload::from_facts([
+        AuditFact::GatewayAuthorizationJournalSchema,
+        AuditFact::GatewayAuthorizationAttemptId(
+            AuditGatewayAuthorizationAttemptId::new(attempt.clone()).map_err(observation_error)?,
+        ),
+        AuditFact::GatewayAuthorizationPhase(AuditGatewayAuthorizationPhase::CodeAdmitted),
+        AuditFact::GatewayAuthorizationOutcome(None),
+    ])
+    .map_err(observation_error)?;
+    let (id, created_at) = gate
+        .io(
+            crate::repo::audit::next_event_coordinates(tx),
+            observation_error,
+        )
+        .await?;
+    let event = AuditEvent {
+        id,
+        actor: Some(auth.actor().clone()),
+        event_type: AuditEventType::GATEWAY_AUTHORIZATION_CODE_ADMITTED,
+        target_kind: AuditLabel::new("gateway_authorization_attempt"),
+        target_id: Some(AuditIdentifier::new(attempt).map_err(observation_error)?),
+        payload,
+        created_at,
+    };
+    gate.io(
+        crate::repo::audit::append_event_in_transaction(tx, &event, key.expose()),
+        observation_error,
+    )
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn cas_registered(
     tx: &Transaction<'_>,
     old: &Row,

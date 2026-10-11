@@ -596,7 +596,7 @@ fn json_media_type(value: &[u8]) -> bool {
     value.eq_ignore_ascii_case(b"utf-8") || value.eq_ignore_ascii_case(b"\"utf-8\"")
 }
 
-fn header_limits(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
+pub(super) fn header_limits(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
     let mut count = 0_usize;
     let mut total = 0_usize;
     for (name, value) in &response.headers {
@@ -614,7 +614,7 @@ fn header_limits(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
     Ok(())
 }
 
-fn success_media_type(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
+pub(super) fn success_media_type(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
     let values = response.headers.get_all("content-type");
     let mut values = values.iter();
     let value = values
@@ -766,6 +766,7 @@ pub(super) async fn consume_initial(
             metadata,
             binding,
             start,
+            ..
         } => {
             let fields = parse_tokens(body.as_slice())?;
             budget.check(&prepared.clock)?;
