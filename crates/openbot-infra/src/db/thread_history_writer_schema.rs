@@ -51,7 +51,9 @@ triggers_scope AS (
  FROM pg_catalog.pg_trigger t
  WHERE t.tgrelid IN (SELECT oid FROM relations)
     OR t.tgconstraint IN (SELECT oid FROM constraints_scope)
-    OR t.tgfoid IN (SELECT oid FROM named_guards)
+    -- Old Run function facts remain complete; their triggers use the public source-table scope.
+    OR t.tgfoid IN (SELECT oid FROM named_guards
+                   WHERE proname NOT IN ('maintain_thread_run_occupancy','guard_thread_run_occupancy'))
     OR (NOT t.tgisinternal AND t.tgrelid IN (
        SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
        WHERE n.nspname='public' AND c.relname IN ('threads','runs','messages','run_events','tool_approvals',
