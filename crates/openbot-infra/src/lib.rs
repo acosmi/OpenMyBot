@@ -134,6 +134,7 @@ pub mod gateway_account;
 pub mod gateway_authority;
 #[cfg(feature = "server-runtime")]
 mod gateway_authorization;
+mod thread_history_writer;
 #[cfg(feature = "server-runtime")]
 pub use gateway_authorization::journal::{
     CallbackErrorKind, CallbackStage, ClosedAttemptReceipt, ControlledCloseReason,

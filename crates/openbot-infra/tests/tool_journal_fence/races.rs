@@ -19,8 +19,8 @@ async fn four_repositories_wait_for_real_terminal_and_read_new_state_under_repea
                 dedicated(&f.config, "journal-terminal-owner", false).await?;
             trigger(
                 &f.pool,
-                "run_events",
-                "INSERT",
+                "thread_leases",
+                "UPDATE",
                 case.lease.run_id().as_str(),
                 false,
             )
@@ -49,7 +49,7 @@ async fn four_repositories_wait_for_real_terminal_and_read_new_state_under_repea
                 journal_rows(&before),
                 "{kind:?}"
             );
-            untrigger(&f.pool, "run_events").await?;
+            untrigger(&f.pool, "thread_leases").await?;
             writer.close();
             terminal.close();
         }
@@ -198,8 +198,8 @@ async fn generic_journal_outcome_waits_for_terminal_under_repeatable_default() {
             dedicated(&f.config, "journal-outcome-terminal", false).await?;
         trigger(
             &f.pool,
-            "run_events",
-            "INSERT",
+            "thread_leases",
+            "UPDATE",
             case.lease.run_id().as_str(),
             false,
         )

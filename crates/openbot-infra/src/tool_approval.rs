@@ -229,6 +229,12 @@ impl PostgresToolApprovalCoordinator {
             return decode_stored(&row);
         }
 
+        crate::thread_history_writer::require_open(&transaction, &request.thread)
+            .await
+            .map_err(approval_writer_error)?;
+        if !request_scope_current(&transaction, &self.deployment, &self.tenant, request).await? {
+            return Err(ToolPortError::NotVisible);
+        }
         let approval_id = Uuid::now_v7().to_string();
         let expires_at = now + APPROVAL_TTL;
         transaction
@@ -922,6 +928,23 @@ fn unavailable(error: crate::db::pool::PoolError) -> ToolPortError {
     tracing::error!(error = %error, "tool approval 获取 PostgreSQL 连接失败");
     ToolPortError::Unavailable {
         dependency: "tool_approval",
+    }
+}
+
+fn approval_writer_error(error: crate::db::InfraError) -> ToolPortError {
+    if crate::thread_history_writer::is_closed(&error) {
+        return ToolPortError::NotVisible;
+    }
+    tracing::warn!(error=%error,"Tool approval history writer admission failed");
+    match error {
+        crate::db::InfraError::Connect { .. } | crate::db::InfraError::Query { .. } => {
+            ToolPortError::Unavailable {
+                dependency: "tool_approval",
+            }
+        }
+        _ => ToolPortError::Corrupt {
+            field: "thread_history_writer",
+        },
     }
 }
 

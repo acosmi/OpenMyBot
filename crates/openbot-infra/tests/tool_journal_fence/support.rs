@@ -417,12 +417,15 @@ pub async fn trigger(
     // table/event are closed test constants and identity is an owned generated UUID.
     assert!(matches!(
         table,
-        "tool_calls" | "tool_attempts" | "run_events" | "audit_events"
+        "tool_calls" | "tool_attempts" | "thread_leases" | "audit_events"
     ));
     assert!(matches!(event, "INSERT" | "UPDATE"));
     assert!(identity.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'));
-    let predicate = if table == "run_events" {
-        "NEW.terminal AND NEW.run_id=TG_ARGV[0]"
+    // A foreign trigger on a 0051-observed writer table (e.g. run_events) is refused by the exact
+    // writer schema check, so the terminal gate sits on finish's own later lease release, still
+    // inside the transaction that holds the Run row lock.
+    let predicate = if table == "thread_leases" {
+        "NEW.thread_id=(SELECT r.thread_id FROM public.runs r WHERE r.run_id=TG_ARGV[0])"
     } else if table == "audit_events" {
         "true"
     } else {
@@ -448,7 +451,7 @@ pub async fn trigger(
 pub async fn untrigger(pool: &Pool, table: &str) -> Result<(), String> {
     assert!(matches!(
         table,
-        "tool_calls" | "tool_attempts" | "run_events" | "audit_events"
+        "tool_calls" | "tool_attempts" | "thread_leases" | "audit_events"
     ));
     pool.get()
         .await
