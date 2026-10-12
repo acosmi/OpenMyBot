@@ -6,8 +6,10 @@ use super::{
     openai::{OpenAiApiKey, OpenAiProtocol, OpenAiProvider, OpenAiProviderConfig},
 };
 use crate::{
+    db::InfraError,
     model_runtime,
     net::safe_http::{SafeDialer, SafeHttpBudget},
+    thread_history_writer::{CurrentWriterSchema, OpenOrClosed, history_closed_for_read},
     vault::CredentialRecordVault,
 };
 use async_trait::async_trait;
@@ -115,8 +117,14 @@ impl PostgresCustomModelProvider {
                 let ProviderRoute::CustomModel(expected)=&request.route else{return Err(invalid("custom_model_route"));};
                 if expected.v2_snapshot().is_none(){return Err(invalid("custom_model_binding"));}
                 let lease=expected.identity_lease().map_err(map_authority)?;
+                // One strict schema observation before this transaction's first row lock.
+                let schema=CurrentWriterSchema::observe(transaction.as_transaction())
+                    .await.map_err(map_history_writer)?;
                 let loaded=model_runtime::load_v2_for_start(&transaction,&self.deployment,&self.tenant,&lease)
                     .await.map_err(map_authority)?;
+                // A closed Thread history refuses this new model request; the H SHARE stays until
+                // the adapter has returned and this original transaction has ended.
+                admit_open_history(&schema,transaction.as_transaction(),&lease).await?;
                 #[cfg(test)]
                 if std::time::Instant::now()>=deadline {
                     self.v2_expired_last_authority_ready.fetch_add(1,Ordering::SeqCst);
@@ -229,6 +237,11 @@ impl PostgresCustomModelProvider {
                     .await
                     .map_err(map_authority)?
                     .ok_or_else(|| invalid("custom_model_binding"))?;
+            // A closed Thread history refuses this new model request. The legacy start keeps no
+            // Thread or head lock across the send, because the durable cancel claim needs the
+            // Thread row while the response headers are pending; what follows this read belongs
+            // to the in-flight drain.
+            refuse_closed_history(&tx, &self.deployment, &self.tenant, &lease).await?;
             if loaded.binding != *expected {
                 return Err(invalid("custom_model_binding"));
             }
@@ -410,6 +423,44 @@ fn map_authority(error: AgentContextError) -> ProviderPortError {
     match error {
         AgentContextError::Unavailable => ProviderPortError::Unavailable,
         _ => invalid("custom_model_authority"),
+    }
+}
+/// Lock, query and invariant failures keep their own class; none of them reads as closed.
+fn map_history_writer(error: InfraError) -> ProviderPortError {
+    tracing::warn!(error = %error, "custom model start history admission failed");
+    match error {
+        InfraError::Connect { .. } | InfraError::Query { .. } => ProviderPortError::Unavailable,
+        _ => invalid("thread_history_writer"),
+    }
+}
+/// Lock-free read for the legacy start: only a closed head maps to the closed authority class.
+async fn refuse_closed_history(
+    tx: &tokio_postgres::Transaction<'_>,
+    deployment: &DeploymentId,
+    tenant: &TenantId,
+    lease: &openbot_application::RunExecutionLease,
+) -> Result<(), ProviderPortError> {
+    if history_closed_for_read(tx, deployment, tenant, lease.thread_id())
+        .await
+        .map_err(map_history_writer)?
+    {
+        return Err(map_authority(AgentContextError::Stale));
+    }
+    Ok(())
+}
+/// Only a closed head maps to the existing closed authority class of this entry.
+async fn admit_open_history(
+    schema: &CurrentWriterSchema<'_, '_>,
+    tx: &tokio_postgres::Transaction<'_>,
+    lease: &openbot_application::RunExecutionLease,
+) -> Result<(), ProviderPortError> {
+    match schema
+        .lock_thread_write_disposition(tx, lease.thread_id())
+        .await
+        .map_err(map_history_writer)?
+    {
+        OpenOrClosed::Open => Ok(()),
+        OpenOrClosed::Closed => Err(map_authority(AgentContextError::Stale)),
     }
 }
 #[derive(Default)]
