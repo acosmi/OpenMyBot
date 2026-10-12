@@ -1932,3 +1932,6 @@ This entry records finite product acceptance. Token exchange, enrollment, accoun
 
 
 2026-10-11 — UI5-P2: Candidate 27d7235 completed ten focused regressions, the UI library suite, directed WASM/Clippy/format/design/i18n/CSS/bundle checks, Web and fixture Host builds, followed by the mounted ModelPicker keyboard journey with en→zh→en updates. Independent finite build and runtime review passed on that candidate. Host shutdown used normal SIGTERM; earlier resource holds, entry failure and unavailable dependency responses retain their original attribution. This normal composition imports delivered main e529ca4 without modifying incoming backend product bytes; validation on the resulting candidate is pending. Full UI, independent visual oracle, pixels, native host and production dependencies remain open.
+
+
+2026-10-12T08:29:30.389787+00:00 - Existing PR177 closeout: six delivered-main Rust test files receive only reviewed Rustfmt 1.98 formatting after explicit file-scope handoff approval. Test assertions, SQL strings, production guards and dependencies are unchanged. Exact-candidate workspace format and the remaining directed checks still require actual results; the prior candidate failures remain recorded. No new work package or acceptance is added by this formatting change.

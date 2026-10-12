@@ -1440,17 +1440,41 @@ async fn foundation_original45_desktop_canary_upgrades_and_current_fresh_matches
     let upgraded_ledger = foundation_desktop_ledger(&database).await;
     assert_eq!(&upgraded_ledger[..old_ledger.len()], old_ledger.as_slice());
     let current_tail = [
-        (native::NATIVE_0046_VERSION, native::NATIVE_0046_NAME, native::NATIVE_0046_SQL),
-        (native::NATIVE_0047_VERSION, native::NATIVE_0047_NAME, native::NATIVE_0047_SQL),
-        (native::NATIVE_0048_VERSION, native::NATIVE_0048_NAME, native::NATIVE_0048_SQL),
-        (native::NATIVE_0049_VERSION, native::NATIVE_0049_NAME, native::NATIVE_0049_SQL),
-        (native::NATIVE_0050_VERSION, native::NATIVE_0050_NAME, native::NATIVE_0050_SQL),
+        (
+            native::NATIVE_0046_VERSION,
+            native::NATIVE_0046_NAME,
+            native::NATIVE_0046_SQL,
+        ),
+        (
+            native::NATIVE_0047_VERSION,
+            native::NATIVE_0047_NAME,
+            native::NATIVE_0047_SQL,
+        ),
+        (
+            native::NATIVE_0048_VERSION,
+            native::NATIVE_0048_NAME,
+            native::NATIVE_0048_SQL,
+        ),
+        (
+            native::NATIVE_0049_VERSION,
+            native::NATIVE_0049_NAME,
+            native::NATIVE_0049_SQL,
+        ),
+        (
+            native::NATIVE_0050_VERSION,
+            native::NATIVE_0050_NAME,
+            native::NATIVE_0050_SQL,
+        ),
     ];
     assert_eq!(upgraded_ledger.len(), old_ledger.len() + current_tail.len());
-    for (row, (version, name, sql)) in upgraded_ledger[old_ledger.len()..].iter().zip(current_tail) {
+    for (row, (version, name, sql)) in upgraded_ledger[old_ledger.len()..].iter().zip(current_tail)
+    {
         assert_eq!(row.0, version);
         assert_eq!(row.1, name);
-        assert_eq!(row.2, openbot_domain::audit::hash::Sha256Digest::of(sql.as_bytes()).to_hex());
+        assert_eq!(
+            row.2,
+            openbot_domain::audit::hash::Sha256Digest::of(sql.as_bytes()).to_hex()
+        );
     }
     let last = upgraded_ledger.last().unwrap();
     let ddl_after = foundation_desktop_ddl_facts(&database).await;
