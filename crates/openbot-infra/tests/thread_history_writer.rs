@@ -298,6 +298,7 @@ async fn w06_approval_component_remote_and_local_fixed_cleanup() {
         require(remote.persist_and_wait(&lease,&writer_interrupt(req.command.run_id.as_str(),"writer-late-remote")?).await==Err(RemoteInterruptError::Stale),"closed actual remote request accepted")?;
         require(writer_snapshot(&p).await?==before,"closed human APIs changed audit/body/metadata")?;
         runtime.finish_run(&lease,1,RunTerminal::Cancelled).await.map_err(|e|e.to_string())?;
+        require(component.wait_component_human_decision(&scope,&draft.decision_id).await==Err(ComponentAdministrationError::NotVisible),"original component waiter did not retire cancelled Run")?;
         let c=p.get().await.map_err(|e|e.to_string())?;
         let r=c.query_one("SELECT (SELECT bool_and(state='cancelled' AND answer IS NULL) FROM public.component_human_decisions WHERE run_id=$1),(SELECT bool_and(state='retired' AND descriptor IS NULL AND response_payload IS NULL) FROM public.remote_agent_interrupts WHERE run_id=$1)",&[&req.command.run_id.as_str()]).await.map_err(|e|e.to_string())?;
         require(r.get::<_,Option<bool>>(0)==Some(true)&&r.get::<_,Option<bool>>(1)==Some(true),"closed fixed component/remote cleanup did not commit")?;
@@ -489,7 +490,7 @@ async fn w08_actual_serializable_component_remote_roll_back() {
             owner.batch_execute(if blocked.is_ok(){"COMMIT"}else{"ROLLBACK"}).await.map_err(|e|e.to_string())?;
             let result=tokio::time::timeout(Duration::from_secs(8),worker).await.map_err(|_|"actual SER caller remained blocked".to_owned())?.map_err(|e|e.to_string())??;blocked?;
             require(result,"actual SERIALIZABLE caller retried/switched isolation or changed error class")?;
-            let r=observer.query_one("SELECT (SELECT count(*) FROM public.component_human_decisions WHERE run_id=$1),(SELECT count(*) FROM public.remote_agent_interrupts WHERE run_id=$1),(SELECT count(*) FROM public.audit_events WHERE event_type IN('component.human_requested','remote.interrupt_requested'))",&[&req.command.run_id.as_str()]).await.map_err(|e|e.to_string())?;
+            let r=observer.query_one("SELECT (SELECT count(*) FROM public.component_human_decisions WHERE run_id=$1),(SELECT count(*) FROM public.remote_agent_interrupts WHERE run_id=$1),(SELECT count(*) FROM public.audit_events WHERE event_type IN('component.human_requested','agent.remote_interrupt_requested'))",&[&req.command.run_id.as_str()]).await.map_err(|e|e.to_string())?;
             require((0..3).all(|i|r.get::<_,i64>(i)==0),"SER refusal retained human body/audit rows")?;
             drop(observer);drop(owner);drop(worker_pool);
         }Ok(())
