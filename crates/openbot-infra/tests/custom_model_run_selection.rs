@@ -476,7 +476,7 @@ async fn custom_binding_requires_both_halves_and_missing_adapter_never_starts_le
             if mode == 0 {
                 assert!(matches!(context.load(&lease).await.unwrap().route, openbot_application::ProviderRoute::CustomModel(_)));
             } else if mode < 4 {
-                assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection" });
+                assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection_storage" });
             } else {
                 assert!(matches!(context.load(&lease).await.unwrap().route, openbot_application::ProviderRoute::PackageOpenAi));
             }
@@ -557,7 +557,7 @@ async fn custom_binding_requires_both_halves_even_when_input_metadata_is_corrupt
             drop(c);
             let lease = RunExecutionLease::new(req.command.run_id.clone(), req.command.thread_id.clone(), req.command.bot_id.clone(), req.actor.clone(), openbot_domain::thread::FencingToken::new(1).unwrap(), 0).unwrap();
             let context = Arc::new(PostgresAgentContextSource::new(pool.clone(), DeploymentId::new(DEP), TenantId::new(TENANT), Some(32)).unwrap());
-            assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection" });
+            assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection_storage" });
             let runtime: Arc<dyn RunRuntime> = Arc::new(PostgresRunRuntime::new(pool.clone(), "selection-runtime".into(), Duration::seconds(30), DEFAULT_DISPATCH_CLAIM_DURATION).unwrap());
             let provider = Arc::new(LegacyProviderSpy::default());
             let agent = openbot_agent::BuiltInAgentRuntime::start(runtime.clone(), context,
