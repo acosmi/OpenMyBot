@@ -65,6 +65,17 @@ const SESSION_KEY: &[u8] = b"owned-cleanup-session-hash-key";
 const TEXT: &str = "  original saved cleanup text\n成果 café 🦀\t  ";
 const AUDIT_LOCK: i64 = 0x4f50_454e_4155_4431;
 
+// The complete source snapshot text follows the 1481-byte visible_run CTE. With PostgreSQL's
+// 1kB default, pg_stat_activity truncates it before the asserted marker and FROM/JOIN text.
+// The owned QA PostgreSQL contract fixes track_activity_query_size=16384; report its absence
+// as the environment fact instead of a product statement that never reached its lock.
+async fn require_activity_width(admin: &DatabasePool) -> Result<(), String> {
+    let width: i64 = admin.get().await.map_err(|error| error.to_string())?
+        .query_one("SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('track_activity_query_size'))", &[])
+        .await.map_err(|error| error.to_string())?.get(0);
+    require(width >= 16_384, "owned PostgreSQL track_activity_query_size was not actually sixteen KiB")
+}
+
 fn require(value: bool, message: &'static str) -> Result<(), String> {
     if value {
         Ok(())
@@ -1639,6 +1650,7 @@ async fn lost_original_guarded_read_rollback_ack_keeps_same_store_unproven_after
             drop(observer);
             // The original source schema is now complete; its actual BEGIN ACK remains
             // withheld so no source table query can preempt this genuine controller lock.
+            require_activity_width(&f.admin).await?;
             transaction.batch_execute("LOCK TABLE openbot_internal.artifact_cleanup_fences IN ACCESS EXCLUSIVE MODE").await
                 .map_err(|error| error.to_string())?;
             relay.release_original_ack(&socket, Hold::Begin)?;
@@ -2659,6 +2671,7 @@ async fn physical_genuine_original_read_ack_loss(f: &Fixture) -> Result<(), Stri
             drop(observer);
             // The original source schema is now complete; its actual BEGIN ACK remains
             // withheld so no source table query can preempt this genuine controller lock.
+            require_activity_width(&f.admin).await?;
             transaction.batch_execute("LOCK TABLE openbot_internal.artifact_cleanup_fences IN ACCESS EXCLUSIVE MODE").await
                 .map_err(|error| error.to_string())?;
             relay.release_original_ack(&socket, Hold::Begin)?;

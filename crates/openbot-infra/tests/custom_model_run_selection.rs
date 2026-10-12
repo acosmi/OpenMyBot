@@ -476,7 +476,7 @@ async fn custom_binding_requires_both_halves_and_missing_adapter_never_starts_le
             if mode == 0 {
                 assert!(matches!(context.load(&lease).await.unwrap().route, openbot_application::ProviderRoute::CustomModel(_)));
             } else if mode < 4 {
-                assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection" });
+                assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection_storage" });
             } else {
                 assert!(matches!(context.load(&lease).await.unwrap().route, openbot_application::ProviderRoute::PackageOpenAi));
             }
@@ -519,6 +519,104 @@ async fn custom_binding_requires_both_halves_and_missing_adapter_never_starts_le
     }).await;
 }
 
+// Own-DB corruption control for the input-metadata matrix below. Each statement declares, in
+// order, every exact refusal (trigger, 55000 message) that the 0050/0051 thread-history writer
+// guards give it as ordinary DML; an empty declaration asserts the ordinary DML is accepted.
+// Only each observed trigger is disabled, and every disabled trigger is origin-enabled again
+// before the owned COMMIT.
+const BODY_REFUSAL: &[(&str, &str)] = &[(
+    "messages_history_body_before",
+    "thread_history_writer_binding_invalid",
+)];
+async fn owned_dml(
+    pool: &openbot_infra::db::pool::DatabasePool,
+    table: &str,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    refusals: &[(&str, &str)],
+) {
+    let mut client = pool.get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")
+        .await
+        .unwrap();
+    let triggers: Vec<(String, String)> = tx
+        .query(
+            "SELECT t.tgname::text,p.proname::text FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_proc p ON p.oid=t.tgfoid \
+             WHERE t.tgrelid=('public.'||$1)::regclass AND NOT t.tgisinternal",
+            &[&table],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let mut disabled = 0;
+    loop {
+        tx.batch_execute("SAVEPOINT owned_dml_probe").await.unwrap();
+        match tx.execute(sql, params).await {
+            Ok(changed) => {
+                assert_eq!(
+                    disabled,
+                    refusals.len(),
+                    "{sql}: declared refusal {:?} did not occur",
+                    refusals.get(disabled)
+                );
+                assert!(changed > 0, "{sql}: owned corruption changed no row");
+                break;
+            }
+            Err(error) => {
+                let db = error
+                    .as_db_error()
+                    .unwrap_or_else(|| panic!("{sql}: {error}"));
+                let observed: Vec<&str> = triggers
+                    .iter()
+                    .filter(|(_, function)| {
+                        db.where_()
+                            .is_some_and(|w| w.contains(&format!("{function}(")))
+                    })
+                    .map(|(trigger, _)| trigger.as_str())
+                    .collect();
+                let Some(&(trigger, message)) = refusals.get(disabled) else {
+                    panic!(
+                        "{sql}: undeclared refusal {} {} {observed:?}",
+                        db.code().code(),
+                        db.message()
+                    );
+                };
+                assert_eq!(
+                    (db.code().code(), db.message(), observed.as_slice()),
+                    ("55000", message, [trigger].as_slice()),
+                    "{sql}"
+                );
+                tx.batch_execute(&format!("ROLLBACK TO SAVEPOINT owned_dml_probe; ALTER TABLE public.{table} DISABLE TRIGGER {trigger}")).await.unwrap();
+                disabled += 1;
+            }
+        }
+    }
+    for (trigger, _) in &refusals[..disabled] {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.{table} ENABLE TRIGGER {trigger}"
+        ))
+        .await
+        .unwrap();
+    }
+    let disabled_now: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid=('public.'||$1)::regclass AND NOT tgisinternal AND tgenabled<>'O'",
+            &[&table],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        disabled_now, 0,
+        "owned {table} guards were not restored before COMMIT"
+    );
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL 17; explicit include-ignored only"]
 async fn custom_binding_requires_both_halves_even_when_input_metadata_is_corrupt() {
@@ -544,20 +642,20 @@ async fn custom_binding_requires_both_halves_even_when_input_metadata_is_corrupt
             c.execute("DELETE FROM public.run_model_selections WHERE run_id=$1", &[&req.command.run_id.as_str()]).await.unwrap();
             let message_id = format!("{}:input", req.command.run_id.as_str());
             match mode {
-                0 => { c.execute("UPDATE public.messages SET role='assistant' WHERE message_id=$1", &[&message_id]).await.unwrap(); }
-                1 => { c.execute("UPDATE public.messages SET run_id='another-owned-run' WHERE message_id=$1", &[&message_id]).await.unwrap(); }
+                0 => owned_dml(&pool, "messages", "UPDATE public.messages SET role='assistant' WHERE message_id=$1", &[&message_id], &[]).await,
+                1 => owned_dml(&pool, "messages", "UPDATE public.messages SET run_id='another-owned-run' WHERE message_id=$1", &[&message_id], BODY_REFUSAL).await,
                 2 => {
-                    c.execute("INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,status,next_message_seq,next_event_seq,created_at,updated_at) SELECT 'another-owned-thread',tenant_id,deployment_id,created_by,anchor_kind,anchor_id,status,next_message_seq,next_event_seq,created_at,updated_at FROM public.threads WHERE thread_id=$1", &[&req.command.thread_id.as_str()]).await.unwrap();
-                    c.execute("UPDATE public.messages SET thread_id='another-owned-thread' WHERE message_id=$1", &[&message_id]).await.unwrap();
+                    owned_dml(&pool, "threads", "INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,status,next_message_seq,next_event_seq,created_at,updated_at) SELECT 'another-owned-thread',tenant_id,deployment_id,created_by,anchor_kind,anchor_id,status,next_message_seq,next_event_seq,created_at,updated_at FROM public.threads WHERE thread_id=$1", &[&req.command.thread_id.as_str()], &[]).await;
+                    owned_dml(&pool, "messages", "UPDATE public.messages SET thread_id='another-owned-thread' WHERE message_id=$1", &[&message_id], BODY_REFUSAL).await
                 }
-                _ => { c.execute("UPDATE public.messages SET actor_id='bob' WHERE message_id=$1", &[&message_id]).await.unwrap(); }
+                _ => owned_dml(&pool, "messages", "UPDATE public.messages SET actor_id='bob' WHERE message_id=$1", &[&message_id], &[]).await,
             }
             let marker: bool = c.query_one("SELECT content ? 'modelSelection' FROM public.messages WHERE message_id=$1", &[&message_id]).await.unwrap().get(0);
             assert!(marker, "the exact original input retains explicit intent in every corruption case");
             drop(c);
             let lease = RunExecutionLease::new(req.command.run_id.clone(), req.command.thread_id.clone(), req.command.bot_id.clone(), req.actor.clone(), openbot_domain::thread::FencingToken::new(1).unwrap(), 0).unwrap();
             let context = Arc::new(PostgresAgentContextSource::new(pool.clone(), DeploymentId::new(DEP), TenantId::new(TENANT), Some(32)).unwrap());
-            assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection" });
+            assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection_storage" });
             let runtime: Arc<dyn RunRuntime> = Arc::new(PostgresRunRuntime::new(pool.clone(), "selection-runtime".into(), Duration::seconds(30), DEFAULT_DISPATCH_CLAIM_DURATION).unwrap());
             let provider = Arc::new(LegacyProviderSpy::default());
             let agent = openbot_agent::BuiltInAgentRuntime::start(runtime.clone(), context,
