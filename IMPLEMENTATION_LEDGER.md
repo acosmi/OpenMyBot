@@ -2,7 +2,7 @@
 
 更新时间：2026-10-02。用户明确恢复实施，仅复核补全 v7/R422 对已合并交付的要求。074/075/076/077分别由PR #95/#96/#97/#98合入，入场main为`8fabc9f634c2f8c640373bf96d2bca8b80559726`。原PR、历史验收及未完成项保持；本轮新证据另列，不启动全新未交付能力。
 
-001–047 已核实为 main 祖先。换机主控已亲读、实测并正常合入049、050、051、052、053、056、057、058及重建060/061、新增必要维护063/064；055、072、073也已按PR及main祖先事实核实合入。048、054保留开放候选，059/062未完成，不能继续用旧待批准记录替代当前合同及实际检查状态。后端规范原件已在本机核对；旧机原始 QA 和其余缺失输入尚未恢复，不能把历史自报转记为新机验收通过。下方历次检查点是历史记录，当前状态以任务表及本轮最终结论为准。
+001–047 已核实为 main 祖先。换机主控已亲读、实测并正常合入049、050、051、052、053、056、057、058及重建060/061、新增必要维护063/064；055、072、073也已按PR及main祖先事实核实合入。048、054已于2026-10-12关闭未合入（ARCHIVE-20261012-01），059/062未完成，不能继续用旧待批准记录替代当前合同及实际检查状态。后端规范原件已在本机核对；旧机原始 QA 和其余缺失输入尚未恢复，不能把历史自报转记为新机验收通过。下方历次检查点是历史记录，当前状态以任务表及本轮最终结论为准。
 
 本台账记录实施与验证事实，不定义产品能力或架构。每个任务对应一个独立 PR，按冻结合同及实际依赖顺序集成。PR 链接中的合并状态与提交是远端集成事实；局部测试通过不表示产品阶段或发布验收完成。
 
@@ -59,13 +59,13 @@
 | V6-PR-045 | 固定网关账户身份读取与有界宿主传输 | 已合入 | [#52](https://github.com/acosmi/wrokbot/pull/52) | [38c7259a18](https://github.com/acosmi/wrokbot/commit/38c7259a187e719831b007202c5c4a3f5061f702) |
 | V6-PR-046 | 自定义模型四入口、队列消费与 UI 目录改名 | 已合入 | [#53](https://github.com/acosmi/wrokbot/pull/53) | [c970fced2e](https://github.com/acosmi/wrokbot/commit/c970fced2eb07f950033f42c8d13795e496b3e22) |
 | V6-PR-047 | SDK 个人凭据的 PG/Vault 持久授权与严格刷新 | 已合入；本轮核实祖先，历史测试未重跑 | [#54](https://github.com/acosmi/wrokbot/pull/54) | [f93ffcbe7c](https://github.com/acosmi/wrokbot/commit/f93ffcbe7c66338f4014e30366942262f777387b) |
-| V6-PR-048 | 第一方技术命名统一与既有数据兼容 | 精确命名合同未冻结，候选保留待验 | [#59](https://github.com/acosmi/wrokbot/pull/59) | 未合入 |
+| V6-PR-048 | 第一方技术命名统一与既有数据兼容 | 2026-10-12关闭未合入；需求由v7 §0.6独立兼容迁移承载，见ARCHIVE-20261012-01 | [#59](https://github.com/acosmi/wrokbot/pull/59) | 未合入 |
 | V6-PR-049 | archive_bundle Clippy 修复 | 主控已验且已合 | [#60](https://github.com/acosmi/wrokbot/pull/60) | [45a0c4a7ac](https://github.com/acosmi/wrokbot/commit/45a0c4a7ac826b47884cd313f6313b461cf41379) |
 | V6-PR-050 | native_0027/0028 历史幂等重检 | 主控已验且已合 | [#62](https://github.com/acosmi/wrokbot/pull/62) | [1f8e24b674](https://github.com/acosmi/wrokbot/commit/1f8e24b674dcd26c2478f6c0b7e40ed80eb32e97) |
 | V6-PR-051 | Infra 测试 Clippy 修复 | 主控已验且已合 | [#64](https://github.com/acosmi/wrokbot/pull/64) | [59647d1487](https://github.com/acosmi/wrokbot/commit/59647d1487930dd0504fd18f636379457104ba9f) |
 | V6-PR-052 | Desktop ScreenSessionService 局部装配 | 主控返修已验且已合，仅backend局部端口 | [#67](https://github.com/acosmi/wrokbot/pull/67) | [82db75413b](https://github.com/acosmi/wrokbot/commit/82db75413bd7ba7639abae2238a7d5ee722a0e0e) |
 | V6-PR-053 | transport_parity 的 ModelConnection 变体分类 | 主控已验且已合 | [#68](https://github.com/acosmi/wrokbot/pull/68) | [e7098b56fa](https://github.com/acosmi/wrokbot/commit/e7098b56fa58370811057b14d4715c642c4bc13b) |
-| V6-PR-054 | skip-link 键盘焦点修复 | 阻塞：UI原件与真实焦点验收输入缺失 | [#70](https://github.com/acosmi/wrokbot/pull/70) | 未合入 |
+| V6-PR-054 | skip-link 键盘焦点修复 | 2026-10-12关闭未合入；转UI v5.1 §13.4可访问性欠项，见ARCHIVE-20261012-01 | [#70](https://github.com/acosmi/wrokbot/pull/70) | 未合入 |
 | V6-PR-055 | UI wasm32 Clippy 修复 | 本轮独立本地检查通过；已正常合入 | [#71](https://github.com/acosmi/wrokbot/pull/71) | [8f7f75f4fa](https://github.com/acosmi/wrokbot/commit/8f7f75f4faa549472e0fcb343278ed343554712d) |
 | V6-PR-056 | Desktop Clippy 修复 | 主控返修已验且已合 | [#72](https://github.com/acosmi/wrokbot/pull/72) | [9bae520869](https://github.com/acosmi/wrokbot/commit/9bae520869f8dc2fb9833fae4b946cd99c3aa64a) |
 | V6-PR-057 | 既有格式差异修复 | 主控已验且已合 | [#74](https://github.com/acosmi/wrokbot/pull/74) | [acf1a26f15](https://github.com/acosmi/wrokbot/commit/acf1a26f15c5ef19f437ec77d56e7c51af0857fe) |
@@ -1923,6 +1923,9 @@ This entry records finite product acceptance. Token exchange, enrollment, accoun
 
 - V7-IMPL-036: Accepted product 77626e5288cba945b8ce10fa706c36a554ec49e6 (tree ee3ffc358e83ffb48079b3259b94a57a7fec78d1) adds native 0051 complete thread-history body-writer admission and canonical channel source closure: same-transaction writer disposition for the eight writer families, the seven body sources and new Runs, closed-thread fixed cleanup, and the private channel history source with its reverse guards, plus the matching current schema observers. Closure also keeps the original import conflict for an existing thread with a different binding. All 53 planned unique runtime cases passed on the exact candidate, with the four directed strict checks and workspace formatting; the remote-interrupt and writer remote waiters each passed ten repeated runs. A directed sweep of every touched test target and of other PG-backed targets that write the guarded tables found no 036 regression; their remaining failures reproduce identically on main 404d6cea (stale native-version/ledger-count assertions, an unknown-future migration probe using an existing version, artifact IO-timing fixtures, a whole-database restore that reports thread-origin corruption, and environment-gated restart/UI-dist cases). Existing fixtures now give terminal Runs their exactly-once terminal event, prove the ordinary 0051 refusal before any owned-database guard control, and move probe triggers off observed writer tables. Three independent reviews found no P1. Recorded follow-ups: Run-locked writer transactions now include the per-transaction schema observation, which widens contention with NOWAIT readers; the 0036 runs TRUNCATE guard is shadowed by the earlier 0051 refusal; adaptive message-corruption helpers do not list each expected refusal. ACK1/ACK2, the public clear workflow, 031 and the overall v7 goal remain open.
 
+
+- ARCHIVE-20261012-01（历史开放候选处置，不占V7-IMPL/V7-COMP/UI5-P*编号）：以main `b05d76e9e9d78c4fcd608e28ea72934491fc74a9`为基准只读核对后，按用户明确指示于2026-10-12正常关闭 [#59](https://github.com/acosmi/wrokbot/pull/59)（head `1528c7338a890cedd0334ea1d3ea91af1445d47e`）与 [#70](https://github.com/acosmi/wrokbot/pull/70)（head `776fdb27d2751b89649d515af9167ae6684f3a01`），均未合入、未被后续交付覆盖，PR内附关闭理由。048：main仍为`crates/openbot-*`等混合命名；v7 §0.6规定crate/path、Desktop/Engine身份和协议更名按独立兼容迁移，精确命名与冻结身份合同未冻结，现行条款及在途任务以`openbot-*`精确路径冻结；候选基于`f93ffcb`，落后687个提交，与main有291个改名/修改冲突路径，不倒推批准。需求继续由v7 §0.6承载。054：UI5重建后的`crates/wrokbot-ui/src/shell/layout.rs`仍只靠原生`#main-content`跳转，未显式移动焦点；UI v5.1 §13.4要求保留skip link与main focus target，该项转为UI5前端轨道的可访问性欠项，须在真实WebKit/桌面宿主中验证键盘激活后焦点落到`#main-content`。原关联issue #56/#57/#58/#69/#75均已关闭。两个原远端分支未删除；原head另由PR引用保留。本次未改产品代码、第一真源或交接索引，未运行CI。
+
 2026-10-08 — UI5-P2 Conversation ModelPicker fixture Source preparation: the existing testkit-only, explicitly enabled synthetic ModelPicker fixture now includes one empty active channel for the owned public assistant. The existing authenticated channel-detail read can mount its Conversation model picker without creating a thread or run. The default fixture, model write rejection and production capability boundaries are unchanged. Targeted Rust 1.98 formatting of this fixture file completed without further byte changes. Directed tests, build checks, fixture Host build and browser acceptance for this change are NOTRUN.
 
 2026-10-08 — UI5-P4 Agent detail Retry and scope cancellation were delivered by PR #170, normally merged as 4b93e7e87efb7f9be1c670110604e7962e098104 from b31cd9e47efc357673923af6cb0054aefbfcd0e9 after finite independent acceptance. Full UI, production, native OS, PostgreSQL, visual oracle and pixel acceptance remain open.
@@ -1941,3 +1944,6 @@ This entry records finite product acceptance. Token exchange, enrollment, accoun
 
 
 Existing UI PR177 normally incorporates delivered main b05d76e9 (backend PR183). All six overlapping test files retain the complete delivered-main contents; the conversation fixture product and original UI facts are preserved. The resulting exact candidate requires its own directed checks; earlier6c results retain their original attribution. No new UI package or whole-scope acceptance is added.
+
+
+Existing frontend PR177 normally incorporates delivered main4ba; only the six incoming backend test files and public facts differ from its prior main. The original empty-conversation fixture and complete main ledger plus existing UI facts are retained. Current exact checks are pending; the earlier validator entry failure remains. No new product task or whole UI acceptance.
