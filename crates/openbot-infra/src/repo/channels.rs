@@ -256,6 +256,20 @@ impl ChannelAdministration for ChannelRepo {
             ChannelAdministrationError::Unavailable
         })?;
         let result = async {
+            crate::db::native::validate_thread_origin_in_transaction(&transaction)
+                .await
+                .map_err(channel_origin_error)?;
+            let current_admin = crate::thread_origin::current_native_actor(
+                &transaction,
+                request.scope.actor.as_str(),
+                request.scope.auth_generation,
+            )
+            .await
+            .map_err(channel_origin_error)?
+            .ok_or(ChannelAdministrationError::NotVisible)?;
+            if current_admin != request.scope.admin {
+                return Err(ChannelAdministrationError::NotVisible);
+            }
             let actor = AgentActor {
                 id: request.scope.actor.as_str(),
                 admin: request.scope.admin,
@@ -363,6 +377,13 @@ impl ChannelAdministration for ChannelRepo {
                 )
                 .await
                 .map_err(|error| channel_admin_query("insert channel thread", error))?;
+            crate::thread_origin::record_new_native(
+                &transaction,
+                thread_id.as_str(),
+                crate::thread_origin::NativeOriginKind::PrivateAgentChannel,
+            )
+            .await
+            .map_err(channel_origin_error)?;
             Ok(ChannelDetail {
                 id: channel_id,
                 name,
@@ -382,6 +403,18 @@ impl ChannelAdministration for ChannelRepo {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+fn channel_origin_error(error: crate::db::InfraError) -> ChannelAdministrationError {
+    tracing::warn!(error = %error, "channel Thread origin verification failed");
+    match error {
+        crate::db::InfraError::Connect { .. } | crate::db::InfraError::Query { .. } => {
+            ChannelAdministrationError::Unavailable
+        }
+        _ => ChannelAdministrationError::Corrupt {
+            field: "thread_origin",
+        },
     }
 }
 

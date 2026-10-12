@@ -136,11 +136,14 @@ pub mod gateway_authority;
 mod gateway_authorization;
 #[cfg(feature = "server-runtime")]
 pub use gateway_authorization::journal::{
-    ClosedAttemptReceipt, ControlledCloseReason, CreatedAttemptOwner, GatewayAuthorizationJournal,
-    GatewayAuthorizationJournalAck, GatewayAuthorizationJournalError,
+    CallbackErrorKind, CallbackStage, ClosedAttemptReceipt, ControlledCloseReason,
+    CreatedAttemptOwner, GatewayAuthorizationCallbackError, GatewayAuthorizationCallbackWaitOwner,
+    GatewayAuthorizationJournal, GatewayAuthorizationJournalAck, GatewayAuthorizationJournalError,
     GatewayAuthorizationJournalErrorKind, GatewayAuthorizationJournalRuntimeOwner,
-    RegisteredAttemptOwner, RegistrationAdmissionReceipt, RegistrationDispatchError,
-    RegistrationDispatchKind,
+    GatewayAuthorizationTokenError, GatewayAuthorizationTokenKind, GatewayAuthorizationTokenOwner,
+    GatewayAuthorizationTokenReplyReason, GatewayAuthorizationTokenStage,
+    GatewayAuthorizationVerifiedCodeOwner, RegisteredAttemptOwner, RegistrationAdmissionReceipt,
+    RegistrationDispatchError, RegistrationDispatchKind,
 };
 #[cfg(feature = "server-runtime")]
 pub use tokio_util::sync::CancellationToken as GatewayAuthorizationCancellationToken;
@@ -198,9 +201,13 @@ pub mod tenant;
 #[cfg(feature = "server-runtime")]
 pub mod thread_directory;
 #[cfg(feature = "server-runtime")]
+pub mod thread_history_authority;
+#[cfg(feature = "server-runtime")]
 pub mod thread_id;
 #[cfg(any(feature = "server-runtime", feature = "desktop-local"))]
 pub mod thread_listener;
+#[cfg(feature = "server-runtime")]
+pub(crate) mod thread_origin;
 #[cfg(feature = "server-runtime")]
 pub mod tool_approval;
 #[cfg(feature = "server-runtime")]

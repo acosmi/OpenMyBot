@@ -183,6 +183,13 @@ impl Fixture {
             .await
             .map_err(|e| e.to_string())
     }
+    async fn tamper_thread_identity(&self, sql: &str) -> Result<(), String> {
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tamper_owned_thread_identity(&tx, sql, &[]).await?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
 }
 
 async fn fixture<F, Fut>(tag: &str, body: F)
@@ -349,6 +356,45 @@ async fn receipt_or_audit_insert_failure_rolls_back_all_business_effects() {
     }).await;
 }
 
+// Privileged corruption control is confined to this owned disposable test DB.
+// Probe the real guard for every change/restore and re-enable it in the same transaction.
+async fn tamper_owned_thread_identity(
+    tx: &tokio_postgres::Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<(), String> {
+    const REGISTERED_GUARD: &str = "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+        WHERE tgrelid='public.threads'::regclass \
+        AND tgname='threads_history_protect_identity_update' AND NOT tgisinternal";
+    let before: String = tx.query_one(REGISTERED_GUARD, &[]).await
+        .map_err(|e| e.to_string())?.get(0);
+    if before != "O" {
+        return Err("owned Thread identity guard was not registered and normally enabled".to_owned());
+    }
+    tx.batch_execute("SAVEPOINT owned_thread_identity_probe").await
+        .map_err(|e| e.to_string())?;
+    let ordinary = tx.execute(sql, params).await;
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_thread_identity_probe; RELEASE SAVEPOINT owned_thread_identity_probe")
+        .await.map_err(|e| e.to_string())?;
+    let refused = ordinary.as_ref().err().and_then(|e| e.as_db_error())
+        .is_some_and(|e| e.code().code() == "55000"
+            && e.message() == "thread_history_state_binding_invalid");
+    if !refused {
+        return Err("ordinary Thread identity DML was not refused by the registered guard".to_owned());
+    }
+    tx.batch_execute("ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update")
+        .await.map_err(|e| e.to_string())?;
+    let changed = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
+    tx.batch_execute("ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update")
+        .await.map_err(|e| e.to_string())?;
+    let after: String = tx.query_one(REGISTERED_GUARD, &[]).await
+        .map_err(|e| e.to_string())?.get(0);
+    if changed == 0 || after != "O" {
+        return Err("owned Thread identity tamper did not change a row and restore its guard".to_owned());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL via OPENBOT_TEST_DATABASE_URL"]
 async fn exact_original_binding_and_current_actor_are_required_before_effect() {
@@ -373,7 +419,15 @@ async fn exact_original_binding_and_current_actor_are_required_before_effect() {
             ("UPDATE public.agent_profiles SET visibility='private',owner_user_id='actor-b' WHERE agent_id='bot-a'".into(),"UPDATE public.agent_profiles SET visibility='public',owner_user_id=NULL WHERE agent_id='bot-a'".into()),
             ("UPDATE public.agent_profiles SET deleted_at=clock_timestamp() WHERE agent_id='bot-a'".into(),"UPDATE public.agent_profiles SET deleted_at=NULL WHERE agent_id='bot-a'".into()),
         ];
-        for (change,restore) in mutations {f.sql(&change).await?;assert!(store(&f.pool).remember_from_tool(request.clone()).await.is_err(),"bad binding admitted");assert_eq!(effects(&f.pool).await?,before);f.sql(&restore).await?;}
+        for (change,restore) in mutations {
+            let corrupts_thread_identity = matches!(change.as_str(),
+                "UPDATE public.threads SET tenant_id='tenant-b'"
+                | "UPDATE public.threads SET deployment_id='dep-b'");
+            if corrupts_thread_identity {f.tamper_thread_identity(&change).await?;} else {f.sql(&change).await?;}
+            assert!(store(&f.pool).remember_from_tool(request.clone()).await.is_err(),"bad binding admitted");
+            assert_eq!(effects(&f.pool).await?,before);
+            if corrupts_thread_identity {f.tamper_thread_identity(&restore).await?;} else {f.sql(&restore).await?;}
+        }
         // Keep the real run FK intact: create another owned run through the production entry.
         let mut foreign=f.begin.clone();
         foreign.command.run_id=RunId::new("foreign-run");
@@ -394,7 +448,8 @@ async fn exact_original_binding_and_current_actor_are_required_before_effect() {
         assert_eq!(effects(&f.pool).await?,before);
         f.pool.get().await.map_err(|e|e.to_string())?.execute("UPDATE public.tool_attempts SET tool_call_id=$2,attempt_seq=0 WHERE attempt_id=$1",&[&request.attempt().as_str(),&request.call().as_str()]).await.map_err(|e|e.to_string())?;
         // Channel membership and installation are independently required, even with a direct member.
-        f.sql("UPDATE public.threads SET anchor_kind='channel',anchor_id='channel-a'; DELETE FROM public.channel_memberships").await?;
+        f.tamper_thread_identity("UPDATE public.threads SET anchor_kind='channel',anchor_id='channel-a'").await?;
+        f.sql("DELETE FROM public.channel_memberships").await?;
         assert_eq!(store(&f.pool).remember_from_tool(request.clone()).await,Err(MemoryError::NotVisible));
         f.sql("INSERT INTO public.channel_memberships(channel_id,user_id) VALUES('channel-a','actor-a'); DELETE FROM public.channel_agents").await?;
         assert_eq!(store(&f.pool).remember_from_tool(request).await,Err(MemoryError::NotVisible));

@@ -7,8 +7,8 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use openbot_infra::db::{
-    InfraError, baseline, desktop_vault_canary, fresh, gateway_authorization_schema as journal,
-    native, pool, schema_facts,
+    InfraError, baseline, desktop_vault_canary, gateway_authorization_schema as journal, native,
+    pool, schema_facts,
     tables::{TableRow, gateway_authorization_attempts as attempts},
 };
 use serde_json::Value;
@@ -98,10 +98,13 @@ async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
         )?;
     } else {
         require(version == 48, "unregistered test target")?;
+        baseline::apply(&c).await.map_err(|e| e.to_string())?;
         require(
-            fresh::apply(&mut c).await.map_err(|e| e.to_string())?
-                == fresh::FreshApplyOutcome::Applied(native::ApplyOutcome::Applied),
-            "original fresh path did not apply48",
+            native::apply_through(&mut c, 48)
+                .await
+                .map_err(|e| e.to_string())?
+                == native::ApplyOutcome::Applied,
+            "explicit historical path did not apply48",
         )?;
     }
     c.execute(
@@ -287,7 +290,7 @@ async fn original47_upgrade48_replay_and_current_canary() {
         let absent: bool = c.query_one("SELECT to_regclass('openbot_internal.gateway_authorization_attempts') IS NULL", &[])
             .await.map_err(|e| e.to_string())?.try_get(0).map_err(|e| e.to_string())?;
         require(absent, "47 replay created unregistered journal")?;
-        require(native::apply(&mut c).await.map_err(|e| e.to_string())? == native::ApplyOutcome::Applied,
+        require(native::apply_through(&mut c, 48).await.map_err(|e| e.to_string())? == native::ApplyOutcome::Applied,
             "real47->48 did not apply exactly once")?;
         let counts: (i64, i32) = {
             let r = c.query_one("SELECT count(*),max(version) FROM openbot_internal.schema_migrations", &[])
@@ -303,14 +306,15 @@ async fn original47_upgrade48_replay_and_current_canary() {
             .map_err(|e| e.to_string())?;
         require(before == public46, "prior public facts not independentPUBLIC46")?;
         journal::verify(&c).await.map_err(|e| e.to_string())?;
-        desktop_vault_canary::verify_current_layout(&p).await.map_err(|e| e.to_string())?;
+        require(desktop_vault_canary::verify_pre_upgrade_layout(&p).await.map_err(|e| e.to_string())?.native_version()==48, "actual48 preupgrade canary rejected")?;
+        require(desktop_vault_canary::verify_current_layout(&p).await.is_err(), "historical48 incorrectly current49")?;
         c.batch_execute("CREATE TABLE openbot_internal.owned_journal_ddl_observations(tag text);
             CREATE FUNCTION openbot_internal.owned_journal_ddl_probe() RETURNS event_trigger LANGUAGE plpgsql AS
             $$BEGIN INSERT INTO openbot_internal.owned_journal_ddl_observations SELECT command_tag FROM pg_event_trigger_ddl_commands(); END$$;
             CREATE EVENT TRIGGER owned_journal_ddl_probe ON ddl_command_end EXECUTE FUNCTION openbot_internal.owned_journal_ddl_probe();
             TRUNCATE openbot_internal.owned_journal_ddl_observations;")
             .await.map_err(|e| e.to_string())?;
-        require(native::apply(&mut c).await.map_err(|e| e.to_string())? == native::ApplyOutcome::AlreadyApplied,
+        require(native::apply_through(&mut c, 48).await.map_err(|e| e.to_string())? == native::ApplyOutcome::AlreadyApplied,
             "48 replay was not AlreadyApplied")?;
         let ddl_count: i64 = c.query_one("SELECT count(*) FROM openbot_internal.owned_journal_ddl_observations", &[])
             .await.map_err(|e| e.to_string())?.try_get(0).map_err(|e| e.to_string())?;
@@ -664,11 +668,11 @@ async fn original48_v2_transaction_replay_requires_whole_journal() {
         initialize(&p,48).await?;
         let mut c=p.get().await.map_err(|e|e.to_string())?;
         // Normal native replay calls the original current V2 transaction observer.
-        require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,
+        require(native::apply_through(&mut c, 48).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,
             "current48 original transaction failed")?;
         c.batch_execute("ALTER TABLE openbot_internal.gateway_authorization_attempts ADD COLUMN damaged text")
             .await.map_err(|e|e.to_string())?;
-        let refusal=native::apply(&mut c).await;
+        let refusal=native::apply_through(&mut c, 48).await;
         require(matches!(refusal,Err(ref error) if structurally_invalid(error)),
             "current48 V2 transaction accepted damaged journal")?;
         let still_damaged:bool=c.query_one("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='openbot_internal.gateway_authorization_attempts'::regclass AND attname='damaged')",&[])
@@ -687,7 +691,7 @@ async fn native_holes_names_checksums_unknown49_and_extra_rows_refuse() {
             "DELETE FROM openbot_internal.schema_migrations WHERE version=47",
             "UPDATE openbot_internal.schema_migrations SET name='wrong_name' WHERE version=48",
             "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=48",
-            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(49,'unknown49',repeat('b',64))",
+            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(51,'unknown51',repeat('b',64))",
             "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(12,'unexpected12',repeat('c',64))",
         ];
         for sql in mutations {
@@ -719,7 +723,7 @@ async fn default_privilege_and_original_owner_refusal_roll_back_new_migration() 
             initialize(&p,47).await?;
             let mut c=p.get().await.map_err(|e|e.to_string())?;
             c.batch_execute(mutation).await.map_err(|e|e.to_string())?;
-            require(native::apply(&mut c).await.is_err(),"migration accepted forbidden owner/defaultACL")?;
+            require(native::apply_through(&mut c, 48).await.is_err(),"migration accepted forbidden owner/defaultACL")?;
             let r=c.query_one("SELECT to_regclass('openbot_internal.gateway_authorization_attempts') IS NULL,NOT EXISTS(SELECT 1 FROM openbot_internal.schema_migrations WHERE version=48)",&[])
                 .await.map_err(|e|e.to_string())?;
             require(r.try_get::<_,bool>(0).map_err(|e|e.to_string())? && r.try_get::<_,bool>(1).map_err(|e|e.to_string())?,
@@ -817,7 +821,9 @@ async fn distinct_and_colliding_owner_o_u_s_keep_object_specific_mapping() {
             .await
             .map_err(|e| e.to_string())?;
             require(
-                native::apply(&mut c).await.map_err(|e| e.to_string())?
+                native::apply_through(&mut c, 48)
+                    .await
+                    .map_err(|e| e.to_string())?
                     == native::ApplyOutcome::Applied,
                 "different owner fixture could not apply original48",
             )?;
