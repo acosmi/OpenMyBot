@@ -2457,6 +2457,45 @@ async fn actual_owned_pg_current_read_and_sync_fd_tail() {
     .await;
 }
 
+// Privileged corruption control is confined to this owned disposable test DB.
+// Probe the real guard for every change/restore and re-enable it in the same transaction.
+async fn tamper_owned_thread_identity(
+    tx: &tokio_postgres::Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<(), String> {
+    const REGISTERED_GUARD: &str = "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+        WHERE tgrelid='public.threads'::regclass \
+        AND tgname='threads_history_protect_identity_update' AND NOT tgisinternal";
+    let before: String = tx.query_one(REGISTERED_GUARD, &[]).await
+        .map_err(|e| e.to_string())?.get(0);
+    if before != "O" {
+        return Err("owned Thread identity guard was not registered and normally enabled".to_owned());
+    }
+    tx.batch_execute("SAVEPOINT owned_thread_identity_probe").await
+        .map_err(|e| e.to_string())?;
+    let ordinary = tx.execute(sql, params).await;
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_thread_identity_probe; RELEASE SAVEPOINT owned_thread_identity_probe")
+        .await.map_err(|e| e.to_string())?;
+    let refused = ordinary.as_ref().err().and_then(|e| e.as_db_error())
+        .is_some_and(|e| e.code().code() == "55000"
+            && e.message() == "thread_history_state_binding_invalid");
+    if !refused {
+        return Err("ordinary Thread identity DML was not refused by the registered guard".to_owned());
+    }
+    tx.batch_execute("ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update")
+        .await.map_err(|e| e.to_string())?;
+    let changed = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
+    tx.batch_execute("ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update")
+        .await.map_err(|e| e.to_string())?;
+    let after: String = tx.query_one(REGISTERED_GUARD, &[]).await
+        .map_err(|e| e.to_string())?.get(0);
+    if changed == 0 || after != "O" {
+        return Err("owned Thread identity tamper did not change a row and restore its guard".to_owned());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum SourceMutation {
     DirectMembership,
@@ -2505,6 +2544,8 @@ impl SourceMutation {
     }
     fn lock_sql(self) -> &'static str {
         match self {
+            // Acquire the ALTER TRIGGER table lock before releasing the real final query.
+            Self::ThreadTenant => "LOCK TABLE public.sessions,public.threads IN ACCESS EXCLUSIVE MODE",
             Self::OperationPayload => {
                 "LOCK TABLE public.sessions,openbot_internal.artifact_save_operations IN ACCESS EXCLUSIVE MODE"
             }
@@ -2520,7 +2561,7 @@ impl SourceMutation {
     async fn apply(self, f: &Fixture, tx: &tokio_postgres::Transaction<'_>) -> Result<(), String> {
         match self {
             Self::DirectMembership => tx.batch_execute("DELETE FROM public.thread_memberships WHERE user_id='read-owner'").await.map_err(|e| e.to_string()),
-            Self::ThreadTenant => tx.batch_execute("UPDATE public.threads SET tenant_id='foreign'").await.map_err(|e| e.to_string()),
+            Self::ThreadTenant => tamper_owned_thread_identity(tx, "UPDATE public.threads SET tenant_id='foreign'", &[]).await,
             Self::ProfileVisibility => tx.batch_execute("UPDATE public.agent_profiles SET visibility='private',owner_user_id='read-other'").await.map_err(|e| e.to_string()),
             Self::ChannelMembership => tx.batch_execute("DELETE FROM public.channel_memberships WHERE user_id='read-owner'").await.map_err(|e| e.to_string()),
             Self::ChannelAssignment => tx.batch_execute("DELETE FROM public.channel_agents WHERE channel_id='read-channel'").await.map_err(|e| e.to_string()),

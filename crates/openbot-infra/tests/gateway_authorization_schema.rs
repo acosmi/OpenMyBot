@@ -691,7 +691,7 @@ async fn native_holes_names_checksums_unknown49_and_extra_rows_refuse() {
             "DELETE FROM openbot_internal.schema_migrations WHERE version=47",
             "UPDATE openbot_internal.schema_migrations SET name='wrong_name' WHERE version=48",
             "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=48",
-            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(50,'unknown50',repeat('b',64))",
+            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(51,'unknown51',repeat('b',64))",
             "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(12,'unexpected12',repeat('c',64))",
         ];
         for sql in mutations {
