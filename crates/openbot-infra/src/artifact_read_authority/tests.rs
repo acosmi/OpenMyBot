@@ -842,9 +842,17 @@ struct SharedPgReadPhases {
     // R432 control-before observes through the same final statement path before any IO.
     // The single-shot test gate is armed only by the actual after-IO trace, so it still
     // selects the final joint rather than the earlier control query.
-    final_gate_after_io: std::sync::Mutex<Option<(std::sync::Weak<PostgresArtifactReadAuthority>, FinalQueryGate)>>,
+    final_gate_after_io: std::sync::Mutex<
+        Option<(
+            std::sync::Weak<PostgresArtifactReadAuthority>,
+            FinalQueryGate,
+        )>,
+    >,
 }
-type FinalQueryGate = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+type FinalQueryGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 impl SharedPgReadPhases {
     fn after_io(authority: &Arc<PostgresArtifactReadAuthority>, gate: FinalQueryGate) -> Arc<Self> {
         let phases = Self::default();
@@ -852,7 +860,11 @@ impl SharedPgReadPhases {
         Arc::new(phases)
     }
     fn arm_final_gate(&self) {
-        let armed = self.final_gate_after_io.lock().ok().and_then(|mut slot| slot.take());
+        let armed = self
+            .final_gate_after_io
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
         if let Some((authority, gate)) = armed
             && let Some(authority) = authority.upgrade()
             && let Ok(mut slot) = authority.final_query_gate.lock()
@@ -1113,7 +1125,8 @@ async fn shared_pg_final_leg(config: DatabaseConfig, leg: SharedPgFinalLeg) -> R
     drop(probe); // With seven original leases held, only this exact connection can serve the read.
     let (reached, reached_rx) = tokio::sync::oneshot::channel();
     let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
-    let phases = SharedPgReadPhases::after_io(&f.administration.read_authority(), (reached, proceed_rx));
+    let phases =
+        SharedPgReadPhases::after_io(&f.administration.read_authority(), (reached, proceed_rx));
     let dispatch = tracing::Dispatch::new(SharedPgPhaseSubscriber(phases.clone()));
     let administration = f.administration.clone();
     let auth = f.auth();

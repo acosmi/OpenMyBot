@@ -73,7 +73,10 @@ async fn require_activity_width(admin: &DatabasePool) -> Result<(), String> {
     let width: i64 = admin.get().await.map_err(|error| error.to_string())?
         .query_one("SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('track_activity_query_size'))", &[])
         .await.map_err(|error| error.to_string())?.get(0);
-    require(width >= 16_384, "owned PostgreSQL track_activity_query_size was not actually sixteen KiB")
+    require(
+        width >= 16_384,
+        "owned PostgreSQL track_activity_query_size was not actually sixteen KiB",
+    )
 }
 
 fn require(value: bool, message: &'static str) -> Result<(), String> {
