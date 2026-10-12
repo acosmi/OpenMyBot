@@ -14,9 +14,11 @@ const MAX_NOTIFY_BYTES: usize = 7_000;
 
 pub(crate) async fn record_from_message(
     transaction: &Transaction<'_>,
+    schema: &crate::thread_history_writer::CurrentWriterSchema<'_, '_>,
     message_id: &MessageId,
 ) -> Result<(), InfraError> {
-    crate::thread_history_writer::verify_current_in_transaction(transaction).await?;
+    // The caller observed the current schema on this transaction before its first row
+    // lock, so the channel serial point below never waits on a catalog observation.
     // Resolve only the actual written message's physical anchor. No caller text,
     // timestamp, J or arbitrary newest Run can select the source.
     let anchor = transaction
@@ -66,7 +68,9 @@ pub(crate) async fn record_from_message(
         return Ok(());
     }
     let thread: String = decode(&source, "thread_id")?;
-    crate::thread_history_writer::require_open(transaction, &ThreadId::new(&thread)).await?;
+    schema
+        .require_open(transaction, &ThreadId::new(&thread))
+        .await?;
     let role: String = decode(&source, "role")?;
     let actor: Option<String> = decode(&source, "message_actor")?;
     let run_actor: String = decode(&source, "actor_id")?;

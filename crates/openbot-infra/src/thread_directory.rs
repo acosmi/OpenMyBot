@@ -1371,6 +1371,11 @@ async fn apply_begin(
     runtime: &RuntimeLease,
     request: &BeginThreadRunRequest,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
+    // One same-transaction observation of the strict current schema, before any lock;
+    // writer admission and the channel source below consume this proof.
+    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
+        .await
+        .map_err(origin_error)?;
     crate::model_runtime::validate_actor(transaction, request).await?;
     skills::validate_actor(transaction, request).await?;
     let command = &request.command;
@@ -1383,9 +1388,6 @@ async fn apply_begin(
         .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
 
     let existing_thread = load_thread(transaction, request).await?;
-    crate::db::native::validate_thread_origin_in_transaction(transaction)
-        .await
-        .map_err(origin_error)?;
     if existing_thread.is_some() {
         crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
             .await
@@ -1433,7 +1435,8 @@ async fn apply_begin(
         }
     };
 
-    crate::thread_history_writer::require_open(transaction, &command.thread_id)
+    schema
+        .require_open(transaction, &command.thread_id)
         .await
         .map_err(writer_error)?;
     // Re-observe the original authority in a fresh statement after actual admission.
@@ -1690,7 +1693,7 @@ async fn apply_begin(
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
     if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
-        crate::channel_activity::record_from_message(transaction, message.id())
+        crate::channel_activity::record_from_message(transaction, &schema, message.id())
             .await
             .map_err(writer_error)?;
     }
@@ -2060,6 +2063,18 @@ async fn apply_begin_v2(
     request: &BeginThreadRunV2Request,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     let transaction = model_transaction.as_transaction();
+    // One same-transaction observation of the strict current schema, before any lock;
+    // writer admission and the channel source below consume this proof.
+    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
+        .await
+        .map_err(|error| match error {
+            InfraError::RepositoryInvariant {
+                code: "thread_origin_native_prefix_invalid",
+            } => ThreadDirectoryError::Corrupt {
+                field: "model_dataset_binding",
+            },
+            error => origin_error(error),
+        })?;
     crate::model_runtime::validate_actor_v2(transaction, request).await?;
     skills::validate_v2_slugs(request)?;
     let command = &request.command;
@@ -2072,16 +2087,6 @@ async fn apply_begin_v2(
         .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
 
     let existing_thread = load_thread_v2(transaction, request).await?;
-    crate::db::native::validate_thread_origin_in_transaction(transaction)
-        .await
-        .map_err(|error| match error {
-            InfraError::RepositoryInvariant {
-                code: "thread_origin_native_prefix_invalid",
-            } => ThreadDirectoryError::Corrupt {
-                field: "model_dataset_binding",
-            },
-            error => origin_error(error),
-        })?;
     if existing_thread.is_some() {
         crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
             .await
@@ -2125,7 +2130,8 @@ async fn apply_begin_v2(
         }
     };
 
-    crate::thread_history_writer::require_open(transaction, &command.thread_id)
+    schema
+        .require_open(transaction, &command.thread_id)
         .await
         .map_err(writer_error)?;
     // Re-observe the original authority in a fresh statement after actual admission.
@@ -2394,7 +2400,7 @@ async fn apply_begin_v2(
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
     if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
-        crate::channel_activity::record_from_message(transaction, message.id())
+        crate::channel_activity::record_from_message(transaction, &schema, message.id())
             .await
             .map_err(writer_error)?;
     }
