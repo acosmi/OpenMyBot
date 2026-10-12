@@ -287,25 +287,17 @@ async fn native_constraints_and_repositories_enforce_fencing_replay_outbox_and_m
                 })
                 .await
                 .map_err(|error| error.to_string())?;
+            // Like the real finish, the exactly-once terminal event and the Run terminal
+            // state settle in one transaction; neither half may commit alone.
             client
                 .execute(
-                    "UPDATE public.runs SET status='completed',terminal_event_seq=1,finished_at=$2 \
-                     WHERE run_id=$1",
+                    "WITH r AS (UPDATE public.runs SET status='completed',terminal_event_seq=1, \
+                       finished_at=$2 WHERE run_id=$1 RETURNING run_id,thread_id) \
+                     INSERT INTO public.run_events( \
+                       run_id,seq,thread_id,event_seq,event_type,payload,terminal,created_at) \
+                     SELECT run_id,1,thread_id,1,'completed','{}'::jsonb,true,$2 FROM r",
                     &[&"run-1", &(now + Duration::SECOND)],
                 )
-                .await
-                .map_err(|error| error.to_string())?;
-            events
-                .insert(&run_events::Row {
-                    run_id: "run-1".to_owned(),
-                    seq: 1,
-                    thread_id: "thread-1".to_owned(),
-                    event_seq: 1,
-                    event_type: "completed".to_owned(),
-                    payload: json!({}),
-                    terminal: true,
-                    created_at: now + Duration::SECOND,
-                })
                 .await
                 .map_err(|error| error.to_string())?;
             events

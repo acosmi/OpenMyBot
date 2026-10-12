@@ -419,6 +419,63 @@ impl Fixture {
             .map_err(|error| error.to_string())
     }
 
+    // Own-DB corruption control for the static canonical-message matrix: the ordinary DML is
+    // tried first; only an exact 0051 writer refusal (55000 thread_history_writer_*) leads to
+    // suppressing the three message writer guards for that statement, restored before COMMIT.
+    async fn owned_message_sql(&self, sql: &str) -> Result<(), String> {
+        const GUARDS: [&str; 3] = [
+            "messages_history_body_before",
+            "messages_history_canonical_before",
+            "messages_history_source_final",
+        ];
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE; SAVEPOINT owned_message_probe")
+            .await
+            .map_err(|e| e.to_string())?;
+        match tx.batch_execute(sql).await {
+            Ok(()) => {}
+            Err(error)
+                if error.as_db_error().is_some_and(|e| {
+                    e.code().code() == "55000" && e.message().starts_with("thread_history_writer_")
+                }) =>
+            {
+                tx.batch_execute("ROLLBACK TO SAVEPOINT owned_message_probe")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for guard in GUARDS {
+                    tx.batch_execute(&format!(
+                        "ALTER TABLE public.messages DISABLE TRIGGER {guard}"
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                tx.batch_execute(sql).await.map_err(|e| e.to_string())?;
+                for guard in GUARDS {
+                    tx.batch_execute(&format!(
+                        "ALTER TABLE public.messages ENABLE TRIGGER {guard}"
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    let state: String = tx
+                        .query_one(
+                            "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+                             WHERE tgrelid='public.messages'::regclass AND tgname=$1 AND NOT tgisinternal",
+                            &[&guard],
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .get(0);
+                    if state != "O" {
+                        return Err(format!("owned message guard {guard} was not restored"));
+                    }
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     async fn source_text(&self) -> Result<String, String> {
         self.pool
             .get()
@@ -1168,7 +1225,7 @@ async fn authoritative_source_selector_role_and_json_text_failures_create_no_obj
             "UPDATE public.messages SET content='{\"text\":17}'::jsonb",
             "UPDATE public.messages SET content='{\"text\":\"\"}'::jsonb",
         ] {
-            fixture.sql(content).await?;
+            fixture.owned_message_sql(content).await?;
             require(
                 administration
                     .save_run_message_text(&fixture.auth(), request.clone())

@@ -804,7 +804,7 @@ async fn server_namespace_schema_native_prefix_and_snapshot_shape_drift_never_ac
                 2=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=repeat('0',64) WHERE version=47",&[]).await.unwrap();},
                 3=>{c.execute("UPDATE openbot_internal.schema_migrations SET name='owned_wrong_native_name' WHERE version=47",&[]).await.unwrap();},
                 4=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=46",&[]).await.unwrap();},
-                5=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(51,'owned_unknown_native_version',repeat('0',64))",&[]).await.unwrap();},
+                5=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(52,'owned_unknown_native_version',repeat('0',64))",&[]).await.unwrap();},
                 _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT run_model_selection_v2_snapshots_protocol_check TO owned_v2_fault_snapshot_protocol").await.unwrap();},
             }
             if mode==6 {assert!(openbot_infra::db::custom_model_v2_schema::verify(&c).await.is_err());}
@@ -821,7 +821,7 @@ async fn server_namespace_schema_native_prefix_and_snapshot_shape_drift_never_ac
                 2=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=$1 WHERE version=47",&[&latest_checksum]).await.unwrap();},
                 3=>{c.execute("UPDATE openbot_internal.schema_migrations SET name=$1 WHERE version=47",&[&latest_name]).await.unwrap();},
                 4=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum,applied_at) VALUES(46,$1,$2,$3)",&[&gap_name,&gap_checksum,&gap_applied]).await.unwrap();},
-                5=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=51",&[]).await.unwrap();},
+                5=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=52",&[]).await.unwrap();},
                 _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT owned_v2_fault_snapshot_protocol TO run_model_selection_v2_snapshots_protocol_check").await.unwrap();},
             }
             let restored_ledger:Value=c.query_one("SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM openbot_internal.schema_migrations m",&[]).await.unwrap().get(0);

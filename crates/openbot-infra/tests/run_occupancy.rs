@@ -276,8 +276,11 @@ async fn reverse_integrity_rejects_orphan_and_nonblocking_slots_without_any_miss
             // Legitimate born-background RR with a real terminal row; its thread has no expected O slot.
             c.execute("INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,next_event_seq) VALUES($1,'tenant','occupancy-deployment','actor','direct_bot','bot',2)",&[&thread.as_str()]).await.unwrap();
             c.execute("INSERT INTO public.thread_memberships(thread_id,user_id) VALUES($1,'actor')",&[&thread.as_str()]).await.unwrap();
+            // The terminal Run and its exactly-once terminal event commit together (0051).
+            c.batch_execute("BEGIN").await.unwrap();
             c.execute("INSERT INTO public.runs(run_id,thread_id,bot_id,actor_id,foreground,status,fencing_token,next_event_seq,terminal_event_seq,error_code,started_at,finished_at) VALUES('background',$1,'bot','actor',false,'reconciliation_required',1,2,1,'fixture_unknown',now(),now())",&[&thread.as_str()]).await.unwrap();
             c.execute("INSERT INTO public.run_events(run_id,seq,thread_id,event_seq,event_type,payload,terminal) VALUES('background',0,$1,0,'started','{}',false),('background',1,$1,1,'reconciliation_required','{}',true)",&[&thread.as_str()]).await.unwrap();
+            c.batch_execute("COMMIT").await.unwrap();
             f.begin.command.thread_id=thread.clone();f.begin.command.run_id=RunId::new("background");f.supports_replay=false;
             assert!(!f.directory.run_reconciliation(f.read_request()).await.unwrap().foreground_blocked);
             assert!(!f.directory.run_effect_receipts(f.read_request()).await.unwrap().foreground_blocked);
@@ -299,7 +302,9 @@ async fn reverse_integrity_rejects_orphan_and_nonblocking_slots_without_any_miss
 async fn begin_uses_rc_even_when_the_reused_database_session_defaults_to_rr() {
     fixture("occupancy_begin_rc",|f|async move {
         let c=f.pool.get().await.unwrap();
-        c.batch_execute("CREATE FUNCTION public.require_begin_rc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('transaction_isolation') <> 'read committed' OR current_setting('default_transaction_isolation') <> 'repeatable read' THEN RAISE EXCEPTION USING ERRCODE='23514',MESSAGE='begin isolation mismatch'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_begin_rc BEFORE INSERT ON public.runs FOR EACH ROW EXECUTE FUNCTION public.require_begin_rc(); SET default_transaction_isolation='repeatable read'").await.unwrap();
+        // The probe watches begin's own lease write; a foreign trigger on runs would be refused
+        // up front by the exact 0051 writer schema observer.
+        c.batch_execute("CREATE FUNCTION public.require_begin_rc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('transaction_isolation') <> 'read committed' OR current_setting('default_transaction_isolation') <> 'repeatable read' THEN RAISE EXCEPTION USING ERRCODE='23514',MESSAGE='begin isolation mismatch'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_begin_rc BEFORE INSERT ON public.thread_leases FOR EACH ROW EXECUTE FUNCTION public.require_begin_rc(); SET default_transaction_isolation='repeatable read'").await.unwrap();
         drop(c);
         let mut request=f.begin.clone();request.command.thread_id=ThreadIdentity::new(&request.deployment).mint_from_entropy([0x79;16]);request.command.run_id=RunId::new("rc-begin");
         f.directory.begin_thread_run(request).await.unwrap();
@@ -399,7 +404,7 @@ async fn a_competing_runtime_lease_cannot_hide_visible_occupancy_corruption() {
 #[tokio::test]
 #[ignore = "requires owned isolated PostgreSQL 17"]
 async fn a_nonblocking_run_cannot_hide_the_missing_unknown_owner_after_a_page_cursor() {
-    corrupted("occupancy_nonblocking","INSERT INTO public.runs(run_id,thread_id,bot_id,actor_id,foreground,status,fencing_token,terminal_event_seq,created_at,started_at,finished_at) SELECT 'history',thread_id,bot_id,actor_id,true,'completed',fencing_token,1,created_at,started_at,finished_at FROM public.runs WHERE run_id='original'; UPDATE public.thread_run_occupancy SET run_id='history'").await;
+    corrupted("occupancy_nonblocking","WITH r AS (INSERT INTO public.runs(run_id,thread_id,bot_id,actor_id,foreground,status,fencing_token,terminal_event_seq,created_at,started_at,finished_at) SELECT 'history',thread_id,bot_id,actor_id,true,'completed',fencing_token,1,created_at,started_at,finished_at FROM public.runs WHERE run_id='original' RETURNING run_id,thread_id) INSERT INTO public.run_events(run_id,seq,thread_id,event_seq,event_type,payload,terminal) SELECT r.run_id,1,r.thread_id,(SELECT coalesce(max(e.event_seq)+1,0) FROM public.run_events e WHERE e.thread_id=r.thread_id),'completed','{}'::jsonb,true FROM r; UPDATE public.thread_run_occupancy SET run_id='history'").await;
 }
 
 #[tokio::test]
