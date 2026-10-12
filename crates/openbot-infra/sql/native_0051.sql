@@ -1514,6 +1514,9 @@ NOT EXISTS (
    FOR v_col IN SELECT value FROM jsonb_array_elements(v_row->'columns') LOOP
     v_attr:=(v_col->>'attributeNumber')::smallint;
  v_deps:=v_deps||jsonb_build_array(jsonb_build_object('classid',2606,'objid',v_oid::pg_catalog.int8,'objsubid',0,'refclassid',1259,'refobjid',v_relation_oid::pg_catalog.int8,'refobjsubid',v_attr,'deptype','a'));
+    IF v_row->>'kind'='c' THEN
+ v_deps:=v_deps||jsonb_build_array(jsonb_build_object('classid',2606,'objid',v_oid::pg_catalog.int8,'objsubid',0,'refclassid',1259,'refobjid',v_relation_oid::pg_catalog.int8,'refobjsubid',v_attr,'deptype','n'));
+    END IF;
    END LOOP;
   END IF;
   IF v_row->>'kind'='p' THEN

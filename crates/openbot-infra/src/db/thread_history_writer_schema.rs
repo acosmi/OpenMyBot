@@ -2282,6 +2282,17 @@ fn check_source_dependencies(raw: &Value, owner: u32) -> Result<(), InfraError> 
                     number(&column["attributeNumber"])?,
                     "a",
                 ));
+                if c["kind"] == "c" {
+                    expected.push(dependence(
+                        CONSTRAINT,
+                        id,
+                        0,
+                        CLASS,
+                        relation,
+                        number(&column["attributeNumber"])?,
+                        "n",
+                    ));
+                }
             }
         }
         if c["kind"] == "p" {
