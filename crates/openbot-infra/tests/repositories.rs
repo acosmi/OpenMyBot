@@ -54,15 +54,18 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool, seed: bool) -> 
     baseline::apply(&client)
         .await
         .map_err(|error| format!("应用 baseline 失败：{error}"))?;
-    native::apply(&mut client)
-        .await
-        .map_err(|error| format!("应用 native migrations 失败：{error}"))?;
+    // seed-0012 is schema-0012 legacy data (including free channel previews). It is
+    // loaded where it was generated and then upgraded; current 0051 guards rightly
+    // refuse a new non-NULL preview without a canonical source.
     if seed {
         client
             .batch_execute(SEED_SQL)
             .await
             .map_err(|error| format!("灌入 seed-0012 失败：{error}"))?;
     }
+    native::apply(&mut client)
+        .await
+        .map_err(|error| format!("应用 native migrations 失败：{error}"))?;
     Ok(())
 }
 

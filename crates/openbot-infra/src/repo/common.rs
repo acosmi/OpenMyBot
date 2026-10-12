@@ -35,8 +35,66 @@ where
 
     pub(crate) async fn insert(&self, row: &R) -> Result<R, InfraError> {
         let sql = insert_sql::<R>();
-        let client = self.client().await?;
+        let mut client = self.client().await?;
         let params = row.as_sql_params();
+        if matches!(
+            R::TABLE_NAME,
+            "threads" | "messages" | "runs" | "run_events"
+        ) {
+            let transaction = client
+                .build_transaction()
+                .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+                .start()
+                .await
+                .map_err(|source| InfraError::query("建立类型化正文insert原事务", source))?;
+            crate::thread_history_writer::verify_current_in_transaction(&transaction).await?;
+            if R::TABLE_NAME != "threads" {
+                let thread_index = R::COLUMNS
+                    .iter()
+                    .position(|column| *column == "thread_id")
+                    .ok_or_else(|| {
+                        InfraError::repository_invariant(
+                            "thread_history_writer_row_mapping_invalid",
+                        )
+                    })?;
+                let thread_param = *params.get(thread_index).ok_or_else(|| {
+                    InfraError::repository_invariant("thread_history_writer_row_mapping_invalid")
+                })?;
+                let binding=if matches!(R::TABLE_NAME,"messages"|"run_events") {
+                    let run_index=R::COLUMNS.iter().position(|column|*column=="run_id")
+                        .ok_or_else(||InfraError::repository_invariant("thread_history_writer_row_mapping_invalid"))?;
+                    let run_param=*params.get(run_index)
+                        .ok_or_else(||InfraError::repository_invariant("thread_history_writer_row_mapping_invalid"))?;
+                    transaction.query_opt(
+                        "SELECT t.thread_id FROM public.threads t LEFT JOIN public.runs r ON r.run_id=$2::text WHERE t.thread_id=$1::text AND (($2::text IS NULL AND $3::boolean) OR r.thread_id=t.thread_id)",
+                        &[thread_param,run_param,&(R::TABLE_NAME=="messages")],
+                    ).await
+                } else {
+                    transaction.query_opt("SELECT thread_id FROM public.threads WHERE thread_id=$1::text",&[thread_param]).await
+                }.map_err(|source|crate::thread_history_writer::query_error("核类型化正文实际Run/Thread来源",source))?
+                    .ok_or_else(||InfraError::repository_invariant("thread_history_writer_binding_invalid"))?;
+                let actual: String = binding.try_get("thread_id").map_err(|source| {
+                    crate::db::RowDecodeError::column("(typed_body_insert)", "thread_id", source)
+                })?;
+                crate::thread_history_writer::require_open(
+                    &transaction,
+                    &openbot_contracts::ids::ThreadId::new(actual),
+                )
+                .await?;
+            }
+            let inserted = transaction
+                .query_one(&sql, &params)
+                .await
+                .map_err(|source| {
+                    crate::thread_history_writer::query_error("插入类型化正文真实行", source)
+                })?;
+            let decoded = R::try_from_pg(&inserted)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| InfraError::query("提交类型化正文insert原事务", source))?;
+            return Ok(decoded);
+        }
         let inserted = client
             .query_one(&sql, &params)
             .await

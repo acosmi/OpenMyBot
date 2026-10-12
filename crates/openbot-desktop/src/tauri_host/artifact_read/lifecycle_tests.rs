@@ -629,6 +629,19 @@ impl LocalFixture {
                 anchor: ThreadRunAnchor::DirectBot, message: "small actual local Begin".to_owned(), selected_skill_slugs: Vec::new(), model_selection: None,
             };
             require(matches!(prepared.application().execute(auth.clone(), AppCommand::BeginThreadRun(begin.clone())).await.map_err(|error| error.to_string())?, AppReply::ThreadRunStarted(_)), "actual Local Begin did not return its durable receipt")?;
+            // The real Local runtime settles this provider-less Run in its own Run-locked
+            // transaction (now also carrying the per-transaction 0051 writer observation);
+            // the fixture's own NOWAIT source save must not race that background settlement.
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let status: String = prepared.pool().get().await.map_err(|error| error.to_string())?
+                        .query_one("SELECT status FROM public.runs WHERE run_id=$1", &[&begin.run_id.as_str()])
+                        .await.map_err(|error| error.to_string())?.get(0);
+                    if status != "queued" && status != "running" { return Ok::<_, String>(()); }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }).await.map_err(|_| "actual Local runtime did not settle the begun Run".to_owned())?;
+            settled?;
             let payload = "D".repeat(256 * 1024);
             let source = format!("{}:input", begin.run_id.as_str());
             let changed = prepared.pool().get().await.map_err(|error| error.to_string())?.execute(

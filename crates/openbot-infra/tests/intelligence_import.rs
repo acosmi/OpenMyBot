@@ -354,12 +354,16 @@ async fn per_thread_failure_marks_cursor_and_resume_finishes_with_database_reche
             let client = pool.get().await.map_err(|error| error.to_string())?;
             client
                 .batch_execute(&format!(
+                    // The fault is injected at the second thread's own cursor write, late in
+                    // its import transaction. A foreign trigger on a body table (messages)
+                    // would instead be refused up front by the exact 0051 writer schema check.
                     "CREATE FUNCTION fail_second_bundle_thread() RETURNS trigger LANGUAGE plpgsql AS $$
                        BEGIN
-                         IF NEW.thread_id='{second}' THEN RAISE EXCEPTION 'forced second thread'; END IF;
+                         IF NEW.cursor='{second}' THEN RAISE EXCEPTION 'forced second thread'; END IF;
                          RETURN NEW;
                        END $$;
-                     CREATE TRIGGER fail_second_bundle_thread_trigger BEFORE INSERT ON public.messages
+                     CREATE TRIGGER fail_second_bundle_thread_trigger
+                       BEFORE INSERT OR UPDATE ON public.intelligence_import_cursors
                        FOR EACH ROW EXECUTE FUNCTION fail_second_bundle_thread();"
                 ))
                 .await
@@ -386,7 +390,7 @@ async fn per_thread_failure_marks_cursor_and_resume_finishes_with_database_reche
             let client = pool.get().await.map_err(|error| error.to_string())?;
             client
                 .batch_execute(
-                    "DROP TRIGGER fail_second_bundle_thread_trigger ON public.messages;
+                    "DROP TRIGGER fail_second_bundle_thread_trigger ON public.intelligence_import_cursors;
                      DROP FUNCTION fail_second_bundle_thread();",
                 )
                 .await

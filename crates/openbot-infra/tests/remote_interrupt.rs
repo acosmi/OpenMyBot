@@ -7,8 +7,8 @@ use std::sync::Arc;
 use harness::{admin_config, with_temp_database};
 use openbot_application::{
     ProviderRemoteInterrupt, ProviderRemoteInterruptBatch, ProviderRemoteInterruptInput,
-    ProviderRemoteResumeStatus, RemoteInterruptCoordinator, RemoteInterruptError,
-    RunExecutionLease,
+    ProviderRemoteResume, ProviderRemoteResumeStatus, RemoteInterruptCoordinator,
+    RemoteInterruptError, RunExecutionLease,
 };
 use openbot_contracts::auth::{AuthContext, AuthContextBuilder, AuthGeneration, Role};
 use openbot_contracts::ids::{ActorId, BotId, DeploymentId, RunId, TenantId, ThreadId};
@@ -39,6 +39,35 @@ fn interrupt(id: &str, message: &str) -> ProviderRemoteInterrupt {
         metadata: Some(serde_json::json!({"authority":"remote-only"})),
     })
     .expect("fixture interrupt")
+}
+
+/// A SERIALIZABLE poll that races a concurrent answer may hit a real 40001. The product
+/// rolls that transaction back and reports it without retrying (§4.2 item 3); only an
+/// explicitly new public caller may wait again, and it must observe the same durable rows.
+async fn resume_after_original_terminal(
+    original: tokio::task::JoinHandle<Result<ProviderRemoteResume, RemoteInterruptError>>,
+    port: &PostgresRemoteInterruptCoordinator,
+    lease: &RunExecutionLease,
+    batch: &ProviderRemoteInterruptBatch,
+) -> Result<ProviderRemoteResume, String> {
+    let original = tokio::time::timeout(core::time::Duration::from_secs(3), original)
+        .await
+        .map_err(|_| "durable waiter did not reach a terminal".to_owned())?
+        .map_err(|error| error.to_string())?;
+    match original {
+        Ok(resume) => Ok(resume),
+        Err(RemoteInterruptError::Unavailable) => {
+            eprintln!("original waiter rejected as unavailable; one new public caller waits");
+            tokio::time::timeout(
+                core::time::Duration::from_secs(3),
+                port.persist_and_wait(lease, batch),
+            )
+            .await
+            .map_err(|_| "new public waiter did not resume".to_owned())?
+            .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 #[tokio::test]
@@ -214,11 +243,7 @@ async fn interrupts_are_actor_scoped_audited_and_cross_replica_resumable() {
                 .await
                 .map_err(|error| error.to_string())?;
 
-            let resume = tokio::time::timeout(core::time::Duration::from_secs(3), waiter)
-                .await
-                .map_err(|_| "durable waiter did not resume".to_owned())?
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())?;
+            let resume = resume_after_original_terminal(waiter, &requester, &lease, &batch).await?;
             if resume.parent_protocol_run_id() != "run-1"
                 || resume.protocol_run_id() == "run-1"
                 || resume.entries().len() != 2
@@ -275,11 +300,8 @@ async fn interrupts_are_actor_scoped_audited_and_cross_replica_resumable() {
                 .map_err(|error| error.to_string())?;
             drop(client);
             let expired_resume =
-                tokio::time::timeout(core::time::Duration::from_secs(3), expiry_waiter)
-                    .await
-                    .map_err(|_| "database-clock expiry did not resume".to_owned())?
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
+                resume_after_original_terminal(expiry_waiter, &requester, &lease, &expiry_batch)
+                    .await?;
             if expired_resume.parent_protocol_run_id() != expiry_batch.protocol_run_id()
                 || expired_resume.entries().len() != 1
                 || expired_resume.entries()[0].status()

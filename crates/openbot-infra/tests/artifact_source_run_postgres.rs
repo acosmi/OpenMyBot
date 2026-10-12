@@ -398,6 +398,69 @@ async fn owned_record_transition(f: &Fixture, id: &str, status: &str) -> Result<
         .map_err(|_| "owned transition COMMIT ACK".to_owned())
 }
 
+// Own-DB corruption control for the static source-message matrix below. The ordinary DML is
+// tried first; only an exact 0051 writer refusal (55000 thread_history_writer_*) leads to
+// suppressing the three message writer guards for that one statement, restored before COMMIT.
+async fn owned_message_dml(
+    pool: &openbot_infra::db::pool::DatabasePool,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<u64, String> {
+    const GUARDS: [&str; 3] = [
+        "messages_history_body_before",
+        "messages_history_canonical_before",
+        "messages_history_source_final",
+    ];
+    let mut client = pool.get().await.map_err(|e| e.to_string())?;
+    let tx = client.transaction().await.map_err(|e| e.to_string())?;
+    tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE; SAVEPOINT owned_message_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let changed = match tx.execute(sql, params).await {
+        Ok(changed) => changed,
+        Err(error)
+            if error.as_db_error().is_some_and(|e| {
+                e.code().code() == "55000" && e.message().starts_with("thread_history_writer_")
+            }) =>
+        {
+            tx.batch_execute("ROLLBACK TO SAVEPOINT owned_message_probe")
+                .await
+                .map_err(|e| e.to_string())?;
+            for guard in GUARDS {
+                tx.batch_execute(&format!(
+                    "ALTER TABLE public.messages DISABLE TRIGGER {guard}"
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+            let changed = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
+            for guard in GUARDS {
+                tx.batch_execute(&format!(
+                    "ALTER TABLE public.messages ENABLE TRIGGER {guard}"
+                ))
+                .await
+                .map_err(|e| e.to_string())?;
+                let state: String = tx
+                    .query_one(
+                        "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+                         WHERE tgrelid='public.messages'::regclass AND tgname=$1 AND NOT tgisinternal",
+                        &[&guard],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .get(0);
+                if state != "O" {
+                    return Err(format!("owned message guard {guard} was not restored"));
+                }
+            }
+            changed
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
 #[tokio::test]
 #[ignore = "requires owned disposable PostgreSQL through OPENBOT_TEST_DATABASE_URL"]
 async fn actual_begin_save_source_run_ids_match_registered_metadata_and_empty_visible_run() {
@@ -503,7 +566,8 @@ async fn actual_current_source_scope_and_materialized_identity_integrity_are_enf
             require(openbot_application::get_source_run_artifact_ids(f.administration.as_ref(),&other_auth,f.input()).await.err()==Some(AppError::NotVisible),"shared workspace cannot expose another actor Run")?;
             for status in ["queued","running","completed"] {
                 let client=f.pool.get().await.map_err(|_| "owned Run status pool".to_owned())?;
-                client.execute("UPDATE public.runs SET status=$1,started_at=CASE WHEN $1='queued' THEN NULL ELSE statement_timestamp() END,finished_at=CASE WHEN $1='completed' THEN statement_timestamp() ELSE NULL END,terminal_event_seq=CASE WHEN $1='completed' THEN 0 ELSE NULL END WHERE run_id=$2",&[&status,&f.begin.command.run_id.as_str()]).await.map_err(|_| "ordinary Run status fixture".to_owned())?;
+                // A completed Run carries its exactly-once terminal event in the same statement (0051).
+                client.execute("WITH r AS (UPDATE public.runs SET status=$1,started_at=CASE WHEN $1='queued' THEN NULL ELSE statement_timestamp() END,finished_at=CASE WHEN $1='completed' THEN statement_timestamp() ELSE NULL END,terminal_event_seq=CASE WHEN $1='completed' THEN (SELECT coalesce(max(e.seq)+1,0) FROM public.run_events e WHERE e.run_id=$2) ELSE NULL END WHERE run_id=$2 RETURNING run_id,thread_id,status,terminal_event_seq) INSERT INTO public.run_events(run_id,seq,thread_id,event_seq,event_type,payload,terminal) SELECT r.run_id,r.terminal_event_seq,r.thread_id,(SELECT coalesce(max(e.event_seq)+1,0) FROM public.run_events e WHERE e.thread_id=r.thread_id),r.status,'{}'::jsonb,true FROM r WHERE r.status='completed'",&[&status,&f.begin.command.run_id.as_str()]).await.map_err(|_| "ordinary Run status fixture".to_owned())?;
                 require(f.ids().await?.artifact_ids==[saved.artifact_id.clone()],"R398 ordinary statuses are visible")?;
             }
             let mut changes=vec![
@@ -529,15 +593,15 @@ async fn actual_current_source_scope_and_materialized_identity_integrity_are_enf
             let client=f.pool.get().await.map_err(|_| "owned message pool".to_owned())?;
             for (field,value,original) in [("role","assistant","user"),("actor_id",OTHER,OWNER),("run_id","own-mismatched-run",f.begin.command.run_id.as_str())] {
                 // Field choices are this closed static fixture matrix, never public SQL input.
-                client.execute(&format!("UPDATE public.messages SET {field}=$1 WHERE message_id=$2"),&[&value,&f.message_id()]).await.map_err(|_| "own source message relation mutation".to_owned())?;
+                owned_message_dml(&f.pool,&format!("UPDATE public.messages SET {field}=$1 WHERE message_id=$2"),&[&value,&f.message_id()]).await.map_err(|_| "own source message relation mutation".to_owned())?;
                 let observed=f.ids().await;
-                client.execute(&format!("UPDATE public.messages SET {field}=$1 WHERE message_id=$2"),&[&original,&f.message_id()]).await.map_err(|_| "own source message relation restore".to_owned())?;
+                owned_message_dml(&f.pool,&format!("UPDATE public.messages SET {field}=$1 WHERE message_id=$2"),&[&original,&f.message_id()]).await.map_err(|_| "own source message relation restore".to_owned())?;
                 require(observed?.artifact_ids.is_empty(),"ineligible original message identity omitted")?;
             }
             let original_message:serde_json::Value=client.query_one("SELECT to_jsonb(m) FROM public.messages m WHERE message_id=$1",&[&f.message_id()]).await.map_err(|_| "own exact message snapshot".to_owned())?.get(0);
-            require(client.execute("DELETE FROM public.messages WHERE message_id=$1",&[&f.message_id()]).await.map_err(|_| "own source message removal".to_owned())?==1,"actual original source message removed")?;
+            require(owned_message_dml(&f.pool,"DELETE FROM public.messages WHERE message_id=$1",&[&f.message_id()]).await.map_err(|_| "own source message removal".to_owned())?==1,"actual original source message removed")?;
             require(f.ids().await?.artifact_ids.is_empty(),"absent source message identity omitted")?;
-            client.execute("INSERT INTO public.messages SELECT (jsonb_populate_record(NULL::public.messages,$1::jsonb)).*",&[&original_message]).await.map_err(|_| "own original message restore".to_owned())?;
+            owned_message_dml(&f.pool,"INSERT INTO public.messages SELECT (jsonb_populate_record(NULL::public.messages,$1::jsonb)).*",&[&original_message]).await.map_err(|_| "own original message restore".to_owned())?;
             drop(client);
             let foreign_pool=pool::connect(&f.config).await.map_err(|_| "independent owned manager".to_owned())?;
             require(!f.administration.read_authority().matches_pool_scope(&foreign_pool,&DeploymentId::new(DEPLOYMENT),&TenantId::new(TENANT)),"foreign actual manager must fail same-Pool enrollment")?;
