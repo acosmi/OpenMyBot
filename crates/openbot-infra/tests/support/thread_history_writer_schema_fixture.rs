@@ -567,6 +567,17 @@ async fn writer_reverse_matrix(p: &pool::DatabasePool) -> TestResult {
         2,
     )
     .await?;
+    // Keep the malformed NEW binding as its own refusal, then provision the
+    // real NEW channel before testing the shared OLD/NEW channel mutex.
+    let missing = p.get().await.map_err(|e| e.to_string())?;
+    writer_refusal(
+        &missing,
+        "UPDATE public.threads SET anchor_id='owned-reverse-other' WHERE thread_id='writer-matrix-thread'",
+        "thread_history_writer_binding_invalid",
+    )
+    .await?;
+    drop(missing);
+    writer_channel(p, "owned-reverse-other").await?;
     let a = p.get().await.map_err(|e| e.to_string())?;
     let b = p.get().await.map_err(|e| e.to_string())?;
     a.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
