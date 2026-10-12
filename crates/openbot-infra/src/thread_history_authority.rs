@@ -1,4 +1,7 @@
 //! One-J current management observation. No result is a later clear/delete permission.
+//!
+//! The stop/clear intent producer is a separate method of the same authority: it repeats this
+//! observation inside its own transaction and consumes nothing observed here.
 
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -24,6 +27,11 @@ use crate::auth::single_user::{SINGLE_USER_ACTOR_ID, SINGLE_USER_EMAIL};
 use crate::db::pool::{DatabasePool, GuardedTransaction, TransactionOwnerError};
 use crate::db::{InfraError, native, thread_origin_schema};
 use crate::thread_origin;
+
+mod stop_clear;
+pub use stop_clear::{
+    ThreadHistoryStopClearConfirmation, ThreadHistoryStopClearError, ThreadHistoryStopClearIntent,
+};
 
 /// Closed internal observation failures. No runtime SQL, row, locator or secret is carried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -295,6 +303,19 @@ impl PostgresThreadHistoryAuthority {
             .await?
             .map_err(schema_error)?;
         current.check_attachment(deadline)?;
+        self.lock_current_positive(current, tx, thread, deadline)
+            .await?;
+        self.observe_current_joint(current, tx, thread, deadline)
+            .await
+    }
+    /// The actor row wait, then every positive current row under NOWAIT. It proves no schema.
+    async fn lock_current_positive(
+        &self,
+        current: &CurrentThreadHistoryRequest<'_>,
+        tx: &Transaction<'_>,
+        thread: &ThreadId,
+        deadline: Instant,
+    ) -> Result<(), Error> {
         required(
             tx,
             deadline,
@@ -378,6 +399,16 @@ impl PostgresThreadHistoryAuthority {
             .await?;
         }
         current.check_attachment(deadline)?;
+        Ok(())
+    }
+    /// One fresh READ COMMITTED statement over every current fact, then the actual Host tail.
+    async fn observe_current_joint(
+        &self,
+        current: &CurrentThreadHistoryRequest<'_>,
+        tx: &Transaction<'_>,
+        thread: &ThreadId,
+        deadline: Instant,
+    ) -> Result<CurrentSnapshot, Error> {
         let epoch = current.host.server_session_epoch();
         let session = epoch.as_ref().map(|epoch| epoch.lookup_id());
         let desktop = current.host.kind() == HostRequestBindingKind::DesktopWindow;
