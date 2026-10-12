@@ -350,6 +350,30 @@ async fn insert_thread(
             field: "next_event_seq",
         })?;
     let next_event = i64_count(event_count, "next_event_seq")?;
+    // The 0050 Thread binding trigger fires BEFORE the ON CONFLICT decision, so an
+    // existing Thread is compared under its actual row lock first; a different binding
+    // keeps the original Conflict instead of surfacing as a refused INSERT.
+    let existing = transaction
+        .query_opt(
+            "SELECT tenant_id,deployment_id,created_by,anchor_kind,anchor_id,title,status, \
+                    next_message_seq,next_event_seq,created_at,updated_at,deleted_at \
+             FROM public.threads WHERE thread_id=$1 FOR SHARE",
+            &[&thread.thread_id],
+        )
+        .await
+        .map_err(|error| unavailable("核对 import thread", error))?;
+    if let Some(row) = &existing
+        && !thread_row_exact(
+            row,
+            request,
+            anchor_kind,
+            anchor_id,
+            next_message,
+            next_event,
+        )?
+    {
+        return Err(IntelligenceImportError::Conflict { field: "thread" });
+    }
     let inserted = transaction
         .query_opt(
             "INSERT INTO public.threads( \
@@ -384,19 +408,14 @@ async fn insert_thread(
         )
         .await
         .map_err(|error| unavailable("核对 import thread", error))?;
-    let exact = decode::<String>(&row, "tenant_id")? == request.target_tenant_id
-        && decode::<String>(&row, "deployment_id")? == request.target_deployment_id
-        && decode::<String>(&row, "created_by")? == thread.created_by
-        && decode::<String>(&row, "anchor_kind")? == anchor_kind
-        && decode::<String>(&row, "anchor_id")? == anchor_id
-        && decode::<Option<String>>(&row, "title")? == thread.title
-        && decode::<String>(&row, "status")? == thread_status(thread.status)
-        && decode::<i64>(&row, "next_message_seq")? == next_message
-        && decode::<i64>(&row, "next_event_seq")? == next_event
-        && decode::<OffsetDateTime>(&row, "created_at")? == thread.created_at
-        && decode::<OffsetDateTime>(&row, "updated_at")? == thread.updated_at
-        && decode::<Option<OffsetDateTime>>(&row, "deleted_at")? == thread.deleted_at;
-    if !exact {
+    if !thread_row_exact(
+        &row,
+        request,
+        anchor_kind,
+        anchor_id,
+        next_message,
+        next_event,
+    )? {
         return Err(IntelligenceImportError::Conflict { field: "thread" });
     }
     if let Some(inserted) = inserted {
@@ -438,6 +457,31 @@ async fn insert_thread(
             .map_err(import_origin_error)?;
     }
     Ok(())
+}
+
+fn thread_row_exact(
+    row: &Row,
+    request: &IntelligenceThreadImportRequest,
+    anchor_kind: &str,
+    anchor_id: &str,
+    next_message: i64,
+    next_event: i64,
+) -> Result<bool, IntelligenceImportError> {
+    let thread = &request.thread;
+    Ok(
+        decode::<String>(row, "tenant_id")? == request.target_tenant_id
+            && decode::<String>(row, "deployment_id")? == request.target_deployment_id
+            && decode::<String>(row, "created_by")? == thread.created_by
+            && decode::<String>(row, "anchor_kind")? == anchor_kind
+            && decode::<String>(row, "anchor_id")? == anchor_id
+            && decode::<Option<String>>(row, "title")? == thread.title
+            && decode::<String>(row, "status")? == thread_status(thread.status)
+            && decode::<i64>(row, "next_message_seq")? == next_message
+            && decode::<i64>(row, "next_event_seq")? == next_event
+            && decode::<OffsetDateTime>(row, "created_at")? == thread.created_at
+            && decode::<OffsetDateTime>(row, "updated_at")? == thread.updated_at
+            && decode::<Option<OffsetDateTime>>(row, "deleted_at")? == thread.deleted_at,
+    )
 }
 
 async fn insert_memberships(
