@@ -741,7 +741,9 @@ async fn w12_current51_explicit50_and_original_host_id_regression() {
             let historical=native::validate_known_prefix(&c,version).await.map_err(|e|e.to_string())?;
             require(historical.latest_version()==version,"explicit original prefix changed")?;
             if version==50 {
-                require(admission_schema::capture(&c).await.map_err(|e|e.to_string())?["schema"]["functions"].as_array().is_some_and(|f|f.len()==7),"explicit0050 no longer pure seven-function history")?;
+                let historical50=admission_schema::capture(&c).await.map_err(|e|e.to_string())?;
+                let expected50:Value=serde_json::from_str(include_str!("../../../fixtures/db/thread-history-admission-0050.json")).map_err(|e|e.to_string())?;
+                require(historical50["schema"]["functions"]==expected50["schema"]["functions"],"explicit0050 original seven user and four RI function facts differ")?;
                 require(admission_schema::verify(&c).await.is_err(),"explicit0050 current consumer bypassed new whole0051")?;
             }
             if version<51 {native::apply(&mut c).await.map_err(|e|e.to_string())?;}
