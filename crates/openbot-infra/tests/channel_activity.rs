@@ -117,6 +117,18 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), S
     baseline::apply(&client)
         .await
         .map_err(|error| error.to_string())?;
+    // The unregistered future preview is real legacy input, created before native migration.
+    client
+        .batch_execute(
+            "INSERT INTO public.channels(
+               id,name,description,last_message,last_message_at,last_message_agent_id
+             ) VALUES
+               ('channel-main','Main','activity test',NULL,NULL,NULL),
+               ('channel-stale','Stale','stale activity test','future wins',
+                '2100-01-01T00:00:00Z',NULL);",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     native::apply(&mut client)
         .await
         .map_err(|error| error.to_string())?;
@@ -137,12 +149,6 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), S
              ) VALUES
                  ('bot-1',NULL,'Bot 1','test role','seed','public',NULL),
                  ('bot-unlinked',NULL,'Unlinked','test role','seed-2','public',NULL);
-             INSERT INTO public.channels(
-               id,name,description,last_message,last_message_at,last_message_agent_id
-             ) VALUES
-               ('channel-main','Main','activity test',NULL,NULL,NULL),
-               ('channel-stale','Stale','stale activity test','future wins',
-                '2100-01-01T00:00:00Z',NULL);
              INSERT INTO public.channel_agents(channel_id,agent_id) VALUES
                ('channel-main','bot-1'),('channel-stale','bot-1');
              INSERT INTO public.channel_memberships(channel_id,user_id) VALUES
