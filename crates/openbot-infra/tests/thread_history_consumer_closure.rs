@@ -102,6 +102,11 @@ const TENANT: &str = "closure-tenant";
 const PROCESS: &str = "closure-runtime";
 const MODEL_KEY: &str = "OWNED_CLOSURE_MODEL_CANARY";
 const AUDIT_KEY: &[u8] = b"owned-consumer-closure-audit-key-0001";
+/// Application names of the pools whose backends are the entries under lock-order evidence.
+const ENTRY_TOOLS: &str = "closure_entry_tools";
+const ENTRY_REMEMBER: &str = "closure_entry_remember";
+const ENTRY_MEMORY: &str = "closure_entry_memory";
+const ENTRY_SAVE: &str = "closure_entry_save";
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -437,29 +442,6 @@ async fn wait_blocked(observer: &Client, worker: i32, owner: i32) -> TestResult 
     .await
 }
 
-/// Some backend of this database is waiting behind `owner`; returns its pid.
-async fn backend_blocked_by(observer: &Client, owner: i32) -> TestResult<i32> {
-    let found = Arc::new(Mutex::new(None));
-    until("a backend waiting behind the owned holder", || {
-        let found = Arc::clone(&found);
-        async move {
-            let row = observer
-                .query_opt(
-                    "SELECT a.pid FROM pg_stat_activity a WHERE a.datname=current_database() \
-                     AND $1=ANY(pg_blocking_pids(a.pid)) ORDER BY a.pid LIMIT 1",
-                    &[&owner],
-                )
-                .await
-                .map_err(text)?;
-            *found.lock().unwrap() = row.map(|row| row.get::<_, i32>(0));
-            Ok(found.lock().unwrap().is_some())
-        }
-    })
-    .await?;
-    let pid = found.lock().unwrap().expect("pid recorded by the probe");
-    Ok(pid)
-}
-
 async fn activity(observer: &Client, pid: i32) -> TestResult<(String, String)> {
     let row = observer
         .query_one(
@@ -483,61 +465,261 @@ async fn lockable(c: &Client, sql: &str, key: &str) -> TestResult<bool> {
     }
 }
 
-/// Lock-order evidence for one consumer. An owned ACCESS EXCLUSIVE holder on the migration
-/// ledger (which the schema observation reads first) keeps `work` waiting. From that real wait
-/// the listed rows must still be unlocked, after a control proved each probe refuses a real
-/// row holder. Releasing the holder lets `work` finish; its result is returned.
+/// The first statement of the strict writer-schema observation, exactly as the writer sends it.
+const OBSERVATION_SQL: &str = "SELECT version,name,checksum FROM openbot_internal.schema_migrations ORDER BY version,name,checksum LIMIT $1";
+/// Stops every reader of the migration ledger, which the observation reads first.
+const LEDGER_LOCK_SQL: &str =
+    "LOCK TABLE openbot_internal.schema_migrations IN ACCESS EXCLUSIVE MODE";
+
+/// A pool whose backends carry `application`, so a lock wait can be tied to the entry using it.
+async fn entry_pool(
+    config: &pool::DatabaseConfig,
+    application: &str,
+    size: usize,
+) -> TestResult<pool::DatabasePool> {
+    pool::connect(
+        &config
+            .clone()
+            .with_max_pool_size(size)
+            .with_application_name(application),
+    )
+    .await
+    .map_err(text)
+}
+
+/// Row-level locks `pid` holds: tuple and advisory locks, and the RowShare and RowExclusive
+/// relation locks that every row-locking or writing statement takes first. A transaction that is
+/// still waiting inside its schema observation holds none of them.
+async fn row_level_locks(observer: &Client, pid: i32) -> TestResult<i64> {
+    Ok(observer
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_locks WHERE pid=$1 AND granted \
+             AND (locktype IN ('tuple','advisory') \
+               OR (locktype='relation' AND mode IN ('RowShareLock','RowExclusiveLock')))",
+            &[&pid],
+        )
+        .await
+        .map_err(text)?
+        .get(0))
+}
+
+/// The backends waiting for the ledger lock behind exactly `holder`, with their statements.
+/// `application` restricts them to the pool of the entry under test.
+async fn ledger_waiters(
+    observer: &Client,
+    holder: i32,
+    application: Option<&str>,
+) -> TestResult<Vec<(i32, String)>> {
+    let rows = observer
+        .query(
+            "SELECT l.pid,coalesce(a.query,'') FROM pg_catalog.pg_locks l \
+             JOIN pg_catalog.pg_stat_activity a ON a.pid=l.pid \
+             WHERE l.locktype='relation' AND NOT l.granted \
+               AND l.relation='openbot_internal.schema_migrations'::regclass \
+               AND pg_catalog.pg_blocking_pids(l.pid)=ARRAY[$1::integer] \
+               AND ($2::text IS NULL OR a.application_name=$2) ORDER BY l.pid",
+            &[&holder, &application],
+        )
+        .await
+        .map_err(text)?;
+    Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+}
+
+/// Controllers for the lock-order evidence of one consumer: an owned holder of the ledger lock,
+/// an observer of `pg_locks` and `pg_stat_activity`, and NOWAIT probes of the rows the consumer
+/// locks after its observation.
+struct LockOrder {
+    observer: pool::PooledClient,
+    holder: pool::PooledClient,
+    probe: pool::PooledClient,
+    probes: Vec<(String, String)>,
+    application: Option<String>,
+}
+
+impl LockOrder {
+    /// `application` names the pool of the entry under test. Controls come first: each probe
+    /// refuses a real row holder, and the row-level lock counter sees that holder.
+    async fn new(
+        p: &pool::DatabasePool,
+        application: Option<&str>,
+        probes: &[(&str, &str)],
+    ) -> TestResult<Self> {
+        let observer = p.get().await.map_err(text)?;
+        let holder = p.get().await.map_err(text)?;
+        let probe = p.get().await.map_err(text)?;
+        for (sql, key) in probes {
+            let control = p.get().await.map_err(text)?;
+            control.batch_execute("BEGIN").await.map_err(text)?;
+            control.query(*sql, &[key]).await.map_err(text)?;
+            let refused = !lockable(&probe, sql, key).await?;
+            let counted = row_level_locks(&observer, backend_pid(&control).await?).await? > 0;
+            control.batch_execute("ROLLBACK").await.map_err(text)?;
+            require(
+                refused,
+                "control: the probe did not refuse a real row holder",
+            )?;
+            require(
+                counted,
+                "control: the lock counter did not see a real row lock",
+            )?;
+        }
+        Ok(Self {
+            observer,
+            holder,
+            probe,
+            probes: probes
+                .iter()
+                .map(|(sql, key)| ((*sql).to_owned(), (*key).to_owned()))
+                .collect(),
+            application: application.map(str::to_owned),
+        })
+    }
+
+    /// Locks the ledger on the holder's own transaction; returns the holder's backend.
+    async fn hold_ledger(&self) -> TestResult<i32> {
+        hold(&self.holder, LEDGER_LOCK_SQL).await
+    }
+
+    async fn release_ledger(&self) -> TestResult {
+        release(&self.holder).await
+    }
+
+    /// From the real wait behind `holder`: exactly one backend waits for the ledger lock, it is
+    /// the entry's (its pool's application name), its statement is the observation itself, it
+    /// holds no row-level lock, and the rows the entry locks afterwards are still free.
+    async fn evidence(&self, holder: i32) -> TestResult {
+        let application = self.application.as_deref();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        until("a backend waiting for the ledger lock", || {
+            let seen = Arc::clone(&seen);
+            let observer = &self.observer;
+            async move {
+                let waiters = ledger_waiters(observer, holder, application).await?;
+                let found = !waiters.is_empty();
+                *seen.lock().unwrap() = waiters;
+                Ok(found)
+            }
+        })
+        .await?;
+        let waiters = seen.lock().unwrap().clone();
+        if waiters.len() != 1 || waiters[0].1 != OBSERVATION_SQL {
+            return Err(format!(
+                "the wait behind the ledger holder was not the one schema observation: {waiters:?}"
+            ));
+        }
+        let held = row_level_locks(&self.observer, waiters[0].0).await?;
+        if held != 0 {
+            return Err(format!(
+                "the backend held {held} row-level locks while it observed the schema"
+            ));
+        }
+        for (sql, key) in &self.probes {
+            require(
+                lockable(&self.probe, sql, key).await?,
+                "a row was locked before the schema observation",
+            )?;
+        }
+        require(
+            ledger_waiters(&self.observer, holder, application).await? == waiters,
+            "the wait changed while it was examined",
+        )
+    }
+
+    /// While the save waits for its operation row behind `blocker`, it already holds the
+    /// workspace quota row and has not yet touched the head of `thread`.
+    async fn quota_before_head(&self, blocker: i32, thread: &ThreadId) -> TestResult {
+        let application = self.application.as_deref();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        until("the save waiting for its operation row", || {
+            let seen = Arc::clone(&seen);
+            let observer = &self.observer;
+            async move {
+                let rows = observer
+                    .query(
+                        "SELECT pid,coalesce(query,'') FROM pg_catalog.pg_stat_activity \
+                         WHERE pg_catalog.pg_blocking_pids(pid)=ARRAY[$1::integer] \
+                           AND ($2::text IS NULL OR application_name=$2) ORDER BY pid",
+                        &[&blocker, &application],
+                    )
+                    .await
+                    .map_err(text)?;
+                let waiters: Vec<(i32, String)> =
+                    rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+                let found = !waiters.is_empty();
+                *seen.lock().unwrap() = waiters;
+                Ok(found)
+            }
+        })
+        .await?;
+        let waiters = seen.lock().unwrap().clone();
+        if waiters.len() != 1
+            || !waiters[0].1.contains("artifact_save_operations")
+            || !waiters[0].1.contains("FOR UPDATE")
+        {
+            return Err(format!(
+                "the wait behind the operation row was not the save's operation lock: {waiters:?}"
+            ));
+        }
+        let held = |relation: &'static str, modes: &'static str| {
+            let sql = format!(
+                "SELECT count(*) FROM pg_catalog.pg_locks WHERE pid=$1 AND granted \
+                 AND locktype='relation' AND relation='{relation}'::regclass AND mode IN ({modes})"
+            );
+            let (observer, pid) = (&self.observer, waiters[0].0);
+            async move {
+                Ok::<i64, String>(
+                    observer
+                        .query_one(&sql, &[&pid])
+                        .await
+                        .map_err(text)?
+                        .get(0),
+                )
+            }
+        };
+        require(
+            held(
+                "openbot_internal.artifact_workspace_quotas",
+                "'RowShareLock'",
+            )
+            .await?
+                > 0,
+            "the save did not hold the workspace quota row before its operation row",
+        )?;
+        require(
+            held(
+                "openbot_internal.thread_history_heads",
+                "'RowShareLock','RowExclusiveLock'",
+            )
+            .await?
+                == 0,
+            "the save took the head before its quota and operation rows",
+        )?;
+        require(
+            lockable(&self.probe, H_FOR_UPDATE_NOWAIT, thread.as_str()).await?,
+            "the head was locked before the quota and operation rows",
+        )
+    }
+}
+
+/// Lock-order evidence for one consumer: `work` starts while the owned ledger lock is held, the
+/// evidence is taken from its real wait (see [`LockOrder`]), and `work` finishes once the lock is
+/// released. Its result is returned.
 async fn observation_precedes_locks<T>(
     p: &pool::DatabasePool,
+    application: Option<&str>,
     probes: &[(&str, &str)],
     work: impl Future<Output = T> + Send + 'static,
 ) -> TestResult<T>
 where
     T: Send + 'static,
 {
-    let observer = p.get().await.map_err(text)?;
-    let holder = p.get().await.map_err(text)?;
-    let probe = p.get().await.map_err(text)?;
-    for (sql, key) in probes {
-        let control = p.get().await.map_err(text)?;
-        control.batch_execute("BEGIN").await.map_err(text)?;
-        control.query(*sql, &[key]).await.map_err(text)?;
-        let refused = lockable(&probe, sql, key).await?;
-        control.batch_execute("ROLLBACK").await.map_err(text)?;
-        require(
-            !refused,
-            "control: the probe did not refuse a real row holder",
-        )?;
-    }
-    let owner = hold(
-        &holder,
-        "LOCK TABLE openbot_internal.schema_migrations IN ACCESS EXCLUSIVE MODE",
-    )
-    .await?;
+    let order = LockOrder::new(p, application, probes).await?;
+    let holder = order.hold_ledger().await?;
     let worker = tokio::spawn(work);
-    let waiting = async {
-        let pid = backend_blocked_by(&observer, owner).await?;
-        let (_, query) = activity(&observer, pid).await?;
-        require(
-            query.contains("schema_migrations"),
-            "the wait behind the holder was not the schema observation",
-        )
-    }
-    .await;
-    let mut unlocked = Ok(());
-    if waiting.is_ok() {
-        for (sql, key) in probes {
-            if !lockable(&probe, sql, key).await? {
-                unlocked = Err(format!(
-                    "a row was locked before the schema observation: {key}"
-                ));
-            }
-        }
-    }
-    release(&holder).await?;
+    let evidence = order.evidence(holder).await;
+    order.release_ledger().await?;
     let output = worker.await.map_err(text)?;
-    waiting?;
-    unlocked?;
+    evidence?;
     Ok(output)
 }
 
@@ -1554,6 +1736,7 @@ async fn consumer_closure_custom_start_refuses_closed_and_holds_head_share_acros
                 };
                 let started = observation_precedes_locks(
                     &p,
+                    None,
                     &[(
                         "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT",
                         "alice",
@@ -1801,33 +1984,43 @@ async fn consumer_closure_tool_decision_retry_attach_refuse_before_effect_outcom
             .await
             .map_err(text)?;
 
-        // Lock order: with the schema observation held back, the Run is still unlocked.
+        // Lock order: the observation is the entry's own first statement, and until it finishes
+        // the Run is still unlocked. The entry runs on a pool of its own, so the one backend
+        // waiting for the ledger can only be the entry's.
+        let entry = entry_pool(&config, ENTRY_TOOLS, 2).await?;
+        let entry_journal = PostgresToolJournal::new(entry.clone(), AUDIT_KEY.to_vec()).map_err(text)?;
+        let entry_attempts = ToolAttemptRepo::new(entry.clone());
         let run_probe = "SELECT run_id FROM public.runs WHERE run_id=$1 FOR UPDATE NOWAIT";
         let run_key = open.command.run_id.as_str().to_owned();
         let call6 = tool_draft(&open.command.run_id, "closure-call-6", 2);
-        let decided = observation_precedes_locks(&p, &[(run_probe, &run_key)], {
-            let (journal, call6) = (journal.clone(), call6.clone());
-            async move { journal.record_decision(&call6).await }
-        })
-        .await?;
-        require(decided.is_ok(), "the held-back decision never completed")?;
-        let capability6 = CapabilityId::new(uuid::Uuid::now_v7().to_string());
-        let attached = observation_precedes_locks(&p, &[(run_probe, &run_key)], {
-            let (journal, id, capability6) = (journal.clone(), call6.call_id.clone(), capability6.clone());
-            async move { journal.attach_capability(&id, &capability6).await }
-        })
-        .await?;
-        require(attached.is_ok(), "the held-back capability never completed")?;
-        let retried = observation_precedes_locks(&p, &[(run_probe, &run_key)], {
-            let attempts = attempts.clone();
-            async move {
-                attempts
-                    .insert_retry(&pristine_attempt("closure-call-6", 1))
-                    .await
-            }
-        })
-        .await?;
-        require(retried.is_ok(), "the held-back retry never completed")
+        let ordered = async {
+            let decided = observation_precedes_locks(&p, Some(ENTRY_TOOLS), &[(run_probe, &run_key)], {
+                let (journal, call6) = (entry_journal.clone(), call6.clone());
+                async move { journal.record_decision(&call6).await }
+            })
+            .await?;
+            require(decided.is_ok(), "the held-back decision never completed")?;
+            let capability6 = CapabilityId::new(uuid::Uuid::now_v7().to_string());
+            let attached = observation_precedes_locks(&p, Some(ENTRY_TOOLS), &[(run_probe, &run_key)], {
+                let (journal, id, capability6) =
+                    (entry_journal.clone(), call6.call_id.clone(), capability6.clone());
+                async move { journal.attach_capability(&id, &capability6).await }
+            })
+            .await?;
+            require(attached.is_ok(), "the held-back capability never completed")?;
+            let retried = observation_precedes_locks(&p, Some(ENTRY_TOOLS), &[(run_probe, &run_key)], {
+                let attempts = entry_attempts.clone();
+                async move {
+                    attempts
+                        .insert_retry(&pristine_attempt("closure-call-6", 1))
+                        .await
+                }
+            })
+            .await?;
+            require(retried.is_ok(), "the held-back retry never completed")
+        }
+        .await;
+        close_pool(entry).await.and(ordered)
     })
     .await;
 }
@@ -1971,13 +2164,22 @@ async fn consumer_closure_remember_effect_refuses_new_and_replays_existing() {
         let store = PostgresMemoryAdministration::new(p.clone())
             .with_effect_audit_key(AUDIT_KEY.to_vec())
             .map_err(text)?;
+        // The first effect commits while open, on a pool of its own: with the schema observation
+        // held back, the one backend waiting for the ledger can only be the entry's, and the
+        // actor row is still unlocked.
         let users_probe = "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT";
-        let committed = observation_precedes_locks(&p, &[(users_probe, "alice")], {
-            let (store, first) = (store.clone(), first.clone());
-            async move { store.remember_from_tool(first).await }
+        let entry = entry_pool(&config, ENTRY_REMEMBER, 2).await?;
+        let entry_store = PostgresMemoryAdministration::new(entry.clone())
+            .with_effect_audit_key(AUDIT_KEY.to_vec())
+            .map_err(text)?;
+        let ordered = observation_precedes_locks(&p, Some(ENTRY_REMEMBER), &[(users_probe, "alice")], {
+            let first = first.clone();
+            async move { entry_store.remember_from_tool(first).await }
         })
-        .await?
-        .map_err(text)?;
+        .await;
+        let closed = close_pool(entry).await;
+        let committed = ordered?.map_err(text)?;
+        closed?;
         let image = remember_image(&p).await?;
         require(
             image[..3] == [1, 1, 1],
@@ -2067,7 +2269,7 @@ struct HeldAck {
 
 impl HeldAck {
     async fn arrived(&mut self) -> TestResult {
-        tokio::time::timeout(Duration::from_secs(15), &mut self.arrived)
+        tokio::time::timeout(Duration::from_secs(30), &mut self.arrived)
             .await
             .map_err(|_| "the selected backend frame never arrived".to_owned())?
             .map_err(|_| "the proxy dropped the selected backend frame".to_owned())
@@ -2222,6 +2424,35 @@ fn rows_of<'a>(facts: &'a Value, key: &str) -> &'a [Value] {
     facts[key].as_array().map_or(&[], Vec::as_slice)
 }
 
+/// A controller transaction holding the save operation row of `thread` (it exists from the
+/// admission on), so the save's own wait for that row can be examined.
+async fn hold_operation(
+    direct: &pool::DatabasePool,
+    thread: &ThreadId,
+) -> TestResult<(pool::PooledClient, i32)> {
+    let facts = artifact_facts(direct).await?;
+    let operation_id = rows_of(&facts, "operations")
+        .iter()
+        .find(|operation| operation["source_thread_id"] == thread.as_str())
+        .and_then(|operation| operation["operation_id"].as_str())
+        .ok_or("the save has no operation row yet")?
+        .to_owned();
+    let holder = direct.get().await.map_err(text)?;
+    holder
+        .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await
+        .map_err(text)?;
+    holder
+        .query_one(
+            "SELECT operation_id FROM openbot_internal.artifact_save_operations WHERE operation_id=$1 FOR UPDATE",
+            &[&operation_id],
+        )
+        .await
+        .map_err(text)?;
+    let pid = backend_pid(&holder).await?;
+    Ok((holder, pid))
+}
+
 /// Builds the save adapter over `registry` and a fresh private root.
 async fn artifact_admin(
     registry: Arc<ArtifactDatasetRegistry>,
@@ -2259,7 +2490,9 @@ async fn consumer_closure_explicit_save_refuses_admission_and_post_io_registrati
         let mut proxied = config.clone();
         proxied.host = "127.0.0.1".to_owned();
         proxied.port = proxy.port;
-        let proxied = proxied.with_max_pool_size(8);
+        let proxied = proxied
+            .with_max_pool_size(8)
+            .with_application_name(ENTRY_SAVE);
         let p = pool::connect(&proxied).await.map_err(text)?;
         let result = save_case(&direct, &p, &proxied, &proxy).await;
         let closed = close_pool(p).await;
@@ -2462,21 +2695,62 @@ async fn save_case(
         "a replay or refused save changed operations, records, receipts, charges or audit",
     )?;
 
-    // 5. The schema observation of the admission precedes its first row lock.
+    // 5. In each of its three transactions the save observes the schema before its first row
+    //    lock. The proxy holds the acknowledgement of the transaction start, so the ledger is
+    //    locked only once the save has passed its registration verification and stands at the
+    //    start of that very transaction; the wait that follows is the observation of the save's
+    //    own backend, which then holds no row-level lock while the actor row is still free. The
+    //    start of IO and the registration also take the head only after their quota rows and
+    //    operation row, the same order as the admission.
     let request = save_request(&ordered);
-    let saved = observation_precedes_locks(
-        direct,
-        &[(
-            "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT",
-            "alice",
-        )],
-        {
-            let (administration, owner) = (Arc::clone(&administration), owner.clone());
-            async move { administration.save_run_message_text(&owner, request).await }
-        },
+    let users_probe = "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT";
+    let order = LockOrder::new(direct, Some(ENTRY_SAVE), &[(users_probe, "alice")]).await?;
+    let mut gate = Some(proxy.arm(b"START TRANSACTION\0", 1)?);
+    let save = {
+        let (administration, owner) = (Arc::clone(&administration), owner.clone());
+        tokio::spawn(async move { administration.save_run_message_text(&owner, request).await })
+    };
+    for (index, transaction) in ["admission", "start of IO", "registration"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut start = gate.take().ok_or("the transaction start was not held")?;
+        start
+            .arrived()
+            .await
+            .map_err(|e| format!("{transaction} START TRANSACTION: {e}"))?;
+        // From the start of IO on, the operation row exists. A controller holds it, so that the
+        // save's later wait for it shows which locks it already took: the quota rows, not the head.
+        let operation = if index > 0 {
+            Some(hold_operation(direct, &ordered.command.thread_id).await?)
+        } else {
+            None
+        };
+        let holder = order.hold_ledger().await?;
+        start.release()?;
+        let evidence = order.evidence(holder).await;
+        // The next transaction start is caught before the ledger is let go.
+        if index < 2 {
+            gate = Some(proxy.arm(b"START TRANSACTION\0", 1)?);
+        }
+        order.release_ledger().await?;
+        evidence.map_err(|e| format!("{transaction}: {e}"))?;
+        if let Some((operation_holder, blocker)) = operation {
+            let ordered_locks = order
+                .quota_before_head(blocker, &ordered.command.thread_id)
+                .await;
+            release(&operation_holder).await?;
+            ordered_locks.map_err(|e| format!("{transaction}: {e}"))?;
+        }
+    }
+    let saved = tokio::time::timeout(Duration::from_secs(30), save)
+        .await
+        .map_err(|_| "the held-back save never completed".to_owned())?
+        .map_err(text)?;
+    require(
+        saved.is_ok(),
+        "the held-back save was refused on an open history",
     )
-    .await?;
-    require(saved.is_ok(), "the held-back save never completed")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2588,22 +2862,28 @@ async fn consumer_closure_manual_memory_with_closed_source_refuses() {
             "a memory with no source waited on the schema observation",
         )?;
         drop(holder);
+        let entry = entry_pool(&config, ENTRY_MEMORY, 2).await?;
+        let entry_store = PostgresMemoryAdministration::new(entry.clone());
         let ordered = observation_precedes_locks(
             &p,
+            Some(ENTRY_MEMORY),
             &[(
                 "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT",
                 "alice",
             )],
             {
-                let (store, source) = (store.clone(), source_message(&open));
+                let source = source_message(&open);
                 async move {
-                    store
+                    entry_store
                         .remember(memory_request(Some(source), "ordered"))
                         .await
                 }
             },
         )
-        .await?;
+        .await;
+        let closed = close_pool(entry).await;
+        let ordered = ordered?;
+        closed?;
         require(ordered.is_ok(), "the held-back memory never completed")
     })
     .await;

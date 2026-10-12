@@ -1224,18 +1224,6 @@ impl PostgresArtifactAdministration {
             Err(ArtifactAdministrationError::NotVisible) => false,
             Err(error) => return Err(error),
         };
-        // A closed source Thread history follows this same source-changed path: the real byte
-        // observation and its charge are kept, and no record, receipt or available state is
-        // published.
-        let authorized = if authorized {
-            match finalize_result!(require_open_history(&tx, &schema, input).await) {
-                Ok(()) => true,
-                Err(ArtifactAdministrationError::NotVisible) => false,
-                Err(error) => return Err(error),
-            }
-        } else {
-            false
-        };
         finalize_stage!(BindingAndQuota);
         finalize_result!(self.check_binding(&tx).await)?;
         finalize_result!(
@@ -1260,6 +1248,19 @@ impl PostgresArtifactAdministration {
             }
             return Err(unavailable());
         }
+        // Same order as the admission and the start of IO: actor, source, quota, operation, then
+        // the head. A closed source Thread history follows the source-changed path: the real byte
+        // observation and its charge are kept, and no record, receipt or available state is
+        // published.
+        let authorized = if authorized {
+            match finalize_result!(require_open_history(&tx, &schema, input).await) {
+                Ok(()) => true,
+                Err(ArtifactAdministrationError::NotVisible) => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
         finalize_stage!(AuditCoordinates);
         let (audit_id, audit_time) = if authorized
             && matches!(
