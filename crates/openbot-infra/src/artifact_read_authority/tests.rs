@@ -839,8 +839,27 @@ struct SharedPgReadPhases {
     io: AtomicUsize,
     joint: AtomicUsize,
     segments: AtomicUsize,
+    // R432 control-before observes through the same final statement path before any IO.
+    // The single-shot test gate is armed only by the actual after-IO trace, so it still
+    // selects the final joint rather than the earlier control query.
+    final_gate_after_io: std::sync::Mutex<Option<(std::sync::Weak<PostgresArtifactReadAuthority>, FinalQueryGate)>>,
 }
+type FinalQueryGate = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
 impl SharedPgReadPhases {
+    fn after_io(authority: &Arc<PostgresArtifactReadAuthority>, gate: FinalQueryGate) -> Arc<Self> {
+        let phases = Self::default();
+        *phases.final_gate_after_io.lock().unwrap() = Some((Arc::downgrade(authority), gate));
+        Arc::new(phases)
+    }
+    fn arm_final_gate(&self) {
+        let armed = self.final_gate_after_io.lock().ok().and_then(|mut slot| slot.take());
+        if let Some((authority, gate)) = armed
+            && let Some(authority) = authority.upgrade()
+            && let Ok(mut slot) = authority.final_query_gate.lock()
+        {
+            *slot = Some(gate);
+        }
+    }
     fn counts(&self) -> (usize, usize, usize) {
         (
             self.io.load(Ordering::SeqCst),
@@ -888,6 +907,7 @@ impl tracing::Subscriber for SharedPgPhaseSubscriber {
         event.record(&mut visitor);
         if visitor.io {
             self.0.io.fetch_add(1, Ordering::SeqCst);
+            self.0.arm_final_gate();
         }
         if visitor.joint {
             self.0.joint.fetch_add(1, Ordering::SeqCst);
@@ -1091,15 +1111,10 @@ async fn shared_pg_final_leg(config: DatabaseConfig, leg: SharedPgFinalLeg) -> R
     let (held, probe, original_pid, original_observation) =
         shared_pg_original_probe(&f, controller_pid, observer_pid).await?;
     drop(probe); // With seven original leases held, only this exact connection can serve the read.
-    let phases = Arc::new(SharedPgReadPhases::default());
-    let dispatch = tracing::Dispatch::new(SharedPgPhaseSubscriber(phases.clone()));
     let (reached, reached_rx) = tokio::sync::oneshot::channel();
     let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
-    *f.administration
-        .read_authority()
-        .final_query_gate
-        .lock()
-        .map_err(|_| "shared final gate poisoned")? = Some((reached, proceed_rx));
+    let phases = SharedPgReadPhases::after_io(&f.administration.read_authority(), (reached, proceed_rx));
+    let dispatch = tracing::Dispatch::new(SharedPgPhaseSubscriber(phases.clone()));
     let administration = f.administration.clone();
     let auth = f.auth();
     let id = saved.artifact_id.clone();
@@ -2341,9 +2356,12 @@ async fn wait_final_lock(pool: &Pool, blocker: i32) -> Result<i32, String> {
     }).await.map_err(|_| "actual final statement Lock/PID was not observed".to_owned())?
 }
 
+// `after_io=false` gates the first statement, which for host-first source errors is the
+// R432 control-before itself; those reads have no body IO or later final joint.
 async fn start_after_io(
     f: &Fixture,
     id: &str,
+    after_io: bool,
 ) -> Result<
     (
         tokio::task::JoinHandle<Result<CurrentArtifactReadChunk, AppError>>,
@@ -2355,15 +2373,23 @@ async fn start_after_io(
     let (reached, acknowledged) = tokio::sync::oneshot::channel();
     let (proceed, release) = tokio::sync::oneshot::channel();
     let authority = f.administration.read_authority();
-    *authority
-        .final_query_gate
-        .lock()
-        .map_err(|_| "gate poisoned".to_owned())? = Some((reached, release));
+    let phases = if after_io {
+        SharedPgReadPhases::after_io(&authority, (reached, release))
+    } else {
+        *authority
+            .final_query_gate
+            .lock()
+            .map_err(|_| "gate poisoned".to_owned())? = Some((reached, release));
+        Arc::new(SharedPgReadPhases::default())
+    };
+    let dispatch = tracing::Dispatch::new(SharedPgPhaseSubscriber(phases));
     let administration = Arc::clone(&f.administration);
     let auth = f.auth();
     let id = id.to_owned();
-    let worker =
-        tokio::spawn(async move { administration.read_host_bound_chunk(&auth, &id).await });
+    let worker = tokio::spawn(
+        async move { administration.read_host_bound_chunk(&auth, &id).await }
+            .with_subscriber(dispatch),
+    );
     Ok((worker, acknowledged, proceed))
 }
 
@@ -2795,7 +2821,7 @@ async fn actual_owned_pg_post_io_source_and_physical_mutation_matrix() {
     ] {
         with_fixture("arc_source", mutation.channel(), |f| async move {
             let saved = f.save().await?;
-            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id).await?;
+            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id, true).await?;
             tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "post-IO gate timed out".to_owned())?.map_err(|_| "post-IO gate sender gone".to_owned())?;
             let mut controller = f.pool.get().await.map_err(|e| e.to_string())?;
             let controller_pid: i32 = controller.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
@@ -2907,7 +2933,7 @@ async fn actual_owned_pg_post_io_session_epoch_and_generation_matrix() {
                 f.created = f.pool.get().await.map_err(|e| e.to_string())?.query_one("SELECT created_at FROM public.sessions WHERE id='core-read-session-a'", &[]).await.map_err(|e| e.to_string())?.get(0);
             }
             let saved = f.save().await?;
-            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id).await?;
+            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id, true).await?;
             tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "post-IO session gate timed out".to_owned())?.map_err(|_| "post-IO session gate gone".to_owned())?;
             let mut controller = f.pool.get().await.map_err(|e| e.to_string())?;
             let blocker: i32 = controller.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
@@ -3175,7 +3201,7 @@ async fn actual_owned_pg_host_first_missing_invisible_gone_and_final_clock() {
         ] {
             with_rollback_ack("arc_error_tail", |f, proxy| async move {
                 let id = outcome.prepare(&f).await?;
-                let (worker, reached, proceed) = start_after_io(&f, &id).await?;
+                let (worker, reached, proceed) = start_after_io(&f, &id, false).await?;
                 tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "source outcome final gate timed out".to_owned())?.map_err(|_| "source outcome final gate closed".to_owned())?;
                 // This source-error path intentionally had no byte worker. The gate proves real
                 // final own-Pool setup/seed, not IO completion or SQL Lock/PID observation.
@@ -3215,15 +3241,20 @@ async fn actual_owned_pg_host_first_missing_invisible_gone_and_final_clock() {
 async fn actual_owned_pg_cancelled_waiter_retains_worker_fd_and_raii_result() {
     with_fixture("arc_cancel", false, |f| async move {
         let saved = f.save().await?;
+        // R430: the cancelled original final query keeps `saved`'s exact key permanently
+        // unproven, so the assembled worker below consumes a second real saved record.
+        let wrapped = f.save().await?;
         // Cancel the actual production consumer at its registered common final gate after
         // real snapshot/worker ACK. Dropping this future owns the pending buffer's Drop path;
         // it does not certify an acknowledged PostgreSQL rollback or inspect freed memory.
-        let (production, reached, proceed) = start_after_io(&f, &saved.artifact_id).await?;
+        let (production, reached, proceed) = start_after_io(&f, &saved.artifact_id, true).await?;
         tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "actual production cancel gate timed out".to_owned())?.map_err(|_| "actual production cancel gate closed".to_owned())?;
         production.abort();
         require(production.await.is_err(), "actual production pending waiter was not cancelled")?;
         drop(proceed);
-        let snapshot = f.observe(&saved.artifact_id).await.map_err(|e| e.to_string())?;
+        let cancelled = f.observe(&saved.artifact_id).await.map_err(|e| e.to_string())?;
+        require(f.store.open_observed_record(cancelled).is_err(), "cancelled original key admitted another body FD")?;
+        let snapshot = f.observe(&wrapped.artifact_id).await.map_err(|e| e.to_string())?;
         let authority = f.administration.read_authority();
         let identity = Arc::clone(&authority.identity);
         let store = Arc::clone(&f.store);
