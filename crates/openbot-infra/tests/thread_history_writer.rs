@@ -590,8 +590,11 @@ async fn w10_three_channel_callers_require_complete_source_pair() {
             "UPDATE public.messages SET search_text='forged' WHERE message_id='writer-pair-message'",
             "UPDATE public.messages SET created_at=created_at+interval '1 microsecond' WHERE message_id='writer-pair-message'",
             "UPDATE public.runs SET bot_id='changed-bot' WHERE run_id='writer-pair-run'",
-            "UPDATE public.threads SET anchor_id='another-channel' WHERE thread_id='writer-pair-thread'",
         ] {writer_refusal(&c,sql,"thread_history_writer_source_mutation_refused").await?;}
+        // A missing NEW anchor fails complete channel binding before reverse-source validation.
+        writer_refusal(&c,"UPDATE public.threads SET anchor_id='another-channel' WHERE thread_id='writer-pair-thread'","thread_history_writer_binding_invalid").await?;
+        writer_channel(&p,"another-channel").await?;
+        writer_refusal(&c,"UPDATE public.threads SET anchor_id='another-channel' WHERE thread_id='writer-pair-thread'","thread_history_writer_source_mutation_refused").await?;
         c.batch_execute("BEGIN;DELETE FROM openbot_internal.channel_history_sources WHERE channel_id='writer-source-pair'").await.map_err(|e|e.to_string())?;
         let half=c.batch_execute("COMMIT").await;
         c.batch_execute("ROLLBACK").await.map_err(|e|e.to_string())?;
