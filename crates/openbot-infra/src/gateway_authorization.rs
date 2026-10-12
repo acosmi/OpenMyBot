@@ -106,6 +106,9 @@ enum InitialReplyWitness {
         metadata: GatewayDesktopMetadata,
         binding: OwnedTokenBinding,
         start: CodeTokenStart,
+        code: Zeroizing<String>,
+        redirect_uri: Zeroizing<String>,
+        code_verifier: Zeroizing<String>,
     },
 }
 
@@ -116,6 +119,32 @@ struct PreparedInitialOwner {
     clock: ClockOwner,
     // This cancelled SDK child proves local helper exit, never parent authority.
     sdk_exit_child: CancellationToken,
+}
+
+// Only the whole registration transfer constructs this non-replayable witness.
+struct RegistrationTransferWitness {
+    _private: (),
+}
+
+struct DispatchedInitialOwner {
+    witness: InitialReplyWitness,
+    budget: InitialBudget,
+    clock: ClockOwner,
+    sdk_exit_child: CancellationToken,
+    transfer: RegistrationTransferWitness,
+}
+
+// Only the Code whole-transfer path constructs this non-replayable witness.
+struct CodeTransferWitness {
+    _private: (),
+}
+
+struct CodeDispatchedInitialOwner {
+    witness: InitialReplyWitness,
+    budget: InitialBudget,
+    clock: ClockOwner,
+    sdk_exit_child: CancellationToken,
+    transfer: CodeTransferWitness,
 }
 
 #[allow(dead_code, reason = "Pending token consumption")]
@@ -147,6 +176,12 @@ struct OwnedRegistrationReply {
     client_id: Zeroizing<String>,
     original_redirect_uri: Zeroizing<String>,
     resources: ReplyResources,
+}
+
+struct CallbackPkceMaterial {
+    state: Zeroizing<String>,
+    verifier: Zeroizing<String>,
+    challenge: Zeroizing<String>,
 }
 
 #[allow(dead_code, reason = "Pending token consumption")]
@@ -233,10 +268,15 @@ redacted_debug! {
     OwnedTokenBinding => "OwnedTokenBinding([redacted])",
     InitialReplyWitness => "InitialReplyWitness([redacted])",
     PreparedInitialOwner => "PreparedInitialOwner([redacted])",
+    RegistrationTransferWitness => "RegistrationTransferWitness([redacted])",
+    DispatchedInitialOwner => "DispatchedInitialOwner([redacted])",
+    CodeTransferWitness => "CodeTransferWitness([redacted])",
+    CodeDispatchedInitialOwner => "CodeDispatchedInitialOwner([redacted])",
     ParsedTokenFields => "ParsedTokenFields([redacted])",
     CheckedExpiry => "CheckedExpiry([redacted])",
     ReplyResources => "ReplyResources([redacted])",
     OwnedRegistrationReply => "OwnedRegistrationReply([redacted])",
+    CallbackPkceMaterial => "CallbackPkceMaterial([redacted])",
     TokenSetGuard => "TokenSetGuard([redacted])",
     InitialReply => "InitialReply([redacted])",
 }
@@ -289,6 +329,77 @@ fn owned_registration_input(
     initial::owned_registration_input(metadata, original_redirect_uri)
 }
 
+fn callback_registration_input(
+    metadata: GatewayDesktopMetadata,
+    original_redirect_uri: Zeroizing<String>,
+    original_clock: &ClockOwner,
+) -> Result<OwnedInitialInput, InitialError> {
+    let mut input = owned_registration_input(metadata, original_redirect_uri)?;
+    input.clock = Arc::clone(original_clock);
+    Ok(input)
+}
+
+fn callback_pkce_material() -> Result<CallbackPkceMaterial, InitialError> {
+    let state = Zeroizing::new(acosmi::generate_state());
+    let verifier = Zeroizing::new(acosmi::generate_code_verifier());
+    let challenge = Zeroizing::new(acosmi::code_challenge(&verifier));
+    for value in [&state, &verifier, &challenge] {
+        if value.len() != 43
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(InitialError::RequestMismatch);
+        }
+    }
+    Ok(CallbackPkceMaterial {
+        state,
+        verifier,
+        challenge,
+    })
+}
+
+fn callback_authorization_endpoint_allowed(endpoint: &url::Url) -> bool {
+    !(endpoint.query().is_some_and(|query| !query.is_empty()) || endpoint.fragment().is_some())
+}
+
+fn callback_authorization_url(
+    reply: &OwnedRegistrationReply,
+    pkce: &CallbackPkceMaterial,
+) -> Result<Zeroizing<String>, InitialError> {
+    let metadata = reply.resources.metadata.sdk_metadata();
+    let endpoint = url::Url::parse(&metadata.authorization_endpoint)
+        .map_err(|_| InitialError::RequestMismatch)?;
+    if !callback_authorization_endpoint_allowed(&endpoint) {
+        return Err(InitialError::RequestMismatch);
+    }
+    let options = acosmi::LoginOptions {
+        skip_browser: true,
+        login_hint: None,
+        login_method: None,
+        org_uuid: None,
+        expires_in: None,
+        success_redirect_url: None,
+    };
+    let scopes = ["ai".to_owned(), "account".to_owned()];
+    let authorization_url = Zeroizing::new(
+        acosmi::auth::auth::build_desktop_authorization_url(
+            metadata,
+            &reply.client_id,
+            &reply.original_redirect_uri,
+            &pkce.challenge,
+            &pkce.state,
+            &scopes,
+            &options,
+        )
+        .map_err(|_| InitialError::RequestMismatch)?,
+    );
+    if authorization_url.len() > 2048 {
+        return Err(InitialError::RequestMismatch);
+    }
+    Ok(authorization_url)
+}
+
 #[allow(dead_code, reason = "Pending code-grant consumption")]
 fn owned_code_input(
     metadata: GatewayDesktopMetadata,
@@ -306,6 +417,24 @@ fn owned_code_input(
     )
 }
 
+fn token_code_input_same_clock(
+    metadata: GatewayDesktopMetadata,
+    client_id: Zeroizing<String>,
+    code: Zeroizing<String>,
+    original_redirect_uri: Zeroizing<String>,
+    code_verifier: Zeroizing<String>,
+    clock: &ClockOwner,
+) -> Result<OwnedInitialInput, InitialError> {
+    initial::owned_code_input_with_clock(
+        metadata,
+        client_id,
+        code,
+        original_redirect_uri,
+        code_verifier,
+        Arc::clone(clock),
+    )
+}
+
 async fn prepare_initial(
     input: OwnedInitialInput,
     original_parent_budget: InitialParentBudget,
@@ -319,4 +448,123 @@ async fn consume_initial(
     response: acosmi::HttpResponse,
 ) -> Result<InitialReply, InitialError> {
     reply::consume_initial(prepared, response).await
+}
+
+// Consume the actual captured SDK request once, retaining every original owner.
+fn transfer_registration_request(
+    mut prepared: PreparedInitialOwner,
+) -> Result<(acosmi::HttpRequest, DispatchedInitialOwner), InitialError> {
+    if !prepared.sdk_exit_child.is_cancelled() {
+        return Err(InitialError::RequestMismatch);
+    }
+    let budget = prepared
+        .budget
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    budget.check(&prepared.clock)?;
+    let request = prepared
+        .request
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    let witness = prepared
+        .witness
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    let InitialReplyWitness::Registration {
+        metadata,
+        original_redirect_uri,
+    } = witness
+    else {
+        return Err(InitialError::RequestMismatch);
+    };
+
+    // Borrow the original validator through its existing kind, without cloning
+    // metadata or reconstructing any part of the owned HTTP request.
+    let kind = OwnedInitialKind::Registration(OwnedRegistrationInput {
+        metadata,
+        original_redirect_uri,
+    });
+    initial::validate_request(&request, &kind)?;
+    budget.check(&prepared.clock)?;
+    let OwnedInitialKind::Registration(registration) = kind else {
+        return Err(InitialError::RequestMismatch);
+    };
+    let dispatched = DispatchedInitialOwner {
+        witness: InitialReplyWitness::Registration {
+            metadata: registration.metadata,
+            original_redirect_uri: registration.original_redirect_uri,
+        },
+        budget,
+        clock: prepared.clock,
+        sdk_exit_child: prepared.sdk_exit_child,
+        transfer: RegistrationTransferWitness { _private: () },
+    };
+    dispatched.budget.check(&dispatched.clock)?;
+    Ok((request, dispatched))
+}
+
+// Consume the same captured Code request once, retaining its original guards.
+fn transfer_code_request(
+    mut prepared: PreparedInitialOwner,
+) -> Result<(acosmi::HttpRequest, CodeDispatchedInitialOwner), InitialError> {
+    if !prepared.sdk_exit_child.is_cancelled() {
+        return Err(InitialError::RequestMismatch);
+    }
+    let budget = prepared
+        .budget
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    budget.check(&prepared.clock)?;
+    let request = prepared
+        .request
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    let witness = prepared
+        .witness
+        .take()
+        .ok_or(InitialError::RequestMismatch)?;
+    let InitialReplyWitness::Code {
+        metadata,
+        binding,
+        start,
+        code,
+        redirect_uri,
+        code_verifier,
+    } = witness
+    else {
+        return Err(InitialError::RequestMismatch);
+    };
+    // Move all five original String guards through the existing validator.
+    let kind = OwnedInitialKind::Code(OwnedCodeInput {
+        metadata,
+        client_id: binding.client_id,
+        code,
+        redirect_uri,
+        code_verifier,
+        server_url: binding.server_url,
+    });
+    initial::validate_request(&request, &kind)?;
+    budget.check(&prepared.clock)?;
+    let OwnedInitialKind::Code(code) = kind else {
+        return Err(InitialError::RequestMismatch);
+    };
+    let dispatched = CodeDispatchedInitialOwner {
+        witness: InitialReplyWitness::Code {
+            metadata: code.metadata,
+            binding: OwnedTokenBinding {
+                client_id: code.client_id,
+                server_url: code.server_url,
+            },
+            start,
+            code: code.code,
+            redirect_uri: code.redirect_uri,
+            code_verifier: code.code_verifier,
+        },
+        budget,
+        clock: prepared.clock,
+        sdk_exit_child: prepared.sdk_exit_child,
+        transfer: CodeTransferWitness { _private: () },
+    };
+    dispatched.budget.check(&dispatched.clock)?;
+    Ok((request, dispatched))
 }

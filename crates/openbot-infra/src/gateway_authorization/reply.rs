@@ -1,15 +1,16 @@
 //! Closed initial OAuth reply decoding; every decoded allocation is armed first.
 
-use std::num::NonZeroI64;
+use std::{future::poll_fn, num::NonZeroI64, task::Poll};
 
 use futures_util::StreamExt;
 
 use zeroize::{Zeroize, Zeroizing};
 
+use super::journal::SavedFlow;
 use super::{
-    ClockOwner, InitialBudget, InitialError, InitialReply, InitialReplyWitness,
-    OwnedRegistrationReply, ParsedTokenFields, PreparedInitialOwner, ReplyInvalidReason,
-    ReplyResources,
+    ClockOwner, DispatchedInitialOwner, InitialBudget, InitialError, InitialReply,
+    InitialReplyWitness, OwnedRegistrationReply, ParsedTokenFields, PreparedInitialOwner,
+    RegistrationTransferWitness, ReplyInvalidReason, ReplyResources,
 };
 
 const BODY_LIMIT: usize = 65_536;
@@ -595,7 +596,7 @@ fn json_media_type(value: &[u8]) -> bool {
     value.eq_ignore_ascii_case(b"utf-8") || value.eq_ignore_ascii_case(b"\"utf-8\"")
 }
 
-fn header_limits(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
+pub(super) fn header_limits(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
     let mut count = 0_usize;
     let mut total = 0_usize;
     for (name, value) in &response.headers {
@@ -613,7 +614,7 @@ fn header_limits(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
     Ok(())
 }
 
-fn success_media_type(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
+pub(super) fn success_media_type(response: &acosmi::HttpResponse) -> Result<(), InitialError> {
     let values = response.headers.get_all("content-type");
     let mut values = values.iter();
     let value = values
@@ -765,6 +766,7 @@ pub(super) async fn consume_initial(
             metadata,
             binding,
             start,
+            ..
         } => {
             let fields = parse_tokens(body.as_slice())?;
             budget.check(&prepared.clock)?;
@@ -781,4 +783,102 @@ pub(super) async fn consume_initial(
             Ok(InitialReply::Tokens(owner))
         }
     }
+}
+
+// The dispatched reader uses both original budgets on every actual stream poll,
+// including Pending. The captured reader above retains its original behavior.
+async fn owned_dispatched_registration_body(
+    response: &mut acosmi::HttpResponse,
+    budget: &InitialBudget,
+    clock: &ClockOwner,
+    flow: &SavedFlow,
+) -> Result<Zeroizing<Vec<u8>>, InitialError> {
+    let mut body = Zeroizing::new(Vec::with_capacity(BODY_LIMIT));
+    let deadline = flow.registration_reply_cap(budget);
+    loop {
+        flow.check_registration_reply(budget, clock)?;
+        let next = tokio::select! {
+            biased;
+            _ = budget.original_parent.cancelled() => return Err(InitialError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => return Err(InitialError::Deadline),
+            next = poll_fn(|cx| {
+                if let Err(error) = flow.check_registration_reply(budget, clock) {
+                    return Poll::Ready(Err(error));
+                }
+                let polled = response.body.as_mut().poll_next(cx);
+                if let Err(error) = flow.check_registration_reply(budget, clock) {
+                    return Poll::Ready(Err(error));
+                }
+                match polled {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(item) => Poll::Ready(Ok(item)),
+                }
+            }) => next?,
+        };
+        flow.check_registration_reply(budget, clock)?;
+        match next {
+            Some(Ok(chunk)) => {
+                let length = body
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or_else(|| invalid(ReplyInvalidReason::BodyLimit))?;
+                if length > BODY_LIMIT {
+                    return Err(invalid(ReplyInvalidReason::BodyLimit));
+                }
+                // Immutable SDK Bytes remain outside the zeroizing body owner.
+                body.extend_from_slice(&chunk);
+            }
+            Some(Err(_)) => return Err(InitialError::BodyTransport),
+            None => return Ok(body),
+        }
+    }
+}
+
+pub(super) async fn consume_dispatched_registration(
+    dispatched: DispatchedInitialOwner,
+    mut response: acosmi::HttpResponse,
+    flow: &SavedFlow,
+) -> Result<OwnedRegistrationReply, InitialError> {
+    flow.check_registration_reply(&dispatched.budget, &dispatched.clock)?;
+    if !dispatched.sdk_exit_child.is_cancelled() {
+        return Err(invalid(ReplyInvalidReason::ReplyBinding));
+    }
+    let DispatchedInitialOwner {
+        witness,
+        budget,
+        clock,
+        sdk_exit_child: _,
+        transfer,
+    } = dispatched;
+    let RegistrationTransferWitness { _private: () } = transfer;
+    let InitialReplyWitness::Registration {
+        metadata,
+        original_redirect_uri,
+    } = witness
+    else {
+        return Err(invalid(ReplyInvalidReason::ReplyBinding));
+    };
+    header_limits(&response)?;
+    let status = response.status.as_u16();
+    if status != 200 && status != 201 {
+        // Preserve only the numeric status; never poll the vendor error body.
+        return Err(InitialError::HttpStatus(status));
+    }
+    success_media_type(&response)?;
+    let body = owned_dispatched_registration_body(&mut response, &budget, &clock, flow).await?;
+    flow.check_registration_reply(&budget, &clock)?;
+    let parsed = parse_registration(body.as_slice(), original_redirect_uri.as_str());
+    flow.check_registration_reply(&budget, &clock)?;
+    let client_id = parsed?;
+    let reply = OwnedRegistrationReply {
+        client_id,
+        original_redirect_uri,
+        resources: ReplyResources {
+            metadata,
+            budget,
+            clock,
+        },
+    };
+    flow.check_registration_reply(&reply.resources.budget, &reply.resources.clock)?;
+    Ok(reply)
 }

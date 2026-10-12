@@ -236,6 +236,109 @@ impl<'a> RememberPreferenceHostObservation<'a> {
         self.factory.witness(auth, session, deadline)
     }
 }
+/// Original internal Thread history observer invocation; implementing this port grants no authority.
+pub trait ThreadHistoryHostTarget: Send + Sync {
+    /// Compare the concrete enrolled Thread history observer instance, independently of its namespace.
+    fn matches_authority(&self, authority: &Arc<()>) -> bool;
+    /// Compare all original Auth facts and the original attached request binding.
+    fn matches_auth(&self, auth: &AuthContext) -> bool;
+}
+
+/// Actual session times decoded by the Thread history observer's own current statement, never a session proof.
+#[derive(Clone, Copy)]
+pub struct ThreadHistorySessionFacts {
+    /// Original immutable creation time read from the session row.
+    pub created_at: OffsetDateTime,
+    /// Current idle activity time read without touching the session.
+    pub updated_at: OffsetDateTime,
+    /// Current expiry time read from the session row.
+    pub expires_at: OffsetDateTime,
+    /// Wall clock observed when the current row was decoded.
+    pub observed_wall: OffsetDateTime,
+    /// Monotonic clock observed when the current row was decoded.
+    pub observed_monotonic: std::time::Instant,
+}
+
+/// Synchronous actual-host tail; it owns no lifecycle lease and opens no database transaction.
+pub trait ThreadHistoryHostTailWitness: Send + Sync {
+    /// Recheck the original issuer, owner, window and clock under the original deadline.
+    fn verify_current(
+        &self,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError>;
+}
+
+/// Real producer retains its own lifetime policy; arbitrary implementations are not enrollment.
+pub trait ThreadHistoryHostTailFactory: Send + Sync {
+    /// Produce a new synchronous tail from this same statement's actual session timing facts.
+    fn witness(
+        &self,
+        auth: &AuthContext,
+        session: Option<ThreadHistorySessionFacts>,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn ThreadHistoryHostTailWitness>, HostRequestBindingError>;
+}
+
+/// Borrowed original host input for one owned Thread history observer transaction; no Serde or secret Debug.
+pub struct ThreadHistoryHostObservation<'a> {
+    kind: HostRequestBindingKind,
+    identity: HostRequestBindingIdentity,
+    epoch: Option<BorrowedServerSessionEpoch<'a>>,
+    factory: Box<dyn ThreadHistoryHostTailFactory + 'a>,
+}
+impl<'a> ThreadHistoryHostObservation<'a> {
+    /// Trusted Rust producer constructor; the Thread history observer must independently check enrollment.
+    #[doc(hidden)]
+    pub fn from_trusted_host(
+        kind: HostRequestBindingKind,
+        identity: HostRequestBindingIdentity,
+        epoch: Option<BorrowedServerSessionEpoch<'a>>,
+        factory: Box<dyn ThreadHistoryHostTailFactory + 'a>,
+    ) -> Result<Self, HostRequestBindingError> {
+        if kind != identity.kind {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        match (&identity.epoch, &epoch) {
+            (Epoch::Session(original), Some(borrowed)) if original == borrowed.epoch => {}
+            (Epoch::SingleUser | Epoch::Window { .. }, None) => {}
+            _ => return Err(HostRequestBindingError::NotCurrent),
+        }
+        Ok(Self {
+            kind,
+            identity,
+            epoch,
+            factory,
+        })
+    }
+    /// Closed host kind, not evidence of current authority.
+    #[must_use]
+    pub const fn kind(&self) -> HostRequestBindingKind {
+        self.kind
+    }
+    /// Original attachment, to be checked against the Thread history observer's actual enrolled issuer.
+    #[must_use]
+    pub const fn identity(&self) -> &HostRequestBindingIdentity {
+        &self.identity
+    }
+    /// Reborrow the original issuer-owned epoch; no token getter or new epoch constructor.
+    #[must_use]
+    pub fn server_session_epoch(&self) -> Option<BorrowedServerSessionEpoch<'_>> {
+        self.epoch
+            .as_ref()
+            .map(|epoch| BorrowedServerSessionEpoch { epoch: epoch.epoch })
+    }
+    /// Create the original host's tail only after the Thread history observer decoded a fresh current row.
+    pub fn witness(
+        &self,
+        auth: &AuthContext,
+        session: Option<ThreadHistorySessionFacts>,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn ThreadHistoryHostTailWitness>, HostRequestBindingError> {
+        self.factory.witness(auth, session, deadline)
+    }
+}
+
 /// 专用目录仓储的原调用目标；实现端口本身不授予权限。
 pub trait CustomModelCatalogHostTarget: Send + Sync {
     /// 比较具体已安装仓储的原 authority Arc。
@@ -288,12 +391,99 @@ pub trait GatewayAuthorizationHostTailFactory: Send + Sync {
     ) -> Result<Box<dyn GatewayAuthorizationHostTailWitness>, HostRequestBindingError>;
 }
 
+/// One synchronous callback URL handoff through the original enrolled Host.
+/// Implementing this port does not mint a matching issuer or current authority.
+pub trait GatewayAuthorizationCallbackUrlPort: Send + Sync {
+    /// Consume one opaque invocation, without returning URL or callback resources.
+    fn handoff(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        invocation: GatewayAuthorizationCallbackUrlInvocation<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError>;
+}
+
+/// The original Host's fixed synchronous URL destination; no asynchronous escape.
+pub trait GatewayAuthorizationCallbackUrlReceiver: Send + Sync {
+    /// Borrow one URL for this call only, without a permission or browser grant.
+    fn accept_url(&self, url: &str) -> Result<(), HostRequestBindingError>;
+}
+
+/// An inseparable one-use URL invocation borrowed from the original issuer.
+/// There is no resource getter, cloning or serialization interface.
+pub struct GatewayAuthorizationCallbackUrlInvocation<'a> {
+    issuer: &'a RequestBindingIssuer,
+    identity: &'a HostRequestBindingIdentity,
+    url: &'a str,
+}
+
+impl RequestBindingIssuer {
+    /// Lend one armed callback URL only for this current original Server identity.
+    /// This constructor alone does not prove the SDK producer's lineage.
+    pub fn gateway_callback_url_invocation<'a>(
+        &'a self,
+        identity: &'a HostRequestBindingIdentity,
+        url: &'a str,
+    ) -> Result<GatewayAuthorizationCallbackUrlInvocation<'a>, HostRequestBindingError> {
+        let invocation = GatewayAuthorizationCallbackUrlInvocation {
+            issuer: self,
+            identity,
+            url,
+        };
+        invocation.check(self, identity)?;
+        Ok(invocation)
+    }
+}
+
+impl GatewayAuthorizationCallbackUrlInvocation<'_> {
+    fn check(
+        &self,
+        original_issuer: &RequestBindingIssuer,
+        original_identity: &HostRequestBindingIdentity,
+    ) -> Result<(), HostRequestBindingError> {
+        if !matches!(
+            self.identity.kind,
+            HostRequestBindingKind::ServerSession | HostRequestBindingKind::ServerSingleUserOwner
+        ) || !self.issuer.observation().is_current()
+            || !original_issuer.observation().is_current()
+            || !self.issuer.owns_identity(self.identity)
+            || !original_issuer.owns_identity(self.identity)
+            || !self.identity.same_binding(original_identity)
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        Ok(())
+    }
+
+    /// Consume the whole invocation and borrow its URL only within the same issuer.
+    /// Original current state and the full binding are rechecked after the receiver.
+    pub fn deliver_to(
+        self,
+        original_issuer: &RequestBindingIssuer,
+        original_identity: &HostRequestBindingIdentity,
+        receiver: &dyn GatewayAuthorizationCallbackUrlReceiver,
+    ) -> Result<(), HostRequestBindingError> {
+        self.check(original_issuer, original_identity)?;
+        let result = receiver.accept_url(self.url);
+        self.check(original_issuer, original_identity)?;
+        result
+    }
+}
+
+impl fmt::Debug for GatewayAuthorizationCallbackUrlInvocation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GatewayAuthorizationCallbackUrlInvocation(<redacted>)")
+    }
+}
+
 /// Borrowed original Server Host identity and epoch, without keeping its owner alive.
 pub struct GatewayAuthorizationHostObservation<'a> {
     kind: HostRequestBindingKind,
     identity: HostRequestBindingIdentity,
     epoch: Option<BorrowedServerSessionEpoch<'a>>,
     factory: Box<dyn GatewayAuthorizationHostTailFactory + 'a>,
+    callback_port: Option<Box<dyn GatewayAuthorizationCallbackUrlPort + 'a>>,
 }
 
 impl<'a> GatewayAuthorizationHostObservation<'a> {
@@ -319,7 +509,66 @@ impl<'a> GatewayAuthorizationHostObservation<'a> {
             identity,
             epoch,
             factory,
+            callback_port: None,
         })
+    }
+
+    /// Attach the real producer's synchronous callback port after the original checks.
+    pub fn with_callback_port(
+        kind: HostRequestBindingKind,
+        identity: HostRequestBindingIdentity,
+        epoch: Option<BorrowedServerSessionEpoch<'a>>,
+        factory: Box<dyn GatewayAuthorizationHostTailFactory + 'a>,
+        callback_port: Box<dyn GatewayAuthorizationCallbackUrlPort + 'a>,
+    ) -> Result<Self, HostRequestBindingError> {
+        let mut observation = Self::from_trusted_host(kind, identity, epoch, factory)?;
+        observation.callback_port = Some(callback_port);
+        Ok(observation)
+    }
+
+    fn check_callback_binding(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let binding = auth
+            .request_binding()
+            .ok_or(HostRequestBindingError::Missing)?;
+        if !matches!(
+            self.kind,
+            HostRequestBindingKind::ServerSession | HostRequestBindingKind::ServerSingleUserOwner
+        ) || self.identity.owner.closed.load(Ordering::SeqCst)
+            || self.identity.facts != AuthFacts::of(auth)
+            || !self.identity.same_binding(binding.identity())
+            || !target.matches_auth(auth)
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        Ok(())
+    }
+
+    /// Consume one callback invocation through this original current borrowed Host.
+    /// A default observation has no port and refuses only this handoff.
+    pub fn handoff_callback_url(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        invocation: GatewayAuthorizationCallbackUrlInvocation<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        self.check_callback_binding(auth, target, deadline)?;
+        invocation.check(invocation.issuer, &self.identity)?;
+        let port = self
+            .callback_port
+            .as_ref()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let result = port.handoff(auth, target, invocation, deadline);
+        self.check_callback_binding(auth, target, deadline)?;
+        result
     }
 
     /// Closed original Host kind, without a current authorization conclusion.
@@ -564,6 +813,15 @@ pub trait HostRequestBindingGuard: Send + Sync {
         _target: &'a dyn RememberPreferenceHostTarget,
         _deadline: std::time::Instant,
     ) -> Result<RememberPreferenceHostObservation<'a>, HostRequestBindingError> {
+        Err(HostRequestBindingError::Unavailable)
+    }
+    /// Borrow original host input for an enrolled Thread history observer's own transaction, without I/O.
+    fn borrow_thread_history_host_before<'a>(
+        &'a self,
+        _auth: &'a AuthContext,
+        _target: &'a dyn ThreadHistoryHostTarget,
+        _deadline: std::time::Instant,
+    ) -> Result<ThreadHistoryHostObservation<'a>, HostRequestBindingError> {
         Err(HostRequestBindingError::Unavailable)
     }
     /// Observe an original positive save receipt and current host together, or refuse unsupported composition.
@@ -900,6 +1158,24 @@ impl VerifiedHostRequestBinding {
         let observation = self
             .guard
             .borrow_remember_preference_host_before(auth, target, deadline)?;
+        self.check_repository_host_attachment(auth, deadline)?;
+        if observation.kind() != self.kind() || !self.identity.same_binding(observation.identity())
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        Ok(observation)
+    }
+    /// Pure attachment checks and real producer delegation; this opens no database transaction.
+    pub fn borrow_thread_history_host_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        target: &'a dyn ThreadHistoryHostTarget,
+        deadline: std::time::Instant,
+    ) -> Result<ThreadHistoryHostObservation<'a>, HostRequestBindingError> {
+        self.check_repository_host_attachment(auth, deadline)?;
+        let observation = self
+            .guard
+            .borrow_thread_history_host_before(auth, target, deadline)?;
         self.check_repository_host_attachment(auth, deadline)?;
         if observation.kind() != self.kind() || !self.identity.same_binding(observation.identity())
         {

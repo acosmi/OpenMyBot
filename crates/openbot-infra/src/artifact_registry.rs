@@ -107,7 +107,7 @@ SELECT pg_catalog.jsonb_build_object(
 // Current live catalog facts cannot become their own acceptance oracle.
 const REGISTERED_INTERNAL_SCHEMA: &str =
     include_str!("../../../fixtures/db/artifact-dataset-bindings-0041.json");
-const REGISTERED_PUBLIC_SCHEMA: &str = include_str!("../../../fixtures/db/schema-0046.json");
+const REGISTERED_PUBLIC_SCHEMA: &str = include_str!("../../../fixtures/db/schema-0050.json");
 
 const READ_NAMESPACE: &str = r"
 SELECT

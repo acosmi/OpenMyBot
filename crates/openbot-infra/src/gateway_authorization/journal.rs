@@ -31,9 +31,17 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod authority_sql;
+mod callback;
 mod current;
+mod registration;
 #[cfg(test)]
 mod tests;
+mod token;
+
+pub use callback::{
+    CallbackErrorKind, CallbackStage, GatewayAuthorizationCallbackError,
+    GatewayAuthorizationCallbackWaitOwner, GatewayAuthorizationVerifiedCodeOwner,
+};
 
 /// Closed, payload-free journal failure classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,6 +237,313 @@ pub struct ClosedAttemptReceipt {
     _private: (),
 }
 
+/// Whole registered result retaining the original reply and one reservation.
+pub struct RegisteredAttemptOwner {
+    reply: super::OwnedRegistrationReply,
+    binding: RegistrationDispatchBinding,
+    reservation: EnrollmentReservation,
+}
+struct RegistrationDispatchBinding {
+    flow: SavedFlow,
+    identity: HostRequestBindingIdentity,
+    expected: Row,
+    journal: Weak<GatewayAuthorizationJournal>,
+    runtime: Weak<GatewayAuthorizationJournalRuntimeOwner>,
+}
+struct EnrollmentReservation {
+    id: Uuid,
+}
+
+/// Whole callback capture; only the genuine callback producer supplies its witness.
+struct TokenCaptureOwner {
+    input: super::OwnedInitialInput,
+    binding: RegistrationDispatchBinding,
+    reservation: EnrollmentReservation,
+    capture: callback::TokenCaptureWitness,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenGatePhase {
+    Registered,
+    CodeAdmitted,
+}
+
+/// Whole token result retaining all six erase responsibilities and the original binding.
+pub struct GatewayAuthorizationTokenOwner {
+    tokens: super::TokenSetGuard,
+    binding: RegistrationDispatchBinding,
+    reservation: EnrollmentReservation,
+}
+
+/// Closed stage facts; a stage never proves that a request was not sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayAuthorizationTokenStage {
+    /// Consume the original verified callback and capture its one SDK request.
+    Capture,
+    /// Admit the original code in the original write transaction.
+    CodeAdmission,
+    /// Read back all original attempt fields in the original read-only transaction.
+    CodeReadback,
+    /// Execute the one original token request and end its original send guard.
+    TokenSend,
+    /// Read and validate the bounded original token reply.
+    TokenReply,
+    /// Check the original current state, budgets and expiry before whole handoff.
+    FinalHandoff,
+}
+
+/// Closed token failure classification; none of these facts permit a retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayAuthorizationTokenKind {
+    /// Refusal with actual structural or transport-minted proof of no dial.
+    BeforeDispatchRefused,
+    /// The required original source or observation was unavailable.
+    Unavailable,
+    /// The original caller cancelled.
+    Cancelled,
+    /// The original absolute cap ended.
+    Deadline,
+    /// The original request or response framing was invalid.
+    FramingInvalid,
+    /// The original response carried this rejected HTTP status.
+    HttpStatus(u16),
+    /// Original send or later token delivery effects could not be proven.
+    TokenUnknown,
+    /// The original send-guard terminal could not be proven.
+    CleanupUnknown,
+    /// The original code write COMMIT acknowledgement was unknown.
+    CommitUnknown,
+    /// The original code write COMMIT acknowledgement was late.
+    CommitAcknowledgedAfterDeadline,
+    /// The exact code-admitted readback could not be proven.
+    ReadbackUnproven,
+    /// The original readback ROLLBACK acknowledgement was late.
+    RollbackAcknowledgedAfterDeadline,
+    /// The original captured request or retained witness did not match.
+    RequestMismatch,
+    /// The original SDK producer ended without its required request.
+    ProducerEnded,
+    /// The original reply body transport failed.
+    BodyTransport,
+    /// The original reply violated this closed protocol predicate.
+    ProtocolInvalid(GatewayAuthorizationTokenReplyReason),
+}
+
+/// Payload-free reasons corresponding to the original private token reply predicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayAuthorizationTokenReplyReason {
+    /// JSON syntax was invalid.
+    JsonSyntax,
+    /// A key outside the fixed protocol was present.
+    UnknownKey,
+    /// A protocol key occurred more than once.
+    DuplicateKey,
+    /// A forbidden secret key was present.
+    ForbiddenSecretKey,
+    /// A field had the wrong shape.
+    FieldShape,
+    /// The original header limits were exceeded.
+    HeaderLimit,
+    /// The original media type was invalid.
+    MediaType,
+    /// The original body limit was exceeded.
+    BodyLimit,
+    /// A field violated its original byte or lexical limit.
+    FieldLimit,
+    /// Scope violated its original lexical shape.
+    ScopeShape,
+    /// Token type was not the original supported literal.
+    TokenType,
+    /// Expiry was not the original supported integer.
+    ExpiryInteger,
+    /// Original clock or expiry checks failed.
+    ClockOrExpiry,
+    /// The original reply binding did not match.
+    ReplyBinding,
+}
+
+/// Closed operation facts retaining three independent original transaction terminals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GatewayAuthorizationTokenError {
+    stage: GatewayAuthorizationTokenStage,
+    kind: GatewayAuthorizationTokenKind,
+    snapshot: Option<crate::gateway_transport::GatewayAttemptSnapshot>,
+    code_write: Ack,
+    code_readback: Ack,
+    token_send: Ack,
+}
+
+impl GatewayAuthorizationTokenError {
+    fn new(stage: GatewayAuthorizationTokenStage, kind: GatewayAuthorizationTokenKind) -> Self {
+        Self {
+            stage,
+            kind,
+            snapshot: None,
+            code_write: Ack::NotAttempted,
+            code_readback: Ack::NotAttempted,
+            token_send: Ack::NotAttempted,
+        }
+    }
+    /// Original operation stage, without inference about send effects.
+    #[must_use]
+    pub const fn stage(&self) -> GatewayAuthorizationTokenStage {
+        self.stage
+    }
+    /// Closed original failure classification; not permission to retry.
+    #[must_use]
+    pub const fn kind(&self) -> GatewayAuthorizationTokenKind {
+        self.kind
+    }
+    /// Original transport-minted facts, retaining absence of an observed snapshot.
+    #[must_use]
+    pub const fn transport_snapshot(
+        &self,
+    ) -> Option<crate::gateway_transport::GatewayAttemptSnapshot> {
+        self.snapshot
+    }
+    /// Original code-write COMMIT or failed-write ROLLBACK acknowledgement.
+    #[must_use]
+    pub const fn code_write_ack(&self) -> GatewayAuthorizationJournalAck {
+        self.code_write
+    }
+    /// Original exact-readback ROLLBACK acknowledgement.
+    #[must_use]
+    pub const fn code_readback_ack(&self) -> GatewayAuthorizationJournalAck {
+        self.code_readback
+    }
+    /// Original token-send guard ROLLBACK acknowledgement.
+    #[must_use]
+    pub const fn token_send_rollback_ack(&self) -> GatewayAuthorizationJournalAck {
+        self.token_send
+    }
+}
+
+impl fmt::Debug for GatewayAuthorizationTokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatewayAuthorizationTokenError")
+            .field("stage", &self.stage)
+            .field("kind", &self.kind)
+            .field("snapshot", &self.snapshot)
+            .field("code_write", &self.code_write)
+            .field("code_readback", &self.code_readback)
+            .field("token_send", &self.token_send)
+            .finish()
+    }
+}
+impl fmt::Display for GatewayAuthorizationTokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "GatewayAuthorizationTokenError({:?},{:?})",
+            self.stage, self.kind
+        )
+    }
+}
+impl std::error::Error for GatewayAuthorizationTokenError {}
+
+/// Closed registration-dispatch failure facts; classification grants no retry authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistrationDispatchKind {
+    /// The operation was refused before dispatch.
+    BeforeDispatchRefused,
+    /// The required registration-dispatch resource was unavailable.
+    Unavailable,
+    /// The original operation was cancelled.
+    Cancelled,
+    /// The original operation deadline was reached.
+    Deadline,
+    /// The registration request or reply framing was invalid.
+    FramingInvalid,
+    /// The registration response carried this rejected HTTP status.
+    HttpStatus(u16),
+    /// The registration result could not be proven.
+    RegistrationUnknown,
+    /// The original send-guard cleanup could not be proven.
+    CleanupUnknown,
+    /// The original registered write COMMIT acknowledgement was unknown.
+    CommitUnknown,
+    /// The original registered write COMMIT acknowledgement was late.
+    CommitAcknowledgedAfterDeadline,
+    /// The registered exact readback could not be proven.
+    ReadbackUnproven,
+    /// The original registered readback ROLLBACK acknowledgement was late.
+    RollbackAcknowledgedAfterDeadline,
+}
+/// Closed operation facts preserving the three original transaction terminals.
+pub struct RegistrationDispatchError {
+    kind: RegistrationDispatchKind,
+    transport: Option<crate::gateway_transport::GatewayAttemptSnapshot>,
+    send_guard_rollback: Ack,
+    registered_write: Ack,
+    registered_readback: Ack,
+}
+impl RegistrationDispatchError {
+    /// Closed failure classification; it is not permission to retry.
+    #[must_use]
+    pub const fn kind(&self) -> RegistrationDispatchKind {
+        self.kind
+    }
+    /// Original transport-minted facts, preserving absence of an observed snapshot.
+    #[must_use]
+    pub const fn transport_snapshot(
+        &self,
+    ) -> Option<crate::gateway_transport::GatewayAttemptSnapshot> {
+        self.transport
+    }
+    /// Original send-guard ROLLBACK acknowledgement fact.
+    #[must_use]
+    pub const fn send_guard_rollback_ack(&self) -> GatewayAuthorizationJournalAck {
+        self.send_guard_rollback
+    }
+    /// Original registered write COMMIT acknowledgement fact.
+    #[must_use]
+    pub const fn registered_write_ack(&self) -> GatewayAuthorizationJournalAck {
+        self.registered_write
+    }
+    /// Original registered readback ROLLBACK acknowledgement fact.
+    #[must_use]
+    pub const fn registered_readback_ack(&self) -> GatewayAuthorizationJournalAck {
+        self.registered_readback
+    }
+    fn new(kind: RegistrationDispatchKind) -> Self {
+        Self {
+            kind,
+            transport: None,
+            send_guard_rollback: Ack::NotAttempted,
+            registered_write: Ack::NotAttempted,
+            registered_readback: Ack::NotAttempted,
+        }
+    }
+}
+impl fmt::Debug for RegistrationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegistrationDispatchError")
+            .field("kind", &self.kind)
+            .field("transport", &self.transport)
+            .field("send_guard_rollback", &self.send_guard_rollback)
+            .field("registered_write", &self.registered_write)
+            .field("registered_readback", &self.registered_readback)
+            .finish()
+    }
+}
+impl fmt::Display for RegistrationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RegistrationDispatchError({:?})", self.kind)
+    }
+}
+impl std::error::Error for RegistrationDispatchError {}
+impl fmt::Debug for RegisteredAttemptOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Each retained resource has static redacted Debug; no identities or
+        // reply fields are exposed from this whole owner.
+        f.debug_struct("RegisteredAttemptOwner")
+            .field("reply", &self.reply)
+            .field("binding", &self.binding)
+            .field("reservation", &self.reservation)
+            .finish()
+    }
+}
+
 /// The two finite controlled-close reasons; expired/revoked cleanup is separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlledCloseReason {
@@ -246,7 +561,7 @@ impl ControlledCloseReason {
     }
 }
 
-struct SavedFlow {
+pub(super) struct SavedFlow {
     clock: ClockOwner,
     start: ClockSample,
     original_parent: CancellationToken,
@@ -322,6 +637,26 @@ impl SavedFlow {
             return Err(Error::new(Kind::Deadline));
         }
         Ok(now)
+    }
+    pub(super) fn check_registration_reply(
+        &self,
+        initial: &InitialBudget,
+        clock: &ClockOwner,
+    ) -> Result<ClockSample, InitialError> {
+        if !Arc::ptr_eq(&self.clock, clock) {
+            return Err(InitialError::ProtocolInvalid(
+                super::ReplyInvalidReason::ReplyBinding,
+            ));
+        }
+        initial.check(clock)?;
+        self.check(Some(initial)).map_err(|error| match error.kind {
+            Kind::Cancelled => InitialError::Cancelled,
+            Kind::Deadline => InitialError::Deadline,
+            _ => InitialError::ProtocolInvalid(super::ReplyInvalidReason::ReplyBinding),
+        })
+    }
+    pub(super) fn registration_reply_cap(&self, initial: &InitialBudget) -> Instant {
+        self.cap(Some(initial))
     }
     fn cap(&self, initial: Option<&InitialBudget>) -> Instant {
         let cap = self.deadline.min(self.original_caller_deadline);
@@ -529,6 +864,24 @@ impl GatewayAuthorizationJournal {
         }
         Ok(())
     }
+    /// Consume one original admission receipt for one registration dispatch.
+    pub async fn register_admitted(
+        self: &Arc<Self>,
+        auth: &AuthContext,
+        receipt: RegistrationAdmissionReceipt,
+        factory: &crate::gateway_transport::GatewayTransportFactory,
+    ) -> Result<RegisteredAttemptOwner, RegistrationDispatchError> {
+        registration::dispatch_registration(self, auth, receipt, factory).await
+    }
+    /// Consume one whole verified callback for one original SDK token dispatch.
+    pub async fn dispatch_token(
+        self: &Arc<Self>,
+        auth: &AuthContext,
+        owner: GatewayAuthorizationVerifiedCodeOwner,
+        factory: &crate::gateway_transport::GatewayTransportFactory,
+    ) -> Result<GatewayAuthorizationTokenOwner, GatewayAuthorizationTokenError> {
+        token::dispatch_token(self, auth, owner, factory).await
+    }
     /// Create/audit/ACK/read back before capturing the original registration request.
     pub async fn create_attempt(
         self: &Arc<Self>,
@@ -541,6 +894,17 @@ impl GatewayAuthorizationJournal {
         self.check_scope(auth)?;
         let input = owned_registration_input(metadata, redirect).map_err(initial_error)?;
         let flow = SavedFlow::new(Arc::clone(&input.clock), original_parent, caller_deadline)?;
+        self.create_from_input_and_flow(auth, input, flow).await
+    }
+    async fn create_from_input_and_flow(
+        self: &Arc<Self>,
+        auth: &AuthContext,
+        input: super::OwnedInitialInput,
+        flow: SavedFlow,
+    ) -> Result<CreatedAttemptOwner, Error> {
+        if !Arc::ptr_eq(&input.clock, &flow.clock) {
+            return Err(Error::new(Kind::Refused));
+        }
         let runtime = self
             .runtime
             .upgrade()
@@ -745,6 +1109,517 @@ impl GatewayAuthorizationJournal {
         gate.check()?;
         Ok(gate)
     }
+    fn registration_binding_gate<'a>(
+        self: &'a Arc<Self>,
+        auth: &'a AuthContext,
+        binding: &'a RegistrationDispatchBinding,
+        initial: &'a InitialBudget,
+        clock: &ClockOwner,
+    ) -> Result<OperationGate<'a>, Error> {
+        self.check_scope(auth)?;
+        let original = binding
+            .journal
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !Arc::ptr_eq(self, &original)
+            || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+            || !Arc::ptr_eq(&binding.flow.clock, clock)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let request_binding = auth
+            .request_binding()
+            .ok_or_else(|| Error::new(Kind::Refused))?;
+        if !request_binding.identity().same_binding(&binding.identity) {
+            return Err(Error::new(Kind::Refused));
+        }
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if binding.expected.installation_id != runtime.installation_id
+            || binding.expected.runtime_epoch != runtime.runtime_epoch
+            || binding.expected.deployment_id != self.deployment.as_str()
+            || binding.expected.tenant_id != self.tenant.as_str()
+            || binding.expected.owner_user_id != auth.actor().as_str()
+            || i64::try_from(auth.auth_generation().get()).ok()
+                != Some(binding.expected.auth_generation)
+            || binding.expected.created_at != binding.flow.created_at
+            || binding.expected.expires_at != binding.flow.expires_at
+            || binding.expected.journal_schema != 1
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        initial.check(clock).map_err(initial_error)?;
+        let gate = OperationGate {
+            journal: self,
+            auth,
+            flow: &binding.flow,
+            initial: Some(initial),
+        };
+        gate.check()?;
+        Ok(gate)
+    }
+    fn dispatched_gate<'a>(
+        self: &'a Arc<Self>,
+        auth: &'a AuthContext,
+        binding: &'a RegistrationDispatchBinding,
+        dispatched: &'a super::DispatchedInitialOwner,
+    ) -> Result<OperationGate<'a>, Error> {
+        // The parent whole-transfer path alone mints this witness. Keep the old
+        // captured-owner request.is_some() predicate unchanged above.
+        let _transfer = &dispatched.transfer;
+        if !dispatched.sdk_exit_child.is_cancelled() {
+            return Err(Error::new(Kind::Refused));
+        }
+        match &dispatched.witness {
+            InitialReplyWitness::Registration {
+                metadata,
+                original_redirect_uri,
+            } if metadata.sdk_metadata().issuer == binding.expected.issuer
+                && original_redirect_uri.as_str() == binding.expected.redirect_uri => {}
+            _ => return Err(Error::new(Kind::Refused)),
+        }
+        self.registration_binding_gate(auth, binding, &dispatched.budget, &dispatched.clock)
+    }
+    fn registered_reply_gate<'a>(
+        self: &'a Arc<Self>,
+        auth: &'a AuthContext,
+        binding: &'a RegistrationDispatchBinding,
+        reply: &'a super::OwnedRegistrationReply,
+    ) -> Result<OperationGate<'a>, Error> {
+        if reply.resources.metadata.sdk_metadata().issuer != binding.expected.issuer
+            || reply.original_redirect_uri.as_str() != binding.expected.redirect_uri
+            || !super::initial::valid_client_id(&reply.client_id)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        self.registration_binding_gate(
+            auth,
+            binding,
+            &reply.resources.budget,
+            &reply.resources.clock,
+        )
+    }
+    /// Bind one original listener and hand off one SDK-built URL after registration.
+    pub async fn start_callback(
+        self: &Arc<Self>,
+        auth: &AuthContext,
+        metadata: GatewayDesktopMetadata,
+        original_parent: CancellationToken,
+        caller_deadline: std::time::Instant,
+        factory: &crate::gateway_transport::GatewayTransportFactory,
+    ) -> Result<GatewayAuthorizationCallbackWaitOwner, GatewayAuthorizationCallbackError> {
+        callback::start_callback(
+            self,
+            auth,
+            metadata,
+            original_parent,
+            caller_deadline,
+            factory,
+        )
+        .await
+    }
+    /// Consume the same whole callback owner once, without granting code dispatch.
+    pub async fn wait_callback(
+        self: &Arc<Self>,
+        auth: &AuthContext,
+        owner: GatewayAuthorizationCallbackWaitOwner,
+    ) -> Result<GatewayAuthorizationVerifiedCodeOwner, GatewayAuthorizationCallbackError> {
+        callback::wait_callback(self, auth, owner).await
+    }
+    fn callback_registered_gate<'a>(
+        self: &'a Arc<Self>,
+        auth: &'a AuthContext,
+        owner: &'a RegisteredAttemptOwner,
+    ) -> Result<OperationGate<'a>, Error> {
+        self.check_scope(auth)?;
+        let binding = &owner.binding;
+        let original = binding
+            .journal
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !Arc::ptr_eq(self, &original)
+            || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+            || !Arc::ptr_eq(&binding.flow.clock, &owner.reply.resources.clock)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let attached = auth
+            .request_binding()
+            .ok_or_else(|| Error::new(Kind::Refused))?;
+        let issuer = self
+            .issuer
+            .get()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !attached.identity().same_binding(&binding.identity)
+            || !issuer.observation().is_current()
+            || !issuer.owns_identity(&binding.identity)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        let row = &binding.expected;
+        if !runtime.matches_pool_scope(&self.pool, &self.deployment, &self.tenant)
+            || row.attempt_id.get_version_num() != 7
+            || row.journal_schema != 1
+            || row.deployment_id != self.deployment.as_str()
+            || row.tenant_id != self.tenant.as_str()
+            || row.owner_user_id != auth.actor().as_str()
+            || i64::try_from(auth.auth_generation().get()).ok() != Some(row.auth_generation)
+            || row.installation_id != runtime.installation_id
+            || row.runtime_epoch != runtime.runtime_epoch
+            || row.issuer != owner.reply.resources.metadata.sdk_metadata().issuer
+            || row.redirect_uri != owner.reply.original_redirect_uri.as_str()
+            || row.phase != "registered"
+            || row.client_id.as_deref() != Some(owner.reply.client_id.as_str())
+            || !super::initial::valid_client_id(&owner.reply.client_id)
+            || row.enrollment_id != Some(owner.reservation.id)
+            || owner.reservation.id.get_version_num() != 7
+            || row.registration_admitted_at.is_none()
+            || row
+                .registration_admitted_at
+                .is_some_and(|t| t < row.created_at || t > row.updated_at)
+            || row.code_admitted_at.is_some()
+            || row.created_at != binding.flow.created_at
+            || row.expires_at != binding.flow.expires_at
+            || row.updated_at < row.created_at
+            || row.updated_at >= row.expires_at
+            || row.finished_at.is_some()
+            || row.outcome_code.is_some()
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        drop(runtime);
+        // The completed registration's 10s stage is historical; never check or renew it here.
+        let gate = OperationGate {
+            journal: self,
+            auth,
+            flow: &binding.flow,
+            initial: None,
+        };
+        gate.check()?;
+        Ok(gate)
+    }
+    fn token_capture_gate<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        binding: &'a RegistrationDispatchBinding,
+        reservation: &EnrollmentReservation,
+        capture: &callback::TokenCaptureWitness,
+    ) -> Result<OperationGate<'a>, Error> {
+        // This callback-only witness proves whole lineage, never current authority.
+        let _capture = capture;
+        self.check_scope(auth)?;
+        let original = binding
+            .journal
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !std::ptr::eq(self, original.as_ref()) || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let attached = auth
+            .request_binding()
+            .ok_or_else(|| Error::new(Kind::Refused))?;
+        let issuer = self
+            .issuer
+            .get()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !attached.identity().same_binding(&binding.identity)
+            || !matches!(
+                attached.kind(),
+                openbot_contracts::request_binding::HostRequestBindingKind::ServerSession
+                    | openbot_contracts::request_binding::HostRequestBindingKind::ServerSingleUserOwner
+            )
+            || !issuer.observation().is_current()
+            || !issuer.owns_identity(&binding.identity)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        let row = &binding.expected;
+        if !runtime.matches_pool_scope(&self.pool, &self.deployment, &self.tenant)
+            || row.attempt_id.get_version_num() != 7
+            || row.journal_schema != 1
+            || row.deployment_id != self.deployment.as_str()
+            || row.tenant_id != self.tenant.as_str()
+            || row.owner_user_id != auth.actor().as_str()
+            || i64::try_from(auth.auth_generation().get()).ok() != Some(row.auth_generation)
+            || row.installation_id != runtime.installation_id
+            || row.runtime_epoch != runtime.runtime_epoch
+            || row
+                .client_id
+                .as_deref()
+                .is_none_or(|v| !super::initial::valid_client_id(v))
+            || row.enrollment_id != Some(reservation.id)
+            || reservation.id.get_version_num() != 7
+            || row.registration_admitted_at.is_none()
+            || row
+                .registration_admitted_at
+                .is_some_and(|t| t < row.created_at || t > row.updated_at)
+            || row.created_at != binding.flow.created_at
+            || row.expires_at != binding.flow.expires_at
+            || row.updated_at < row.created_at
+            || row.updated_at >= row.expires_at
+            || row.finished_at.is_some()
+            || row.outcome_code.is_some()
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        drop(runtime);
+        if row.phase != "registered" || row.code_admitted_at.is_some() {
+            return Err(Error::new(Kind::Refused));
+        }
+        // Input is already owned by prepare_initial; the completed registration
+        // stage is historical. Only the original Flow/caller cap applies here.
+        let gate = OperationGate {
+            journal: self,
+            auth,
+            flow: &binding.flow,
+            initial: None,
+        };
+        gate.check()?;
+        Ok(gate)
+    }
+
+    fn token_dispatched_gate<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        binding: &'a RegistrationDispatchBinding,
+        reservation: &EnrollmentReservation,
+        dispatched: &'a super::CodeDispatchedInitialOwner,
+        phase: TokenGatePhase,
+    ) -> Result<OperationGate<'a>, Error> {
+        let _transfer = &dispatched.transfer;
+        if !dispatched.sdk_exit_child.is_cancelled()
+            || !Arc::ptr_eq(&binding.flow.clock, &dispatched.clock)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        self.check_scope(auth)?;
+        let original = binding
+            .journal
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !std::ptr::eq(self, original.as_ref()) || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let attached = auth
+            .request_binding()
+            .ok_or_else(|| Error::new(Kind::Refused))?;
+        let issuer = self
+            .issuer
+            .get()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !attached.identity().same_binding(&binding.identity)
+            || !matches!(
+                attached.kind(),
+                openbot_contracts::request_binding::HostRequestBindingKind::ServerSession
+                    | openbot_contracts::request_binding::HostRequestBindingKind::ServerSingleUserOwner
+            )
+            || !issuer.observation().is_current()
+            || !issuer.owns_identity(&binding.identity)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        let row = &binding.expected;
+        if !runtime.matches_pool_scope(&self.pool, &self.deployment, &self.tenant)
+            || row.attempt_id.get_version_num() != 7
+            || row.journal_schema != 1
+            || row.deployment_id != self.deployment.as_str()
+            || row.tenant_id != self.tenant.as_str()
+            || row.owner_user_id != auth.actor().as_str()
+            || i64::try_from(auth.auth_generation().get()).ok() != Some(row.auth_generation)
+            || row.installation_id != runtime.installation_id
+            || row.runtime_epoch != runtime.runtime_epoch
+            || row
+                .client_id
+                .as_deref()
+                .is_none_or(|v| !super::initial::valid_client_id(v))
+            || row.enrollment_id != Some(reservation.id)
+            || reservation.id.get_version_num() != 7
+            || row.registration_admitted_at.is_none()
+            || row
+                .registration_admitted_at
+                .is_some_and(|t| t < row.created_at || t > row.updated_at)
+            || row.created_at != binding.flow.created_at
+            || row.expires_at != binding.flow.expires_at
+            || row.updated_at < row.created_at
+            || row.updated_at >= row.expires_at
+            || row.finished_at.is_some()
+            || row.outcome_code.is_some()
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        drop(runtime);
+        let valid_phase = match phase {
+            TokenGatePhase::Registered => {
+                row.phase == "registered" && row.code_admitted_at.is_none()
+            }
+            TokenGatePhase::CodeAdmitted => {
+                row.phase == "code_admitted"
+                    && row.code_admitted_at.is_some_and(|t| {
+                        row.registration_admitted_at.is_some_and(|r| r <= t)
+                            && t <= row.updated_at
+                            && t < row.expires_at
+                    })
+            }
+        };
+        if !valid_phase {
+            return Err(Error::new(Kind::Refused));
+        }
+        match &dispatched.witness {
+            InitialReplyWitness::Code {
+                metadata,
+                binding: reply_binding,
+                start,
+                redirect_uri,
+                ..
+            } if metadata.sdk_metadata().issuer == row.issuer
+                && reply_binding.server_url.as_str() == row.issuer
+                && row.client_id.as_deref() == Some(reply_binding.client_id.as_str())
+                && super::initial::valid_client_id(&reply_binding.client_id)
+                && redirect_uri.as_str() == row.redirect_uri
+                && start.original.mono >= binding.flow.start.mono
+                && start.original.wall >= binding.flow.start.wall
+                && start.original.mono <= dispatched.budget.http_entered_at => {}
+            _ => return Err(Error::new(Kind::Refused)),
+        }
+        dispatched
+            .budget
+            .check(&dispatched.clock)
+            .map_err(initial_error)?;
+        let gate = OperationGate {
+            journal: self,
+            auth,
+            flow: &binding.flow,
+            initial: Some(&dispatched.budget),
+        };
+        gate.check()?;
+        Ok(gate)
+    }
+
+    fn token_owner_gate<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        binding: &'a RegistrationDispatchBinding,
+        reservation: &EnrollmentReservation,
+        tokens: &'a super::TokenSetGuard,
+    ) -> Result<OperationGate<'a>, Error> {
+        if !Arc::ptr_eq(&binding.flow.clock, &tokens.resources.clock) {
+            return Err(Error::new(Kind::Refused));
+        }
+        self.check_scope(auth)?;
+        let original = binding
+            .journal
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !std::ptr::eq(self, original.as_ref()) || !Weak::ptr_eq(&binding.runtime, &self.runtime)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let attached = auth
+            .request_binding()
+            .ok_or_else(|| Error::new(Kind::Refused))?;
+        let issuer = self
+            .issuer
+            .get()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        if !attached.identity().same_binding(&binding.identity)
+            || !matches!(
+                attached.kind(),
+                openbot_contracts::request_binding::HostRequestBindingKind::ServerSession
+                    | openbot_contracts::request_binding::HostRequestBindingKind::ServerSingleUserOwner
+            )
+            || !issuer.observation().is_current()
+            || !issuer.owns_identity(&binding.identity)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| Error::new(Kind::Unavailable))?;
+        let row = &binding.expected;
+        if !runtime.matches_pool_scope(&self.pool, &self.deployment, &self.tenant)
+            || row.attempt_id.get_version_num() != 7
+            || row.journal_schema != 1
+            || row.deployment_id != self.deployment.as_str()
+            || row.tenant_id != self.tenant.as_str()
+            || row.owner_user_id != auth.actor().as_str()
+            || i64::try_from(auth.auth_generation().get()).ok() != Some(row.auth_generation)
+            || row.installation_id != runtime.installation_id
+            || row.runtime_epoch != runtime.runtime_epoch
+            || row
+                .client_id
+                .as_deref()
+                .is_none_or(|v| !super::initial::valid_client_id(v))
+            || row.enrollment_id != Some(reservation.id)
+            || reservation.id.get_version_num() != 7
+            || row.registration_admitted_at.is_none()
+            || row
+                .registration_admitted_at
+                .is_some_and(|t| t < row.created_at || t > row.updated_at)
+            || row.created_at != binding.flow.created_at
+            || row.expires_at != binding.flow.expires_at
+            || row.updated_at < row.created_at
+            || row.updated_at >= row.expires_at
+            || row.finished_at.is_some()
+            || row.outcome_code.is_some()
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        drop(runtime);
+        if row.phase != "code_admitted"
+            || row.code_admitted_at.is_none()
+            || row.code_admitted_at.is_some_and(|t| {
+                row.registration_admitted_at.is_none_or(|r| t < r)
+                    || t > row.updated_at
+                    || t >= row.expires_at
+            })
+            || row.issuer != tokens.resources.metadata.sdk_metadata().issuer
+            || tokens.sdk.server_url != tokens.resources.metadata.sdk_metadata().issuer
+            || row.client_id.as_deref() != Some(tokens.sdk.client_id.as_str())
+            || !super::reply::client_id_valid(&tokens.sdk.client_id)
+        {
+            return Err(Error::new(Kind::Refused));
+        }
+        tokens
+            .resources
+            .budget
+            .check(&tokens.resources.clock)
+            .map_err(initial_error)?;
+        let gate = OperationGate {
+            journal: self,
+            auth,
+            flow: &binding.flow,
+            initial: Some(&tokens.resources.budget),
+        };
+        let now = gate.check()?;
+        let expiry = &tokens.expiry;
+        if now.mono < expiry.original_start.mono
+            || now.mono >= expiry.mono_expiry
+            || now.wall < expiry.original_start.wall
+            || now.wall >= expiry.wall_expiry
+            || now.wall >= expiry.encoded_wall_expiry
+        {
+            return Err(Error::new(Kind::Deadline));
+        }
+        Ok(gate)
+    }
+
     async fn write(
         self: &Arc<Self>,
         auth: &AuthContext,
@@ -853,6 +1728,64 @@ fn admitted_row(old: &Row, stamp: OffsetDateTime) -> Result<Row, Error> {
     next.updated_at = stamp;
     Ok(next)
 }
+fn registered_row(
+    old: &Row,
+    client_id: &str,
+    enrollment_id: Uuid,
+    stamp: OffsetDateTime,
+) -> Result<Row, Error> {
+    if old.phase != "registration_admitted"
+        || old.registration_admitted_at.is_none()
+        || old.client_id.is_some()
+        || old.enrollment_id.is_some()
+        || old.code_admitted_at.is_some()
+        || old.finished_at.is_some()
+        || old.outcome_code.is_some()
+        || !super::initial::valid_client_id(client_id)
+        || enrollment_id.get_version_num() != 7
+        || stamp < old.updated_at
+        || stamp >= old.expires_at
+    {
+        return Err(Error::new(Kind::Refused));
+    }
+    let mut next = old.clone();
+    next.phase = "registered".to_owned();
+    next.client_id = Some(client_id.to_owned());
+    next.enrollment_id = Some(enrollment_id);
+    next.updated_at = stamp;
+    Ok(next)
+}
+fn code_admitted_row(old: &Row, stamp: OffsetDateTime) -> Result<Row, Error> {
+    if old.phase != "registered"
+        || old.journal_schema != 1
+        || old.attempt_id.get_version_num() != 7
+        || old
+            .client_id
+            .as_deref()
+            .is_none_or(|v| !super::initial::valid_client_id(v))
+        || old.enrollment_id.is_none_or(|id| id.get_version_num() != 7)
+        || old.registration_admitted_at.is_none()
+        || old
+            .registration_admitted_at
+            .is_some_and(|t| t < old.created_at || t > old.updated_at)
+        || old.code_admitted_at.is_some()
+        || old.updated_at < old.created_at
+        || old.updated_at >= old.expires_at
+        || old.finished_at.is_some()
+        || old.outcome_code.is_some()
+        || stamp < old.updated_at
+        || stamp >= old.expires_at
+    {
+        return Err(Error::new(Kind::Refused));
+    }
+    // Only descriptive row storage is cloned. No owner, identity or reservation is minted.
+    let mut next = old.clone();
+    next.phase = "code_admitted".to_owned();
+    next.code_admitted_at = Some(stamp);
+    next.updated_at = stamp;
+    Ok(next)
+}
+
 fn closed_row(old: &Row, template: &Row, stamp: OffsetDateTime) -> Result<Row, Error> {
     if !matches!(old.phase.as_str(), "created" | "registration_admitted")
         || (old.phase == "created" && old.registration_admitted_at.is_some())
@@ -890,6 +1823,10 @@ redacted!(
     CreatedAttemptOwner,
     RegistrationAdmissionReceipt,
     ClosedAttemptReceipt,
+    RegistrationDispatchBinding,
+    EnrollmentReservation,
     SavedFlow,
-    OperationGate<'_>
+    OperationGate<'_>,
+    TokenCaptureOwner,
+    GatewayAuthorizationTokenOwner
 );

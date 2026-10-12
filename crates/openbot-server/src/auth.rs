@@ -61,9 +61,10 @@ use openbot_contracts::request_binding::{
     CustomModelCatalogSessionFacts,
 };
 use openbot_contracts::request_binding::{
-    GatewayAuthorizationHostObservation, GatewayAuthorizationHostTailFactory,
-    GatewayAuthorizationHostTailWitness, GatewayAuthorizationHostTarget,
-    GatewayAuthorizationSessionFacts,
+    GatewayAuthorizationCallbackUrlInvocation, GatewayAuthorizationCallbackUrlPort,
+    GatewayAuthorizationCallbackUrlReceiver, GatewayAuthorizationHostObservation,
+    GatewayAuthorizationHostTailFactory, GatewayAuthorizationHostTailWitness,
+    GatewayAuthorizationHostTarget, GatewayAuthorizationSessionFacts, HostRequestBindingIdentity,
 };
 use openbot_contracts::request_binding::{
     HostRequestBindingError, HostRequestBindingGuard, HostRequestBindingKind,
@@ -72,6 +73,10 @@ use openbot_contracts::request_binding::{
     RememberPreferenceSessionFacts, RequestBindingIssuer, RequestBindingOwnerLease,
     RequestBindingOwnerObservation, ServerSessionBindingIdentity,
 };
+use openbot_contracts::request_binding::{
+    ThreadHistoryHostObservation, ThreadHistoryHostTailFactory, ThreadHistoryHostTailWitness,
+    ThreadHistoryHostTarget, ThreadHistorySessionFacts,
+};
 use openbot_domain::identity::roles::resolve_effective_role;
 use openbot_domain::identity::session::{
     LiveSession, SensitiveWriteApproved, SensitiveWriteRejection, SensitiveWriteRequest,
@@ -79,6 +84,8 @@ use openbot_domain::identity::session::{
     TrustedOrigins, authorize_fresh_origin_write, authorize_sensitive_write, evaluate_session,
 };
 use openbot_infra::approval_preferences::PostgresRememberPreferenceRepository;
+use openbot_infra::thread_history_authority::PostgresThreadHistoryAuthority;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use openbot_infra::artifact_read_authority::PostgresArtifactReadAuthority;
 use openbot_infra::auth::sso::ReadOnlySsoCapabilitySource;
@@ -555,10 +562,188 @@ struct ServerSessionProbeState {
     tenant: TenantId,
     capability_facts: std::sync::OnceLock<Weak<PostgresRuntimeCapabilityFacts>>,
     remember_preferences: std::sync::OnceLock<Weak<PostgresRememberPreferenceRepository>>,
+    thread_history_authority: std::sync::OnceLock<Weak<PostgresThreadHistoryAuthority>>,
     custom_model_catalog_inventory: std::sync::OnceLock<Weak<PostgresCustomModelCatalogInventory>>,
     gateway_authorization_journal: std::sync::OnceLock<Weak<GatewayAuthorizationJournal>>,
+    callback_url_sink: std::sync::OnceLock<Arc<GatewayCallbackUrlSink>>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     artifact_read_authority: std::sync::OnceLock<Weak<PostgresArtifactReadAuthority>>,
+}
+
+// The destination is deliberately uninstalled in production main. This fixed
+// bounded sink is the only installer input; callers cannot supply a trait or Fn.
+struct GatewayCallbackUrlSink {
+    state: std::sync::Mutex<GatewayCallbackUrlSinkState>,
+}
+
+struct GatewayCallbackUrlSinkState {
+    url: Option<zeroize::Zeroizing<String>>,
+    offered: bool,
+}
+
+impl GatewayCallbackUrlSink {
+    #[allow(
+        dead_code,
+        reason = "The production callback URL destination remains disabled"
+    )]
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(GatewayCallbackUrlSinkState {
+                url: Some(zeroize::Zeroizing::new(String::with_capacity(2048))),
+                offered: false,
+            }),
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Only the owned synthetic destination consumes the URL"
+    )]
+    fn take_url(&self) -> Result<zeroize::Zeroizing<String>, HostRequestBindingError> {
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_| HostRequestBindingError::Unavailable)?;
+        if !state.offered {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        state.url.take().ok_or(HostRequestBindingError::Unavailable)
+    }
+}
+
+impl GatewayAuthorizationCallbackUrlReceiver for GatewayCallbackUrlSink {
+    fn accept_url(&self, url: &str) -> Result<(), HostRequestBindingError> {
+        if url.len() > 2048 {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_| HostRequestBindingError::Unavailable)?;
+        if state.offered {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let owned = state
+            .url
+            .as_mut()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        owned.push_str(url);
+        state.offered = true;
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for GatewayCallbackUrlSink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("GatewayCallbackUrlSink([redacted])")
+    }
+}
+
+enum ServerGatewayCallbackSource {
+    Session(Weak<ServerSessionProbeState>),
+    SingleUser(Weak<SingleUserProbeState>),
+}
+
+struct ServerGatewayCallbackUrlPort {
+    source: ServerGatewayCallbackSource,
+    owner: RequestBindingOwnerObservation,
+    issuer: RequestBindingIssuer,
+    identity: HostRequestBindingIdentity,
+    original: AuthContext,
+}
+
+impl ServerGatewayCallbackUrlPort {
+    fn check(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        deadline: std::time::Instant,
+    ) -> Result<Arc<GatewayCallbackUrlSink>, HostRequestBindingError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        if auth != &self.original || !self.owner.is_current() || !target.matches_auth(auth) {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let binding = auth
+            .request_binding()
+            .ok_or(HostRequestBindingError::Missing)?;
+        if !self.issuer.owns_identity(binding.identity())
+            || !self.identity.same_binding(binding.identity())
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        match &self.source {
+            ServerGatewayCallbackSource::Session(original_probe) => {
+                let probe = original_probe
+                    .upgrade()
+                    .ok_or(HostRequestBindingError::NotCurrent)?;
+                let journal = probe
+                    .gateway_authorization_journal
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or(HostRequestBindingError::Unavailable)?;
+                if binding.kind() != HostRequestBindingKind::ServerSession
+                    || !journal.matches_pool_scope(&probe.pool, &probe.deployment, &probe.tenant)
+                    || !journal.matches_host_target(target)
+                {
+                    return Err(HostRequestBindingError::NotCurrent);
+                }
+                self.issuer
+                    .borrow_server_session_epoch(binding.identity())?;
+                probe
+                    .callback_url_sink
+                    .get()
+                    .cloned()
+                    .ok_or(HostRequestBindingError::Unavailable)
+            }
+            ServerGatewayCallbackSource::SingleUser(original_probe) => {
+                let probe = original_probe
+                    .upgrade()
+                    .ok_or(HostRequestBindingError::NotCurrent)?;
+                let enrollment = probe
+                    .gateway_authorization_journal
+                    .get()
+                    .ok_or(HostRequestBindingError::Unavailable)?;
+                let journal = enrollment
+                    .journal
+                    .upgrade()
+                    .ok_or(HostRequestBindingError::Unavailable)?;
+                if binding.kind() != HostRequestBindingKind::ServerSingleUserOwner
+                    || probe.principal.auth_context() != auth
+                    || !probe.principal.matches_pool_scope(&enrollment.pool)
+                    || !journal.matches_pool_scope(
+                        &enrollment.pool,
+                        auth.deployment(),
+                        auth.tenant(),
+                    )
+                    || !journal.matches_host_target(target)
+                {
+                    return Err(HostRequestBindingError::NotCurrent);
+                }
+                probe
+                    .callback_url_sink
+                    .get()
+                    .cloned()
+                    .ok_or(HostRequestBindingError::Unavailable)
+            }
+        }
+    }
+}
+
+impl GatewayAuthorizationCallbackUrlPort for ServerGatewayCallbackUrlPort {
+    fn handoff(
+        &self,
+        auth: &AuthContext,
+        target: &dyn GatewayAuthorizationHostTarget,
+        invocation: GatewayAuthorizationCallbackUrlInvocation<'_>,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        let sink = self.check(auth, target, deadline)?;
+        let result = invocation.deliver_to(&self.issuer, &self.identity, sink.as_ref());
+        self.check(auth, target, deadline)?;
+        result
+    }
 }
 
 struct ServerSessionRowTuple {
@@ -683,7 +868,7 @@ impl HostRequestBindingGuard for ServerSessionCurrentGuard {
         ) {
             return Err(HostRequestBindingError::NotCurrent);
         }
-        GatewayAuthorizationHostObservation::from_trusted_host(
+        GatewayAuthorizationHostObservation::with_callback_port(
             HostRequestBindingKind::ServerSession,
             binding.identity().clone(),
             Some(epoch),
@@ -694,6 +879,13 @@ impl HostRequestBindingGuard for ServerSessionCurrentGuard {
                 original: auth.clone(),
                 lifetime: probe.lifetime,
                 created_at: self.row.created_at,
+            }),
+            Box::new(ServerGatewayCallbackUrlPort {
+                source: ServerGatewayCallbackSource::Session(self.probe.clone()),
+                owner: self.owner.clone(),
+                issuer: self.issuer.clone(),
+                identity: binding.identity().clone(),
+                original: auth.clone(),
             }),
         )
     }
@@ -798,6 +990,62 @@ impl HostRequestBindingGuard for ServerSessionCurrentGuard {
             binding.identity().clone(),
             Some(epoch),
             Box::new(ServerRememberPreferenceTailFactory {
+                probe: self.probe.clone(),
+                owner: self.owner.clone(),
+                issuer: self.issuer.clone(),
+                original: auth.clone(),
+                lifetime: probe.lifetime,
+                created_at: self.row.created_at,
+            }),
+        )
+    }
+    fn borrow_thread_history_host_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        target: &'a dyn ThreadHistoryHostTarget,
+        deadline: std::time::Instant,
+    ) -> Result<ThreadHistoryHostObservation<'a>, HostRequestBindingError> {
+        if auth != &self.original || !self.owner.is_current() {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let probe = self
+            .probe
+            .upgrade()
+            .ok_or(HostRequestBindingError::NotCurrent)?;
+        let authority = probe
+            .thread_history_authority
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        if !authority.matches_pool_scope(&probe.pool, &probe.deployment, &probe.tenant)
+            || !authority.matches_host_target(target, auth)
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let binding = auth
+            .request_binding()
+            .ok_or(HostRequestBindingError::Missing)?;
+        let epoch = self
+            .issuer
+            .borrow_server_session_epoch(binding.identity())?;
+        if !epoch.matches_raw_row(
+            &self.row.id,
+            &self.row.user_id,
+            &self.row.token_column,
+            self.row.created_at,
+            self.row.issued_generation,
+        ) {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        ThreadHistoryHostObservation::from_trusted_host(
+            HostRequestBindingKind::ServerSession,
+            binding.identity().clone(),
+            Some(epoch),
+            Box::new(ServerThreadHistoryTailFactory {
+                authority: Arc::downgrade(&authority),
                 probe: self.probe.clone(),
                 owner: self.owner.clone(),
                 issuer: self.issuer.clone(),
@@ -1302,6 +1550,17 @@ struct ServerRememberPreferenceTailFactory {
     lifetime: SessionLifetimePolicy,
     created_at: OffsetDateTime,
 }
+
+#[derive(Clone)]
+struct ServerThreadHistoryTailFactory {
+    authority: Weak<PostgresThreadHistoryAuthority>,
+    probe: Weak<ServerSessionProbeState>,
+    owner: RequestBindingOwnerObservation,
+    issuer: RequestBindingIssuer,
+    original: AuthContext,
+    lifetime: SessionLifetimePolicy,
+    created_at: OffsetDateTime,
+}
 fn verify_repository_host_attachment(
     owner: &RequestBindingOwnerObservation,
     issuer: &RequestBindingIssuer,
@@ -1344,9 +1603,32 @@ impl RememberPreferenceHostTailFactory for ServerRememberPreferenceTailFactory {
         Ok(Box::new(witness))
     }
 }
+impl ThreadHistoryHostTailFactory for ServerThreadHistoryTailFactory {
+    fn witness(
+        &self,
+        auth: &AuthContext,
+        session: Option<ThreadHistorySessionFacts>,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn ThreadHistoryHostTailWitness>, HostRequestBindingError> {
+        let session = session.ok_or(HostRequestBindingError::NotCurrent)?;
+        if session.created_at != self.created_at {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let witness = ServerThreadHistoryTail {
+            source: self.clone(),
+            session,
+        };
+        witness.verify_current(auth, deadline)?;
+        Ok(Box::new(witness))
+    }
+}
 struct ServerRememberPreferenceTail {
     source: ServerRememberPreferenceTailFactory,
     session: RememberPreferenceSessionFacts,
+}
+struct ServerThreadHistoryTail {
+    source: ServerThreadHistoryTailFactory,
+    session: ThreadHistorySessionFacts,
 }
 impl RememberPreferenceHostTailWitness for ServerRememberPreferenceTail {
     fn verify_current(
@@ -1363,6 +1645,65 @@ impl RememberPreferenceHostTailWitness for ServerRememberPreferenceTail {
         )?;
         if self.source.probe.upgrade().is_none() {
             return Err(HostRequestBindingError::NotCurrent);
+        }
+        let now = OffsetDateTime::now_utc();
+        if now < self.session.observed_wall
+            || std::time::Instant::now() < self.session.observed_monotonic
+            || now >= self.session.expires_at
+            || evaluate_session(
+                self.source.lifetime,
+                SessionState::rehydrate(
+                    self.session.created_at,
+                    self.session.updated_at,
+                    auth.auth_generation(),
+                ),
+                auth.auth_generation(),
+                now,
+            )
+            .is_err()
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        verify_repository_host_attachment(
+            &self.source.owner,
+            &self.source.issuer,
+            &self.source.original,
+            auth,
+            deadline,
+        )
+    }
+}
+impl ThreadHistoryHostTailWitness for ServerThreadHistoryTail {
+    fn verify_current(
+        &self,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        verify_repository_host_attachment(
+            &self.source.owner,
+            &self.source.issuer,
+            &self.source.original,
+            auth,
+            deadline,
+        )?;
+        let probe = self
+            .source
+            .probe
+            .upgrade()
+            .ok_or(HostRequestBindingError::NotCurrent)?;
+        let authority = self
+            .source
+            .authority
+            .upgrade()
+            .ok_or(HostRequestBindingError::NotCurrent)?;
+        if !authority.matches_pool_scope(&probe.pool, &probe.deployment, &probe.tenant)
+            || !probe
+                .thread_history_authority
+                .get()
+                .and_then(Weak::upgrade)
+                .is_some_and(|current| Arc::ptr_eq(&current, &authority))
+        {
+            return Err(HostRequestBindingError::Unavailable);
         }
         let now = OffsetDateTime::now_utc();
         if now < self.session.observed_wall
@@ -1570,6 +1911,39 @@ impl ServerSessionCurrentGuard {
 }
 
 impl PostgresSessionAuthResolver {
+    #[allow(
+        dead_code,
+        reason = "The production callback URL destination remains disabled"
+    )]
+    fn install_gateway_callback_url_sink(
+        &self,
+        sink: Arc<GatewayCallbackUrlSink>,
+    ) -> Result<(), HostRequestBindingError> {
+        let owner = &self.binding_owner;
+        let probe = &owner.probe;
+        let journal = probe
+            .gateway_authorization_journal
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        if !owner.issuer.observation().is_current()
+            || probe.callback_url_sink.get().is_some()
+            || !journal.matches_pool_scope(&probe.pool, &probe.deployment, &probe.tenant)
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        probe
+            .callback_url_sink
+            .set(sink)
+            .map_err(|_| HostRequestBindingError::Unavailable)?;
+        if !owner.issuer.observation().is_current()
+            || !journal.matches_pool_scope(&probe.pool, &probe.deployment, &probe.tenant)
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        Ok(())
+    }
+
     /// Install one journal against this exact original Session Host Pool and namespace.
     pub fn install_gateway_authorization_journal(
         &self,
@@ -1633,8 +2007,10 @@ impl PostgresSessionAuthResolver {
             tenant: tenant.clone(),
             capability_facts: std::sync::OnceLock::new(),
             remember_preferences: std::sync::OnceLock::new(),
+            thread_history_authority: std::sync::OnceLock::new(),
             custom_model_catalog_inventory: std::sync::OnceLock::new(),
             gateway_authorization_journal: std::sync::OnceLock::new(),
+            callback_url_sink: std::sync::OnceLock::new(),
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             artifact_read_authority: std::sync::OnceLock::new(),
         });
@@ -1685,6 +2061,30 @@ impl PostgresSessionAuthResolver {
             .probe
             .remember_preferences
             .set(Arc::downgrade(repository))
+            .map_err(|_| HostRequestBindingError::Unavailable)
+    }
+
+    /// Enroll this real same-Pool observer and original issuer for Thread management once.
+    pub fn install_thread_history_authority(
+        &self,
+        authority: &Arc<PostgresThreadHistoryAuthority>,
+    ) -> Result<(), HostRequestBindingError> {
+        if self
+            .binding_owner
+            .probe
+            .thread_history_authority
+            .get()
+            .is_some()
+            || !self.binding_owner.issuer.observation().is_current()
+            || !authority.matches_pool_scope(&self.pool, &self.deployment, &self.tenant)
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        authority.enroll_host_issuer(&self.binding_owner.issuer)?;
+        self.binding_owner
+            .probe
+            .thread_history_authority
+            .set(Arc::downgrade(authority))
             .map_err(|_| HostRequestBindingError::Unavailable)
     }
 
@@ -1979,10 +2379,17 @@ struct SingleUserProbeState {
     principal: openbot_infra::auth::single_user::VerifiedSingleUserPrincipal,
     capability_facts: std::sync::OnceLock<Weak<PostgresRuntimeCapabilityFacts>>,
     remember_preferences: std::sync::OnceLock<Weak<PostgresRememberPreferenceRepository>>,
+    thread_history_authority: std::sync::OnceLock<SingleUserThreadHistoryEnrollment>,
     custom_model_catalog_inventory: std::sync::OnceLock<SingleUserCustomCatalogEnrollment>,
     gateway_authorization_journal: std::sync::OnceLock<SingleUserGatewayAuthorizationEnrollment>,
+    callback_url_sink: std::sync::OnceLock<Arc<GatewayCallbackUrlSink>>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     artifact_read_authority: std::sync::OnceLock<Weak<PostgresArtifactReadAuthority>>,
+}
+
+struct SingleUserThreadHistoryEnrollment {
+    authority: Weak<PostgresThreadHistoryAuthority>,
+    pool: openbot_infra::db::pool::DatabasePool,
 }
 
 struct SingleUserGatewayAuthorizationEnrollment {
@@ -2115,11 +2522,18 @@ impl HostRequestBindingGuard for SingleUserCurrentGuard {
             observed_monotonic: std::time::Instant::now(),
         };
         factory.verify_current(auth, deadline)?;
-        GatewayAuthorizationHostObservation::from_trusted_host(
+        GatewayAuthorizationHostObservation::with_callback_port(
             HostRequestBindingKind::ServerSingleUserOwner,
             binding.identity().clone(),
             None,
             Box::new(factory),
+            Box::new(ServerGatewayCallbackUrlPort {
+                source: ServerGatewayCallbackSource::SingleUser(self.probe.clone()),
+                owner: self.owner.clone(),
+                issuer: self.issuer.clone(),
+                identity: binding.identity().clone(),
+                original: auth.clone(),
+            }),
         )
     }
     fn borrow_custom_model_catalog_host_before<'a>(
@@ -2220,6 +2634,58 @@ impl HostRequestBindingGuard for SingleUserCurrentGuard {
         };
         factory.verify_current(auth, deadline)?;
         RememberPreferenceHostObservation::from_trusted_host(
+            HostRequestBindingKind::ServerSingleUserOwner,
+            binding.identity().clone(),
+            None,
+            Box::new(factory),
+        )
+    }
+    fn borrow_thread_history_host_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        target: &'a dyn ThreadHistoryHostTarget,
+        deadline: std::time::Instant,
+    ) -> Result<ThreadHistoryHostObservation<'a>, HostRequestBindingError> {
+        if !self.owner.is_current() {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let probe = self
+            .probe
+            .upgrade()
+            .ok_or(HostRequestBindingError::NotCurrent)?;
+        if probe.principal.auth_context() != auth {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let enrollment = probe
+            .thread_history_authority
+            .get()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let authority = enrollment
+            .authority
+            .upgrade()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        if !probe.principal.matches_pool_scope(&enrollment.pool)
+            || !authority.matches_pool_scope(&enrollment.pool, auth.deployment(), auth.tenant())
+            || !authority.matches_host_target(target, auth)
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        let binding = auth
+            .request_binding()
+            .ok_or(HostRequestBindingError::Missing)?;
+        if binding.kind() != HostRequestBindingKind::ServerSingleUserOwner
+            || !self.issuer.owns_identity(binding.identity())
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let factory = SingleUserThreadHistoryTail {
+            probe: self.probe.clone(),
+            owner: self.owner.clone(),
+            issuer: self.issuer.clone(),
+            original: auth.clone(),
+        };
+        factory.verify_current(auth, deadline)?;
+        ThreadHistoryHostObservation::from_trusted_host(
             HostRequestBindingKind::ServerSingleUserOwner,
             binding.identity().clone(),
             None,
@@ -2442,6 +2908,14 @@ struct SingleUserRememberPreferenceTail {
     issuer: RequestBindingIssuer,
     original: AuthContext,
 }
+
+#[derive(Clone)]
+struct SingleUserThreadHistoryTail {
+    probe: Weak<SingleUserProbeState>,
+    owner: RequestBindingOwnerObservation,
+    issuer: RequestBindingIssuer,
+    original: AuthContext,
+}
 impl RememberPreferenceHostTailFactory for SingleUserRememberPreferenceTail {
     fn witness(
         &self,
@@ -2449,6 +2923,20 @@ impl RememberPreferenceHostTailFactory for SingleUserRememberPreferenceTail {
         session: Option<RememberPreferenceSessionFacts>,
         deadline: std::time::Instant,
     ) -> Result<Box<dyn RememberPreferenceHostTailWitness>, HostRequestBindingError> {
+        if session.is_some() {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        self.verify_current(auth, deadline)?;
+        Ok(Box::new(self.clone()))
+    }
+}
+impl ThreadHistoryHostTailFactory for SingleUserThreadHistoryTail {
+    fn witness(
+        &self,
+        auth: &AuthContext,
+        session: Option<ThreadHistorySessionFacts>,
+        deadline: std::time::Instant,
+    ) -> Result<Box<dyn ThreadHistoryHostTailWitness>, HostRequestBindingError> {
         if session.is_some() {
             return Err(HostRequestBindingError::NotCurrent);
         }
@@ -2479,6 +2967,42 @@ impl RememberPreferenceHostTailWitness for SingleUserRememberPreferenceTail {
         Ok(())
     }
 }
+impl ThreadHistoryHostTailWitness for SingleUserThreadHistoryTail {
+    fn verify_current(
+        &self,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        verify_repository_host_attachment(
+            &self.owner,
+            &self.issuer,
+            &self.original,
+            auth,
+            deadline,
+        )?;
+        let probe = self
+            .probe
+            .upgrade()
+            .ok_or(HostRequestBindingError::NotCurrent)?;
+        if probe.principal.auth_context() != auth {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let enrollment = probe
+            .thread_history_authority
+            .get()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let authority = enrollment
+            .authority
+            .upgrade()
+            .ok_or(HostRequestBindingError::NotCurrent)?;
+        if !probe.principal.matches_pool_scope(&enrollment.pool)
+            || !authority.matches_pool_scope(&enrollment.pool, auth.deployment(), auth.tenant())
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        verify_repository_host_attachment(&self.owner, &self.issuer, &self.original, auth, deadline)
+    }
+}
 
 impl core::fmt::Debug for SingleUserAuthResolver {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -2491,6 +3015,56 @@ impl core::fmt::Debug for SingleUserAuthResolver {
 }
 
 impl SingleUserAuthResolver {
+    #[allow(
+        dead_code,
+        reason = "The production callback URL destination remains disabled"
+    )]
+    fn install_gateway_callback_url_sink(
+        &self,
+        sink: Arc<GatewayCallbackUrlSink>,
+    ) -> Result<(), HostRequestBindingError> {
+        let owner = self
+            .binding_owner
+            .as_ref()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let original = owner.probe.principal.auth_context();
+        let enrollment = owner
+            .probe
+            .gateway_authorization_journal
+            .get()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let journal = enrollment
+            .journal
+            .upgrade()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        if !owner.issuer.observation().is_current()
+            || owner.probe.callback_url_sink.get().is_some()
+            || !owner.probe.principal.matches_pool_scope(&enrollment.pool)
+            || !journal.matches_pool_scope(
+                &enrollment.pool,
+                original.deployment(),
+                original.tenant(),
+            )
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        owner
+            .probe
+            .callback_url_sink
+            .set(sink)
+            .map_err(|_| HostRequestBindingError::Unavailable)?;
+        if !owner.issuer.observation().is_current()
+            || !journal.matches_pool_scope(
+                &enrollment.pool,
+                original.deployment(),
+                original.tenant(),
+            )
+        {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        Ok(())
+    }
+
     /// Enroll only the genuine principal and its original actual Pool once.
     pub fn install_gateway_authorization_journal(
         &self,
@@ -2515,6 +3089,35 @@ impl SingleUserAuthResolver {
             .gateway_authorization_journal
             .set(SingleUserGatewayAuthorizationEnrollment {
                 journal: Arc::downgrade(journal),
+                pool: actual_pool.clone(),
+            })
+            .map_err(|_| HostRequestBindingError::Unavailable)
+    }
+
+    /// Enroll only this verified original principal and its actual Pool for Thread management.
+    pub fn install_thread_history_authority(
+        &self,
+        authority: &Arc<PostgresThreadHistoryAuthority>,
+        actual_pool: &openbot_infra::db::pool::DatabasePool,
+    ) -> Result<(), HostRequestBindingError> {
+        let owner = self
+            .binding_owner
+            .as_ref()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let original = owner.probe.principal.auth_context();
+        if !owner.issuer.observation().is_current()
+            || owner.probe.thread_history_authority.get().is_some()
+            || !owner.probe.principal.matches_pool_scope(actual_pool)
+            || !authority.matches_pool_scope(actual_pool, original.deployment(), original.tenant())
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        authority.enroll_host_issuer(&owner.issuer)?;
+        owner
+            .probe
+            .thread_history_authority
+            .set(SingleUserThreadHistoryEnrollment {
+                authority: Arc::downgrade(authority),
                 pool: actual_pool.clone(),
             })
             .map_err(|_| HostRequestBindingError::Unavailable)
@@ -2569,8 +3172,10 @@ impl SingleUserAuthResolver {
                     principal,
                     capability_facts: std::sync::OnceLock::new(),
                     remember_preferences: std::sync::OnceLock::new(),
+                    thread_history_authority: std::sync::OnceLock::new(),
                     custom_model_catalog_inventory: std::sync::OnceLock::new(),
                     gateway_authorization_journal: std::sync::OnceLock::new(),
+                    callback_url_sink: std::sync::OnceLock::new(),
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
                     artifact_read_authority: std::sync::OnceLock::new(),
                 }),
@@ -2990,3 +3595,15 @@ impl AuthResolver for FixedAuthResolver {
 
 #[cfg(test)]
 mod gateway_authorization_journal_tests;
+
+#[cfg(test)]
+mod gateway_callback_rendezvous_tests;
+#[cfg(test)]
+mod gateway_registration_dispatch_tests;
+
+#[cfg(test)]
+mod gateway_token_dispatch_tests;
+
+#[cfg(test)]
+#[path = "auth/thread_history_management_tests.rs"]
+mod thread_history_management_tests;

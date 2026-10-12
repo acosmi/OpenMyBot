@@ -1496,9 +1496,19 @@ mod v2_vault_tests {
                         Ordering::SeqCst,
                     );
                 }
-                if tag == b'2' && selection.lock().map_err(|_| "D1 selection lock")?.portal.is_some() {
+                if tag == b'2'
+                    && selection
+                        .lock()
+                        .map_err(|_| "D1 selection lock")?
+                        .portal
+                        .is_some()
+                {
                     // Keep the selected original BindComplete separate from the original 32B result.
-                    if !bytes.is_empty() || bind_complete.replace(last_ready_wire_frame(tag, &bytes)).is_some() {
+                    if !bytes.is_empty()
+                        || bind_complete
+                            .replace(last_ready_wire_frame(tag, &bytes))
+                            .is_some()
+                    {
                         return Err("D1 single original empty BindComplete required");
                     }
                     control.counts.bind_held.fetch_add(1, Ordering::SeqCst);
@@ -1525,8 +1535,12 @@ mod v2_vault_tests {
                         return Err("D1 original in-transaction ReadyForQuery required");
                     }
                     held.extend_from_slice(&last_ready_wire_frame(ready, &ready_bytes));
-                    let bind = bind_complete.take().ok_or("D1 actual BindComplete missing")?;
-                    if bind.len() != 5 { return Err("D1 original BindComplete must be 5B"); }
+                    let bind = bind_complete
+                        .take()
+                        .ok_or("D1 actual BindComplete missing")?;
+                    if bind.len() != 5 {
+                        return Err("D1 original BindComplete must be 5B");
+                    }
                     let metadata = {
                         let selected = selection.lock().map_err(|_| "D1 selection lock")?;
                         LastReadyHeld {
@@ -1554,25 +1568,43 @@ mod v2_vault_tests {
                             .take()
                             .ok_or("D1 duplicate gate release")?
                     };
-                    let bind_release = control.bind_release.lock().map_err(|_| "D1 bind release lock")?
-                        .take().ok_or("D1 duplicate bind release")?;
-                    let bind_forwarded = control.bind_forwarded.lock().map_err(|_| "D1 bind forward lock")?
-                        .take().ok_or("D1 duplicate bind forward observer")?;
+                    let bind_release = control
+                        .bind_release
+                        .lock()
+                        .map_err(|_| "D1 bind release lock")?
+                        .take()
+                        .ok_or("D1 duplicate bind release")?;
+                    let bind_forwarded = control
+                        .bind_forwarded
+                        .lock()
+                        .map_err(|_| "D1 bind forward lock")?
+                        .take()
+                        .ok_or("D1 duplicate bind forward observer")?;
                     // One unchanged total 8s gate covers BOTH actual releases, starting before metadata.
                     let gate_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
                     control.counts.held.fetch_add(1, Ordering::SeqCst);
                     held_sender
                         .send(metadata)
                         .map_err(|_| "D1 actual gate observer dropped")?;
-                    tokio::time::timeout_at(gate_deadline, bind_release).await
+                    tokio::time::timeout_at(gate_deadline, bind_release)
+                        .await
                         .map_err(|_| "D1 actual bind release budget exhausted")?
                         .map_err(|_| "D1 actual bind release dropped")?;
-                    down_write.write_all(&bind).await.map_err(|_| "D1 original BindComplete forward")?;
+                    down_write
+                        .write_all(&bind)
+                        .await
+                        .map_err(|_| "D1 original BindComplete forward")?;
                     control.counts.bind_released.fetch_add(1, Ordering::SeqCst);
-                    eprintln!("CUSTOM_V2_D1_TRACE released_original_bind_bytes={}", bind.len());
+                    eprintln!(
+                        "CUSTOM_V2_D1_TRACE released_original_bind_bytes={}",
+                        bind.len()
+                    );
                     // This observes the original write only; it is not a SQL/consumer ACK.
-                    bind_forwarded.send(()).map_err(|_| "D1 bind write observer dropped")?;
-                    tokio::time::timeout_at(gate_deadline, release).await
+                    bind_forwarded
+                        .send(())
+                        .map_err(|_| "D1 bind write observer dropped")?;
+                    tokio::time::timeout_at(gate_deadline, release)
+                        .await
                         .map_err(|_| "D1 actual gate release budget exhausted")?
                         .map_err(|_| "D1 actual gate release dropped")?;
                     down_write

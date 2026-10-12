@@ -1859,6 +1859,68 @@ Current candidate validation: seven strict Clippy configurations and the SDK dep
 This finite scope ends at creation, registration admission and the two controlled close reasons. SDK registration/token dispatch, callbacks, enrollment, account bridge, readiness, recovery and overall backend completion remain open.
 
 
+### V7-IMPL-029 - gated SDK registration dispatch
+
+Product candidate: `5a5ad4d5db1a6aee4d3e60395877d14ab11720c1`. Seven directed strict checks, the SDK dependency guard and three current harness compilations completed successfully. Current Source04 runtime validation: 28 unique cases passed, 0 failed and 0 ignored. Independent acceptance of the complete Task029 product scope passed with no confirmed P1/P2 findings. Publication, merge and delivery remain pending.
+
+Adds a registration-dispatch API to the existing Server Host and authorization-attempt journal. A current admitted operation transfers the whole original SDK-prepared request once through the gated transport. Current actor/Host checks and the original cancellation/deadline budget remain attached. After headers, the send fence releases the original transaction through its rollback acknowledgement before bounded reply consumption. A registered result uses the complete journal row comparison, typed audit, original commit acknowledgement and exact readback. Late or unknown acknowledgements, cancellation and drops retain closed operation outcomes; no automatic retry or resend is added.
+
+The two request-body assignments in directed test fixtures now use the SDK's Vec body type. Current runtime coverage is 24 new core cases (Infra 6 and Server Host/PostgreSQL 18), plus four current Domain compatibility cases reported separately. Earlier resource refusal and compilation failure, and original compiler or nested-tool diagnostics, retain their recorded results; they provide no current runtime credit. Individual production driver joins remain unproven.
+
+Scope is 12 product files and this public ledger entry, reusing the native-48 journal without a migration, dependency, UI or SDK-source change. Authorization-code/token sending, callbacks/listeners, enrollment, account bridge, application/UI integration, readiness, recovery and overall backend completion remain open.
+
+
+### V7-IMPL-029 - SDK registration dispatch and typed outcome facts
+
+Product candidate: `b7a6e798f816365ff480451f4c982f90d149ce82`. A current admitted Server operation transfers the whole original SDK registration request once through the gated transport. The original Host/actor checks, cancellation and deadlines stay attached. After headers, bounded reply consumption follows the original send-fence rollback acknowledgement. The registered successor uses the complete journal row comparison, typed audit, commit acknowledgement and exact readback. Public errors expose five existing facts directly: dispatch kind, optional transport snapshot, and separate send-guard rollback, registered-write and registered-readback acknowledgements. Late, unknown and dropped operations retain their outcomes without automatic retry.
+
+Independent finite acceptance of the whole task passed with no confirmed P1/P2 findings. Fresh Source05 validation passed three affected strict checks, the SDK dependency guard, two harness compilations and 24 unique core cases (Infra 6 and Server Host/PostgreSQL 18), with 0 failed and 0 ignored. Five unchanged compile stages and four Domain compatibility cases retain their Source04 results; those four cases were not rerun on Source05.
+
+Scope remains 12 product files plus this ledger, reusing native migration 0048 without new dependencies, migrations, UI or SDK-source changes. Prior failures and diagnostics remain recorded. Current diagnostics include three LLVM stripping SIGABRT warnings, an existing unused import and 24 logfile-deprecation warnings. Individual production-driver and asynchronous drop joins remain unproven. The existing rollback-kind documentation comment remains unresolved; the three ACK slots distinguish the actual observations.
+
+Token exchange, callbacks/listeners, enrollment, account bridge, application integration, Ready, recovery and overall backend completion remain open. Publication review, exact-head merge and delivery remain pending.
+
+
+### V7-IMPL-029 — guarded SDK registration dispatch and typed ACK verification
+
+Candidate: `d175d89f972a4a71208263058794a772ce5130f3` (Source06).
+
+Registration consumes the original admitted request owner, checks the current Host and actor fences, and releases the send permit through the original rollback ACK before exposing response data. A successful bounded reply uses the reserved client/enrollment identifiers for one registered-row CAS and exact readback with typed audit facts. Dispatch failures retain a closed kind plus independent send-rollback, registered-write and readback ACKs. The current Server regression checks revocation while response headers are pending through the typed registered-write ACK getter.
+
+Validation: the current Source06 Server strict check, Server harness compile and SDK dependency guard passed. Runtime validation: all 18 current Server PG/TLS cases passed with one exact test per original process and no ignored cases. The exact Source06 product candidate passed independent finite acceptance. Original Source05 coverage comprises three unchanged compile phases and Infra6; original Source04 coverage comprises five compile phases and Domain4 compatibility. These remain attributed to their original candidates. The task denominator is 24 core cases plus four compatibility cases; they are not all new Source06 executions.
+
+Earlier holds/failures and LLVM strip/libtest diagnostics remain recorded; production individual driver joins remain unproven. Unknown/Late outcomes and documentation follow-ups remain open. Public scope is 12 product paths plus this ledger, with no new migration, dependency or UI change. SDK token exchange, callback/listener, enrollment consumption, Account/UI bridge, recovery and full Ready remain open. Publication, merge and delivery are pending.
+
+
+### V7-MAINT-FMT-001 — five backend Rust files
+
+2026-10-10: The independently reviewed formatting changes cover 17 registered regions in five backend Rust files (15 unified diff hunks). The original review contains 17 focused format checks on the earlier base; those results retain that identity. This maintenance candidate uses actual main 30dd25dd8aac8f52d97c47edd925e5865d2152b9 after Task029 / PR #175 delivery, preserves every other main tree object, and appends only this execution fact to the public ledger. Five complete stdin/stdout Rust 1.98 format comparisons on the composed candidate and independent publication review are required before publication. The change has no runtime capability credit; backend work and its remaining tasks continue.
+
+
+### V7-IMPL-030 — internal gateway callback rendezvous
+
+Product commit `b3d007870f8ca4f7d04fc7f846554a94c37b2086` adds the bounded callback listener, strict callback parser, original attempt ownership and same-poll authority/deadline checks. The real Server authorization path is validated with an owned test destination; the production authorization URL destination remains disabled.
+
+Independent finite code and actual validation passed for the eight product files: 22 new cases and 24 affected registration regressions, six directed strict Clippy builds, exact formatting checks and the SDK dependency guard. The callback cancellation regression exercises a complete fixed response and refusal in the same original business poll. An additional old-version control build stopped at its disk guard before any test ran; it has zero test or negative-control credit. Its original failure is retained and it is outside the required current-candidate acceptance boundary.
+
+This entry records finite product acceptance. Token exchange, enrollment, account bridging and complete recovery remain open. Production browser consumption, continuous connection observations and individual driver joins have no new acceptance credit.
+
+
+- V7-IMPL-032: SDK token dispatch with original callback/current-owner binding, same-transaction code_admitted journal/audit, independent commit/readback/send acknowledgements, one bounded POST and typed refusal/unknown facts. Accepted product 71b6fc44fb6989280513252484b537bc4a1b1b23; directed checks and 121 exact cases (28 new,86 regression,7 audit compatibility) independently reviewed. Reuses existing migration; no added dependency. Enrollment/account bridge/production destination enablement/complete readiness and broader backend scope remain open. Four stripping diagnostics and one existing Server test import warning retained. This row records acceptance before publication; actual PR/merge delivery is recorded separately.
+
+
+- V7-IMPL-033: Immutable Thread origin implemented by native V1/V2 creation, private agent channels and new maintenance imports in their original transactions. Accepted product commit `b0c67c34a266cc9caa842eead3287ed34bf215ff`; 12 new origin cases and 58 existing compatibility cases passed, with four directed Clippy configurations, one migration-composition build check, 11 exact executor builds and registered Rust formatting. Independent code and actual-result review passed. Toolchain/test warnings and earlier failed or resource-interrupted attempts retain their original attribution. History management, full copy/clear/drain, byte cleanup and restore readiness remain open.
+
+
+- V7-IMPL-034: added an original-host-bound current management observation for one Thread whose immutable creator and live namespace/anchor tuple agree. The original controlled transaction checks current user/generation/roles/deny and exact direct or channel access; its bounded result is a snapshot. Accepted product 76d7d53faa8c86c529b845c87fad34cfcc711781; 34 exact runtime tests passed (12 new and 22 regressions); six directed production checks and four unaffected harness builds retain their original unchanged-input attribution, while the changed Server harness was rebuilt. Compiler and libtest warnings, prior failures and resource interruptions remain recorded. Per-Run body visibility and independent saved-owner rules remain separate. No delete/stop/clear producer, admission closure, copy purge, reader/worker drain or ACK1/ACK2 is delivered; the complete history-clearing chain remains open. This row records acceptance before publication; actual PR and merge delivery are recorded separately.
+
+
+- V7-IMPL-035: Persisted thread history admission heads and cleanup source identifiers, with original-transaction Thread insert/delete integration and strict current/historical schema verification. Product source: `34a360d6ec1e559019a676ae194de0df08751b30` (tree `21d5387d3f1ae78871423a3774261a37e8fd542d`). The exact candidate completed four directed strict checks, seven test harness builds and 32 runtime cases: 12 new storage cases and 20 existing regressions. Independent review accepted the exact candidate and original resource receipts; 15 compiler diagnostics remain recorded. Normal publication checks are recorded separately. Body writer admission and the public clear/complete cleanup workflow remain subsequent work.
+
+
+- V7-IMPL-035: Accepted product c92b78ac8af4fcd23cef00e7173b7df8f970e085 adds persistent thread history admission heads and cleanup source references, updated transactionally with thread creation/deletion, and complete migration metadata verification. Current-schema and thread-identity fixtures retain historical checks, prove ordinary tampering is refused, and restore the exact guard before reader denial assertions. Four directed strict checks and fourteen candidate test harness builds passed; all 41 unique runtime cases passed (12 storage, 20 prior regressions, nine current-schema/identity regressions). Independent review accepted the exact product candidate without confirmed P1/P2 findings. Earlier validation-controller failures and compiler warnings remain recorded. Body writer admission, the public clear workflow and complete cleanup acknowledgements remain follow-up integration work. Publication and delivery require their subsequent exact-head verification.
+
+
 2026-10-10 — UI5-P3 original-run fact observation labels now read the active locale reactively, so a mounted blocked/unblocked fact can follow language changes. This presentation change preserves the observed clock, terminal identity, backend read intent and empty action contract. Source implementation is prepared in an isolated worktree; targeted verification and independent review remain pending, with production/native/oracle and full acceptance still open.
 
 
@@ -1871,3 +1933,6 @@ This finite scope ends at creation, registration admission and the two controlle
 2026-10-10T08:18:16.746126+00:00 UI5-P3: adds an explicitly enabled synthetic original-run facts fixture using the existing reconciliation and receipt read contracts. It remains disabled by default and rejects PostgreSQL, auth-journey and foreign request identities; no writer, dispatch, unlock or production capability is added. The fixture source passed independent review, and all three changed Rust files pass Rust 1.98 formatting and diff checks after four formatter-only repairs. Exact-candidate compilation, mounted bilingual checks and publication remain pending; tool-card labels are not yet exercised by this fixture. Production, native and independent visual-reference acceptance remain open.
 
 2026-10-10T09:04:37.372428+00:00 UI5-P3 isolated synthetic read-only tool history: added recorded, waiting and missing-name/error history objects only within the existing explicit Unknown-facts fixture option. Independent source review passed before application; current fixture bytes match the reviewed postimage, three-file Rust 1.98 formatting and diff checks pass. The initial formatting invocation named an absent path and is retained as an invocation failure. Compilation, mounted bilingual tool-card and Unknown-fact acceptance remain not run; no production tool execution or Unknown unlock is claimed. Independent reference, native and production requirements remain open.
+
+
+2026-10-12T08:20:49.633584+00:00 - Existing UI5-P3 source candidate incorporates delivered main404d by normal merge. All three previously reviewed product files keep their exact bytes; incoming backend files and the complete public main ledger are preserved. This is source composition only: P2 acceptance, exact-candidate directed checks and mounted bilingual validation remain pending; no PR merge or full-package acceptance is claimed.
