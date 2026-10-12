@@ -503,12 +503,12 @@ async fn row_level_locks(observer: &Client, pid: i32) -> TestResult<i64> {
         .get(0))
 }
 
-/// The backends waiting for the ledger lock behind exactly `holder`, with their statements.
-/// `application` restricts them to the pool of the entry under test.
+/// The backends of the pool named `application` (the entry under test) that wait for the ledger
+/// lock behind exactly `holder`, with their statements.
 async fn ledger_waiters(
     observer: &Client,
     holder: i32,
-    application: Option<&str>,
+    application: &str,
 ) -> TestResult<Vec<(i32, String)>> {
     let rows = observer
         .query(
@@ -517,7 +517,7 @@ async fn ledger_waiters(
              WHERE l.locktype='relation' AND NOT l.granted \
                AND l.relation='openbot_internal.schema_migrations'::regclass \
                AND pg_catalog.pg_blocking_pids(l.pid)=ARRAY[$1::integer] \
-               AND ($2::text IS NULL OR a.application_name=$2) ORDER BY l.pid",
+               AND a.application_name=$2 ORDER BY l.pid",
             &[&holder, &application],
         )
         .await
@@ -533,7 +533,7 @@ struct LockOrder {
     holder: pool::PooledClient,
     probe: pool::PooledClient,
     probes: Vec<(String, String)>,
-    application: Option<String>,
+    application: String,
 }
 
 impl LockOrder {
@@ -541,7 +541,7 @@ impl LockOrder {
     /// refuses a real row holder, and the row-level lock counter sees that holder.
     async fn new(
         p: &pool::DatabasePool,
-        application: Option<&str>,
+        application: &str,
         probes: &[(&str, &str)],
     ) -> TestResult<Self> {
         let observer = p.get().await.map_err(text)?;
@@ -571,7 +571,7 @@ impl LockOrder {
                 .iter()
                 .map(|(sql, key)| ((*sql).to_owned(), (*key).to_owned()))
                 .collect(),
-            application: application.map(str::to_owned),
+            application: application.to_owned(),
         })
     }
 
@@ -588,7 +588,7 @@ impl LockOrder {
     /// the entry's (its pool's application name), its statement is the observation itself, it
     /// holds no row-level lock, and the rows the entry locks afterwards are still free.
     async fn evidence(&self, holder: i32) -> TestResult {
-        let application = self.application.as_deref();
+        let application = self.application.as_str();
         let seen = Arc::new(Mutex::new(Vec::new()));
         until("a backend waiting for the ledger lock", || {
             let seen = Arc::clone(&seen);
@@ -628,7 +628,7 @@ impl LockOrder {
     /// While the save waits for its operation row behind `blocker`, it already holds the
     /// workspace quota row and has not yet touched the head of `thread`.
     async fn quota_before_head(&self, blocker: i32, thread: &ThreadId) -> TestResult {
-        let application = self.application.as_deref();
+        let application = self.application.as_str();
         let seen = Arc::new(Mutex::new(Vec::new()));
         until("the save waiting for its operation row", || {
             let seen = Arc::clone(&seen);
@@ -638,7 +638,7 @@ impl LockOrder {
                     .query(
                         "SELECT pid,coalesce(query,'') FROM pg_catalog.pg_stat_activity \
                          WHERE pg_catalog.pg_blocking_pids(pid)=ARRAY[$1::integer] \
-                           AND ($2::text IS NULL OR application_name=$2) ORDER BY pid",
+                           AND application_name=$2 ORDER BY pid",
                         &[&blocker, &application],
                     )
                     .await
@@ -706,7 +706,7 @@ impl LockOrder {
 /// released. Its result is returned.
 async fn observation_precedes_locks<T>(
     p: &pool::DatabasePool,
-    application: Option<&str>,
+    application: &str,
     probes: &[(&str, &str)],
     work: impl Future<Output = T> + Send + 'static,
 ) -> TestResult<T>
@@ -1268,7 +1268,7 @@ async fn consumer_closure_closed_context_run_ends_without_provider_start() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// c03 -- custom start refuses a closed history; the V2 start holds the head share across the send
+// c03 -- custom start (both routes) refuses a closed history before the Vault and the send
 // ---------------------------------------------------------------------------------------------
 
 const TEST_CA_DER_BASE64: &str = "MIIBYTCCAROgAwIBAgIUV2Gyaxvee9eFEK3h9B3MJM3RdHMwBQYDK2VwMB0xGzAZBgNVBAMMEk9wZW5Cb3QgVzcgVGVzdCBDQTAgFw0yNjA4MjMxNzIxNTNaGA8yMTI2MDczMDE3MjE1M1owHTEbMBkGA1UEAwwST3BlbkJvdCBXNyBUZXN0IENBMCowBQYDK2VwAyEApgBzSV/LoqKcnUaH8XyHAyeVHmSdWzs/pG1QLsZtLXujYzBhMB0GA1UdDgQWBBRGuULlFEmfV4B1pDoFKLlyG87ckjAfBgNVHSMEGDAWgBRGuULlFEmfV4B1pDoFKLlyG87ckjAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAFBgMrZXADQQAhZqm1u2PwIPUkIhbQpjQhEbNUYoF2Abyx+fdXyy5b0QRLqnEK/8DY350B6fiQHd7a6BEa+qN+qhUQNauulgwB";
@@ -1444,104 +1444,21 @@ fn authority_refusal(result: &Result<Box<dyn ProviderSession>, ProviderPortError
 }
 
 const H_FOR_UPDATE_NOWAIT: &str = "SELECT thread_id FROM openbot_internal.thread_history_heads WHERE thread_id=$1 FOR UPDATE NOWAIT";
-
-/// While a V2 start waits inside the adapter, its transaction still holds the head share: an
-/// independent NOWAIT writer is refused, a waiting writer is tied to that very backend, and both
-/// are free once the adapter has returned and the transaction has ended.
-async fn head_share_is_held_across_send(
-    p: &pool::DatabasePool,
-    config: &pool::DatabaseConfig,
-    tls: &Tls,
-    provider: &Arc<PostgresCustomModelProvider>,
-    request: ProviderRequest,
-    thread: &ThreadId,
-) -> TestResult {
-    let observer = p.get().await.map_err(text)?;
-    let probe = p.get().await.map_err(text)?;
-    let before = tls.requests();
-    let start = {
-        let provider = Arc::clone(provider);
-        tokio::spawn(async move { provider.start(request).await })
-    };
-    until("the start reaching the owned model endpoint", || async {
-        Ok(tls.requests() == before + 1)
-    })
-    .await?;
-    require(
-        !lockable(&probe, H_FOR_UPDATE_NOWAIT, thread.as_str()).await?,
-        "a start inside the adapter did not hold the head share",
-    )?;
-    let (writer_pool, writer) = dedicated(config, "closure_head_writer").await?;
-    let waiting = {
-        let thread = thread.clone();
-        let writer_pool = writer_pool.clone();
-        tokio::spawn(async move {
-            let c = writer_pool.get().await.map_err(text)?;
-            c.batch_execute("BEGIN").await.map_err(text)?;
-            c.query_one(
-                "SELECT thread_id FROM openbot_internal.thread_history_heads WHERE thread_id=$1 FOR UPDATE",
-                &[&thread.as_str()],
-            )
-            .await
-            .map_err(text)?;
-            c.batch_execute("ROLLBACK").await.map_err(text)
-        })
-    };
-    let owners = Arc::new(Mutex::new(Vec::<i32>::new()));
-    until("a head writer waiting behind the start", || {
-        let owners = Arc::clone(&owners);
-        let observer = &observer;
-        async move {
-            let row = observer
-                .query_one("SELECT pg_blocking_pids($1)", &[&writer])
-                .await
-                .map_err(text)?;
-            *owners.lock().unwrap() = row.get::<_, Vec<i32>>(0);
-            Ok(!owners.lock().unwrap().is_empty())
-        }
-    })
-    .await?;
-    let owners = owners.lock().unwrap().clone();
-    for owner in owners {
-        let (state, query) = activity(&observer, owner).await?;
-        require(
-            state == "idle in transaction" && query.contains("thread_history_lock_joint"),
-            "the head writer waits behind something other than the start's head share",
-        )?;
-    }
-    tls.gate.add_permits(1);
-    let session = tokio::time::timeout(Duration::from_secs(10), start)
-        .await
-        .map_err(|_| "the held start never returned".to_owned())?
-        .map_err(text)?;
-    require(
-        session.is_ok(),
-        "the open history's start did not return a session",
-    )?;
-    tokio::time::timeout(Duration::from_secs(10), waiting)
-        .await
-        .map_err(|_| "the head writer stayed blocked after the start ended".to_owned())?
-        .map_err(text)??;
-    require(
-        lockable(&probe, H_FOR_UPDATE_NOWAIT, thread.as_str()).await?,
-        "the head share outlived the start's transaction",
-    )?;
-    drop((observer, probe));
-    close_pool(writer_pool).await
-}
-
 const THREAD_FOR_UPDATE_NOWAIT: &str =
     "SELECT thread_id FROM public.threads WHERE thread_id=$1 FOR UPDATE NOWAIT";
 
-/// The legacy start keeps no Thread or head lock while it waits inside the adapter, so the Run's
-/// durable cancel claim (which needs the Thread row exclusively) is never held back by it. A
-/// control first proves that both probes do refuse a real share holder.
-async fn legacy_start_holds_no_history_lock_across_send(
+/// While a start waits inside the adapter, its transaction keeps none of the locks the `free`
+/// probes need: the head for both routes and, on the legacy route, the Thread row too, so the
+/// Run's durable cancel claim (which needs the Thread row exclusively) is never held back by it.
+/// The current-dataset route keeps the shares of its own authority load, so its Thread row is not
+/// probed. A control first proves that the probes do refuse a real share holder.
+async fn start_holds_no_history_lock_across_send(
     p: &pool::DatabasePool,
     tls: &Tls,
     provider: &Arc<PostgresCustomModelProvider>,
     request: ProviderRequest,
     thread: &ThreadId,
+    free: &[&str],
 ) -> TestResult {
     let probe = p.get().await.map_err(text)?;
     let holder = p.get().await.map_err(text)?;
@@ -1560,8 +1477,10 @@ async fn legacy_start_holds_no_history_lock_across_send(
         )
         .await
         .map_err(text)?;
-    let seen = !lockable(&probe, THREAD_FOR_UPDATE_NOWAIT, thread.as_str()).await?
-        && !lockable(&probe, H_FOR_UPDATE_NOWAIT, thread.as_str()).await?;
+    let mut seen = true;
+    for sql in free {
+        seen &= !lockable(&probe, sql, thread.as_str()).await?;
+    }
     holder.batch_execute("ROLLBACK").await.map_err(text)?;
     require(
         seen,
@@ -1577,20 +1496,22 @@ async fn legacy_start_holds_no_history_lock_across_send(
         Ok(tls.requests() == before + 1)
     })
     .await?;
-    let free = lockable(&probe, THREAD_FOR_UPDATE_NOWAIT, thread.as_str()).await?
-        && lockable(&probe, H_FOR_UPDATE_NOWAIT, thread.as_str()).await?;
+    let mut unlocked = true;
+    for sql in free {
+        unlocked &= lockable(&probe, sql, thread.as_str()).await?;
+    }
     tls.gate.add_permits(1);
     let session = tokio::time::timeout(Duration::from_secs(10), start)
         .await
-        .map_err(|_| "the legacy start never returned".to_owned())?
+        .map_err(|_| "the start never returned".to_owned())?
         .map_err(text)?;
     require(
-        free,
-        "a legacy start inside the adapter held the Thread or head lock",
+        unlocked,
+        "a start inside the adapter held a lock the probes need",
     )?;
     require(
         session.is_ok(),
-        "the open history's legacy start did not return a session",
+        "the open history's start did not return a session",
     )?;
     drop((probe, holder));
     Ok(())
@@ -1598,7 +1519,7 @@ async fn legacy_start_holds_no_history_lock_across_send(
 
 #[tokio::test]
 #[ignore = "requires explicitly owned loopback SCRAM PostgreSQL17.11"]
-async fn consumer_closure_custom_start_refuses_closed_and_holds_head_share_across_send() {
+async fn consumer_closure_custom_start_refuses_closed_history_before_send() {
     owned("closure_custom_start", |p, config| async move {
         let tls = Tls::new().await;
         let v2 = V2::new(&p, &config).await?;
@@ -1632,9 +1553,9 @@ async fn consumer_closure_custom_start_refuses_closed_and_holds_head_share_acros
             // credential only when the start gets as far as the Vault.
             let unopenable = provider_for(0x7f);
 
-            // Runs 31/33/35/37 are V2 selections, 32/34/36 are legacy selections.
+            // Runs 31/33/35 are current-dataset selections, 32/34/36 are legacy selections.
             let mut requests = Vec::new();
-            for index in 31..=37u64 {
+            for index in 31..=36u64 {
                 let (thread, run) = if index % 2 == 1 {
                     let begin = v2.request(index, &model);
                     v2.directory
@@ -1673,7 +1594,8 @@ async fn consumer_closure_custom_start_refuses_closed_and_holds_head_share_acros
             let reached = tls.requests();
             require(reached == 2, "premise: exactly two sends so far")?;
 
-            // Closed histories: the existing authority refusal, before the Vault and the network.
+            // Closed histories: the existing authority refusal on both routes, before the Vault
+            // and the network.
             let accepted = tls.accepted.load(Ordering::SeqCst);
             let runs_before = count(&p, "SELECT count(*) FROM public.runs").await?;
             for index in [33u64, 34] {
@@ -1697,57 +1619,32 @@ async fn consumer_closure_custom_start_refuses_closed_and_holds_head_share_acros
                 "a refused start changed Run state",
             )?;
 
-            // The V2 start holds the head share from the authority loads to the end of the send.
+            // Neither route keeps a head lock across the send, and the legacy route keeps no
+            // Thread lock either, so a durable cancel can still claim the Run while the response
+            // headers are pending.
             {
                 let (_, thread, request) = request_of(35);
-                head_share_is_held_across_send(
+                start_holds_no_history_lock_across_send(
                     &p,
-                    &config,
                     &tls,
                     &provider,
                     request.clone(),
                     thread,
+                    &[H_FOR_UPDATE_NOWAIT],
                 )
                 .await?;
             }
-
-            // The legacy start holds no Thread or head lock across the send, so a durable cancel
-            // can still claim the Run while the response headers are pending.
             {
                 let (_, thread, request) = request_of(36);
-                legacy_start_holds_no_history_lock_across_send(
+                start_holds_no_history_lock_across_send(
                     &p,
                     &tls,
                     &provider,
                     request.clone(),
                     thread,
+                    &[THREAD_FOR_UPDATE_NOWAIT, H_FOR_UPDATE_NOWAIT],
                 )
                 .await?;
-            }
-
-            // The V2 schema observation precedes the first row lock of the start transaction.
-            {
-                let (_, _, request) = request_of(37);
-                tls.gate.add_permits(1);
-                let work = {
-                    let provider = Arc::clone(&provider);
-                    let request = request.clone();
-                    async move { provider.start(request).await }
-                };
-                let started = observation_precedes_locks(
-                    &p,
-                    None,
-                    &[(
-                        "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT",
-                        "alice",
-                    )],
-                    work,
-                )
-                .await?;
-                require(
-                    started.is_ok(),
-                    "the start did not finish once the schema observation was released",
-                )?;
             }
             Ok(())
         }
@@ -1994,21 +1891,21 @@ async fn consumer_closure_tool_decision_retry_attach_refuse_before_effect_outcom
         let run_key = open.command.run_id.as_str().to_owned();
         let call6 = tool_draft(&open.command.run_id, "closure-call-6", 2);
         let ordered = async {
-            let decided = observation_precedes_locks(&p, Some(ENTRY_TOOLS), &[(run_probe, &run_key)], {
+            let decided = observation_precedes_locks(&p, ENTRY_TOOLS, &[(run_probe, &run_key)], {
                 let (journal, call6) = (entry_journal.clone(), call6.clone());
                 async move { journal.record_decision(&call6).await }
             })
             .await?;
             require(decided.is_ok(), "the held-back decision never completed")?;
             let capability6 = CapabilityId::new(uuid::Uuid::now_v7().to_string());
-            let attached = observation_precedes_locks(&p, Some(ENTRY_TOOLS), &[(run_probe, &run_key)], {
+            let attached = observation_precedes_locks(&p, ENTRY_TOOLS, &[(run_probe, &run_key)], {
                 let (journal, id, capability6) =
                     (entry_journal.clone(), call6.call_id.clone(), capability6.clone());
                 async move { journal.attach_capability(&id, &capability6).await }
             })
             .await?;
             require(attached.is_ok(), "the held-back capability never completed")?;
-            let retried = observation_precedes_locks(&p, Some(ENTRY_TOOLS), &[(run_probe, &run_key)], {
+            let retried = observation_precedes_locks(&p, ENTRY_TOOLS, &[(run_probe, &run_key)], {
                 let attempts = entry_attempts.clone();
                 async move {
                     attempts
@@ -2172,7 +2069,7 @@ async fn consumer_closure_remember_effect_refuses_new_and_replays_existing() {
         let entry_store = PostgresMemoryAdministration::new(entry.clone())
             .with_effect_audit_key(AUDIT_KEY.to_vec())
             .map_err(text)?;
-        let ordered = observation_precedes_locks(&p, Some(ENTRY_REMEMBER), &[(users_probe, "alice")], {
+        let ordered = observation_precedes_locks(&p, ENTRY_REMEMBER, &[(users_probe, "alice")], {
             let first = first.clone();
             async move { entry_store.remember_from_tool(first).await }
         })
@@ -2704,7 +2601,7 @@ async fn save_case(
     //    operation row, the same order as the admission.
     let request = save_request(&ordered);
     let users_probe = "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT";
-    let order = LockOrder::new(direct, Some(ENTRY_SAVE), &[(users_probe, "alice")]).await?;
+    let order = LockOrder::new(direct, ENTRY_SAVE, &[(users_probe, "alice")]).await?;
     let mut gate = Some(proxy.arm(b"START TRANSACTION\0", 1)?);
     let save = {
         let (administration, owner) = (Arc::clone(&administration), owner.clone());
@@ -2866,7 +2763,7 @@ async fn consumer_closure_manual_memory_with_closed_source_refuses() {
         let entry_store = PostgresMemoryAdministration::new(entry.clone());
         let ordered = observation_precedes_locks(
             &p,
-            Some(ENTRY_MEMORY),
+            ENTRY_MEMORY,
             &[(
                 "SELECT id FROM public.users WHERE id=$1 FOR UPDATE NOWAIT",
                 "alice",
@@ -3142,15 +3039,12 @@ async fn not_closed_case(
             == Err(MemoryAdministrationError::Unavailable),
         "a head lock conflict on a memory from a message read as closed or as success",
     )?;
+    // Both custom starts only read the head: a writer's lock neither blocks it nor closes it.
+    tls.gate.add_permits(2);
     require(
-        matches!(
-            provider.start(current_request.clone()).await,
-            Err(ProviderPortError::Unavailable)
-        ),
-        "a head lock conflict on a current start read as closed or as success",
+        provider.start(current_request.clone()).await.is_ok(),
+        "a head held by a writer blocked or closed the current-dataset start",
     )?;
-    // The legacy start only reads the head: a writer's lock neither blocks it nor closes it.
-    tls.gate.add_permits(1);
     require(
         provider.start(legacy_request.clone()).await.is_ok(),
         "a head held by a writer blocked or closed the legacy start",
@@ -3171,8 +3065,8 @@ async fn not_closed_case(
         "a refused-for-lock consumer changed journal, memory or artifact state",
     )?;
     require(
-        tls.requests() == 1,
-        "a consumer other than the legacy start reached the model endpoint behind a held head",
+        tls.requests() == 2,
+        "a consumer other than the two custom starts reached the model endpoint behind a held head",
     )?;
 
     // Once the real writer is gone, the very same calls are admitted.
@@ -3194,11 +3088,6 @@ async fn not_closed_case(
         .remember(memory_request(Some(source_message(&manual)), "released"))
         .await
         .map_err(text)?;
-    tls.gate.add_permits(1);
-    require(
-        provider.start(current_request).await.is_ok(),
-        "a released head did not admit the current start",
-    )?;
     administration
         .save_run_message_text(&owner, save_asked)
         .await
@@ -3217,9 +3106,11 @@ async fn not_closed_case(
     legacy_start_query_failure(p, config, &dir, tls, v2, &model).await
 }
 
-/// The legacy start's closed-head read is a real query. When its backend is terminated while
-/// that read waits behind an owned table lock, the start fails as `Unavailable`: neither closed
-/// nor admitted, and nothing reaches the endpoint.
+/// A custom start's closed-head read is a real query. When its backend is terminated while that
+/// read waits behind an owned table lock, the start fails as `Unavailable`: neither closed nor
+/// admitted, and nothing reaches the endpoint. Shown on the legacy route, whose first wait behind
+/// such a lock is that read; the current-dataset route calls the very same function after its
+/// authority load, and its own schema verification waits behind the lock first.
 async fn legacy_start_query_failure(
     p: &pool::DatabasePool,
     config: &pool::DatabaseConfig,
