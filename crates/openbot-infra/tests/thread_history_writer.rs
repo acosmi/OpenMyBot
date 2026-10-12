@@ -290,6 +290,30 @@ async fn w06_approval_component_remote_and_local_fixed_cleanup() {
         let pending=tokio::time::timeout(Duration::from_secs(5),async{loop{let r=remote.list_pending(&actor).await.map_err(|e|e.to_string())?;if !r.is_empty(){return Ok::<_,String>(r);}tokio::task::yield_now().await;}}).await.map_err(|_|"actual remote request did not commit".to_owned())??;
         remote.resolve(&actor,pending[0].request_id(),ProviderRemoteResumeStatus::Resolved,Some(json!({"owned":"answer"}))).await.map_err(|e|e.to_string())?;
         tokio::time::timeout(Duration::from_secs(5),&mut waiter).await.map_err(|_|"actual remote waiter not closed".to_owned())?.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+        // A resolver waiting on the actual Run must not hold the interrupt row.
+        let gate=p.get().await.map_err(|e|e.to_string())?;
+        let gate_pid:i32=gate.query_one("SELECT pg_backend_pid()",&[]).await.map_err(|e|e.to_string())?.get(0);
+        gate.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED").await.map_err(|e|e.to_string())?;
+        gate.query_one("SELECT run_id FROM public.runs WHERE run_id=$1 FOR UPDATE",&[&req.command.run_id.as_str()]).await.map_err(|e|e.to_string())?;
+        let(resolver_pool,resolver_pid)=writer_dedicated(&config,"writer51_remote_run_first").await?;
+        let resolver=PostgresRemoteInterruptCoordinator::new(resolver_pool.clone(),PROCESS.into(),vec![0x52;32]).map_err(|e|e.to_string())?;
+        let replay_auth=actor.clone();let replay_id=pending[0].request_id().to_owned();let request_id=replay_id.clone();
+        let replay_worker=tokio::spawn(async move{resolver.resolve(&replay_auth,&replay_id,ProviderRemoteResumeStatus::Resolved,Some(json!({"owned":"answer"}))).await});
+        let observer=p.get().await.map_err(|e|e.to_string())?;
+        let blocked=writer_blocked(&observer,resolver_pid,gate_pid).await;
+        let interrupt_unlocked=if blocked.is_ok(){
+            observer.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
+            let lock=observer.query_one("SELECT request_id FROM public.remote_agent_interrupts WHERE request_id=$1 FOR UPDATE NOWAIT",&[&request_id]).await;
+            observer.batch_execute("ROLLBACK").await.map_err(|e|e.to_string())?;
+            lock.map(|row|row.get::<_,String>(0)==request_id).map_err(|e|e.to_string())
+        }else{Err("actual remote Run-first wait was not observed".to_owned())};
+        gate.batch_execute(if blocked.is_ok()&&interrupt_unlocked==Ok(true){"COMMIT"}else{"ROLLBACK"}).await.map_err(|e|e.to_string())?;
+        let replay=tokio::time::timeout(Duration::from_secs(8),replay_worker).await.map_err(|_|"actual remote resolver did not naturally finish".to_owned())?.map_err(|e|e.to_string())?;
+        blocked?;
+        require(interrupt_unlocked?,"remote resolver held interrupt before Run lock")?;
+        let replay=replay.map_err(|e|e.to_string())?;
+        require(replay.replayed()&&replay.request_id()==request_id&&replay.status()==ProviderRemoteResumeStatus::Resolved,"Run-first real resolve changed exact answer replay")?;
+        drop(observer);drop(gate);drop(resolver_pool);
         {let c=p.get().await.map_err(|e|e.to_string())?;close_writer_head(&c,req.command.thread_id.as_str()).await?;}
         let before=writer_snapshot(&p).await?;
         require(component.request_component_human_decision(&scope,&writer_decision("writer-late-decision")).await==Err(ComponentAdministrationError::NotVisible),"closed actual component request accepted")?;
