@@ -413,7 +413,16 @@ async fn existing_0032_canary_upgrades_once_and_0033_restart_runs_no_ddl() {
         .await
         .unwrap();
     let after = bootstrap_write_counts(&database).await;
-    assert_eq!(after.ledger, 21);
+    assert_eq!(
+        after.ledger,
+        i64::try_from(native::NATIVE_MIGRATION_COUNT).unwrap()
+    );
+    // The upgrade appends 0033 onward exactly once and never rewrites the historical 0032 prefix.
+    assert!(
+        after
+            .ledger_fingerprint
+            .starts_with(&format!("{}|", before.ledger_fingerprint))
+    );
     let first_facts = native_0033_restart_facts(&database).await;
     assert_eq!(first_facts.1.len(), 3);
 
