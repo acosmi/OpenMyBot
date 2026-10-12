@@ -126,6 +126,8 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), S
                ('actor-a','a@example.test'),
                ('actor-b','b@example.test'),
                ('actor-c','c@example.test');
+             INSERT INTO public.user_roles(user_id,role) VALUES
+               ('actor-a','user'),('actor-b','user'),('actor-c','user');
              INSERT INTO public.agents(id,name,type,configuration)
                VALUES
                  ('bot-1','Bot 1','built_in','{}'::jsonb),
