@@ -129,12 +129,14 @@ impl Fixture {
 
     async fn assert_all_readers_reject(&self) {
         let before = self.snapshot().await;
-        assert!(matches!(
+        assert_eq!(
             self.directory
                 .thread_conversation(self.conversation())
                 .await,
-            Err(ThreadDirectoryError::Corrupt { .. })
-        ));
+            Err(ThreadDirectoryError::Corrupt {
+                field: "thread_run_occupancy"
+            })
+        );
         assert!(matches!(
             RunRepo::new(self.pool.clone())
                 .active_foreground_for_thread(self.begin.command.thread_id.as_str())
@@ -155,17 +157,21 @@ impl Fixture {
         ));
         // Exact idempotent replay and a fresh begin must both reject, without lease/message writes.
         if self.supports_replay {
-            assert!(matches!(
+            assert_eq!(
                 self.directory.begin_thread_run(self.begin.clone()).await,
-                Err(ThreadDirectoryError::Corrupt { .. })
-            ));
+                Err(ThreadDirectoryError::Corrupt {
+                    field: "thread_run_occupancy"
+                })
+            );
         }
         let mut next = self.begin.clone();
         next.command.run_id = RunId::new("new-run");
-        assert!(matches!(
+        assert_eq!(
             self.directory.begin_thread_run(next).await,
-            Err(ThreadDirectoryError::Corrupt { .. })
-        ));
+            Err(ThreadDirectoryError::Corrupt {
+                field: "thread_run_occupancy"
+            })
+        );
         assert_eq!(self.snapshot().await, before);
         let mut hidden = self.read_request();
         hidden.actor = ActorId::new("outsider");
@@ -225,18 +231,41 @@ where
     .await;
 }
 
+async fn finish_unknown_and_observe_blocking(f: &Fixture) {
+    f.finish(RunTerminal::ReconciliationRequired(
+        RunFailureCode::JournalCommitUnknown,
+    ))
+    .await;
+    assert!(
+        f.directory
+            .run_reconciliation(f.read_request())
+            .await
+            .unwrap()
+            .foreground_blocked
+    );
+    assert!(
+        f.directory
+            .run_effect_receipts(f.read_request())
+            .await
+            .unwrap()
+            .foreground_blocked
+    );
+}
+
+async fn damage_occupancy(f: &Fixture, damage: &str) {
+    let c = f.pool.get().await.unwrap();
+    // Only these disposable corruption fixtures bypass the projection's guards and FK.
+    c.batch_execute(&format!("BEGIN; ALTER TABLE public.thread_run_occupancy DISABLE TRIGGER ALL; {damage}; ALTER TABLE public.thread_run_occupancy ENABLE TRIGGER ALL; COMMIT;")).await.unwrap();
+}
+
 async fn corrupted(name: &str, damage: &str) {
     fixture(name, |f| async move {
-        f.finish(RunTerminal::ReconciliationRequired(RunFailureCode::JournalCommitUnknown)).await;
-        assert!(f.directory.run_reconciliation(f.read_request()).await.unwrap().foreground_blocked);
-        assert!(f.directory.run_effect_receipts(f.read_request()).await.unwrap().foreground_blocked);
-        let c=f.pool.get().await.unwrap();
-        // Only these disposable corruption fixtures bypass the projection's guards and FK.
-        c.batch_execute(&format!("BEGIN; ALTER TABLE public.thread_run_occupancy DISABLE TRIGGER ALL; {damage}; ALTER TABLE public.thread_run_occupancy ENABLE TRIGGER ALL; COMMIT;")).await.unwrap();
-        drop(c);
+        finish_unknown_and_observe_blocking(&f).await;
+        damage_occupancy(&f, damage).await;
         f.assert_all_readers_reject().await;
         Ok(())
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -404,7 +433,27 @@ async fn a_competing_runtime_lease_cannot_hide_visible_occupancy_corruption() {
 #[tokio::test]
 #[ignore = "requires owned isolated PostgreSQL 17"]
 async fn a_nonblocking_run_cannot_hide_the_missing_unknown_owner_after_a_page_cursor() {
-    corrupted("occupancy_nonblocking","WITH r AS (INSERT INTO public.runs(run_id,thread_id,bot_id,actor_id,foreground,status,fencing_token,terminal_event_seq,created_at,started_at,finished_at) SELECT 'history',thread_id,bot_id,actor_id,true,'completed',fencing_token,1,created_at,started_at,finished_at FROM public.runs WHERE run_id='original' RETURNING run_id,thread_id) INSERT INTO public.run_events(run_id,seq,thread_id,event_seq,event_type,payload,terminal) SELECT r.run_id,1,r.thread_id,(SELECT coalesce(max(e.event_seq)+1,0) FROM public.run_events e WHERE e.thread_id=r.thread_id),'completed','{}'::jsonb,true FROM r; UPDATE public.thread_run_occupancy SET run_id='history'").await;
+    fixture("occupancy_nonblocking", |f| async move {
+        finish_unknown_and_observe_blocking(&f).await;
+        let c=f.pool.get().await.unwrap();
+        // The completed 'history' Run is ordinary DML, not part of the corruption: its terminal
+        // event takes the Thread's next event slot and both Run and Thread counters advance past it.
+        c.batch_execute("BEGIN; WITH r AS (INSERT INTO public.runs(run_id,thread_id,bot_id,actor_id,foreground,status,fencing_token,next_event_seq,terminal_event_seq,created_at,started_at,finished_at) SELECT 'history',thread_id,bot_id,actor_id,true,'completed',fencing_token,1,0,created_at,started_at,finished_at FROM public.runs WHERE run_id='original' RETURNING run_id,thread_id) INSERT INTO public.run_events(run_id,seq,thread_id,event_seq,event_type,payload,terminal) SELECT r.run_id,0,r.thread_id,t.next_event_seq,'completed','{}'::jsonb,true FROM r JOIN public.threads t ON t.thread_id=r.thread_id; UPDATE public.threads SET next_event_seq=next_event_seq+1 WHERE thread_id=(SELECT thread_id FROM public.runs WHERE run_id='history'); COMMIT").await.unwrap();
+        let consistent:bool=c.query_one("SELECT t.next_event_seq=(SELECT max(e.event_seq)+1 FROM public.run_events e WHERE e.thread_id=t.thread_id) AND r.next_event_seq=(SELECT max(e.seq)+1 FROM public.run_events e WHERE e.run_id=r.run_id) AND r.terminal_event_seq=r.next_event_seq-1 FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id WHERE r.run_id='history'",&[]).await.unwrap().get(0);
+        assert!(consistent,"history Run and Thread event counters must cover the new event");
+        drop(c);
+        // Control: with the slot still on the unknown owner, every reader accepts this state, so
+        // the rejections below can only come from the moved slot.
+        let conversation=f.directory.thread_conversation(f.conversation()).await.unwrap();
+        assert_eq!(conversation.active_run_id,Some(RunId::new("original")));
+        assert_eq!(RunRepo::new(f.pool.clone()).active_foreground_for_thread(f.begin.command.thread_id.as_str()).await.unwrap().unwrap().run_id,"original");
+        assert!(f.directory.run_reconciliation(f.read_request()).await.unwrap().foreground_blocked);
+        assert!(f.directory.run_effect_receipts(f.read_request()).await.unwrap().foreground_blocked);
+        assert!(f.directory.begin_thread_run(f.begin.clone()).await.unwrap().replayed);
+        damage_occupancy(&f, "UPDATE public.thread_run_occupancy SET run_id='history'").await;
+        f.assert_all_readers_reject().await;
+        Ok(())
+    }).await;
 }
 
 #[tokio::test]
