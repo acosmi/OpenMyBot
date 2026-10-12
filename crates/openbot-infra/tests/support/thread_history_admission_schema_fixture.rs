@@ -252,15 +252,15 @@ where
 }
 async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     let mut c = p.get().await.map_err(|e| e.to_string())?;
-    if version == 50 {
+    if version == 51 {
         require(
             fresh::apply(&mut c).await.map_err(|e| e.to_string())?
                 == fresh::FreshApplyOutcome::Applied(native::ApplyOutcome::Applied),
-            "fresh50 not applied",
+            "fresh51 not applied",
         )?;
     } else {
         require(
-            matches!(version, 47 | 48 | 49),
+            matches!(version, 47 | 48 | 49 | 50),
             "unregistered historical fixture",
         )?;
         baseline::apply(&c).await.map_err(|e| e.to_string())?;
@@ -275,7 +275,7 @@ async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     Ok(())
 }
 async fn provision(p: &pool::DatabasePool) -> TestResult {
-    initialize(p, 50).await?;
+    initialize(p, 51).await?;
     let c = p.get().await.map_err(|e| e.to_string())?;
     c.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES
         ('origin-a','origin-a@example.test',7),('origin-b','origin-b@example.test',7),

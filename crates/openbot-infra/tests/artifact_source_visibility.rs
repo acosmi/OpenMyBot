@@ -235,6 +235,13 @@ impl Fixture {
         tx.commit().await.map_err(|e| e.to_string())
     }
 
+    async fn tamper_channel_run_source(&self, sql: &str) -> Result<(), String> {
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tamper_owned_channel_run_source(&tx, sql).await?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     fn runtime(&self) -> Result<PostgresRunRuntime, String> {
         PostgresRunRuntime::new(
             self.pool.clone(),
@@ -597,36 +604,64 @@ async fn tamper_owned_thread_identity(
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<(), String> {
-    const REGISTERED_GUARD: &str = "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
-        WHERE tgrelid='public.threads'::regclass \
-        AND tgname='threads_history_protect_identity_update' AND NOT tgisinternal";
-    let before: String = tx
-        .query_one(REGISTERED_GUARD, &[])
-        .await
-        .map_err(|e| e.to_string())?
-        .get(0);
-    if before != "O" {
-        return Err(
-            "owned Thread identity guard was not registered and normally enabled".to_owned(),
-        );
+    const NEW_GUARDS: [&str; 3] = [
+        "threads_history_body_before_update",
+        "threads_history_canonical_before",
+        "threads_history_source_final",
+    ];
+    const OLD: &str = "threads_history_protect_identity_update";
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned registered Thread guard {guard} was not normally enabled"
+            ));
+        }
     }
-    tx.batch_execute("SAVEPOINT owned_thread_identity_probe")
+    tx.batch_execute("SAVEPOINT owned_current_identity_probe")
         .await
         .map_err(|e| e.to_string())?;
     let ordinary = tx.execute(sql, params).await;
-    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_thread_identity_probe; RELEASE SAVEPOINT owned_thread_identity_probe")
-        .await.map_err(|e| e.to_string())?;
-    let refused = ordinary
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_current_identity_probe; RELEASE SAVEPOINT owned_current_identity_probe").await.map_err(|e|e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && matches!(
+                    e.message(),
+                    "thread_history_state_binding_invalid"
+                        | "thread_history_writer_binding_invalid"
+                        | "thread_history_writer_source_mutation_refused"
+                )
+        })
+    {
+        return Err("ordinary current Thread identity DML was not explicitly refused".into());
+    }
+    // Suppress only these owned fixture events BEFORE corrupting DML. Re-enabling
+    // at COMMIT cannot remove an already queued deferred event; none is bypassed.
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads DISABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    tx.batch_execute("SAVEPOINT owned_original50_identity_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let original = tx.execute(sql, params).await;
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_original50_identity_probe; RELEASE SAVEPOINT owned_original50_identity_probe").await.map_err(|e|e.to_string())?;
+    if !original
         .as_ref()
         .err()
         .and_then(|e| e.as_db_error())
         .is_some_and(|e| {
             e.code().code() == "55000" && e.message() == "thread_history_state_binding_invalid"
-        });
-    if !refused {
-        return Err(
-            "ordinary Thread identity DML was not refused by the registered guard".to_owned(),
-        );
+        })
+    {
+        return Err("original0050 single identity guard control lost its exact refusal".into());
     }
     tx.batch_execute(
         "ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update",
@@ -639,15 +674,87 @@ async fn tamper_owned_thread_identity(
     )
     .await
     .map_err(|e| e.to_string())?;
-    let after: String = tx
-        .query_one(REGISTERED_GUARD, &[])
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads ENABLE TRIGGER {guard}"
+        ))
         .await
-        .map_err(|e| e.to_string())?
-        .get(0);
-    if changed == 0 || after != "O" {
-        return Err(
-            "owned Thread identity tamper did not change a row and restore its guard".to_owned(),
-        );
+        .map_err(|e| e.to_string())?;
+    }
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned Thread guard {guard} was not restored before product entry"
+            ));
+        }
+    }
+    if changed == 0 {
+        return Err("owned identity control changed no row".into());
+    }
+    Ok(())
+}
+
+// A channel source pins its canonical Run's Bot (0051 item 10/11): ordinary Run.bot DML is
+// refused immediately. Only in this owned disposable DB, after proving that refusal, the
+// exact reverse and source-final Run guards are suppressed for the change and restored.
+async fn tamper_owned_channel_run_source(
+    tx: &tokio_postgres::Transaction<'_>,
+    sql: &str,
+) -> Result<(), String> {
+    const GUARDS: [&str; 2] = ["runs_history_canonical_before", "runs_history_source_final"];
+    for guard in GUARDS {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.runs'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned registered Run guard {guard} was not normally enabled"
+            ));
+        }
+    }
+    tx.batch_execute("SAVEPOINT owned_channel_run_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let ordinary = tx.execute(sql, &[]).await;
+    tx.batch_execute(
+        "ROLLBACK TO SAVEPOINT owned_channel_run_probe; RELEASE SAVEPOINT owned_channel_run_probe",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && e.message() == "thread_history_writer_source_mutation_refused"
+        })
+    {
+        return Err("ordinary channel source Run.bot DML was not explicitly refused".into());
+    }
+    for guard in GUARDS {
+        tx.batch_execute(&format!("ALTER TABLE public.runs DISABLE TRIGGER {guard}"))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    // The still-enabled deferred Run guards (e.g. terminal final) check this change at
+    // statement end instead of queuing an event that would block re-enabling the guards.
+    tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")
+        .await
+        .map_err(|e| e.to_string())?;
+    let changed = tx.execute(sql, &[]).await.map_err(|e| e.to_string())?;
+    for guard in GUARDS {
+        tx.batch_execute(&format!("ALTER TABLE public.runs ENABLE TRIGGER {guard}"))
+            .await
+            .map_err(|e| e.to_string())?;
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.runs'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned Run guard {guard} was not restored before product entry"
+            ));
+        }
+    }
+    if changed == 0 {
+        return Err("owned channel Run control changed no row".into());
     }
     Ok(())
 }
@@ -720,9 +827,18 @@ async fn source_channel_current_membership_bot_link_and_both_packages_are_rechec
             ("UPDATE public.runs SET bot_id='bot-b'",
              "UPDATE public.runs SET bot_id='bot-a'", "source selected Bot has no channel link"),
         ] {
-            fixture.sql(change).await?;
+            let pinned_run_source = change == "UPDATE public.runs SET bot_id='bot-b'";
+            if pinned_run_source {
+                fixture.tamper_channel_run_source(change).await?;
+            } else {
+                fixture.sql(change).await?;
+            }
             fixture.expect_current_invisible(reason).await?;
-            fixture.sql(restore).await?;
+            if pinned_run_source {
+                fixture.tamper_channel_run_source(restore).await?;
+            } else {
+                fixture.sql(restore).await?;
+            }
             fixture.observe().await?;
         }
         fixture.sql("UPDATE public.channels SET package_id='00000000-0000-4000-8000-000000000041';

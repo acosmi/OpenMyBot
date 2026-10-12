@@ -154,9 +154,13 @@ async fn check_admission(c: &Client) -> TestResult<Value> {
         )?;
     }
     require(actual["rawFacts"].is_object(), "raw graph proof absent")?;
-    admission_schema::verify(c)
+    let ledger = native::validate_known_prefix(c, 50)
         .await
         .map_err(|e| e.to_string())?;
+    require(
+        ledger.latest_version() == 50,
+        "historical0050 prefix is not exact50/38",
+    )?;
     Ok(actual)
 }
 async fn head(c: &Client, id: &str) -> TestResult<Option<Value>> {
@@ -309,7 +313,7 @@ async fn s01_fresh50_complete_independent_schema_and_original_owner() {
         c.batch_execute(&format!("CREATE ROLE \"{name}\" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE;GRANT CREATE ON DATABASE \"{database}\" TO \"{name}\";GRANT USAGE,CREATE ON SCHEMA public TO \"{name}\";SET ROLE \"{name}\";")).await.map_err(|e|e.to_string())?;
         let result:TestResult=async {
             baseline::apply(&c).await.map_err(|e|e.to_string())?;
-            native::apply(&mut c).await.map_err(|e|e.to_string())?;
+            native::apply_through(&mut c, 50).await.map_err(|e|e.to_string())?;
             let old:String=c.query_one("SELECT relowner::text FROM pg_class WHERE oid='public.threads'::regclass",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
             require(old!="10","owner O not distinct from PG bootstrap")?;
             check_admission(&c).await?;
@@ -337,14 +341,14 @@ async fn s02_historical49_upgrade50_and_zero_ddl_replay() {
         let old:Value=c.query_one("SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM openbot_internal.schema_migrations m",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
         require(native::apply_through(&mut c,49).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,"historical49 replay drifted")?;
         require(c.query_one("SELECT to_regclass('openbot_internal.thread_history_heads') IS NULL AND to_regclass('openbot_internal.thread_history_clear_intents') IS NULL",&[]).await.map_err(|e|e.to_string())?.get::<_,bool>(0),"explicit49 fabricated50")?;
-        require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"actual49->50 did not apply")?;
+        require(native::apply_through(&mut c, 50).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"actual49->50 did not apply")?;
         let retained:Value=c.query_one("SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM openbot_internal.schema_migrations m WHERE version<=49",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
         require(retained==old,"upgrade rewrote old ledger bytes")?;
         let r=c.query_one("SELECT count(*),max(version) FROM openbot_internal.schema_migrations",&[]).await.map_err(|e|e.to_string())?;
         require(r.get::<_,i64>(0)==38&&r.get::<_,i32>(1)==50,"ordinary ledger not exact38/50")?;
         check_admission(&c).await?;
         c.batch_execute("CREATE TABLE openbot_internal.owned_history_ddl(tag text);CREATE FUNCTION openbot_internal.owned_history_ddl_probe() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO openbot_internal.owned_history_ddl SELECT command_tag FROM pg_event_trigger_ddl_commands();END$$;CREATE EVENT TRIGGER owned_history_ddl_probe ON ddl_command_end EXECUTE FUNCTION openbot_internal.owned_history_ddl_probe();TRUNCATE openbot_internal.owned_history_ddl;").await.map_err(|e|e.to_string())?;
-        require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,"current50 replay outcome differs")?;
+        require(native::apply_through(&mut c, 50).await.map_err(|e|e.to_string())?==native::ApplyOutcome::AlreadyApplied,"current50 replay outcome differs")?;
         require(c.query_one("SELECT count(*) FROM openbot_internal.owned_history_ddl",&[]).await.map_err(|e|e.to_string())?.get::<_,i64>(0)==0,"exact current replay issued actual DDL")?;
         Ok(())
     }).await;
@@ -754,7 +758,11 @@ async fn s10_concurrent_unique_and_base_waits_refresh_original_read_committed() 
             let mut c = p.get().await.map_err(|e| e.to_string())?;
             raw_thread(&c, "owned-base-commit").await?;
             raw_thread(&c, "owned-base-rollback").await?;
-            native::apply(&mut c).await.map_err(|e| e.to_string())?;
+            // Original 0050 storage wait semantics stay on explicit 50 (0051 writer guards
+            // would lazily register H before this legacy anchor change and refuse it).
+            native::apply_through(&mut c, 50)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         wait_round(&p, "owned-unique-commit", false, true).await?;
         wait_round(&p, "owned-unique-rollback", false, false).await?;
@@ -807,11 +815,11 @@ async fn s11_complete_schema_acl_function_and_ri_tamper_refuses_without_repair()
             c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
             let mutation=c.batch_execute(sql).await;
             if let Err(e)=mutation {c.batch_execute("ROLLBACK").await.map_err(|e|e.to_string())?;return Err(format!("tamper fixture never formed: {sql}: {e}"));}
-            let refusal=admission_schema::verify(&c).await;
+            let refusal=check_admission(&c).await;
             // No nested transaction: these complete raw catalog values observe only the
             // frozen relevant graph, including facts normalization may refuse to return.
             let before=owned_raw_catalog(&c).await?;
-            let second=admission_schema::verify(&c).await;
+            let second=check_admission(&c).await;
             let after=owned_raw_catalog(&c).await?;
             c.batch_execute("ROLLBACK").await.map_err(|e|e.to_string())?;
             require(refusal.is_err()&&second.is_err(),"tampered schema accepted ordinary current observer")?;
@@ -822,13 +830,13 @@ async fn s11_complete_schema_acl_function_and_ri_tamper_refuses_without_repair()
         require(trigger.starts_with("RI_ConstraintTrigger_c_")&&trigger.chars().all(|x|x.is_ascii_alphanumeric()||x=='_'),"actual owned RI identity escaped")?;
         c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
         c.batch_execute(&format!("ALTER TABLE openbot_internal.thread_history_heads DISABLE TRIGGER \"{trigger}\"")).await.map_err(|e|e.to_string())?;
-        let rejected=admission_schema::verify(&c).await.is_err();
+        let rejected=check_admission(&c).await.is_err();
         c.batch_execute("ROLLBACK").await.map_err(|e|e.to_string())?;
         require(rejected,"disabled real RI trigger accepted")?;
         check_admission(&c).await?;
         // One committed fault proves the migration replay also refuses without repair.
         c.batch_execute("ALTER TABLE openbot_internal.thread_history_heads RENAME CONSTRAINT thread_history_heads_phase_check TO owned_committed_wrong_phase_check").await.map_err(|e|e.to_string())?;
-        let refused=native::apply(&mut c).await;
+        let refused=native::apply_through(&mut c, 50).await;
         let still_wrong:bool=c.query_one("SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='openbot_internal.thread_history_heads'::regclass AND conname='owned_committed_wrong_phase_check')",&[]).await.map_err(|e|e.to_string())?.get(0);
         c.batch_execute("ALTER TABLE openbot_internal.thread_history_heads RENAME CONSTRAINT owned_committed_wrong_phase_check TO thread_history_heads_phase_check").await.map_err(|e|e.to_string())?;
         require(refused.is_err()&&still_wrong,"native replay repaired/accepted committed exact fault")?;
@@ -853,7 +861,7 @@ async fn s12_explicit49_historical_canary_and_current50_admission_are_distinct()
         drop(c);desktop_vault_canary::verify_current_layout(&p).await.map_err(|e|e.to_string())?;
         let c=p.get().await.map_err(|e|e.to_string())?;
         for sql in ["DELETE FROM openbot_internal.schema_migrations WHERE version=46","UPDATE openbot_internal.schema_migrations SET name='wrong50' WHERE version=50",
-            "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=50","INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(51,'unknown51',repeat('b',64))",
+            "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=50","INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(52,'unknown52',repeat('b',64))",
             "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(12,'unexpected12',repeat('c',64))"] {
             c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;c.batch_execute(sql).await.map_err(|e|e.to_string())?;
             let result=admission_schema::verify(&c).await;
@@ -861,7 +869,7 @@ async fn s12_explicit49_historical_canary_and_current50_admission_are_distinct()
             require(matches!(result,Err(InfraError::NativeMigration(_))|Err(InfraError::RepositoryInvariant{..})),"current50 drift structural classification lost")?;
             admission_schema::verify(&c).await.map_err(|e|e.to_string())?;
         }
-        check_admission(&c).await?;
+        admission_schema::verify(&c).await.map_err(|e|e.to_string())?;
         Ok(())
     }).await;
 }

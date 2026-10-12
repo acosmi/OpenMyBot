@@ -792,6 +792,11 @@ impl ComponentAdministration for PostgresComponentAdministration {
             commit_component_runtime(transaction, "component_human_refused").await?;
             return Err(ComponentAdministrationError::NotVisible);
         }
+        crate::thread_history_writer::require_open(&transaction, &scope.thread_id)
+            .await
+            .map_err(component_writer_error)?;
+        ensure_component_human_scope(&transaction, scope).await?;
+        ensure_runnable_agent(&transaction, &runtime_scope).await?;
         let ttl_seconds = i64::try_from(draft.ttl.as_secs())
             .map_err(|_| corrupt("component_human_decision_ttl"))?;
         let generation =
@@ -1027,6 +1032,13 @@ impl ComponentAdministration for PostgresComponentAdministration {
             commit_component_runtime(transaction, "component_human_expired").await?;
             return Err(ComponentAdministrationError::NotVisible);
         }
+        let actual_thread: String = row.try_get("thread_id").map_err(|_| corrupt("thread_id"))?;
+        crate::thread_history_writer::require_open(
+            &transaction,
+            &openbot_contracts::ids::ThreadId::new(actual_thread),
+        )
+        .await
+        .map_err(component_writer_error)?;
         let component_name: String = row
             .try_get("component_name")
             .map_err(|_| corrupt("component_name"))?;
@@ -1973,7 +1985,25 @@ fn unavailable(error: crate::db::pool::PoolError) -> ComponentAdministrationErro
     ComponentAdministrationError::Unavailable
 }
 
+fn component_writer_error(error: crate::db::InfraError) -> ComponentAdministrationError {
+    if crate::thread_history_writer::is_closed(&error) {
+        return ComponentAdministrationError::NotVisible;
+    }
+    tracing::warn!(error=%error,"Component history writer admission failed");
+    match error {
+        crate::db::InfraError::Connect { .. } | crate::db::InfraError::Query { .. } => {
+            ComponentAdministrationError::Unavailable
+        }
+        _ => ComponentAdministrationError::Corrupt {
+            field: "thread_history_writer",
+        },
+    }
+}
+
 fn query_unavailable(error: tokio_postgres::Error) -> ComponentAdministrationError {
+    if crate::thread_history_writer::is_closed_query(&error) {
+        return ComponentAdministrationError::NotVisible;
+    }
     tracing::warn!(error = %error, "component catalogue query unavailable");
     ComponentAdministrationError::Unavailable
 }
