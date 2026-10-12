@@ -3854,6 +3854,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let channels = FixtureChannels::new(now);
+    if model_picker_fixture {
+        // An empty channel makes the explicit ModelPicker fixture reachable without a run.
+        channels.rows.lock().expect("fixture channel lock").insert(
+            0,
+            ChannelSummary {
+                id: ChannelId::new("channel-model-picker-fixture"),
+                name: "Model picker fixture conversation".to_owned(),
+                agent_ids: vec![BotId::new("fixture-owned-public")],
+                last_message: None,
+                last_message_at: None,
+                last_message_agent_id: None,
+                created_at: now,
+                thread_id: None,
+                active: true,
+            },
+        );
+    }
     let home_channel_probe = channels.clone();
     let threads = FixtureThreads::new(channels.clone());
     let bot_thread_probe = threads.clone();
