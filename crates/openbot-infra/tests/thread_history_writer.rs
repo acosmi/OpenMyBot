@@ -211,7 +211,8 @@ async fn w03_typed_and_raw_seven_body_actual_joint_and_old_new() {
         require(matches!(runs.insert(&new_run).await,Err(InfraError::RepositoryInvariant{code:"thread_history_writer_closed"})),"typed newRun accepted closed referenced Thread")?;
         let mut forged=new_m;forged.thread_id="writer-body-other".into();
         require(messages.insert(&forged).await.is_err(),"open forged row.Thread bypassed actual closed Run.thread")?;
-        writer_refusal(&c,"UPDATE public.messages SET thread_id='writer-body-other' WHERE message_id='writer-typed-open'","thread_history_writer_closed").await?;
+        writer_refusal(&c,"UPDATE public.messages SET thread_id='writer-body-other' WHERE message_id='writer-typed-open'","thread_history_writer_binding_invalid").await?;
+        writer_refusal(&c,"UPDATE public.messages SET thread_id='writer-body-other',run_id='writer-body-other-run' WHERE message_id='writer-typed-open'","thread_history_writer_closed").await?;
         writer_refusal(&c,"UPDATE public.runs SET thread_id='writer-body-other' WHERE run_id='writer-body-run'","thread_history_writer_closed").await?;
         writer_refusal(&c,"INSERT INTO public.messages(message_id,thread_id,seq,role,content,search_text,run_id,actor_id) VALUES('writer-bad-joint','writer-body-other',99,'user','{}','x','writer-body-run','origin-a')","thread_history_writer_binding_invalid").await?;
         c.execute("UPDATE public.threads SET status='archived',updated_at=updated_at WHERE thread_id='writer-body-open'",&[]).await.map_err(|e|e.to_string())?;
