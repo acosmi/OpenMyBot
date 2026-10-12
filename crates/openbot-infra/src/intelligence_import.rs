@@ -74,6 +74,9 @@ impl IntelligenceImportStore for PostgresIntelligenceImportStore {
         thread_id: &str,
     ) -> Result<IntelligenceThreadChecksum, IntelligenceImportError> {
         let client = self.client().await?;
+        crate::db::thread_origin_schema::verify(&client)
+            .await
+            .map_err(import_origin_error)?;
         observe_thread_checksum(&**client, thread_id).await
     }
 
@@ -208,6 +211,9 @@ async fn import_thread_transaction(
     transaction: &Transaction<'_>,
     request: &IntelligenceThreadImportRequest,
 ) -> Result<IntelligenceThreadImportReceipt, IntelligenceImportError> {
+    crate::db::native::validate_thread_origin_in_transaction(transaction)
+        .await
+        .map_err(import_origin_error)?;
     lock_bundle(transaction, &request.bundle_id).await?;
     let current = load_progress_transaction(
         transaction,
@@ -338,13 +344,13 @@ async fn insert_thread(
             field: "next_event_seq",
         })?;
     let next_event = i64_count(event_count, "next_event_seq")?;
-    transaction
-        .execute(
+    let inserted = transaction
+        .query_opt(
             "INSERT INTO public.threads( \
                thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,title,status, \
                next_message_seq,next_event_seq,created_at,updated_at,deleted_at \
              ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
-             ON CONFLICT(thread_id) DO NOTHING",
+             ON CONFLICT(thread_id) DO NOTHING RETURNING thread_id",
             &[
                 &thread.thread_id,
                 &request.target_tenant_id,
@@ -384,11 +390,48 @@ async fn insert_thread(
         && decode::<OffsetDateTime>(&row, "created_at")? == thread.created_at
         && decode::<OffsetDateTime>(&row, "updated_at")? == thread.updated_at
         && decode::<Option<OffsetDateTime>>(&row, "deleted_at")? == thread.deleted_at;
-    if exact {
-        Ok(())
-    } else {
-        Err(IntelligenceImportError::Conflict { field: "thread" })
+    if !exact {
+        return Err(IntelligenceImportError::Conflict { field: "thread" });
     }
+    if let Some(inserted) = inserted {
+        if decode::<String>(&inserted, "thread_id")? != thread.thread_id {
+            return Err(IntelligenceImportError::Corrupt {
+                field: "thread_origin",
+            });
+        }
+        let signing_key_id = request
+            .provenance
+            .get("signingKeyId")
+            .and_then(Value::as_str)
+            .ok_or(IntelligenceImportError::Corrupt {
+                field: "import_provenance",
+            })?;
+        if request
+            .provenance
+            .get("payloadSha256")
+            .and_then(Value::as_str)
+            != Some(request.payload_sha256.as_str())
+        {
+            return Err(IntelligenceImportError::Corrupt {
+                field: "import_provenance",
+            });
+        }
+        crate::thread_origin::record_new_import(
+            transaction,
+            &thread.thread_id,
+            &request.bundle_id,
+            &request.payload_sha256,
+            signing_key_id,
+            &request.checksum,
+        )
+        .await
+        .map_err(import_origin_error)?;
+    } else {
+        crate::thread_origin::observe_on(transaction, &thread.thread_id)
+            .await
+            .map_err(import_origin_error)?;
+    }
+    Ok(())
 }
 
 async fn insert_memberships(
@@ -724,6 +767,9 @@ async fn observe_thread_checksum(
     client: &impl GenericClient,
     thread_id: &str,
 ) -> Result<IntelligenceThreadChecksum, IntelligenceImportError> {
+    crate::thread_origin::observe_on(client, thread_id)
+        .await
+        .map_err(import_origin_error)?;
     let thread = reconstruct_thread(client, thread_id).await?;
     compute_intelligence_thread_checksum(&thread)
 }
@@ -1415,6 +1461,18 @@ fn validate_hash(value: &str) -> Result<(), IntelligenceImportError> {
         Err(IntelligenceImportError::Corrupt {
             field: "cursor_hash",
         })
+    }
+}
+
+fn import_origin_error(error: crate::db::InfraError) -> IntelligenceImportError {
+    tracing::warn!(error = %error, "import historical origin verification failed");
+    match error {
+        crate::db::InfraError::Connect { .. } | crate::db::InfraError::Query { .. } => {
+            IntelligenceImportError::Unavailable
+        }
+        _ => IntelligenceImportError::Corrupt {
+            field: "thread_origin",
+        },
     }
 }
 

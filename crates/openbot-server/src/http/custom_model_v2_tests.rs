@@ -107,7 +107,11 @@ impl ServerFixture {
             deny: vec![],
             allow: vec![r#"tool.name == "remember" && bot.id == "owned-v2-bot" && actor.id == "owned-v2-server-owner""#.to_owned()],
         }, Some(ACTOR)).await.map_err(|e|e.to_string())?;
-        require(policy_store.load().await.map_err(|e|e.to_string())? == openbot_infra::policy::PolicyOrigin::Database, "custom-V2 policy must load from database")?;
+        require(
+            policy_store.load().await.map_err(|e| e.to_string())?
+                == openbot_infra::policy::PolicyOrigin::Database,
+            "custom-V2 policy must load from database",
+        )?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
             pool: pool.clone(),
             listener_database: config.into(),
@@ -172,7 +176,10 @@ impl ServerFixture {
     fn router(&self) -> axum::Router {
         let environment = openbot_server::config::EnvMap::from([
             ("OPENBOT_PUBLIC_URL".to_owned(), ORIGIN.to_owned()),
-            ("OPENBOT_TLS_PROXY_SECRET".to_owned(), PROXY_SECRET.to_owned()),
+            (
+                "OPENBOT_TLS_PROXY_SECRET".to_owned(),
+                PROXY_SECRET.to_owned(),
+            ),
         ]);
         let configuration = openbot_server::config::ServerConfig::from_env_map(&environment)
             .expect("owned HTTPS proxy configuration");
@@ -328,7 +335,10 @@ async fn post(
         .header("x-forwarded-proto", "https")
         .header("x-forwarded-host", "owned-v2-server.example.test")
         // Controlled oneshot peer input, not evidence of an incoming TCP socket.
-        .extension(axum::extract::ConnectInfo(SocketAddr::from(([127,0,0,1],41025))));
+        .extension(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            41025,
+        ))));
     if let Some(cookie) = cookie {
         request = request.header("cookie", format!("openbot_session={cookie}"));
     }

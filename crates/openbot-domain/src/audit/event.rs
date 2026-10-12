@@ -158,6 +158,9 @@ impl AuditEventType {
         Self("gateway_authorization_attempt_closed");
     /// The original registration reply was committed and read back before handoff.
     pub const GATEWAY_AUTHORIZATION_REGISTERED: Self = Self("gateway_authorization_registered");
+    /// The original code admission was committed with its original typed audit.
+    pub const GATEWAY_AUTHORIZATION_CODE_ADMITTED: Self =
+        Self("gateway_authorization_code_admitted");
 
     /// 从字符串解析。**只接受 [`AUDIT_EVENT_TYPES`] 里的字面量。**
     ///
@@ -273,6 +276,7 @@ pub const AUDIT_EVENT_TYPES: &[AuditEventType] = &[
     AuditEventType::GATEWAY_AUTHORIZATION_REGISTRATION_ADMITTED,
     AuditEventType::GATEWAY_AUTHORIZATION_ATTEMPT_CLOSED,
     AuditEventType::GATEWAY_AUTHORIZATION_REGISTERED,
+    AuditEventType::GATEWAY_AUTHORIZATION_CODE_ADMITTED,
 ];
 
 /// 一条审计事件。
@@ -334,9 +338,9 @@ mod tests {
 
     #[test]
     fn catalog_is_upstream_fifty_seven_plus_twenty_seven_new_and_has_no_duplicates() {
-        assert_eq!(AUDIT_EVENT_TYPES.len(), 85);
+        assert_eq!(AUDIT_EVENT_TYPES.len(), 86);
         let unique: BTreeSet<&str> = AUDIT_EVENT_TYPES.iter().map(|t| t.0).collect();
-        assert_eq!(unique.len(), 85, "目录里有重复的事件类型");
+        assert_eq!(unique.len(), 86, "目录里有重复的事件类型");
     }
 
     #[test]
@@ -358,19 +362,23 @@ mod tests {
                 "gateway_authorization_registered",
                 AuditEventType::GATEWAY_AUTHORIZATION_REGISTERED,
             ),
+            (
+                "gateway_authorization_code_admitted",
+                AuditEventType::GATEWAY_AUTHORIZATION_CODE_ADMITTED,
+            ),
         ];
         for (value, event) in values {
             assert_eq!(AuditEventType::parse(value), Some(event));
             assert_eq!(event.as_str(), value);
         }
-        assert_eq!(AUDIT_EVENT_TYPES.len(), 85);
+        assert_eq!(AUDIT_EVENT_TYPES.len(), 86);
         assert_eq!(
             AUDIT_EVENT_TYPES
                 .iter()
                 .map(|t| t.as_str())
                 .collect::<BTreeSet<_>>()
                 .len(),
-            85
+            86
         );
         assert_eq!(&AUDIT_EVENT_TYPES[81..], &values.map(|(_, event)| event));
         for invalid in [
@@ -379,6 +387,9 @@ mod tests {
             "gateway_authorization_registered ",
             "gateway_authorization_registered_unknown",
             "gateway_authorization_attempt_closed_unknown",
+            "Gateway_authorization_code_admitted",
+            "gateway_authorization_code_admitted ",
+            "gateway_authorization_code_admitted_unknown",
         ] {
             assert_eq!(AuditEventType::parse(invalid), None);
         }
@@ -398,6 +409,10 @@ mod tests {
         assert_eq!(AuditEventType::parse("computer.action_allowed "), None);
         assert_eq!(AuditEventType::parse(""), None);
         assert_eq!(AuditEventType::parse("anything.at.all"), None);
+        assert_eq!(
+            AuditEventType::parse("gateway_authorization_code_admitted "),
+            None
+        );
     }
 
     #[test]
@@ -433,6 +448,7 @@ mod tests {
             AuditEventType::GATEWAY_AUTHORIZATION_REGISTRATION_ADMITTED,
             AuditEventType::GATEWAY_AUTHORIZATION_ATTEMPT_CLOSED,
             AuditEventType::GATEWAY_AUTHORIZATION_REGISTERED,
+            AuditEventType::GATEWAY_AUTHORIZATION_CODE_ADMITTED,
         ] {
             assert!(
                 AUDIT_EVENT_TYPES.contains(&constant),

@@ -1074,6 +1074,7 @@ async fn p02() {
             metadata,
             binding,
             start,
+            ..
         } => {
             assert_eq!(metadata.sdk_metadata().issuer, ORIGIN);
             assert_eq!(binding.client_id.as_str(), "client-original");
@@ -1368,6 +1369,7 @@ async fn o02() {
         metadata,
         binding,
         start,
+        ..
     } = f.prepared.witness.take().expect("original witness")
     else {
         panic!("wrong witness")
