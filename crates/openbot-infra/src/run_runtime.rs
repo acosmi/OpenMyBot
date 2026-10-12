@@ -407,10 +407,7 @@ impl RunRuntime for PostgresRunRuntime {
             .await
             .map_err(|error| unavailable("开始 run terminal 事务", error))?;
         let result = async {
-            // Observe the current writer schema before the first row lock; it locks no row.
-            let schema = crate::thread_history_writer::CurrentWriterSchema::observe(&transaction)
-                .await
-                .map_err(history_writer_error)?;
+            let schema = observe_writer_schema(&transaction).await?;
             finish_run_in_transaction(
                 &transaction,
                 &schema,
@@ -860,10 +857,7 @@ async fn finish_unstarted_cancellation_in_transaction(
     owner: &str,
     claim: &ClaimedRunCancellation,
 ) -> Result<RunWriteReceipt, RunRuntimeError> {
-    // Observe the current writer schema before the first row lock; it locks no row.
-    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
-        .await
-        .map_err(history_writer_error)?;
+    let schema = observe_writer_schema(transaction).await?;
     let row = transaction
         .query_opt(
             "SELECT status,claimed_by,attempt_count FROM public.outbox \
@@ -1232,10 +1226,7 @@ async fn reject_dispatch_in_transaction(
     code: RunFailureCode,
 ) -> Result<RunWriteReceipt, RunRuntimeError> {
     let expected = claim.lease().next_event_sequence();
-    // Observe the current writer schema before the first row lock; it locks no row.
-    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
-        .await
-        .map_err(history_writer_error)?;
+    let schema = observe_writer_schema(transaction).await?;
     let row = transaction
         .query_opt(
             "SELECT status,claimed_by,attempt_count FROM public.outbox WHERE outbox_id=$1 FOR UPDATE",
@@ -1297,10 +1288,7 @@ async fn append_chunk_in_transaction(
 ) -> Result<RunWriteReceipt, RunRuntimeError> {
     let expected = sequence_i64(expected_sequence)?;
     let payload = json!({"channel":channel.as_str(),"delta":chunk});
-    // Observe the current writer schema before the first row lock; it locks no row.
-    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
-        .await
-        .map_err(history_writer_error)?;
+    let schema = observe_writer_schema(transaction).await?;
     let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
         return Err(RunRuntimeError::StaleLease);
     };
@@ -1383,10 +1371,7 @@ async fn append_remote_projection_in_transaction(
 ) -> Result<RunWriteReceipt, RunRuntimeError> {
     let expected = sequence_i64(expected_sequence)?;
     let payload = projection.journal_payload();
-    // Observe the current writer schema before the first row lock; it locks no row.
-    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
-        .await
-        .map_err(history_writer_error)?;
+    let schema = observe_writer_schema(transaction).await?;
     let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
         return Err(RunRuntimeError::StaleLease);
     };
@@ -1484,10 +1469,7 @@ async fn append_tool_exchange_in_transaction(
         "resultHash":Sha256Digest::of(exchange.result().as_bytes()).to_hex(),
         "errorCode":exchange.error_code(),
     });
-    // Observe the current writer schema before the first row lock; it locks no row.
-    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
-        .await
-        .map_err(history_writer_error)?;
+    let schema = observe_writer_schema(transaction).await?;
     let Some(locked) = lock_run(transaction, lease.run_id().as_str()).await? else {
         return Err(RunRuntimeError::StaleLease);
     };
@@ -2295,7 +2277,6 @@ async fn finish_run_in_transaction(
         .map_err(|error| write_error("推进 terminal thread sequence", error))?;
     if !assistant_text.is_empty() {
         crate::channel_activity::record_from_message(
-            transaction,
             schema,
             &openbot_domain::thread::MessageId::new(assistant_message_id(lease.run_id())),
         )
@@ -2405,10 +2386,9 @@ async fn recover_one_in_transaction(
     let run_id: String = decode(&row, "run_id")?;
     let outbox_status: String = decode(&row, "outbox_status")?;
     // Recovery polls every relay tick, so it observes only after the probe selected
-    // one lease-expired Run; that Run has no live writer, and T is not locked yet.
-    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
-        .await
-        .map_err(history_writer_error)?;
+    // one lease-expired Run. The probe keeps that Run, its lease and dispatch outbox
+    // rows locked across the observation; the Run has no live writer, T is not locked.
+    let schema = observe_writer_schema(transaction).await?;
     let Some(mut locked) = lock_run(transaction, &run_id).await? else {
         return Err(RunRuntimeError::Corrupt { field: "stale_run" });
     };
@@ -2897,6 +2877,16 @@ where
 {
     row.try_get(column)
         .map_err(|_| RunRuntimeError::Corrupt { field: column })
+}
+
+/// One same-transaction observation of the strict current writer schema. Writers call
+/// it before their first row lock: it reads only catalogs and the migration ledger.
+async fn observe_writer_schema<'t, 'c>(
+    transaction: &'t Transaction<'c>,
+) -> Result<crate::thread_history_writer::CurrentWriterSchema<'t, 'c>, RunRuntimeError> {
+    crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
+        .await
+        .map_err(history_writer_error)
 }
 
 fn history_writer_error(error: crate::db::InfraError) -> RunRuntimeError {

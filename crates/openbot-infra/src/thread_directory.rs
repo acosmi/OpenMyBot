@@ -1693,7 +1693,7 @@ async fn apply_begin(
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
     if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
-        crate::channel_activity::record_from_message(transaction, &schema, message.id())
+        crate::channel_activity::record_from_message(&schema, message.id())
             .await
             .map_err(writer_error)?;
     }
@@ -2400,7 +2400,7 @@ async fn apply_begin_v2(
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
     if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
-        crate::channel_activity::record_from_message(transaction, &schema, message.id())
+        crate::channel_activity::record_from_message(&schema, message.id())
             .await
             .map_err(writer_error)?;
     }

@@ -29,6 +29,12 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
         Ok(Self { tx })
     }
 
+    /// The original transaction this proof was observed on.
+    #[cfg(feature = "server-runtime")]
+    pub(crate) fn transaction(&self) -> &'t Transaction<'c> {
+        self.tx
+    }
+
     /// The physical Thread joint and H SHARE on the same original transaction.
     pub(crate) async fn lock_thread_write_disposition(
         &self,
@@ -79,7 +85,8 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
     }
 }
 
-/// Observe and admit in one call, for a writer that holds no row lock yet.
+/// Observe and admit in one call: the observation is the earlier statement of the same
+/// transaction. Writers that take row locks first keep holding them across it.
 #[cfg(feature = "server-runtime")]
 pub(crate) async fn require_open(
     tx: &Transaction<'_>,

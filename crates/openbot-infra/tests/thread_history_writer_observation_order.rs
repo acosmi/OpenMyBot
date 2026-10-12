@@ -1,7 +1,8 @@
 //! PostgreSQL 17 evidence that writer transactions observe the current schema before
 //! their first row lock. A real ACCESS EXCLUSIVE holder on the migration ledger stops
 //! the observation; while the writer waits there, independent NOWAIT probes must
-//! acquire the very Run/Thread rows and per-thread advisory lock the writer will use.
+//! acquire the very Run/Thread/lease/channel rows and per-thread advisory lock the
+//! writer uses afterwards. A built-in control proves the probe refuses real holders.
 #![cfg(feature = "server-runtime")]
 
 mod harness;
@@ -15,17 +16,26 @@ use openbot_application::{
 };
 use openbot_contracts::command::{BeginThreadRun, ThreadRunAnchor};
 use openbot_contracts::ids::thread::ThreadIdentity;
-use openbot_contracts::ids::{ActorId, BotId, DeploymentId, RunId, TenantId};
+use openbot_contracts::ids::{ActorId, BotId, ChannelId, DeploymentId, RunId, TenantId};
 use openbot_infra::db::pool::{self, DatabasePool};
 use openbot_infra::db::{baseline, native};
 use openbot_infra::run_runtime::{DEFAULT_DISPATCH_CLAIM_DURATION, PostgresRunRuntime};
 use openbot_infra::thread_directory::{DEFAULT_THREAD_LEASE_DURATION, PostgresThreadDirectory};
 
 const WAIT_BUDGET: Duration = Duration::from_secs(10);
+const CHANNEL: &str = "channel-main";
 
 async fn provision(pool: &DatabasePool) -> Result<(), String> {
     let mut client = pool.get().await.map_err(|error| error.to_string())?;
     baseline::apply(&client)
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .batch_execute(
+            "INSERT INTO public.channels(
+               id,name,description,last_message,last_message_at,last_message_agent_id
+             ) VALUES('channel-main','Main','observation order',NULL,NULL,NULL);",
+        )
         .await
         .map_err(|error| error.to_string())?;
     native::apply(&mut client)
@@ -39,15 +49,20 @@ async fn provision(pool: &DatabasePool) -> Result<(), String> {
                VALUES('bot-1','Bot 1','built_in','{}'::jsonb);
              INSERT INTO public.agent_profiles(
                agent_id,owner_user_id,title,role_description,avatar_seed,visibility,deleted_at
-             ) VALUES('bot-1',NULL,'Bot 1','test role','seed','public',NULL);",
+             ) VALUES('bot-1',NULL,'Bot 1','test role','seed','public',NULL);
+             INSERT INTO public.channel_agents(channel_id,agent_id)
+               VALUES('channel-main','bot-1');
+             INSERT INTO public.channel_memberships(channel_id,user_id)
+               VALUES('channel-main','actor-a');",
         )
         .await
         .map_err(|error| error.to_string())
 }
 
-fn request(deployment: &DeploymentId, run_id: &str) -> BeginThreadRunRequest {
+fn request(entropy_tail: u8, run_id: &str, anchor: ThreadRunAnchor) -> BeginThreadRunRequest {
+    let deployment = DeploymentId::new("dep-a");
     let mut entropy = [0_u8; 16];
-    entropy[15] = 7;
+    entropy[15] = entropy_tail;
     BeginThreadRunRequest {
         auth_generation: openbot_contracts::auth::AuthGeneration::new(0),
         deployment: deployment.clone(),
@@ -56,30 +71,56 @@ fn request(deployment: &DeploymentId, run_id: &str) -> BeginThreadRunRequest {
         command: BeginThreadRun {
             model_selection: None,
             selected_skill_slugs: Vec::new(),
-            thread_id: ThreadIdentity::new(deployment).mint_from_entropy(entropy),
+            thread_id: ThreadIdentity::new(&deployment).mint_from_entropy(entropy),
             run_id: RunId::new(run_id),
             bot_id: BotId::new("bot-1"),
-            anchor: ThreadRunAnchor::DirectBot,
-            message: "observation order".to_owned(),
+            anchor,
+            message: format!("observation order {run_id}"),
         },
     }
+}
+
+fn channel_anchor() -> ThreadRunAnchor {
+    ThreadRunAnchor::Channel {
+        channel_id: ChannelId::new(CHANNEL),
+    }
+}
+
+/// The exact rows and advisory key a writer locks after its observation.
+#[derive(Clone, Copy)]
+struct Target<'a> {
+    thread_id: &'a str,
+    run_id: Option<&'a str>,
+    channel_id: Option<&'a str>,
 }
 
 /// Holds ACCESS EXCLUSIVE on the migration ledger, which only the schema observation reads.
 struct LedgerBlocker {
     client: pool::PooledClient,
+    pid: i32,
 }
 
 impl LedgerBlocker {
     async fn hold(control: &DatabasePool) -> Result<Self, String> {
         let client = control.get().await.map_err(|error| error.to_string())?;
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .map_err(|error| error.to_string())?
+            .try_get(0)
+            .map_err(|error| error.to_string())?;
         client
-            .batch_execute(
-                "BEGIN; LOCK TABLE openbot_internal.schema_migrations IN ACCESS EXCLUSIVE MODE",
-            )
+            .batch_execute("BEGIN")
             .await
             .map_err(|error| error.to_string())?;
-        Ok(Self { client })
+        if let Err(error) = client
+            .batch_execute("LOCK TABLE openbot_internal.schema_migrations IN ACCESS EXCLUSIVE MODE")
+            .await
+        {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(error.to_string());
+        }
+        Ok(Self { client, pid })
     }
 
     async fn release(self) -> Result<(), String> {
@@ -90,8 +131,8 @@ impl LedgerBlocker {
     }
 }
 
-/// The real waiting backend on the ledger lock, observed from `pg_locks`.
-async fn ledger_waiter(control: &DatabasePool) -> Result<i32, String> {
+/// The real backend waiting on the ledger lock, blocked by exactly this blocker.
+async fn ledger_waiter(control: &DatabasePool, blocker: i32) -> Result<i32, String> {
     let client = control.get().await.map_err(|error| error.to_string())?;
     let started = Instant::now();
     loop {
@@ -100,8 +141,9 @@ async fn ledger_waiter(control: &DatabasePool) -> Result<i32, String> {
                 "SELECT pid FROM pg_catalog.pg_locks \
                  WHERE locktype='relation' AND NOT granted \
                    AND relation='openbot_internal.schema_migrations'::regclass \
+                   AND pg_catalog.pg_blocking_pids(pid)=ARRAY[$1::integer] \
                  ORDER BY pid LIMIT 1",
-                &[],
+                &[&blocker],
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -115,12 +157,11 @@ async fn ledger_waiter(control: &DatabasePool) -> Result<i32, String> {
     }
 }
 
-/// NOWAIT probes for the exact rows the blocked writer locks after its observation.
+/// NOWAIT probes for the exact rows and advisory key `holder` must not hold.
 async fn probe_unlocked(
     control: &DatabasePool,
-    waiter: i32,
-    thread_id: &str,
-    run_id: Option<&str>,
+    holder: i32,
+    target: Target<'_>,
 ) -> Result<(), String> {
     let mut client = control.get().await.map_err(|error| error.to_string())?;
     let transaction = client
@@ -132,10 +173,9 @@ async fn probe_unlocked(
             "SELECT count(*) FROM pg_catalog.pg_locks \
              WHERE pid=$1 AND granted AND (locktype IN ('tuple','advisory') \
                OR (locktype='relation' AND mode IN ('RowShareLock','RowExclusiveLock') \
-                 AND relation IN ( \
-                 'public.runs'::regclass,'public.threads'::regclass, \
-                 'public.thread_leases'::regclass)))",
-            &[&waiter],
+                 AND relation IN ('public.runs'::regclass,'public.threads'::regclass, \
+                   'public.thread_leases'::regclass,'public.channels'::regclass)))",
+            &[&holder],
         )
         .await
         .map_err(|error| error.to_string())?
@@ -143,36 +183,39 @@ async fn probe_unlocked(
         .map_err(|error| error.to_string())?;
     if held != 0 {
         return Err(format!(
-            "writer pid {waiter} held {held} Run/Thread/lease/advisory locks while observing"
+            "pid {holder} held {held} Run/Thread/lease/channel/advisory locks while observing"
         ));
     }
-    transaction
-        .query_one(
-            "SELECT thread_id FROM public.threads WHERE thread_id=$1 FOR UPDATE NOWAIT",
-            &[&thread_id],
-        )
-        .await
-        .map_err(|error| format!("Thread row was locked during observation: {error}"))?;
-    transaction
-        .query_one(
-            "SELECT thread_id FROM public.thread_leases WHERE thread_id=$1 FOR UPDATE NOWAIT",
-            &[&thread_id],
-        )
-        .await
-        .map_err(|error| format!("lease row was locked during observation: {error}"))?;
-    if let Some(run_id) = run_id {
-        transaction
-            .query_one(
-                "SELECT run_id FROM public.runs WHERE run_id=$1 FOR UPDATE NOWAIT",
-                &[&run_id],
-            )
-            .await
-            .map_err(|error| format!("Run row was locked during observation: {error}"))?;
+    let rows = [
+        (
+            "SELECT 1 FROM public.threads WHERE thread_id=$1 FOR UPDATE NOWAIT",
+            Some(target.thread_id),
+        ),
+        (
+            "SELECT 1 FROM public.thread_leases WHERE thread_id=$1 FOR UPDATE NOWAIT",
+            Some(target.thread_id),
+        ),
+        (
+            "SELECT 1 FROM public.runs WHERE run_id=$1 FOR UPDATE NOWAIT",
+            target.run_id,
+        ),
+        (
+            "SELECT 1 FROM public.channels WHERE id=$1 FOR UPDATE NOWAIT",
+            target.channel_id,
+        ),
+    ];
+    for (sql, key) in rows {
+        if let Some(key) = key {
+            transaction
+                .query_one(sql, &[&key])
+                .await
+                .map_err(|error| format!("`{sql}` for {key} was locked: {error}"))?;
+        }
     }
     let advisory: bool = transaction
         .query_one(
             "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))",
-            &[&thread_id],
+            &[&target.thread_id],
         )
         .await
         .map_err(|error| error.to_string())?
@@ -187,11 +230,46 @@ async fn probe_unlocked(
         .map_err(|error| error.to_string())
 }
 
+/// The probe is not vacuous: a real holder of the writer's locks makes it fail.
+async fn probe_refuses_real_holder(
+    control: &DatabasePool,
+    target: Target<'_>,
+) -> Result<(), String> {
+    let mut client = control.get().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
+    let pid: i32 = transaction
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .map_err(|error| error.to_string())?
+        .try_get(0)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .query_one(
+            "SELECT 1 FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id \
+             JOIN public.thread_leases l ON l.thread_id=r.thread_id \
+             WHERE r.run_id=$1 FOR UPDATE OF r,t,l",
+            &[&target.run_id.ok_or("control needs a Run")?],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let probed = probe_unlocked(control, pid, target).await;
+    transaction
+        .rollback()
+        .await
+        .map_err(|error| error.to_string())?;
+    match probed {
+        Err(message) if message.contains("held") => Ok(()),
+        other => Err(format!("probe accepted a real r/t/l holder: {other:?}")),
+    }
+}
+
 /// Starts `writer`, proves it waits in the observation without row locks, then lets it finish.
 async fn assert_observes_unlocked<T, F>(
     control: &DatabasePool,
-    thread_id: &str,
-    run_id: Option<&str>,
+    target: Target<'_>,
     writer: F,
 ) -> Result<T, String>
 where
@@ -201,12 +279,16 @@ where
     let blocker = LedgerBlocker::hold(control).await?;
     let task = tokio::spawn(writer);
     let probed = async {
-        let waiter = ledger_waiter(control).await?;
-        probe_unlocked(control, waiter, thread_id, run_id).await
+        let waiter = ledger_waiter(control, blocker.pid).await?;
+        probe_unlocked(control, waiter, target).await
     }
     .await;
-    blocker.release().await?;
-    let written = task.await.map_err(|error| error.to_string())?;
+    let released = blocker.release().await;
+    let written = tokio::time::timeout(WAIT_BUDGET, task)
+        .await
+        .map_err(|_| "blocked writer did not finish after release".to_owned())?
+        .map_err(|error| error.to_string())?;
+    released?;
     probed?;
     written
 }
@@ -224,7 +306,6 @@ async fn writers_observe_current_schema_before_their_first_row_lock() {
             .map_err(|error| error.to_string())?;
         let result = async {
             provision(&pool).await?;
-            let deployment = DeploymentId::new("dep-a");
             let directory = PostgresThreadDirectory::with_runtime(
                 pool.clone(),
                 config,
@@ -239,69 +320,101 @@ async fn writers_observe_current_schema_before_their_first_row_lock() {
                 DEFAULT_DISPATCH_CLAIM_DURATION,
             )
             .map_err(|error| error.to_string())?;
-            let first = request(&deployment, "run-1");
-            let thread_id = first.command.thread_id.as_str().to_owned();
-            directory
-                .begin_thread_run(first)
-                .await
-                .map_err(|error| error.to_string())?;
-            let claim = runtime
-                .claim_dispatch()
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or("dispatch was not claimed")?;
-            let lease = runtime
-                .acknowledge_dispatch(&claim)
-                .await
-                .map_err(|error| error.to_string())?;
 
-            // Chunk append: the observation precedes lock_run.
-            let chunk_runtime = runtime.clone();
-            let chunk_lease = lease.clone();
-            let chunk = assert_observes_unlocked(&control, &thread_id, Some("run-1"), async move {
-                chunk_runtime
-                    .append_semantic_chunk(&chunk_lease, 1, RunSemanticChannel::Text, "hello")
+            // One direct and one channel Thread, each with an acknowledged running Run.
+            let mut leases = Vec::new();
+            let mut threads = Vec::new();
+            for (tail, run, anchor) in [
+                (7, "run-d1", ThreadRunAnchor::DirectBot),
+                (8, "run-c1", channel_anchor()),
+            ] {
+                let begin = request(tail, run, anchor);
+                threads.push(begin.command.thread_id.as_str().to_owned());
+                directory
+                    .begin_thread_run(begin)
                     .await
-                    .map_err(|error| error.to_string())
-            })
-            .await?;
-            if chunk.replayed || chunk.run_event_sequence != 1 {
-                return Err(format!("blocked chunk append drifted: {chunk:?}"));
+                    .map_err(|error| error.to_string())?;
+                let claim = runtime
+                    .claim_dispatch()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or("dispatch was not claimed")?;
+                if claim.lease().run_id().as_str() != run {
+                    return Err(format!("claimed {:?} instead of {run}", claim.lease()));
+                }
+                leases.push(
+                    runtime
+                        .acknowledge_dispatch(&claim)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                );
             }
+            let direct = Target {
+                thread_id: &threads[0],
+                run_id: Some("run-d1"),
+                channel_id: None,
+            };
+            let channel = Target {
+                thread_id: &threads[1],
+                run_id: Some("run-c1"),
+                channel_id: Some(CHANNEL),
+            };
+            probe_refuses_real_holder(&control, direct).await?;
 
-            // Terminal finish: the observation precedes lock_run.
-            let finish_runtime = runtime.clone();
-            let finish_lease = lease.clone();
-            let finished =
-                assert_observes_unlocked(&control, &thread_id, Some("run-1"), async move {
+            for (target, lease) in [(direct, &leases[0]), (channel, &leases[1])] {
+                // Chunk append: the observation precedes lock_run.
+                let chunk_runtime = runtime.clone();
+                let chunk_lease = lease.clone();
+                let chunk = assert_observes_unlocked(&control, target, async move {
+                    chunk_runtime
+                        .append_semantic_chunk(&chunk_lease, 1, RunSemanticChannel::Text, "hello")
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+                .await?;
+                if chunk.replayed || chunk.run_event_sequence != 1 {
+                    return Err(format!("blocked chunk append drifted: {chunk:?}"));
+                }
+                // Finish with assistant text: lock_run, the joint and, on the channel
+                // Thread, the channel source all consume the one earlier observation.
+                let finish_runtime = runtime.clone();
+                let finish_lease = lease.clone();
+                let finished = assert_observes_unlocked(&control, target, async move {
                     finish_runtime
                         .finish_run(&finish_lease, 2, RunTerminal::Completed)
                         .await
                         .map_err(|error| error.to_string())
                 })
                 .await?;
-            if finished.replayed || finished.message_sequence != Some(1) {
-                return Err(format!("blocked finish drifted: {finished:?}"));
+                if finished.replayed || finished.message_sequence != Some(1) {
+                    return Err(format!("blocked finish drifted: {finished:?}"));
+                }
             }
 
-            // Begin on the existing Thread: the single observation precedes the
-            // per-thread advisory lock, the Thread row lock and the lease upsert.
-            let begin_directory = directory.clone();
-            let second = request(&deployment, "run-2");
-            assert_observes_unlocked(&control, &thread_id, None, async move {
-                begin_directory
-                    .begin_thread_run(second)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-            .await?;
+            // Begin on each existing Thread: the single observation precedes the per-thread
+            // advisory lock, the Thread row lock, the lease upsert and the channel lock.
+            for (tail, run, anchor, target) in [
+                (7, "run-d2", ThreadRunAnchor::DirectBot, direct),
+                (8, "run-c2", channel_anchor(), channel),
+            ] {
+                let begin_directory = directory.clone();
+                let begin = request(tail, run, anchor);
+                let target = Target {
+                    run_id: None,
+                    ..target
+                };
+                assert_observes_unlocked(&control, target, async move {
+                    begin_directory
+                        .begin_thread_run(begin)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+                .await?;
+            }
 
             let client = pool.get().await.map_err(|error| error.to_string())?;
             let rows = client
-                .query(
-                    "SELECT run_id,status FROM public.runs WHERE thread_id=$1 ORDER BY run_id",
-                    &[&thread_id],
-                )
+                .query("SELECT run_id,status FROM public.runs ORDER BY run_id", &[])
                 .await
                 .map_err(|error| error.to_string())?;
             let states = rows
@@ -313,13 +426,31 @@ async fn writers_observe_current_schema_before_their_first_row_lock() {
                     ))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let expected = vec![
-                ("run-1".to_owned(), "completed".to_owned()),
-                ("run-2".to_owned(), "running".to_owned()),
-            ];
+            let expected = [
+                ("run-c1", "completed"),
+                ("run-c2", "running"),
+                ("run-d1", "completed"),
+                ("run-d2", "running"),
+            ]
+            .map(|(run, status)| (run.to_owned(), status.to_owned()));
             if states != expected {
                 return Err(format!(
                     "unexpected Run states after blocked writers: {states:?}"
+                ));
+            }
+            let source: String = client
+                .query_one(
+                    "SELECT run_id FROM openbot_internal.channel_history_sources \
+                     WHERE channel_id=$1",
+                    &[&CHANNEL],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .try_get(0)
+                .map_err(|error| error.to_string())?;
+            if source != "run-c2" {
+                return Err(format!(
+                    "channel source did not follow the newest message: {source}"
                 ));
             }
             Ok(())
