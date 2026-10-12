@@ -47,7 +47,8 @@ where
                 .start()
                 .await
                 .map_err(|source| InfraError::query("建立类型化正文insert原事务", source))?;
-            crate::thread_history_writer::verify_current_in_transaction(&transaction).await?;
+            let schema =
+                crate::thread_history_writer::CurrentWriterSchema::observe(&transaction).await?;
             if R::TABLE_NAME != "threads" {
                 let thread_index = R::COLUMNS
                     .iter()
@@ -76,11 +77,9 @@ where
                 let actual: String = binding.try_get("thread_id").map_err(|source| {
                     crate::db::RowDecodeError::column("(typed_body_insert)", "thread_id", source)
                 })?;
-                crate::thread_history_writer::require_open(
-                    &transaction,
-                    &openbot_contracts::ids::ThreadId::new(actual),
-                )
-                .await?;
+                schema
+                    .require_open(&transaction, &openbot_contracts::ids::ThreadId::new(actual))
+                    .await?;
             }
             let inserted = transaction
                 .query_one(&sql, &params)

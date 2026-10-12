@@ -6,17 +6,20 @@ use openbot_contracts::ids::{BotId, ChannelId, ThreadId};
 use openbot_domain::audit::hash::Sha256Digest;
 use openbot_domain::thread::MessageId;
 use time::OffsetDateTime;
-use tokio_postgres::{Row, Transaction};
+use tokio_postgres::Row;
 
 pub(crate) const CHANNEL_ACTIVITY_TOPIC: &str = "openbot_channel_activity";
 const MAX_PREVIEW_CODE_POINTS: usize = 200;
 const MAX_NOTIFY_BYTES: usize = 7_000;
 
 pub(crate) async fn record_from_message(
-    transaction: &Transaction<'_>,
+    schema: &crate::thread_history_writer::CurrentWriterSchema<'_, '_>,
     message_id: &MessageId,
 ) -> Result<(), InfraError> {
-    crate::thread_history_writer::verify_current_in_transaction(transaction).await?;
+    // The caller observed the current schema on this original transaction before its
+    // first row lock; every statement here runs on that same transaction, and none of
+    // them repeats the catalog observation under the channel serial point.
+    let transaction = schema.transaction();
     // Resolve only the actual written message's physical anchor. No caller text,
     // timestamp, J or arbitrary newest Run can select the source.
     let anchor = transaction
@@ -66,7 +69,9 @@ pub(crate) async fn record_from_message(
         return Ok(());
     }
     let thread: String = decode(&source, "thread_id")?;
-    crate::thread_history_writer::require_open(transaction, &ThreadId::new(&thread)).await?;
+    schema
+        .require_open(transaction, &ThreadId::new(&thread))
+        .await?;
     let role: String = decode(&source, "role")?;
     let actor: Option<String> = decode(&source, "message_actor")?;
     let run_actor: String = decode(&source, "actor_id")?;
