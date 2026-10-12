@@ -48,6 +48,36 @@ const EXACT: &str = "  SOURCE_IDS_OWNED_MESSAGE\n成果 café 🦀\t  ";
 fn require(ok: bool, msg: &'static str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(msg.to_owned()) }
 }
+const TERMINAL_FINAL_GUARD: &str = "runs_history_terminal_final";
+// Each 0051 runs row guard and the trigger function its refusal context names.
+const RUN_GUARDS: [(&str, &str); 4] = [
+    ("runs_history_body_before", "guard_thread_history_body()"),
+    (
+        "runs_history_canonical_before",
+        "guard_thread_history_canonical_reverse()",
+    ),
+    (
+        "runs_history_source_final",
+        "require_thread_history_channel_final()",
+    ),
+    (
+        TERMINAL_FINAL_GUARD,
+        "require_thread_history_terminal_final()",
+    ),
+];
+type GuardRefusals = &'static [(&'static str, &'static str)];
+
+fn observed_refusal(error: &tokio_postgres::Error) -> String {
+    let Some(db) = error.as_db_error() else {
+        return error.to_string();
+    };
+    let guards: Vec<&str> = RUN_GUARDS
+        .iter()
+        .filter(|(_, function)| db.where_().is_some_and(|w| w.contains(function)))
+        .map(|(guard, _)| *guard)
+        .collect();
+    format!("{} {} {guards:?}", db.code().code(), db.message())
+}
 struct OwnedRoot(PathBuf);
 impl OwnedRoot {
     fn new() -> Result<Self, String> {
@@ -313,7 +343,7 @@ impl Fixture {
             .map_err(|_| "own fixture pool unavailable".to_owned())?
             .batch_execute(sql)
             .await
-            .map_err(|_| "own fixture mutation failed".to_owned())
+            .map_err(|e| format!("own fixture mutation failed: {e:?}"))
     }
     async fn facts(&self) -> Result<Value, String> {
         self.pool.get().await.map_err(|_| "own fact pool".to_owned())?.query_one(
@@ -361,6 +391,72 @@ impl Fixture {
         tx.commit()
             .await
             .map_err(|_| "own reader fixture COMMIT ACK".to_owned())
+    }
+    // Own-DB reader-input control for the source Run. The statement declares, in order, every
+    // exact 0051 runs-guard refusal (55000 thread_history_writer_*) it meets as ordinary DML;
+    // an empty declaration asserts the ordinary DML itself is accepted. Only each observed guard
+    // is disabled, before its statement queues any deferred event, and every guard is back to
+    // origin-enabled before the owned COMMIT.
+    async fn owned_run_dml(&self, sql: &str, refusals: GuardRefusals) -> Result<u64, String> {
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut disabled = 0;
+        let changed = loop {
+            tx.batch_execute("SAVEPOINT owned_run_probe")
+                .await
+                .map_err(|e| e.to_string())?;
+            match tx.execute(sql, &[]).await {
+                Ok(changed) if disabled == refusals.len() => break changed,
+                Ok(_) => {
+                    return Err(format!(
+                        "{sql}: declared refusal {:?} did not occur",
+                        refusals[disabled]
+                    ));
+                }
+                Err(error) => {
+                    let observed = observed_refusal(&error);
+                    let Some(&(guard, message)) = refusals.get(disabled) else {
+                        return Err(format!("{sql}: undeclared refusal {observed}"));
+                    };
+                    if observed != format!("55000 {message} {:?}", [guard]) {
+                        return Err(format!(
+                            "{sql}: expected {guard} {message}, observed {observed}"
+                        ));
+                    }
+                    tx.batch_execute(&format!(
+                        "ROLLBACK TO SAVEPOINT owned_run_probe; \
+                         ALTER TABLE public.runs DISABLE TRIGGER {guard}"
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    disabled += 1;
+                }
+            }
+        };
+        for (guard, _) in &refusals[..disabled] {
+            tx.batch_execute(&format!("ALTER TABLE public.runs ENABLE TRIGGER {guard}"))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let states: Vec<String> = tx
+            .query(
+                "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+                 WHERE tgrelid='public.runs'::regclass AND tgname=ANY($1) AND NOT tgisinternal",
+                &[&RUN_GUARDS.map(|(guard, _)| guard).to_vec()],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if states != ["O", "O", "O", "O"] {
+            return Err(format!("owned run guards were not restored: {states:?}"));
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(changed)
     }
 }
 fn lifetime() -> SessionLifetimePolicy {
@@ -618,9 +714,12 @@ async fn actual_request_scope_source_visibility_and_receipt_integrity_are_one_sn
                     Err(AppError::Unauthenticated) },
                 18..=20 => {
                     let status = ["completed", "failed", "reconciliation_required"][case-18];
-                    // Schema-valid reader inputs only; this does not accept a Run writer.
-                    f.sql(&format!("UPDATE public.runs SET status='{status}',terminal_event_seq=0,started_at=now(),finished_at=now(),error_code='owned_reader_fixture'"))
-                        .await?; Ok(saved.clone())
+                    // Reader inputs only; this does not accept a Run writer. 0051 refuses a terminal
+                    // Run without its matching terminal event, so the ordinary DML declares exactly
+                    // that refusal and only its guard is suppressed for this owned statement.
+                    require(f.owned_run_dml(&format!("UPDATE public.runs SET status='{status}',terminal_event_seq=0,started_at=now(),finished_at=now(),error_code='owned_reader_fixture'"),
+                        &[(TERMINAL_FINAL_GUARD, "thread_history_writer_binding_invalid")]).await? == 1, "own terminal reader Run status")?;
+                    Ok(saved.clone())
                 },
                 21 => { observation_auth = f.other_admin_auth().await?; Err(AppError::NotVisible) },
                 22 => { f.mutate("UPDATE openbot_internal.artifact_save_operations SET dataset_id='different-owned-dataset' WHERE artifact_id=$1", &saved.artifact_id).await?;
