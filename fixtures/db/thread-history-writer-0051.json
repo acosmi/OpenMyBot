@@ -9850,7 +9850,7 @@
         "proowner": 10,
         "prolang": 12,
         "procost": 1,
-        "prorows": 100.0,
+        "prorows": 100,
         "provariadic": 0,
         "prosupport": 3996,
         "prokind": "f",
