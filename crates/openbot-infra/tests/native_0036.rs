@@ -296,6 +296,82 @@ async fn run_writes_preserve_exact_ownership_and_prohibit_unknown_release_shortc
 
 #[tokio::test]
 #[ignore = "requires owned isolated PostgreSQL 17"]
+async fn runs_truncate_is_refused_by_the_occupancy_guard_before_0051_exists() {
+    fixture("occupancy36truncate", |p| async move {
+        let mut c = p.get().await.unwrap();
+        baseline::apply(&c).await.unwrap();
+        // From 0051 on, runs_history_no_truncate sorts first and refuses before occupancy, so
+        // runs_occupancy_no_truncate is only observable as the first refusal through 0050.
+        native::apply_through(&mut c, native::NATIVE_0050_VERSION)
+            .await
+            .unwrap();
+        let version: i32 = c
+            .query_one(
+                "SELECT max(version) FROM openbot_internal.schema_migrations",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(version, native::NATIVE_0050_VERSION);
+        let guards: Vec<(String, String)> = c
+            .query(
+                "SELECT tgname::text,tgenabled::text FROM pg_catalog.pg_trigger \
+                 WHERE tgrelid='public.runs'::regclass AND NOT tgisinternal \
+                   AND tgtype & 32 <> 0 ORDER BY tgname",
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        assert_eq!(
+            guards,
+            vec![("runs_occupancy_no_truncate".to_owned(), "O".to_owned())]
+        );
+        seed(&c, "unknown", "reconciliation_required", true).await;
+        let before = pairs(&c).await;
+        assert_eq!(before.len(), 1);
+        // The cascaded thread_run_occupancy guard raises the same constraint name. This owned,
+        // rolled-back observation hook sorts first on that table and raises a distinct error, so
+        // only the runs guard itself can produce the asserted refusal.
+        let error = c.batch_execute("BEGIN; CREATE FUNCTION public.observe_cascaded_occupancy_truncate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='cascaded occupancy truncate reached'; END $$; CREATE TRIGGER a_observe_cascaded_truncate BEFORE TRUNCATE ON public.thread_run_occupancy FOR EACH STATEMENT EXECUTE FUNCTION public.observe_cascaded_occupancy_truncate(); TRUNCATE public.runs CASCADE").await.unwrap_err();
+        c.batch_execute("ROLLBACK").await.unwrap();
+        let db = error.as_db_error().expect("server rejection");
+        assert_eq!(
+            (db.code(), db.constraint(), db.message()),
+            (
+                &tokio_postgres::error::SqlState::CHECK_VIOLATION,
+                Some("thread_run_occupancy_no_truncate"),
+                "occupancy truncate forbidden"
+            ),
+            "{error}"
+        );
+        assert_eq!(pairs(&c).await, before);
+        let runs: i64 = c
+            .query_one("SELECT count(*) FROM public.runs", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(runs, 1);
+        let hook: bool = c
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_proc \
+                 WHERE proname='observe_cascaded_occupancy_truncate')",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!hook);
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires owned isolated PostgreSQL 17"]
 async fn terminal_release_bulk_updates_and_public_repo_insert_are_atomic() {
     fixture("occupancy36terminal", |p| async move {
         let mut c=p.get().await.unwrap();
