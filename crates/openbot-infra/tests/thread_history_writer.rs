@@ -289,7 +289,14 @@ async fn w06_approval_component_remote_and_local_fixed_cleanup() {
         let actor=current_owned_auth(&p,"origin-a").await?;
         let pending=tokio::time::timeout(Duration::from_secs(5),async{loop{let r=remote.list_pending(&actor).await.map_err(|e|e.to_string())?;if !r.is_empty(){return Ok::<_,String>(r);}tokio::task::yield_now().await;}}).await.map_err(|_|"actual remote request did not commit".to_owned())??;
         remote.resolve(&actor,pending[0].request_id(),ProviderRemoteResumeStatus::Resolved,Some(json!({"owned":"answer"}))).await.map_err(|e|e.to_string())?;
-        tokio::time::timeout(Duration::from_secs(5),&mut waiter).await.map_err(|_|"actual remote waiter not closed".to_owned())?.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+        // The original SERIALIZABLE poll may be naturally refused by a concurrent answer
+        // (real 40001, or 55P03 from its NOWAIT admission lock); the product neither retries nor
+        // relabels it (items 3/10). Only one explicitly new public caller may then observe it.
+        match tokio::time::timeout(Duration::from_secs(5),&mut waiter).await.map_err(|_|"actual remote waiter not closed".to_owned())?.map_err(|e|e.to_string())? {
+            Ok(_)=>{}
+            Err(RemoteInterruptError::Unavailable)=>{tokio::time::timeout(Duration::from_secs(5),remote.persist_and_wait(&lease,&batch)).await.map_err(|_|"new public remote waiter not closed".to_owned())?.map_err(|e|e.to_string())?;}
+            Err(error)=>return Err(error.to_string()),
+        }
         // A resolver waiting on the actual Run must not hold the interrupt row.
         let gate=p.get().await.map_err(|e|e.to_string())?;
         let gate_pid:i32=gate.query_one("SELECT pg_backend_pid()",&[]).await.map_err(|e|e.to_string())?.get(0);

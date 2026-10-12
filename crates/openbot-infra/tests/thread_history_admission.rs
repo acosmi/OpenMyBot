@@ -758,7 +758,11 @@ async fn s10_concurrent_unique_and_base_waits_refresh_original_read_committed() 
             let mut c = p.get().await.map_err(|e| e.to_string())?;
             raw_thread(&c, "owned-base-commit").await?;
             raw_thread(&c, "owned-base-rollback").await?;
-            native::apply(&mut c).await.map_err(|e| e.to_string())?;
+            // Original 0050 storage wait semantics stay on explicit 50 (0051 writer guards
+            // would lazily register H before this legacy anchor change and refuse it).
+            native::apply_through(&mut c, 50)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         wait_round(&p, "owned-unique-commit", false, true).await?;
         wait_round(&p, "owned-unique-rollback", false, false).await?;

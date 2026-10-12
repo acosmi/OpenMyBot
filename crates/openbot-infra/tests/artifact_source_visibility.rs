@@ -235,6 +235,13 @@ impl Fixture {
         tx.commit().await.map_err(|e| e.to_string())
     }
 
+    async fn tamper_channel_run_source(&self, sql: &str) -> Result<(), String> {
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tamper_owned_channel_run_source(&tx, sql).await?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     fn runtime(&self) -> Result<PostgresRunRuntime, String> {
         PostgresRunRuntime::new(
             self.pool.clone(),
@@ -688,6 +695,70 @@ async fn tamper_owned_thread_identity(
     Ok(())
 }
 
+// A channel source pins its canonical Run's Bot (0051 item 10/11): ordinary Run.bot DML is
+// refused immediately. Only in this owned disposable DB, after proving that refusal, the
+// exact reverse and source-final Run guards are suppressed for the change and restored.
+async fn tamper_owned_channel_run_source(
+    tx: &tokio_postgres::Transaction<'_>,
+    sql: &str,
+) -> Result<(), String> {
+    const GUARDS: [&str; 2] = ["runs_history_canonical_before", "runs_history_source_final"];
+    for guard in GUARDS {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.runs'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned registered Run guard {guard} was not normally enabled"
+            ));
+        }
+    }
+    tx.batch_execute("SAVEPOINT owned_channel_run_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let ordinary = tx.execute(sql, &[]).await;
+    tx.batch_execute(
+        "ROLLBACK TO SAVEPOINT owned_channel_run_probe; RELEASE SAVEPOINT owned_channel_run_probe",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && e.message() == "thread_history_writer_source_mutation_refused"
+        })
+    {
+        return Err("ordinary channel source Run.bot DML was not explicitly refused".into());
+    }
+    for guard in GUARDS {
+        tx.batch_execute(&format!("ALTER TABLE public.runs DISABLE TRIGGER {guard}"))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    // The still-enabled deferred Run guards (e.g. terminal final) check this change at
+    // statement end instead of queuing an event that would block re-enabling the guards.
+    tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")
+        .await
+        .map_err(|e| e.to_string())?;
+    let changed = tx.execute(sql, &[]).await.map_err(|e| e.to_string())?;
+    for guard in GUARDS {
+        tx.batch_execute(&format!("ALTER TABLE public.runs ENABLE TRIGGER {guard}"))
+            .await
+            .map_err(|e| e.to_string())?;
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.runs'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned Run guard {guard} was not restored before product entry"
+            ));
+        }
+    }
+    if changed == 0 {
+        return Err("owned channel Run control changed no row".into());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires an owned disposable PostgreSQL through OPENBOT_TEST_DATABASE_URL"]
 async fn source_direct_current_role_deny_membership_profile_package_and_thread_are_rechecked() {
@@ -756,9 +827,18 @@ async fn source_channel_current_membership_bot_link_and_both_packages_are_rechec
             ("UPDATE public.runs SET bot_id='bot-b'",
              "UPDATE public.runs SET bot_id='bot-a'", "source selected Bot has no channel link"),
         ] {
-            fixture.sql(change).await?;
+            let pinned_run_source = change == "UPDATE public.runs SET bot_id='bot-b'";
+            if pinned_run_source {
+                fixture.tamper_channel_run_source(change).await?;
+            } else {
+                fixture.sql(change).await?;
+            }
             fixture.expect_current_invisible(reason).await?;
-            fixture.sql(restore).await?;
+            if pinned_run_source {
+                fixture.tamper_channel_run_source(restore).await?;
+            } else {
+                fixture.sql(restore).await?;
+            }
             fixture.observe().await?;
         }
         fixture.sql("UPDATE public.channels SET package_id='00000000-0000-4000-8000-000000000041';
