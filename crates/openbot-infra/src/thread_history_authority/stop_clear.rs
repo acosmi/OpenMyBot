@@ -30,6 +30,9 @@ use crate::thread_history_writer::{CurrentWriterSchema, OpenOrClosed};
 pub enum ThreadHistoryStopClearError {
     #[error("thread_history_stop_clear_invalid_input")]
     InvalidInput { field: &'static str },
+    /// The original Host or its attachment is not current. This can also follow an acknowledged
+    /// COMMIT: a Host failure after a known COMMIT does not undo the stored intent, and the
+    /// caller may re-issue the same request id from a current Host to obtain the exact replay.
     #[error("thread_history_stop_clear_host_refused")]
     Host(HostRequestBindingError),
     #[error("thread_history_stop_clear_not_visible")]
@@ -38,6 +41,10 @@ pub enum ThreadHistoryStopClearError {
     /// Nothing was written and the real original ROLLBACK ACK was observed.
     #[error("thread_history_stop_clear_conflict")]
     Conflict,
+    /// A pool, statement or lock was unavailable, or the shared deadline ran out inside a
+    /// statement: a refused NOWAIT lock, a deadlock detected by PostgreSQL and any other database
+    /// error alike. Nothing is retried here, and none of them is ever closed or `Conflict`. See
+    /// the concurrency note on `close_for_stop_clear_before`.
     #[error("thread_history_stop_clear_unavailable")]
     Unavailable,
     #[error("thread_history_stop_clear_corrupt")]
@@ -178,6 +185,17 @@ impl PostgresThreadHistoryAuthority {
     /// still reported as that failure; it never becomes Unknown and never undoes the stored
     /// intent. This is ACK1 only: in-flight Runs are not cancelled or drained.
     ///
+    /// # Concurrency
+    /// The schema observation precedes every row lock and may wait on a relation lock of the
+    /// migration ledger. After it, apart from the actor row that the existing observer also waits
+    /// on, only the lazy head insert and the intent insert can wait on a unique key, and a fresh
+    /// current statement follows each wait. The exclusive head lock and every positive row lock
+    /// are NOWAIT. One bounded corner case can deadlock: a Thread that predates the head table has
+    /// no head row yet, so the producer holds the Thread row `SHARE` while its lazy head insert
+    /// waits for a writer's uncommitted head insert, and that writer may then need the Thread row
+    /// exclusively. PostgreSQL's deadlock detection ends one side; on the producer's side it
+    /// surfaces as `Unavailable` with the whole transaction rolled back, and nothing is retried.
+    ///
     /// # Errors
     /// Refuses a malformed Thread or request id, a foreign or no longer current Host, an actor
     /// that is not the current creator with live access, a Thread already closed by another
@@ -287,7 +305,8 @@ impl PostgresThreadHistoryAuthority {
                 .map_err(owner_error)?;
         }
         // The Host may close while the original ACK is in flight; recheck the same witness. After
-        // a known COMMIT only the exhausted deadline is left, and it keeps the stored fact.
+        // a known COMMIT a Host failure is reported as that failure and an exhausted deadline as
+        // CommitAcknowledgedAfterDeadline; neither undoes the stored fact.
         verify_after_ack(&current, &snapshot, auth, deadline).map_err(|error| {
             if committed && error == Error::Unavailable {
                 Error::CommitAcknowledgedAfterDeadline

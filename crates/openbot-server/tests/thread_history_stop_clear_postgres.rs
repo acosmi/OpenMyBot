@@ -595,13 +595,7 @@ impl Fixture {
         request: &str,
         original: Instant,
     ) -> tokio::task::JoinHandle<Close> {
-        let authority = Arc::clone(&self.authority);
-        let (auth, j, request) = (auth.clone(), j.to_owned(), request.to_owned());
-        tokio::spawn(async move {
-            authority
-                .close_for_stop_clear_before(&auth, &j, &request, original)
-                .await
-        })
+        spawn_close_with(&self.authority, auth, j, request, original)
     }
     async fn phase(&self, j: &str) -> Result<Option<String>> {
         let c = self.pool.get().await.map_err(text)?;
@@ -697,6 +691,93 @@ impl Fixture {
         drop(self.registry);
         drop(self.resolver);
         close_pool(self.pool).await
+    }
+}
+/// One producer call of this authority as its own task.
+fn spawn_close_with(
+    authority: &Arc<PostgresThreadHistoryAuthority>,
+    auth: &AuthContext,
+    j: &str,
+    request: &str,
+    original: Instant,
+) -> tokio::task::JoinHandle<Close> {
+    let authority = Arc::clone(authority);
+    let (auth, j, request) = (auth.clone(), j.to_owned(), request.to_owned());
+    tokio::spawn(async move {
+        authority
+            .close_for_stop_clear_before(&auth, &j, &request, original)
+            .await
+    })
+}
+/// A genuine further producer stack on the same Pool and registry: a new authority and a new
+/// Session resolver with its own request-binding issuer. Closing one stack never touches another.
+struct FreshHost {
+    authority: Arc<PostgresThreadHistoryAuthority>,
+    resolver: PostgresSessionAuthResolver,
+}
+impl FreshHost {
+    fn new(f: &Fixture) -> Result<Self> {
+        let authority = Arc::new(
+            PostgresThreadHistoryAuthority::new(
+                f.pool.clone(),
+                DeploymentId::new(DEP),
+                TenantId::new(TENANT),
+            )
+            .map_err(text)?,
+        );
+        authority
+            .enroll_original_registry(&f.registry)
+            .map_err(text)?;
+        let resolver = PostgresSessionAuthResolver::new(
+            f.pool.clone(),
+            SESSION_KEY,
+            openbot_infra::auth::config::default_session_lifetime(),
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+        )
+        .map_err(text)?;
+        resolver
+            .install_thread_history_authority(&authority)
+            .map_err(text)?;
+        Ok(Self {
+            authority,
+            resolver,
+        })
+    }
+    async fn auth(&self, actor: &str, index: u8) -> Result<AuthContext> {
+        self.resolver
+            .resolve(
+                &http::Request::builder()
+                    .uri("/owned-stop-new-producer")
+                    .header(
+                        "cookie",
+                        format!("openbot_session=owned-stop-cookie-{actor}-{index:02}"),
+                    )
+                    .body(())
+                    .map_err(text)?
+                    .into_parts()
+                    .0,
+            )
+            .await
+            .map_err(text)
+    }
+    async fn close(&self, auth: &AuthContext, j: &str, request: &str) -> Close {
+        self.authority
+            .close_for_stop_clear_before(auth, j, request, deadline())
+            .await
+    }
+    fn spawn_close(
+        &self,
+        auth: &AuthContext,
+        j: &str,
+        request: &str,
+        original: Instant,
+    ) -> tokio::task::JoinHandle<Close> {
+        spawn_close_with(&self.authority, auth, j, request, original)
+    }
+    /// Close this stack's request bindings and release its Pool handles.
+    fn retire(self) {
+        self.resolver.close_request_bindings();
     }
 }
 async fn close_pool(p: pool::DatabasePool) -> Result {
@@ -1628,7 +1709,7 @@ async fn thread_history_stop_clear_waits_recheck_and_writer_h_share_refuses_nowa
                 && last.contains("thread_history_heads_closed_intent_fkey")
                 && last.contains("thread_history_clear_intents_require_closed_head")
                 && last.ends_with("IMMEDIATE"),
-            "the producer's last statement before COMMIT is not the pair settlement",
+            "the pair is not settled by an ordinary statement before COMMIT",
         )?;
         check(
             f.phase(&jx).await?.as_deref() == Some("open") && f.intents(&jx).await? == 0,
@@ -1923,7 +2004,7 @@ async fn thread_history_stop_clear_real_session_withdrawal_and_closed_host_refus
         let old = f.auth(A, 1).await?;
         let (_, j) = f.settled(&old, 701).await?;
         let untouched = f.hq().await?;
-        // The original Session is withdrawn while the producer waits for the actor row.
+        // Leg 1: the original Session is withdrawn while the producer waits for the actor row.
         {
             let mut writer = f.pool.get().await.map_err(text)?;
             let blocker = backend_pid(&writer).await?;
@@ -1946,72 +2027,66 @@ async fn thread_history_stop_clear_real_session_withdrawal_and_closed_host_refus
             untouched == f.hq().await?,
             "a withdrawn Session left H or Q behind",
         )?;
-        // A new request on the second real Session; its COMMIT ACK is withheld while the real Host closes.
+        // Leg 2: the real Host closes while the producer's transaction is still open. The
+        // producer is paused at the real SET CONSTRAINTS acknowledgement, so the intent, the
+        // closed head and the settled pair exist only in its uncommitted transaction. It must
+        // refuse and roll back. Its ROLLBACK acknowledgement is withheld in turn: the server has
+        // already undone every write while the result still waits for the real acknowledgement.
         let next = f.auth(A, 2).await?;
+        let mut settled = proxy.hold(SETTLED)?;
+        let attempt = f.spawn_close(&next, &j, &request_id(), deadline());
+        settled.wait().await?;
+        let mut rollback = proxy.hold(ROLLBACK)?;
+        f.resolver.close_request_bindings();
+        settled.release()?;
+        rollback.wait().await?;
+        check(
+            !attempt.is_finished(),
+            "a result escaped before the real original ROLLBACK ACK",
+        )?;
+        check(
+            untouched == f.hq().await?,
+            "a write survived although the Host closed before COMMIT",
+        )?;
+        rollback.release()?;
+        host_refused(&attempt.await.map_err(text)?)?;
+        check(
+            untouched == f.hq().await?
+                && f.phase(&j).await?.as_deref() == Some("open")
+                && f.intents(&j).await? == 0,
+            "a Host closed before COMMIT left H or Q behind",
+        )?;
+        host_refused(&f.close(&next, &j, &request_id()).await)?;
+        // Leg 3: a genuine new producer is not poisoned by the closed old owner and still closes
+        // the same Thread. Its COMMIT ACK is withheld while its own Host closes: a Host failure
+        // after a known COMMIT is that failure, never Unknown, and keeps the stored fact.
+        let second = FreshHost::new(&f)?;
+        let after = second.auth(A, 2).await?;
         let request = request_id();
         let mut hold = proxy.hold(COMMIT)?;
-        let task = f.spawn_close(&next, &j, &request, deadline());
+        let task = second.spawn_close(&after, &j, &request, deadline());
         hold.wait().await?;
-        f.resolver.close_request_bindings();
+        second.resolver.close_request_bindings();
         check(
             !task.is_finished(),
-            "the old owner escaped before the original COMMIT ACK",
+            "the owner escaped before the original COMMIT ACK",
         )?;
         hold.release()?;
         host_refused(&task.await.map_err(text)?)?;
-        // A Host failure after a known COMMIT is that failure, never Unknown, and keeps the fact.
         check(
             f.phase(&j).await?.as_deref() == Some("closed") && f.intents(&j).await? == 1,
             "a post-commit Host failure undid the committed intent",
         )?;
         let operation = f.operation_of(&j).await?;
-        host_refused(&f.close(&next, &j, &request).await)?;
-        // A genuine new producer is not poisoned by the closed old owner and replays the fact.
-        let fresh_authority = Arc::new(
-            PostgresThreadHistoryAuthority::new(
-                f.pool.clone(),
-                DeploymentId::new(DEP),
-                TenantId::new(TENANT),
-            )
-            .map_err(text)?,
-        );
-        fresh_authority
-            .enroll_original_registry(&f.registry)
-            .map_err(text)?;
-        let fresh_resolver = PostgresSessionAuthResolver::new(
-            f.pool.clone(),
-            SESSION_KEY,
-            openbot_infra::auth::config::default_session_lifetime(),
-            DeploymentId::new(DEP),
-            TenantId::new(TENANT),
-        )
-        .map_err(text)?;
-        fresh_resolver
-            .install_thread_history_authority(&fresh_authority)
-            .map_err(text)?;
-        let fresh = fresh_resolver
-            .resolve(
-                &http::Request::builder()
-                    .uri("/owned-stop-new-producer")
-                    .header(
-                        "cookie",
-                        format!("openbot_session=owned-stop-cookie-{A}-02"),
-                    )
-                    .body(())
-                    .map_err(text)?
-                    .into_parts()
-                    .0,
-            )
-            .await
-            .map_err(text)?;
-        let replay = fresh_authority
-            .close_for_stop_clear_before(&fresh, &j, &request, deadline())
-            .await;
+        host_refused(&second.close(&after, &j, &request).await)?;
+        second.retire();
+        // Leg 4: yet another genuine producer replays the stored fact.
+        let third = FreshHost::new(&f)?;
+        let current = third.auth(A, 2).await?;
+        let replay = third.close(&current, &j, &request).await;
         replayed(&replay, &j, &request, &operation)?;
-        fresh_resolver.close_request_bindings();
-        drop(fresh);
-        drop(fresh_resolver);
-        drop(fresh_authority);
+        drop(current);
+        third.retire();
         f.finish().await?;
         proxy.finish().await
     })
