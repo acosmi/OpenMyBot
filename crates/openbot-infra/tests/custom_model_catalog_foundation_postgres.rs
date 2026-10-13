@@ -258,7 +258,7 @@ async fn registered_legacy_identity(p: &pool::DatabasePool) -> TestResult {
 async fn assert_current(p: &pool::DatabasePool) -> TestResult {
     let mut c = p.get().await.map_err(|e| e.to_string())?;
     let expected: schema_facts::SchemaFacts =
-        serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json"))
+        serde_json::from_str(include_str!("../../../fixtures/db/schema-0052.json"))
             .map_err(|e| e.to_string())?;
     let actual_public = schema_facts::fetch(&c).await.map_err(|e| e.to_string())?;
     require(

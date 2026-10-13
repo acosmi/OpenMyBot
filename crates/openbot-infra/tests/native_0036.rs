@@ -130,7 +130,7 @@ async fn upgrade_backfills_every_state_at_0036_and_latest_fresh_matches_register
         assert_eq!(fresh::apply(&mut c).await.unwrap(),fresh::FreshApplyOutcome::Applied(native::ApplyOutcome::Applied));
         c.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; DROP EVENT TRIGGER require_fresh_rc; DROP FUNCTION public.require_fresh_rc(); COMMIT").await.unwrap();
         let actual=schema_facts::fetch(&c).await.unwrap();
-        let expected=serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json")).unwrap();
+        let expected=serde_json::from_str(include_str!("../../../fixtures/db/schema-0052.json")).unwrap();
         assert_eq!(actual,expected);
         assert_eq!(fresh::apply(&mut c).await.unwrap(),fresh::FreshApplyOutcome::AlreadyInitialized);
         assert!(pairs(&c).await.is_empty());

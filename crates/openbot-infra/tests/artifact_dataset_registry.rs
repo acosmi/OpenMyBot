@@ -65,7 +65,7 @@ async fn fresh_current_native_preserves_exact_0041_registry_and_public_0040() {
             // 0041 is internal-only; PUBLIC has since moved past 0040, so fresh current must
             // equal the current PUBLIC oracle while the 0041 registry stays exact below.
             let expected: schema_facts::SchemaFacts =
-                serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json"))
+                serde_json::from_str(include_str!("../../../fixtures/db/schema-0052.json"))
                     .unwrap();
             assert_eq!(facts, expected);
             assert_eq!(
@@ -122,7 +122,7 @@ async fn actual_0040_upgrades_once_without_rewriting_older_ledger_or_public_sche
             assert_eq!(ledger_after, ledger_before);
             // The current migration adds its registered table and model connection trigger.
             let current: schema_facts::SchemaFacts =
-                serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json"))
+                serde_json::from_str(include_str!("../../../fixtures/db/schema-0052.json"))
                     .unwrap();
             assert_eq!(schema_facts::fetch(&c).await.map_err(|e| e.to_string())?, current);
             assert_eq!(native::apply(&mut c).await.map_err(|e| e.to_string())?, native::ApplyOutcome::AlreadyApplied);

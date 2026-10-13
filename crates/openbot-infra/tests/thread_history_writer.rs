@@ -1,4 +1,4 @@
-//! Native0051 body writers and canonical channel sources on owned PostgreSQL17.11.
+//! Native0051 body writers on current0052, with explicit historical0051 PostgreSQL17.11 checks.
 //! Internal metadata and permanent IDs; this suite grants no current Host or ACK.
 #![cfg(feature = "server-runtime")]
 mod harness;
@@ -85,7 +85,9 @@ include!("support/thread_history_writer_schema_fixture.rs");
 #[tokio::test]
 #[ignore = "requires explicitly owned loopback SCRAM PostgreSQL17.11"]
 async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
-    for prior in [50, 51] {
+    // The delivered function identity is retained; this candidate runs its compatibility
+    // assertions on current52 and explicitly proves the unchanged historical51 branch first.
+    for prior in [50, 51, 52] {
         owned(&format!("writer51graph{prior}"),move|p,_|async move {
             initialize(&p,prior).await?;
             let mut c=p.get().await.map_err(|e|e.to_string())?;
@@ -93,7 +95,10 @@ async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
                 let pure=admission_schema::capture(&c).await.map_err(|e|e.to_string())?;
                 let old:Value=serde_json::from_str(include_str!("../../../fixtures/db/thread-history-admission-0050.json")).map_err(|e|e.to_string())?;
                 require(pure["schema"]["relations"]==old["schema"]["relations"],"explicit0050 relations altered before upgrade")?;
-                require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"real50 to51 upgrade was not applied")?;
+            }
+            if prior==51 { writer_check_legacy51(&mut c).await?; }
+            if prior<52 {
+                require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"real historical to52 upgrade was not applied")?;
             }
             writer_check(&c).await?;
             let rows:i64=c.query_one("SELECT count(*) FROM openbot_internal.channel_history_sources",&[]).await.map_err(|e|e.to_string())?.get(0);
@@ -733,7 +738,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
 #[tokio::test]
 #[ignore = "requires explicitly owned loopback SCRAM PostgreSQL17.11"]
 async fn w12_current51_explicit50_and_original_host_id_regression() {
-    for version in [47, 48, 49, 50, 51] {
+    for version in [47, 48, 49, 50, 51, 52] {
         owned(&format!("writer51boundary{version}"),move|p,_|async move{
             initialize(&p,version).await?;
             let mut c=p.get().await.map_err(|e|e.to_string())?;
@@ -743,9 +748,10 @@ async fn w12_current51_explicit50_and_original_host_id_regression() {
                 let historical50=admission_schema::capture(&c).await.map_err(|e|e.to_string())?;
                 let expected50:Value=serde_json::from_str(include_str!("../../../fixtures/db/thread-history-admission-0050.json")).map_err(|e|e.to_string())?;
                 require(historical50["schema"]["functions"]==expected50["schema"]["functions"],"explicit0050 original seven user and four RI function facts differ")?;
-                require(admission_schema::verify(&c).await.is_err(),"explicit0050 current consumer bypassed new whole0051")?;
+                require(admission_schema::verify(&c).await.is_err(),"explicit0050 current consumer bypassed new whole0052")?;
             }
-            if version<51 {native::apply(&mut c).await.map_err(|e|e.to_string())?;}
+            if version==51 { writer_check_legacy51(&mut c).await?; }
+            if version<52 {native::apply(&mut c).await.map_err(|e|e.to_string())?;}
             writer_check(&c).await?;
             raw_thread(&c,"writer-original-permanent-id").await?;
             close_writer_head(&c,"writer-original-permanent-id").await?;
@@ -753,7 +759,7 @@ async fn w12_current51_explicit50_and_original_host_id_regression() {
             writer_refusal(&c,"UPDATE public.threads SET title='must not write closed body' WHERE thread_id='writer-original-permanent-id'","thread_history_writer_closed").await?;
             c.execute("UPDATE public.threads SET status='deleted',deleted_at=clock_timestamp(),updated_at=clock_timestamp() WHERE thread_id='writer-original-permanent-id'",&[]).await.map_err(|e|e.to_string())?;
             c.execute("DELETE FROM public.threads WHERE thread_id='writer-original-permanent-id'",&[]).await.map_err(|e|e.to_string())?;
-            require(head(&c,"writer-original-permanent-id").await?==h,"current51 changed original permanent closed H/ID")?;
+            require(head(&c,"writer-original-permanent-id").await?==h,"current52 changed original permanent closed H/ID")?;
             require(c.execute(THREAD_INSERT,&[&"writer-original-permanent-id",&"origin-bot"]).await.is_err_and(|e|e.code().is_some_and(|s|s.code()=="55000")),"closed/deleted exact ID reused")?;
             // H/Q contains no current Host/window/session/lease permission. The
             // original current-authority regression functions remain selected separately.

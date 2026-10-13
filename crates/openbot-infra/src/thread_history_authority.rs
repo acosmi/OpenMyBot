@@ -16,6 +16,7 @@ use openbot_contracts::request_binding::{
     ThreadHistorySessionFacts,
 };
 use openbot_domain::identity::roles::resolve_effective_role;
+use openbot_domain::vault::SecretBytes;
 use time::OffsetDateTime;
 use tokio_postgres::types::{FromSqlOwned, ToSql};
 use tokio_postgres::{Row, Transaction};
@@ -28,6 +29,8 @@ use crate::db::pool::{DatabasePool, GuardedTransaction, TransactionOwnerError};
 use crate::db::{InfraError, native, thread_origin_schema};
 use crate::thread_origin;
 
+mod clear;
+pub use clear::{ThreadHistoryClearProgress, ThreadHistoryClearSource};
 mod stop_clear;
 pub use stop_clear::{
     ThreadHistoryStopClearConfirmation, ThreadHistoryStopClearError, ThreadHistoryStopClearIntent,
@@ -103,6 +106,7 @@ pub struct PostgresThreadHistoryAuthority {
     authority: Arc<()>,
     issuer: OnceLock<RequestBindingIssuer>,
     registry: OnceLock<Result<OriginalRegistry, HostRequestBindingError>>,
+    clear_audit_checkpoint_key: OnceLock<SecretBytes>,
 }
 impl core::fmt::Debug for PostgresThreadHistoryAuthority {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -134,8 +138,36 @@ impl PostgresThreadHistoryAuthority {
             authority: Arc::new(()),
             issuer: OnceLock::new(),
             registry: OnceLock::new(),
+            clear_audit_checkpoint_key: OnceLock::new(),
         })
     }
+    /// Enrol the actual nonempty audit checkpoint key once from trusted startup configuration.
+    /// This creates no user, Host attachment or grant. Original observation and ACK1 need no key;
+    /// the internal clear producer refuses until its audit input is enrolled.
+    ///
+    /// # Errors
+    /// Refuses a closed pool, an empty key or a second initialization.
+    pub fn enroll_clear_audit_checkpoint_key(&self, key: SecretBytes) -> Result<(), InfraError> {
+        if self.pool.is_closed() || key.is_empty() {
+            return Err(InfraError::repository_invariant(
+                "thread_history_clear_audit_key_unavailable",
+            ));
+        }
+        self.clear_audit_checkpoint_key.set(key).map_err(|_| {
+            InfraError::repository_invariant("thread_history_clear_audit_key_already_initialized")
+        })
+    }
+
+    fn clear_checkpoint_key(&self) -> Result<&[u8], ThreadHistoryStopClearError> {
+        if self.pool.is_closed() {
+            return Err(ThreadHistoryStopClearError::Unavailable);
+        }
+        self.clear_audit_checkpoint_key
+            .get()
+            .map(SecretBytes::expose)
+            .ok_or(ThreadHistoryStopClearError::Unavailable)
+    }
+
     /// The actual immutable manager and namespace match; this bool supplies no grant.
     #[must_use]
     pub fn matches_pool_scope(

@@ -11,6 +11,9 @@ WITH visible_run AS (
   LEFT JOIN public.deployment_packages bp ON bp.id=b.package_id
   WHERE r.thread_id=$1 AND r.run_id=$2 AND r.actor_id=$3
     AND t.deployment_id=$4 AND t.tenant_id=$5 AND t.status<>'deleted'
+    AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions hc
+                   WHERE hc.thread_id=t.thread_id AND hc.deployment_id=t.deployment_id
+                     AND hc.tenant_id=t.tenant_id)
     AND coalesce(u.auth_generation,0)=$6
     AND EXISTS(SELECT 1 FROM public.user_roles ur
                WHERE ur.user_id=u.id AND ur.role IN ('user','admin'))

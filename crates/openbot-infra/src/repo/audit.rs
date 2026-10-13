@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::db::InfraError;
 use crate::db::tables::{audit_checkpoints, audit_events};
 
-const AUDIT_CHAIN_LOCK_KEY: i64 = 0x4f50_454e_4155_4431; // ASCII `OPENAUD1`
+pub(crate) const AUDIT_CHAIN_LOCK_KEY: i64 = 0x4f50_454e_4155_4431; // ASCII `OPENAUD1`
 
 /// audit event 与 checkpoint 的唯一写入面。
 #[derive(Clone)]
