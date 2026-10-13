@@ -427,6 +427,34 @@ impl FixtureAgents {
             callback_sequence: Arc::new(AtomicU64::new(1)),
         }
     }
+
+    // Reference data for the explicit Synthetic Unknown-facts fixture only.
+    // No endpoint, credentials, callback token, model or execution is installed.
+    fn with_channel_unknown_facts(self, enabled: bool) -> Result<Self, PortError> {
+        if enabled {
+            self.rows
+                .lock()
+                .map_err(|_| PortError::Unavailable {
+                    dependency: "fixture_agents",
+                })?
+                .push(AgentProfile {
+                    id: BotId::new("bot-0"),
+                    name: "Synthetic Channel Fixture".to_owned(),
+                    title: "Synthetic history profile".to_owned(),
+                    role_description: "Read-only synthetic profile referenced by the registered channel Unknown-facts history.".to_owned(),
+                    avatar_seed: "fixture-channel-unknown-facts".to_owned(),
+                    visibility: AgentVisibility::Public,
+                    endpoint: None,
+                    has_auth: false,
+                    has_callback_token: false,
+                    hidden: false,
+                    system_owned: true,
+                    can_manage: false,
+                    mine: false,
+                });
+        }
+        Ok(self)
+    }
 }
 
 #[async_trait]
@@ -4132,7 +4160,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sandboxed = FixtureSandboxed::new(now);
     let routing = FixtureRouting::new();
     let routing_probe = routing.probe();
-    let agents = Arc::new(FixtureAgents::new());
+    let agents =
+        Arc::new(FixtureAgents::new().with_channel_unknown_facts(channel_unknown_facts_fixture)?);
     let plugins = fixture_plugins::PluginsFixture::new(connections);
     let plugins = match home_skills_context.as_ref() {
         Some(context) => plugins.with_home_skills(context),
@@ -4384,6 +4413,131 @@ mod approval_pg_tests {
             // None leaves every existing assembly mode under its original startup validation.
             assert!(validate_home_skills_fixture_mode(false, approval, auth, journey).is_ok());
         }
+    }
+
+    #[test]
+    fn channel_unknown_facts_fixture_requires_exact_opt_in_and_memory_fixed_mode() {
+        use std::ffi::OsStr;
+
+        assert!(!channel_unknown_facts_fixture_enabled(None).unwrap());
+        assert!(channel_unknown_facts_fixture_enabled(Some(OsStr::new("1"))).unwrap());
+        for value in ["", "0", "true", " 1", "1\n", "private-value-canary"] {
+            let error = channel_unknown_facts_fixture_enabled(Some(OsStr::new(value))).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "OPENBOT_UI_CHANNEL_UNKNOWN_FACTS_FIXTURE must be exactly 1 when present"
+            );
+        }
+        assert!(
+            validate_channel_unknown_facts_fixture_mode(true, "memory", "fixed", false).is_ok()
+        );
+        for (approval, auth, journey) in [
+            ("postgres", "fixed", false),
+            ("memory", "session", false),
+            ("memory", "fixed", true),
+        ] {
+            assert!(
+                validate_channel_unknown_facts_fixture_mode(true, approval, auth, journey).is_err()
+            );
+            assert!(
+                validate_channel_unknown_facts_fixture_mode(false, approval, auth, journey).is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_unknown_facts_fixture_agent_reference_is_opt_in_and_nonmanageable() {
+        let baseline = FixtureAgents::new().rows.lock().unwrap().clone();
+        assert_eq!(baseline.len(), 5);
+        let disabled = FixtureAgents::new()
+            .with_channel_unknown_facts(false)
+            .unwrap();
+        assert_eq!(*disabled.rows.lock().unwrap(), baseline);
+        let agents = FixtureAgents::new()
+            .with_channel_unknown_facts(true)
+            .unwrap();
+        let scope = AgentReadScope {
+            tenant: TenantId::new(FIXTURE_TENANT),
+            actor: ActorId::new(FIXTURE_ACTOR),
+            admin: false,
+        };
+        let id = BotId::new("bot-0");
+        assert!(
+            disabled
+                .get_visible_agent(&scope, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let all = agents.rows.lock().unwrap().clone();
+        assert_eq!(all.len(), 6);
+        assert_eq!(&all[..5], baseline.as_slice());
+        assert_eq!(all.iter().filter(|row| row.id == id).count(), 1);
+        let profile = agents
+            .get_visible_agent(&scope, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.visibility, AgentVisibility::Public);
+        assert!(profile.name.contains("Synthetic"));
+        assert!(profile.system_owned);
+        assert!(!profile.can_manage && !profile.mine && !profile.hidden);
+        assert!(profile.endpoint.is_none() && !profile.has_auth && !profile.has_callback_token);
+        assert!(
+            agents
+                .list_visible_agents(&scope, false)
+                .await
+                .unwrap()
+                .contains(&profile)
+        );
+
+        let channels = FixtureChannels::new(fixture_unknown_facts_time());
+        let channel = channels.rows.lock().unwrap()[0].clone();
+        assert_eq!(channel.id, ChannelId::new("channel-00"));
+        assert_eq!(channel.agent_ids, vec![id.clone()]);
+        assert_eq!(channel.last_message_agent_id, Some(id.clone()));
+        let threads = FixtureThreads::new(channels)
+            .with_channel_unknown_facts(true)
+            .unwrap();
+        let snapshots = threads.inner.snapshots.lock().unwrap();
+        let history = snapshots.get(FIXTURE_EXISTING_THREAD).unwrap();
+        let references: Vec<_> = history
+            .messages
+            .iter()
+            .filter(|message| message.id.starts_with("fixture-p3-tool-history-"))
+            .map(|message| message.agent_id.clone())
+            .collect();
+        assert_eq!(references, vec![Some(id.clone()); 3]);
+        drop(snapshots);
+
+        let auth = AuthContext::for_test(
+            DeploymentId::new(FIXTURE_DEPLOYMENT),
+            TenantId::new(FIXTURE_TENANT),
+            ActorId::new(FIXTURE_ACTOR),
+            [Role::User],
+            AuthGeneration::new(1),
+            false,
+        );
+        let administration = AgentAdministrationScope {
+            tenant: scope.tenant,
+            actor: scope.actor,
+            admin: false,
+            auth_generation: AuthGeneration::new(1),
+        };
+        assert_eq!(
+            agents.delete_agent(&administration, &id).await.unwrap_err(),
+            AgentAdministrationError::Protected
+        );
+        assert_eq!(
+            agents.issue(&auth, &id).await.unwrap_err(),
+            AgentCallbackTokenError::NotVisible
+        );
+        assert_eq!(
+            agents.revoke(&auth, &id).await.unwrap_err(),
+            AgentCallbackTokenError::NotVisible
+        );
+        assert_eq!(agents.rows.lock().unwrap().len(), 6);
     }
 
     #[tokio::test]
