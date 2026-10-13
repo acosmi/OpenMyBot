@@ -60,11 +60,12 @@ async fn fresh_current_native_preserves_exact_0041_registry_and_public_0040() {
         "artifact41fresh",
         |config| async move {
             let p = fresh_pool(&config).await?;
-            assert_eq!(native::NATIVE_LATEST_VERSION, 42);
             let mut c = p.get().await.map_err(|e| e.to_string())?;
             let facts = schema_facts::fetch(&c).await.map_err(|e| e.to_string())?;
+            // 0041 is internal-only; PUBLIC has since moved past 0040, so fresh current must
+            // equal the current PUBLIC oracle while the 0041 registry stays exact below.
             let expected: schema_facts::SchemaFacts =
-                serde_json::from_str(include_str!("../../../fixtures/db/schema-0040.json"))
+                serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json"))
                     .unwrap();
             assert_eq!(facts, expected);
             assert_eq!(
@@ -79,7 +80,7 @@ async fn fresh_current_native_preserves_exact_0041_registry_and_public_0040() {
                 .await
                 .map_err(|e| e.to_string())?
                 .get(0);
-            assert_eq!(latest, 42);
+            assert_eq!(latest, native::NATIVE_LATEST_VERSION);
             drop(c);
             assert_eq!(
                 capture_artifact_registry_schema(&p).await.unwrap(),
@@ -121,7 +122,7 @@ async fn actual_0040_upgrades_once_without_rewriting_older_ledger_or_public_sche
             assert_eq!(ledger_after, ledger_before);
             // The current migration adds its registered table and model connection trigger.
             let current: schema_facts::SchemaFacts =
-                serde_json::from_str(include_str!("../../../fixtures/db/schema-0050.json"))
+                serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json"))
                     .unwrap();
             assert_eq!(schema_facts::fetch(&c).await.map_err(|e| e.to_string())?, current);
             assert_eq!(native::apply(&mut c).await.map_err(|e| e.to_string())?, native::ApplyOutcome::AlreadyApplied);

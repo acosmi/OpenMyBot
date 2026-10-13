@@ -70,6 +70,11 @@ async fn provision(p: &openbot_infra::db::pool::DatabasePool, version: i32) {
           ('unbound','550e8400-e29b-41d4-a716-446655440000',1,'user','{"text":"source"}','source',NULL,'actor'),
           ('mismatched','550e8400-e29b-41d4-a716-446655440000',2,'user','{"text":"source"}','source','run-b','actor'),
           ('channel-message','550e8400-e29b-41d4-a716-446655440002',0,'user','{"text":"source"}','source',NULL,'actor');"#).await.unwrap();
+    if version == 37 {
+        // The fixture rows are inserted at the historical prefix; the consumers under test
+        // require the current native prefix, so upgrade once the rows exist.
+        native::apply(&mut c).await.unwrap();
+    }
 }
 
 fn request(thread: &str, message: &str, scope: MemoryScope) -> RememberMemoryRequest {

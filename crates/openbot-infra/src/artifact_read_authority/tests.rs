@@ -839,8 +839,39 @@ struct SharedPgReadPhases {
     io: AtomicUsize,
     joint: AtomicUsize,
     segments: AtomicUsize,
+    // R432 control-before observes through the same final statement path before any IO.
+    // The single-shot test gate is armed only by the actual after-IO trace, so it still
+    // selects the final joint rather than the earlier control query.
+    final_gate_after_io: std::sync::Mutex<
+        Option<(
+            std::sync::Weak<PostgresArtifactReadAuthority>,
+            FinalQueryGate,
+        )>,
+    >,
 }
+type FinalQueryGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 impl SharedPgReadPhases {
+    fn after_io(authority: &Arc<PostgresArtifactReadAuthority>, gate: FinalQueryGate) -> Arc<Self> {
+        let phases = Self::default();
+        *phases.final_gate_after_io.lock().unwrap() = Some((Arc::downgrade(authority), gate));
+        Arc::new(phases)
+    }
+    fn arm_final_gate(&self) {
+        let armed = self
+            .final_gate_after_io
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some((authority, gate)) = armed
+            && let Some(authority) = authority.upgrade()
+            && let Ok(mut slot) = authority.final_query_gate.lock()
+        {
+            *slot = Some(gate);
+        }
+    }
     fn counts(&self) -> (usize, usize, usize) {
         (
             self.io.load(Ordering::SeqCst),
@@ -888,6 +919,7 @@ impl tracing::Subscriber for SharedPgPhaseSubscriber {
         event.record(&mut visitor);
         if visitor.io {
             self.0.io.fetch_add(1, Ordering::SeqCst);
+            self.0.arm_final_gate();
         }
         if visitor.joint {
             self.0.joint.fetch_add(1, Ordering::SeqCst);
@@ -1091,15 +1123,11 @@ async fn shared_pg_final_leg(config: DatabaseConfig, leg: SharedPgFinalLeg) -> R
     let (held, probe, original_pid, original_observation) =
         shared_pg_original_probe(&f, controller_pid, observer_pid).await?;
     drop(probe); // With seven original leases held, only this exact connection can serve the read.
-    let phases = Arc::new(SharedPgReadPhases::default());
-    let dispatch = tracing::Dispatch::new(SharedPgPhaseSubscriber(phases.clone()));
     let (reached, reached_rx) = tokio::sync::oneshot::channel();
     let (proceed, proceed_rx) = tokio::sync::oneshot::channel();
-    *f.administration
-        .read_authority()
-        .final_query_gate
-        .lock()
-        .map_err(|_| "shared final gate poisoned")? = Some((reached, proceed_rx));
+    let phases =
+        SharedPgReadPhases::after_io(&f.administration.read_authority(), (reached, proceed_rx));
+    let dispatch = tracing::Dispatch::new(SharedPgPhaseSubscriber(phases.clone()));
     let administration = f.administration.clone();
     let auth = f.auth();
     let id = saved.artifact_id.clone();
@@ -2341,9 +2369,12 @@ async fn wait_final_lock(pool: &Pool, blocker: i32) -> Result<i32, String> {
     }).await.map_err(|_| "actual final statement Lock/PID was not observed".to_owned())?
 }
 
+// `after_io=false` gates the first statement, which for host-first source errors is the
+// R432 control-before itself; those reads have no body IO or later final joint.
 async fn start_after_io(
     f: &Fixture,
     id: &str,
+    after_io: bool,
 ) -> Result<
     (
         tokio::task::JoinHandle<Result<CurrentArtifactReadChunk, AppError>>,
@@ -2355,15 +2386,23 @@ async fn start_after_io(
     let (reached, acknowledged) = tokio::sync::oneshot::channel();
     let (proceed, release) = tokio::sync::oneshot::channel();
     let authority = f.administration.read_authority();
-    *authority
-        .final_query_gate
-        .lock()
-        .map_err(|_| "gate poisoned".to_owned())? = Some((reached, release));
+    let phases = if after_io {
+        SharedPgReadPhases::after_io(&authority, (reached, release))
+    } else {
+        *authority
+            .final_query_gate
+            .lock()
+            .map_err(|_| "gate poisoned".to_owned())? = Some((reached, release));
+        Arc::new(SharedPgReadPhases::default())
+    };
+    let dispatch = tracing::Dispatch::new(SharedPgPhaseSubscriber(phases));
     let administration = Arc::clone(&f.administration);
     let auth = f.auth();
     let id = id.to_owned();
-    let worker =
-        tokio::spawn(async move { administration.read_host_bound_chunk(&auth, &id).await });
+    let worker = tokio::spawn(
+        async move { administration.read_host_bound_chunk(&auth, &id).await }
+            .with_subscriber(dispatch),
+    );
     Ok((worker, acknowledged, proceed))
 }
 
@@ -2459,39 +2498,174 @@ async fn actual_owned_pg_current_read_and_sync_fd_tail() {
 
 // Privileged corruption control is confined to this owned disposable test DB.
 // Probe the real guard for every change/restore and re-enable it in the same transaction.
+
+// Finite privileged joint corruption in this disposable test DB. Ordinary
+// open direct-source metadata changes stay ordinary DML; missing actual Run or
+// referenced canonical mutations first prove their precise new55000 refusal.
+async fn tamper_owned_message_joint(
+    tx: &tokio_postgres::Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<(), String> {
+    const GUARDS: [&str; 3] = [
+        "messages_history_body_before",
+        "messages_history_canonical_before",
+        "messages_history_source_final",
+    ];
+    for guard in GUARDS {
+        let state:String=tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.messages'::regclass AND tgname=$1 AND NOT tgisinternal",&[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!("owned message guard {guard} was not enabled"));
+        }
+    }
+    tx.batch_execute("SAVEPOINT owned_message_joint_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let ordinary = tx.execute(sql, params).await;
+    if matches!(&ordinary,Ok(n) if *n>0) {
+        tx.batch_execute("RELEASE SAVEPOINT owned_message_joint_probe")
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_message_joint_probe; RELEASE SAVEPOINT owned_message_joint_probe").await.map_err(|e|e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && matches!(
+                    e.message(),
+                    "thread_history_writer_binding_invalid"
+                        | "thread_history_writer_source_mutation_refused"
+                )
+        })
+    {
+        return Err(
+            "message joint control did not encounter its explicit registered refusal".into(),
+        );
+    }
+    for guard in GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.messages DISABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    let n = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
+    for guard in GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.messages ENABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    for guard in GUARDS {
+        let state:String=tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.messages'::regclass AND tgname=$1 AND NOT tgisinternal",&[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "message guard {guard} was not restored before natural COMMIT/product reader"
+            ));
+        }
+    }
+    if n == 0 {
+        return Err("owned message corruption changed no row".into());
+    }
+    Ok(())
+}
 async fn tamper_owned_thread_identity(
     tx: &tokio_postgres::Transaction<'_>,
     sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<(), String> {
-    const REGISTERED_GUARD: &str = "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
-        WHERE tgrelid='public.threads'::regclass \
-        AND tgname='threads_history_protect_identity_update' AND NOT tgisinternal";
-    let before: String = tx.query_one(REGISTERED_GUARD, &[]).await
-        .map_err(|e| e.to_string())?.get(0);
-    if before != "O" {
-        return Err("owned Thread identity guard was not registered and normally enabled".to_owned());
+    const NEW_GUARDS: [&str; 3] = [
+        "threads_history_body_before_update",
+        "threads_history_canonical_before",
+        "threads_history_source_final",
+    ];
+    const OLD: &str = "threads_history_protect_identity_update";
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned registered Thread guard {guard} was not normally enabled"
+            ));
+        }
     }
-    tx.batch_execute("SAVEPOINT owned_thread_identity_probe").await
+    tx.batch_execute("SAVEPOINT owned_current_identity_probe")
+        .await
         .map_err(|e| e.to_string())?;
     let ordinary = tx.execute(sql, params).await;
-    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_thread_identity_probe; RELEASE SAVEPOINT owned_thread_identity_probe")
-        .await.map_err(|e| e.to_string())?;
-    let refused = ordinary.as_ref().err().and_then(|e| e.as_db_error())
-        .is_some_and(|e| e.code().code() == "55000"
-            && e.message() == "thread_history_state_binding_invalid");
-    if !refused {
-        return Err("ordinary Thread identity DML was not refused by the registered guard".to_owned());
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_current_identity_probe; RELEASE SAVEPOINT owned_current_identity_probe").await.map_err(|e|e.to_string())?;
+    if !ordinary
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000"
+                && matches!(
+                    e.message(),
+                    "thread_history_state_binding_invalid"
+                        | "thread_history_writer_binding_invalid"
+                        | "thread_history_writer_source_mutation_refused"
+                )
+        })
+    {
+        return Err("ordinary current Thread identity DML was not explicitly refused".into());
     }
-    tx.batch_execute("ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update")
-        .await.map_err(|e| e.to_string())?;
+    // Suppress only these owned fixture events BEFORE corrupting DML. Re-enabling
+    // at COMMIT cannot remove an already queued deferred event; none is bypassed.
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads DISABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    tx.batch_execute("SAVEPOINT owned_original50_identity_probe")
+        .await
+        .map_err(|e| e.to_string())?;
+    let original = tx.execute(sql, params).await;
+    tx.batch_execute("ROLLBACK TO SAVEPOINT owned_original50_identity_probe; RELEASE SAVEPOINT owned_original50_identity_probe").await.map_err(|e|e.to_string())?;
+    if !original
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_db_error())
+        .is_some_and(|e| {
+            e.code().code() == "55000" && e.message() == "thread_history_state_binding_invalid"
+        })
+    {
+        return Err("original0050 single identity guard control lost its exact refusal".into());
+    }
+    tx.batch_execute(
+        "ALTER TABLE public.threads DISABLE TRIGGER threads_history_protect_identity_update",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let changed = tx.execute(sql, params).await.map_err(|e| e.to_string())?;
-    tx.batch_execute("ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update")
-        .await.map_err(|e| e.to_string())?;
-    let after: String = tx.query_one(REGISTERED_GUARD, &[]).await
-        .map_err(|e| e.to_string())?.get(0);
-    if changed == 0 || after != "O" {
-        return Err("owned Thread identity tamper did not change a row and restore its guard".to_owned());
+    tx.batch_execute(
+        "ALTER TABLE public.threads ENABLE TRIGGER threads_history_protect_identity_update",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    for guard in NEW_GUARDS {
+        tx.batch_execute(&format!(
+            "ALTER TABLE public.threads ENABLE TRIGGER {guard}"
+        ))
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    for guard in NEW_GUARDS.into_iter().chain([OLD]) {
+        let state: String = tx.query_one("SELECT tgenabled::text FROM pg_catalog.pg_trigger WHERE tgrelid='public.threads'::regclass AND tgname=$1 AND NOT tgisinternal", &[&guard]).await.map_err(|e|e.to_string())?.get(0);
+        if state != "O" {
+            return Err(format!(
+                "owned Thread guard {guard} was not restored before product entry"
+            ));
+        }
+    }
+    if changed == 0 {
+        return Err("owned identity control changed no row".into());
     }
     Ok(())
 }
@@ -2545,7 +2719,12 @@ impl SourceMutation {
     fn lock_sql(self) -> &'static str {
         match self {
             // Acquire the ALTER TRIGGER table lock before releasing the real final query.
-            Self::ThreadTenant => "LOCK TABLE public.sessions,public.threads IN ACCESS EXCLUSIVE MODE",
+            Self::ThreadTenant => {
+                "LOCK TABLE public.sessions,public.threads IN ACCESS EXCLUSIVE MODE"
+            }
+            Self::MessageRole | Self::MessageActor | Self::MessageRun => {
+                "LOCK TABLE public.sessions,public.messages IN ACCESS EXCLUSIVE MODE"
+            }
             Self::OperationPayload => {
                 "LOCK TABLE public.sessions,openbot_internal.artifact_save_operations IN ACCESS EXCLUSIVE MODE"
             }
@@ -2566,9 +2745,9 @@ impl SourceMutation {
             Self::ChannelMembership => tx.batch_execute("DELETE FROM public.channel_memberships WHERE user_id='read-owner'").await.map_err(|e| e.to_string()),
             Self::ChannelAssignment => tx.batch_execute("DELETE FROM public.channel_agents WHERE channel_id='read-channel'").await.map_err(|e| e.to_string()),
             Self::PackageTenant => tx.batch_execute("UPDATE public.channels SET package_id='00000000-0000-4000-8000-000000000051'; UPDATE public.deployment_packages SET tenant_id='foreign'").await.map_err(|e| e.to_string()),
-            Self::MessageRole => tx.batch_execute("UPDATE public.messages SET role='assistant'").await.map_err(|e| e.to_string()),
-            Self::MessageActor => tx.batch_execute("UPDATE public.messages SET actor_id='read-other'").await.map_err(|e| e.to_string()),
-            Self::MessageRun => tx.batch_execute("UPDATE public.messages SET run_id='another-run'").await.map_err(|e| e.to_string()),
+            Self::MessageRole => tamper_owned_message_joint(tx, "UPDATE public.messages SET role='assistant'", &[]).await,
+            Self::MessageActor => tamper_owned_message_joint(tx, "UPDATE public.messages SET actor_id='read-other'", &[]).await,
+            Self::MessageRun => tamper_owned_message_joint(tx, "UPDATE public.messages SET run_id='another-run'", &[]).await,
             Self::MessageDelete => tx.batch_execute("DELETE FROM public.messages").await.map_err(|e| e.to_string()),
             // Closed corruption controls only in this disposable DB. Restore the registered
             // trigger in the same transaction before the real controller COMMIT ACK.
@@ -2655,7 +2834,7 @@ async fn actual_owned_pg_post_io_source_and_physical_mutation_matrix() {
     ] {
         with_fixture("arc_source", mutation.channel(), |f| async move {
             let saved = f.save().await?;
-            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id).await?;
+            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id, true).await?;
             tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "post-IO gate timed out".to_owned())?.map_err(|_| "post-IO gate sender gone".to_owned())?;
             let mut controller = f.pool.get().await.map_err(|e| e.to_string())?;
             let controller_pid: i32 = controller.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
@@ -2767,7 +2946,7 @@ async fn actual_owned_pg_post_io_session_epoch_and_generation_matrix() {
                 f.created = f.pool.get().await.map_err(|e| e.to_string())?.query_one("SELECT created_at FROM public.sessions WHERE id='core-read-session-a'", &[]).await.map_err(|e| e.to_string())?.get(0);
             }
             let saved = f.save().await?;
-            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id).await?;
+            let (worker, reached, proceed) = start_after_io(&f, &saved.artifact_id, true).await?;
             tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "post-IO session gate timed out".to_owned())?.map_err(|_| "post-IO session gate gone".to_owned())?;
             let mut controller = f.pool.get().await.map_err(|e| e.to_string())?;
             let blocker: i32 = controller.query_one("SELECT pg_backend_pid()", &[]).await.map_err(|e| e.to_string())?.get(0);
@@ -3035,7 +3214,7 @@ async fn actual_owned_pg_host_first_missing_invisible_gone_and_final_clock() {
         ] {
             with_rollback_ack("arc_error_tail", |f, proxy| async move {
                 let id = outcome.prepare(&f).await?;
-                let (worker, reached, proceed) = start_after_io(&f, &id).await?;
+                let (worker, reached, proceed) = start_after_io(&f, &id, false).await?;
                 tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "source outcome final gate timed out".to_owned())?.map_err(|_| "source outcome final gate closed".to_owned())?;
                 // This source-error path intentionally had no byte worker. The gate proves real
                 // final own-Pool setup/seed, not IO completion or SQL Lock/PID observation.
@@ -3075,15 +3254,20 @@ async fn actual_owned_pg_host_first_missing_invisible_gone_and_final_clock() {
 async fn actual_owned_pg_cancelled_waiter_retains_worker_fd_and_raii_result() {
     with_fixture("arc_cancel", false, |f| async move {
         let saved = f.save().await?;
+        // R430: the cancelled original final query keeps `saved`'s exact key permanently
+        // unproven, so the assembled worker below consumes a second real saved record.
+        let wrapped = f.save().await?;
         // Cancel the actual production consumer at its registered common final gate after
         // real snapshot/worker ACK. Dropping this future owns the pending buffer's Drop path;
         // it does not certify an acknowledged PostgreSQL rollback or inspect freed memory.
-        let (production, reached, proceed) = start_after_io(&f, &saved.artifact_id).await?;
+        let (production, reached, proceed) = start_after_io(&f, &saved.artifact_id, true).await?;
         tokio::time::timeout(Duration::from_secs(3), reached).await.map_err(|_| "actual production cancel gate timed out".to_owned())?.map_err(|_| "actual production cancel gate closed".to_owned())?;
         production.abort();
         require(production.await.is_err(), "actual production pending waiter was not cancelled")?;
         drop(proceed);
-        let snapshot = f.observe(&saved.artifact_id).await.map_err(|e| e.to_string())?;
+        let cancelled = f.observe(&saved.artifact_id).await.map_err(|e| e.to_string())?;
+        require(f.store.open_observed_record(cancelled).is_err(), "cancelled original key admitted another body FD")?;
+        let snapshot = f.observe(&wrapped.artifact_id).await.map_err(|e| e.to_string())?;
         let authority = f.administration.read_authority();
         let identity = Arc::clone(&authority.identity);
         let store = Arc::clone(&f.store);

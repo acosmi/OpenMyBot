@@ -169,6 +169,82 @@ impl Fixture {
             .map_err(|error| error.to_string())
     }
 
+    // 0051 refuses these corrupt terminal/event shapes at the source. Only in this owned
+    // disposable DB, after proving the ordinary refusal, the exact Run/event writer guards
+    // are suppressed for the single corrupting statement and restored before COMMIT.
+    async fn controlled_terminal_corruption(
+        &self,
+        sql: &str,
+        ordinary_refused: bool,
+    ) -> Result<(), String> {
+        const GUARDS: [(&str, &str); 5] = [
+            ("public.run_events", "run_events_history_body_before"),
+            ("public.run_events", "run_events_history_terminal_final"),
+            ("public.runs", "runs_history_body_before"),
+            ("public.runs", "runs_history_canonical_before"),
+            ("public.runs", "runs_history_terminal_final"),
+        ];
+        // Only the writer guards of the one table this static statement mutates.
+        let target = if sql.contains("public.run_events") {
+            "public.run_events"
+        } else {
+            "public.runs"
+        };
+        let guards = GUARDS.into_iter().filter(|(table, _)| *table == target);
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")
+            .await
+            .map_err(|e| e.to_string())?;
+        if ordinary_refused {
+            tx.batch_execute("SAVEPOINT owned_terminal_probe")
+                .await
+                .map_err(|e| e.to_string())?;
+            let ordinary = tx.batch_execute(sql).await;
+            tx.batch_execute(
+                "ROLLBACK TO SAVEPOINT owned_terminal_probe; RELEASE SAVEPOINT owned_terminal_probe",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            if !ordinary
+                .as_ref()
+                .err()
+                .and_then(|e| e.as_db_error())
+                .is_some_and(|e| {
+                    e.code().code() == "55000" && e.message().starts_with("thread_history_writer_")
+                })
+            {
+                return Err(format!(
+                    "ordinary corrupt terminal DML was not refused: {sql}"
+                ));
+            }
+        }
+        for (table, guard) in guards.clone() {
+            tx.batch_execute(&format!("ALTER TABLE {table} DISABLE TRIGGER {guard}"))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tx.batch_execute(sql).await.map_err(|e| e.to_string())?;
+        for (table, guard) in guards {
+            tx.batch_execute(&format!("ALTER TABLE {table} ENABLE TRIGGER {guard}"))
+                .await
+                .map_err(|e| e.to_string())?;
+            let state: String = tx
+                .query_one(
+                    "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+                     WHERE tgrelid=$1::text::regclass AND tgname=$2 AND NOT tgisinternal",
+                    &[&table, &guard],
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .get(0);
+            if state != "O" {
+                return Err(format!("owned writer guard {guard} was not restored"));
+            }
+        }
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+
     async fn seed_attempts(&self, count: i64) -> Result<(), String> {
         let client = self.pool.get().await.map_err(|error| error.to_string())?;
         client
@@ -506,22 +582,22 @@ async fn reconciliation_rejects_hidden_bad_bindings_and_unbound_terminal_events(
         fixture.expect_corrupt().await?;
         fixture.sql("UPDATE public.tool_calls SET bot_id='bot-a' WHERE call_seq=0").await?;
         fixture.read().await?;
-        fixture.sql("UPDATE public.run_events SET event_type='failed' WHERE terminal").await?;
+        fixture.controlled_terminal_corruption("UPDATE public.run_events SET event_type='failed' WHERE terminal", true).await?;
         fixture.expect_corrupt().await?;
         fixture.sql("UPDATE public.run_events SET event_type='reconciliation_required' WHERE terminal").await?;
         fixture.sql("INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id)
           VALUES('550e8400-e29b-41d4-a716-446655440074','tenant-a','reconciliation-deployment',
-                 'actor-a','direct_bot','bot-a');
-          UPDATE public.run_events SET thread_id='550e8400-e29b-41d4-a716-446655440074' WHERE terminal").await?;
+                 'actor-a','direct_bot','bot-a')").await?;
+        fixture.controlled_terminal_corruption("UPDATE public.run_events SET thread_id='550e8400-e29b-41d4-a716-446655440074' WHERE terminal", true).await?;
         fixture.expect_corrupt().await?;
-        fixture.sql("UPDATE public.run_events e SET thread_id=r.thread_id FROM public.runs r
-          WHERE e.run_id=r.run_id AND e.terminal;
-          UPDATE public.run_events SET event_type='checkpoint',terminal=false
-          WHERE event_type='reconciliation_required'").await?;
+        fixture.controlled_terminal_corruption("UPDATE public.run_events e SET thread_id=r.thread_id FROM public.runs r
+          WHERE e.run_id=r.run_id AND e.terminal", true).await?;
+        fixture.controlled_terminal_corruption("UPDATE public.run_events SET event_type='checkpoint',terminal=false
+          WHERE event_type='reconciliation_required'", true).await?;
         fixture.expect_corrupt().await?;
         fixture.sql("UPDATE public.run_events SET event_type='reconciliation_required',terminal=true
           WHERE event_type='checkpoint'").await?;
-        fixture.sql("UPDATE public.runs SET terminal_event_seq=999").await?;
+        fixture.controlled_terminal_corruption("UPDATE public.runs SET terminal_event_seq=999", true).await?;
         fixture.expect_corrupt().await?;
         fixture.sql("UPDATE public.runs SET terminal_event_seq=1").await?;
         fixture.read().await?;
@@ -533,7 +609,9 @@ async fn reconciliation_rejects_hidden_bad_bindings_and_unbound_terminal_events(
           ALTER TABLE public.thread_run_occupancy ENABLE TRIGGER USER; COMMIT").await?;
         require(!fixture.read().await?.foreground_blocked,
             "foregroundBlocked must describe only this original run")?;
-        fixture.sql("DELETE FROM public.run_events WHERE terminal").await?;
+        fixture
+            .controlled_terminal_corruption("DELETE FROM public.run_events WHERE terminal", true)
+            .await?;
         fixture.expect_corrupt().await
     }).await;
 }

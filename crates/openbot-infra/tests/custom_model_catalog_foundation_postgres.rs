@@ -258,12 +258,12 @@ async fn registered_legacy_identity(p: &pool::DatabasePool) -> TestResult {
 async fn assert_current(p: &pool::DatabasePool) -> TestResult {
     let mut c = p.get().await.map_err(|e| e.to_string())?;
     let expected: schema_facts::SchemaFacts =
-        serde_json::from_str(include_str!("../../../fixtures/db/schema-0050.json"))
+        serde_json::from_str(include_str!("../../../fixtures/db/schema-0051.json"))
             .map_err(|e| e.to_string())?;
     let actual_public = schema_facts::fetch(&c).await.map_err(|e| e.to_string())?;
     require(
         actual_public == expected,
-        "actual full public catalogue differs from independent current0050 oracle",
+        "actual full public catalogue differs from independent current0051 oracle",
     )?;
     custom_model_catalog_schema::verify(&c)
         .await
@@ -1312,6 +1312,11 @@ async fn foundation_native_pre_backfill_failure_installs_no_catalog() {
 #[ignore = "requires explicitly owned loopback PG17 and independently captured0046 fixtures"]
 async fn foundation_tamper_is_refused_at_native_replay_start_and_schema_verify() {
     // Separate newly owned databases avoid restoring a tampered schema through product code.
+    // The unknown row must stay strictly after the binary's pinned latest, not a real migration.
+    let unknown_future = format!(
+        "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES({},'owned_unknown_native','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')",
+        native::NATIVE_LATEST_VERSION + 1
+    );
     let mutations = [
         ("missingmapping", "DELETE FROM public.custom_model_catalogs"),
         (
@@ -1362,10 +1367,7 @@ async fn foundation_tamper_is_refused_at_native_replay_start_and_schema_verify()
             "secretpolicy",
             "CREATE POLICY owned_extra_policy ON public.model_connection_secrets USING(true)",
         ),
-        (
-            "unknownprefix",
-            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(47,'owned_unknown_native','ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')",
-        ),
+        ("unknownprefix", unknown_future.as_str()),
     ];
     for (tag, sql) in mutations {
         owned_fixture(tag, move |_, p| async move {

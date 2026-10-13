@@ -433,6 +433,32 @@ impl LocalFixture {
                 ),
                 "actual Local Begin did not return its durable receipt",
             )?;
+            // Save locks the source run with FOR SHARE NOWAIT; wait until the dispatched run is
+            // durably inactive so the single Save does not race its own terminal transition.
+            let fixture_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let AppReply::ThreadConversation(conversation) = prepared
+                    .application()
+                    .execute(
+                        auth.clone(),
+                        AppCommand::GetThreadConversation {
+                            thread_id: begin.thread_id.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Err("actual Local conversation returned another reply".to_owned());
+                };
+                if conversation.active_run_id.is_none() && conversation.active_run_state.is_none() {
+                    break;
+                }
+                require(
+                    tokio::time::Instant::now() < fixture_deadline,
+                    "actual Local run did not become inactive before Save",
+                )?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             let source = format!("{}:input", begin.run_id.as_str());
             let receipt = prepared
                 .application()

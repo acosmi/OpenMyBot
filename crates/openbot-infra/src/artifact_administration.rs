@@ -36,8 +36,10 @@ use crate::artifact_store::{
     ArtifactByteObservationState, ArtifactByteWritePhase, ArtifactReadControlledBarrier,
     ArtifactStoreError, DatasetBoundArtifactStore, VerifiedArtifactByteObservation,
 };
+use crate::db::InfraError;
 use crate::repo::audit::{append_event_in_transaction, next_event_coordinates};
 use crate::thread_directory::reconciliation_visibility::VISIBLE_RUN;
+use crate::thread_history_writer::{CurrentWriterSchema, OpenOrClosed};
 
 #[path = "artifact_read_authority.rs"]
 pub mod artifact_read_authority;
@@ -983,6 +985,10 @@ impl PostgresArtifactAdministration {
             .await
             .map_err(|_| unavailable())?;
         setup(&tx).await?;
+        // One strict schema observation before this transaction's first row lock.
+        let schema = CurrentWriterSchema::observe(&tx)
+            .await
+            .map_err(history_error)?;
         self.lock_actor(&tx, auth).await?;
         let source = self.lock_source(&tx, auth, input).await?;
         self.check_binding(&tx).await?;
@@ -1014,6 +1020,9 @@ impl PostgresArtifactAdministration {
             }
             return Err(unavailable());
         }
+        // Only a NEW operation is a new copy: a closed source Thread history refuses it. The
+        // exact replay of a committed operation above is unchanged.
+        require_open_history(&tx, &schema, input).await?;
         if fresh.sha256 != input.expected_sha256 {
             return Err(ArtifactAdministrationError::InvalidInput {
                 field: "expectedSha256",
@@ -1094,6 +1103,10 @@ impl PostgresArtifactAdministration {
             .await
             .map_err(|_| unavailable())?;
         setup(&tx).await?;
+        // One strict schema observation before this transaction's first row lock.
+        let schema = CurrentWriterSchema::observe(&tx)
+            .await
+            .map_err(history_error)?;
         self.lock_actor(&tx, auth).await?;
         self.lock_source(&tx, auth, input)
             .await?
@@ -1112,6 +1125,9 @@ impl PostgresArtifactAdministration {
         {
             return Err(unavailable());
         }
+        // No IO may begin from a closed source Thread history. The operation stays admitted,
+        // with its original charge, exactly like any other refusal at this fence.
+        require_open_history(&tx, &schema, input).await?;
         self.fresh_source(&tx, auth, input)
             .await?
             .ensure_same(&admission.source)?;
@@ -1187,6 +1203,12 @@ impl PostgresArtifactAdministration {
         .map_err(|_| unavailable())?;
         finalize_stage!(Setup);
         finalize_result!(setup(&tx).await)?;
+        // One strict schema observation before this transaction's first row lock.
+        let schema = finalize_result!(
+            CurrentWriterSchema::observe(&tx)
+                .await
+                .map_err(history_error)
+        )?;
         // A no-row authority result does not abort the transaction. Retain real failure facts
         // under the original private admission, without granting the revoked caller a read.
         finalize_stage!(InitialAuthority);
@@ -1226,6 +1248,19 @@ impl PostgresArtifactAdministration {
             }
             return Err(unavailable());
         }
+        // Same order as the admission and the start of IO: actor, source, quota, operation, then
+        // the head. A closed source Thread history follows the source-changed path: the real byte
+        // observation and its charge are kept, and no record, receipt or available state is
+        // published.
+        let authorized = if authorized {
+            match finalize_result!(require_open_history(&tx, &schema, input).await) {
+                Ok(()) => true,
+                Err(ArtifactAdministrationError::NotVisible) => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
         finalize_stage!(AuditCoordinates);
         let (audit_id, audit_time) = if authorized
             && matches!(
@@ -2004,6 +2039,31 @@ async fn setup(tx: &Transaction<'_>) -> Result<(), ArtifactAdministrationError> 
     tx.batch_execute("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='5s'")
         .await
         .map_err(|_| unavailable())
+}
+/// Lock, query and invariant failures of the history admission keep their own class; none of
+/// them reads as closed.
+fn history_error(error: InfraError) -> ArtifactAdministrationError {
+    tracing::warn!(error = %error, "artifact save history admission failed");
+    match error {
+        InfraError::Connect { .. } | InfraError::Query { .. } => unavailable(),
+        _ => corrupt("thread_history_writer"),
+    }
+}
+/// Takes H SHARE on this transaction, held to its natural end. A closed source Thread history
+/// is unknown to the caller, like any other source that is not currently visible.
+async fn require_open_history(
+    tx: &Transaction<'_>,
+    schema: &CurrentWriterSchema<'_, '_>,
+    input: &SaveRunMessageTextArtifact,
+) -> Result<(), ArtifactAdministrationError> {
+    match schema
+        .lock_thread_write_disposition(tx, &input.source_thread_id)
+        .await
+        .map_err(history_error)?
+    {
+        OpenOrClosed::Open => Ok(()),
+        OpenOrClosed::Closed => Err(ArtifactAdministrationError::NotVisible),
+    }
 }
 async fn commit(tx: deadpool_postgres::Transaction<'_>) -> Result<(), ArtifactAdministrationError> {
     tokio::time::timeout(WAIT, tx.commit())

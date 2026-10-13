@@ -100,6 +100,29 @@ impl Drop for OwnedRoot {
     }
 }
 
+const BODY_GUARD: &str = "messages_history_body_before";
+const CANONICAL_GUARD: &str = "messages_history_canonical_before";
+const SOURCE_FINAL_GUARD: &str = "messages_history_source_final";
+// Each 0051 messages guard and the trigger function its refusal context names.
+const MESSAGE_GUARDS: [(&str, &str); 3] = [
+    (BODY_GUARD, "guard_thread_history_body()"),
+    (CANONICAL_GUARD, "guard_thread_history_canonical_reverse()"),
+    (SOURCE_FINAL_GUARD, "require_thread_history_channel_final()"),
+];
+type GuardRefusals = &'static [(&'static str, &'static str)];
+
+fn observed_refusal(error: &tokio_postgres::Error) -> String {
+    let Some(db) = error.as_db_error() else {
+        return error.to_string();
+    };
+    let guards: Vec<&str> = MESSAGE_GUARDS
+        .iter()
+        .filter(|(_, function)| db.where_().is_some_and(|w| w.contains(function)))
+        .map(|(guard, _)| *guard)
+        .collect();
+    format!("{} {} {guards:?}", db.code().code(), db.message())
+}
+
 struct Fixture {
     pool: openbot_infra::db::pool::DatabasePool,
     config: DatabaseConfig,
@@ -417,6 +440,76 @@ impl Fixture {
             .batch_execute(sql)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    // Own-DB corruption control for the static canonical-message matrix. Each statement declares,
+    // in order, every exact 0051 messages-guard refusal (55000 thread_history_writer_*) it meets
+    // as ordinary DML; an empty declaration asserts the ordinary DML itself is accepted. Only each
+    // observed guard is disabled, before its statement queues any source-final event, and every
+    // guard is back to origin-enabled before the owned COMMIT.
+    async fn owned_message_sql(&self, sql: &str, refusals: GuardRefusals) -> Result<(), String> {
+        let mut client = self.pool.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+        tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut disabled = 0;
+        loop {
+            tx.batch_execute("SAVEPOINT owned_message_probe")
+                .await
+                .map_err(|e| e.to_string())?;
+            match tx.batch_execute(sql).await {
+                Ok(()) if disabled == refusals.len() => break,
+                Ok(()) => {
+                    return Err(format!(
+                        "{sql}: declared refusal {:?} did not occur",
+                        refusals[disabled]
+                    ));
+                }
+                Err(error) => {
+                    let observed = observed_refusal(&error);
+                    let Some(&(guard, message)) = refusals.get(disabled) else {
+                        return Err(format!("{sql}: undeclared refusal {observed}"));
+                    };
+                    if observed != format!("55000 {message} {:?}", [guard]) {
+                        return Err(format!(
+                            "{sql}: expected {guard} {message}, observed {observed}"
+                        ));
+                    }
+                    tx.batch_execute(&format!(
+                        "ROLLBACK TO SAVEPOINT owned_message_probe; \
+                         ALTER TABLE public.messages DISABLE TRIGGER {guard}"
+                    ))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    disabled += 1;
+                }
+            }
+        }
+        for (guard, _) in &refusals[..disabled] {
+            tx.batch_execute(&format!(
+                "ALTER TABLE public.messages ENABLE TRIGGER {guard}"
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        let states: Vec<String> = tx
+            .query(
+                "SELECT tgenabled::text FROM pg_catalog.pg_trigger \
+                 WHERE tgrelid='public.messages'::regclass AND tgname=ANY($1) AND NOT tgisinternal",
+                &[&MESSAGE_GUARDS.map(|(guard, _)| guard).to_vec()],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if states != ["O", "O", "O"] {
+            return Err(format!(
+                "owned message guards were not restored: {states:?}"
+            ));
+        }
+        tx.commit().await.map_err(|e| e.to_string())
     }
 
     async fn source_text(&self) -> Result<String, String> {
@@ -1160,15 +1253,43 @@ async fn authoritative_source_selector_role_and_json_text_failures_create_no_obj
                 == Err(ArtifactAdministrationError::NotVisible),
             "two real but mismatched source selectors were accepted",
         )?;
-        for content in [
-            "UPDATE public.messages SET role='assistant' WHERE role='user'",
-            "UPDATE public.messages SET role='user',content='{}'::jsonb",
-            "UPDATE public.messages SET content='[]'::jsonb",
-            "UPDATE public.messages SET content='{\"text\":null}'::jsonb",
-            "UPDATE public.messages SET content='{\"text\":17}'::jsonb",
-            "UPDATE public.messages SET content='{\"text\":\"\"}'::jsonb",
+        // Every statement also rewrites the second channel Run's canonical source message: the
+        // 0051 canonical-reverse guard refuses that first, then the deferred source-final check
+        // refuses the invalid source unless its guard is off before the statement.
+        const SOURCE_MUTATION: GuardRefusals = &[
+            (
+                CANONICAL_GUARD,
+                "thread_history_writer_source_mutation_refused",
+            ),
+            (SOURCE_FINAL_GUARD, "thread_history_writer_binding_invalid"),
+        ];
+        for (content, refusals) in [
+            (
+                "UPDATE public.messages SET role='assistant' WHERE role='user'",
+                SOURCE_MUTATION,
+            ),
+            (
+                "UPDATE public.messages SET role='user',content='{}'::jsonb",
+                SOURCE_MUTATION,
+            ),
+            (
+                "UPDATE public.messages SET content='[]'::jsonb",
+                SOURCE_MUTATION,
+            ),
+            (
+                "UPDATE public.messages SET content='{\"text\":null}'::jsonb",
+                SOURCE_MUTATION,
+            ),
+            (
+                "UPDATE public.messages SET content='{\"text\":17}'::jsonb",
+                SOURCE_MUTATION,
+            ),
+            (
+                "UPDATE public.messages SET content='{\"text\":\"\"}'::jsonb",
+                SOURCE_MUTATION,
+            ),
         ] {
-            fixture.sql(content).await?;
+            fixture.owned_message_sql(content, refusals).await?;
             require(
                 administration
                     .save_run_message_text(&fixture.auth(), request.clone())

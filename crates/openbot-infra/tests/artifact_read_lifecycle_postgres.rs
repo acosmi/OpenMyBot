@@ -872,6 +872,11 @@ impl PhaseGate {
         if value == "actual_io_completed_before_joint" {
             self.io.fetch_add(1, Ordering::SeqCst);
         }
+        // R432 control-before emits the same joint phase before any body IO; the selected
+        // FinalJoint is the one that follows this operation's actual IO.
+        if value == JOINT && self.io.load(Ordering::SeqCst) == 0 {
+            return;
+        }
         if value != self.selected || self.reached.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -984,8 +989,12 @@ async fn cancel_actual_phase(
         matches!(operation.next_block(&fixture.auth).await, Err(ref e) if unavailable(e)),
         "cancelled_original_operation_reentered",
     )?;
+    // R432/§3679: a cancelled FinalJoint leaves its exact key closed, so the denied next still
+    // makes one no-body RequestedTarget host-first classification. A cancelled Working phase
+    // keeps body admission and is refused by its own operation lifecycle without a statement.
+    let classified = usize::from(phase == JOINT);
     require(
-        counters
+        (counters.0, counters.1, counters.2 + classified)
             == (
                 gate.partial.load(Ordering::SeqCst),
                 gate.io.load(Ordering::SeqCst),
@@ -1065,8 +1074,10 @@ async fn retained_original_fd_sequential_sizes_and_verified_eof() {
             // Fact 5: zero is an actual read on the original nonempty saved FD, with final joint
             // and handoff completed. EOF closes it; a subsequent next cannot reopen it.
             require(position == length, "actual_stream_length_changed")?;
+            // Each admitted block, including the verified EOF, runs its R432 control-before and
+            // then its final joint through the same original guard.
             require(
-                fixture.final_calls.load(Ordering::SeqCst) == before + blocks + 1,
+                fixture.final_calls.load(Ordering::SeqCst) == before + 2 * (blocks + 1),
                 "verified_eof_missing_actual_joint",
             )?;
             original_fd(&physical, retained, false).await?;
@@ -1152,8 +1163,10 @@ async fn original_allocation_owner_prevents_next_worker_joint_and_buffer() {
             .handoff(&fixture.auth)
             .map_err(|_| "actual_second_handoff_failed")?
             .ok_or("actual_second_block_was_eof")?;
+        // The busy refusals above keep body admission and make no statement; the admitted
+        // second block runs its R432 control-before and then its final joint.
         require(
-            second.as_bytes() == b"L" && fixture.final_calls.load(Ordering::SeqCst) == before + 1,
+            second.as_bytes() == b"L" && fixture.final_calls.load(Ordering::SeqCst) == before + 2,
             "actual_second_sequential_block_changed",
         )?;
         original_fd(&physical, Some(retained), true).await?;
