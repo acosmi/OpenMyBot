@@ -6661,10 +6661,17 @@ mod tests {
 
     #[test]
     fn command_audit_list_and_generated_handler_are_exactly_joined() {
+        // The production text ends at the test-module header. Single test-only `use` items come
+        // earlier, so the first `#[cfg(test)]` is not the header; a missing header must fail
+        // here rather than fall back to the whole file.
         let source = include_str!("tauri_host.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
+        let (production, _) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("tauri_host.rs must keep its test module header");
         let chrome_source = include_str!("tauri_host/window_chrome.rs");
-        let chrome_production = chrome_source.split("#[cfg(test)]").next().unwrap();
+        let (chrome_production, _) = chrome_source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("window_chrome.rs must keep its test module header");
         assert_eq!(production.matches("#[tauri::command]").count(), 2);
         assert_eq!(chrome_production.matches("#[tauri::command]").count(), 1);
         let handler = production
