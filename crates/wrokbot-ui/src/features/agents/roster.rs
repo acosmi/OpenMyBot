@@ -5,7 +5,7 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 use openbot_contracts::agent::{AgentProfile, AgentVisibility};
 
 #[cfg(target_arch = "wasm32")]
-use crate::api::list_agents;
+use crate::api::list_agents_with_abort_signal;
 use crate::features::layout::{
     DetailPanel, DetailPanelLayout, DetailPanelMain, PageEmpty, PageHeader, PageSection, PageShell,
     PageWidth, StaggerItem,
@@ -260,9 +260,29 @@ fn install_agent_loader(
         let generation = reload_generation.get();
         loading.set(true);
         load_error.set(false);
+        let Ok(cancellation) = AgentRosterReadAbort::new() else {
+            agents.set(Vec::new());
+            hidden_agents.set(Vec::new());
+            loading.set(false);
+            load_error.set(true);
+            return;
+        };
+        let cancellation = std::rc::Rc::new(cancellation);
+        let scope_cancellation = StoredValue::new_local(std::rc::Rc::downgrade(&cancellation));
+        // Abort both browser reads before the scoped Rust task is cancelled or replaced.
+        on_cleanup(move || {
+            let _ = scope_cancellation.try_with_value(|pending| {
+                if let Some(pending) = pending.upgrade() {
+                    pending.abort_pending();
+                }
+            });
+        });
         leptos::task::spawn_local_scoped_with_cancellation(async move {
-            let outcome = list_agents(false).await;
-            let hidden_outcome = list_agents(true).await;
+            let outcome = list_agents_with_abort_signal(false, &cancellation.signal).await;
+            let hidden_outcome = list_agents_with_abort_signal(true, &cancellation.signal).await;
+            if outcome.is_ok() && hidden_outcome.is_ok() {
+                cancellation.disarm();
+            }
             if reload_generation.get_untracked() != generation {
                 return;
             }
@@ -288,6 +308,62 @@ fn install_agent_loader(
         loading,
         load_error,
     );
+}
+
+// One mounted roster load owns its visible and hidden reads; mutations retain their owners.
+#[cfg(target_arch = "wasm32")]
+struct AgentRosterReadAbort {
+    controller: wasm_bindgen::JsValue,
+    signal: web_sys::AbortSignal,
+    abort: js_sys::Function,
+    pending: std::cell::Cell<bool>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl AgentRosterReadAbort {
+    fn new() -> Result<Self, crate::api::ApiError> {
+        use wasm_bindgen::{JsCast, JsValue};
+
+        let unavailable = |_| crate::api::ApiError::Unavailable;
+        let constructor = js_sys::Reflect::get(&js_sys::global(), &"AbortController".into())
+            .map_err(unavailable)?
+            .dyn_into::<js_sys::Function>()
+            .map_err(unavailable)?;
+        let controller: JsValue = js_sys::Reflect::construct(&constructor, &js_sys::Array::new())
+            .map_err(unavailable)?
+            .into();
+        let signal = js_sys::Reflect::get(&controller, &"signal".into())
+            .map_err(unavailable)?
+            .dyn_into::<web_sys::AbortSignal>()
+            .map_err(unavailable)?;
+        let abort = js_sys::Reflect::get(&controller, &"abort".into())
+            .map_err(unavailable)?
+            .dyn_into::<js_sys::Function>()
+            .map_err(unavailable)?;
+        Ok(Self {
+            controller,
+            signal,
+            abort,
+            pending: std::cell::Cell::new(true),
+        })
+    }
+
+    fn abort_pending(&self) {
+        if self.pending.replace(false) {
+            let _ = self.abort.call0(&self.controller);
+        }
+    }
+
+    fn disarm(&self) {
+        self.pending.set(false);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for AgentRosterReadAbort {
+    fn drop(&mut self) {
+        self.abort_pending();
+    }
 }
 
 #[cfg(test)]

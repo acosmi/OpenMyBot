@@ -1048,7 +1048,7 @@ async fn held_worker_shutdown(fixture: &mut LocalFixture, poll_waiter: bool) -> 
         .drain_before(Instant::now() + Duration::from_secs(5))
         .await;
     let terminal = match &state {
-        Some(state) => Some(real_terminal_state(&state).await),
+        Some(state) => Some(real_terminal_state(state).await),
         None => None,
     };
     attempted?;

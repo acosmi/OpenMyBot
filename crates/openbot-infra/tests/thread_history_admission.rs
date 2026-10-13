@@ -3,7 +3,6 @@
 #![cfg(feature = "server-runtime")]
 mod harness;
 use async_trait::async_trait;
-use openbot_application::AgentContextSource;
 use openbot_application::model_connections::ModelConnectionAdministration;
 use openbot_application::provider::{
     RemoteAguiEventStream, RemoteAguiTransport, RemoteAguiTransportError,
@@ -41,16 +40,12 @@ use openbot_infra::{
     model_connections::PostgresModelConnections,
     model_dataset::PostgresModelDatasetBinding,
     policy::PolicyStore,
-    provider::context::PostgresAgentContextSource,
     vault::CredentialRecordVault,
 };
 use openbot_infra::{
-    db::{
-        self, InfraError, baseline, desktop_vault_canary, fresh, native, pool, schema_facts,
-        thread_origin_schema as origin_schema,
-    },
+    db::{InfraError, baseline, desktop_vault_canary, fresh, native, pool, schema_facts},
     intelligence_import::PostgresIntelligenceImportStore,
-    repo::{ChannelRepo, thread::ThreadRepo},
+    repo::ChannelRepo,
     run_runtime::{DEFAULT_DISPATCH_CLAIM_DURATION, PostgresRunRuntime},
     thread_directory::{DEFAULT_THREAD_LEASE_DURATION, PostgresThreadDirectory},
 };
@@ -262,6 +257,139 @@ async fn owned_raw_catalog(c: &Client) -> TestResult<Value> {
         'indexes',(SELECT jsonb_agg(to_jsonb(x) ORDER BY x.indexrelid) FROM pg_index x WHERE x.indrelid IN (SELECT oid FROM relations)),
         'triggers',(SELECT jsonb_agg(to_jsonb(x) ORDER BY x.oid) FROM pg_trigger x WHERE x.tgrelid IN (SELECT oid FROM relations) OR x.tgfoid IN (SELECT oid FROM functions)),
         'functions',(SELECT jsonb_agg(to_jsonb(x) ORDER BY x.oid) FROM pg_proc x WHERE x.oid IN (SELECT oid FROM functions)))",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())
+}
+// Helpers used only by this suite; the shared fixture is also included by thread_history_writer.
+async fn record_import(
+    p: &pool::DatabasePool,
+    index: u64,
+) -> TestResult<(
+    RecordingImport,
+    VerifiedIntelligenceBundle,
+    IntelligenceImportMapping,
+    IntelligenceThreadExport,
+    IntelligenceThreadImportRequest,
+)> {
+    let (verified, mapping, normalized) = import_fixture(index)?;
+    let store = RecordingImport {
+        store: PostgresIntelligenceImportStore::new(p.clone()),
+        request: std::sync::Mutex::new(None),
+    };
+    let report = import_intelligence_bundle(&store, verified.clone(), mapping.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    require(
+        report.status == IntelligenceImportReportStatus::Completed && report.thread_count == 1,
+        "original maintenance application did not truly complete",
+    )?;
+    let captured = store
+        .request
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or("original app never reached import_thread")?;
+    require(
+        captured.thread == normalized && captured.checksum == normalized.checksum,
+        "original app target normalization differs independently mapped fixture",
+    )?;
+    Ok((store, verified, mapping, normalized, captured))
+}
+async fn origin(c: &Client, thread: &str) -> TestResult<Option<Value>> {
+    let query = format!(
+        "SELECT to_jsonb(o) FROM (SELECT {ORIGIN_COLUMNS},xmin::text AS \"storageXmin\" FROM openbot_internal.thread_origins WHERE thread_id=$1) o"
+    );
+    c.query_opt(&query, &[&thread])
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|row| row.try_get(0).map_err(|e| e.to_string()))
+        .transpose()
+}
+async fn counts(p: &pool::DatabasePool) -> TestResult<Vec<i64>> {
+    let c = p.get().await.map_err(|e| e.to_string())?;
+    let mut out = vec![];
+    for table in [
+        "public.threads",
+        "public.thread_memberships",
+        "public.thread_leases",
+        "public.messages",
+        "public.runs",
+        "public.run_events",
+        "public.outbox",
+        "openbot_internal.thread_origins",
+        "public.run_model_selections",
+        "openbot_internal.run_model_selection_v2_snapshots",
+        "public.channels",
+        "public.channel_memberships",
+        "public.channel_agents",
+        "openbot_internal.thread_history_heads",
+        "openbot_internal.thread_history_clear_intents",
+    ] {
+        out.push(
+            c.query_one(&format!("SELECT count(*)::bigint FROM {table}"), &[])
+                .await
+                .map_err(|e| e.to_string())?
+                .try_get(0)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(out)
+}
+async fn verify_native_origin(
+    c: &Client,
+    thread: &str,
+    creator: &str,
+    kind: &str,
+) -> TestResult<Value> {
+    let value = origin(c, thread)
+        .await?
+        .ok_or("actual new Thread has no origin")?;
+    require(
+        value.as_object().map(|v| v.len()) == Some(15),
+        "origin must preserve exactly14 stored columns plus observed xmin",
+    )?;
+    require(
+        value["thread_id"] == thread
+            && value["deployment_id"] == DEP
+            && value["tenant_id"] == TENANT
+            && value["creator_actor_id"] == creator
+            && value["origin_kind"] == kind
+            && value["origin_schema"] == 1,
+        "origin identity/creator/kind differ",
+    )?;
+    let r=c.query_one("SELECT o.thread_created_at=t.created_at AND o.creator_actor_id=t.created_by AND o.anchor_kind=t.anchor_kind AND o.anchor_id=t.anchor_id,isfinite(o.thread_created_at) AND isfinite(o.recorded_at),o.import_bundle_id IS NULL AND o.import_payload_sha256 IS NULL AND o.import_signing_key_id IS NULL AND o.import_thread_checksum IS NULL FROM openbot_internal.thread_origins o JOIN public.threads t USING(thread_id) WHERE o.thread_id=$1",&[&thread]).await.map_err(|e|e.to_string())?;
+    require(
+        r.try_get::<_, bool>(0).map_err(|e| e.to_string())?
+            && r.try_get::<_, bool>(1).map_err(|e| e.to_string())?
+            && r.try_get::<_, bool>(2).map_err(|e| e.to_string())?,
+        "base tuple/finite timestamps/import NULL facts differ",
+    )?;
+    Ok(value)
+}
+async fn settle(p: &pool::DatabasePool, run: &str) -> TestResult {
+    let runtime = PostgresRunRuntime::new(
+        p.clone(),
+        PROCESS.to_owned(),
+        DEFAULT_THREAD_LEASE_DURATION,
+        DEFAULT_DISPATCH_CLAIM_DURATION,
+    )
+    .map_err(|e| e.to_string())?;
+    let claim = runtime
+        .claim_dispatch()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("real pending dispatch absent")?;
+    let lease = runtime
+        .acknowledge_dispatch(&claim)
+        .await
+        .map_err(|e| e.to_string())?;
+    require(
+        lease.run_id().as_str() == run,
+        "claimed different original Run",
+    )?;
+    runtime
+        .finish_run(&lease, lease.next_event_sequence(), RunTerminal::Completed)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tokio::test]
