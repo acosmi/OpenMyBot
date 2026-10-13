@@ -1053,14 +1053,18 @@ async fn exercise(f: &LocalFixture) -> TestResult {
     );
 
     // L5: once the protocol owner closes, even the last current window is refused, and the reason
-    // is exactly NotCurrent. Dropping the protocol closes its owner lease synchronously. The
-    // producer's first Host check, `CurrentThreadHistoryRequest::borrow`, refuses a closed owner
-    // (`!issuer.observation().is_current()`) with NotCurrent before any window map, identity
-    // source or statement is consulted. The only checks ahead of it are the shared deadline and
-    // `scope`: they fail with Unavailable for a spent deadline or a closed Pool and with
-    // NotVisible for a foreign scope or role, and none of that holds here. The window guard behind
-    // it would answer NotCurrent first for a closed owner as well (`check_window`), so neither its
-    // window-map branch nor its missing-source branch (Unavailable) is ever reached.
+    // is exactly NotCurrent. Dropping the protocol closes its owner lease synchronously. The first
+    // check that refuses here is the closed-owner check of `CurrentThreadHistoryRequest::borrow`
+    // (`!issuer.observation().is_current()`), which answers NotCurrent before any window map,
+    // identity source or statement is consulted. Only these checks run ahead of it, and none of
+    // them fires in this case: the input validation of `close_for_stop_clear_before` (InvalidInput;
+    // both ids are valid), the remaining deadline (Unavailable; the deadline is taken afresh with 5
+    // seconds), `scope` (NotVisible for a foreign scope or role, Unavailable for a closed Pool;
+    // scope and role fit and the Pool is open), the enrolled issuer (Unavailable; `f.protocol()`
+    // enrolled it with the authority and that enrollment outlives the protocol) and the binding
+    // (Missing; `fourth` carries one). The window guard behind it would answer NotCurrent first for
+    // a closed owner as well (`check_window`), so neither its window-map branch nor its
+    // missing-source branch (Unavailable) is ever reached.
     drop(protocol);
     host_not_current(&f.close(&fourth, &request_a).await)?;
     f.nothing_written(&hq1, &facts0, "L5 owner closed").await?;
