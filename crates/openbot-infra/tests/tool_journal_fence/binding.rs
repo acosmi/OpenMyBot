@@ -190,6 +190,12 @@ async fn missing_expected_rows_conflict_but_stored_binding_status_and_decode_dam
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        // The product calls below run with the Run guard restored (the capability attach now
+        // observes the complete writer schema first); the dropped checks stay dropped.
+        client
+            .batch_execute("ALTER TABLE public.runs ENABLE TRIGGER USER")
+            .await
+            .map_err(|e| e.to_string())?;
         client
             .execute(
                 "DELETE FROM public.tool_attempts WHERE attempt_id=$1",

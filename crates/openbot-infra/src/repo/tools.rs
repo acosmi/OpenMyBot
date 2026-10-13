@@ -25,6 +25,7 @@ use crate::db::InfraError;
 use crate::db::tables::{tool_attempts, tool_calls};
 use crate::repo::audit::{append_event_in_transaction, next_event_coordinates};
 use crate::repo::common::{RepoCore, columns_sql, insert_sql};
+use crate::thread_history_writer::CurrentWriterSchema;
 
 mod fence;
 
@@ -90,7 +91,10 @@ impl ToolCallRepo {
             .await
             .map_err(|source| InfraError::query("开始 durable tool decision 事务", source))?;
         fence::initialize(&transaction).await?;
-        fence::decision(&transaction, &decision.call).await?;
+        // One schema observation before the first row lock; a closed Thread history refuses
+        // this new decision after the Run lock.
+        let schema = CurrentWriterSchema::observe(&transaction).await?;
+        fence::decision(&transaction, &schema, &decision.call).await?;
 
         let call_params = decision.call.as_sql_params();
         transaction
@@ -187,7 +191,8 @@ impl ToolAttemptRepo {
             .await
             .map_err(|error| InfraError::query("开始 tool retry 事务", error))?;
         fence::initialize(&transaction).await?;
-        fence::call(&transaction, &attempt.tool_call_id).await?;
+        let schema = CurrentWriterSchema::observe(&transaction).await?;
+        fence::call_for_new_work(&transaction, &schema, &attempt.tool_call_id).await?;
         let params = attempt.as_sql_params();
         let row = transaction
             .query_one(&insert_sql::<tool_attempts::Row>(), &params)
@@ -249,7 +254,8 @@ impl ToolAttemptRepo {
             .await
             .map_err(|error| InfraError::query("开始 tool capability 事务", error))?;
         fence::initialize(&transaction).await?;
-        fence::call(&transaction, tool_call_id).await?;
+        let schema = CurrentWriterSchema::observe(&transaction).await?;
+        fence::call_for_new_work(&transaction, &schema, tool_call_id).await?;
         if fence::attempt_sequence(&transaction, tool_call_id, attempt_seq)
             .await?
             .is_none()

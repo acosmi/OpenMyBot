@@ -2,11 +2,13 @@
 //! A call lookup before that lock is only a locator; the locked call is checked again afterwards.
 
 use openbot_application::ToolOutcomeDraft;
+use openbot_contracts::ids::ThreadId;
 use tokio_postgres::Transaction;
 
 use crate::db::InfraError;
 use crate::db::tables::{tool_attempts, tool_calls};
 use crate::repo::common::columns_sql;
+use crate::thread_history_writer::{CurrentWriterSchema, OpenOrClosed};
 
 pub(super) const CONFLICT: &str = "tool_journal_write_conflict";
 
@@ -23,6 +25,7 @@ pub(super) async fn initialize(tx: &Transaction<'_>) -> Result<(), InfraError> {
 struct LockedRun {
     actor: String,
     bot: String,
+    thread: String,
     running: bool,
 }
 
@@ -33,7 +36,7 @@ async fn lock_run(
 ) -> Result<LockedRun, InfraError> {
     let row = tx
         .query_opt(
-            "SELECT actor_id,bot_id,status FROM public.runs WHERE run_id=$1 FOR UPDATE",
+            "SELECT actor_id,bot_id,thread_id,status FROM public.runs WHERE run_id=$1 FOR UPDATE",
             &[&run_id],
         )
         .await
@@ -60,25 +63,66 @@ async fn lock_run(
         bot: row
             .try_get("bot_id")
             .map_err(|_| InfraError::repository_invariant("tool_run_bot_decode"))?,
+        thread: row
+            .try_get("thread_id")
+            .map_err(|_| InfraError::repository_invariant("tool_run_thread_decode"))?,
         running,
     })
 }
 
+/// New durable work needs an open Thread history. The schema proof was observed before the
+/// first row lock; the H SHARE is taken after the Run lock and stays on this transaction until
+/// its natural end. A closed head is the same journal conflict a stale Run gets; lock, query
+/// and invariant failures keep their own class. `outcome` never calls this, because an effect
+/// that already ran must still be able to record its result.
+async fn admit_open_history(
+    tx: &Transaction<'_>,
+    schema: &CurrentWriterSchema<'_, '_>,
+    run: &LockedRun,
+) -> Result<(), InfraError> {
+    match schema
+        .lock_thread_write_disposition(tx, &ThreadId::new(run.thread.as_str()))
+        .await?
+    {
+        OpenOrClosed::Open => Ok(()),
+        OpenOrClosed::Closed => Err(conflict()),
+    }
+}
+
 pub(super) async fn decision(
     tx: &Transaction<'_>,
+    schema: &CurrentWriterSchema<'_, '_>,
     call: &tool_calls::Row,
 ) -> Result<(), InfraError> {
     let run = lock_run(tx, &call.run_id, false).await?;
     if !run.running || run.actor != call.actor_id || run.bot != call.bot_id {
         return Err(conflict());
     }
-    Ok(())
+    admit_open_history(tx, schema, &run).await
+}
+
+/// Locks the original call for a write that creates new durable work (retry, capability).
+pub(super) async fn call_for_new_work(
+    tx: &Transaction<'_>,
+    schema: &CurrentWriterSchema<'_, '_>,
+    call_id: &str,
+) -> Result<tool_calls::CurrentRow, InfraError> {
+    let (stored, run) = lock_call(tx, call_id).await?;
+    admit_open_history(tx, schema, &run).await?;
+    Ok(stored)
 }
 
 pub(super) async fn call(
     tx: &Transaction<'_>,
     call_id: &str,
 ) -> Result<tool_calls::CurrentRow, InfraError> {
+    lock_call(tx, call_id).await.map(|(stored, _)| stored)
+}
+
+async fn lock_call(
+    tx: &Transaction<'_>,
+    call_id: &str,
+) -> Result<(tool_calls::CurrentRow, LockedRun), InfraError> {
     let locator = tx
         .query_opt(
             "SELECT run_id FROM public.tool_calls WHERE tool_call_id=$1",
@@ -110,7 +154,7 @@ pub(super) async fn call(
     if !run.running {
         return Err(conflict());
     }
-    Ok(stored)
+    Ok((stored, run))
 }
 
 fn decode_attempt(row: &tokio_postgres::Row) -> Result<tool_attempts::Row, InfraError> {

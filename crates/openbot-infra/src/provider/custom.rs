@@ -6,8 +6,10 @@ use super::{
     openai::{OpenAiApiKey, OpenAiProtocol, OpenAiProvider, OpenAiProviderConfig},
 };
 use crate::{
+    db::InfraError,
     model_runtime,
     net::safe_http::{SafeDialer, SafeHttpBudget},
+    thread_history_writer::history_closed_for_read,
     vault::CredentialRecordVault,
 };
 use async_trait::async_trait;
@@ -117,6 +119,12 @@ impl PostgresCustomModelProvider {
                 let lease=expected.identity_lease().map_err(map_authority)?;
                 let loaded=model_runtime::load_v2_for_start(&transaction,&self.deployment,&self.tenant,&lease)
                     .await.map_err(map_authority)?;
+                // The lineage stage of that load already verified the complete current writer
+                // schema in this very transaction, so a second observation is not taken. A closed
+                // Thread history refuses this new model request. Like the legacy start, this only
+                // reads the head and keeps no head lock across the send; what follows the read
+                // belongs to the in-flight drain.
+                refuse_closed_history(transaction.as_transaction(),&self.deployment,&self.tenant,&lease).await?;
                 #[cfg(test)]
                 if std::time::Instant::now()>=deadline {
                     self.v2_expired_last_authority_ready.fetch_add(1,Ordering::SeqCst);
@@ -229,6 +237,11 @@ impl PostgresCustomModelProvider {
                     .await
                     .map_err(map_authority)?
                     .ok_or_else(|| invalid("custom_model_binding"))?;
+            // A closed Thread history refuses this new model request. The legacy start keeps no
+            // Thread or head lock across the send, because the durable cancel claim needs the
+            // Thread row while the response headers are pending; what follows this read belongs
+            // to the in-flight drain.
+            refuse_closed_history(&tx, &self.deployment, &self.tenant, &lease).await?;
             if loaded.binding != *expected {
                 return Err(invalid("custom_model_binding"));
             }
@@ -411,6 +424,30 @@ fn map_authority(error: AgentContextError) -> ProviderPortError {
         AgentContextError::Unavailable => ProviderPortError::Unavailable,
         _ => invalid("custom_model_authority"),
     }
+}
+/// Lock, query and invariant failures keep their own class; none of them reads as closed.
+fn map_history_writer(error: InfraError) -> ProviderPortError {
+    tracing::warn!(error = %error, "custom model start history admission failed");
+    match error {
+        InfraError::Connect { .. } | InfraError::Query { .. } => ProviderPortError::Unavailable,
+        _ => invalid("thread_history_writer"),
+    }
+}
+/// Lock-free read for both custom start routes: only a closed head maps to the closed authority
+/// class, and a lock, query or decode failure is never read as closed.
+async fn refuse_closed_history(
+    tx: &tokio_postgres::Transaction<'_>,
+    deployment: &DeploymentId,
+    tenant: &TenantId,
+    lease: &openbot_application::RunExecutionLease,
+) -> Result<(), ProviderPortError> {
+    if history_closed_for_read(tx, deployment, tenant, lease.thread_id())
+        .await
+        .map_err(map_history_writer)?
+    {
+        return Err(map_authority(AgentContextError::Stale));
+    }
+    Ok(())
 }
 #[derive(Default)]
 struct StartProgress {
