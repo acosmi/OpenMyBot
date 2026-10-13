@@ -832,45 +832,45 @@ impl LocalFixture {
                     AppCommand::SaveRunMessageTextArtifact(original_save.clone()),
                 )
                 .await;
-            if let Some(diagnostic) = setup_diagnostic {
-                if let Err(error) = &receipt {
-                    eprintln!("{diagnostic} phase=SaveRunMessageTextArtifact original_app_error={error}");
-                    if p1_setup_diagnostic {
-                        match &original_save_diagnostic {
-                            Some(Ok(capture)) => eprintln!(
-                                "ARTIFACT_LOCAL_P1_ORIGINAL_SAVE_PRODUCER snapshot={:?} original_single_save_executed=true nongrant=true",
-                                capture.snapshot()
-                            ),
-                            Some(Err(install_error)) => eprintln!(
-                                "ARTIFACT_LOCAL_P1_ORIGINAL_SAVE_PRODUCER install_error={install_error:?} original_single_save_executed=true diagnostic_UNKNOWN=true"
-                            ),
-                            None => eprintln!(
-                                "ARTIFACT_LOCAL_P1_ORIGINAL_SAVE_PRODUCER original_single_save_executed=true diagnostic_UNKNOWN=true"
-                            ),
-                        }
-                        let diagnostic_deadline = Instant::now() + Duration::from_secs(2);
-                        failed_p1_postmaster_pid = capture_original_p1_postmaster(&root.0, diagnostic_deadline);
-                        match failed_p1_postmaster_pid {
-                            Some(pid) => eprintln!("ARTIFACT_LOCAL_P1_SETUP_FACTS original_owned_postmaster_pid={pid} original_private_root_pidfile_bound=true root_path_omitted=true"),
-                            None => eprintln!("ARTIFACT_LOCAL_P1_SETUP_FACTS original_private_root_pidfile_bound=false no_original_pg_termination_claim=true"),
-                        }
-                        capture_original_p1_setup_failure_before(&prepared, &original_save_auth,
-                            &original_save, original_save_started, diagnostic_deadline).await;
+            if let Some(diagnostic) = setup_diagnostic
+                && let Err(error) = &receipt
+            {
+                eprintln!("{diagnostic} phase=SaveRunMessageTextArtifact original_app_error={error}");
+                if p1_setup_diagnostic {
+                    match &original_save_diagnostic {
+                        Some(Ok(capture)) => eprintln!(
+                            "ARTIFACT_LOCAL_P1_ORIGINAL_SAVE_PRODUCER snapshot={:?} original_single_save_executed=true nongrant=true",
+                            capture.snapshot()
+                        ),
+                        Some(Err(install_error)) => eprintln!(
+                            "ARTIFACT_LOCAL_P1_ORIGINAL_SAVE_PRODUCER install_error={install_error:?} original_single_save_executed=true diagnostic_UNKNOWN=true"
+                        ),
+                        None => eprintln!(
+                            "ARTIFACT_LOCAL_P1_ORIGINAL_SAVE_PRODUCER original_single_save_executed=true diagnostic_UNKNOWN=true"
+                        ),
                     }
-                    let schema = openbot_infra::artifact_administration::verify_artifact_registration_schema(prepared.pool()).await;
-                    eprintln!("{diagnostic} phase=post_original_Save_error legacy41_42={schema:?}");
-                    if matches!(&schema, Err(openbot_application::ArtifactAdministrationError::Corrupt { field: "registration_schema" })) {
-                        let expected = serde_json::from_str::<serde_json::Value>(include_str!("../../../../fixtures/db/artifact-registration-0042.json"));
-                        let actual = openbot_infra::artifact_administration::capture_artifact_registration_schema(prepared.pool()).await;
-                        match (expected, actual) {
-                            (Ok(expected), Ok(actual)) => {
-                                let mut paths = Vec::new();
-                                cleanup_cached_schema_difference_paths(&expected, &actual, "", &mut paths);
-                                eprintln!("{diagnostic} legacy42_difference_paths={paths:?} path_limit=16 values_omitted=true");
-                            }
-                            (Err(_), _) => eprintln!("{diagnostic} fixed_original_oracle_decode_failed=true"),
-                            (_, Err(error)) => eprintln!("{diagnostic} legacy42_capture_error={error:?}"),
+                    let diagnostic_deadline = Instant::now() + Duration::from_secs(2);
+                    failed_p1_postmaster_pid = capture_original_p1_postmaster(&root.0, diagnostic_deadline);
+                    match failed_p1_postmaster_pid {
+                        Some(pid) => eprintln!("ARTIFACT_LOCAL_P1_SETUP_FACTS original_owned_postmaster_pid={pid} original_private_root_pidfile_bound=true root_path_omitted=true"),
+                        None => eprintln!("ARTIFACT_LOCAL_P1_SETUP_FACTS original_private_root_pidfile_bound=false no_original_pg_termination_claim=true"),
+                    }
+                    capture_original_p1_setup_failure_before(&prepared, &original_save_auth,
+                        &original_save, original_save_started, diagnostic_deadline).await;
+                }
+                let schema = openbot_infra::artifact_administration::verify_artifact_registration_schema(prepared.pool()).await;
+                eprintln!("{diagnostic} phase=post_original_Save_error legacy41_42={schema:?}");
+                if matches!(&schema, Err(openbot_application::ArtifactAdministrationError::Corrupt { field: "registration_schema" })) {
+                    let expected = serde_json::from_str::<serde_json::Value>(include_str!("../../../../fixtures/db/artifact-registration-0042.json"));
+                    let actual = openbot_infra::artifact_administration::capture_artifact_registration_schema(prepared.pool()).await;
+                    match (expected, actual) {
+                        (Ok(expected), Ok(actual)) => {
+                            let mut paths = Vec::new();
+                            cleanup_cached_schema_difference_paths(&expected, &actual, "", &mut paths);
+                            eprintln!("{diagnostic} legacy42_difference_paths={paths:?} path_limit=16 values_omitted=true");
                         }
+                        (Err(_), _) => eprintln!("{diagnostic} fixed_original_oracle_decode_failed=true"),
+                        (_, Err(error)) => eprintln!("{diagnostic} legacy42_capture_error={error:?}"),
                     }
                 }
             }
@@ -2084,9 +2084,7 @@ fn cleanup_arm_local_only_tables_changed(
     }
     Ok(())
 }
-fn cleanup_arm_local_object_fact(
-    path: &Path,
-) -> Result<(u64, u64, u32, u32, u64, u64, String), String> {
+fn cleanup_arm_local_object_fact(path: &Path) -> Result<PhysicalLocalObjectFact, String> {
     let m = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     require(
         m.is_file() && m.mode() & 0o7777 == 0o400 && m.nlink() == 1,

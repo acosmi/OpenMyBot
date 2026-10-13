@@ -102,7 +102,7 @@ impl CallbackInput {
         })
     }
     fn query(&self, code: &str) -> String {
-        format!("state={}&code={code}", &*self.state)
+        format!("state={}&code={code}", *self.state)
     }
     fn request(&self, query: &str) -> Vec<u8> {
         format!(
