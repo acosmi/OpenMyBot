@@ -8956,3 +8956,7 @@ mod tests {
 #[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
 #[path = "tauri_host/thread_history_management_local_tests.rs"]
 mod thread_history_management_local_tests;
+
+#[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
+#[path = "tauri_host/thread_history_stop_clear_local_tests.rs"]
+mod thread_history_stop_clear_local_tests;
