@@ -58,6 +58,7 @@ async fn lost_notify_replays_and_one_commit_wakes_two_replicas_without_duplicate
             client
                 .batch_execute(
                     "INSERT INTO public.users(id,email) VALUES('actor-a','a@example.test');
+                     INSERT INTO public.user_roles(user_id,role) VALUES('actor-a','user');
                      INSERT INTO public.agents(id,name,type,configuration)
                        VALUES('bot-1','Bot 1','built_in','{}'::jsonb);
                      INSERT INTO public.agent_profiles(

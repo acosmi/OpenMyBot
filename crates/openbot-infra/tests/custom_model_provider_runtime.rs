@@ -586,6 +586,53 @@ fn retried(inner: Arc<dyn ProviderAdapter>) -> openbot_agent::RetryingProvider {
     )
     .unwrap()
 }
+// R437/0046 makes a connection's (id,deployment,tenant,owner) scope immutable: the catalog
+// FK is ON UPDATE RESTRICT and the sync trigger refuses a rebinding. First prove that ordinary
+// DML is refused, then move the connection, secret and catalog scope jointly inside this owned
+// disposable superuser DB only, with replica role scoped to that one transaction.
+async fn tamper_owned_connection_scope(c: &tokio_postgres::Client, column: &str, value: &str) {
+    let sql = format!(
+        "UPDATE public.model_connections SET {column}='{value}';\
+         UPDATE public.model_connection_secrets SET {column}='{value}';\
+         UPDATE public.custom_model_catalogs SET {column}='{value}'"
+    );
+    let refused = c
+        .batch_execute(&format!("BEGIN;{sql};COMMIT"))
+        .await
+        .unwrap_err();
+    c.batch_execute("ROLLBACK").await.unwrap();
+    let db = refused
+        .as_db_error()
+        .expect("ordinary scope rebinding must be a database refusal");
+    assert_eq!(
+        (db.code().code(), db.constraint()),
+        ("23503", Some("custom_model_catalogs_connection_scope_fkey"))
+    );
+    let superuser: bool = c
+        .query_one(
+            "SELECT rolsuper FROM pg_roles WHERE rolname=current_user",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        superuser,
+        "owned scope corruption requires the disposable superuser test database"
+    );
+    c.batch_execute(&format!(
+        "BEGIN;SET LOCAL session_replication_role=replica;{sql};COMMIT"
+    ))
+    .await
+    .unwrap();
+    let role: String = c
+        .query_one("SELECT current_setting('session_replication_role')", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(role, "origin");
+}
+
 fn closed(result: Result<Box<dyn ProviderSession>, ProviderPortError>) {
     assert!(
         matches!(result, Err(ProviderPortError::InvalidRequest { .. })),
@@ -1206,13 +1253,13 @@ async fn deployment_tenant_owner_current_reference_and_valid_legacy_cipher_are_n
         let f=Fixture::new(config).await;let tls=TlsFixture::new(vec![]).await;
         let (model,_,request)=f.begin(150,CustomModelProtocol::OpenaiChatCompletions,&tls.endpoint(),false).await;
         let c=f.pool.get().await.unwrap();
-        for (change,restore) in [
-            ("BEGIN;UPDATE public.model_connections SET deployment_id='other';UPDATE public.model_connection_secrets SET deployment_id='other';COMMIT", "BEGIN;UPDATE public.model_connections SET deployment_id='custom-runtime-dep';UPDATE public.model_connection_secrets SET deployment_id='custom-runtime-dep';COMMIT"),
-            ("BEGIN;UPDATE public.model_connections SET tenant_id='other';UPDATE public.model_connection_secrets SET tenant_id='other';COMMIT", "BEGIN;UPDATE public.model_connections SET tenant_id='custom-runtime-tenant';UPDATE public.model_connection_secrets SET tenant_id='custom-runtime-tenant';COMMIT"),
-            ("BEGIN;UPDATE public.model_connections SET owner_user_id='bob';UPDATE public.model_connection_secrets SET owner_user_id='bob';COMMIT", "BEGIN;UPDATE public.model_connections SET owner_user_id='alice';UPDATE public.model_connection_secrets SET owner_user_id='alice';COMMIT"),
+        for (column,other,original) in [
+            ("deployment_id","other","custom-runtime-dep"),
+            ("tenant_id","other","custom-runtime-tenant"),
+            ("owner_user_id","bob","alice"),
         ] {
-            c.batch_execute(change).await.unwrap();closed(f.adapter(tls.dialer(),Duration::from_secs(3)).start(request.clone()).await);
-            c.batch_execute(restore).await.unwrap();
+            tamper_owned_connection_scope(&c,column,other).await;closed(f.adapter(tls.dialer(),Duration::from_secs(3)).start(request.clone()).await);
+            tamper_owned_connection_scope(&c,column,original).await;
         }
         let secret:Uuid=c.query_one("SELECT current_secret_id FROM public.model_connections",&[]).await.unwrap().get(0);
         let replacement=Uuid::new_v4();

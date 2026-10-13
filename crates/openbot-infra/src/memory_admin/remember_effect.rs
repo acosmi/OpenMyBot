@@ -16,6 +16,9 @@ use crate::db::tables::remember_effect_receipts;
 use crate::repo::audit::{append_event_in_transaction, next_event_coordinates};
 use crate::repo::common::insert_sql;
 use crate::run_runtime::{RUN_CANCEL_DESTINATION, run_cancel_outbox_id};
+use crate::thread_history_writer::{CurrentWriterSchema, OpenOrClosed};
+
+use super::history_error;
 
 fn corrupt() -> Error {
     Error::Corrupt {
@@ -42,12 +45,16 @@ pub(super) struct Locked {
     attempt: Row,
     lease: Option<Row>,
     cancelled: bool,
+    /// Set by `admit` only. A closed Thread history refuses a NEW effect (`require_fresh`),
+    /// while an exact replay of an already committed receipt is still returned.
+    history_closed: bool,
 }
 
 impl Locked {
     pub(super) fn require_fresh(&self) -> Result<(), Error> {
         if get::<&str>(&self.run, "status")? != "running"
             || self.cancelled
+            || self.history_closed
             || get::<&str>(&self.attempt, "status")? != "executing"
         {
             return Err(Error::Conflict);
@@ -105,6 +112,7 @@ async fn lock_original(
         attempt,
         lease,
         cancelled,
+        history_closed: false,
     })
 }
 
@@ -139,6 +147,10 @@ pub(super) async fn admit(
     tx.batch_execute("SET LOCAL lock_timeout='5s'")
         .await
         .map_err(db)?;
+    // One strict schema observation before this transaction's first row lock.
+    let schema = CurrentWriterSchema::observe(tx)
+        .await
+        .map_err(history_error)?;
     let generation = number(r.auth_generation().get())?;
     // First business row lock; direct UPDATE mode also serializes default-enabled control absence.
     if tx
@@ -156,7 +168,7 @@ pub(super) async fn admit(
     // Preserve the tool's user/admin rule and check it before historical receipt observation.
     if tx.query_opt("SELECT u.id FROM public.users u WHERE u.id=$1 AND coalesce(u.auth_generation,0)=$2 AND EXISTS(SELECT 1 FROM public.user_roles ur WHERE ur.user_id=u.id AND ur.role IN ('user','admin')) AND NOT EXISTS(SELECT 1 FROM public.revoked_access ra WHERE ra.email=lower(u.email))",
         &[&r.actor().as_str(),&generation]).await.map_err(db)?.is_none() { return Err(Error::NotVisible); }
-    let locked = lock_original(
+    let mut locked = lock_original(
         tx,
         r.actor().as_str(),
         r.run().as_str(),
@@ -210,6 +222,13 @@ pub(super) async fn admit(
         AuditIdentifier::new(id).map_err(|_| corrupt())?;
     }
     visibility(tx, r, &locked).await?;
+    // H SHARE after every existing authority lock, held to the transaction's natural end. Closed
+    // is recorded, not refused here: only a new effect is refused, never an exact replay.
+    locked.history_closed = schema
+        .lock_thread_write_disposition(tx, r.thread())
+        .await
+        .map_err(history_error)?
+        == OpenOrClosed::Closed;
     Ok(locked)
 }
 

@@ -1503,6 +1503,10 @@ async fn final_joint_statement_observes_source_revocation_after_its_actual_relat
                 tx.batch_execute("LOCK TABLE public.user_roles IN ACCESS EXCLUSIVE MODE").await.map_err(|e|e.to_string())?;
                 proceed_tx.send(()).map_err(|_|"real observer ended before final query was released".to_owned())?;
                 let observer=f.pool.get().await.map_err(|e|e.to_string())?;
+                // The marker follows the 1481-byte visible_run CTE; PostgreSQL's 1kB default
+                // truncates it. The owned QA contract fixes track_activity_query_size=16384.
+                let width:i64=observer.query_one("SELECT pg_catalog.pg_size_bytes(pg_catalog.current_setting('track_activity_query_size'))",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
+                require(width>=16_384,"owned PostgreSQL track_activity_query_size was not actually sixteen KiB")?;
                 let mut actual_wait=false;
                 for _ in 0..150 {
                     let held:bool=observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a WHERE a.datname=current_database() AND a.pid<>pg_backend_pid() AND a.query LIKE '%artifact_private_read_record_snapshot%' AND a.wait_event_type='Lock' AND cardinality(pg_blocking_pids(a.pid))>0)",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;

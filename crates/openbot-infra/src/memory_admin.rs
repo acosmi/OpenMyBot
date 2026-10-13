@@ -28,8 +28,10 @@ use time::OffsetDateTime;
 use tokio_postgres::Transaction;
 use tokio_postgres::error::SqlState;
 
+use crate::db::InfraError;
 use crate::db::tables::memories;
 use crate::repo::common::columns_sql;
+use crate::thread_history_writer::{CurrentWriterSchema, OpenOrClosed};
 
 /// Explicit memory 的 production adapter；不包含 background extraction job。
 #[derive(Clone)]
@@ -166,6 +168,17 @@ impl MemoryAdministration for PostgresMemoryAdministration {
             .await
             .map_err(|_| MemoryAdministrationError::Unavailable)?;
         let result = async {
+            // A memory with a source message copies from that Thread's history. It takes one
+            // strict schema observation before this transaction's first row lock and H SHARE
+            // after the permission checks below; a memory with no source reads no Thread.
+            let schema = match request.input.source {
+                Some(_) => Some(
+                    CurrentWriterSchema::observe(&transaction)
+                        .await
+                        .map_err(history_error)?,
+                ),
+                None => None,
+            };
             actor_authority::lock_actor(&transaction, &request.actor, request.auth_generation)
                 .await?;
             ensure_writes_enabled(&transaction, &request.tenant, &request.actor).await?;
@@ -178,6 +191,16 @@ impl MemoryAdministration for PostgresMemoryAdministration {
                 &request.input,
             )
             .await?;
+            if let (Some(schema), Some(source)) = (&schema, &request.input.source)
+                && schema
+                    .lock_thread_write_disposition(&transaction, &source.thread_id)
+                    .await
+                    .map_err(history_error)?
+                    == OpenOrClosed::Closed
+            {
+                // A closed source Thread is unknown to the caller, like any foreign source.
+                return Err(MemoryAdministrationError::NotVisible);
+            }
             let authorization = capture_authorization(
                 &transaction,
                 &request.actor,
@@ -1237,6 +1260,20 @@ async fn finish_transaction<T>(
             let _ = transaction.rollback().await;
             Err(error)
         }
+    }
+}
+
+/// Lock, query and invariant failures of the history admission keep their own class; none of
+/// them reads as closed.
+fn history_error(error: InfraError) -> MemoryAdministrationError {
+    tracing::warn!(error = %error, "memory history admission failed");
+    match error {
+        InfraError::Connect { .. } | InfraError::Query { .. } => {
+            MemoryAdministrationError::Unavailable
+        }
+        _ => MemoryAdministrationError::Corrupt {
+            field: "thread_history_writer",
+        },
     }
 }
 
