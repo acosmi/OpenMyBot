@@ -32,9 +32,6 @@ use openbot_contracts::reconciliation::{
 };
 use serde::Deserialize;
 
-#[cfg(test)]
-use openbot_contracts::command::BeginThreadRunBody;
-
 use crate::auth::{Authenticated, OriginAuthenticated};
 use crate::error::HttpError;
 use crate::http::ServerState;
