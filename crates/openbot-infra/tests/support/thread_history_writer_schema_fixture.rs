@@ -3,7 +3,6 @@
 include!("thread_history_admission_schema_fixture.rs");
 const THREAD_INSERT: &str = "INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,title,status,next_message_seq,next_event_seq,created_at,updated_at,deleted_at) VALUES($1,'owned-origin-tenant','owned-origin-deployment','origin-a','direct_bot',$2,'Owned permanent ID','active',0,0,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',NULL)";
 const OP: &str = "019a1234-5678-7abc-8abc-000000000001";
-const REQUEST: &str = "019a1234-5678-7abc-8abc-000000000002";
 
 async fn head(c: &Client, id: &str) -> TestResult<Option<Value>> {
     c.query_opt("SELECT to_jsonb(h)||jsonb_build_object('storageXmin',xmin::text) FROM openbot_internal.thread_history_heads h WHERE thread_id=$1",&[&id]).await.map_err(|e|e.to_string())?.map(|r|r.try_get(0).map_err(|e|e.to_string())).transpose()
@@ -22,70 +21,6 @@ async fn check_base_head(c: &Client, id: &str) -> TestResult<Value> {
         "actual Thread/full base/head open tuple differs",
     )?;
     Ok(h)
-}
-async fn immediate_refusal(c: &Client, sql: &str, accepted_codes: &[&str]) -> TestResult {
-    c.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
-    let result = c.batch_execute(sql).await;
-    c.batch_execute("ROLLBACK")
-        .await
-        .map_err(|e| e.to_string())?;
-    let error = result
-        .err()
-        .ok_or("actual statement unexpectedly accepted")?;
-    require(
-        error
-            .code()
-            .is_some_and(|code| accepted_codes.contains(&code.code())),
-        "actual refusal SQLSTATE outside registered cause",
-    )
-}
-async fn deferred_refusal(c: &Client, sql: &str) -> TestResult {
-    c.batch_execute("BEGIN").await.map_err(|e| e.to_string())?;
-    if let Err(error) = c.batch_execute(sql).await {
-        c.batch_execute("ROLLBACK")
-            .await
-            .map_err(|e| e.to_string())?;
-        return Err(format!(
-            "deferred premise failed before real COMMIT: {error}"
-        ));
-    }
-    let result = c.batch_execute("COMMIT").await;
-    c.batch_execute("ROLLBACK")
-        .await
-        .map_err(|e| e.to_string())?;
-    let error = result
-        .err()
-        .ok_or("deferred invalid pair actually committed")?;
-    require(
-        error
-            .code()
-            .is_some_and(|code| matches!(code.code(), "23503" | "55000")),
-        "deferred refusal has wrong cause",
-    )
-}
-fn intent_sql(id: &str) -> String {
-    // All identifiers here are owned fixed ASCII fixtures, never user-controlled input.
-    format!(
-        "INSERT INTO openbot_internal.thread_history_clear_intents(deployment_id,tenant_id,thread_id,intent_schema,intent_kind,operation_id,request_id,actor_id,auth_generation,anchor_kind,anchor_id,thread_created_at,recorded_at) SELECT deployment_id,tenant_id,thread_id,1,'stop_clear','{OP}','{REQUEST}','owned-close-actor',7,anchor_kind,anchor_id,thread_created_at,'2026-09-01T00:00:01Z' FROM openbot_internal.thread_history_heads WHERE thread_id='{id}';"
-    )
-}
-fn closed_sql(id: &str) -> String {
-    format!(
-        "UPDATE openbot_internal.thread_history_heads SET phase='closed',closure_operation_id='{OP}',closure_request_id='{REQUEST}',closure_actor_id='owned-close-actor',closure_auth_generation=7,closed_at='2026-09-01T00:00:01Z' WHERE thread_id='{id}';"
-    )
-}
-async fn close_metadata(c: &Client, id: &str) -> TestResult {
-    c.batch_execute(&format!(
-        "BEGIN;{}{}COMMIT;",
-        intent_sql(id),
-        closed_sql(id)
-    ))
-    .await
-    .map_err(|e| e.to_string())?;
-    require(
-        head(c, id).await?.ok_or("closed metadata vanished")?["phase"] == "closed",
-        "metadata close did not commit",
-    )
 }
 async fn raw_thread(c: &Client, id: &str) -> TestResult {
     c.execute(THREAD_INSERT, &[&id, &"origin-bot"])
@@ -314,7 +249,7 @@ async fn writer_raw_open(c: &Client, thread: &str, run: &str) -> TestResult {
 }
 fn writer_raw_body_sql(thread: &str, run: &str) -> Vec<(&'static str, String)> {
     // Finite owned ASCII identities and known table/column constants only.
-    let prefix = format!("WITH stamp AS(SELECT clock_timestamp() at) ");
+    let prefix = "WITH stamp AS(SELECT clock_timestamp() at) ";
     vec![
         (
             "threads",
@@ -397,16 +332,26 @@ async fn writer_stage_close(c: &Client, id: &str) -> TestResult {
     c.execute("UPDATE openbot_internal.thread_history_heads SET phase='closed',closure_operation_id=$2,closure_request_id=$3,closure_actor_id='owned-close-actor',closure_auth_generation=7,closed_at=$4 WHERE thread_id=$1",&[&id,&op,&request,&at]).await.map_err(|e|e.to_string())?;
     Ok(())
 }
+// Channel, Thread, Run and message identities bound by one `writer_canonical` call.
+struct WriterCanonicalIds<'a> {
+    channel: &'a str,
+    thread: &'a str,
+    run: &'a str,
+    message: &'a str,
+}
 async fn writer_canonical(
     p: &pool::DatabasePool,
-    channel: &str,
-    thread: &str,
-    run: &str,
-    message: &str,
+    ids: WriterCanonicalIds<'_>,
     text: &str,
     role: &str,
     second: i64,
 ) -> TestResult {
+    let WriterCanonicalIds {
+        channel,
+        thread,
+        run,
+        message,
+    } = ids;
     let c = p.get().await.map_err(|e| e.to_string())?;
     if !c
         .query_one(
@@ -547,10 +492,12 @@ async fn writer_reverse_matrix(p: &pool::DatabasePool) -> TestResult {
     writer_channel(p, "writer-reverse-matrix").await?;
     writer_canonical(
         p,
-        "writer-reverse-matrix",
-        "writer-matrix-thread",
-        "writer-matrix-run",
-        "writer-matrix-old",
+        WriterCanonicalIds {
+            channel: "writer-reverse-matrix",
+            thread: "writer-matrix-thread",
+            run: "writer-matrix-run",
+            message: "writer-matrix-old",
+        },
         "matrix original",
         "assistant",
         1,
@@ -558,10 +505,12 @@ async fn writer_reverse_matrix(p: &pool::DatabasePool) -> TestResult {
     .await?;
     writer_canonical(
         p,
-        "writer-reverse-matrix",
-        "writer-matrix-thread",
-        "writer-matrix-run",
-        "writer-matrix-new",
+        WriterCanonicalIds {
+            channel: "writer-reverse-matrix",
+            thread: "writer-matrix-thread",
+            run: "writer-matrix-run",
+            message: "writer-matrix-new",
+        },
         "matrix replacement",
         "assistant",
         2,

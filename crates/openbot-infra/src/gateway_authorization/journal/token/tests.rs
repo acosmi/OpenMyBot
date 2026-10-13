@@ -633,8 +633,7 @@ async fn p05_token_ack_error() {
             .and_then(|inner| {
                 inner.map_err(|e| History::new().error(Stage::Capture, initial_kind(e), &outcomes))
             })
-            .err()
-            .expect("fixed initial capture error");
+            .expect_err("fixed initial capture error");
         assert_eq!(error.kind(), expected);
         assert_eq!(error.stage(), Stage::Capture);
         assert_eq!(error.transport_snapshot(), None);

@@ -593,10 +593,7 @@ async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
             "fresh51 did not apply",
         )?;
     } else {
-        require(
-            matches!(version, 47 | 48 | 49 | 50),
-            "unregistered historical prefix",
-        )?;
+        require(matches!(version, 47..=50), "unregistered historical prefix")?;
         baseline::apply(&c).await.map_err(|e| e.to_string())?;
         require(
             native::apply_through(&mut c, version)
