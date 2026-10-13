@@ -1967,7 +1967,12 @@ async fn thread_history_run_drain_open_history_is_not_visible_and_queued_row_is_
         for j in [&open.j, &headless.j, &unknown] {
             not_visible(&f.drain(j).await)?;
         }
-        for bad in ["", "not-a-thread", "00000000-0000-4000-8000-000000000000\n"] {
+        for bad in [
+            "",
+            "not-a-thread",
+            "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",
+            "00000000-0000-4000-8000-000000000000\n",
+        ] {
             check(
                 matches!(
                     f.drain(bad).await,
