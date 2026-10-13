@@ -380,6 +380,10 @@ impl PostgresAgentContextSource {
                    WHERE r.run_id=$1 AND r.thread_id=$2 AND r.bot_id=$3 AND r.actor_id=$4 \
                      AND r.fencing_token=$5 AND r.status='running' \
                      AND t.deployment_id=$6 AND t.tenant_id=$7 \
+                     AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads h \
+                                     WHERE h.deployment_id=t.deployment_id \
+                                       AND h.tenant_id=t.tenant_id \
+                                       AND h.thread_id=t.thread_id AND h.phase='closed') \
                      AND (a.package_id IS NULL OR dp.tenant_id=$7) \
                      AND t.status='active' AND ($8::boolean OR EXISTS( \
                        SELECT 1 FROM public.thread_memberships tm WHERE tm.thread_id=t.thread_id AND tm.user_id=$4)) \
@@ -678,6 +682,22 @@ impl PostgresAgentContextSource {
             )
             .await
             .map_err(|_| AgentContextError::Unavailable)?;
+        // A close that committed after the admission statement above must not hand out a
+        // request built from this read. A missing head is open; a failed check is never open.
+        // The window after this check, up to the provider send, belongs to the in-flight drain.
+        if crate::thread_history_writer::history_closed_for_read(
+            client,
+            &self.deployment,
+            &self.tenant,
+            lease.thread_id(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "agent context history closure check failed");
+            AgentContextError::Unavailable
+        })? {
+            return Err(AgentContextError::Stale);
+        }
         let mut messages = Vec::with_capacity(rows.len() + 1);
         let mut total_bytes = standing_prompt.len();
         if total_bytes > MAX_AGENT_CONTEXT_BYTES {

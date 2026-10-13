@@ -3,6 +3,8 @@
 //! This storage observation grants no user, creator, lease or clear authority.
 
 use openbot_contracts::ids::ThreadId;
+#[cfg(feature = "server-runtime")]
+use openbot_contracts::ids::{DeploymentId, TenantId};
 use tokio_postgres::{Transaction, error::SqlState};
 
 use crate::db::{InfraError, RowDecodeError, native};
@@ -96,6 +98,32 @@ pub(crate) async fn require_open(
         .await?
         .require_open(tx, thread_id)
         .await
+}
+
+/// Read-only consumers: whether the exact J's admission head is closed.
+///
+/// This takes no lock and registers nothing. A missing head is provably open: a closed head
+/// requires its closing intent and base tuple, and a newly minted head can only be open. Any
+/// query or decode failure is an error and never reads as open.
+#[cfg(feature = "server-runtime")]
+pub(crate) async fn history_closed_for_read<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    deployment: &DeploymentId,
+    tenant: &TenantId,
+    thread: &ThreadId,
+) -> Result<bool, InfraError> {
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads h \
+              WHERE h.deployment_id=$1 AND h.tenant_id=$2 AND h.thread_id=$3 \
+                AND h.phase='closed') AS closed",
+            &[&deployment.as_str(), &tenant.as_str(), &thread.as_str()],
+        )
+        .await
+        .map_err(|source| InfraError::query("读取历史正文关闭状态", source))?;
+    Ok(row
+        .try_get("closed")
+        .map_err(|source| RowDecodeError::column("(thread_history_writer)", "closed", source))?)
 }
 
 async fn verify_current_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
