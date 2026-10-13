@@ -134,11 +134,12 @@ async fn owned_response(f: &Fixture, configuration: &Value, full_body: bool) -> 
         sent.len() == 1,
         "one actual owned POST response header write",
     )?;
+    // The owned fixture records Content-Length as a JSON string, so it stays a string comparison.
     check(
         sent[0]["status"] == 200
             && sent[0]["headers"] == headers
             && sent[0]["body_bytes"].as_u64() == Some(raw.len() as u64)
-            && sent[0]["content_length"] == raw.len().to_string(),
+            && sent[0]["content_length"].as_str() == Some(raw.len().to_string().as_str()),
         "actual owned response status/configured headers/declared exact body size",
     )?;
     let tail: Vec<_> = events
@@ -312,7 +313,7 @@ fn registered(old: &Row, next: &Row, f: &Fixture, actor: &str) -> Result<(), Str
     check(
         next.updated_at >= old.updated_at
             && next.updated_at < next.expires_at
-            && next.updated_at.nanosecond() % 1000 == 0,
+            && next.updated_at.nanosecond().is_multiple_of(1000),
         "original-clock PG microsecond floor",
     )?;
     check(
