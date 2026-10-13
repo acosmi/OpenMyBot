@@ -364,12 +364,44 @@ fn begin_request(original: &AuthContext, run: &str) -> BeginThreadRunRequest {
     }
 }
 
-/// A refused producer call: the actual Host refusal and its closed reason.
-fn host_refusal(r: &Close) -> TestResult<HostRequestBindingError> {
+/// Claim, acknowledge and complete the one pending dispatch, which must be `run`'s own: the
+/// Thread then holds no live Run of that dispatch.
+async fn settle_dispatch(pool: &pool::DatabasePool, run: &RunId) -> TestResult {
+    let runtime = PostgresRunRuntime::new(
+        pool.clone(),
+        PROCESS.into(),
+        DEFAULT_THREAD_LEASE_DURATION,
+        DEFAULT_DISPATCH_CLAIM_DURATION,
+    )
+    .map_err(|e| e.to_string())?;
+    let claim = runtime
+        .claim_dispatch()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("owned Local real dispatch missing")?;
+    let lease = runtime
+        .acknowledge_dispatch(&claim)
+        .await
+        .map_err(|e| e.to_string())?;
+    require(
+        lease.run_id() == run,
+        "owned Local dispatch claimed different Run",
+    )?;
+    runtime
+        .finish_run(&lease, lease.next_event_sequence(), RunTerminal::Completed)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|_| ())
+}
+
+/// The call was refused by the actual Host, and the closed reason is exactly `NotCurrent`: a
+/// withdrawn window epoch of the same actor and label, like a closed owner, is no longer current.
+/// `Missing`, `Unavailable` and every other result do not count.
+fn host_not_current(r: &Close) -> TestResult {
     match r {
-        Err(Stop::Host(inner)) => Ok(*inner),
-        Err(other) => Err(format!("expected actual Host refusal, got {other:?}")),
-        Ok(intent) => Err(format!("expected actual Host refusal, got {intent:?}")),
+        Err(Stop::Host(HostRequestBindingError::NotCurrent)) => Ok(()),
+        Err(other) => Err(format!("expected Host(NotCurrent), got {other:?}")),
+        Ok(intent) => Err(format!("expected Host(NotCurrent), got {intent:?}")),
     }
 }
 
@@ -547,31 +579,7 @@ impl LocalFixture {
             .begin_thread_run(req.clone())
             .await
             .map_err(|e| e.to_string())?;
-        let runtime = PostgresRunRuntime::new(
-            p.clone(),
-            PROCESS.into(),
-            DEFAULT_THREAD_LEASE_DURATION,
-            DEFAULT_DISPATCH_CLAIM_DURATION,
-        )
-        .map_err(|e| e.to_string())?;
-        let claim = runtime
-            .claim_dispatch()
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("owned Local real dispatch missing")?;
-        let lease = runtime
-            .acknowledge_dispatch(&claim)
-            .await
-            .map_err(|e| e.to_string())?;
-        require(
-            lease.run_id() == &req.command.run_id,
-            "owned Local dispatch claimed different Run",
-        )?;
-        runtime
-            .finish_run(&lease, lease.next_event_sequence(), RunTerminal::Completed)
-            .await
-            .map_err(|e| e.to_string())?;
-        drop(runtime);
+        settle_dispatch(p, &req.command.run_id).await?;
         let application: Arc<dyn ApplicationService> =
             Arc::new(OpenBotApplication::new(ChannelRepo::new(p.clone())));
         let assets = desktop._sidecar.app_root.join("assets");
@@ -827,13 +835,61 @@ impl LocalFixture {
             "stored Q/H pair is not the exact single acknowledged intent",
         )
     }
-    /// A further new Run on the same J; only a closed H may make this refuse.
-    async fn begin_again_refused(&self) -> TestResult {
-        let again = begin_request(&self.original, "owned-stopclear-local-run-again");
+    /// A further Run request for the fixture's Thread: only the Run id differs from the first.
+    fn further_run(&self, run: &str) -> TestResult<BeginThreadRunRequest> {
+        let request = begin_request(&self.original, run);
         require(
-            again.command.thread_id.as_str() == self.j,
+            request.command.thread_id.as_str() == self.j,
             "rebuilt Run request names another Thread",
         )?;
+        Ok(request)
+    }
+    /// The Thread holds exactly `expected` Runs and all of them are completed: none is queued or
+    /// running.
+    async fn runs_all_completed(&self, expected: i64) -> TestResult {
+        let row = self
+            .pool()
+            .get()
+            .await
+            .map_err(text)?
+            .query_one(
+                "SELECT count(*) AS runs, count(*) FILTER (WHERE status='completed') AS completed, \
+                        count(*) FILTER (WHERE status IN ('queued','running')) AS live \
+                 FROM public.runs WHERE thread_id=$1",
+                &[&self.j],
+            )
+            .await
+            .map_err(text)?;
+        let runs: i64 = row.try_get("runs").map_err(text)?;
+        let completed: i64 = row.try_get("completed").map_err(text)?;
+        let live: i64 = row.try_get("live").map_err(text)?;
+        require(
+            runs == expected && completed == expected && live == 0,
+            "the Thread does not hold exactly the expected completed Runs and no live Run",
+        )
+    }
+    /// Positive control for `begin_again_refused`: while H is open a further Run on the same J is
+    /// admitted as a new Run. It is run to its terminal state at once, so the Thread holds no live
+    /// Run afterwards and only the closure can refuse the next one.
+    async fn open_admits_further_run(&self) -> TestResult {
+        let further = self.further_run("owned-stopclear-local-run-open")?;
+        let started = self
+            .directory
+            .begin_thread_run(further.clone())
+            .await
+            .map_err(text)?;
+        require(
+            started.thread_id.as_str() == self.j
+                && started.run_id == further.command.run_id
+                && !started.replayed,
+            "open Local J did not admit the further Run as a new Run",
+        )?;
+        settle_dispatch(self.pool(), &further.command.run_id).await?;
+        self.runs_all_completed(2).await
+    }
+    /// A further new Run on the same J; only a closed H may make this refuse.
+    async fn begin_again_refused(&self) -> TestResult {
+        let again = self.further_run("owned-stopclear-local-run-again")?;
         require(
             matches!(
                 self.directory.begin_thread_run(again).await,
@@ -884,7 +940,10 @@ async fn wait_actor(pool: &pool::DatabasePool, blocker: i32) -> TestResult<i32> 
 
 /// The six legs, in order, on one actual Local sidecar and one protocol owner.
 async fn exercise(f: &LocalFixture) -> TestResult {
-    // L0: the genuine original window is eligible, H is open and there is no intent.
+    // L0: the genuine original window is eligible, H is open and there is no intent. While H is
+    // open a further Run on the same J is admitted and run to its terminal state first; that is
+    // the positive control for the refusal L3 expects after the closure. Only then is the baseline
+    // taken.
     let protocol = f.protocol()?;
     protocol
         .bind_window("main", f.original.clone(), None)
@@ -895,12 +954,14 @@ async fn exercise(f: &LocalFixture) -> TestResult {
         f.phase().await?.as_deref() == Some("open") && f.intents().await? == 0,
         "premise: the Thread head is open and has no intent",
     )?;
+    f.open_admits_further_run().await?;
+    eprintln!("THREAD_HISTORY_STOP_CLEAR id=L01 leg=L0 open_admits_further_run=true");
     let hq0 = f.hq().await?;
     let facts0 = f.facts().await?;
     require(
         hq0["openbot_internal.thread_history_heads"]
             .as_array()
-            .is_some_and(|heads| heads.len() == 1)
+            .is_some_and(|heads| heads.len() == 1 && heads[0]["phase"] == "open")
             && hq0["openbot_internal.thread_history_clear_intents"]
                 .as_array()
                 .is_some_and(|intents| intents.is_empty()),
@@ -909,15 +970,19 @@ async fn exercise(f: &LocalFixture) -> TestResult {
     f.nothing_written(&hq0, &facts0, "L0 baseline").await?;
 
     // L1: a window withdrawn before the call borrows its Host is refused and nothing is written.
+    // The window map now holds another binding id under the label, so the guard's `check_window`
+    // answers NotCurrent while the producer borrows its Host, before it takes a connection.
     let second = f.rebind(&protocol, &first)?;
     let request_a = request_id();
-    let stale_before_borrow = host_refusal(&f.close(&first, &request_a).await)?;
+    host_not_current(&f.close(&first, &request_a).await)?;
     f.nothing_written(&hq0, &facts0, "L1 stale window before borrow")
         .await?;
-    eprintln!("THREAD_HISTORY_STOP_CLEAR id=L01 leg=L1 host_refusal={stale_before_borrow:?}");
+    eprintln!("THREAD_HISTORY_STOP_CLEAR id=L01 leg=L1 host_refusal=NotCurrent");
 
     // L2: the window is withdrawn while the producer's original transaction waits for the actor
-    // row. The refusal comes after the wait ends, and its ROLLBACK leaves nothing behind.
+    // row. The refusal comes after the wait ends (the Host tail witness of the first fresh joint
+    // statement finds another binding id under the label and answers NotCurrent), and its ROLLBACK
+    // leaves nothing behind.
     let request_b = request_id();
     let mut writer = f.pool().get().await.map_err(text)?;
     let writer_pid: i32 = writer
@@ -943,48 +1008,63 @@ async fn exercise(f: &LocalFixture) -> TestResult {
     let third = f.rebind(&protocol, &second)?;
     tx.rollback().await.map_err(text)?;
     drop(writer);
-    let stale_in_tx = host_refusal(&task.await.map_err(text)?)?;
+    host_not_current(&task.await.map_err(text)?)?;
     f.nothing_written(&hq0, &facts0, "L2 stale window inside the transaction")
         .await?;
     eprintln!(
-        "THREAD_HISTORY_STOP_CLEAR id=L01 leg=L2 actual_actor_wait_pid={actor_wait_pid} original_writer_pid={writer_pid} host_refusal={stale_in_tx:?}"
+        "THREAD_HISTORY_STOP_CLEAR id=L01 leg=L2 actual_actor_wait_pid={actor_wait_pid} original_writer_pid={writer_pid} host_refusal=NotCurrent"
     );
 
-    // L3: the current window closes J with the very request id L1 was refused with.
+    // L3: the current window closes J with the very request id L1 was refused with. The H/Q
+    // snapshot (row versions included) is taken right after the stored pair was checked, and every
+    // later step has to leave it exactly as it is.
     let closed = f.close(&third, &request_a).await;
     let operation = committed(&closed, &third, &f.j, &request_a)?;
     f.stored(&third, &request_a, &operation, 0).await?;
+    let hq1 = f.hq().await?;
     require(
         facts0 == f.facts().await?,
         "the producer changed an original fact other than H and Q",
     )?;
     f.begin_again_refused().await?;
+    require(
+        hq1 == f.hq().await?,
+        "the refused further Run changed H or Q",
+    )?;
     f.authority
         .observe_management_before(&third, &f.j, deadline())
         .await
         .map_err(text)?;
-    let hq1 = f.hq().await?;
+    require(hq1 == f.hq().await?, "the 034 observer changed H or Q")?;
     let replay = f.close(&third, &request_a).await;
     replayed(&replay, &f.j, &request_a, &operation)?;
     f.nothing_written(&hq1, &facts0, "L3 exact replay").await?;
 
     // L4: a window withdrawn after the commit is refused and does not poison its successor.
     let fourth = f.rebind(&protocol, &third)?;
-    let stale_after_commit = host_refusal(&f.close(&third, &request_a).await)?;
+    host_not_current(&f.close(&third, &request_a).await)?;
     f.nothing_written(&hq1, &facts0, "L4 stale window after commit")
         .await?;
     let replay = f.close(&fourth, &request_a).await;
     replayed(&replay, &f.j, &request_a, &operation)?;
     f.nothing_written(&hq1, &facts0, "L4 exact replay").await?;
     eprintln!(
-        "THREAD_HISTORY_STOP_CLEAR id=L01 leg=L4 host_refusal={stale_after_commit:?} operation_unchanged=true"
+        "THREAD_HISTORY_STOP_CLEAR id=L01 leg=L4 host_refusal=NotCurrent operation_unchanged=true"
     );
 
-    // L5: once the protocol owner closes, even the last current window is refused.
+    // L5: once the protocol owner closes, even the last current window is refused, and the reason
+    // is exactly NotCurrent. Dropping the protocol closes its owner lease synchronously. The
+    // producer's first Host check, `CurrentThreadHistoryRequest::borrow`, refuses a closed owner
+    // (`!issuer.observation().is_current()`) with NotCurrent before any window map, identity
+    // source or statement is consulted. The only checks ahead of it are the shared deadline and
+    // `scope`: they fail with Unavailable for a spent deadline or a closed Pool and with
+    // NotVisible for a foreign scope or role, and none of that holds here. The window guard behind
+    // it would answer NotCurrent first for a closed owner as well (`check_window`), so neither its
+    // window-map branch nor its missing-source branch (Unavailable) is ever reached.
     drop(protocol);
-    let owner_closed = host_refusal(&f.close(&fourth, &request_a).await)?;
+    host_not_current(&f.close(&fourth, &request_a).await)?;
     f.nothing_written(&hq1, &facts0, "L5 owner closed").await?;
-    eprintln!("THREAD_HISTORY_STOP_CLEAR id=L01 leg=L5 host_refusal={owner_closed:?}");
+    eprintln!("THREAD_HISTORY_STOP_CLEAR id=L01 leg=L5 host_refusal=NotCurrent");
 
     eprintln!(
         "THREAD_HISTORY_STOP_CLEAR id=L01 actual_actor_wait_pid={actor_wait_pid} stale_before_borrow_refused=true stale_in_tx_refused=true commit_ack=true exact_replay=true stale_after_commit_refused=true owner_closed_refused=true"
