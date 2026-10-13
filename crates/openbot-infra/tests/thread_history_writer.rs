@@ -3,7 +3,6 @@
 #![cfg(feature = "server-runtime")]
 mod harness;
 use async_trait::async_trait;
-use openbot_application::AgentContextSource;
 use openbot_application::model_connections::ModelConnectionAdministration;
 use openbot_application::provider::{
     RemoteAguiEventStream, RemoteAguiTransport, RemoteAguiTransportError,
@@ -41,16 +40,11 @@ use openbot_infra::{
     model_connections::PostgresModelConnections,
     model_dataset::PostgresModelDatasetBinding,
     policy::PolicyStore,
-    provider::context::PostgresAgentContextSource,
     vault::CredentialRecordVault,
 };
 use openbot_infra::{
-    db::{
-        self, InfraError, baseline, desktop_vault_canary, fresh, native, pool, schema_facts,
-        thread_origin_schema as origin_schema,
-    },
+    db::{InfraError, baseline, fresh, native, pool, thread_origin_schema as origin_schema},
     intelligence_import::PostgresIntelligenceImportStore,
-    repo::{ChannelRepo, thread::ThreadRepo},
     run_runtime::{DEFAULT_DISPATCH_CLAIM_DURATION, PostgresRunRuntime},
     thread_directory::{DEFAULT_THREAD_LEASE_DURATION, PostgresThreadDirectory},
 };
@@ -67,7 +61,6 @@ type TestResult<T = ()> = Result<T, String>;
 const DEP: &str = "owned-origin-deployment";
 const TENANT: &str = "owned-origin-tenant";
 const PROCESS: &str = "owned-origin-runtime";
-const ORIGIN_COLUMNS: &str = "thread_id,deployment_id,tenant_id,creator_actor_id,anchor_kind,anchor_id,thread_created_at,origin_kind,origin_schema,recorded_at,import_bundle_id,import_payload_sha256,import_signing_key_id,import_thread_checksum";
 use openbot_application::provider::{ProviderRemoteProjection, ProviderRemoteProjectionKind};
 use openbot_application::{
     COMPONENT_HUMAN_DECISION_TTL, ComponentAdministration, ComponentAdministrationError,
@@ -80,8 +73,7 @@ use openbot_contracts::components::{
     ASK_APPROVAL_COMPONENT_DESCRIPTION, ASK_APPROVAL_COMPONENT_NAME, ASK_APPROVAL_COMPONENT_TITLE,
     ComponentApprovalAnswer, ComponentApprovalDecision, ComponentHumanDecisionAnswer,
 };
-use openbot_contracts::ids::{ThreadId, ToolCallId};
-use openbot_domain::audit::hash::Sha256Digest;
+use openbot_contracts::ids::ToolCallId;
 use openbot_domain::tool::args::ToolArguments;
 use openbot_infra::component_catalogue::PostgresComponentAdministration;
 use openbot_infra::db::thread_history_admission_schema as admission_schema;
@@ -579,7 +571,7 @@ async fn w10_three_channel_callers_require_complete_source_pair() {
         // V1 and V2 real user callers are both exercised by w02; this case
         // executes the third production caller and both halves' final constraints.
         writer_channel(&p,"writer-source-pair").await?;
-        writer_canonical(&p,"writer-source-pair","writer-pair-thread","writer-pair-run","writer-pair-message","owned canonical user","user",1).await?;
+        writer_canonical(&p,WriterCanonicalIds{channel:"writer-source-pair",thread:"writer-pair-thread",run:"writer-pair-run",message:"writer-pair-message"},"owned canonical user","user",1).await?;
         let c=p.get().await.map_err(|e|e.to_string())?;
         writer_refusal(&c,"UPDATE public.channels SET last_message='forged',last_message_at='2026-09-01T00:00:01Z' WHERE id='writer-source-pair'","thread_history_writer_binding_invalid").await?;
         c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
@@ -647,7 +639,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
         drop(c);
         writer_channel(&p,"writer-reverse-channel").await?;
         let long="😀".repeat(201);
-        writer_canonical(&p,"writer-reverse-channel","writer-reverse-thread","writer-reverse-run","writer-reverse-message",&long,"assistant",1).await?;
+        writer_canonical(&p,WriterCanonicalIds{channel:"writer-reverse-channel",thread:"writer-reverse-thread",run:"writer-reverse-run",message:"writer-reverse-message"},&long,"assistant",1).await?;
         let c=p.get().await.map_err(|e|e.to_string())?;c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;writer_pair_sql(&c,"writer-reverse-channel","writer-reverse-message",true).await?;c.batch_execute("COMMIT").await.map_err(|e|e.to_string())?;
         for sql in [
             "UPDATE public.messages SET content=jsonb_set(content,'{text}',to_jsonb(left(search_text,200)||'x')),search_text=left(search_text,200)||'x' WHERE message_id='writer-reverse-message'",
@@ -665,7 +657,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
         drop(c);
         // Two actual transactions share the channel mutex in both directions.
         writer_channel(&p,"writer-two-tx").await?;
-        writer_canonical(&p,"writer-two-tx","writer-two-thread","writer-two-run","writer-two-message","two Tx canonical","assistant",1).await?;
+        writer_canonical(&p,WriterCanonicalIds{channel:"writer-two-tx",thread:"writer-two-thread",run:"writer-two-run",message:"writer-two-message"},"two Tx canonical","assistant",1).await?;
         let a=p.get().await.map_err(|e|e.to_string())?;a.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
         a.query_one("SELECT id FROM public.channels WHERE id='writer-two-tx' FOR UPDATE",&[]).await.map_err(|e|e.to_string())?;
         let b=p.get().await.map_err(|e|e.to_string())?;b.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
@@ -690,7 +682,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
         // Only actual production callbacks notify. Seed a later, valid canonical
         // pair, then a real older Begin must preserve it and produce no wake.
         writer_channel(&p,"writer-notify-channel").await?;
-        writer_canonical(&p,"writer-notify-channel","writer-notify-seed","writer-notify-seed-run","writer-notify-seed-msg","owned future canonical","assistant",2_000_000_000).await?;
+        writer_canonical(&p,WriterCanonicalIds{channel:"writer-notify-channel",thread:"writer-notify-seed",run:"writer-notify-seed-run",message:"writer-notify-seed-msg"},"owned future canonical","assistant",2_000_000_000).await?;
         let c=p.get().await.map_err(|e|e.to_string())?;
         c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;writer_pair_sql(&c,"writer-notify-channel","writer-notify-seed-msg",true).await?;c.batch_execute("COMMIT").await.map_err(|e|e.to_string())?;drop(c);
         let(listener,mut notes,driver)=writer_listen(&config).await?;
@@ -704,7 +696,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
         let mut req=request("origin-a",361199);req.command.anchor=ThreadRunAnchor::Channel{channel_id:ChannelId::new("writer-notify-channel")};req.command.message="actual older source".into();
         directory(&p,&config)?.begin_thread_run(req.clone()).await.map_err(|e|e.to_string())?;
         writer_notify_barrier(&listener,&mut notes).await?;
-        writer_canonical(&p,"writer-notify-channel","writer-notify-equal","writer-notify-equal-run","writer-notify-equal-msg","owned equal canonical","assistant",2_000_000_000).await?;
+        writer_canonical(&p,WriterCanonicalIds{channel:"writer-notify-channel",thread:"writer-notify-equal",run:"writer-notify-equal-run",message:"writer-notify-equal-msg"},"owned equal canonical","assistant",2_000_000_000).await?;
         let c=p.get().await.map_err(|e|e.to_string())?;c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
         let equal=writer_pair_sql_pg(&c,"writer-notify-channel","writer-notify-equal-msg",true).await;c.batch_execute("ROLLBACK").await.map_err(|e|e.to_string())?;
         require(equal.is_err_and(|e|e.as_db_error().is_some_and(|d|d.code().code()=="55000"&&d.message()=="thread_history_writer_source_order_refused")),"equal timestamp source replacement bypassed strict ordering")?;
@@ -717,7 +709,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
         // This is an owned transaction rollback witness, not a Rust late-outbox
         // fault: production Begin inserts its outbox before record_from_message.
         writer_channel(&p,"writer-notify-rollback").await?;
-        writer_canonical(&p,"writer-notify-rollback","writer-notify-rollback-thread","writer-notify-rollback-run","writer-notify-rollback-msg","owned rollback body","assistant",9).await?;
+        writer_canonical(&p,WriterCanonicalIds{channel:"writer-notify-rollback",thread:"writer-notify-rollback-thread",run:"writer-notify-rollback-run",message:"writer-notify-rollback-msg"},"owned rollback body","assistant",9).await?;
         let before=writer_snapshot(&p).await?;
         let c=p.get().await.map_err(|e|e.to_string())?;
         c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;
