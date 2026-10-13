@@ -908,11 +908,13 @@ async fn thread_history_management_bad_known_binding_and_database_failures_are_d
  f.resolver.close_request_bindings();host_refused(f.authority.observe_management_before(&a,&j,deadline()).await)?;eprintln!("THREAD_HISTORY_OBSERVATION id=H08 schema_and_original_host_errors_distinct=true actual_RowDecode_credit=0");f.finish().await
 }).await;
 }
+// Proxy-side ends of one `AckHold`: signal the real ROLLBACK ACK arrived, then await its release.
+type ProxyAckHold = (oneshot::Sender<()>, oneshot::Receiver<()>);
 // Protocol-aware owned PG relay. Only a real backend ROLLBACK CommandComplete is held/dropped.
 struct AckProxy {
     port: u16,
     remaining: Arc<AtomicUsize>,
-    control: Arc<tokio::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>>,
+    control: Arc<tokio::sync::Mutex<Option<ProxyAckHold>>>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -940,9 +942,7 @@ impl AckProxy {
             .map_err(|e| e.to_string())?;
         let local = listener.local_addr().map_err(|e| e.to_string())?.port();
         let remaining = Arc::new(AtomicUsize::new(0));
-        let control = Arc::new(tokio::sync::Mutex::new(
-            None::<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
-        ));
+        let control = Arc::new(tokio::sync::Mutex::new(None::<ProxyAckHold>));
         let count = remaining.clone();
         let gate = control.clone();
         let (stop, mut stopped) = oneshot::channel();
@@ -1020,7 +1020,7 @@ async fn thread_history_management_waits_recheck_current_facts_and_use_positive_
  let mut writer=f.pool.get().await.map_err(|e|e.to_string())?;let tx=writer.transaction().await.map_err(|e|e.to_string())?;tx.execute("UPDATE public.threads SET title=title WHERE thread_id=$1",&[&j]).await.map_err(|e|e.to_string())?;unavailable(f.authority.observe_management_before(&a,&j,deadline()).await)?;tx.rollback().await.map_err(|e|e.to_string())?;drop(writer);f.eligible(&a,&j).await?;
  let(r1,r2)=tokio::join!(f.authority.observe_management_before(&a,&j,deadline()),f.authority.observe_management_before(&a,&j,deadline()));check(r1.is_ok()&&r2.is_ok(),"parallel valid original observations failed")?;
  let mut hold=proxy.hold().await?;let authority=f.authority.clone();let aa=a.clone();let jj=j.clone();let task=tokio::spawn(async move{authority.observe_management_before(&aa,&jj,deadline()).await});hold.wait().await?;check(!task.is_finished(),"success escaped before real original ROLLBACK ACK")?;hold.release()?;check(task.await.map_err(|e|e.to_string())?.is_ok(),"released original ACK did not permit bounded snapshot")?;
- let mut writer=f.pool.get().await.map_err(|e|e.to_string())?;let pid:i32=writer.query_one("SELECT pg_backend_pid()",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;let tx=writer.transaction().await.map_err(|e|e.to_string())?;tx.execute("UPDATE public.users SET auth_generation=auth_generation WHERE id=$1",&[&A]).await.map_err(|e|e.to_string())?;let original=Instant::now()+Duration::from_secs(2);let authority=f.authority.clone();let aa=a.clone();let jj=j.clone();let task=tokio::spawn(async move{authority.observe_management_before(&aa,&jj,original).await});let _=wait_actor_lock(&f.pool,pid).await?;check(!task.is_finished(),"original observer ended before the real actor lock wait")?;unavailable(task.await.map_err(|e|e.to_string())?)?;check(Instant::now()<=original+Duration::from_secs(1),"original deadline renewed during the actor lock wait")?;tx.rollback().await.map_err(|e|e.to_string())?;drop(writer);f.eligible(&a,&j).await?;
+ let mut writer=f.pool.get().await.map_err(|e|e.to_string())?;let pid:i32=writer.query_one("SELECT pg_backend_pid()",&[]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;let tx=writer.transaction().await.map_err(|e|e.to_string())?;tx.execute("UPDATE public.users SET auth_generation=auth_generation WHERE id=$1",&[&A]).await.map_err(|e|e.to_string())?;let original=Instant::now()+Duration::from_secs(2);let authority=f.authority.clone();let aa=a.clone();let jj=j.clone();let task=tokio::spawn(async move{authority.observe_management_before(&aa,&jj,original).await});let _=wait_actor_lock(&f.pool,pid).await?;check(!task.is_finished(),"original observer ended before the real actor lock wait")?;unavailable(tokio::time::timeout_at(tokio::time::Instant::from_std(original+Duration::from_secs(1)),task).await.map_err(|_|"original deadline renewed during the actor lock wait".to_string())?.map_err(|e|e.to_string())?)?;check(Instant::now()<=original+Duration::from_secs(1),"original deadline renewed during the actor lock wait")?;tx.rollback().await.map_err(|e|e.to_string())?;drop(writer);f.eligible(&a,&j).await?;
  f.finish().await?;proxy.finish().await
 }).await;
 }
