@@ -156,8 +156,8 @@ BEGIN
  ELSE
   IF ROW(NEW.deployment_id,NEW.tenant_id,NEW.thread_id) IS DISTINCT FROM
      ROW(v_q.deployment_id,v_q.tenant_id,v_q.thread_id) OR
-     NEW.source IS DISTINCT FROM CASE v_q.intent_kind WHEN 'stop_clear' THEN 'stop_clear'
-       WHEN 'maintenance_clear' THEN 'maintenance' ELSE NULL END OR
+     NEW.source IS DISTINCT FROM (CASE v_q.intent_kind WHEN 'stop_clear' THEN 'stop_clear'
+       WHEN 'maintenance_clear' THEN 'maintenance' ELSE NULL END) OR
      NEW.completed_at<v_q.recorded_at THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_clear_binding_invalid';
   END IF;
@@ -674,8 +674,8 @@ BEGIN
  v_thread:=v_q.thread_id;
  IF NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads h
    WHERE h.thread_id=v_thread AND h.phase='closed' AND h.closure_operation_id=NEW.operation_id) OR
-   NEW.source IS DISTINCT FROM CASE v_q.intent_kind WHEN 'stop_clear' THEN 'stop_clear'
-    WHEN 'maintenance_clear' THEN 'maintenance' ELSE NULL END THEN
+   NEW.source IS DISTINCT FROM (CASE v_q.intent_kind WHEN 'stop_clear' THEN 'stop_clear'
+    WHEN 'maintenance_clear' THEN 'maintenance' ELSE NULL END) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_clear_binding_invalid';
  END IF;
  SELECT count(*) AS batches,max(batch_seq) AS max_seq,max(recorded_at) AS last_at,
@@ -764,14 +764,14 @@ BEGIN
   v_oid:=v_row.oid;
   SELECT count(*) INTO v_count FROM pg_catalog.pg_attribute
    WHERE attrelid=v_oid AND attnum>0 AND NOT attisdropped;
-  IF v_count<>CASE v_name WHEN 'thread_history_clear_batches' THEN 14 ELSE 18 END OR
+  IF v_count<>(CASE v_name WHEN 'thread_history_clear_batches' THEN 14 ELSE 18 END) OR
      EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=v_oid AND attnum>0 AND
        (attisdropped OR NOT attnotnull OR attidentity<>'' OR attgenerated<>'')) OR
      EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite WHERE ev_class=v_oid) OR
      EXISTS(SELECT 1 FROM pg_catalog.pg_policy WHERE polrelid=v_oid) OR
      EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=v_oid OR inhparent=v_oid) OR
      (SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid=v_oid)<>
-       CASE v_name WHEN 'thread_history_clear_batches' THEN 6 ELSE 9 END OR
+       (CASE v_name WHEN 'thread_history_clear_batches' THEN 6 ELSE 9 END) OR
      EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=v_oid AND
        (NOT convalidated OR (contype<>'t' AND (condeferrable OR condeferred)))) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_clear_schema_invalid';
@@ -858,7 +858,7 @@ BEGIN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_clear_schema_invalid';
   END IF;
   IF (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid=v_oid AND NOT tgisinternal)<>
-      CASE v_name WHEN 'thread_history_clear_batches' THEN 2 ELSE 3 END OR
+      (CASE v_name WHEN 'thread_history_clear_batches' THEN 2 ELSE 3 END) OR
      EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=v_oid AND NOT tgisinternal AND
       (tgenabled<>'O' OR tgnargs<>0 OR tgargs<>''::bytea OR tgqual IS NOT NULL)) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='thread_history_clear_schema_invalid';
