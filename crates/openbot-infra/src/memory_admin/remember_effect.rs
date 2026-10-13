@@ -17,6 +17,7 @@ use crate::repo::audit::{append_event_in_transaction, next_event_coordinates};
 use crate::repo::common::insert_sql;
 use crate::run_runtime::{
     RUN_CANCEL_DESTINATION, RunCancelAcceptance, run_cancel_acceptance, run_cancel_outbox_id,
+    thread_history_closed_by_sql,
 };
 use crate::thread_history_writer::{CurrentWriterSchema, OpenOrClosed};
 
@@ -124,8 +125,19 @@ async fn cancellation(
     thread: &str,
     actor: &str,
 ) -> Result<bool, Error> {
-    let Some(row) = tx.query_opt("SELECT aggregate_kind,aggregate_id,seq,destination,delivery_class,payload,status FROM public.outbox WHERE outbox_id=$1",
-        &[&run_cancel_outbox_id(run)]).await.map_err(db)? else { return Ok(false); };
+    // One statement, no lock: the acceptance and, for a system acceptance, whether the Thread's head
+    // is closed by exactly the operation it names (read from head and intent without a lock).
+    let sql = format!(
+        "SELECT o.aggregate_kind,o.aggregate_id,o.seq,o.destination,o.delivery_class,o.payload,o.status,{} AS system_bound FROM public.outbox o WHERE o.outbox_id=$1",
+        thread_history_closed_by_sql("o.payload->>'operationId'", "$2")
+    );
+    let Some(row) = tx
+        .query_opt(&sql, &[&run_cancel_outbox_id(run), &thread])
+        .await
+        .map_err(db)?
+    else {
+        return Ok(false);
+    };
     require(
         get::<&str>(&row, "aggregate_kind")? == "run"
             && get::<&str>(&row, "aggregate_id")? == run
@@ -133,14 +145,18 @@ async fn cancellation(
             && get::<&str>(&row, "destination")? == RUN_CANCEL_DESTINATION
             && get::<&str>(&row, "delivery_class")? == "internal"
             // The one acceptance of the Run is lawful in exactly two shapes: this actor's own
-            // request, or the system stop of a closed Thread history. Both fence a fresh effect.
+            // request, or the system stop of a closed Thread history, which holds only when that
+            // operation closed this Thread's head. Both fence a fresh effect; any other row, a
+            // system-shaped one the head and intent do not bear out included, is a broken binding.
             && match run_cancel_acceptance(
                 &get::<serde_json::Value>(&row, "payload")?,
                 run,
                 thread,
             ) {
                 Some(RunCancelAcceptance::Actor(requested_by)) => requested_by == actor,
-                Some(RunCancelAcceptance::ThreadHistoryClosed { .. }) => true,
+                Some(RunCancelAcceptance::ThreadHistoryClosed { .. }) => {
+                    get::<bool>(&row, "system_bound")?
+                }
                 None => false,
             }
             && matches!(

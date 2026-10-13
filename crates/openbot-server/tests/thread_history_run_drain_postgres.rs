@@ -11,36 +11,57 @@ mod harness {
 }
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use openbot_application::model_connections::ModelConnectionAdministration;
 use openbot_application::{
-    BeginThreadRunRequest, CancelThreadRunRequest, CommittedMemoryEffect,
-    MemoryAdministrationError, RememberToolMemory, RememberToolMemoryRequest,
-    RunCancellationDisposition, RunDispatchConsumer, RunDispatchDecision, RunExecutionLease,
-    RunFailureCode, RunRuntime, RunRuntimeError, RunSemanticChannel, RunTerminal, ThreadDirectory,
-    ThreadDirectoryError, ToolDecisionDraft, ToolJournal, ToolOutcomeDraft, ToolPortError,
-    ToolRefusalDraft, invoke_tool,
+    AgentContextSource, BeginThreadRunRequest, BeginThreadRunV2Request, CancelThreadRunRequest,
+    CommittedMemoryEffect, MemoryAdministrationError, ProviderAdapter, RememberToolMemory,
+    RememberToolMemoryRequest, RunCancellationDisposition, RunDispatchConsumer,
+    RunDispatchDecision, RunExecutionLease, RunFailureCode, RunRuntime, RunRuntimeError,
+    RunSemanticChannel, RunTerminal, ThreadDirectory, ThreadDirectoryError, ToolDecisionDraft,
+    ToolJournal, ToolOutcomeDraft, ToolPortError, ToolRefusalDraft, invoke_tool,
 };
 use openbot_contracts::auth::AuthContext;
 use openbot_contracts::command::{
-    BeginThreadRun, CancelThreadRun, ThreadRunAnchor, ThreadRunCancellationState,
+    BeginThreadRun, BeginThreadRunV2, CancelThreadRun, ThreadRunAnchor, ThreadRunCancellationState,
 };
 use openbot_contracts::error::AppError;
 use openbot_contracts::ids::thread::ThreadIdentity;
 use openbot_contracts::ids::{
     ActorId, BotId, CapabilityId, ChannelId, DeploymentId, RunId, TenantId, ThreadId, ToolCallId,
 };
+use openbot_contracts::model_connections::{
+    CreateModelConnection, CustomModelProtocol, ModelApiKey,
+};
 use openbot_contracts::tool::{ToolInvocation, ToolResult};
+use openbot_contracts::versioned_model_selection::{
+    ModelSelectionIntentSource, RunModelSelectionV2,
+};
 use openbot_domain::identity::session::{SessionHashKey, SessionToken, SessionTokenHash};
 use openbot_domain::policy::{ActionPolicy, PolicyMode};
+use openbot_domain::remote_callback::RemoteRunAssertionSigner;
 use openbot_domain::tool::pipeline::DurableDecisionReceipt;
+use openbot_domain::vault::{KeyVersion, SecretBytes, WrappingKey};
 use openbot_infra::agent_tools::PostgresBuiltInToolControlPlane;
+use openbot_infra::application_assembly::{
+    ChannelRoutingProviderInput, PostgresApplicationAssembly, PostgresApplicationAssemblyInput,
+    assemble_postgres_application,
+};
 use openbot_infra::artifact_registry::ArtifactDatasetRegistry;
 use openbot_infra::db::{fresh, pool};
 use openbot_infra::memory_admin::PostgresMemoryAdministration;
+use openbot_infra::model_connections::PostgresModelConnections;
+use openbot_infra::net::safe_http::{
+    CidrAllowlist, DnsResolver, DnsUnavailable, EgressPolicy, SafeDialer, SafeHttpBudget,
+};
 use openbot_infra::policy::PolicyStore;
+use openbot_infra::provider::context::PostgresAgentContextSource;
+use openbot_infra::provider::custom::PostgresCustomModelProvider;
 use openbot_infra::repo::ChannelRepo;
 use openbot_infra::repo::tools::PostgresToolJournal;
 use openbot_infra::run_runtime::{DEFAULT_DISPATCH_CLAIM_DURATION, PostgresRunRuntime, RunRelay};
@@ -49,10 +70,15 @@ use openbot_infra::thread_history_authority::{
     PostgresThreadHistoryAuthority, ThreadHistoryRunDrain,
     ThreadHistoryStopClearConfirmation as Confirmation, ThreadHistoryStopClearError as Stop,
 };
+use openbot_infra::vault::CredentialRecordVault;
 use openbot_server::{AuthResolver, PostgresSessionAuthResolver};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+use tokio::net::TcpListener;
+use tokio::sync::{Notify, oneshot};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 type Result<T = ()> = std::result::Result<T, String>;
 type Drain = std::result::Result<ThreadHistoryRunDrain, Stop>;
@@ -179,6 +205,23 @@ impl RunDispatchConsumer for Consumer {
         } else {
             RunCancellationDisposition::NoLocalChild
         }
+    }
+}
+
+#[derive(Default)]
+struct NoRemote;
+#[async_trait]
+impl openbot_application::provider::RemoteAguiTransport for NoRemote {
+    async fn start(
+        &self,
+        _: &str,
+        _: Option<&openbot_application::RemoteAguiAuthorization>,
+        _: Vec<u8>,
+    ) -> std::result::Result<
+        Box<dyn openbot_application::provider::RemoteAguiEventStream>,
+        openbot_application::provider::RemoteAguiTransportError,
+    > {
+        Err(openbot_application::provider::RemoteAguiTransportError::Unavailable)
     }
 }
 
@@ -685,6 +728,71 @@ impl Fixture {
             "the cancelled Run has more than one terminal, a body or an error code",
         )
     }
+    /// Whether the Run's acceptance was dead-lettered with exactly this code.
+    async fn dead_lettered(&self, run: &str, code: &str) -> Result<bool> {
+        self.pool
+            .get()
+            .await
+            .map_err(text)?
+            .query_one(
+                "SELECT status='dead_letter' AND coalesce(last_error_code,'')=$2 \
+                 FROM public.outbox WHERE outbox_id=$1::text||':agent_run_cancel'",
+                &[&run, &code],
+            )
+            .await
+            .map_err(text)?
+            .try_get(0)
+            .map_err(text)
+    }
+    /// Point a system acceptance at another operation, as a corrupted or forged row would.
+    async fn set_cancel_operation(&self, run: &str, operation: &str) -> Result {
+        self.sql(&format!(
+            "UPDATE public.outbox SET payload=jsonb_set(payload,'{{operationId}}',to_jsonb('{operation}'::text)) \
+             WHERE outbox_id='{run}:agent_run_cancel'"
+        ))
+        .await
+    }
+    /// The application assembly, taken only for its once-enrolled original model dataset binding,
+    /// which a custom v2 begin and start need. It starts no relay and no Agent.
+    async fn assemble(&self, vault: &CredentialRecordVault) -> Result<PostgresApplicationAssembly> {
+        let policy_store = PolicyStore::postgres(self.pool.clone(), None);
+        policy_store.load().await.map_err(text)?;
+        assemble_postgres_application(PostgresApplicationAssemblyInput {
+            pool: self.pool.clone(),
+            listener_database: self.config.clone().into(),
+            deployment: DeploymentId::new(DEP),
+            tenant: TenantId::new(TENANT),
+            single_user: false,
+            admin_floor: None,
+            model: "owned-model".into(),
+            credential_key_id: "owned-key-ref".into(),
+            credential_vault: vault.clone(),
+            audit_key: SecretBytes::new(vec![0x62; 32]),
+            remote_assertions: Arc::new(
+                RemoteRunAssertionSigner::new(vec![0x63; 32]).map_err(text)?,
+            ),
+            mcp_oauth_state_key: SecretBytes::new(vec![0x64; 32]),
+            policy_store,
+            ui_preferences: Arc::new(openbot_application::NoUiPreferenceAdministration),
+            screen_sessions: Arc::new(openbot_application::NoScreenSessionAdministration),
+            artifacts: None,
+            runtime_capabilities: None,
+            remote_agent_probe: Arc::new(NoRemote),
+            managed_slot_available: false,
+            channel_routing_provider: ChannelRoutingProviderInput {
+                endpoint: url::Url::parse("http://127.0.0.1:9/v1/chat/completions")
+                    .map_err(text)?,
+                environment_api_key: None,
+                egress_allow_cidrs: vec!["127.0.0.1/32".into()],
+                allow_http: true,
+            },
+            stall_timeout: Some(Duration::from_secs(2)),
+            oauth_public_url: None,
+            app_url: None,
+        })
+        .await
+        .map_err(text)
+    }
     /// A forged cancellation acceptance row of the given payload, pending.
     async fn forge(&self, run: &str, payload: &Value) -> Result {
         self.pool
@@ -776,6 +884,83 @@ impl Drop for Listener {
         self.task.abort();
     }
 }
+/// A loopback listener that accepts connections and never answers one. A provider start that
+/// dials it waits in its TLS handshake, holding its original transaction, until its own budget
+/// ends: the provider send window, held open without any provider.
+struct Blackhole {
+    address: SocketAddr,
+    accepted: Arc<AtomicUsize>,
+    arrived: Arc<Notify>,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+impl Blackhole {
+    async fn start() -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(text)?;
+        let address = listener.local_addr().map_err(text)?;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let arrived = Arc::new(Notify::new());
+        let (stop, mut stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn({
+            let (accepted, arrived) = (Arc::clone(&accepted), Arc::clone(&arrived));
+            async move {
+                let mut held = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        pair = listener.accept() => {
+                            let Ok((stream, _)) = pair else { break };
+                            held.push(stream);
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            arrived.notify_one();
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            accepted,
+            arrived,
+            stop: Some(stop),
+            task: Some(task),
+        })
+    }
+    /// The provider dialed in: its start is past its admission read and inside its send window.
+    async fn connected(&self) -> Result {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.accepted.load(Ordering::SeqCst) == 0 {
+                self.arrived.notified().await;
+            }
+        })
+        .await
+        .map_err(|_| "the provider never dialed the stalled endpoint".to_owned())
+    }
+    async fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+/// Resolves only the stalled provider's host name, to its loopback listener.
+struct StallResolver(SocketAddr);
+#[async_trait]
+impl DnsResolver for StallResolver {
+    async fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<Vec<SocketAddr>, DnsUnavailable> {
+        if host == "idp.test" && port == self.0.port() {
+            Ok(vec![self.0])
+        } else {
+            Err(DnsUnavailable)
+        }
+    }
+}
 async fn release(held: pool::PooledClient) -> Result {
     held.batch_execute("ROLLBACK").await.map_err(text)
 }
@@ -840,6 +1025,73 @@ async fn quiesced(f: &Fixture) -> Result {
         Ok(busy == 0)
     })
     .await
+}
+/// Backends of this database that sit idle inside an open transaction: a provider start that has
+/// finished its statements and waits on the network holds exactly such an original transaction.
+async fn idle_transactions(f: &Fixture) -> Result<i64> {
+    f.pool
+        .get()
+        .await
+        .map_err(text)?
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() \
+             AND pid<>pg_backend_pid() AND state='idle in transaction'",
+            &[],
+        )
+        .await
+        .map_err(text)?
+        .try_get(0)
+        .map_err(text)
+}
+/// A blocking `FOR UPDATE` on the Run row waits behind a backend that is idle inside its
+/// transaction: the original transaction of a start in its send window holds a lock on the Run.
+async fn run_held_by_idle_transaction(f: &Fixture, run: &str) -> Result<bool> {
+    let mut probe = f.pool.get().await.map_err(text)?;
+    let tx = probe.transaction().await.map_err(text)?;
+    tx.batch_execute("SET LOCAL lock_timeout='700ms'")
+        .await
+        .map_err(text)?;
+    let waiting = async {
+        tx.execute(
+            "SELECT 1 FROM public.runs WHERE run_id=$1 FOR UPDATE",
+            &[&run],
+        )
+        .await
+    };
+    let observed = async {
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            let blocked: i64 = f
+                .pool
+                .get()
+                .await
+                .map_err(text)?
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity w \
+                     CROSS JOIN LATERAL unnest(pg_blocking_pids(w.pid)) AS bp(pid) \
+                     JOIN pg_stat_activity b ON b.pid=bp.pid \
+                     WHERE w.datname=current_database() AND w.pid<>pg_backend_pid() \
+                     AND w.wait_event_type='Lock' AND w.query LIKE '%FOR UPDATE%' \
+                     AND b.state='idle in transaction'",
+                    &[],
+                )
+                .await
+                .map_err(text)?
+                .try_get(0)
+                .map_err(text)?;
+            if blocked > 0 {
+                return Ok::<bool, String>(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let (_, held) = tokio::join!(waiting, observed);
+    // The probe's own wait ends at its lock wait limit; the transaction is left to roll back.
+    drop(tx);
+    held
 }
 async fn backend_pid(c: &pool::PooledClient) -> Result<i32> {
     c.query_one("SELECT pg_backend_pid()", &[])
@@ -1134,12 +1386,14 @@ async fn thread_history_run_drain_member_cannot_cancel_another_members_run_and_o
             "the drain overwrote or rewrote the user's own request",
         )?;
 
-        // Forged system acceptances are consumed only for a Thread closed by exactly that
-        // intent: another operation, another Thread's operation and an open Thread are all
-        // dead-lettered as a scope binding and their Runs keep running.
+        // A system acceptance is lawful only for a Thread closed by exactly the operation it names:
+        // another operation, another Thread's operation and an open Thread are forged, and so is
+        // a payload that carries a system key without being the system shape.
         let forged_closed = f.in_flight(&a, 203).await?;
         let forged_other = f.in_flight(&a, 204).await?;
         let forged_open = f.in_flight(&a, 205).await?;
+        let forged_partial = f.in_flight(&a, 206).await?;
+        let forged_bare = f.in_flight(&a, 207).await?;
         f.close(&a, &forged_closed.j).await?;
         let (_, borrowed) = f.close(&a, &forged_other.j).await?;
         let stranger = Uuid::now_v7().to_string();
@@ -1154,15 +1408,55 @@ async fn thread_history_run_drain_member_cannot_cancel_another_members_run_and_o
             )
             .await?;
         }
+        f.forge(
+            &forged_partial.run,
+            &json!({"runId": forged_partial.run, "threadId": forged_partial.j, "source": CANCEL_SOURCE}),
+        )
+        .await?;
+        f.forge(
+            &forged_bare.run,
+            &json!({"runId": forged_bare.run, "threadId": forged_bare.j, "note": "x"}),
+        )
+        .await?;
+        // The user's own producer reads the same row with the same question: a Run's actor who
+        // asks to cancel finds a forged row corrupt, never an accepted request, and nothing changes.
+        let forged = [
+            &forged_closed,
+            &forged_other,
+            &forged_open,
+            &forged_partial,
+            &forged_bare,
+        ];
+        let rows = f.acceptances().await?;
+        for flight in forged {
+            check(
+                matches!(
+                    f.cancel_as(A, &flight.j, &flight.run).await,
+                    Err(ThreadDirectoryError::Corrupt {
+                        field: "run_cancel_outbox"
+                    })
+                ),
+                "the producer did not find a forged acceptance corrupt",
+            )?;
+        }
+        check(
+            rows == f.acceptances().await?,
+            "a refused producer changed an acceptance",
+        )?;
+        // The consumer dead-letters each forged row: a system row the head and intent do not bear
+        // out as a scope binding, a payload with a system key but not the system shape as a broken
+        // binding, and only a payload with no system key and no requester as a missing requester.
         let consumer = Arc::new(Consumer::default());
         let relay = f.relay(&consumer)?;
-        for flight in [&forged_closed, &forged_other, &forged_open] {
-            until("a forged system acceptance is dead-lettered", || {
-                f.holds(
-                    "SELECT status='dead_letter' AND coalesce(last_error_code,'')='cancel_scope_binding' \
-                     FROM public.outbox WHERE outbox_id=$1::text||':agent_run_cancel'",
-                    &flight.run,
-                )
+        for (flight, code) in [
+            (&forged_closed, "cancel_scope_binding"),
+            (&forged_other, "cancel_scope_binding"),
+            (&forged_open, "cancel_scope_binding"),
+            (&forged_partial, "cancel_binding"),
+            (&forged_bare, "cancel_actor"),
+        ] {
+            until("a forged acceptance is dead-lettered", || {
+                f.dead_lettered(&flight.run, code)
             })
             .await?;
         }
@@ -1175,10 +1469,10 @@ async fn thread_history_run_drain_member_cannot_cancel_another_members_run_and_o
         f.ended_cancelled_without_body(&run).await?;
         f.ended_cancelled_without_body(&own.run).await?;
         let revoked = consumer.revoked();
-        for flight in [&forged_closed, &forged_other, &forged_open] {
+        for flight in forged {
             check(
                 f.is_status(&flight.run, "running").await? && !revoked.contains(&flight.run),
-                "a forged system acceptance stopped a Run",
+                "a forged acceptance stopped a Run",
             )?;
         }
         // After the terminal the user's cancel is a closed observation.
@@ -1193,7 +1487,7 @@ async fn thread_history_run_drain_member_cannot_cancel_another_members_run_and_o
             "a cancel after the terminal was not a closed observation",
         )?;
         eprintln!(
-            "THREAD_HISTORY_RUN_DRAIN id=D02 creator_and_admin_not_visible=true member_own_cancel=AlreadyRequested system_row_untouched=true user_request_kept=true forged_system_dead_letters=3 forged_runs_stopped=0"
+            "THREAD_HISTORY_RUN_DRAIN id=D02 creator_and_admin_not_visible=true member_own_cancel=AlreadyRequested system_row_untouched=true user_request_kept=true forged_rows=5 producer_corrupt=5 dead_letter_codes=scope_binding:3,binding:1,actor:1 forged_runs_stopped=0"
         );
         f.finish().await
     })
@@ -1390,6 +1684,186 @@ async fn thread_history_run_drain_streaming_and_custom_v2_start_window_terminate
         release(sending).await?;
         drained(&f.drain(&window.j).await, &window.j, &window_operation, (1, 0, 1))?;
 
+        // A real custom v2 start, held in its provider send window. The provider never answers
+        // its handshake, so the start has read the history head open and then holds its original
+        // transaction, with the shared lock of Thread, Run and lease, until its own budget ends.
+        // The real ACK1 lands inside that window and the drain cannot take the Run until the
+        // start has returned and its transaction is gone; the Run then ends cancelled.
+        const START_BUDGET: Duration = Duration::from_secs(3);
+        let vault = CredentialRecordVault::single_key(
+            TenantId::new(TENANT),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x61; 32]).map_err(text)?,
+        );
+        let assembly = f.assemble(&vault).await?;
+        let binding = Arc::clone(&assembly.model_dataset_binding);
+        binding
+            .enroll_original_registry(&f.registry)
+            .map_err(text)?;
+        let directory = PostgresThreadDirectory::with_runtime(
+            f.pool.clone(),
+            f.config.clone(),
+            PROCESS.into(),
+            DEFAULT_THREAD_LEASE_DURATION,
+        )
+        .map_err(text)?
+        .with_model_dataset_binding(Arc::clone(&binding))
+        .map_err(text)?;
+        let models = PostgresModelConnections::new(
+            f.pool.clone(),
+            vault.clone(),
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            SecretBytes::new(vec![0x62; 32]),
+        )
+        .map_err(text)?;
+        let hole = Blackhole::start().await?;
+        let model = models
+            .create(
+                &a,
+                &CreateModelConnection {
+                    name: "Owned drain stalled provider".into(),
+                    protocol: CustomModelProtocol::OpenaiResponses,
+                    endpoint: format!("https://idp.test:{}/v1", hole.address.port()),
+                    model: "owned-model".into(),
+                    enabled: true,
+                    api_key: ModelApiKey::new(Zeroizing::new("OWNED_DRAIN_SYNTHETIC_KEY".into()))
+                        .map_err(text)?,
+                },
+            )
+            .await
+            .map_err(text)?;
+        let base = f.request(&a, 503, ThreadRunAnchor::DirectBot);
+        let (v2_j, v2_run) = (
+            base.command.thread_id.as_str().to_owned(),
+            base.command.run_id.as_str().to_owned(),
+        );
+        directory
+            .begin_thread_run_v2(BeginThreadRunV2Request {
+                deployment: a.deployment().clone(),
+                tenant: a.tenant().clone(),
+                actor: a.actor().clone(),
+                auth_generation: a.auth_generation(),
+                command: BeginThreadRunV2 {
+                    thread_id: base.command.thread_id.clone(),
+                    run_id: base.command.run_id.clone(),
+                    bot_id: base.command.bot_id.clone(),
+                    anchor: base.command.anchor.clone(),
+                    message: base.command.message.clone(),
+                    selected_skill_slugs: vec![],
+                    model_selection: RunModelSelectionV2::new(
+                        ModelSelectionIntentSource::Custom,
+                        model.id.clone(),
+                        model.revision,
+                        format!("custom:{}", model.id),
+                        1,
+                    )
+                    .map_err(text)?,
+                },
+            })
+            .await
+            .map_err(text)?;
+        let (_, v2_lease) = f.claim(&v2_run).await?;
+        let provider_request = PostgresAgentContextSource::new(
+            f.pool.clone(),
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            Some(32),
+        )
+        .map_err(text)?
+        .with_model_dataset_binding(Arc::clone(&binding))
+        .map_err(text)?
+        .load(&v2_lease)
+        .await
+        .map_err(text)?;
+        let provider = Arc::new(
+            PostgresCustomModelProvider::new(
+                f.pool.clone(),
+                vault.clone(),
+                DeploymentId::new(DEP),
+                TenantId::new(TENANT),
+                SafeDialer::with_resolver(
+                    EgressPolicy::new(
+                        CidrAllowlist::parse_exact(vec!["127.0.0.1/32"]).map_err(text)?,
+                    ),
+                    Arc::new(StallResolver(hole.address)),
+                ),
+                SafeHttpBudget::new(64 * 1024 * 1024, START_BUDGET).map_err(text)?,
+                Some(Duration::from_secs(2)),
+            )
+            .map_err(text)?
+            .with_model_dataset_binding(Arc::clone(&binding))
+            .map_err(text)?,
+        );
+        let began = Instant::now();
+        let start = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move { provider.start(provider_request).await.map(|_| ()) })
+        };
+        hole.connected().await?;
+        check(
+            idle_transactions(&f).await? >= 1,
+            "the start in its send window holds no open original transaction",
+        )?;
+        check(
+            run_held_by_idle_transaction(&f, &v2_run).await?,
+            "the Run row is not held by the start's open original transaction",
+        )?;
+        let (_, v2_operation) = f.close(&a, &v2_j).await?;
+        let (facts, hq, rows) = (f.facts().await?, f.hq().await?, f.acceptances().await?);
+        unavailable(&f.drain(&v2_j).await)?;
+        check(
+            !start.is_finished()
+                && facts == f.facts().await?
+                && hq == f.hq().await?
+                && rows == f.acceptances().await?,
+            "a drain during the real start window wrote, or the start was not still in its window",
+        )?;
+        // The start returns when its budget ends, never later, and its transaction goes with it.
+        let ended = start.await.map_err(text)?;
+        let window_len = began.elapsed();
+        check(
+            ended.is_err()
+                && window_len >= START_BUDGET
+                && window_len <= START_BUDGET + Duration::from_secs(2),
+            &format!("the start did not end within its budget: {ended:?} after {window_len:?}"),
+        )?;
+        quiesced(&f).await?;
+        let resumed = Instant::now();
+        drained(&f.drain(&v2_j).await, &v2_j, &v2_operation, (1, 0, 1))?;
+        let v2_consumer = Arc::new(Consumer::default());
+        let v2_relay = f.relay(&v2_consumer)?;
+        until("the Run of the stalled start is cancelled", || {
+            f.is_status(&v2_run, "cancelled")
+        })
+        .await?;
+        let resume = resumed.elapsed();
+        // The same relay also consumes the pending acceptance of the simulated window above.
+        until("the simulated-window Run is cancelled", || {
+            f.is_status(&window.run, "cancelled")
+        })
+        .await?;
+        v2_relay.stop().await;
+        for run in [&v2_run, &window.run] {
+            f.ended_cancelled_without_body(run).await?;
+        }
+        let revoked = v2_consumer.revoked();
+        check(
+            resume <= Duration::from_secs(6)
+                && revoked.len() == 2
+                && revoked.contains(&v2_run)
+                && revoked.contains(&window.run)
+                && v2_consumer.dispatched().is_empty(),
+            "the stop after the start window was slow, or the relay revoked another Run",
+        )?;
+        drained(&f.drain(&v2_j).await, &v2_j, &v2_operation, (0, 0, 0))?;
+        drop(provider);
+        hole.stop().await;
+        drop(directory);
+        drop(models);
+        drop(binding);
+        assembly.shutdown().await;
+
         // An already dispatched streaming Run has a local child. The relay signals it, the child
         // cannot stream on (the closed history refuses its chunk) and stops with its fenced
         // lease, and the terminal is cancelled without any body.
@@ -1416,10 +1890,6 @@ async fn thread_history_run_drain_streaming_and_custom_v2_start_window_terminate
                  FROM public.outbox WHERE outbox_id=$1::text||':agent_run_cancel'",
                 &streaming.run,
             )
-        })
-        .await?;
-        until("the send-window Run is cancelled", || {
-            f.is_status(&window.run, "cancelled")
         })
         .await?;
         check(
@@ -1451,17 +1921,15 @@ async fn thread_history_run_drain_streaming_and_custom_v2_start_window_terminate
         })
         .await?;
         relay.stop().await;
-        for run in [&window.run, &streaming.run] {
-            f.ended_cancelled_without_body(run).await?;
-        }
+        f.ended_cancelled_without_body(&streaming.run).await?;
         check(
-            consumer.revoked().len() == 2 && consumer.dispatched().is_empty(),
-            "the relay did not revoke exactly the two accepted Runs",
+            consumer.revoked() == vec![streaming.run.clone()] && consumer.dispatched().is_empty(),
+            "the relay did not revoke exactly the signalled Run",
         )?;
         drained(&f.drain(&window.j).await, &window.j, &window_operation, (0, 0, 0))?;
         drained(&f.drain(&streaming.j).await, &streaming.j, &streaming_operation, (0, 0, 0))?;
         eprintln!(
-            "THREAD_HISTORY_RUN_DRAIN id=D05 v2_window_share_lock=Unavailable released_then_written=true streaming_child_signalled=true late_chunk_refused=true both_cancelled_without_body=true"
+            "THREAD_HISTORY_RUN_DRAIN id=D05 v2_window_share_lock=Unavailable released_then_written=true real_v2_start_window=Unavailable start_ended_within_budget=true real_v2_run_cancelled_without_body=true streaming_child_signalled=true late_chunk_refused=true both_cancelled_without_body=true"
         );
         f.finish().await
     })
@@ -1887,11 +2355,11 @@ async fn thread_history_run_drain_remember_exact_replay_survives_system_cancel_a
             memory(&f.pool)?
                 .remember_from_tool(committed_request.clone())
                 .await
-                == Ok(receipt),
+                == Ok(receipt.clone()),
             "the exact replay did not survive the delivered system acceptance",
         )?;
         check(
-            memory(&f.pool)?.remember_from_tool(fresh_request).await
+            memory(&f.pool)?.remember_from_tool(fresh_request.clone()).await
                 == Err(MemoryAdministrationError::Conflict),
             "a fresh effect was not refused after the Run was cancelled",
         )?;
@@ -1900,8 +2368,39 @@ async fn thread_history_run_drain_remember_exact_replay_survives_system_cancel_a
             "a replay or a refusal changed a remember-owned row",
         )?;
 
-        // The recogniser is the one shared shape judge: on an open Thread a system-shaped row
-        // fences a fresh effect, and a row of any other shape is a corrupt binding.
+        // The same statement that reads the acceptance also asks whether the Thread's head is
+        // closed by exactly the operation it names. A system acceptance the head and intent do
+        // not bear out is a broken binding, for the exact replay and for a fresh effect alike,
+        // and the lawful row is read as lawful again.
+        let other = f.in_flight(&a, 803).await?;
+        let (_, foreign_operation) = f.close(&a, &other.j).await?;
+        for (name, tampered) in [
+            ("a different operation", Uuid::now_v7().to_string()),
+            ("another Thread's operation", foreign_operation),
+        ] {
+            f.set_cancel_operation(&flight.run, &tampered).await?;
+            for request in [&committed_request, &fresh_request] {
+                check(
+                    matches!(
+                        memory(&f.pool)?.remember_from_tool(request.clone()).await,
+                        Err(MemoryAdministrationError::Corrupt { .. })
+                    ),
+                    &format!("{name} was not a corrupt binding"),
+                )?;
+            }
+        }
+        f.set_cancel_operation(&flight.run, &operation).await?;
+        check(
+            memory(&f.pool)?
+                .remember_from_tool(committed_request.clone())
+                .await
+                == Ok(receipt.clone())
+                && memory(&f.pool)?.remember_from_tool(fresh_request).await
+                    == Err(MemoryAdministrationError::Conflict),
+            "the lawful acceptance was not read as lawful again",
+        )?;
+        // On an open Thread a system-shaped row is not lawful either, and a row of any other
+        // shape is a corrupt binding too: the head is not closed, so no operation bears it out.
         let open = f.in_flight(&a, 802).await?;
         let probe = capture(&f, &a, &open, 0).await?;
         let before = effects(&f).await?;
@@ -1911,9 +2410,11 @@ async fn thread_history_run_drain_remember_exact_replay_survives_system_cancel_a
         )
         .await?;
         check(
-            memory(&f.pool)?.remember_from_tool(probe.clone()).await
-                == Err(MemoryAdministrationError::Conflict),
-            "a system-shaped acceptance did not fence a fresh effect",
+            matches!(
+                memory(&f.pool)?.remember_from_tool(probe.clone()).await,
+                Err(MemoryAdministrationError::Corrupt { .. })
+            ),
+            "a system-shaped acceptance on an open head was not a corrupt binding",
         )?;
         for broken in [
             json!({"runId": open.run, "threadId": open.j, "source": CANCEL_SOURCE, "operationId": "o", "requestedBy": A}),
@@ -1936,7 +2437,7 @@ async fn thread_history_run_drain_remember_exact_replay_survives_system_cancel_a
         }
         check(before == effects(&f).await?, "a refusal wrote a remember-owned row")?;
         eprintln!(
-            "THREAD_HISTORY_RUN_DRAIN id=D08 replay_pending=receipt replay_delivered=receipt fresh_effect=Conflict system_shape_fences_open_thread=true broken_shapes_corrupt=4 effects_unchanged=true"
+            "THREAD_HISTORY_RUN_DRAIN id=D08 replay_pending=receipt replay_delivered=receipt fresh_effect=Conflict unbound_system_rows_corrupt=3 broken_shapes_corrupt=4 lawful_row_read_again=true effects_unchanged=true"
         );
         f.finish().await
     })

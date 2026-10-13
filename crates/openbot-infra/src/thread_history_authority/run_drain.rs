@@ -145,10 +145,13 @@ impl PostgresThreadHistoryAuthority {
     /// locked: the consumer takes the acceptance first and the Run second, and this adds no
     /// reverse edge and no wait. A custom v2 start that still holds its shared Run lock is
     /// therefore reported as `Unavailable` and is stopped by a later call. A refused lock, a
-    /// deadlock, a serialization failure, a lock wait that ran out of time and every other
-    /// database failure roll the current Run back and return `Unavailable`; the Runs committed
-    /// before it keep their acceptance and nothing is retried here. None of them is `Conflict`
-    /// or a closed answer.
+    /// deadlock, a serialization failure, a lock wait that ran out of time, a deadline that runs
+    /// out inside a statement and every other database failure roll the current Run back and
+    /// return `Unavailable`; the Runs committed before it keep their acceptance and nothing is
+    /// retried here. None of them is `Conflict` or a closed answer. The deadline of the
+    /// transaction owner itself, at BEGIN, COMMIT or ROLLBACK, is the existing
+    /// `DeadlineExceeded`, `CommitAcknowledgedAfterDeadline` and
+    /// `RollbackAcknowledgedAfterDeadline`, and an unacknowledged COMMIT is `CommitUnknown`.
     ///
     /// # Errors
     /// Refuses a malformed Thread id, a Thread whose head is not closed in this deployment and
