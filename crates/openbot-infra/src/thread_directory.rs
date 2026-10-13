@@ -27,7 +27,10 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{AsyncMessage, Client, Connection, NoTls, Socket, Transaction};
 
 use crate::db::{InfraError, occupancy};
-use crate::run_runtime::{RUN_CANCEL_DESTINATION, RUN_CONTROL_TOPIC, run_cancel_outbox_id};
+use crate::run_runtime::{
+    RUN_CANCEL_DESTINATION, RUN_CONTROL_TOPIC, RunCancelAcceptance, run_cancel_acceptance,
+    run_cancel_outbox_id,
+};
 use crate::thread_id::mint_thread_id;
 use crate::thread_listener::ThreadListenerDatabase;
 
@@ -765,12 +768,22 @@ async fn request_run_cancellation(
         let delivery_class: String = decode(&existing, "delivery_class")?;
         let stored_payload: Value = decode(&existing, "payload")?;
         let outbox_status: String = decode(&existing, "status")?;
+        // The Run has one acceptance. Besides this actor's own request, the system's closed-history
+        // stop is an accepted request too; it is observed as such and never replaced or rejected.
+        let system_acceptance = matches!(
+            run_cancel_acceptance(
+                &stored_payload,
+                request.command.run_id.as_str(),
+                request.command.thread_id.as_str(),
+            ),
+            Some(RunCancelAcceptance::ThreadHistoryClosed { .. })
+        );
         if aggregate_kind != "run"
             || aggregate_id != request.command.run_id.as_str()
             || seq != 0
             || destination != RUN_CANCEL_DESTINATION
             || delivery_class != "internal"
-            || stored_payload != payload
+            || (stored_payload != payload && !system_acceptance)
             || !matches!(outbox_status.as_str(), "pending" | "delivering")
         {
             return Err(ThreadDirectoryError::Corrupt {

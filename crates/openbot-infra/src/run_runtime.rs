@@ -44,6 +44,71 @@ pub(crate) fn run_cancel_outbox_id(run_id: &str) -> String {
     format!("{run_id}:{RUN_CANCEL_DESTINATION}")
 }
 
+/// The `source` of the system acceptance written when a closed Thread history stops its Runs.
+pub(crate) const THREAD_HISTORY_CLOSED_CANCEL_SOURCE: &str = "thread_history_closed";
+
+/// The two lawful shapes of the one durable cancellation acceptance of a Run. Every other payload
+/// is a broken binding, wherever it is read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RunCancelAcceptance {
+    /// `{runId,threadId,requestedBy}`: the Run's own actor asked. The reader compares the actor.
+    Actor(String),
+    /// `{runId,threadId,source:"thread_history_closed",operationId}`: the system stopped the Run
+    /// because its Thread history is closed by that intent. It carries no requester, and its
+    /// reader compares the closed head and the intent instead of an actor.
+    ThreadHistoryClosed { operation_id: String },
+}
+
+/// Classify a stored cancellation payload for exactly this Run and Thread: the user shape has
+/// exactly its three keys and the system shape exactly its four, and both must name this Run
+/// and Thread. This only reads the shape; every reader still checks what the shape claims.
+pub(crate) fn run_cancel_acceptance(
+    payload: &Value,
+    run_id: &str,
+    thread_id: &str,
+) -> Option<RunCancelAcceptance> {
+    let object = payload.as_object()?;
+    if object.get("runId").and_then(Value::as_str) != Some(run_id)
+        || object.get("threadId").and_then(Value::as_str) != Some(thread_id)
+    {
+        return None;
+    }
+    match object.len() {
+        3 => object
+            .get("requestedBy")
+            .and_then(Value::as_str)
+            .map(|actor| RunCancelAcceptance::Actor(actor.to_owned())),
+        4 => {
+            if object.get("source").and_then(Value::as_str)
+                != Some(THREAD_HISTORY_CLOSED_CANCEL_SOURCE)
+            {
+                return None;
+            }
+            object
+                .get("operationId")
+                .and_then(Value::as_str)
+                .map(|operation_id| RunCancelAcceptance::ThreadHistoryClosed {
+                    operation_id: operation_id.to_owned(),
+                })
+        }
+        _ => None,
+    }
+}
+
+/// The system acceptance payload for one Run of a Thread whose history `operation_id` closed.
+pub(crate) fn thread_history_closed_cancel_payload(
+    run_id: &str,
+    thread_id: &str,
+    operation_id: &str,
+) -> Value {
+    json!({
+        "runId": run_id,
+        "threadId": thread_id,
+        "source": THREAD_HISTORY_CLOSED_CANCEL_SOURCE,
+        "operationId": operation_id,
+    })
+}
+
 /// Production outbox relay 生命周期句柄。
 pub struct RunRelay {
     stop: watch::Sender<bool>,
@@ -694,28 +759,32 @@ async fn claim_cancellation_in_transaction(
     let Some(thread_id) = payload.get("threadId").and_then(Value::as_str) else {
         return dead_letter_cancellation(transaction, &outbox_id, now, "cancel_thread_id").await;
     };
-    let Some(requested_by) = payload.get("requestedBy").and_then(Value::as_str) else {
+    let acceptance = run_cancel_acceptance(&payload, run_id, thread_id);
+    if acceptance.is_none() && !payload.get("requestedBy").is_some_and(Value::is_string) {
         return dead_letter_cancellation(transaction, &outbox_id, now, "cancel_actor").await;
-    };
-    if aggregate_kind != "run"
-        || aggregate_id != run_id
-        || outbox_seq != 0
-        || delivery_class != "internal"
-        || outbox_id != run_cancel_outbox_id(run_id)
-        || payload
-            != json!({
-                "runId": run_id,
-                "threadId": thread_id,
-                "requestedBy": requested_by,
-            })
-    {
-        return dead_letter_cancellation(transaction, &outbox_id, now, "cancel_binding").await;
     }
+    let bound = aggregate_kind == "run"
+        && aggregate_id == run_id
+        && outbox_seq == 0
+        && delivery_class == "internal"
+        && outbox_id == run_cancel_outbox_id(run_id);
+    let (Some(acceptance), true) = (acceptance, bound) else {
+        return dead_letter_cancellation(transaction, &outbox_id, now, "cancel_binding").await;
+    };
 
     let Some(mut locked) = lock_run(transaction, run_id).await? else {
         return dead_letter_cancellation(transaction, &outbox_id, now, "cancel_run").await;
     };
-    if locked.thread_id != thread_id || locked.actor_id != requested_by {
+    // A user acceptance is scoped by its requester. A system acceptance has none: it is scoped by
+    // the closed head and its intent, read by the next statement after the run lock, lock-free.
+    let scoped = locked.thread_id == thread_id
+        && match &acceptance {
+            RunCancelAcceptance::Actor(requested_by) => locked.actor_id == *requested_by,
+            RunCancelAcceptance::ThreadHistoryClosed { operation_id } => {
+                thread_history_closed_by(transaction, &locked.thread_id, operation_id).await?
+            }
+        };
+    if !scoped {
         return dead_letter_cancellation(transaction, &outbox_id, now, "cancel_scope_binding")
             .await;
     }
@@ -967,6 +1036,32 @@ async fn dead_letter_cancellation(
         .await
         .map_err(|error| unavailable("dead-letter cancellation outbox", error))?;
     Ok(None)
+}
+
+/// Whether the Thread's history head is closed by exactly the intent `operation_id` of that same
+/// Thread and namespace. It is one lock-free statement made after the run lock: it takes no row
+/// lock, adds no wait edge and is not a writer schema proof.
+async fn thread_history_closed_by(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    operation_id: &str,
+) -> Result<bool, RunRuntimeError> {
+    transaction
+        .query_opt(
+            "SELECT 1 FROM openbot_internal.thread_history_clear_intents q \
+             JOIN openbot_internal.thread_history_heads h \
+               ON h.deployment_id=q.deployment_id AND h.tenant_id=q.tenant_id \
+              AND h.thread_id=q.thread_id \
+             JOIN public.threads t \
+               ON t.thread_id=q.thread_id AND t.deployment_id=q.deployment_id \
+              AND t.tenant_id=q.tenant_id \
+             WHERE q.operation_id=$1 AND q.thread_id=$2 \
+               AND h.phase='closed' AND h.closure_operation_id=q.operation_id",
+            &[&operation_id, &thread_id],
+        )
+        .await
+        .map(|row| row.is_some())
+        .map_err(|error| unavailable("读取 cancellation 的 thread history 关闭事实", error))
 }
 
 async fn claim_dispatch_in_transaction(
@@ -2928,5 +3023,103 @@ fn write_error(context: &'static str, error: tokio_postgres::Error) -> RunRuntim
         Some(code) if code == &SqlState::UNIQUE_VIOLATION => RunRuntimeError::Conflict,
         Some(code) if code == &SqlState::FOREIGN_KEY_VIOLATION => RunRuntimeError::StaleLease,
         _ => RunRuntimeError::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod cancel_acceptance_tests {
+    use super::*;
+
+    const RUN: &str = "run-shape";
+    const THREAD: &str = "thread-shape";
+
+    fn user() -> Value {
+        json!({"runId": RUN, "threadId": THREAD, "requestedBy": "actor-shape"})
+    }
+    fn system() -> Value {
+        thread_history_closed_cancel_payload(RUN, THREAD, "operation-shape")
+    }
+
+    #[test]
+    fn exactly_two_shapes_are_lawful_and_name_this_run_and_thread() {
+        assert_eq!(
+            run_cancel_acceptance(&user(), RUN, THREAD),
+            Some(RunCancelAcceptance::Actor("actor-shape".into()))
+        );
+        assert_eq!(
+            run_cancel_acceptance(&system(), RUN, THREAD),
+            Some(RunCancelAcceptance::ThreadHistoryClosed {
+                operation_id: "operation-shape".into()
+            })
+        );
+        assert_eq!(
+            system(),
+            json!({
+                "runId": RUN,
+                "threadId": THREAD,
+                "source": "thread_history_closed",
+                "operationId": "operation-shape",
+            })
+        );
+        assert_eq!(system().as_object().map(serde_json::Map::len), Some(4));
+        // Another Run or Thread is never this Run's acceptance, in either shape.
+        for payload in [user(), system()] {
+            assert_eq!(run_cancel_acceptance(&payload, "other-run", THREAD), None);
+            assert_eq!(run_cancel_acceptance(&payload, RUN, "other-thread"), None);
+        }
+    }
+
+    #[test]
+    fn every_other_shape_is_a_broken_binding() {
+        let mut with_extra_key = user();
+        with_extra_key["extra"] = json!(1);
+        let mut system_with_requester = system();
+        system_with_requester["requestedBy"] = json!("actor-shape");
+        let mut system_with_other_source = system();
+        system_with_other_source["source"] = json!("user");
+        let mut system_with_number = system();
+        system_with_number["operationId"] = json!(7);
+        let mut user_with_number = user();
+        user_with_number["requestedBy"] = json!(7);
+        let without = |key: &str| {
+            let mut payload = system();
+            if let Some(object) = payload.as_object_mut() {
+                object.remove(key);
+            }
+            payload
+        };
+        let system_without_source = without("source");
+        let system_without_operation = without("operationId");
+        for (name, payload) in [
+            ("user plus a key", with_extra_key),
+            ("system plus a requester", system_with_requester),
+            ("system with another source", system_with_other_source),
+            ("system with a numeric operation", system_with_number),
+            ("user with a numeric requester", user_with_number),
+            ("system without its source", system_without_source),
+            ("system without its operation", system_without_operation),
+            (
+                "user without its requester",
+                json!({"runId": RUN, "threadId": THREAD}),
+            ),
+            (
+                "three keys naming no requester",
+                json!({"runId": RUN, "threadId": THREAD, "operationId": "operation-shape"}),
+            ),
+            (
+                "four keys without a source",
+                json!({"runId": RUN, "threadId": THREAD, "requestedBy": "a", "operationId": "o"}),
+            ),
+            ("an empty object", json!({})),
+            ("an array", json!([])),
+            ("a string", json!("run-shape")),
+            ("null", Value::Null),
+        ] {
+            assert_eq!(
+                run_cancel_acceptance(&payload, RUN, THREAD),
+                None,
+                "{name} must not be a lawful acceptance"
+            );
+        }
     }
 }

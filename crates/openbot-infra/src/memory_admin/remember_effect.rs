@@ -15,7 +15,9 @@ use tokio_postgres::{Row, Transaction};
 use crate::db::tables::remember_effect_receipts;
 use crate::repo::audit::{append_event_in_transaction, next_event_coordinates};
 use crate::repo::common::insert_sql;
-use crate::run_runtime::{RUN_CANCEL_DESTINATION, run_cancel_outbox_id};
+use crate::run_runtime::{
+    RUN_CANCEL_DESTINATION, RunCancelAcceptance, run_cancel_acceptance, run_cancel_outbox_id,
+};
 use crate::thread_history_writer::{CurrentWriterSchema, OpenOrClosed};
 
 use super::history_error;
@@ -130,8 +132,17 @@ async fn cancellation(
             && get::<i64>(&row, "seq")? == 0
             && get::<&str>(&row, "destination")? == RUN_CANCEL_DESTINATION
             && get::<&str>(&row, "delivery_class")? == "internal"
-            && get::<serde_json::Value>(&row, "payload")?
-                == serde_json::json!({"runId":run,"threadId":thread,"requestedBy":actor})
+            // The one acceptance of the Run is lawful in exactly two shapes: this actor's own
+            // request, or the system stop of a closed Thread history. Both fence a fresh effect.
+            && match run_cancel_acceptance(
+                &get::<serde_json::Value>(&row, "payload")?,
+                run,
+                thread,
+            ) {
+                Some(RunCancelAcceptance::Actor(requested_by)) => requested_by == actor,
+                Some(RunCancelAcceptance::ThreadHistoryClosed { .. }) => true,
+                None => false,
+            }
             && matches!(
                 get::<&str>(&row, "status")?,
                 "pending" | "delivering" | "delivered" | "dead_letter"
