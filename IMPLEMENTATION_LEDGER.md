@@ -1928,3 +1928,6 @@ This entry records finite product acceptance. Token exchange, enrollment, accoun
 
 
 Existing roster cancellation candidate normally incorporates delivered main b05d76e9. Both UI product files and original facts are preserved; the exact resulting candidate still requires current directed checks and both prescribed fixture journeys. Earlier Source and syntax acceptance is finite only; production, oracle and same-mounted reload observations remain open.
+
+
+2026-10-13: Existing UI5-P4 roster cancellation closeout retains both original product files and their independent source review. Exact current-candidate directed checks and the two original fixture journeys remain required; same-mounted pending reload is unexercised. This normal fact commit records Codex assistance without transferring historical runtime or whole-UI acceptance.
