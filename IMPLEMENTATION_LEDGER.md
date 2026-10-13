@@ -1936,3 +1936,6 @@ This entry records finite product acceptance. Token exchange, enrollment, accoun
 
 
 2026-10-12T08:20:49.633584+00:00 - Existing UI5-P3 source candidate incorporates delivered main404d by normal merge. All three previously reviewed product files keep their exact bytes; incoming backend files and the complete public main ledger are preserved. This is source composition only: P2 acceptance, exact-candidate directed checks and mounted bilingual validation remain pending; no PR merge or full-package acceptance is claimed.
+
+
+2026-10-13 - Existing Unknown live-locale closeout retains the original terminal facts, read-only behavior, action boundaries and three mounted card presentations. Its conversation dependency was delivered through PR177. The separate system-language candidate remains unaccepted at the logout transport-completion gate; it is not a prerequisite for this existing package. Current-main composition, directed checks and different-author browser acceptance remain pending. This records an existing tail and adds no work package.
