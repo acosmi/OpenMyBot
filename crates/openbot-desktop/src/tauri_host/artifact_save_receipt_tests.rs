@@ -913,7 +913,7 @@ impl Drop for OwnedWindowWriteHold {
 
 enum HeldReceipt {
     Protocol(Result<Response<Vec<u8>>, String>),
-    Application(Result<AppReply, AppError>),
+    Application(Box<Result<AppReply, AppError>>),
 }
 async fn original_window_tail(
     fixture: &LocalFixture,
@@ -1010,11 +1010,11 @@ async fn original_window_tail(
                 Some(protocol) => HeldReceipt::Protocol(
                     local_request(&protocol, "main", Method::GET, &uri, "").await,
                 ),
-                None => HeldReceipt::Application(
+                None => HeldReceipt::Application(Box::new(
                     application
                         .execute(auth, AppCommand::GetArtifactSaveReceipt(input))
                         .await,
-                ),
+                )),
             }
         }
         .with_subscriber(tracing::Dispatch::new(ReceiptSubscriber(gate.clone()))),
@@ -1131,7 +1131,7 @@ async fn original_window_tail(
         }
         HeldReceipt::Application(result) => {
             require(
-                matches!(result, Err(AppError::Unauthenticated)),
+                matches!(*result, Err(AppError::Unauthenticated)),
                 "last true Protocol drop released held source outcome or lost original401",
             )?;
         }
