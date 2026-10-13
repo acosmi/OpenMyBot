@@ -1495,6 +1495,29 @@ pub async fn list_agents(hidden: bool) -> Result<Vec<AgentProfile>, ApiError> {
     }
 }
 
+/// The current roster load owns both reads' browser cancellation signal.
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn list_agents_with_abort_signal(
+    hidden: bool,
+    signal: &web_sys::AbortSignal,
+) -> Result<Vec<AgentProfile>, ApiError> {
+    use crate::api::request::Request;
+
+    let path = if hidden {
+        "/api/agents?hidden=true"
+    } else {
+        "/api/agents"
+    };
+    let response = Request::send(Request::get(path).abort_signal(Some(signal))).await?;
+    if !response.ok() {
+        return Err(status_error(response.status()));
+    }
+    crate::api::request::Request::decode::<AgentProfilesResponse>(&response)
+        .await
+        .map(|response| response.agents)
+        .map_err(|_| ApiError::InvalidResponse)
+}
+
 /// Load one current-actor-visible coworker profile.
 pub async fn load_agent(agent_id: &str) -> Result<AgentProfile, ApiError> {
     #[cfg(target_arch = "wasm32")]
