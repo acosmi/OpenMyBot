@@ -1159,7 +1159,7 @@ async fn thread_history_run_drain_member_cannot_cancel_another_members_run_and_o
         for flight in [&forged_closed, &forged_other, &forged_open] {
             until("a forged system acceptance is dead-lettered", || {
                 f.holds(
-                    "SELECT status='dead_letter' AND last_error_code='cancel_scope_binding' \
+                    "SELECT status='dead_letter' AND coalesce(last_error_code,'')='cancel_scope_binding' \
                      FROM public.outbox WHERE outbox_id=$1::text||':agent_run_cancel'",
                     &flight.run,
                 )
@@ -1412,7 +1412,7 @@ async fn thread_history_run_drain_streaming_and_custom_v2_start_window_terminate
         let relay = f.relay(&consumer)?;
         until("the streaming Run's child is signalled", || {
             f.holds(
-                "SELECT status='delivering' AND last_error_code='child_signalled' \
+                "SELECT status='delivering' AND coalesce(last_error_code,'')='child_signalled' \
                  FROM public.outbox WHERE outbox_id=$1::text||':agent_run_cancel'",
                 &streaming.run,
             )
