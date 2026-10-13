@@ -22,3 +22,11 @@ condition = "AND"
 regexTarget = "line"
 paths = ['''(?:^|/)crates/openbot\-infra/tests/scoped_egress\.rs$''']
 regexes = ['''^\s*socket\.write_all\(format!\("GET\ http://target\.test:\{port\}/ws\ HTTP/1\.1\\r\\nHost:\ target\.test:\{port\}\\r\\nProxy\-Authorization:\ \{\}\\r\\nConnection:\ Upgrade\\r\\nUpgrade:\ websocket\\r\\nSec\-WebSocket\-Key:\ dGhlIHNhbXBsZSBub25jZQ==\\r\\nSec\-WebSocket\-Version:\ 13\\r\\n\\r\\n",auth\(\&binding\)\)\.as_bytes\(\)\)\.await\.unwrap\(\);\s*$''']
+
+[[allowlists]]
+description = "Exact SQL column mapping with no credential literal"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)crates/openbot\-infra/src/thread_history_authority/stop_clear\.rs$''']
+regexes = ['''^\n?\ \ \ \ closure_actor_id=q\.actor_id,closure_auth_generation=q\.auth_generation,closed_at=q\.recorded_at\ \\$''']

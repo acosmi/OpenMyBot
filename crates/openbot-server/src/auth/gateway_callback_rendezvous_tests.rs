@@ -98,7 +98,7 @@ impl CallbackInput {
         })
     }
     fn query(&self, code: &str) -> String {
-        format!("state={}&code={code}", &*self.state)
+        format!("state={}&code={code}", *self.state)
     }
     fn request(&self, query: &str) -> Vec<u8> {
         format!(
@@ -674,9 +674,9 @@ async fn r06_query_reject_then_success() {
         let (auth, wait, input) = start(&f).await?;
         relay.arm_original(&f).await;
         let mut call = Box::pin(f.journal.wait_callback(&auth, wait));
-        let base = format!("state={}", &*input.state);
+        let base = format!("state={}", *input.state);
         for query in [
-            format!("{base}&st%61te={}&code=x", &*input.state),
+            format!("{base}&st%61te={}&code=x", *input.state),
             format!("{base}&x=unknown&code=x"),
             format!("{base}&code=%GG"),
             format!("{base}&code=x&error=other"),
@@ -795,7 +795,7 @@ async fn r09_matched_error_static_and_no_close() {
             relay.arm_original(&f).await;
             let bytes = input.request(&format!(
                 "state={}&error={vendor}&error_description=vendor-detail",
-                &*input.state
+                *input.state
             ));
             let (owner, raw) = tokio::join!(
                 f.journal.wait_callback(&auth, wait),
