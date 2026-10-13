@@ -51,6 +51,7 @@ pub mod design_gallery;
 mod editor_notice;
 mod editor_runtime;
 pub mod features;
+mod locale_policy;
 pub mod preferences;
 pub mod primitives;
 mod revision_editor;

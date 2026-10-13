@@ -3042,7 +3042,24 @@ pub async fn sign_out_current_session() -> Result<(), ApiError> {
     {
         use crate::api::request::Request;
 
-        let response = Request::send(Request::post("/api/auth/sign-out")).await?;
+        // Let this sign-out request finish across the following full-document navigation.
+        let request = Request::post("/api/auth/sign-out")
+            .build()
+            .map_err(|_| ApiError::NotSubmitted)?;
+        let request: web_sys::Request = request.into();
+        let init = web_sys::RequestInit::new();
+        let keepalive_set = js_sys::Reflect::set(
+            init.as_ref(),
+            &wasm_bindgen::JsValue::from_str("keepalive"),
+            &wasm_bindgen::JsValue::TRUE,
+        )
+        .map_err(|_| ApiError::NotSubmitted)?;
+        if !keepalive_set {
+            return Err(ApiError::NotSubmitted);
+        }
+        let request = web_sys::Request::new_with_request_and_init(&request, &init)
+            .map_err(|_| ApiError::NotSubmitted)?;
+        let response = Request::send(gloo_net::http::Request::from(request)).await?;
         if response.status() != 204 {
             return Err(status_error(response.status()));
         }

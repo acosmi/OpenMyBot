@@ -1999,6 +1999,23 @@ Existing roster cancellation candidate normally incorporates delivered main b05d
 2026-10-13: Existing UI5-P4 roster cancellation closeout retains both original product files and their independent source review. Exact current-candidate directed checks and the two original fixture journeys remain required; same-mounted pending reload is unexercised. This normal fact commit records Codex assistance without transferring historical runtime or whole-UI acceptance.
 
 
+2026-10-10 UI5 system-language default: the primary system Chinese language selects zh-CN; English and all other primary languages select English. Existing explicit preferences and unsubmitted manual locale drafts remain authoritative, with no preference write on default selection. Four scoped UI files have different-author Source review and fixed rustfmt; five focused tests, prescribed checks and delivery remain pending. Anonymous/read-failure static Server first-frame synchronization and a real unsupported-language reporting interface remain unresolved dependencies. No backend capability, production reporting, native runtime or full acceptance is claimed.
+
+
+Existing system-language candidate normally incorporates delivered main b05d76e9. The four original UI product files and original facts are preserved; the exact resulting candidate still requires current directed checks. Earlier a670 results keep their original attribution, and first-frame language sync and real unsupported-language reporting remain open.
+
+2026-10-12T15:40:44.868803+00:00 — Existing SystemLanguage tail normally incorporates delivered PR177/main096e after different source composition review. Its original four product files remain unchanged; the full delivered ledger and six original Language fact lines are retained. PR177 b68 was verified and normally merged at15:37:50Z; current Language exact-candidate checks are pending. Desktop first-frame projection and unsupported-language reporting dependencies remain open. Three existing tails only; no new task or whole acceptance.
+
+2026-10-12 - Existing SystemLanguage closeout PR200 normally incorporates delivered PR199 main788e532. All four original locale files remain byte-identical to candidate4630fa1; incoming thread-history stop/clear implementation and tests remain intact. The prior candidate passed15 directed commands and339 UI tests; its browser attempt03 passed six scenes before a real original202 response EOF timeout. Those results remain historical and do not accept this successor candidate. Exact-candidate verification and independent runtime acceptance are pending. No new product task or automation.
+
+
+### Existing frontend tail: system language and sign-out request lifecycle
+
+The previous candidate completed its directed checks and separate build/artifact review. Seven of eight browser scenarios passed; the final synthetic sign-out scenario received HTTP 204 and then the original request was canceled during full-document navigation. That scenario remains failed, and its evidence is retained.
+
+This candidate enables keepalive only for the existing empty sign-out POST. The endpoint, request policy, 204-only success rule, error handling and existing navigation remain intact. No dependency, backend or mobile change is included. Current-candidate directed checks and independent source/runtime review remain pending; earlier passes do not count as this candidate acceptance. This continues the existing language PR and adds no work package.
+
+
 2026-10-10 — UI5-P3 original-run fact observation labels now read the active locale reactively, so a mounted blocked/unblocked fact can follow language changes. This presentation change preserves the observed clock, terminal identity, backend read intent and empty action contract. Source implementation is prepared in an isolated worktree; targeted verification and independent review remain pending, with production/native/oracle and full acceptance still open.
 
 
