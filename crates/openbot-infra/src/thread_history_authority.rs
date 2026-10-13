@@ -28,7 +28,9 @@ use crate::db::pool::{DatabasePool, GuardedTransaction, TransactionOwnerError};
 use crate::db::{InfraError, native, thread_origin_schema};
 use crate::thread_origin;
 
+mod run_drain;
 mod stop_clear;
+pub use run_drain::ThreadHistoryRunDrain;
 pub use stop_clear::{
     ThreadHistoryStopClearConfirmation, ThreadHistoryStopClearError, ThreadHistoryStopClearIntent,
 };
