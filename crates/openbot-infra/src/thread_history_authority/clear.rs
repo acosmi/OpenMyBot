@@ -1120,14 +1120,14 @@ const fn corrupt(field: &'static str) -> Error {
     Error::Corrupt { field }
 }
 fn statement_error(error: tokio_postgres::Error) -> Error {
-    if let Some(db) = error.as_db_error() {
-        if db.code().code() == "55000" {
-            return match db.message() {
-                "run_output_producer_unregistered" => corrupt("run_output_producer_unregistered"),
-                "thread_history_clear_body_remaining" => corrupt("clear_body_remaining"),
-                _ => corrupt("history_binding"),
-            };
-        }
+    if let Some(db) = error.as_db_error()
+        && db.code().code() == "55000"
+    {
+        return match db.message() {
+            "run_output_producer_unregistered" => corrupt("run_output_producer_unregistered"),
+            "thread_history_clear_body_remaining" => corrupt("clear_body_remaining"),
+            _ => corrupt("history_binding"),
+        };
     }
     match error.code().map(tokio_postgres::error::SqlState::code) {
         Some("23503" | "23514" | "23505") => corrupt("history_binding"),

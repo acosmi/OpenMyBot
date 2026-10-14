@@ -545,10 +545,10 @@ impl ThreadDirectory for PostgresThreadDirectory {
             )
             .await
             .map_err(|error| unavailable("读取 thread history 失败", error))?;
-        if let Some(first) = rows.first() {
-            if decode::<bool>(first, "history_completed")? {
-                return Err(ThreadDirectoryError::NotVisible);
-            }
+        if let Some(first) = rows.first()
+            && decode::<bool>(first, "history_completed")?
+        {
+            return Err(ThreadDirectoryError::NotVisible);
         }
         let mut messages = Vec::with_capacity(rows.len());
         for row in &rows {
