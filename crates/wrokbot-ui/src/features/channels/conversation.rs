@@ -1822,14 +1822,11 @@ fn ToolTranscriptCard(tool: TranscriptTool) -> impl IntoView {
     let failed = error.is_some();
     let data_call = tool.call_id.clone();
     let computer = tool.name.starts_with("computer_");
-    let label = if tool.name.is_empty() {
-        t_string!(i18n, channels.tool_unrecognized).to_owned()
-    } else {
-        display.label
-    };
+    let unnamed = tool.name.is_empty();
+    let label = display.label;
     view! { <article class="ob-tool-card" data-tool-call=data_call data-tool-state=if failed { "review" } else if recorded { "recorded" } else { "waiting" }>
-        <header><strong>{label}</strong>{display.detail.map(|detail| view! { <span>{detail}</span> })}
-            <span class="ob-tool-state">{if failed { t_string!(i18n, channels.tool_record_error).to_owned() } else if recorded { t_string!(i18n, channels.tool_result_recorded).to_owned() } else { t_string!(i18n, channels.tool_waiting_result).to_owned() }}</span>
+        <header><strong>{move || if unnamed { t_string!(i18n, channels.tool_unrecognized).to_owned() } else { label.clone() }}</strong>{display.detail.map(|detail| view! { <span>{detail}</span> })}
+            <span class="ob-tool-state">{move || if failed { t_string!(i18n, channels.tool_record_error).to_owned() } else if recorded { t_string!(i18n, channels.tool_result_recorded).to_owned() } else { t_string!(i18n, channels.tool_waiting_result).to_owned() }}</span>
             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| controls.show(if computer { WorkspaceTab::Computer } else { WorkspaceTab::Results })>{move || t!(i18n, gallery.details)}</Button>
         </header>
         <p class="ob-tool-source">{tool.call_id.map(|id| view! { <code>{id}</code> })} " · " {tool.agent_id.map(|id| view! { <code>{id.as_str().to_owned()}</code> })}</p>

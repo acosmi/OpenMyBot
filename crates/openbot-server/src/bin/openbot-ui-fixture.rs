@@ -30,11 +30,12 @@ use openbot_application::{
     MemoryAdministration, MemoryAdministrationError, MemoryControlRequest, MemoryPageRequest,
     MutateMemoryRequest, OpenBotApplication, PeopleAdministration, PeoplePageRequest,
     PeoplePortError, PortError, RecallMemoriesRequest, RememberMemoryRequest, RoutingAuditRecord,
-    SandboxedComponentAdministration, SandboxedComponentAdministrationError,
-    SandboxedComponentDraft, ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError,
-    ThreadEventSubscription, ThreadHistoryRequest, ToolApprovalAdministration,
-    ToolApprovalAdministrationError, ToolApprovalPresentation, ToolApprovalRequest,
-    UiPreferenceAdministration, UiPreferenceAdministrationError, UpdateMemoryControlRequest,
+    RunEffectReceiptsRequest, RunReconciliationRequest, SandboxedComponentAdministration,
+    SandboxedComponentAdministrationError, SandboxedComponentDraft, ThreadConversationRequest,
+    ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription, ThreadHistoryRequest,
+    ToolApprovalAdministration, ToolApprovalAdministrationError, ToolApprovalPresentation,
+    ToolApprovalRequest, UiPreferenceAdministration, UiPreferenceAdministrationError,
+    UpdateMemoryControlRequest,
 };
 use openbot_contracts::agent::{
     AgentConnectionTestRequest, AgentConnectionVerdict, AgentLifecycleReceipt, AgentLifecycleState,
@@ -76,6 +77,11 @@ use openbot_contracts::memory::{
     MemoryRecord, MemoryScope, MemorySensitivity, MemorySource, MemoryStatus,
 };
 use openbot_contracts::people::{CurrentUser, PeoplePage, Person};
+use openbot_contracts::reconciliation::{
+    RunEffectReceipt, RunEffectReceiptFact, RunEffectReceiptsSnapshot, RunReconciliationAttempt,
+    RunReconciliationAttemptStatus, RunReconciliationCursor, RunReconciliationSnapshot,
+    RunReconciliationStatus, validate_page,
+};
 use openbot_contracts::sandboxed::{
     PublishedSandboxedComponent, PublishedSandboxedComponents, SandboxedComponentRecord,
     SandboxedComponents,
@@ -112,6 +118,9 @@ const FIXTURE_APPROVAL_THREAD: &str = "550e8400-e29b-81d4-a716-446655440001";
 const FIXTURE_CHOICE_THREAD: &str = "550e8400-e29b-81d4-a716-446655440002";
 const FIXTURE_APPROVAL_RUN: &str = "fixture-decision-run-approval";
 const FIXTURE_CHOICE_RUN: &str = "fixture-decision-run-choice";
+const FIXTURE_UNKNOWN_RUN: &str = "fixture-channel-unknown-run";
+const FIXTURE_UNKNOWN_TERMINAL: u64 = 12;
+const FIXTURE_UNKNOWN_FACTS_ENV: &str = "OPENBOT_UI_CHANNEL_UNKNOWN_FACTS_FIXTURE";
 const FIXTURE_GOOGLE_DRIVE_SERVER: &str = "google-drive";
 const FIXTURE_GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 const FIXTURE_ACTIVITY_FOLLOW_UP: &str =
@@ -417,6 +426,34 @@ impl FixtureAgents {
             next: Arc::new(AtomicU64::new(1)),
             callback_sequence: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    // Reference data for the explicit Synthetic Unknown-facts fixture only.
+    // No endpoint, credentials, callback token, model or execution is installed.
+    fn with_channel_unknown_facts(self, enabled: bool) -> Result<Self, PortError> {
+        if enabled {
+            self.rows
+                .lock()
+                .map_err(|_| PortError::Unavailable {
+                    dependency: "fixture_agents",
+                })?
+                .push(AgentProfile {
+                    id: BotId::new("bot-0"),
+                    name: "Synthetic Channel Fixture".to_owned(),
+                    title: "Synthetic history profile".to_owned(),
+                    role_description: "Read-only synthetic profile referenced by the registered channel Unknown-facts history.".to_owned(),
+                    avatar_seed: "fixture-channel-unknown-facts".to_owned(),
+                    visibility: AgentVisibility::Public,
+                    endpoint: None,
+                    has_auth: false,
+                    has_callback_token: false,
+                    hidden: false,
+                    system_owned: true,
+                    can_manage: false,
+                    mine: false,
+                });
+        }
+        Ok(self)
     }
 }
 
@@ -2163,6 +2200,7 @@ impl PeopleAdministration for FixturePeople {
 struct FixtureThreads {
     inner: Arc<FixtureThreadsInner>,
     channels: FixtureChannels,
+    channel_unknown_facts_fixture: bool,
 }
 
 struct FixtureThreadsInner {
@@ -2424,7 +2462,118 @@ impl FixtureThreads {
                 fail_activity_follow_up_once: AtomicBool::new(true),
             }),
             channels,
+            channel_unknown_facts_fixture: false,
         }
+    }
+
+    // Synthetic presentation seed only: no remember, dispatch, unlock or tool execution.
+    fn with_channel_unknown_facts(mut self, enabled: bool) -> Result<Self, ThreadDirectoryError> {
+        if enabled {
+            {
+                let mut snapshots = self
+                    .inner
+                    .snapshots
+                    .lock()
+                    .map_err(|_| ThreadDirectoryError::Unavailable)?;
+                let snapshot = snapshots.get_mut(FIXTURE_EXISTING_THREAD).ok_or(
+                    ThreadDirectoryError::Corrupt {
+                        field: "fixture_unknown_thread",
+                    },
+                )?;
+                // Read-only synthetic history, not tool dispatch or effect execution.
+                // An unpaired result exercises the existing missing-name/error presentation.
+                snapshot.messages.extend([
+                    ThreadHistoryMessage {
+                        selected_skill_slugs: Vec::new(),
+                        id: "fixture-p3-tool-history-calls".to_owned(),
+                        role: ThreadHistoryRole::Assistant,
+                        content: String::new(),
+                        agent_id: Some(BotId::new("bot-0")),
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_error_code: None,
+                        tool_calls: Some(vec![
+                            serde_json::json!({
+                                "id":"fixture-p3-tool-recorded",
+                                "type":"function",
+                                "function":{"name":"fixtureRecordedHistory","arguments":{}}
+                            }),
+                            serde_json::json!({
+                                "id":"fixture-p3-tool-waiting",
+                                "type":"function",
+                                "function":{"name":"fixtureWaitingHistory","arguments":{}}
+                            }),
+                        ]),
+                    },
+                    ThreadHistoryMessage {
+                        selected_skill_slugs: Vec::new(),
+                        id: "fixture-p3-tool-history-recorded".to_owned(),
+                        role: ThreadHistoryRole::Tool,
+                        content: "Read-only synthetic history result.".to_owned(),
+                        agent_id: Some(BotId::new("bot-0")),
+                        tool_call_id: Some("fixture-p3-tool-recorded".to_owned()),
+                        tool_name: Some("fixtureRecordedHistory".to_owned()),
+                        tool_error_code: None,
+                        tool_calls: None,
+                    },
+                    ThreadHistoryMessage {
+                        selected_skill_slugs: Vec::new(),
+                        id: "fixture-p3-tool-history-unnamed".to_owned(),
+                        role: ThreadHistoryRole::Tool,
+                        content: "Read-only history result with no recorded tool name.".to_owned(),
+                        agent_id: Some(BotId::new("bot-0")),
+                        tool_call_id: Some("fixture-p3-tool-unnamed".to_owned()),
+                        tool_name: None,
+                        tool_error_code: None,
+                        tool_calls: None,
+                    },
+                ]);
+                snapshot.active_run_id = Some(RunId::new(FIXTURE_UNKNOWN_RUN));
+                snapshot.active_run_state = Some(ThreadForegroundRunState::ReconciliationRequired);
+                snapshot.active_run_cancellable = false;
+                snapshot.last_event_sequence = Some(FIXTURE_UNKNOWN_TERMINAL);
+            }
+            // Register the seed's original terminal for normal replay; do not publish a new event.
+            self.inner
+                .events
+                .lock()
+                .map_err(|_| ThreadDirectoryError::Unavailable)?
+                .insert(
+                    FIXTURE_EXISTING_THREAD.to_owned(),
+                    vec![ThreadRunEvent {
+                        thread_id: ThreadId::new(FIXTURE_EXISTING_THREAD),
+                        run_id: RunId::new(FIXTURE_UNKNOWN_RUN),
+                        event_sequence: FIXTURE_UNKNOWN_TERMINAL,
+                        event_type: ThreadRunEventKind::ReconciliationRequired,
+                        payload: serde_json::json!({"status":"reconciliation_required"}),
+                        terminal: true,
+                        created_at: fixture_unknown_facts_time() + Duration::seconds(2),
+                    }],
+                );
+            self.channel_unknown_facts_fixture = true;
+        }
+        Ok(self)
+    }
+
+    fn ensure_unknown_facts_request(
+        &self,
+        request: &RunReconciliationRequest,
+    ) -> Result<(), ThreadDirectoryError> {
+        if !self.channel_unknown_facts_fixture {
+            return Err(ThreadDirectoryError::Unavailable);
+        }
+        if request.deployment.as_str() != FIXTURE_DEPLOYMENT
+            || request.tenant.as_str() != FIXTURE_TENANT
+            || request.actor.as_str() != FIXTURE_ACTOR
+            || request.auth_generation != AuthGeneration::new(1)
+            || request.thread.as_str() != FIXTURE_EXISTING_THREAD
+            || request.run.as_str() != FIXTURE_UNKNOWN_RUN
+        {
+            return Err(ThreadDirectoryError::NotVisible);
+        }
+        validate_page(request.after, Some(request.limit))
+            .map_err(|_| ThreadDirectoryError::InvalidInput { field: "page" })?;
+        Ok(())
     }
 
     fn proof(&self) -> Result<serde_json::Value, ()> {
@@ -2861,6 +3010,82 @@ impl ThreadDirectory for FixtureThreads {
             thread_id,
             run_id,
             state: ThreadRunCancellationState::Requested,
+        })
+    }
+
+    async fn run_reconciliation(
+        &self,
+        request: RunReconciliationRequest,
+    ) -> Result<RunReconciliationSnapshot, ThreadDirectoryError> {
+        self.ensure_unknown_facts_request(&request)?;
+        let position = RunReconciliationCursor {
+            call_sequence: 2,
+            attempt_sequence: 1,
+        };
+        let created_at = fixture_unknown_facts_time();
+        let attempts = if request.after.is_none_or(|after| position > after) {
+            vec![RunReconciliationAttempt {
+                tool_call_id: "fixture-unknown-call".to_owned(),
+                call_sequence: position.call_sequence,
+                attempt_id: "fixture-unknown-attempt".to_owned(),
+                attempt_sequence: position.attempt_sequence,
+                status: RunReconciliationAttemptStatus::ReconciliationRequired,
+                recorded_commit_state: None,
+                created_at,
+                started_at: Some(created_at),
+                finished_at: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(RunReconciliationSnapshot {
+            thread_id: request.thread,
+            run_id: request.run,
+            status: RunReconciliationStatus::ReconciliationRequired,
+            terminal_event_sequence: FIXTURE_UNKNOWN_TERMINAL,
+            observed_at: created_at + Duration::seconds(2),
+            foreground_blocked: true,
+            attempts,
+            next: None,
+            available_actions: [],
+        })
+    }
+
+    async fn run_effect_receipts(
+        &self,
+        request: RunEffectReceiptsRequest,
+    ) -> Result<RunEffectReceiptsSnapshot, ThreadDirectoryError> {
+        self.ensure_unknown_facts_request(&request)?;
+        let position = RunReconciliationCursor {
+            call_sequence: 2,
+            attempt_sequence: 1,
+        };
+        let created_at = fixture_unknown_facts_time();
+        let receipts = if request.after.is_none_or(|after| position > after) {
+            // A registered synthetic positive fact, not a call to the Memory write port.
+            vec![RunEffectReceipt {
+                receipt_id: "fixture-unknown-memory-receipt".to_owned(),
+                tool_call_id: "fixture-unknown-call".to_owned(),
+                call_sequence: position.call_sequence,
+                attempt_id: "fixture-unknown-attempt".to_owned(),
+                attempt_sequence: position.attempt_sequence,
+                fact: RunEffectReceiptFact::MemoryCreated,
+                recorded_at: created_at + Duration::seconds(1),
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(RunEffectReceiptsSnapshot {
+            thread_id: request.thread,
+            run_id: request.run,
+            status: RunReconciliationStatus::ReconciliationRequired,
+            terminal_event_sequence: FIXTURE_UNKNOWN_TERMINAL,
+            observed_at: created_at + Duration::seconds(3),
+            // This separate later observation neither edits the seed nor releases its slot.
+            foreground_blocked: false,
+            receipts,
+            next: None,
+            available_actions: [],
         })
     }
 
@@ -3620,6 +3845,40 @@ fn auth_journey_enabled() -> Result<bool, Box<dyn Error>> {
     }
 }
 
+fn fixture_unknown_facts_time() -> OffsetDateTime {
+    // Fixed synthetic registration time: 2026-10-02T00:00:00Z.
+    OffsetDateTime::from_unix_timestamp(1_790_899_200)
+        .expect("fixed synthetic date is representable")
+}
+
+fn channel_unknown_facts_fixture_enabled(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<bool, std::io::Error> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == std::ffi::OsStr::new("1") => Ok(true),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OPENBOT_UI_CHANNEL_UNKNOWN_FACTS_FIXTURE must be exactly 1 when present",
+        )),
+    }
+}
+
+fn validate_channel_unknown_facts_fixture_mode(
+    enabled: bool,
+    approval_mode: &str,
+    auth_mode: &str,
+    auth_journey: bool,
+) -> Result<(), std::io::Error> {
+    if enabled && (approval_mode != "memory" || auth_mode != "fixed" || auth_journey) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Synthetic channel Unknown facts require Memory/fixed mode without the auth journey",
+        ));
+    }
+    Ok(())
+}
+
 fn home_skills_fixture_enabled(value: Option<&std::ffi::OsStr>) -> Result<bool, std::io::Error> {
     match value {
         None => Ok(false),
@@ -3774,6 +4033,20 @@ fn is_auth_journey_protected_path(path: &str) -> bool {
 async fn main() -> Result<(), Box<dyn Error>> {
     let (dist, port) = arguments()?;
     let auth_journey = auth_journey_enabled()?;
+    let channel_unknown_facts_fixture = channel_unknown_facts_fixture_enabled(
+        std::env::var_os(FIXTURE_UNKNOWN_FACTS_ENV).as_deref(),
+    )?;
+    // Reject this synthetic opt-in before PostgreSQL assembly or any listening socket.
+    validate_channel_unknown_facts_fixture_mode(
+        channel_unknown_facts_fixture,
+        if std::env::var_os(FIXTURE_APPROVAL_DATABASE_URL).is_some() {
+            "postgres"
+        } else {
+            "memory"
+        },
+        "fixed",
+        auth_journey,
+    )?;
     let home_skills_fixture =
         home_skills_fixture_enabled(std::env::var_os(FIXTURE_HOME_SKILLS_ENV).as_deref())?;
     let model_picker_fixture = fixture_model_connections::enabled(
@@ -3825,6 +4098,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         mode: approval_mode,
         auth_mode,
     } = assemble_approval_fixture(now, &context).await?;
+    validate_channel_unknown_facts_fixture_mode(
+        channel_unknown_facts_fixture,
+        approval_mode,
+        auth_mode,
+        auth_journey,
+    )?;
     validate_home_skills_fixture_mode(home_skills_fixture, approval_mode, auth_mode, auth_journey)?;
     fixture_model_connections::validate_mode(
         model_picker_fixture,
@@ -3872,7 +4151,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     let home_channel_probe = channels.clone();
-    let threads = FixtureThreads::new(channels.clone());
+    let threads = FixtureThreads::new(channels.clone())
+        .with_channel_unknown_facts(channel_unknown_facts_fixture)?;
     let bot_thread_probe = threads.clone();
     let memory = FixtureMemory::new(tenant, actor.clone(), now);
     let connections = FixtureConnections::new(actor, port, now);
@@ -3880,7 +4160,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sandboxed = FixtureSandboxed::new(now);
     let routing = FixtureRouting::new();
     let routing_probe = routing.probe();
-    let agents = Arc::new(FixtureAgents::new());
+    let agents =
+        Arc::new(FixtureAgents::new().with_channel_unknown_facts(channel_unknown_facts_fixture)?);
     let plugins = fixture_plugins::PluginsFixture::new(connections);
     let plugins = match home_skills_context.as_ref() {
         Some(context) => plugins.with_home_skills(context),
@@ -4132,6 +4413,131 @@ mod approval_pg_tests {
             // None leaves every existing assembly mode under its original startup validation.
             assert!(validate_home_skills_fixture_mode(false, approval, auth, journey).is_ok());
         }
+    }
+
+    #[test]
+    fn channel_unknown_facts_fixture_requires_exact_opt_in_and_memory_fixed_mode() {
+        use std::ffi::OsStr;
+
+        assert!(!channel_unknown_facts_fixture_enabled(None).unwrap());
+        assert!(channel_unknown_facts_fixture_enabled(Some(OsStr::new("1"))).unwrap());
+        for value in ["", "0", "true", " 1", "1\n", "private-value-canary"] {
+            let error = channel_unknown_facts_fixture_enabled(Some(OsStr::new(value))).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "OPENBOT_UI_CHANNEL_UNKNOWN_FACTS_FIXTURE must be exactly 1 when present"
+            );
+        }
+        assert!(
+            validate_channel_unknown_facts_fixture_mode(true, "memory", "fixed", false).is_ok()
+        );
+        for (approval, auth, journey) in [
+            ("postgres", "fixed", false),
+            ("memory", "session", false),
+            ("memory", "fixed", true),
+        ] {
+            assert!(
+                validate_channel_unknown_facts_fixture_mode(true, approval, auth, journey).is_err()
+            );
+            assert!(
+                validate_channel_unknown_facts_fixture_mode(false, approval, auth, journey).is_ok()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_unknown_facts_fixture_agent_reference_is_opt_in_and_nonmanageable() {
+        let baseline = FixtureAgents::new().rows.lock().unwrap().clone();
+        assert_eq!(baseline.len(), 5);
+        let disabled = FixtureAgents::new()
+            .with_channel_unknown_facts(false)
+            .unwrap();
+        assert_eq!(*disabled.rows.lock().unwrap(), baseline);
+        let agents = FixtureAgents::new()
+            .with_channel_unknown_facts(true)
+            .unwrap();
+        let scope = AgentReadScope {
+            tenant: TenantId::new(FIXTURE_TENANT),
+            actor: ActorId::new(FIXTURE_ACTOR),
+            admin: false,
+        };
+        let id = BotId::new("bot-0");
+        assert!(
+            disabled
+                .get_visible_agent(&scope, &id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let all = agents.rows.lock().unwrap().clone();
+        assert_eq!(all.len(), 6);
+        assert_eq!(&all[..5], baseline.as_slice());
+        assert_eq!(all.iter().filter(|row| row.id == id).count(), 1);
+        let profile = agents
+            .get_visible_agent(&scope, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.visibility, AgentVisibility::Public);
+        assert!(profile.name.contains("Synthetic"));
+        assert!(profile.system_owned);
+        assert!(!profile.can_manage && !profile.mine && !profile.hidden);
+        assert!(profile.endpoint.is_none() && !profile.has_auth && !profile.has_callback_token);
+        assert!(
+            agents
+                .list_visible_agents(&scope, false)
+                .await
+                .unwrap()
+                .contains(&profile)
+        );
+
+        let channels = FixtureChannels::new(fixture_unknown_facts_time());
+        let channel = channels.rows.lock().unwrap()[0].clone();
+        assert_eq!(channel.id, ChannelId::new("channel-00"));
+        assert_eq!(channel.agent_ids, vec![id.clone()]);
+        assert_eq!(channel.last_message_agent_id, Some(id.clone()));
+        let threads = FixtureThreads::new(channels)
+            .with_channel_unknown_facts(true)
+            .unwrap();
+        let snapshots = threads.inner.snapshots.lock().unwrap();
+        let history = snapshots.get(FIXTURE_EXISTING_THREAD).unwrap();
+        let references: Vec<_> = history
+            .messages
+            .iter()
+            .filter(|message| message.id.starts_with("fixture-p3-tool-history-"))
+            .map(|message| message.agent_id.clone())
+            .collect();
+        assert_eq!(references, vec![Some(id.clone()); 3]);
+        drop(snapshots);
+
+        let auth = AuthContext::for_test(
+            DeploymentId::new(FIXTURE_DEPLOYMENT),
+            TenantId::new(FIXTURE_TENANT),
+            ActorId::new(FIXTURE_ACTOR),
+            [Role::User],
+            AuthGeneration::new(1),
+            false,
+        );
+        let administration = AgentAdministrationScope {
+            tenant: scope.tenant,
+            actor: scope.actor,
+            admin: false,
+            auth_generation: AuthGeneration::new(1),
+        };
+        assert_eq!(
+            agents.delete_agent(&administration, &id).await.unwrap_err(),
+            AgentAdministrationError::Protected
+        );
+        assert_eq!(
+            agents.issue(&auth, &id).await.unwrap_err(),
+            AgentCallbackTokenError::NotVisible
+        );
+        assert_eq!(
+            agents.revoke(&auth, &id).await.unwrap_err(),
+            AgentCallbackTokenError::NotVisible
+        );
+        assert_eq!(agents.rows.lock().unwrap().len(), 6);
     }
 
     #[tokio::test]
