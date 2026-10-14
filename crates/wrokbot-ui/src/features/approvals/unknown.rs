@@ -154,7 +154,7 @@ pub(crate) fn UnknownFacts(
                 <FactObservation observed=page.observed_at blocked=page.foreground_blocked terminal=page.terminal_event_sequence/>
                 <Show when=move || empty><p>{move || t!(i18n, admin.unknown_empty)}</p></Show>
                 <ul>{rows.into_iter().map(|row| view! { <li><code>{row.tool_call_id}</code> " / " <code>{row.attempt_id}</code>
-                    <p>{format!("{:?} · {}", row.status, row.recorded_commit_state.map_or_else(|| t_string!(i18n, admin.unknown_not_recorded).to_owned(), |state| format!("{state:?}")))}</p>
+                    <p>{move || format!("{:?} · {}", row.status, row.recorded_commit_state.map_or_else(|| t_string!(i18n, admin.unknown_not_recorded).to_owned(), |state| format!("{state:?}")))}</p>
                     <time>{format_time(row.created_at)}</time>
                 </li> }).collect_view()}</ul>
                 {next.map(|next| view! { <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| read_attempts.run(Some(next))>{move || t!(i18n, common.next)}</Button> })}
@@ -200,7 +200,7 @@ fn bind_terminal(terminal: RwSignal<Option<u64>>, sequence: u64) -> Result<(), A
 #[component]
 fn FactObservation(observed: time::OffsetDateTime, blocked: bool, terminal: u64) -> impl IntoView {
     let i18n = use_i18n();
-    view! { <p class="ob-page-intro"><time>{format_time(observed)}</time> " · " <code>{terminal}</code> " · " {if blocked { t_string!(i18n, admin.unknown_blocked).to_owned() } else { t_string!(i18n, admin.unknown_unblocked_fact).to_owned() }}</p> }
+    view! { <p class="ob-page-intro"><time>{format_time(observed)}</time> " · " <code>{terminal}</code> " · " {move || if blocked { t_string!(i18n, admin.unknown_blocked).to_owned() } else { t_string!(i18n, admin.unknown_unblocked_fact).to_owned() }}</p> }
 }
 fn format_time(time: time::OffsetDateTime) -> String {
     time.format(&time::format_description::well_known::Rfc3339)

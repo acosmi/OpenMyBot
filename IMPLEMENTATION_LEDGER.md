@@ -2014,3 +2014,23 @@ Existing system-language candidate normally incorporates delivered main b05d76e9
 The previous candidate completed its directed checks and separate build/artifact review. Seven of eight browser scenarios passed; the final synthetic sign-out scenario received HTTP 204 and then the original request was canceled during full-document navigation. That scenario remains failed, and its evidence is retained.
 
 This candidate enables keepalive only for the existing empty sign-out POST. The endpoint, request policy, 204-only success rule, error handling and existing navigation remain intact. No dependency, backend or mobile change is included. Current-candidate directed checks and independent source/runtime review remain pending; earlier passes do not count as this candidate acceptance. This continues the existing language PR and adds no work package.
+
+
+2026-10-10 — UI5-P3 original-run fact observation labels now read the active locale reactively, so a mounted blocked/unblocked fact can follow language changes. This presentation change preserves the observed clock, terminal identity, backend read intent and empty action contract. Source implementation is prepared in an isolated worktree; targeted verification and independent review remain pending, with production/native/oracle and full acceptance still open.
+
+
+2026-10-10 — UI5-P3 the existing attempt-row missing-record label now also observes live locale changes. Both reactive label changes preserve original attempt status, nullable commit facts, page generations, terminal binding and read-only behavior. Source-only continuation: new directed verification, independent exact-candidate review and mounted runtime evidence remain pending; all native, production, oracle and full-package debt remains open.
+
+
+2026-10-10 — UI5-P3 mounted tool transcript cards now also read the active locale for the unknown-tool fallback and recorded, waiting or error status. Named tool labels and recorded facts keep their original content; details navigation and submission behavior are unchanged. These presentation fixes remain an isolated source candidate pending directed compilation, current independent review and mounted browser validation.
+
+
+2026-10-10T08:18:16.746126+00:00 UI5-P3: adds an explicitly enabled synthetic original-run facts fixture using the existing reconciliation and receipt read contracts. It remains disabled by default and rejects PostgreSQL, auth-journey and foreign request identities; no writer, dispatch, unlock or production capability is added. The fixture source passed independent review, and all three changed Rust files pass Rust 1.98 formatting and diff checks after four formatter-only repairs. Exact-candidate compilation, mounted bilingual checks and publication remain pending; tool-card labels are not yet exercised by this fixture. Production, native and independent visual-reference acceptance remain open.
+
+2026-10-10T09:04:37.372428+00:00 UI5-P3 isolated synthetic read-only tool history: added recorded, waiting and missing-name/error history objects only within the existing explicit Unknown-facts fixture option. Independent source review passed before application; current fixture bytes match the reviewed postimage, three-file Rust 1.98 formatting and diff checks pass. The initial formatting invocation named an absent path and is retained as an invocation failure. Compilation, mounted bilingual tool-card and Unknown-fact acceptance remain not run; no production tool execution or Unknown unlock is claimed. Independent reference, native and production requirements remain open.
+
+
+2026-10-12T08:20:49.633584+00:00 - Existing UI5-P3 source candidate incorporates delivered main404d by normal merge. All three previously reviewed product files keep their exact bytes; incoming backend files and the complete public main ledger are preserved. This is source composition only: P2 acceptance, exact-candidate directed checks and mounted bilingual validation remain pending; no PR merge or full-package acceptance is claimed.
+
+
+2026-10-13 - Existing Unknown live-locale closeout retains the original terminal facts, read-only behavior, action boundaries and three mounted card presentations. Its conversation dependency was delivered through PR177. The separate system-language candidate remains unaccepted at the logout transport-completion gate; it is not a prerequisite for this existing package. Current-main composition, directed checks and different-author browser acceptance remain pending. This records an existing tail and adds no work package.
