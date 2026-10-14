@@ -703,10 +703,14 @@ impl ThreadDirectory for PostgresThreadDirectory {
             active_run_state,
             active_run_cancellable,
             active_run_text: active_texts.into_iter().next().unwrap_or_default(),
-            last_event_sequence: next_event_sequence
-                .checked_sub(1)
-                .map(|value| checked_sequence(value, "last_event_sequence"))
-                .transpose()?,
+            last_event_sequence: if next_event_sequence == 0 {
+                None
+            } else {
+                Some(checked_sequence(
+                    next_event_sequence - 1,
+                    "last_event_sequence",
+                )?)
+            },
         })
     }
 }
