@@ -299,7 +299,7 @@ async fn auxiliary_bodies(c: &Client, t: &ThreadId) -> TestResult {
 }
 
 async fn assert_held_lock(c: &Client, pid: i32, relation: &str) -> TestResult {
-    require(c.query_one("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND relation=$2::regclass AND granted)",&[&pid,&relation]).await.map_err(text)?.get::<_,bool>(0),"owned locker did not hold actual relation lock")
+    require(c.query_one("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND relation=$2::text::regclass AND granted)",&[&pid,&relation]).await.map_err(text)?.get::<_,bool>(0),"owned locker did not hold actual relation lock")
 }
 
 // This finite probe retains only the clearing objects and the original C01 guards.
