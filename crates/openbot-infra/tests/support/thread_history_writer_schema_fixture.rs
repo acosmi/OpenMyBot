@@ -46,7 +46,7 @@ async fn writer_check(c: &Client) -> TestResult {
     )?;
     Ok(())
 }
-async fn writer_check_legacy51(c: &mut Client) -> TestResult {
+async fn writer_check_legacy51(c: &mut pool::PooledClient) -> TestResult {
     let ledger = native::validate_known_prefix(c, 51)
         .await
         .map_err(|e| e.to_string())?;
