@@ -93,6 +93,7 @@ enum ReadChoice {
 #[derive(Clone, Copy)]
 pub struct UiPreferenceContext {
     theme: RwSignal<UiTheme>,
+    fallback_locale: UiLocale,
     writes: RwSignal<PreferenceWrites>,
     reading: RwSignal<bool>,
     read_failed: RwSignal<bool>,
@@ -105,6 +106,8 @@ pub struct UiPreferenceContext {
 pub fn provide_ui_preferences(i18n: I18nContext<Locale>) -> UiPreferenceContext {
     let context = UiPreferenceContext {
         theme: RwSignal::new(current_theme()),
+        fallback_locale: use_context::<crate::locale_policy::SystemLocale>()
+            .map_or(UiLocale::En, |locale| locale.0),
         writes: RwSignal::new(PreferenceWrites::default()),
         reading: RwSignal::new(false),
         read_failed: RwSignal::new(false),
@@ -304,7 +307,11 @@ impl UiPreferenceContext {
             apply_theme(theme);
             self.theme.try_set(theme);
         }
-        if locale_unedited && let Some(locale) = stored.locale {
+        if let Some(locale) = crate::locale_policy::locale_after_read(
+            stored.locale,
+            self.fallback_locale,
+            locale_unedited,
+        ) {
             i18n.set_locale(contract_locale(locale));
         }
     }

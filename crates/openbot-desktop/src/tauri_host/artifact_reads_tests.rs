@@ -752,61 +752,63 @@ impl LocalFixture {
             if arm_setup_diagnostic {
                 eprintln!("ARTIFACT_LOCAL_ARM_SETUP_DIAGNOSTIC phase=BeginThreadRun actual_thread_run_started_reply=true original_passive=true nongrant=true agent_terminal_observation_claimed=false original_result_unchanged=true");
             }
-            if p1_setup_diagnostic || arm_setup_diagnostic {
-                require(
-                    begin_receipt.thread_id == begin.thread_id
-                        && begin_receipt.run_id == begin.run_id,
-                    "P1 original Begin receipt selected another run",
-                )?;
-                // This fixture precondition observes the actual dispatched run before the
-                // single Save. It does not alter Save's original budget or claim Agent join ACK.
-                let fixture_deadline = Instant::now() + Duration::from_secs(5);
-                tokio::time::timeout_at(tokio::time::Instant::from_std(fixture_deadline), async {
-                    let mut events = prepared.application().subscribe(auth.clone(),
-                        SubscriptionRequest::ThreadEvents {
-                            thread_id: begin.thread_id.clone(),
-                            after_event_sequence: Some(begin_receipt.event_sequence),
-                        }).await.map_err(|error| error.to_string())?;
-                    let mut cursor = begin_receipt.event_sequence;
-                    let terminal = loop {
-                        let event = core::future::poll_fn(|cx| events.as_mut().poll_next(cx)).await
-                            .ok_or("P1 original run stream ended before durable terminal")?;
-                        let AppEvent::ThreadRunEvent(event) = event else {
-                            return Err("P1 original run stream failed or returned another envelope".to_owned());
-                        };
-                        require(event.thread_id == begin.thread_id && event.run_id == begin.run_id
-                            && event.event_sequence > cursor
-                            && event.terminal == event.event_type.is_terminal(),
-                            "P1 original run event identity, cursor or terminal flag differed")?;
-                        cursor = event.event_sequence;
-                        match event.event_type {
-                            ThreadRunEventKind::Completed | ThreadRunEventKind::Failed
-                                | ThreadRunEventKind::Cancelled => break event.event_type,
-                            ThreadRunEventKind::ReconciliationRequired => return Err(
-                                "P1 original run has unknown terminal facts".to_owned()),
-                            ThreadRunEventKind::Started | ThreadRunEventKind::SemanticChunk
-                                | ThreadRunEventKind::Checkpoint => {}
-                        }
+            // Every fixture label Saves only after its dispatched source Run is durably terminal
+            // and the thread foreground is inactive. A live Run holds FOR UPDATE on its
+            // run/thread/lease rows while Save's source locks are NOWAIT, so an earlier Save gets
+            // a legitimate immediate Unavailable. A missing or unknown terminal fails right here.
+            require(
+                begin_receipt.thread_id == begin.thread_id
+                    && begin_receipt.run_id == begin.run_id,
+                "P1 original Begin receipt selected another run",
+            )?;
+            // This fixture precondition observes the actual dispatched run before the
+            // single Save. It does not alter Save's original budget or claim Agent join ACK.
+            let fixture_deadline = Instant::now() + Duration::from_secs(5);
+            tokio::time::timeout_at(tokio::time::Instant::from_std(fixture_deadline), async {
+                let mut events = prepared.application().subscribe(auth.clone(),
+                    SubscriptionRequest::ThreadEvents {
+                        thread_id: begin.thread_id.clone(),
+                        after_event_sequence: Some(begin_receipt.event_sequence),
+                    }).await.map_err(|error| error.to_string())?;
+                let mut cursor = begin_receipt.event_sequence;
+                let terminal = loop {
+                    let event = core::future::poll_fn(|cx| events.as_mut().poll_next(cx)).await
+                        .ok_or("P1 original run stream ended before durable terminal")?;
+                    let AppEvent::ThreadRunEvent(event) = event else {
+                        return Err("P1 original run stream failed or returned another envelope".to_owned());
                     };
-                    let conversation = prepared.application().execute(auth.clone(),
-                        AppCommand::GetThreadConversation { thread_id: begin.thread_id.clone() })
-                        .await.map_err(|error| error.to_string())?;
-                    let AppReply::ThreadConversation(conversation) = conversation else {
-                        return Err("P1 original conversation returned another reply".to_owned());
-                    };
-                    require(conversation.active_run_id.is_none()
-                        && conversation.active_run_state.is_none()
-                        && conversation.last_event_sequence.is_some_and(|value| value >= cursor),
-                        "P1 original run foreground was not durably inactive")?;
-                    require(Instant::now() < fixture_deadline,
-                        "P1 original run fixture deadline expired")?;
-                    // Dropping this real stream requests its existing producer to stop;
-                    // neither Drop nor durable terminal observation is a resource closure ACK.
-                    drop(events);
-                    eprintln!("ARTIFACT_LOCAL_P1_RUN_PRECONDITION fixture_label={label} original_run_terminal={terminal:?} original_foreground_inactive=true one_absolute_fixture_budget=true original_save_not_started=true stream_drop_is_not_join_ack=true");
-                    Ok::<_, String>(())
-                }).await.map_err(|_| "P1 original run fixture deadline expired".to_owned())??;
-            }
+                    require(event.thread_id == begin.thread_id && event.run_id == begin.run_id
+                        && event.event_sequence > cursor
+                        && event.terminal == event.event_type.is_terminal(),
+                        "P1 original run event identity, cursor or terminal flag differed")?;
+                    cursor = event.event_sequence;
+                    match event.event_type {
+                        ThreadRunEventKind::Completed | ThreadRunEventKind::Failed
+                            | ThreadRunEventKind::Cancelled => break event.event_type,
+                        ThreadRunEventKind::ReconciliationRequired => return Err(
+                            "P1 original run has unknown terminal facts".to_owned()),
+                        ThreadRunEventKind::Started | ThreadRunEventKind::SemanticChunk
+                            | ThreadRunEventKind::Checkpoint => {}
+                    }
+                };
+                let conversation = prepared.application().execute(auth.clone(),
+                    AppCommand::GetThreadConversation { thread_id: begin.thread_id.clone() })
+                    .await.map_err(|error| error.to_string())?;
+                let AppReply::ThreadConversation(conversation) = conversation else {
+                    return Err("P1 original conversation returned another reply".to_owned());
+                };
+                require(conversation.active_run_id.is_none()
+                    && conversation.active_run_state.is_none()
+                    && conversation.last_event_sequence.is_some_and(|value| value >= cursor),
+                    "P1 original run foreground was not durably inactive")?;
+                require(Instant::now() < fixture_deadline,
+                    "P1 original run fixture deadline expired")?;
+                // Dropping this real stream requests its existing producer to stop;
+                // neither Drop nor durable terminal observation is a resource closure ACK.
+                drop(events);
+                eprintln!("ARTIFACT_LOCAL_P1_RUN_PRECONDITION fixture_label={label} original_run_terminal={terminal:?} original_foreground_inactive=true one_absolute_fixture_budget=true original_save_not_started=true stream_drop_is_not_join_ack=true");
+                Ok::<_, String>(())
+            }).await.map_err(|_| "P1 original run fixture deadline expired".to_owned())??;
             let source = format!("{}:input", begin.run_id.as_str());
             let original_save = SaveRunMessageTextArtifact {
                 request_id: uuid::Uuid::now_v7().to_string(),
