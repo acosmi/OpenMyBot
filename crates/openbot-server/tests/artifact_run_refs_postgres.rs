@@ -23,7 +23,7 @@ use openbot_contracts::command::{
 };
 use openbot_contracts::error::AppError;
 use openbot_contracts::ids::{
-    BotId, DeploymentId, RunId, TenantId, ThreadId, thread::ThreadIdentity,
+    ActorId, BotId, DeploymentId, RunId, TenantId, ThreadId, thread::ThreadIdentity,
 };
 use openbot_domain::artifact::ArtifactQuotaPolicy;
 use openbot_domain::identity::session::{SessionHashKey, SessionToken, SessionTokenHash};
@@ -84,11 +84,7 @@ fn parts(cookie: &str) -> Result<http::request::Parts> {
 }
 
 // Reuse the existing owned-current-read corruption carrier verbatim apart from check naming.
-fn mutate_owned_read_only_file<M, E>(
-    path: &std::path::Path,
-    mutation: M,
-    expected: E,
-) -> Result<(), String>
+fn mutate_owned_read_only_file<M, E>(path: &std::path::Path, mutation: M, expected: E) -> Result
 where
     M: FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
     E: FnOnce(&[u8], &[u8]) -> bool,
