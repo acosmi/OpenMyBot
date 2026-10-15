@@ -2060,7 +2060,7 @@ mod tests {
         assert_ne!(native_0035_checksum(), native_0036_checksum());
         assert_eq!(native_0037_checksum().len(), 64);
         assert_ne!(native_0036_checksum(), native_0037_checksum());
-        assert_eq!(MIGRATIONS.len(), 39);
+        assert_eq!(MIGRATIONS.len(), 40);
         assert_eq!(native_0038_checksum().len(), 64);
         assert_ne!(native_0037_checksum(), native_0038_checksum());
         assert_eq!(native_0039_checksum().len(), 64);
