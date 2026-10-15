@@ -160,6 +160,7 @@ async fn detail_is_member_only_and_projects_only_the_matching_native_thread() {
                     tenant: TenantId::new("tenant-a"),
                     actor: ActorId::new("actor-a"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: None,
                         selected_skill_slugs: Vec::new(),
                         thread_id: openbot_contracts::ids::ThreadId::new("thread-shared"),

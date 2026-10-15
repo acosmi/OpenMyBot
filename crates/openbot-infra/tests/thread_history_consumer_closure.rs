@@ -262,6 +262,7 @@ fn begin_v1(
         actor: ActorId::new("alice"),
         auth_generation: AuthGeneration::new(7),
         command: BeginThreadRun {
+            artifact_refs: Vec::new(),
             thread_id: thread_for(index),
             run_id: RunId::new(format!("closure-run-{index}")),
             bot_id: BotId::new("bot"),
@@ -866,6 +867,7 @@ impl V2 {
             actor: ActorId::new("alice"),
             auth_generation: AuthGeneration::new(7),
             command: BeginThreadRunV2 {
+                artifact_refs: Vec::new(),
                 thread_id: thread_for(index),
                 run_id: RunId::new(format!("closure-run-{index}")),
                 bot_id: BotId::new("bot"),
@@ -1278,10 +1280,12 @@ const TEST_KEY_DER_BASE64: &str =
 
 struct LocalResolver {
     address: SocketAddr,
+    resolved: Arc<AtomicUsize>,
 }
 #[async_trait]
 impl DnsResolver for LocalResolver {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, DnsUnavailable> {
+        self.resolved.fetch_add(1, Ordering::SeqCst);
         if host != "idp.test" || port != self.address.port() {
             return Err(DnsUnavailable);
         }
@@ -1296,6 +1300,7 @@ struct Tls {
     root: CertificateDer<'static>,
     accepted: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
+    resolved: Arc<AtomicUsize>,
     gate: Arc<Semaphore>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
@@ -1320,6 +1325,7 @@ impl Tls {
         let address = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
+        let resolved = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Semaphore::new(0));
         let (stop, mut stopped) = oneshot::channel();
         let (seen_accept, seen_request, held) = (accepted.clone(), requests.clone(), gate.clone());
@@ -1365,6 +1371,7 @@ impl Tls {
             root,
             accepted,
             requests,
+            resolved,
             gate,
             stop: Some(stop),
             task: Some(task),
@@ -1380,6 +1387,7 @@ impl Tls {
             EgressPolicy::new(CidrAllowlist::parse_exact(["127.0.0.1/32"]).unwrap()),
             Arc::new(LocalResolver {
                 address: self.address,
+                resolved: self.resolved.clone(),
             }),
             [self.root.clone()],
         )
@@ -3183,5 +3191,95 @@ async fn legacy_start_query_failure(
         "a failed closed-head read closed or removed the head",
     )?;
     drop((observer, heads, c));
+    close_pool(starter_pool).await?;
+    v2_start_early_dataset_query_failure(p, config, tls, v2).await
+}
+
+/// Independent current-dataset start error classification at its EARLY schema observation.
+/// The heads table lock makes V2's earlier schema/capture read wait first. This deliberately
+/// does not claim an injected error at the later shared `history_closed_for_read` predicate.
+/// The original legacy case above retains that distinct exact closed-predicate witness.
+async fn v2_start_early_dataset_query_failure(
+    p: &pool::DatabasePool,
+    config: &pool::DatabaseConfig,
+    tls: &Tls,
+    v2: &V2,
+) -> TestResult {
+    let model = v2
+        .model(CustomModelProtocol::OpenaiResponses, &tls.endpoint())
+        .await?;
+    let begin = v2.request(79, &model);
+    v2.directory
+        .begin_thread_run_v2(begin.clone())
+        .await
+        .map_err(text)?;
+    let request = v2
+        .context(p)
+        .load(&lease_of(&begin.command.run_id, &begin.command.thread_id))
+        .await
+        .map_err(text)?;
+    let (starter_pool, starter) = dedicated(config, "closure_v2_early_dataset_starter").await?;
+    // A V2 binding cannot be borrowed from a same-DSN different Pool. Enrol this pool's actual
+    // registry via the existing V2 assembly; it observes the same real persisted dataset tuple.
+    let original = V2::new(&starter_pool, config).await?;
+    let provider = PostgresCustomModelProvider::new(
+        starter_pool.clone(),
+        vault(0x71),
+        DeploymentId::new(DEP),
+        TenantId::new(TENANT),
+        tls.dialer(),
+        SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(20)).map_err(text)?,
+        Some(Duration::from_secs(2)),
+    )
+    .map_err(text)?
+    .with_model_dataset_binding(original.binding.clone())
+    .map_err(text)?;
+    let sends = tls.requests();
+    let accepts = tls.accepted.load(Ordering::SeqCst);
+    let resolves = tls.resolved.load(Ordering::SeqCst);
+    let observer = p.get().await.map_err(text)?;
+    let heads = p.get().await.map_err(text)?;
+    let blocker = hold(
+        &heads,
+        "LOCK TABLE openbot_internal.thread_history_heads IN ACCESS EXCLUSIVE MODE",
+    )
+    .await?;
+    let task = tokio::spawn(async move { provider.start(request).await });
+    wait_blocked(&observer, starter, blocker).await?;
+    let (_, query) = activity(&observer, starter).await?;
+    require(
+        query.contains("pg_catalog")
+            && !query.contains("SELECT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads")
+            && row_level_locks(&observer, starter).await? == 0,
+        "V2 witness was not its early original dataset/schema read",
+    )?;
+    let terminated: bool = observer
+        .query_one("SELECT pg_terminate_backend($1)", &[&starter])
+        .await
+        .map_err(text)?
+        .get(0);
+    require(terminated, "owned early V2 backend was not terminated")?;
+    release(&heads).await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .map_err(|_| "the failed early V2 schema read never returned".to_owned())?
+        .map_err(text)?;
+    require(
+        matches!(outcome, Err(ProviderPortError::Unavailable)),
+        "V2 early dataset query error read as closed, admitted or invalid request",
+    )?;
+    require(
+        tls.resolved.load(Ordering::SeqCst) == resolves
+            && tls.requests() == sends
+            && tls.accepted.load(Ordering::SeqCst) == accepts,
+        "V2 early query failure reached owned DNS/TLS/HTTP endpoint",
+    )?;
+    let c = p.get().await.map_err(text)?;
+    require(
+        head_phase(&c, &begin.command.thread_id).await?.as_deref() == Some("open"),
+        "V2 early schema failure closed or removed its original head",
+    )?;
+    drop((observer, heads, c));
+    original.finish().await;
     close_pool(starter_pool).await
 }

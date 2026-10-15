@@ -322,6 +322,7 @@ impl Fixture {
             actor: auth.actor().clone(),
             auth_generation: auth.auth_generation(),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment()).mint_from_entropy(entropy),
                 run_id: RunId::new(format!("owned-history-run-{index}")),
                 bot_id: BotId::new(BOT),
@@ -466,6 +467,7 @@ impl Fixture {
             .map_err(|e| e.to_string())?;
         let req = self.request(auth, index, ThreadRunAnchor::DirectBot);
         let command = BeginThreadRunV2 {
+            artifact_refs: Vec::new(),
             thread_id: req.command.thread_id.clone(),
             run_id: req.command.run_id.clone(),
             bot_id: req.command.bot_id,

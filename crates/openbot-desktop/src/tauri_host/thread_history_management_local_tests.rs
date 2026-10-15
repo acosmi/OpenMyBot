@@ -456,6 +456,7 @@ impl LocalFixture {
             actor: original.actor().clone(),
             auth_generation: original.auth_generation(),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(original.deployment()).mint_from_entropy([0x45; 16]),
                 run_id: RunId::new("owned-history-local-run"),
                 bot_id: BotId::new(BOT),

@@ -779,6 +779,7 @@ fn begin(slug: &str, entropy: u64, run: &str) -> BeginThreadRunRequest {
         tenant: TenantId::new(TENANT),
         actor: ActorId::new(OWNER),
         command: BeginThreadRun {
+            artifact_refs: Vec::new(),
             model_selection: None,
             selected_skill_slugs: vec![slug.to_owned()],
             thread_id: ThreadIdentity::new(&deployment).mint_from_entropy(bytes),

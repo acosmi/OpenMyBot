@@ -195,6 +195,7 @@ async fn create_is_atomic_scoped_independent_native_and_single_connection() {
                     tenant: TenantId::new("tenant-a"),
                     actor: ActorId::new("actor"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: None,
                         selected_skill_slugs: Vec::new(),
                         thread_id: thread.clone(),

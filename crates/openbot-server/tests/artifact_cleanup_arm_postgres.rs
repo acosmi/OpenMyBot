@@ -398,6 +398,7 @@ impl Fixture {
             actor: ActorId::new(OWNER),
             auth_generation: AuthGeneration::new(0),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([18; 16]),
                 run_id: RunId::new("actual/cleanup-run%成果"),
                 bot_id: BotId::new("cleanup-bot"),

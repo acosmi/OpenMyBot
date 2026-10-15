@@ -3925,6 +3925,7 @@ mod tests {
             .execute(
                 prepared.auth_context().clone(),
                 AppCommand::BeginThreadRun(BeginThreadRun {
+                    artifact_refs: Vec::new(),
                     model_selection: None,
                     selected_skill_slugs: Vec::new(),
                     thread_id: minted.thread_id,

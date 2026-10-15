@@ -115,6 +115,7 @@ impl Fixture {
             tenant,
             actor: ActorId::new(OWNER),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&DeploymentId::new(DEPLOYMENT))
                     .mint_from_entropy([9; 16]),
                 run_id: RunId::new("read/source%成果"),

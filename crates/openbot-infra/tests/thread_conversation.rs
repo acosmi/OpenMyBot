@@ -84,6 +84,7 @@ async fn atomic_snapshot_bridges_active_text_cursor_live_terminal_and_materializ
                     tenant: TenantId::new("tenant"),
                     actor: ActorId::new("actor"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: None,
                         selected_skill_slugs: Vec::new(),
                         thread_id: thread.clone(),

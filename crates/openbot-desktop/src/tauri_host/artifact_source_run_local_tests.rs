@@ -414,6 +414,7 @@ impl LocalFixture {
                 .clone();
             let payload = "genuine Local source IDs text".to_owned();
             let begin = BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment()).mint_from_entropy([9; 16]),
                 run_id: RunId::new("actual/local-lifecycle-run"),
                 bot_id: BotId::new("desktop-assistant"),

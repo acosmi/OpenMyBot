@@ -624,6 +624,7 @@ impl LocalFixture {
             prepared.protocol().bind_window("main", prepared.auth_context().clone(), None).map_err(|error| error.to_string())?;
             let auth = prepared.protocol().windows.try_read().map_err(|_| "actual window lock unavailable")?.get("main").ok_or("actual main missing")?.auth.clone();
             let begin = BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment()).mint_from_entropy([9; 16]),
                 run_id: RunId::new("actual/local-lifecycle-run"), bot_id: BotId::new("desktop-assistant"),
                 anchor: ThreadRunAnchor::DirectBot, message: "small actual local Begin".to_owned(), selected_skill_slugs: Vec::new(), model_selection: None,

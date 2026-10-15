@@ -63,6 +63,7 @@ fn request(index: u64, channel: bool, row: Option<&ModelConnection>) -> BeginThr
         actor: ActorId::new("alice"),
         auth_generation: AuthGeneration::new(7),
         command: BeginThreadRun {
+            artifact_refs: Vec::new(),
             thread_id: ThreadIdentity::new(&DeploymentId::new(DEP)).mint_from_entropy(bytes),
             run_id: RunId::new(format!("selection-run-{index}")),
             bot_id: BotId::new("bot"),

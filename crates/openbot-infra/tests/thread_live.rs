@@ -93,6 +93,7 @@ async fn lost_notify_replays_and_one_commit_wakes_two_replicas_without_duplicate
                     tenant: tenant.clone(),
                     actor: actor.clone(),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: None,
                         selected_skill_slugs: Vec::new(),
                         thread_id: thread.clone(),

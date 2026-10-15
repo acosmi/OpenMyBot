@@ -431,6 +431,7 @@ mod tests {
             ),
             (
                 AppCommand::BeginThreadRun(openbot_contracts::command::BeginThreadRun {
+                    artifact_refs: Vec::new(),
                     model_selection: None,
                     selected_skill_slugs: Vec::new(),
                     thread_id: openbot_contracts::ids::ThreadId::new(

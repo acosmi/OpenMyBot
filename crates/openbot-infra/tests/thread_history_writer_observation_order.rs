@@ -69,6 +69,7 @@ fn request(entropy_tail: u8, run_id: &str, anchor: ThreadRunAnchor) -> BeginThre
         tenant: TenantId::new("tenant-a"),
         actor: ActorId::new("actor-a"),
         command: BeginThreadRun {
+            artifact_refs: Vec::new(),
             model_selection: None,
             selected_skill_slugs: Vec::new(),
             thread_id: ThreadIdentity::new(&deployment).mint_from_entropy(entropy),

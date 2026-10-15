@@ -255,6 +255,7 @@ impl Fixture {
             actor: ActorId::new(OWNER),
             auth_generation: AuthGeneration::new(0),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([0x59; 16]),
                 run_id: RunId::new("lifecycle/core-source"),
                 bot_id: BotId::new("lifecycle-core-bot"),

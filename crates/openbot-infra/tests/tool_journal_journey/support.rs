@@ -80,6 +80,7 @@ impl Fixture {
             tenant: TenantId::new("tenant-journey"),
             actor: ActorId::new("actor-a"),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 model_selection: None,
                 selected_skill_slugs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([76_u8; 16]),

@@ -540,6 +540,7 @@ impl Host {
         let transport = self.transport.as_ref().ok_or("transport_missing")?;
         let command =
             BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment())
                     .mint_from_entropy(if actor == 0 { [24; 16] } else { [25; 16] }),
                 run_id: RunId::new(format!("producer/{tag}%原始")),

@@ -4629,6 +4629,7 @@ mod approval_pg_tests {
                 tenant,
                 actor,
                 command: openbot_contracts::command::BeginThreadRun {
+                    artifact_refs: Vec::new(),
                     model_selection: None,
                     selected_skill_slugs: Vec::new(),
                     thread_id: thread,

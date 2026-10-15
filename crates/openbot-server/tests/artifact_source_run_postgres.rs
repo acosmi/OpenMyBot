@@ -177,6 +177,7 @@ impl Fixture {
             actor: ActorId::new(OWNER),
             auth_generation: AuthGeneration::new(0),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([8; 16]),
                 run_id: RunId::new("actual/current-read-run%成果"),
                 bot_id: BotId::new("current-read-bot"),
@@ -198,6 +199,7 @@ impl Fixture {
         .map_err(|error| error.to_string())?;
         let empty_begin = BeginThreadRunRequest {
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([10; 16]),
                 run_id: RunId::new("actual/empty-source-run%成果"),
                 message: "empty materialized source".to_owned(),
