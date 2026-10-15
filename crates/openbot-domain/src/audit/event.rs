@@ -402,16 +402,16 @@ mod tests {
             assert_eq!(AuditEventType::parse(value), Some(event));
             assert_eq!(event.as_str(), value);
         }
-        assert_eq!(AUDIT_EVENT_TYPES.len(), 86);
+        assert_eq!(AUDIT_EVENT_TYPES.len(), 87);
         assert_eq!(
             AUDIT_EVENT_TYPES
                 .iter()
                 .map(|t| t.as_str())
                 .collect::<BTreeSet<_>>()
                 .len(),
-            86
+            87
         );
-        assert_eq!(&AUDIT_EVENT_TYPES[81..], &values.map(|(_, event)| event));
+        assert_eq!(&AUDIT_EVENT_TYPES[81..86], &values.map(|(_, event)| event));
         for invalid in [
             "gateway_authorization_attempt_created ",
             "Gateway_authorization_attempt_created",

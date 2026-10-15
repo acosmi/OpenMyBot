@@ -451,50 +451,107 @@ async fn wait_for_blocker(
 async fn disabling_writes_orders_gui_save_and_correction_before_or_after_control_commit() {
     for mode in ["save_first", "correct_first", "control_first"] {
         fixture(&format!("memorycontrol_{mode}"), |p| async move {
-            provision(&p,37).await;
-            let store=PostgresMemoryAdministration::new(p.clone());
-            let old=if mode=="correct_first" {Some(store.remember(request(DIRECT,"bound",MemoryScope::User)).await.unwrap())} else {None};
-            let c=p.get().await.unwrap();
-            let table=if mode=="control_first" {"user_memory_controls"} else {"memories"};
-            // Own transaction barrier pauses the real operation after actor admission, before effect commit.
-            c.batch_execute(&format!("CREATE FUNCTION public.owned_memory_barrier() RETURNS trigger LANGUAGE plpgsql AS $$
-                BEGIN PERFORM pg_advisory_xact_lock(417003); RETURN NEW; END $$;
-                CREATE TRIGGER owned_memory_barrier BEFORE INSERT ON public.{table}
-                FOR EACH ROW EXECUTE FUNCTION public.owned_memory_barrier();")).await.unwrap();
-            c.batch_execute("BEGIN; SELECT pg_advisory_xact_lock(417003)").await.unwrap();
-            let barrier_pid:i32=c.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
-            let writer_store=store.clone();
-            let write=async move {
-                if let Some(old)=old {writer_store.correct(correction(&old,0)).await}
-                else {writer_store.remember(request(DIRECT,"bound",MemoryScope::User)).await}
-            };
-            let control_store=store.clone();
-            let control=async move {control_store.update_memory_control(UpdateMemoryControlRequest {
-                tenant:TenantId::new("tenant"),actor:ActorId::new("actor"),auth_generation:AuthGeneration::new(0),
-                update:UpdateMemoryControl {writes_enabled:false},
-            }).await};
-            let (writer,controller)=if mode=="control_first" {
-                let controller=tokio::spawn(control);
-                let controller_pid=wait_for_blocker(&c,"INSERT INTO public.user_memory_controls",barrier_pid).await;
-                let writer=tokio::spawn(write);
-                wait_for_blocker(&c,"FOR SHARE OF u",controller_pid).await;
-                (writer,controller)
+            provision(&p, 37).await;
+            let store = PostgresMemoryAdministration::new(p.clone());
+            let old = if mode == "correct_first" {
+                Some(
+                    store
+                        .remember(request(DIRECT, "bound", MemoryScope::User))
+                        .await
+                        .unwrap(),
+                )
             } else {
-                let writer=tokio::spawn(write);
-                let writer_pid=wait_for_blocker(&c,"INSERT INTO public.memories",barrier_pid).await;
-                let controller=tokio::spawn(control);
-                wait_for_blocker(&c,"FOR UPDATE OF u",writer_pid).await;
-                (writer,controller)
+                None
+            };
+            let c = p.get().await.unwrap();
+            let table = if mode == "control_first" {
+                "user_memory_controls"
+            } else {
+                "memories"
+            };
+            // The owned table lock pauses the real write after actor admission and before
+            // effect commit, without changing the catalog checked by the current schema guard.
+            c.batch_execute(&format!("BEGIN; LOCK TABLE public.{table} IN SHARE MODE"))
+                .await
+                .unwrap();
+            let barrier_pid: i32 = c
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            let writer_store = store.clone();
+            let write = async move {
+                if let Some(old) = old {
+                    writer_store.correct(correction(&old, 0)).await
+                } else {
+                    writer_store
+                        .remember(request(DIRECT, "bound", MemoryScope::User))
+                        .await
+                }
+            };
+            let control_store = store.clone();
+            let control = async move {
+                control_store
+                    .update_memory_control(UpdateMemoryControlRequest {
+                        tenant: TenantId::new("tenant"),
+                        actor: ActorId::new("actor"),
+                        auth_generation: AuthGeneration::new(0),
+                        update: UpdateMemoryControl {
+                            writes_enabled: false,
+                        },
+                    })
+                    .await
+            };
+            let (writer, controller) = if mode == "control_first" {
+                let controller = tokio::spawn(control);
+                let controller_pid =
+                    wait_for_blocker(&c, "INSERT INTO public.user_memory_controls", barrier_pid)
+                        .await;
+                let writer = tokio::spawn(write);
+                wait_for_blocker(&c, "FOR SHARE OF u", controller_pid).await;
+                (writer, controller)
+            } else {
+                let writer = tokio::spawn(write);
+                let query_fragment = if mode == "correct_first" {
+                    "UPDATE public.memories SET status='superseded'"
+                } else {
+                    "INSERT INTO public.memories"
+                };
+                let writer_pid = wait_for_blocker(&c, query_fragment, barrier_pid).await;
+                let controller = tokio::spawn(control);
+                wait_for_blocker(&c, "FOR UPDATE OF u", writer_pid).await;
+                (writer, controller)
             };
             c.batch_execute("COMMIT").await.unwrap();
-            let written=writer.await.unwrap();let disabled=controller.await.unwrap().unwrap();
+            let written = writer.await.unwrap();
+            let disabled = controller.await.unwrap().unwrap();
             assert!(!disabled.writes_enabled);
-            if mode=="control_first" {assert_eq!(written,Err(MemoryAdministrationError::WritesDisabled));}
-            else {assert!(written.is_ok());}
-            let count:i64=c.query_one("SELECT count(*) FROM public.memories",&[]).await.unwrap().get(0);
-            assert_eq!(count,match mode {"control_first"=>0,"correct_first"=>2,_=>1});
-            assert_eq!(store.remember(request(DIRECT,"bound",MemoryScope::User)).await,Err(MemoryAdministrationError::WritesDisabled));
+            if mode == "control_first" {
+                assert_eq!(written, Err(MemoryAdministrationError::WritesDisabled));
+            } else {
+                assert!(written.is_ok());
+            }
+            let count: i64 = c
+                .query_one("SELECT count(*) FROM public.memories", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                count,
+                match mode {
+                    "control_first" => 0,
+                    "correct_first" => 2,
+                    _ => 1,
+                }
+            );
+            assert_eq!(
+                store
+                    .remember(request(DIRECT, "bound", MemoryScope::User))
+                    .await,
+                Err(MemoryAdministrationError::WritesDisabled)
+            );
             Ok(())
-        }).await;
+        })
+        .await;
     }
 }

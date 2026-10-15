@@ -989,7 +989,7 @@ async fn s12_explicit49_historical_canary_and_current50_admission_are_distinct()
         drop(c);desktop_vault_canary::verify_current_layout(&p).await.map_err(|e|e.to_string())?;
         let c=p.get().await.map_err(|e|e.to_string())?;
         for sql in ["DELETE FROM openbot_internal.schema_migrations WHERE version=46","UPDATE openbot_internal.schema_migrations SET name='wrong50' WHERE version=50",
-            "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=50","INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(52,'unknown52',repeat('b',64))",
+            "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=50","INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(53,'unknown53',repeat('b',64))",
             "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(12,'unexpected12',repeat('c',64))"] {
             c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;c.batch_execute(sql).await.map_err(|e|e.to_string())?;
             let result=admission_schema::verify(&c).await;
