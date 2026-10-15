@@ -76,13 +76,13 @@ pub(super) fn validate_materials(
 pub(super) async fn verify_current(
     tx: &Transaction<'_>,
     schema: &CurrentWriterSchema<'_, '_>,
-    deployment: &DeploymentId,
-    tenant: &TenantId,
+    namespace: (&DeploymentId, &TenantId),
     actor: &ActorId,
     generation: u64,
     target_thread: &ThreadId,
     materials: &[RunInputArtifactMaterial],
 ) -> Result<(), ThreadDirectoryError> {
+    let (deployment, tenant) = namespace;
     let generation = i64::try_from(generation).map_err(|_| ThreadDirectoryError::NotVisible)?;
     let mut ordered: Vec<_> = materials.iter().collect();
     ordered.sort_unstable_by(|a, b| a.artifact_id.cmp(&b.artifact_id));

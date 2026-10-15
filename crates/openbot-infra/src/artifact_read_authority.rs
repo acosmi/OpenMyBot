@@ -979,7 +979,7 @@ impl PostgresArtifactReadAuthority {
                     administration.decode_run_input_metadata(auth, &row).map_err(source_error)
                 })();
                 return Ok::<_, ArtifactReadCurrentError>((witness,
-                    CurrentSourceObservation::RunInput { target: Arc::clone(collected), observation }));
+                    CurrentSourceObservation::RunInput { target: Arc::clone(collected), observation: Box::new(observation) }));
             }
             let source = (|| {
                 let id: Option<String> = super::value(&row, "artifact_id").map_err(source_error)?;
@@ -1016,7 +1016,7 @@ impl PostgresArtifactReadAuthority {
             CurrentSourceObservation::RunInput {
                 target,
                 observation,
-            } => target.publish(observation)?,
+            } => target.publish(*observation)?,
         }
         Ok(Box::new(witness))
     }
@@ -1296,9 +1296,11 @@ enum CurrentSourceObservation {
     Body(Result<(), ArtifactReadCurrentError>),
     RunInput {
         target: Arc<RequestedRunInputMetadataTarget>,
-        observation: Result<
-            openbot_application::artifacts::RunInputArtifactMetadataObservation,
-            ArtifactReadCurrentError,
+        observation: Box<
+            Result<
+                openbot_application::artifacts::RunInputArtifactMetadataObservation,
+                ArtifactReadCurrentError,
+            >,
         >,
     },
 }

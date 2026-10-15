@@ -518,10 +518,10 @@ impl PostgresThreadDirectory {
             Err(error) => {
                 // Preserve the legacy empty-input classification. New references cannot
                 // publish a refusal until the original transaction has really closed.
-                if materials.is_empty() {
-                    if let Ok(mut failure) = progress.failure.lock() {
-                        *failure = Some(error);
-                    }
+                if materials.is_empty()
+                    && let Ok(mut failure) = progress.failure.lock()
+                {
+                    *failure = Some(error);
                 }
                 if let Err(end) = transaction.rollback().await {
                     tracing::warn!(state=?end,"custom v2 rejected transaction closure not timely");
@@ -1844,8 +1844,7 @@ async fn apply_begin(
     artifact_refs::verify_current(
         transaction,
         &schema,
-        &request.deployment,
-        &request.tenant,
+        (&request.deployment, &request.tenant),
         &request.actor,
         request.auth_generation.get(),
         &command.thread_id,
@@ -2576,8 +2575,7 @@ async fn apply_begin_v2(
     artifact_refs::verify_current(
         transaction,
         &schema,
-        &request.deployment,
-        &request.tenant,
+        (&request.deployment, &request.tenant),
         &request.actor,
         request.auth_generation.get(),
         &command.thread_id,
