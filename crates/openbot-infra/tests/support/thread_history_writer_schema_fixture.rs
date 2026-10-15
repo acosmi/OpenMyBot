@@ -1,5 +1,5 @@
 // Reuse the original isolated-database, V1/V2, import and connection teardown controls.
-// Expected0051 comes exclusively from separately authored immutable prior fixtures.
+// Historical0051 and current0052 remain separate independently authored immutable fixtures.
 include!("thread_history_admission_schema_fixture.rs");
 const THREAD_INSERT: &str = "INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,title,status,next_message_seq,next_event_seq,created_at,updated_at,deleted_at) VALUES($1,'owned-origin-tenant','owned-origin-deployment','origin-a','direct_bot',$2,'Owned permanent ID','active',0,0,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',NULL)";
 const OP: &str = "019a1234-5678-7abc-8abc-000000000001";
@@ -37,14 +37,43 @@ async fn writer_check(c: &Client) -> TestResult {
         .await
         .map_err(|e| e.to_string())?;
     origin_schema::verify(c).await.map_err(|e| e.to_string())?;
+    let ledger = native::validate_known_prefix(c, 52)
+        .await
+        .map_err(|e| e.to_string())?;
+    require(
+        ledger.latest_version() == 52,
+        "current prefix not exact0052",
+    )?;
+    Ok(())
+}
+async fn writer_check_legacy51(c: &mut pool::PooledClient) -> TestResult {
     let ledger = native::validate_known_prefix(c, 51)
         .await
         .map_err(|e| e.to_string())?;
     require(
         ledger.latest_version() == 51,
-        "current prefix not exact0051",
+        "historical prefix not exact0051",
     )?;
-    Ok(())
+    // This explicit no-DDL replay consumes the original full39 prefix and independent0051
+    // writer oracle inside the migration transaction. It supplies no current52 admission.
+    require(
+        native::apply_through(c, 51)
+            .await
+            .map_err(|e| e.to_string())?
+            == native::ApplyOutcome::AlreadyApplied,
+        "historical0051 whole-schema replay changed or refused",
+    )?;
+    let public = openbot_infra::db::schema_facts::fetch(c)
+        .await
+        .map_err(|e| e.to_string())?;
+    let expected: openbot_infra::db::schema_facts::SchemaFacts =
+        serde_json::from_str(include_str!("../../../../fixtures/db/schema-0051.json"))
+            .map_err(|e| e.to_string())?;
+    require(public == expected, "historical0051 public oracle changed")?;
+    require(
+        admission_schema::verify(c).await.is_err(),
+        "historical0051 supplied current0052 admission",
+    )
 }
 async fn writer_snapshot(p: &pool::DatabasePool) -> TestResult<Value> {
     let c = p.get().await.map_err(|e| e.to_string())?;
@@ -73,6 +102,8 @@ async fn writer_snapshot(p: &pool::DatabasePool) -> TestResult<Value> {
         "openbot_internal.thread_history_heads",
         "openbot_internal.thread_history_clear_intents",
         "openbot_internal.channel_history_sources",
+        "openbot_internal.thread_history_clear_batches",
+        "openbot_internal.thread_history_clear_completions",
     ] {
         let rows:Value=c.query_one(&format!("SELECT coalesce(jsonb_agg(to_jsonb(x) ORDER BY to_jsonb(x)::text),'[]'::jsonb) FROM {table} x"),&[]).await.map_err(|e|e.to_string())?.get(0);
         result.insert(table.into(), rows);

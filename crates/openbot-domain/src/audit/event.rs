@@ -161,6 +161,8 @@ impl AuditEventType {
     /// The original code admission was committed with its original typed audit.
     pub const GATEWAY_AUTHORIZATION_CODE_ADMITTED: Self =
         Self("gateway_authorization_code_admitted");
+    /// History clearing and its durable completion committed in the original transaction.
+    pub const THREAD_HISTORY_CLEAR_COMPLETED: Self = Self("thread_history.clear_completed");
 
     /// 从字符串解析。**只接受 [`AUDIT_EVENT_TYPES`] 里的字面量。**
     ///
@@ -187,7 +189,7 @@ impl fmt::Display for AuditEventType {
     }
 }
 
-/// 事件类型全集：上游 57 项 + 本项目新增 deadline/budget/memory/catalog/approval/component/interrupt/artifact/gateway 28 项。
+/// 事件类型全集：上游 57 项 + 本项目新增 deadline/budget/memory/catalog/approval/component/interrupt/artifact/gateway/history 30 项。
 ///
 /// 顺序也照抄上游，方便逐行对拍。
 pub const AUDIT_EVENT_TYPES: &[AuditEventType] = &[
@@ -277,6 +279,7 @@ pub const AUDIT_EVENT_TYPES: &[AuditEventType] = &[
     AuditEventType::GATEWAY_AUTHORIZATION_ATTEMPT_CLOSED,
     AuditEventType::GATEWAY_AUTHORIZATION_REGISTERED,
     AuditEventType::GATEWAY_AUTHORIZATION_CODE_ADMITTED,
+    AuditEventType::THREAD_HISTORY_CLEAR_COMPLETED,
 ];
 
 /// 一条审计事件。
@@ -337,10 +340,38 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn catalog_is_upstream_fifty_seven_plus_twenty_seven_new_and_has_no_duplicates() {
-        assert_eq!(AUDIT_EVENT_TYPES.len(), 86);
+    fn catalog_is_upstream_fifty_seven_plus_thirty_new_and_has_no_duplicates() {
+        assert_eq!(AUDIT_EVENT_TYPES.len(), 87);
         let unique: BTreeSet<&str> = AUDIT_EVENT_TYPES.iter().map(|t| t.0).collect();
-        assert_eq!(unique.len(), 86, "目录里有重复的事件类型");
+        assert_eq!(unique.len(), 87, "目录里有重复的事件类型");
+    }
+
+    #[test]
+    fn history_clear_event_appends_without_changing_the_existing_catalog() {
+        let old_catalog = AUDIT_EVENT_TYPES[..86]
+            .iter()
+            .map(|event| event.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            super::super::hash::Sha256Digest::of(old_catalog.as_bytes()).to_hex(),
+            "6361c89679fd68a574b12326e4abdb1e0da805600734fc88c9f9aa8e95d060e1"
+        );
+        assert_eq!(
+            AUDIT_EVENT_TYPES.last(),
+            Some(&AuditEventType::THREAD_HISTORY_CLEAR_COMPLETED)
+        );
+        assert_eq!(
+            AuditEventType::parse("thread_history.clear_completed"),
+            Some(AuditEventType::THREAD_HISTORY_CLEAR_COMPLETED)
+        );
+        for unknown in [
+            "thread_history.clear_completed ",
+            "thread_history.clear_completed_unknown",
+            "thread_history.clear_started",
+        ] {
+            assert_eq!(AuditEventType::parse(unknown), None);
+        }
     }
 
     #[test]
@@ -371,16 +402,16 @@ mod tests {
             assert_eq!(AuditEventType::parse(value), Some(event));
             assert_eq!(event.as_str(), value);
         }
-        assert_eq!(AUDIT_EVENT_TYPES.len(), 86);
+        assert_eq!(AUDIT_EVENT_TYPES.len(), 87);
         assert_eq!(
             AUDIT_EVENT_TYPES
                 .iter()
                 .map(|t| t.as_str())
                 .collect::<BTreeSet<_>>()
                 .len(),
-            86
+            87
         );
-        assert_eq!(&AUDIT_EVENT_TYPES[81..], &values.map(|(_, event)| event));
+        assert_eq!(&AUDIT_EVENT_TYPES[81..86], &values.map(|(_, event)| event));
         for invalid in [
             "gateway_authorization_attempt_created ",
             "Gateway_authorization_attempt_created",

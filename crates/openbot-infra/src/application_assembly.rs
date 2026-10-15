@@ -440,6 +440,9 @@ pub async fn assemble_postgres_application(
         PostgresThreadHistoryAuthority::new(pool.clone(), deployment.clone(), tenant.clone())
             .map_err(|_| fail("thread_history_authority"))?,
     );
+    thread_history_authority
+        .enroll_clear_audit_checkpoint_key(SecretBytes::new(audit_key.to_vec()))
+        .map_err(|_| fail("thread_history_authority"))?;
     let custom_model_catalog_inventory = Arc::new(
         PostgresCustomModelCatalogInventory::new(pool.clone(), deployment.clone(), tenant.clone())
             .map_err(|_| fail("custom_model_catalog"))?,

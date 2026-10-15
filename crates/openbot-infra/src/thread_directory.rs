@@ -334,6 +334,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
                 "SELECT EXISTS( \
                    SELECT 1 FROM public.threads t \
                    WHERE t.thread_id=$1 AND t.deployment_id=$2 AND t.tenant_id=$3 \
+                     AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions hc \
+                       WHERE hc.thread_id=t.thread_id AND hc.deployment_id=t.deployment_id \
+                         AND hc.tenant_id=t.tenant_id) \
                      AND t.status<>'deleted' AND ( \
                        (t.anchor_kind='direct_bot' AND EXISTS( \
                          SELECT 1 FROM public.thread_memberships tm \
@@ -514,12 +517,16 @@ impl ThreadDirectory for PostgresThreadDirectory {
         })?;
         let rows = client
             .query(
-                "SELECT m.message_id,m.role,m.content,r.bot_id AS agent_id \
-                 FROM public.messages m \
-                 JOIN public.threads t ON t.thread_id=m.thread_id \
+                "SELECT (hc.operation_id IS NOT NULL) AS history_completed, \
+                        m.message_id,m.role,m.content,r.bot_id AS agent_id \
+                 FROM public.threads t \
+                 LEFT JOIN openbot_internal.thread_history_clear_completions hc \
+                   ON hc.thread_id=t.thread_id AND hc.deployment_id=t.deployment_id \
+                     AND hc.tenant_id=t.tenant_id \
+                 LEFT JOIN public.messages m ON m.thread_id=t.thread_id AND hc.operation_id IS NULL \
                  LEFT JOIN public.runs r ON r.run_id=m.run_id \
                  WHERE t.thread_id=$1 AND t.deployment_id=$2 AND t.tenant_id=$3 \
-                   AND t.status<>'deleted' AND ( \
+                   AND (t.status<>'deleted' OR hc.operation_id IS NOT NULL) AND ( \
                      (t.anchor_kind='direct_bot' AND EXISTS( \
                        SELECT 1 FROM public.thread_memberships tm \
                        WHERE tm.thread_id=t.thread_id AND tm.user_id=$4 \
@@ -538,10 +545,17 @@ impl ThreadDirectory for PostgresThreadDirectory {
             )
             .await
             .map_err(|error| unavailable("读取 thread history 失败", error))?;
-        let messages = rows
-            .iter()
-            .map(decode_history_message)
-            .collect::<Result<_, _>>()?;
+        if let Some(first) = rows.first()
+            && decode::<bool>(first, "history_completed")?
+        {
+            return Err(ThreadDirectoryError::NotVisible);
+        }
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if decode::<Option<String>>(row, "message_id")?.is_some() {
+                messages.push(decode_history_message(row)?);
+            }
+        }
         Ok(ThreadHistory { messages })
     }
 
@@ -556,15 +570,19 @@ impl ThreadDirectory for PostgresThreadDirectory {
         let query = format!(
             "WITH occupancy_scope AS (SELECT $1::text AS thread_id) {} {}",
             occupancy::INTEGRITY_CTE,
-            "SELECT i.bad_occupancy,t.next_event_seq,coalesce(a.run_ids,'{}'::text[]) AS active_run_ids, \
+            "SELECT (hc.operation_id IS NOT NULL) AS history_completed, \
+                        i.bad_occupancy,t.next_event_seq,coalesce(a.run_ids,'{}'::text[]) AS active_run_ids, \
                         coalesce(a.run_statuses,'{}'::text[]) AS active_run_statuses, \
                         coalesce(a.run_actors,'{}'::text[]) AS active_run_actors, \
                         coalesce(a.cancel_requested,'{}'::boolean[]) AS cancel_requested, \
                         coalesce(a.run_texts,'{}'::text[]) AS active_run_texts, \
                         m.message_id,m.role,m.content,mr.bot_id AS agent_id \
                  FROM public.threads t \
-                 JOIN occupancy_integrity i ON i.thread_id=t.thread_id \
-                 LEFT JOIN public.messages m ON m.thread_id=t.thread_id \
+                 LEFT JOIN openbot_internal.thread_history_clear_completions hc \
+                   ON hc.thread_id=t.thread_id AND hc.deployment_id=t.deployment_id \
+                     AND hc.tenant_id=t.tenant_id \
+                 LEFT JOIN occupancy_integrity i ON i.thread_id=t.thread_id \
+                 LEFT JOIN public.messages m ON m.thread_id=t.thread_id AND hc.operation_id IS NULL \
                  LEFT JOIN public.runs mr ON mr.run_id=m.run_id \
                  LEFT JOIN LATERAL ( \
                    SELECT array_agg(r.run_id ORDER BY r.created_at,r.run_id) AS run_ids, \
@@ -587,10 +605,11 @@ impl ThreadDirectory for PostgresThreadDirectory {
                           ),'') ORDER BY r.created_at,r.run_id) AS run_texts \
                    FROM public.thread_run_occupancy slot \
                    JOIN public.runs r ON r.thread_id=slot.thread_id AND r.run_id=slot.run_id \
-                   WHERE slot.thread_id=t.thread_id \
+                   WHERE slot.thread_id=t.thread_id AND hc.operation_id IS NULL \
                  ) a ON true \
                  WHERE t.thread_id=$1 AND t.deployment_id=$2 AND t.tenant_id=$3 \
-                   AND t.status<>'deleted' AND ( \
+                   AND (i.thread_id IS NOT NULL OR hc.operation_id IS NOT NULL) \
+                   AND (t.status<>'deleted' OR hc.operation_id IS NOT NULL) AND ( \
                      (t.anchor_kind='direct_bot' AND EXISTS( \
                        SELECT 1 FROM public.thread_memberships tm \
                        WHERE tm.thread_id=t.thread_id AND tm.user_id=$4 \
@@ -617,6 +636,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         let Some(first) = rows.first() else {
             return Ok(ThreadConversationSnapshot::default());
         };
+        if decode::<bool>(first, "history_completed")? {
+            return Err(ThreadDirectoryError::NotVisible);
+        }
         if decode::<bool>(first, "bad_occupancy")? {
             return Err(ThreadDirectoryError::Corrupt {
                 field: "thread_run_occupancy",
@@ -681,10 +703,14 @@ impl ThreadDirectory for PostgresThreadDirectory {
             active_run_state,
             active_run_cancellable,
             active_run_text: active_texts.into_iter().next().unwrap_or_default(),
-            last_event_sequence: next_event_sequence
-                .checked_sub(1)
-                .map(|value| checked_sequence(value, "last_event_sequence"))
-                .transpose()?,
+            last_event_sequence: if next_event_sequence == 0 {
+                None
+            } else {
+                Some(checked_sequence(
+                    next_event_sequence - 1,
+                    "last_event_sequence",
+                )?)
+            },
         })
     }
 }
@@ -1137,11 +1163,14 @@ async fn replay_batch(
         tracing::error!(error = %error, "thread event replay 获取连接失败");
         ThreadDirectoryError::Unavailable
     })?;
-    let visible: bool = client
-        .query_one(
-            "SELECT EXISTS( \
-               SELECT 1 FROM public.threads t \
+    let rows = client
+        .query(
+            "WITH visible_thread AS ( \
+               SELECT t.thread_id FROM public.threads t \
                WHERE t.thread_id=$1 AND t.deployment_id=$2 AND t.tenant_id=$3 \
+                 AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions hc \
+                   WHERE hc.thread_id=t.thread_id AND hc.deployment_id=t.deployment_id \
+                     AND hc.tenant_id=t.tenant_id) \
                  AND t.status<>'deleted' AND ( \
                    (t.anchor_kind='direct_bot' AND EXISTS( \
                      SELECT 1 FROM public.thread_memberships tm \
@@ -1151,35 +1180,33 @@ async fn replay_batch(
                      WHERE cm.channel_id=t.anchor_id AND cm.user_id=$4 \
                    )) \
                  ) \
-             )",
+             ) SELECT e.run_id,e.event_seq,e.event_type,e.payload,e.terminal,e.created_at \
+               FROM visible_thread v LEFT JOIN LATERAL ( \
+                 SELECT run_id,event_seq,event_type,payload,terminal,created_at \
+                 FROM public.run_events WHERE thread_id=v.thread_id AND event_seq>$5 \
+                 ORDER BY event_seq LIMIT $6 \
+               ) e ON true ORDER BY e.event_seq NULLS FIRST",
             &[
                 &request.thread.as_str(),
                 &request.deployment.as_str(),
                 &request.tenant.as_str(),
                 &request.actor.as_str(),
+                &cursor,
+                &THREAD_EVENT_BATCH,
             ],
         )
         .await
-        .map_err(|error| unavailable("验证 thread event replay scope 失败", error))?
-        .try_get(0)
-        .map_err(|_| ThreadDirectoryError::Corrupt {
-            field: "thread_visible",
-        })?;
-    if !visible {
+        .map_err(|error| unavailable("补取 durable thread events 失败", error))?;
+    if rows.is_empty() {
         return Err(ThreadDirectoryError::NotVisible);
     }
-    let rows = client
-        .query(
-            "SELECT run_id,event_seq,event_type,payload,terminal,created_at \
-             FROM public.run_events WHERE thread_id=$1 AND event_seq>$2 \
-             ORDER BY event_seq LIMIT $3",
-            &[&request.thread.as_str(), &cursor, &THREAD_EVENT_BATCH],
-        )
-        .await
-        .map_err(|error| unavailable("补取 durable thread events 失败", error))?;
-    rows.iter()
-        .map(|row| decode_thread_event(row, &request.thread))
-        .collect()
+    let mut events = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if decode::<Option<i64>>(row, "event_seq")?.is_some() {
+            events.push(decode_thread_event(row, &request.thread)?);
+        }
+    }
+    Ok(events)
 }
 
 fn decode_thread_event(

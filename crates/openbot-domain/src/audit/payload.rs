@@ -208,6 +208,87 @@ impl fmt::Display for AuditLabel {
     }
 }
 
+/// The two trusted entry points that can complete a history clear operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditThreadHistoryClearSource {
+    /// A user-authorized stop/clear operation, followed by the trusted clearing producer.
+    StopClear,
+    /// Deployment maintenance clearing of an already soft-deleted thread.
+    Maintenance,
+}
+
+impl AuditThreadHistoryClearSource {
+    /// Exact durable spelling; caller text cannot become an audit source.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StopClear => "stop_clear",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+/// Nonnegative history-clear row count, bounded by PostgreSQL's signed `bigint` domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditThreadHistoryClearCount(u64);
+
+impl AuditThreadHistoryClearCount {
+    /// Largest count representable in the durable completion row.
+    pub const MAX: u64 = i64::MAX as u64;
+
+    /// Validate an already-counted quantity; no truncation or saturation is allowed.
+    ///
+    /// # Errors
+    /// Returns [`AuditFieldError::InvalidThreadHistoryClearCount`] above [`Self::MAX`].
+    pub fn new(value: u64) -> Result<Self, AuditFieldError> {
+        if value > Self::MAX {
+            return Err(AuditFieldError::InvalidThreadHistoryClearCount);
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the exact validated count.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Canonical UUIDv7 of an existing clear operation; not a permission or completion proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditThreadHistoryClearOperationId(String);
+
+impl AuditThreadHistoryClearOperationId {
+    /// Accept only the lowercase, hyphenated UUIDv7 representation.
+    ///
+    /// # Errors
+    /// Reject noncanonical bytes, separators, version and variant without echoing input.
+    pub fn new(value: impl Into<String>) -> Result<Self, AuditFieldError> {
+        let value = value.into();
+        let raw = value.as_bytes();
+        if raw.len() != 36
+            || raw.iter().enumerate().any(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte != b'-'
+                } else {
+                    !matches!(*byte, b'0'..=b'9' | b'a'..=b'f')
+                }
+            })
+            || raw[14] != b'7'
+            || !matches!(raw[19], b'8' | b'9' | b'a' | b'b')
+        {
+            return Err(AuditFieldError::InvalidThreadHistoryClearOperationId);
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the exact descriptive operation identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 字段值校验失败。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuditFieldError {
@@ -238,6 +319,12 @@ pub enum AuditFieldError {
     /// A gateway attempt identifier was not a canonical lowercase UUIDv7.
     #[error("audit_field_invalid_gateway_authorization_attempt_id")]
     InvalidGatewayAuthorizationAttemptId,
+    /// A history-clear count exceeded the durable signed `bigint` range.
+    #[error("audit_field_invalid_thread_history_clear_count")]
+    InvalidThreadHistoryClearCount,
+    /// A clear operation identity was not a canonical lowercase UUIDv7.
+    #[error("audit_field_invalid_thread_history_clear_operation_id")]
+    InvalidThreadHistoryClearOperationId,
 }
 
 /// Canonical UUIDv7 data for an existing authorization attempt, never a permission proof.
@@ -504,6 +591,32 @@ pub enum AuditFact {
         /// 值的**字节长度**。
         value_len: u32,
     },
+    /// The existing clearing operation identity; never the thread body or request input.
+    ThreadHistoryClearOperationId(AuditThreadHistoryClearOperationId),
+    /// Closed trusted entry point that completed the clearing operation.
+    ThreadHistoryClearSource(AuditThreadHistoryClearSource),
+    /// Thread title rows changed to the fixed tombstone.
+    ThreadHistoryClearThreads(AuditThreadHistoryClearCount),
+    /// Message rows changed to the fixed content/search tombstone.
+    ThreadHistoryClearMessages(AuditThreadHistoryClearCount),
+    /// Run event rows changed to their event-specific fixed tombstone.
+    ThreadHistoryClearRunEvents(AuditThreadHistoryClearCount),
+    /// Tool approval rows cleared or cancelled by the clear operation.
+    ThreadHistoryClearToolApprovals(AuditThreadHistoryClearCount),
+    /// Component human decision rows changed to their fixed tombstone.
+    ThreadHistoryClearComponentDecisions(AuditThreadHistoryClearCount),
+    /// Remote interrupt rows retired and cleared by the clear operation.
+    ThreadHistoryClearRemoteInterrupts(AuditThreadHistoryClearCount),
+    /// Canonical channel source rows removed for the cleared thread.
+    ThreadHistoryClearChannelSources(AuditThreadHistoryClearCount),
+    /// Channel rows whose last-message triple was actually cleared.
+    ThreadHistoryClearChannels(AuditThreadHistoryClearCount),
+    /// Thread-scoped memory rows marked deleted and cleared.
+    ThreadHistoryClearMemories(AuditThreadHistoryClearCount),
+    /// Number of committed batches in this completed operation.
+    ThreadHistoryClearBatches(AuditThreadHistoryClearCount),
+    /// No run-output producer exists; this completion counter is always exactly zero.
+    ThreadHistoryClearRunOutputExpired,
 }
 
 impl AuditFact {
@@ -574,6 +687,19 @@ impl AuditFact {
             Self::OutputTruncated(_) => "output_truncated",
             Self::HumanTakeover(_) => "human_takeover",
             Self::SecretInput { .. } => "secret_input",
+            Self::ThreadHistoryClearOperationId(_) => "operation_id",
+            Self::ThreadHistoryClearSource(_) => "source",
+            Self::ThreadHistoryClearThreads(_) => "threads_cleared",
+            Self::ThreadHistoryClearMessages(_) => "messages_cleared",
+            Self::ThreadHistoryClearRunEvents(_) => "run_events_cleared",
+            Self::ThreadHistoryClearToolApprovals(_) => "tool_approvals_cleared",
+            Self::ThreadHistoryClearComponentDecisions(_) => "component_decisions_cleared",
+            Self::ThreadHistoryClearRemoteInterrupts(_) => "remote_interrupts_cleared",
+            Self::ThreadHistoryClearChannelSources(_) => "channel_sources_cleared",
+            Self::ThreadHistoryClearChannels(_) => "channels_cleared",
+            Self::ThreadHistoryClearMemories(_) => "memories_cleared",
+            Self::ThreadHistoryClearBatches(_) => "batches",
+            Self::ThreadHistoryClearRunOutputExpired => "run_output_expired",
         }
     }
 
@@ -643,6 +769,19 @@ impl AuditFact {
             Self::AttemptNumber(value) => Value::Number((*value).into()),
             Self::ApprovalPreferenceRevision(value) => Value::Number(value.get().into()),
             Self::HumanTakeover(phase) => Value::String(phase.as_str().to_owned()),
+            Self::ThreadHistoryClearSource(source) => Value::String(source.as_str().to_owned()),
+            Self::ThreadHistoryClearOperationId(value) => Value::String(value.as_str().to_owned()),
+            Self::ThreadHistoryClearThreads(value)
+            | Self::ThreadHistoryClearMessages(value)
+            | Self::ThreadHistoryClearRunEvents(value)
+            | Self::ThreadHistoryClearToolApprovals(value)
+            | Self::ThreadHistoryClearComponentDecisions(value)
+            | Self::ThreadHistoryClearRemoteInterrupts(value)
+            | Self::ThreadHistoryClearChannelSources(value)
+            | Self::ThreadHistoryClearChannels(value)
+            | Self::ThreadHistoryClearMemories(value)
+            | Self::ThreadHistoryClearBatches(value) => Value::Number(value.get().into()),
+            Self::ThreadHistoryClearRunOutputExpired => Value::Number(0.into()),
             Self::RoutingCandidates(values) => Value::Array(
                 values
                     .as_slice()
@@ -751,6 +890,19 @@ impl AuditFact {
                 );
             }
             Self::HumanTakeover(phase) => writer.str(phase.as_str()),
+            Self::ThreadHistoryClearSource(source) => writer.str(source.as_str()),
+            Self::ThreadHistoryClearOperationId(value) => writer.str(value.as_str()),
+            Self::ThreadHistoryClearThreads(value)
+            | Self::ThreadHistoryClearMessages(value)
+            | Self::ThreadHistoryClearRunEvents(value)
+            | Self::ThreadHistoryClearToolApprovals(value)
+            | Self::ThreadHistoryClearComponentDecisions(value)
+            | Self::ThreadHistoryClearRemoteInterrupts(value)
+            | Self::ThreadHistoryClearChannelSources(value)
+            | Self::ThreadHistoryClearChannels(value)
+            | Self::ThreadHistoryClearMemories(value)
+            | Self::ThreadHistoryClearBatches(value) => writer.u64(value.get()),
+            Self::ThreadHistoryClearRunOutputExpired => writer.u64(0),
             Self::RoutingCandidates(values) => {
                 writer.u64(values.as_slice().len() as u64);
                 for value in values.as_slice() {
@@ -847,6 +999,19 @@ pub const AUDIT_FIELD_LEDGER: &[&str] = &[
     "attempt_id",
     "phase",
     "outcome_code",
+    "operation_id",
+    "source",
+    "threads_cleared",
+    "messages_cleared",
+    "run_events_cleared",
+    "tool_approvals_cleared",
+    "component_decisions_cleared",
+    "remote_interrupts_cleared",
+    "channel_sources_cleared",
+    "channels_cleared",
+    "memories_cleared",
+    "batches",
+    "run_output_expired",
 ];
 
 /// 一条审计事件的 payload：一组互不重键的 [`AuditFact`]。
@@ -945,6 +1110,150 @@ pub enum AuditPayloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn history_clear_facts(source: AuditThreadHistoryClearSource) -> [AuditFact; 13] {
+        [
+            AuditFact::ThreadHistoryClearOperationId(
+                AuditThreadHistoryClearOperationId::new("019a0300-0000-7000-8000-000000000004")
+                    .unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearSource(source),
+            AuditFact::ThreadHistoryClearThreads(AuditThreadHistoryClearCount::new(1).unwrap()),
+            AuditFact::ThreadHistoryClearMessages(AuditThreadHistoryClearCount::new(2).unwrap()),
+            AuditFact::ThreadHistoryClearRunEvents(AuditThreadHistoryClearCount::new(3).unwrap()),
+            AuditFact::ThreadHistoryClearToolApprovals(
+                AuditThreadHistoryClearCount::new(4).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearComponentDecisions(
+                AuditThreadHistoryClearCount::new(5).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearRemoteInterrupts(
+                AuditThreadHistoryClearCount::new(6).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearChannelSources(
+                AuditThreadHistoryClearCount::new(7).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearChannels(AuditThreadHistoryClearCount::new(8).unwrap()),
+            AuditFact::ThreadHistoryClearMemories(AuditThreadHistoryClearCount::new(9).unwrap()),
+            AuditFact::ThreadHistoryClearBatches(AuditThreadHistoryClearCount::new(10).unwrap()),
+            AuditFact::ThreadHistoryClearRunOutputExpired,
+        ]
+    }
+
+    #[test]
+    fn history_clear_counts_are_nonnegative_and_bounded_by_bigint() {
+        for value in [0, 1, AuditThreadHistoryClearCount::MAX] {
+            let count = AuditThreadHistoryClearCount::new(value).unwrap();
+            assert_eq!(count.get(), value);
+            assert_eq!(
+                AuditFact::ThreadHistoryClearMessages(count).to_json(),
+                Value::Number(value.into())
+            );
+        }
+        for invalid in [AuditThreadHistoryClearCount::MAX + 1, u64::MAX] {
+            assert_eq!(
+                AuditThreadHistoryClearCount::new(invalid),
+                Err(AuditFieldError::InvalidThreadHistoryClearCount)
+            );
+        }
+        assert_eq!(
+            AuditFact::ThreadHistoryClearRunOutputExpired.to_json(),
+            serde_json::json!(0)
+        );
+    }
+
+    #[test]
+    fn history_clear_operation_identity_accepts_only_canonical_uuidv7() {
+        let valid = "019a0300-0000-7000-8000-000000000004";
+        assert_eq!(
+            AuditThreadHistoryClearOperationId::new(valid)
+                .unwrap()
+                .as_str(),
+            valid
+        );
+        for variant in ['8', '9', 'a', 'b'] {
+            let mut value = valid.to_owned();
+            value.replace_range(19..20, &variant.to_string());
+            assert!(AuditThreadHistoryClearOperationId::new(value).is_ok());
+        }
+        for invalid in [
+            "",
+            "019A0300-0000-7000-8000-000000000004",
+            "019a0300-0000-4000-8000-000000000004",
+            "019a0300-0000-7000-7000-000000000004",
+            "019a0300000070008000000000000004",
+            "019a0300-0000-7000-8000-000000000004 ",
+            "user message",
+            "{\"body\":\"user message\"}",
+        ] {
+            let error = AuditThreadHistoryClearOperationId::new(invalid).unwrap_err();
+            assert_eq!(error, AuditFieldError::InvalidThreadHistoryClearOperationId);
+            assert_eq!(
+                error.to_string(),
+                "audit_field_invalid_thread_history_clear_operation_id"
+            );
+        }
+    }
+
+    #[test]
+    fn history_clear_payload_contains_only_operation_source_and_counts() {
+        for (source, expected_source) in [
+            (AuditThreadHistoryClearSource::StopClear, "stop_clear"),
+            (AuditThreadHistoryClearSource::Maintenance, "maintenance"),
+        ] {
+            let facts = history_clear_facts(source);
+            let payload = AuditPayload::from_facts(facts.clone()).unwrap();
+            assert_eq!(payload.len(), 13);
+            assert_eq!(
+                payload.to_json(),
+                serde_json::json!({
+                    "operation_id":"019a0300-0000-7000-8000-000000000004",
+                    "source":expected_source,
+                    "threads_cleared":1,"messages_cleared":2,"run_events_cleared":3,
+                    "tool_approvals_cleared":4,"component_decisions_cleared":5,
+                    "remote_interrupts_cleared":6,"channel_sources_cleared":7,
+                    "channels_cleared":8,"memories_cleared":9,"batches":10,
+                    "run_output_expired":0
+                })
+            );
+            for fact in facts {
+                let field = fact.field();
+                assert_eq!(
+                    AuditPayload::from_facts([fact.clone(), fact]),
+                    Err(AuditPayloadError::DuplicateField { field })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn history_clear_canonical_encoding_matches_independent_vector() {
+        let facts = history_clear_facts(AuditThreadHistoryClearSource::StopClear);
+        let mut writer = CanonicalWriter::new("thread-history-clear-audit-test");
+        AuditPayload::from_facts(facts.clone())
+            .unwrap()
+            .write_canonical(&mut writer);
+        let canonical = writer.finish();
+        // Independent u64be lengths, sorted field names, exact UUID/source and u64be counters.
+        assert_eq!(canonical.len(), 522);
+        assert_eq!(
+            Sha256Digest::of(&canonical).to_hex(),
+            "4f6a4eea5ec1acb85d775096f6b9187e2a4506678345120d073ca9086d524e90"
+        );
+        let mut reversed = CanonicalWriter::new("thread-history-clear-audit-test");
+        AuditPayload::from_facts(facts.into_iter().rev())
+            .unwrap()
+            .write_canonical(&mut reversed);
+        assert_eq!(canonical, reversed.finish());
+
+        let mut maintenance = CanonicalWriter::new("thread-history-clear-audit-test");
+        AuditPayload::from_facts(history_clear_facts(
+            AuditThreadHistoryClearSource::Maintenance,
+        ))
+        .unwrap()
+        .write_canonical(&mut maintenance);
+        assert_ne!(canonical, maintenance.finish());
+    }
 
     #[test]
     fn approval_preference_revision_payload_is_closed_and_numeric() {
@@ -1255,6 +1564,30 @@ mod tests {
                 target_field: identifier("password"),
                 value_len: 18,
             },
+            AuditFact::ThreadHistoryClearOperationId(
+                AuditThreadHistoryClearOperationId::new("019a0300-0000-7000-8000-000000000004")
+                    .unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearSource(AuditThreadHistoryClearSource::StopClear),
+            AuditFact::ThreadHistoryClearThreads(AuditThreadHistoryClearCount::new(1).unwrap()),
+            AuditFact::ThreadHistoryClearMessages(AuditThreadHistoryClearCount::new(2).unwrap()),
+            AuditFact::ThreadHistoryClearRunEvents(AuditThreadHistoryClearCount::new(3).unwrap()),
+            AuditFact::ThreadHistoryClearToolApprovals(
+                AuditThreadHistoryClearCount::new(4).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearComponentDecisions(
+                AuditThreadHistoryClearCount::new(5).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearRemoteInterrupts(
+                AuditThreadHistoryClearCount::new(6).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearChannelSources(
+                AuditThreadHistoryClearCount::new(7).unwrap(),
+            ),
+            AuditFact::ThreadHistoryClearChannels(AuditThreadHistoryClearCount::new(8).unwrap()),
+            AuditFact::ThreadHistoryClearMemories(AuditThreadHistoryClearCount::new(9).unwrap()),
+            AuditFact::ThreadHistoryClearBatches(AuditThreadHistoryClearCount::new(10).unwrap()),
+            AuditFact::ThreadHistoryClearRunOutputExpired,
         ]
     }
 

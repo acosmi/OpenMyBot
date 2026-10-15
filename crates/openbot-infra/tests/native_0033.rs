@@ -162,8 +162,16 @@ async fn post_0033_preserves_0032_applies_once_and_fresh_matches_owned_fixture()
             .await
             .map_err(|error| error.to_string())?;
         let current = schema_facts::fetch(&client).await.unwrap();
-        for old in &read_post_0033().tables {
-            assert_eq!(current.table(&old.name), Some(old), "{}", old.name);
+        let expected_current: SchemaFacts =
+            serde_json::from_str(include_str!("../../../fixtures/db/schema-0052.json"))
+                .expect("current schema-0052 fixture must be frozen");
+        assert_eq!(current, expected_current);
+        let original = read_post_0033();
+        for spec in NATIVE_0033_TABLES {
+            let old = original
+                .table(spec.name)
+                .expect("native0033 frozen table exists");
+            assert_eq!(current.table(spec.name), Some(old), "{}", spec.name);
         }
         drop(client);
         pool.close();

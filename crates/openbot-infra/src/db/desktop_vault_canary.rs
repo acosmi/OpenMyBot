@@ -27,6 +27,7 @@ const PUBLIC_0040: &str = include_str!("../../../../fixtures/db/schema-0040.json
 const PUBLIC_0046: &str = include_str!("../../../../fixtures/db/schema-0046.json");
 const PUBLIC_0050: &str = include_str!("../../../../fixtures/db/schema-0050.json");
 const PUBLIC_0051: &str = include_str!("../../../../fixtures/db/schema-0051.json");
+const PUBLIC_0052: &str = include_str!("../../../../fixtures/db/schema-0052.json");
 const PUBLIC_0038: &str = include_str!("../../../../fixtures/db/schema-0038.json");
 
 #[derive(Debug, thiserror::Error)]
@@ -662,7 +663,9 @@ pub async fn verify_pre_upgrade_layout(
         }
         if ledger.latest_version()==native::NATIVE_0050_VERSION {
             super::thread_origin_schema::verify_legacy0050(&client).await?;
-        } else if ledger.latest_version()>=native::NATIVE_0051_VERSION {
+        } else if ledger.latest_version()==native::NATIVE_0051_VERSION {
+            super::thread_origin_schema::verify_legacy0051(&client).await?;
+        } else if ledger.latest_version()>=native::NATIVE_0052_VERSION {
             super::thread_origin_schema::verify(&client).await?;
         }
         Ok(ValidatedDesktopVaultLayout {
@@ -715,6 +718,7 @@ fn registered_public_schema(native_version: i32) -> Result<SchemaFacts, InfraErr
         //0050 retains public columns and adds four Thread identity/admission triggers.
         native::NATIVE_0050_VERSION => PUBLIC_0050,
         native::NATIVE_0051_VERSION => PUBLIC_0051,
+        native::NATIVE_0052_VERSION => PUBLIC_0052,
         _ => {
             return Err(InfraError::repository_invariant(
                 "desktop_vault_native_schema_unregistered",

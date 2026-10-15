@@ -4,12 +4,18 @@ use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use openbot_application::tenant::package::TenantPackageEnvironment;
 use openbot_application::{
     IntelligenceImportError, import_intelligence_bundle, validate_intelligence_tool_run_fk,
 };
+use openbot_contracts::ids::thread::ThreadIdentity;
+use openbot_contracts::ids::{DeploymentId, TenantId};
 use openbot_contracts::intelligence::IntelligenceImportMapping;
-use openbot_domain::vault::SecretBytes;
+use openbot_domain::vault::{ApplicationKeyPurpose, SecretBytes, derive_application_key};
+use openbot_infra::auth::config::{ExampleKeyPolicy, KeyEncryptionKey};
 use openbot_infra::db::pool;
 use openbot_infra::db::pool::DatabaseConfig;
 use openbot_infra::intelligence_bundle::{
@@ -17,7 +23,14 @@ use openbot_infra::intelligence_bundle::{
     MAX_INTELLIGENCE_BUNDLE_BYTES, verify_intelligence_bundle,
 };
 use openbot_infra::intelligence_import::PostgresIntelligenceImportStore;
-use openbot_server::config::{env_map_from_process, preflight_audit_retention};
+use openbot_infra::tenant::load_tenant_package;
+use openbot_infra::thread_history_authority::{
+    PostgresThreadHistoryAuthority, ThreadHistoryClearProgress, ThreadHistoryStopClearError,
+};
+use openbot_server::config::{
+    DEFAULT_TENANT_PACKAGE_DIR, DeploymentEnvironment, ServerConfig, env_map_from_process,
+    preflight_audit_retention,
+};
 
 const ACTION_REQUIRED_EXIT: u8 = 2;
 const USAGE_EXIT: u8 = 64;
@@ -27,10 +40,31 @@ const SOFTWARE_EXIT: u8 = 70;
 const TEMPORARY_EXIT: u8 = 75;
 const MAX_MAPPING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_KEY_FILE_BYTES: usize = 1024;
+const CLEAR_CALLS: usize = 3;
+const CLEAR_BUDGET: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|value| value == "thread-history-clear-deleted")
+    {
+        return match parse_clear_thread(&arguments) {
+            Ok(thread) => match run_clear_deleted(thread).await {
+                Ok(progress) => {
+                    println!("{progress}");
+                    if progress == "thread_history_clear_completed" {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(TEMPORARY_EXIT)
+                    }
+                }
+                Err(failure) => fail(failure.code, failure.exit),
+            },
+            Err(failure) => fail(failure.code, failure.exit),
+        };
+    }
     if arguments.len() == 1 && arguments[0] == "preflight-audit-retention" {
         return run_audit_preflight();
     }
@@ -80,6 +114,124 @@ async fn main() -> ExitCode {
         };
     }
     fail("migration_preflight_usage", USAGE_EXIT)
+}
+
+fn parse_clear_thread(arguments: &[OsString]) -> Result<&str, MigrationFailure> {
+    let [command, thread] = arguments else {
+        return Err(MigrationFailure {
+            code: "thread_history_clear_usage",
+            exit: USAGE_EXIT,
+        });
+    };
+    if command != "thread-history-clear-deleted" {
+        return Err(MigrationFailure {
+            code: "thread_history_clear_usage",
+            exit: USAGE_EXIT,
+        });
+    }
+    let thread = thread
+        .to_str()
+        .ok_or_else(|| MigrationFailure::data("thread_history_clear_invalid_thread"))?;
+    if thread.len() != 36
+        || !ThreadIdentity::is_plausible(&openbot_contracts::ids::ThreadId::new(thread))
+    {
+        return Err(MigrationFailure::data(
+            "thread_history_clear_invalid_thread",
+        ));
+    }
+    Ok(thread)
+}
+
+async fn run_clear_deleted(thread: &str) -> Result<&'static str, MigrationFailure> {
+    // Use the deployed host's existing namespace and domain-separated audit key. Neither is
+    // inferred from a target database row, supplied as a new permission, or randomly generated.
+    let environment =
+        openbot_server::config::launch::prepare_environment(env_map_from_process(), false)
+            .map_err(|_| MigrationFailure::data("thread_history_clear_environment_invalid"))?;
+    let server = ServerConfig::from_env_map(&environment)
+        .map_err(|_| MigrationFailure::data("thread_history_clear_environment_invalid"))?;
+    let mut directory = PathBuf::from(&server.tenant_package_directory);
+    if !directory.is_dir() && server.tenant_package_directory == DEFAULT_TENANT_PACKAGE_DIR {
+        let workspace_default = PathBuf::from("examples/fintech");
+        if workspace_default.is_dir() {
+            directory = workspace_default;
+        }
+    }
+    let package_environment =
+        TenantPackageEnvironment::from_allowlist(&environment, &["MANAGED_AGENT_AG_UI_URL"]);
+    let package = load_tenant_package(&directory, &package_environment)
+        .map_err(|_| MigrationFailure::data("thread_history_clear_package_invalid"))?;
+    let tenant = TenantId::new(&package.package.tenant_id);
+    let deployment = DeploymentId::new(server.deployment_id.as_deref().unwrap_or(tenant.as_str()));
+    let key_policy = match server.deployment_environment {
+        DeploymentEnvironment::Production => ExampleKeyPolicy::Reject,
+        DeploymentEnvironment::Development => ExampleKeyPolicy::Allow,
+    };
+    let _validated_master = KeyEncryptionKey::from_env_map(&environment, key_policy)
+        .map_err(|_| MigrationFailure::data("thread_history_clear_key_invalid"))?;
+    let master = openbot_server::config::env::optional(&environment, "KEY_ENCRYPTION_KEY")
+        .ok_or_else(|| MigrationFailure::unavailable("thread_history_clear_key_missing"))?;
+    let checkpoint_key = derive_application_key(
+        &SecretBytes::new(master.as_bytes().to_vec()),
+        ApplicationKeyPurpose::AuditCheckpoint,
+    )
+    .map_err(|_| MigrationFailure::data("thread_history_clear_key_invalid"))?;
+    let database_url = openbot_server::config::env::optional(&environment, "DATABASE_URL")
+        .ok_or_else(|| MigrationFailure::unavailable("database_url_missing"))?;
+    let database: DatabaseConfig = database_url
+        .parse()
+        .map_err(|_| MigrationFailure::data("database_url_invalid"))?;
+    let pool = pool::connect(&database)
+        .await
+        .map_err(|_| MigrationFailure::unavailable("database_unavailable"))?;
+    let result = async {
+        openbot_server::database::initialize(&pool)
+            .await
+            .map_err(|_| MigrationFailure::unavailable("database_initialization_failed"))?;
+        let authority = Arc::new(
+            PostgresThreadHistoryAuthority::new(pool.clone(), deployment, tenant)
+                .map_err(|_| MigrationFailure::data("thread_history_clear_namespace_invalid"))?,
+        );
+        authority
+            .enroll_clear_audit_checkpoint_key(checkpoint_key)
+            .map_err(|_| MigrationFailure::unavailable("thread_history_clear_audit_unavailable"))?;
+        let deadline = Instant::now().checked_add(CLEAR_BUDGET).ok_or_else(|| {
+            MigrationFailure::unavailable("thread_history_clear_deadline_invalid")
+        })?;
+        authority
+            .close_deleted_history_before(thread, deadline)
+            .await
+            .map_err(MigrationFailure::from_clear)?;
+        let drain = authority
+            .drain_closed_history_runs_before(thread, deadline)
+            .await
+            .map_err(MigrationFailure::from_clear)?;
+        if !drain.is_complete() {
+            return Ok("thread_history_clear_awaiting_drain");
+        }
+        for _ in 0..CLEAR_CALLS {
+            match authority
+                .clear_closed_history_before(thread, deadline)
+                .await
+                .map_err(MigrationFailure::from_clear)?
+            {
+                ThreadHistoryClearProgress::Completed { .. } => {
+                    return Ok("thread_history_clear_completed");
+                }
+                ThreadHistoryClearProgress::AwaitingDrain => {
+                    return Ok("thread_history_clear_awaiting_drain");
+                }
+                ThreadHistoryClearProgress::AwaitingReaders => {
+                    return Ok("thread_history_clear_awaiting_readers");
+                }
+                ThreadHistoryClearProgress::BatchCommitted { .. } => {}
+            }
+        }
+        Ok("thread_history_clear_batch_budget_exhausted")
+    }
+    .await;
+    pool.close();
+    result
 }
 
 fn run_audit_preflight() -> ExitCode {
@@ -298,6 +450,35 @@ struct MigrationFailure {
 }
 
 impl MigrationFailure {
+    const fn from_clear(error: ThreadHistoryStopClearError) -> Self {
+        match error {
+            ThreadHistoryStopClearError::InvalidInput { .. }
+            | ThreadHistoryStopClearError::NotVisible
+            | ThreadHistoryStopClearError::Conflict
+            | ThreadHistoryStopClearError::Corrupt { .. } => {
+                Self::data("thread_history_clear_refused")
+            }
+            ThreadHistoryStopClearError::Unavailable
+            | ThreadHistoryStopClearError::BeginUnavailable => {
+                Self::unavailable("thread_history_clear_unavailable")
+            }
+            ThreadHistoryStopClearError::DeadlineExceeded
+            | ThreadHistoryStopClearError::CommitUnknown
+            | ThreadHistoryStopClearError::RollbackUnproven
+            | ThreadHistoryStopClearError::CommitAcknowledgedAfterDeadline
+            | ThreadHistoryStopClearError::RollbackAcknowledgedAfterDeadline => Self {
+                code: "thread_history_clear_transaction_unproven_or_late",
+                exit: TEMPORARY_EXIT,
+            },
+            ThreadHistoryStopClearError::Host(_) | ThreadHistoryStopClearError::AlreadyStarted => {
+                Self {
+                    code: "thread_history_clear_internal_binding_failed",
+                    exit: SOFTWARE_EXIT,
+                }
+            }
+        }
+    }
+
     const fn usage() -> Self {
         Self {
             code: "intelligence_import_usage",
@@ -345,6 +526,33 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+
+    #[test]
+    fn clear_deleted_requires_exact_arity_and_plausible_thread_before_configuration() {
+        let thread = ThreadIdentity::new(&DeploymentId::new("owned-cli-deployment"))
+            .mint_from_entropy([9; 16]);
+        let valid = [
+            OsString::from("thread-history-clear-deleted"),
+            OsString::from(thread.as_str()),
+        ];
+        assert_eq!(parse_clear_thread(&valid).unwrap(), thread.as_str());
+        for args in [
+            vec![],
+            vec![valid[0].clone()],
+            vec![valid[0].clone(), valid[1].clone(), OsString::from("extra")],
+        ] {
+            assert_eq!(parse_clear_thread(&args).unwrap_err().exit, USAGE_EXIT);
+        }
+        for invalid in [
+            "",
+            "other-thread",
+            "00000000-0000-0000-0000-00000000000z",
+            " 00000000-0000-0000-0000-000000000000",
+        ] {
+            let args = [valid[0].clone(), OsString::from(invalid)];
+            assert_eq!(parse_clear_thread(&args).unwrap_err().exit, DATA_EXIT);
+        }
+    }
 
     #[test]
     fn key_file_hex_is_exact_lowercase_with_at_most_one_line_ending() {

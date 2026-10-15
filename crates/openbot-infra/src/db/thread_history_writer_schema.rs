@@ -8,6 +8,8 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 /// Whole portable schema, the actual table ACL state and original raw facts.
 pub type ThreadHistoryWriterSchemaFacts = Value;
 const REGISTERED_SCHEMA: &str =
+    include_str!("../../../../fixtures/db/thread-history-writer-0052.json");
+const LEGACY0051_SCHEMA: &str =
     include_str!("../../../../fixtures/db/thread-history-writer-0051.json");
 
 const CAPTURE_SQL: &str = r####"WITH
@@ -15,6 +17,8 @@ wanted_relations(schema_name, relation_name) AS (
  VALUES ('openbot_internal'::text,'thread_history_heads'::text),
         ('openbot_internal'::text,'thread_history_clear_intents'::text),
         ('openbot_internal'::text,'channel_history_sources'::text)
+ UNION ALL SELECT 'openbot_internal','thread_history_clear_batches' WHERE $2::boolean
+ UNION ALL SELECT 'openbot_internal','thread_history_clear_completions' WHERE $2::boolean
 ),
 relations AS (
  SELECT c.*, n.nspname AS schema_name
@@ -30,7 +34,9 @@ original_owner AS (
 named_guards AS (
  SELECT p.* FROM pg_catalog.pg_proc p
  JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
- WHERE n.nspname='openbot_internal' AND p.proname IN ('guard_thread_history_head_mutation','prevent_thread_history_intent_mutation','require_thread_history_intent_closed_head','bind_thread_history_head_on_insert','retain_thread_history_head_on_delete','protect_thread_history_base_identity','prevent_thread_history_base_truncate','thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate','maintain_thread_run_occupancy','guard_thread_run_occupancy')
+ WHERE (n.nspname='openbot_internal' AND (p.proname IN ('guard_thread_history_head_mutation','prevent_thread_history_intent_mutation','require_thread_history_intent_closed_head','bind_thread_history_head_on_insert','retain_thread_history_head_on_delete','protect_thread_history_base_identity','prevent_thread_history_base_truncate','thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate','maintain_thread_run_occupancy','guard_thread_run_occupancy')
+ OR ($2::boolean AND p.proname IN ('guard_thread_history_clear_fact','thread_history_clear_batch_active','thread_history_clear_event_payload','require_thread_history_clear_completion','thread_history_clear_readers_quiescent','thread_history_clear_bodies_erased','require_thread_history_maintenance_source','guard_thread_history_memory_body'))))
+ OR ($2::boolean AND n.nspname='public' AND p.proname='guard_memory_provenance')
 ),
 constraints_scope AS (
  SELECT c.*
@@ -39,6 +45,10 @@ constraints_scope AS (
     OR (c.contype='f' AND c.confrelid IN (SELECT oid FROM relations))
     OR c.oid IN (SELECT t.tgconstraint FROM pg_catalog.pg_trigger t
                 WHERE t.tgfoid IN (SELECT oid FROM named_guards) AND t.tgconstraint<>0)
+    OR ($2::boolean AND c.conrelid='public.memories'::regclass AND c.conname IN
+        ('memories_scope_shape','memories_content_shape','memories_source_run_shape','memories_source_authorization_shape'))
+    OR ($2::boolean AND c.conrelid='public.component_human_decisions'::regclass
+        AND c.conname='component_human_decisions_answer_shape')
 ),
 indexes_scope AS (
  SELECT i.*
@@ -58,6 +68,7 @@ triggers_scope AS (
        SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
        WHERE n.nspname='public' AND c.relname IN ('threads','runs','messages','run_events','tool_approvals',
           'component_human_decisions','remote_agent_interrupts','channels')))
+    OR ($2::boolean AND NOT t.tgisinternal AND t.tgrelid='public.memories'::regclass)
 ),
 functions_scope AS (
  SELECT p.*
@@ -398,20 +409,50 @@ source_toast AS (
  SELECT c.* FROM pg_catalog.pg_class c WHERE c.oid IN (SELECT reltoastrelid FROM source_class)
 ),
 source_toast_indexes AS (SELECT i.* FROM pg_catalog.pg_index i WHERE i.indrelid IN (SELECT oid FROM source_toast)),
-new_functions AS (SELECT p.* FROM named_guards p WHERE p.proname IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate')),
+physical_class AS (
+ SELECT * FROM source_class
+ UNION ALL SELECT * FROM relations WHERE $2::boolean AND relname IN
+  ('thread_history_clear_batches','thread_history_clear_completions')
+),
+physical_types AS (
+ SELECT t.* FROM pg_catalog.pg_type t WHERE t.oid IN (
+  SELECT r.reltype FROM physical_class r UNION ALL
+  SELECT t.typarray FROM physical_class r JOIN pg_catalog.pg_type t ON t.oid=r.reltype)
+),
+physical_toast AS (SELECT c.* FROM pg_catalog.pg_class c WHERE c.oid IN (SELECT reltoastrelid FROM physical_class)),
+physical_toast_indexes AS (SELECT i.* FROM pg_catalog.pg_index i WHERE i.indrelid IN (SELECT oid FROM physical_toast)),
+clear_physical_facts AS (
+ SELECT r.relname,pg_catalog.jsonb_build_object(
+  'name',r.relname,
+  'sourceClass',(SELECT (pg_catalog.to_jsonb(s)-'schema_name')||pg_catalog.jsonb_build_object('oid',s.oid::pg_catalog.int8,'relnamespace',s.relnamespace::pg_catalog.int8,'reltype',s.reltype::pg_catalog.int8,'reloftype',s.reloftype::pg_catalog.int8,'relowner',s.relowner::pg_catalog.int8,'relam',s.relam::pg_catalog.int8,'relfilenode',s.relfilenode::pg_catalog.int8,'reltablespace',s.reltablespace::pg_catalog.int8,'reltoastrelid',s.reltoastrelid::pg_catalog.int8,'relrewrite',s.relrewrite::pg_catalog.int8) FROM physical_class s WHERE s.oid=r.oid),
+  'sourceTypes',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(t)||pg_catalog.jsonb_build_object('oid',t.oid::pg_catalog.int8,'typnamespace',t.typnamespace::pg_catalog.int8,'typowner',t.typowner::pg_catalog.int8,'typrelid',t.typrelid::pg_catalog.int8,'typelem',t.typelem::pg_catalog.int8,'typarray',t.typarray::pg_catalog.int8,'typbasetype',t.typbasetype::pg_catalog.int8,'typcollation',t.typcollation::pg_catalog.int8,'typinput',t.typinput::pg_catalog.oid::pg_catalog.int8,'typoutput',t.typoutput::pg_catalog.oid::pg_catalog.int8,'typreceive',t.typreceive::pg_catalog.oid::pg_catalog.int8,'typsend',t.typsend::pg_catalog.oid::pg_catalog.int8,'typmodin',t.typmodin::pg_catalog.oid::pg_catalog.int8,'typmodout',t.typmodout::pg_catalog.oid::pg_catalog.int8,'typanalyze',t.typanalyze::pg_catalog.oid::pg_catalog.int8,'typsubscript',t.typsubscript::pg_catalog.oid::pg_catalog.int8) ORDER BY t.oid),'[]'::jsonb) FROM physical_types t WHERE t.typrelid=r.oid OR t.typelem=r.reltype),
+  'sourceAttributes',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(a)||pg_catalog.jsonb_build_object('attrelid',a.attrelid::pg_catalog.int8,'atttypid',a.atttypid::pg_catalog.int8,'attcollation',a.attcollation::pg_catalog.int8) ORDER BY a.attnum),'[]'::jsonb) FROM pg_catalog.pg_attribute a WHERE a.attrelid=r.oid AND a.attnum>0),
+  'sourceToast',pg_catalog.jsonb_build_object(
+   'relation',(SELECT pg_catalog.to_jsonb(t)||pg_catalog.jsonb_build_object('oid',t.oid::pg_catalog.int8,'relnamespace',t.relnamespace::pg_catalog.int8,'reltype',t.reltype::pg_catalog.int8,'reloftype',t.reloftype::pg_catalog.int8,'relowner',t.relowner::pg_catalog.int8,'relam',t.relam::pg_catalog.int8,'relfilenode',t.relfilenode::pg_catalog.int8,'reltablespace',t.reltablespace::pg_catalog.int8,'reltoastrelid',t.reltoastrelid::pg_catalog.int8,'relrewrite',t.relrewrite::pg_catalog.int8) FROM physical_toast t WHERE t.oid=r.reltoastrelid),
+   'indexes',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('class',pg_catalog.to_jsonb(c)||pg_catalog.jsonb_build_object('oid',c.oid::pg_catalog.int8,'relnamespace',c.relnamespace::pg_catalog.int8,'reltype',c.reltype::pg_catalog.int8,'reloftype',c.reloftype::pg_catalog.int8,'relowner',c.relowner::pg_catalog.int8,'relam',c.relam::pg_catalog.int8,'relfilenode',c.relfilenode::pg_catalog.int8,'reltablespace',c.reltablespace::pg_catalog.int8,'reltoastrelid',c.reltoastrelid::pg_catalog.int8,'relrewrite',c.relrewrite::pg_catalog.int8),'index',pg_catalog.to_jsonb(i)||pg_catalog.jsonb_build_object('indexrelid',i.indexrelid::pg_catalog.int8,'indrelid',i.indrelid::pg_catalog.int8)||pg_catalog.jsonb_build_object('indkey',pg_catalog.to_jsonb(i.indkey::smallint[]),'indclass',pg_catalog.to_jsonb(i.indclass::pg_catalog.oid[]::pg_catalog.int8[]),'indcollation',pg_catalog.to_jsonb(i.indcollation::pg_catalog.oid[]::pg_catalog.int8[]),'indoption',pg_catalog.to_jsonb(i.indoption::smallint[]))) ORDER BY i.indexrelid),'[]'::jsonb) FROM physical_toast_indexes i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=r.reltoastrelid),
+   'attributes',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(a)||pg_catalog.jsonb_build_object('attrelid',a.attrelid::pg_catalog.int8,'atttypid',a.atttypid::pg_catalog.int8,'attcollation',a.attcollation::pg_catalog.int8) ORDER BY a.attnum),'[]'::jsonb) FROM pg_catalog.pg_attribute a WHERE a.attrelid=r.reltoastrelid AND a.attnum>0),
+   'operatorClasses',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('class',pg_catalog.to_jsonb(o)||pg_catalog.jsonb_build_object('oid',o.oid::pg_catalog.int8,'opcmethod',o.opcmethod::pg_catalog.int8,'opcnamespace',o.opcnamespace::pg_catalog.int8,'opcowner',o.opcowner::pg_catalog.int8,'opcfamily',o.opcfamily::pg_catalog.int8,'opcintype',o.opcintype::pg_catalog.int8,'opckeytype',o.opckeytype::pg_catalog.int8),'family',pg_catalog.to_jsonb(f)||pg_catalog.jsonb_build_object('oid',f.oid::pg_catalog.int8,'opfmethod',f.opfmethod::pg_catalog.int8,'opfnamespace',f.opfnamespace::pg_catalog.int8,'opfowner',f.opfowner::pg_catalog.int8),'method',pg_catalog.to_jsonb(m)||pg_catalog.jsonb_build_object('oid',m.oid::pg_catalog.int8,'amhandler',m.amhandler::pg_catalog.oid::pg_catalog.int8)) ORDER BY o.oid),'[]'::jsonb)
+    FROM pg_catalog.pg_opclass o JOIN pg_catalog.pg_opfamily f ON f.oid=o.opcfamily JOIN pg_catalog.pg_am m ON m.oid=o.opcmethod
+    WHERE o.oid IN (SELECT pg_catalog.unnest(i.indclass::pg_catalog.oid[]) FROM physical_toast_indexes i WHERE i.indrelid=r.reltoastrelid))),
+  'sourceDefaults',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('oid',d.oid::pg_catalog.int8,'adrelid',d.adrelid::pg_catalog.int8,'adnum',d.adnum) ORDER BY d.oid),'[]'::jsonb) FROM pg_catalog.pg_attrdef d WHERE d.adrelid=r.oid)
+ ) AS facts FROM physical_class r WHERE $2::boolean AND r.relname IN
+  ('thread_history_clear_batches','thread_history_clear_completions')
+),
+new_functions AS (SELECT p.* FROM named_guards p WHERE p.proname IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate')
+ OR ($2::boolean AND p.proname IN ('guard_thread_history_clear_fact','thread_history_clear_batch_active','thread_history_clear_event_payload','require_thread_history_clear_completion','thread_history_clear_readers_quiescent','thread_history_clear_bodies_erased','require_thread_history_maintenance_source','guard_thread_history_memory_body'))),
 new_triggers AS (SELECT t.* FROM triggers_scope t WHERE t.tgfoid IN (SELECT oid FROM new_functions)),
-new_constraints AS (SELECT c.* FROM constraints_scope c WHERE c.conrelid IN (SELECT oid FROM source_class)
+new_constraints AS (SELECT c.* FROM constraints_scope c WHERE c.conrelid IN (SELECT oid FROM physical_class)
  OR c.oid IN (SELECT tgconstraint FROM new_triggers WHERE tgconstraint<>0)),
 writer_addresses(classid,objid) AS (
- SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,r.oid FROM source_class r
- UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,i.indexrelid FROM indexes_scope i WHERE i.indrelid IN (SELECT oid FROM source_class)
- UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,t.oid FROM source_toast t
- UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,i.indexrelid FROM source_toast_indexes i
- UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass::oid,t.oid FROM source_types t
+ SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,r.oid FROM physical_class r
+ UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,i.indexrelid FROM indexes_scope i WHERE i.indrelid IN (SELECT oid FROM physical_class)
+ UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,t.oid FROM physical_toast t
+ UNION ALL SELECT 'pg_catalog.pg_class'::pg_catalog.regclass::oid,i.indexrelid FROM physical_toast_indexes i
+ UNION ALL SELECT 'pg_catalog.pg_type'::pg_catalog.regclass::oid,t.oid FROM physical_types t
  UNION ALL SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass::oid,p.oid FROM new_functions p
  UNION ALL SELECT 'pg_catalog.pg_trigger'::pg_catalog.regclass::oid,t.oid FROM new_triggers t
  UNION ALL SELECT 'pg_catalog.pg_constraint'::pg_catalog.regclass::oid,c.oid FROM new_constraints c
- UNION ALL SELECT 'pg_catalog.pg_attrdef'::pg_catalog.regclass::oid,d.oid FROM pg_catalog.pg_attrdef d WHERE d.adrelid IN (SELECT oid FROM source_class)
+ UNION ALL SELECT 'pg_catalog.pg_attrdef'::pg_catalog.regclass::oid,d.oid FROM pg_catalog.pg_attrdef d WHERE d.adrelid IN (SELECT oid FROM physical_class)
 ),
 writer_expression_facts AS (
  SELECT c.conname AS name,c.conkey AS attnums,pg_catalog.pg_get_constraintdef(c.oid,false) AS deparsed,c.conbin::text AS node_tree
@@ -420,6 +461,20 @@ writer_expression_facts AS (
  SELECT 'channel_history_sources.'||a.attname,ARRAY[a.attnum]::smallint[],pg_catalog.pg_get_expr(d.adbin,d.adrelid,false),d.adbin::text
  FROM pg_catalog.pg_attrdef d JOIN pg_catalog.pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum
  WHERE d.adrelid IN (SELECT oid FROM source_class)
+ UNION ALL
+ SELECT c.conname,c.conkey,pg_catalog.pg_get_constraintdef(c.oid,false),c.conbin::text
+ FROM constraints_scope c WHERE $2::boolean AND c.contype='c'
+  AND (c.conrelid IN (SELECT oid FROM relations WHERE relname IN
+       ('thread_history_clear_batches','thread_history_clear_completions'))
+       OR c.conname IN ('thread_history_clear_intents_kind_check',
+           'thread_history_clear_intents_maintenance_actor_check','component_human_decisions_answer_shape',
+           'memories_scope_shape','memories_content_shape','memories_source_run_shape','memories_source_authorization_shape'))
+ UNION ALL
+ SELECT r.relname||'.'||a.attname,ARRAY[a.attnum]::smallint[],
+  pg_catalog.pg_get_expr(d.adbin,d.adrelid,false),d.adbin::text
+ FROM relations r JOIN pg_catalog.pg_attrdef d ON d.adrelid=r.oid
+ JOIN pg_catalog.pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum
+ WHERE $2::boolean AND r.relname IN ('thread_history_clear_batches','thread_history_clear_completions')
 )
 SELECT pg_catalog.jsonb_build_object(
  'format','thread-history-writer-raw-v1',
@@ -453,7 +508,7 @@ SELECT pg_catalog.jsonb_build_object(
  'builtinAnchorsRaw',pg_catalog.jsonb_build_object(
   'types',(SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('oidRaw',t.oid::text,'schema',n.nspname,'name',t.typname) ORDER BY t.typname COLLATE pg_catalog."C")
     FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace
-    WHERE n.nspname='pg_catalog' AND t.typname IN ('text','timestamptz','int2','int4','int8','jsonb','trigger','bool','void','_text')),
+    WHERE n.nspname='pg_catalog' AND (t.typname IN ('text','timestamptz','int2','int4','int8','jsonb','trigger','bool','void','_text') OR ($2::boolean AND t.typname='xid8'))),
   'collation',(SELECT pg_catalog.jsonb_build_object('oidRaw',c.oid::text,'schema',n.nspname,'name',c.collname)
     FROM pg_catalog.pg_collation c JOIN pg_catalog.pg_namespace n ON n.oid=c.collnamespace
     WHERE n.nspname='pg_catalog' AND c.collname='C' AND c.collencoding=-1),
@@ -463,14 +518,14 @@ SELECT pg_catalog.jsonb_build_object(
     FROM pg_catalog.pg_opclass c JOIN pg_catalog.pg_namespace n ON n.oid=c.opcnamespace
     JOIN pg_catalog.pg_am a ON a.oid=c.opcmethod JOIN pg_catalog.pg_opfamily f ON f.oid=c.opcfamily
     JOIN pg_catalog.pg_namespace fn ON fn.oid=f.opfnamespace
-    WHERE n.nspname='pg_catalog' AND c.opcname IN ('text_ops','int8_ops','timestamptz_ops') AND a.amname='btree'),
+    WHERE n.nspname='pg_catalog' AND (c.opcname IN ('text_ops','int8_ops','timestamptz_ops') OR ($2::boolean AND c.opcname='xid8_ops')) AND a.amname='btree'),
   'equalityOperators',(SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('oidRaw',op.oid::text,'schema',ons.nspname,'name',op.oprname,
     'leftType',pg_catalog.format_type(op.oprleft,NULL),'rightType',pg_catalog.format_type(op.oprright,NULL),'resultType',pg_catalog.format_type(op.oprresult,NULL),
     'function',pg_catalog.jsonb_build_object('oidRaw',p.oid::text,'schema',pn.nspname,'name',p.proname,'arguments',pg_catalog.pg_get_function_identity_arguments(p.oid)))
     ORDER BY op.oprleft)
     FROM pg_catalog.pg_operator op JOIN pg_catalog.pg_namespace ons ON ons.oid=op.oprnamespace
     JOIN pg_catalog.pg_proc p ON p.oid=op.oprcode JOIN pg_catalog.pg_namespace pn ON pn.oid=p.pronamespace
-    WHERE ons.nspname='pg_catalog' AND op.oprname='=' AND op.oprleft IN (20,25,1184) AND op.oprright=op.oprleft)
+    WHERE ons.nspname='pg_catalog' AND op.oprname='=' AND (op.oprleft IN (20,25,1184) OR ($2::boolean AND op.oprleft=5069)) AND op.oprright=op.oprleft)
 
  ),
  'legacyOwnershipRaw',pg_catalog.jsonb_build_object(
@@ -488,6 +543,7 @@ SELECT pg_catalog.jsonb_build_object(
    FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
    WHERE (n.nspname='public' AND c.relname IN ('threads','runs','messages','run_events','tool_approvals','component_human_decisions','remote_agent_interrupts','channels'))
       OR (n.nspname='openbot_internal' AND c.relname='schema_migrations')
+      OR ($2::boolean AND n.nspname='public' AND c.relname='memories')
   ),
   'namespaces',(
    SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
@@ -546,7 +602,9 @@ SELECT pg_catalog.jsonb_build_object(
   'toastOperatorFamilies',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(p)||pg_catalog.jsonb_build_object('oid',p.oid::pg_catalog.int8,'opfmethod',p.opfmethod::pg_catalog.int8,'opfnamespace',p.opfnamespace::pg_catalog.int8,'opfowner',p.opfowner::pg_catalog.int8) ORDER BY p.oid),'[]'::jsonb) FROM pg_catalog.pg_opfamily p WHERE p.oid IN(SELECT(x->>'oid')::pg_catalog.oid FROM pg_catalog.jsonb_array_elements($1::jsonb->'toastOperatorFamilies')x)),
   'collations',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(p)||pg_catalog.jsonb_build_object('oid',p.oid::pg_catalog.int8,'collnamespace',p.collnamespace::pg_catalog.int8,'collowner',p.collowner::pg_catalog.int8) ORDER BY p.oid),'[]'::jsonb) FROM pg_catalog.pg_collation p WHERE p.oid IN(SELECT(x->>'oid')::pg_catalog.oid FROM pg_catalog.jsonb_array_elements($1::jsonb->'collations')x)),
   'aggregates',(SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(p)||pg_catalog.jsonb_build_object('aggfnoid',p.aggfnoid::pg_catalog.oid::pg_catalog.int8,'aggtransfn',p.aggtransfn::pg_catalog.oid::pg_catalog.int8,'aggfinalfn',p.aggfinalfn::pg_catalog.oid::pg_catalog.int8,'aggcombinefn',p.aggcombinefn::pg_catalog.oid::pg_catalog.int8,'aggserialfn',p.aggserialfn::pg_catalog.oid::pg_catalog.int8,'aggdeserialfn',p.aggdeserialfn::pg_catalog.oid::pg_catalog.int8,'aggmtransfn',p.aggmtransfn::pg_catalog.oid::pg_catalog.int8,'aggminvtransfn',p.aggminvtransfn::pg_catalog.oid::pg_catalog.int8,'aggmfinalfn',p.aggmfinalfn::pg_catalog.oid::pg_catalog.int8,'aggsortop',p.aggsortop::pg_catalog.int8,'aggtranstype',p.aggtranstype::pg_catalog.int8,'aggmtranstype',p.aggmtranstype::pg_catalog.int8) ORDER BY p.aggfnoid),'[]'::jsonb)
-    FROM pg_catalog.pg_aggregate p WHERE p.aggfnoid IN (SELECT (x->>'aggfnoid')::pg_catalog.oid FROM pg_catalog.jsonb_array_elements($1::jsonb->'aggregates') x))),
+    FROM pg_catalog.pg_aggregate p WHERE p.aggfnoid IN (SELECT (x->>'aggfnoid')::pg_catalog.oid FROM pg_catalog.jsonb_array_elements($1::jsonb->'aggregates') x))) || CASE WHEN $2::boolean THEN pg_catalog.jsonb_build_object(
+  'clearRelations',(SELECT coalesce(pg_catalog.jsonb_agg(c.facts ORDER BY c.relname COLLATE pg_catalog."C"),'[]'::jsonb) FROM clear_physical_facts c)
+ ) ELSE '{}'::jsonb END,
  'relations',(SELECT coalesce(pg_catalog.jsonb_agg(f.facts ORDER BY f.schema_name COLLATE pg_catalog."C",f.relname COLLATE pg_catalog."C"),'[]'::jsonb) FROM relation_facts f),
  'constraints',(SELECT coalesce(pg_catalog.jsonb_agg(f.facts ORDER BY f.schema_name COLLATE pg_catalog."C",f.relname COLLATE pg_catalog."C",f.conname COLLATE pg_catalog."C",f.contype::text COLLATE pg_catalog."C"),'[]'::jsonb) FROM constraint_facts f),
  'indexes',(SELECT coalesce(pg_catalog.jsonb_agg(f.facts ORDER BY f.schema_name COLLATE pg_catalog."C",f.relname COLLATE pg_catalog."C"),'[]'::jsonb) FROM index_facts f),
@@ -556,19 +614,19 @@ SELECT pg_catalog.jsonb_build_object(
 NOT EXISTS (
  (SELECT p.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable
   FROM functions_scope p
-  CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f'::pg_catalog."char",p.proowner))) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate'))
+  CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f'::pg_catalog."char",p.proowner))) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate','guard_thread_history_clear_fact','thread_history_clear_batch_active','thread_history_clear_event_payload','require_thread_history_clear_completion','thread_history_clear_readers_quiescent','thread_history_clear_bodies_erased','require_thread_history_maintenance_source','guard_thread_history_memory_body'))
  EXCEPT ALL
  (SELECT p.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable
   FROM functions_scope p
-  CROSS JOIN LATERAL pg_catalog.aclexplode(pg_catalog.acldefault('f'::pg_catalog."char",p.proowner)) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate'))
+  CROSS JOIN LATERAL pg_catalog.aclexplode(pg_catalog.acldefault('f'::pg_catalog."char",p.proowner)) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate','guard_thread_history_clear_fact','thread_history_clear_batch_active','thread_history_clear_event_payload','require_thread_history_clear_completion','thread_history_clear_readers_quiescent','thread_history_clear_bodies_erased','require_thread_history_maintenance_source','guard_thread_history_memory_body'))
 ) AND NOT EXISTS (
  (SELECT p.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable
   FROM functions_scope p
-  CROSS JOIN LATERAL pg_catalog.aclexplode(pg_catalog.acldefault('f'::pg_catalog."char",p.proowner)) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate'))
+  CROSS JOIN LATERAL pg_catalog.aclexplode(pg_catalog.acldefault('f'::pg_catalog."char",p.proowner)) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate','guard_thread_history_clear_fact','thread_history_clear_batch_active','thread_history_clear_event_payload','require_thread_history_clear_completion','thread_history_clear_readers_quiescent','thread_history_clear_bodies_erased','require_thread_history_maintenance_source','guard_thread_history_memory_body'))
  EXCEPT ALL
  (SELECT p.oid,a.grantor,a.grantee,a.privilege_type,a.is_grantable
   FROM functions_scope p
-  CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f'::pg_catalog."char",p.proowner))) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate'))
+  CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f'::pg_catalog."char",p.proowner))) a WHERE p.proname NOT IN ('thread_history_preview','thread_history_lock_joint','thread_history_lock_channel_ids','thread_history_related_channel_ids','thread_history_validate_channel_source','guard_channel_history_source','guard_thread_history_channel_projection','thread_history_validate_channel_final','require_thread_history_channel_final','thread_history_terminal_payload','guard_thread_history_body','thread_history_validate_terminal_run','require_thread_history_terminal_final','guard_thread_history_canonical_reverse','prevent_thread_history_writer_truncate','guard_thread_history_clear_fact','thread_history_clear_batch_active','thread_history_clear_event_payload','require_thread_history_clear_completion','thread_history_clear_readers_quiescent','thread_history_clear_bodies_erased','require_thread_history_maintenance_source','guard_thread_history_memory_body'))
 ) AS function_acl_matches_builtin
 "####;
 
@@ -796,7 +854,7 @@ fn function_named<'a>(raw: &'a Value, identity: &Value) -> Result<&'a Value, Inf
     })
 }
 
-fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
+fn check_raw_bindings(raw: &Value, current52: bool) -> Result<(u32, u32), InfraError> {
     require(raw["format"] == "thread-history-writer-raw-v1")?;
     check_storage(raw)?;
     let owner = oid(&raw["ownerAnchorRaw"]["ownerOidRaw"])?;
@@ -810,8 +868,8 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
             && raw["systemOwnerRaw"]["ownerRoleCount"] == 1,
     )?;
     let legacy = arr(&raw["legacyOwnershipRaw"]["relations"])?;
-    require(legacy.len() == 9)?;
-    for (schema, name) in [
+    require(legacy.len() == if current52 { 10 } else { 9 })?;
+    let mut legacy_relations = vec![
         ("public", "threads"),
         ("public", "runs"),
         ("public", "messages"),
@@ -821,7 +879,11 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         ("public", "remote_agent_interrupts"),
         ("public", "channels"),
         ("openbot_internal", "schema_migrations"),
-    ] {
+    ];
+    if current52 {
+        legacy_relations.push(("public", "memories"));
+    }
+    for (schema, name) in legacy_relations {
         let r = unique(legacy, |r| same_identity(r, schema, name))?;
         require(oid(&r["ownerOidRaw"])? == owner && oid(&r["oidRaw"])? != 0)?;
         if schema == "public" && name == "threads" {
@@ -834,11 +896,11 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
     require(oid(&internal["oidRaw"])? != 0 && oid(&internal["ownerOidRaw"])? == owner)?;
     unique(ns, |n| n["schema"] == "public")?;
     let relations = arr(&raw["relations"])?;
-    require(relations.len() == 3)?;
+    require(relations.len() == if current52 { 5 } else { 3 })?;
     let mut all_relation_oids = std::collections::BTreeSet::from([base_oid]);
     let types = arr(&raw["builtinAnchorsRaw"]["types"])?;
-    require(types.len() == 10)?;
-    for (name, id) in [
+    require(types.len() == if current52 { 11 } else { 10 })?;
+    let mut builtin_types = vec![
         ("text", 25),
         ("int2", 21),
         ("int4", 23),
@@ -849,13 +911,24 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         ("timestamptz", 1184),
         ("jsonb", 3802),
         ("trigger", 2279),
-    ] {
+    ];
+    if current52 {
+        builtin_types.push(("xid8", 5069));
+    }
+    for (name, id) in builtin_types {
         let t = unique(types, |t| same_identity(t, "pg_catalog", name))?;
         require(oid(&t["oidRaw"])? == id)?;
     }
     let collation = &raw["builtinAnchorsRaw"]["collation"];
     require(same_identity(collation, "pg_catalog", "C") && oid(&collation["oidRaw"])? != 0)?;
-    for (name, cols) in [(H, 14), (Q, 13), ("channel_history_sources", 13)] {
+    let mut relation_columns = vec![(H, 14), (Q, 13), ("channel_history_sources", 13)];
+    if current52 {
+        relation_columns.extend([
+            ("thread_history_clear_batches", 14),
+            ("thread_history_clear_completions", 18),
+        ]);
+    }
+    for (name, cols) in relation_columns {
         let r = unique(relations, |r| {
             same_identity(&r["identity"], "openbot_internal", name)
         })?;
@@ -879,14 +952,22 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         }
     }
     let classes = arr(&raw["builtinAnchorsRaw"]["operatorClasses"])?;
-    require(classes.len() == 3)?;
-    for n in ["text_ops", "int8_ops", "timestamptz_ops"] {
+    require(classes.len() == if current52 { 4 } else { 3 })?;
+    let mut operator_classes = vec!["text_ops", "int8_ops", "timestamptz_ops"];
+    if current52 {
+        operator_classes.push("xid8_ops");
+    }
+    for n in operator_classes {
         let c = unique(classes, |c| same_identity(c, "pg_catalog", n))?;
         require(oid(&c["oidRaw"])? != 0 && oid(&c["familyOidRaw"])? != 0)?;
     }
     let equality = arr(&raw["builtinAnchorsRaw"]["equalityOperators"])?;
-    require(equality.len() == 3)?;
-    for t in ["text", "bigint", "timestamp with time zone"] {
+    require(equality.len() == if current52 { 4 } else { 3 })?;
+    let mut equality_types = vec!["text", "bigint", "timestamp with time zone"];
+    if current52 {
+        equality_types.push("xid8");
+    }
+    for t in equality_types {
         let op = unique(equality, |op| op["leftType"] == t && op["rightType"] == t)?;
         require(
             same_identity(op, "pg_catalog", "=")
@@ -897,7 +978,7 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         )?;
     }
     let indexes = arr(&raw["indexes"])?;
-    require(indexes.len() == 8)?;
+    require(indexes.len() == if current52 { 12 } else { 8 })?;
     let mut index_oids = std::collections::BTreeSet::new();
     for i in indexes {
         let id = oid(&i["identity"]["oidRaw"])?;
@@ -930,7 +1011,7 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         }
     }
     let constraints = arr(&raw["constraints"])?;
-    require(constraints.len() == 39)?;
+    require(constraints.len() == if current52 { 60 } else { 39 })?;
     let mut constraint_oids = std::collections::BTreeSet::new();
     for c in constraints {
         let id = oid(&c["oidRaw"])?;
@@ -977,7 +1058,7 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         }
     }
     let functions = arr(&raw["functions"])?;
-    require(functions.len() == 28)?;
+    require(functions.len() == if current52 { 39 } else { 28 })?;
     let mut function_oids = std::collections::BTreeSet::new();
     for name in USER_FUNCTIONS {
         let f = unique(functions, |f| {
@@ -986,12 +1067,19 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         })?;
         require(oid(&f["ownerOidRaw"])? == owner)?;
     }
-    for (name, id) in [
+    let mut ri_functions = vec![
         ("RI_FKey_check_ins", 1644),
         ("RI_FKey_check_upd", 1645),
         ("RI_FKey_noaction_del", 1654),
         ("RI_FKey_noaction_upd", 1655),
-    ] {
+    ];
+    if current52 {
+        ri_functions.extend([
+            ("RI_FKey_restrict_del", 1648),
+            ("RI_FKey_restrict_upd", 1649),
+        ]);
+    }
+    for (name, id) in ri_functions {
         let f = unique(functions, |f| {
             same_identity(&f["identity"], "pg_catalog", name) && f["identity"]["arguments"] == ""
         })?;
@@ -1001,6 +1089,12 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         let id = oid(&f["identity"]["oidRaw"])?;
         if f["identity"]["schema"] == "openbot_internal" {
             require(oid(&f["ownerOidRaw"])? == owner)?;
+        } else if f["identity"]["schema"] == "public" {
+            require(
+                current52
+                    && f["identity"]["name"] == "guard_memory_provenance"
+                    && oid(&f["ownerOidRaw"])? == owner,
+            )?;
         }
         require(
             id != 0
@@ -1014,7 +1108,7 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         )?;
     }
     let triggers = arr(&raw["triggers"])?;
-    require(triggers.len() == 44)?;
+    require(triggers.len() == if current52 { 60 } else { 44 })?;
     let mut trigger_oids = std::collections::BTreeSet::new();
     let mut ri_signatures = Vec::new();
     for t in triggers {
@@ -1055,10 +1149,19 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
                             && t["constraintRelation"] == c["relation"],
                     )?;
                 }
+                let clear_fk = current52
+                    && matches!(
+                        text(&c["name"])?,
+                        "thread_history_clear_batches_operation_fkey"
+                            | "thread_history_clear_completions_operation_fkey"
+                    );
+                let deferred = !clear_fk;
                 require(
                     t["function"]["schema"] == "pg_catalog"
-                        && t["deferrable"] == true
-                        && t["deferred"] == true,
+                        && c["deferrable"] == deferred
+                        && c["deferred"] == deferred
+                        && t["deferrable"] == deferred
+                        && t["deferred"] == deferred,
                 )?;
                 let prefix = if child {
                     "RI_ConstraintTrigger_c"
@@ -1096,6 +1199,21 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
             expected.push((name.to_owned(), child, function.to_owned(), kind));
         }
     }
+    if current52 {
+        for name in [
+            "thread_history_clear_batches_operation_fkey",
+            "thread_history_clear_completions_operation_fkey",
+        ] {
+            for (child, function, kind) in [
+                (true, "RI_FKey_check_ins", 5),
+                (true, "RI_FKey_check_upd", 17),
+                (false, "RI_FKey_restrict_del", 9),
+                (false, "RI_FKey_restrict_upd", 17),
+            ] {
+                expected.push((name.to_owned(), child, function.to_owned(), kind));
+            }
+        }
+    }
     ri_signatures.sort();
     expected.sort();
     require(ri_signatures == expected)?;
@@ -1104,9 +1222,51 @@ fn check_raw_bindings(raw: &Value) -> Result<(u32, u32), InfraError> {
         schemas.first() == Some(&json!("pg_catalog"))
             && !schemas.iter().any(|s| s == "openbot_internal"),
     )?;
-    check_source_types_and_attributes(raw, owner)?;
-    check_source_toast(raw, owner)?;
-    check_source_dependencies(raw, owner)?;
+    check_source_types_and_attributes(
+        raw,
+        &raw["writerRaw"],
+        owner,
+        "channel_history_sources",
+        13,
+        &[13],
+    )?;
+    check_source_toast(
+        raw,
+        &raw["writerRaw"],
+        owner,
+        "channel_history_sources",
+        13,
+        6,
+    )?;
+    if current52 {
+        let clear = arr(&raw["writerRaw"]["clearRelations"])?;
+        require(clear.len() == 2)?;
+        for (name, columns, checks, defaults) in [
+            ("thread_history_clear_batches", 14, 3, &[3, 4][..]),
+            ("thread_history_clear_completions", 18, 5, &[7][..]),
+        ] {
+            let physical = unique(clear, |r| r["name"] == name)?;
+            require(
+                obj(physical)?
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == [
+                        "name",
+                        "sourceClass",
+                        "sourceTypes",
+                        "sourceAttributes",
+                        "sourceToast",
+                        "sourceDefaults",
+                    ]
+                    .into_iter()
+                    .collect(),
+            )?;
+            check_source_types_and_attributes(raw, physical, owner, name, columns, defaults)?;
+            check_source_toast(raw, physical, owner, name, columns, checks)?;
+        }
+    }
+    check_source_dependencies(raw, owner, current52)?;
     // Remaining names, columns, ordering, bodies, policies, ACLs and flags must exactly match
     // the independent complete oracle. Raw OIDs above are bound before any are removed.
     Ok((owner, system))
@@ -1128,6 +1288,16 @@ const NEW_FUNCTIONS: [&str; 15] = [
     "require_thread_history_terminal_final",
     "guard_thread_history_canonical_reverse",
     "prevent_thread_history_writer_truncate",
+];
+const CLEAR_FUNCTIONS: [&str; 8] = [
+    "guard_thread_history_clear_fact",
+    "thread_history_clear_batch_active",
+    "thread_history_clear_event_payload",
+    "require_thread_history_clear_completion",
+    "thread_history_clear_readers_quiescent",
+    "thread_history_clear_bodies_erased",
+    "require_thread_history_maintenance_source",
+    "guard_thread_history_memory_body",
 ];
 fn sole_function_acl(v: &Value, owner: u32, role: &str) -> Result<Value, InfraError> {
     let rows = acl_rows(v)?;
@@ -1180,8 +1350,11 @@ fn portable_ri_identifier(t: &Value) -> Result<(String, String), InfraError> {
     ))
 }
 
-fn normalize_owner_relative(mut raw: Value) -> Result<ThreadHistoryWriterSchemaFacts, InfraError> {
-    let (owner, system) = check_raw_bindings(&raw)?;
+fn normalize_owner_relative(
+    mut raw: Value,
+    current52: bool,
+) -> Result<ThreadHistoryWriterSchemaFacts, InfraError> {
+    let (owner, system) = check_raw_bindings(&raw, current52)?;
     let raw_facts = raw.clone();
     let mut table_acl_states = Vec::new();
     for r in raw["relations"]
@@ -1219,7 +1392,8 @@ fn normalize_owner_relative(mut raw: Value) -> Result<ThreadHistoryWriterSchemaF
         } else {
             (owner, "original_threads_owner")
         };
-        let sole = NEW_FUNCTIONS.contains(&text(&f["identity"]["name"])?);
+        let name = text(&f["identity"]["name"])?;
+        let sole = NEW_FUNCTIONS.contains(&name) || (current52 && CLEAR_FUNCTIONS.contains(&name));
         let acl = if sole {
             sole_function_acl(&f["acl"], actual_owner, role)?
         } else {
@@ -1285,11 +1459,16 @@ fn count_hot_markers(v: &Value) -> usize {
         _ => 0,
     }
 }
-fn hot_comparison_clone(expected: &Value, actual: &Value) -> Result<Value, InfraError> {
-    require(count_hot_markers(expected) == 8 && count_hot_markers(actual) == 0)?;
+fn hot_comparison_clone(
+    expected: &Value,
+    actual: &Value,
+    current52: bool,
+) -> Result<Value, InfraError> {
+    let count = if current52 { 12 } else { 8 };
+    require(count_hot_markers(expected) == count && count_hot_markers(actual) == 0)?;
     let es = arr(&expected["indexes"])?;
     let actuals = arr(&actual["indexes"])?;
-    require(es.len() == 8 && actuals.len() == 8)?;
+    require(es.len() == count && actuals.len() == count)?;
     let mut indexes = Vec::new();
     for e in es {
         require(e["checkXmin"] == hot_marker())?;
@@ -1312,12 +1491,18 @@ fn hot_comparison_clone(expected: &Value, actual: &Value) -> Result<Value, Infra
 }
 async fn observation_on<C: GenericClient + Sync>(
     client: &C,
+    current52: bool,
 ) -> Result<ThreadHistoryWriterSchemaFacts, InfraError> {
-    let expected: Value = serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("oracle"))?;
+    let registered = if current52 {
+        REGISTERED_SCHEMA
+    } else {
+        LEGACY0051_SCHEMA
+    };
+    let expected: Value = serde_json::from_str(registered).map_err(|_| corrupt("oracle"))?;
     let contract = &expected["rawContract"];
-    check_raw_contract_shape(contract)?;
+    check_raw_contract_shape(contract, current52)?;
     let row = client
-        .query_one(CAPTURE_SQL, &[contract])
+        .query_one(CAPTURE_SQL, &[contract, &current52])
         .await
         .map_err(|source| InfraError::query("只读观察 Thread 持久状态与来源ID schema", source))?;
     let payload: String = row.try_get("thread_history_raw").map_err(|source| {
@@ -1338,10 +1523,18 @@ async fn observation_on<C: GenericClient + Sync>(
         })?;
     require(matches)?;
     let raw = serde_json::from_str(&payload).map_err(|_| corrupt("facts"))?;
-    normalize_owner_relative(raw)
+    normalize_owner_relative(raw, current52)
 }
-fn compare_registered(observation: &ThreadHistoryWriterSchemaFacts) -> Result<(), InfraError> {
-    let expected: Value = serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("oracle"))?;
+fn compare_registered(
+    observation: &ThreadHistoryWriterSchemaFacts,
+    current52: bool,
+) -> Result<(), InfraError> {
+    let registered = if current52 {
+        REGISTERED_SCHEMA
+    } else {
+        LEGACY0051_SCHEMA
+    };
+    let expected: Value = serde_json::from_str(registered).map_err(|_| corrupt("oracle"))?;
     let keys = obj(&expected)?
         .keys()
         .map(String::as_str)
@@ -1354,12 +1547,23 @@ fn compare_registered(observation: &ThreadHistoryWriterSchemaFacts) -> Result<()
             && expected["schema"]["format"] == "thread-history-writer-schema-v1"
             && observation["format"] == "thread-history-writer-observation-v1",
     )?;
-    check_independent_raw_contract(&expected["rawContract"], &observation["rawFacts"])?;
+    check_independent_raw_contract(
+        &expected["rawContract"],
+        &observation["rawFacts"],
+        current52,
+    )?;
     let states = arr(&expected["allowedTableAclStates"])?;
     require(states.len() == 2)?;
     let observed = arr(&observation["tableAclStates"])?;
-    require(observed.len() == 3)?;
-    for name in [H, Q, "channel_history_sources"] {
+    require(observed.len() == if current52 { 5 } else { 3 })?;
+    let mut names = vec![H, Q, "channel_history_sources"];
+    if current52 {
+        names.extend([
+            "thread_history_clear_batches",
+            "thread_history_clear_completions",
+        ]);
+    }
+    for name in names {
         let s = unique(observed, |s| {
             same_identity(&s["relation"], "openbot_internal", name)
         })?;
@@ -1372,27 +1576,38 @@ fn compare_registered(observation: &ThreadHistoryWriterSchemaFacts) -> Result<()
         )?;
     }
     require(
-        expected["schema"] == hot_comparison_clone(&expected["schema"], &observation["schema"])?,
+        expected["schema"]
+            == hot_comparison_clone(&expected["schema"], &observation["schema"], current52)?,
     )
 }
-/// Require exact current51/39 and the entire independent0051 schema on this same Client.
+/// Require exact current52/40 and the entire independent0052 schema on this same Client.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0051_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0051_VERSION)?;
+    let ledger = native::validate_known_prefix(client, native::NATIVE_0052_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_0052_VERSION)?;
     verify_schema(client).await
 }
 /// Schema-only helper after the caller proves its original exact native prefix.
 pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {
-    compare_registered(&observation_on(client).await?)
+    compare_registered(&observation_on(client, true).await?, true)
 }
-/// Whole0051 on the original transaction; never checks out, repairs or closes it.
+/// Whole0052 on the original transaction; never checks out, repairs or closes it.
 pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
-    compare_registered(&observation_on(tx).await?)
+    compare_registered(&observation_on(tx, true).await?, true)
+}
+/// Schema-only historical51 helper after an explicit exact pre-upgrade prefix proof.
+pub(crate) async fn verify_schema_legacy0051(client: &Client) -> Result<(), InfraError> {
+    compare_registered(&observation_on(client, false).await?, false)
+}
+/// Original whole0051 schema and oracle, only on an explicitly proven 39-item legacy prefix.
+pub(crate) async fn verify_legacy0051_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<(), InfraError> {
+    compare_registered(&observation_on(tx, false).await?, false)
 }
 
 // The independent fixture declares the finite builtin scope. Candidate observations
 // are consumers of these original declarations and never create an expected row.
-fn check_raw_contract_shape(v: &Value) -> Result<(), InfraError> {
+fn check_raw_contract_shape(v: &Value, current52: bool) -> Result<(), InfraError> {
     let keys = obj(v)?
         .keys()
         .map(String::as_str)
@@ -1415,7 +1630,10 @@ fn check_raw_contract_shape(v: &Value) -> Result<(), InfraError> {
         .collect()
             && v["format"] == "thread-history-writer-raw-contract-v1",
     )?;
-    require(!arr(&v["builtinFunctions"])?.is_empty() && arr(&v["sourceExpressions"])?.len() == 7)?;
+    require(
+        !arr(&v["builtinFunctions"])?.is_empty()
+            && arr(&v["sourceExpressions"])?.len() == if current52 { 25 } else { 7 },
+    )?;
     for key in [
         "builtinFunctions",
         "builtinOperators",
@@ -1459,8 +1677,12 @@ fn multiset(v: &Value) -> Result<Vec<Vec<u8>>, InfraError> {
     out.sort();
     Ok(out)
 }
-fn check_independent_raw_contract(expected: &Value, raw: &Value) -> Result<(), InfraError> {
-    check_raw_contract_shape(expected)?;
+fn check_independent_raw_contract(
+    expected: &Value,
+    raw: &Value,
+    current52: bool,
+) -> Result<(), InfraError> {
+    check_raw_contract_shape(expected, current52)?;
     let observed = &raw["writerRaw"];
     check_language_contract(&expected["languageContract"], raw)?;
     for key in [
@@ -1476,7 +1698,7 @@ fn check_independent_raw_contract(expected: &Value, raw: &Value) -> Result<(), I
         require(multiset(&expected[key])? == multiset(&observed[key])?)?;
     }
     let expressions = arr(&observed["sourceExpressions"])?;
-    require(expressions.len() == 7)?;
+    require(expressions.len() == if current52 { 25 } else { 7 })?;
     for expected in arr(&expected["sourceExpressions"])? {
         let actual = unique(expressions, |v| v["name"] == expected["name"])?;
         require(
@@ -1628,15 +1850,18 @@ fn raw_builtin_function(raw: &Value, name: &str) -> Result<u32, InfraError> {
     require(row["pronamespace"] == 11 && row["proowner"] == 10)?;
     number(&row["oid"])
 }
-fn check_source_types_and_attributes(raw: &Value, owner: u32) -> Result<(), InfraError> {
+fn check_source_types_and_attributes(
+    raw: &Value,
+    writer: &Value,
+    owner: u32,
+    name: &str,
+    count: u32,
+    defaults: &[u32],
+) -> Result<(), InfraError> {
     let source = unique(arr(&raw["relations"])?, |r| {
-        same_identity(
-            &r["identity"],
-            "openbot_internal",
-            "channel_history_sources",
-        )
+        same_identity(&r["identity"], "openbot_internal", name)
     })?;
-    let class = &raw["writerRaw"]["sourceClass"];
+    let class = &writer["sourceClass"];
     let source_id = oid(&source["identity"]["oidRaw"])?;
     require(
         number(&class["oid"])? == source_id
@@ -1648,10 +1873,11 @@ fn check_source_types_and_attributes(raw: &Value, owner: u32) -> Result<(), Infr
         n["schema"] == "openbot_internal"
     })?;
     require(number(&class["relnamespace"])? == oid(&internal["oidRaw"])?)?;
-    let types = arr(&raw["writerRaw"]["sourceTypes"])?;
+    let types = arr(&writer["sourceTypes"])?;
     require(types.len() == 2)?;
-    let composite = unique(types, |t| t["typname"] == "channel_history_sources")?;
-    let array = unique(types, |t| t["typname"] == "_channel_history_sources")?;
+    let composite = unique(types, |t| t["typname"] == name)?;
+    let array_name = format!("_{name}");
+    let array = unique(types, |t| t["typname"] == array_name)?;
     let composite_id = number(&composite["oid"])?;
     let array_id = number(&array["oid"])?;
     require(
@@ -1722,7 +1948,12 @@ fn check_source_types_and_attributes(raw: &Value, owner: u32) -> Result<(), Infr
         number(&array["typsubscript"])? == raw_builtin_function(raw, "array_subscript_handler")?
             && number(&array["typanalyze"])? == raw_builtin_function(raw, "array_typanalyze")?,
     )?;
-    for f in arr(&raw["functions"])? {
+    // Only the original source composite is a declared function argument.
+    // The new clearing tables do not widen that legacy function-type contract.
+    for f in arr(&raw["functions"])?
+        .iter()
+        .filter(|_| name == "channel_history_sources")
+    {
         for field in ["inputTypes", "allArgumentTypes", "transformTypes"] {
             for t in arr(&f[field])? {
                 let actual = oid(&t["oidRaw"])?;
@@ -1737,9 +1968,9 @@ fn check_source_types_and_attributes(raw: &Value, owner: u32) -> Result<(), Infr
             }
         }
     }
-    let attributes = arr(&raw["writerRaw"]["sourceAttributes"])?;
+    let attributes = arr(&writer["sourceAttributes"])?;
     let columns = arr(&source["columns"])?;
-    require(attributes.len() == 13 && columns.len() == 13)?;
+    require(attributes.len() == count as usize && columns.len() == count as usize)?;
     for column in columns {
         let ordinal = number(&column["ordinal"])?;
         let a = unique(attributes, |a| a["attnum"] == column["ordinal"])?;
@@ -1768,11 +1999,15 @@ fn check_source_types_and_attributes(raw: &Value, owner: u32) -> Result<(), Infr
         ] {
             require(a.get(key) == Some(&want))?;
         }
-        require(a["attnotnull"] == column["notNull"] && a["atthasdef"] == json!(ordinal == 13))?;
+        require(
+            a["attnotnull"] == column["notNull"]
+                && a["atthasdef"] == json!(defaults.contains(&ordinal)),
+        )?;
         let (length, byval, align, storage) = match text(&column["type"]["name"])? {
             "text" => (-1, false, "i", "x"),
             "int2" => (2, true, "s", "p"),
             "int4" => (4, true, "i", "p"),
+            "int8" | "xid8" if name != "channel_history_sources" => (8, true, "d", "p"),
             "timestamptz" => (8, true, "d", "p"),
             _ => return Err(corrupt("source_column")),
         };
@@ -1992,26 +2227,30 @@ fn check_class_storage(
     }
     Ok(())
 }
-fn check_source_toast(raw: &Value, owner: u32) -> Result<(), InfraError> {
-    let writer = &raw["writerRaw"];
+fn check_source_toast(
+    raw: &Value,
+    writer: &Value,
+    owner: u32,
+    name: &str,
+    count: u32,
+    checks: u32,
+) -> Result<(), InfraError> {
     let source = &writer["sourceClass"];
     let source_id = number(&source["oid"])?;
     let toast_id = number(&source["reltoastrelid"])?;
-    let composite = unique(arr(&writer["sourceTypes"])?, |t| {
-        t["typname"] == "channel_history_sources"
-    })?;
+    let composite = unique(arr(&writer["sourceTypes"])?, |t| t["typname"] == name)?;
     let namespace = number(&source["relnamespace"])?;
     let tablespace = number(&source["reltablespace"])?;
     check_class_storage(
         source,
-        "channel_history_sources",
+        name,
         "r",
         namespace,
         owner,
         number(&composite["oid"])?,
         toast_id,
-        13,
-        6,
+        count,
+        checks,
         true,
         tablespace,
     )?;
@@ -2158,7 +2397,9 @@ fn check_source_toast(raw: &Value, owner: u32) -> Result<(), InfraError> {
             ("family", "toastOperatorFamilies"),
             ("method", "accessMethods"),
         ] {
-            let catalog = unique(arr(&writer[key])?, |c| c["oid"] == row[field]["oid"])?;
+            let catalog = unique(arr(&raw["writerRaw"][key])?, |c| {
+                c["oid"] == row[field]["oid"]
+            })?;
             require(&row[field] == catalog)?;
         }
     }
@@ -2176,7 +2417,7 @@ fn dependence(
 ) -> Value {
     json!({"classid":class,"objid":id,"objsubid":sub,"refclassid":ref_class,"refobjid":ref_id,"refobjsubid":ref_sub,"deptype":kind})
 }
-fn check_source_dependencies(raw: &Value, owner: u32) -> Result<(), InfraError> {
+fn check_source_dependencies(raw: &Value, owner: u32, current52: bool) -> Result<(), InfraError> {
     // Relational prior: dependent row/array types inherit source ownership;
     // toast and indexes do not invent independent owner/namespace dependencies.
     const CLASS: u32 = 1259;
@@ -2215,20 +2456,69 @@ fn check_source_dependencies(raw: &Value, owner: u32) -> Result<(), InfraError> 
         dependence(CLASS, toast_index, 0, CLASS, toast, 1, "a"),
         dependence(CLASS, toast_index, 0, CLASS, toast, 2, "a"),
     ];
+    let mut physical = vec![(writer, source_id, &[13][..])];
+    let mut physical_ids = std::collections::BTreeSet::from([source_id]);
+    if current52 {
+        for (name, defaults) in [
+            ("thread_history_clear_batches", &[3, 4][..]),
+            ("thread_history_clear_completions", &[7][..]),
+        ] {
+            let row = unique(arr(&writer["clearRelations"])?, |r| r["name"] == name)?;
+            let class = &row["sourceClass"];
+            let relation = number(&class["oid"])?;
+            require(physical_ids.insert(relation))?;
+            let types = arr(&row["sourceTypes"])?;
+            let composite = unique(types, |t| t["typname"] == name)?;
+            let array_name = format!("_{name}");
+            let array = unique(types, |t| t["typname"] == array_name)?;
+            let toast = number(&class["reltoastrelid"])?;
+            let toast_index =
+                number(&arr(&row["sourceToast"]["indexes"])?[0]["index"]["indexrelid"])?;
+            expected.extend([
+                dependence(CLASS, relation, 0, NAMESPACE, namespace, 0, "n"),
+                dependence(TYPE, number(&composite["oid"])?, 0, CLASS, relation, 0, "i"),
+                dependence(
+                    TYPE,
+                    number(&array["oid"])?,
+                    0,
+                    TYPE,
+                    number(&composite["oid"])?,
+                    0,
+                    "i",
+                ),
+                dependence(CLASS, toast, 0, CLASS, relation, 0, "i"),
+                dependence(CLASS, toast_index, 0, CLASS, toast, 1, "a"),
+                dependence(CLASS, toast_index, 0, CLASS, toast, 2, "a"),
+            ]);
+            physical.push((row, relation, defaults));
+        }
+    }
     let functions = arr(&raw["functions"])?;
     let languages = arr(&writer["newFunctionLanguages"])?;
-    require(languages.len() == 15)?;
+    require(languages.len() == if current52 { 23 } else { 15 })?;
     let mut new_function_ids = std::collections::BTreeSet::new();
-    for name in NEW_FUNCTIONS {
+    let extra_functions = if current52 { &CLEAR_FUNCTIONS[..] } else { &[] };
+    for name in NEW_FUNCTIONS
+        .into_iter()
+        .chain(extra_functions.iter().copied())
+    {
         let f = unique(functions, |f| {
             same_identity(&f["identity"], "openbot_internal", name)
         })?;
         let id = oid(&f["identity"]["oidRaw"])?;
         require(new_function_ids.insert(id))?;
         let l = unique(languages, |l| l["oid"] == id)?;
-        require(number(&l["prolang"])? == language)?;
+        let builtin_sql = current52 && name == "thread_history_clear_batch_active";
+        // PG17's SQLlanguageId is the pinned builtin 14. Only this exact 0052
+        // helper uses it; every legacy and other clearing function remains plpgsql.
+        require(number(&l["prolang"])? == if builtin_sql { 14 } else { language })?;
+        require(f["language"] == if builtin_sql { "sql" } else { "plpgsql" })?;
         expected.push(dependence(PROC, id, 0, NAMESPACE, namespace, 0, "n"));
-        expected.push(dependence(PROC, id, 0, LANGUAGE, language, 0, "n"));
+        // recordMultipleDependencies omits a pinned referenced builtin. An
+        // unexpected SQL-language dependency must still fail the exact multiset.
+        if !builtin_sql {
+            expected.push(dependence(PROC, id, 0, LANGUAGE, language, 0, "n"));
+        }
         if name == "thread_history_validate_channel_source" {
             expected.push(dependence(PROC, id, 0, TYPE, composite_id, 0, "n"));
         }
@@ -2260,12 +2550,18 @@ fn check_source_dependencies(raw: &Value, owner: u32) -> Result<(), InfraError> 
             expected.push(dependence(CONSTRAINT, c, 0, TRIGGER, id, 0, "i"));
         }
     }
-    require(new_trigger_ids.len() == 25 && new_constraint_ids.len() == 7)?;
+    let expected_triggers = if current52 { 32 } else { 25 };
+    let expected_constraints = if current52 { 8 } else { 7 };
+    require(
+        new_trigger_ids.len() == expected_triggers
+            && new_constraint_ids.len() == expected_constraints,
+    )?;
     let constraints = arr(&raw["constraints"])?;
+    let mut clear_fk_ids = std::collections::BTreeSet::new();
     for c in constraints {
         let id = oid(&c["oidRaw"])?;
         let relation = oid(&c["relation"]["oidRaw"])?;
-        if !new_constraint_ids.contains(&id) && relation != source_id {
+        if !new_constraint_ids.contains(&id) && !physical_ids.contains(&relation) {
             continue;
         }
         let columns = arr(&c["columns"])?;
@@ -2295,24 +2591,75 @@ fn check_source_dependencies(raw: &Value, owner: u32) -> Result<(), InfraError> 
                 }
             }
         }
-        if c["kind"] == "p" {
+        if c["kind"] == "p" || c["kind"] == "u" {
             let index = oid(&c["supportingIndex"]["oidRaw"])?;
             expected.push(dependence(CLASS, index, 0, CONSTRAINT, id, 0, "i"));
         }
+        if c["kind"] == "f" {
+            require(
+                current52
+                    && matches!(
+                        text(&c["name"])?,
+                        "thread_history_clear_batches_operation_fkey"
+                            | "thread_history_clear_completions_operation_fkey"
+                    )
+                    && clear_fk_ids.insert(id),
+            )?;
+            let reference = &c["reference"];
+            let target = oid(&reference["relation"]["oidRaw"])?;
+            require(same_identity(&reference["relation"], "openbot_internal", Q))?;
+            for column in arr(&reference["columns"])? {
+                expected.push(dependence(
+                    CONSTRAINT,
+                    id,
+                    0,
+                    CLASS,
+                    target,
+                    number(&column["attributeNumber"])?,
+                    "n",
+                ));
+            }
+            expected.push(dependence(
+                CONSTRAINT,
+                id,
+                0,
+                CLASS,
+                oid(&c["supportingIndex"]["oidRaw"])?,
+                0,
+                "n",
+            ));
+        }
     }
-    let defaults = arr(&writer["sourceDefaults"])?;
-    require(defaults.len() == 1)?;
-    let default = &defaults[0];
-    require(number(&default["adrelid"])? == source_id && default["adnum"] == 13)?;
-    expected.push(dependence(
-        ATTRDEF,
-        number(&default["oid"])?,
-        0,
-        CLASS,
-        source_id,
-        13,
-        "a",
-    ));
+    require(clear_fk_ids.len() == if current52 { 2 } else { 0 })?;
+    let mut clear_ri_ids = std::collections::BTreeSet::new();
+    for t in triggers {
+        let constraint = oid(&t["constraintOidRaw"])?;
+        if clear_fk_ids.contains(&constraint) {
+            let id = oid(&t["oidRaw"])?;
+            require(t["internal"] == true && clear_ri_ids.insert(id))?;
+            // These eight internal RI triggers depend on their FK constraint.
+            // Their pinned pg_catalog functions have no dependency row.
+            expected.push(dependence(TRIGGER, id, 0, CONSTRAINT, constraint, 0, "i"));
+        }
+    }
+    require(clear_ri_ids.len() == if current52 { 8 } else { 0 })?;
+    for (row, relation, ordinals) in physical {
+        let defaults = arr(&row["sourceDefaults"])?;
+        require(defaults.len() == ordinals.len())?;
+        for ordinal in ordinals {
+            let default = unique(defaults, |d| d["adnum"] == *ordinal)?;
+            require(number(&default["adrelid"])? == relation)?;
+            expected.push(dependence(
+                ATTRDEF,
+                number(&default["oid"])?,
+                0,
+                CLASS,
+                relation,
+                *ordinal,
+                "a",
+            ));
+        }
+    }
     // Builtin types/functions/operators/C/default collations/heap/btree/opclasses
     // are the independently pinned PG17 catalog objects. PostgreSQL omits their
     // dependency rows; their complete catalog attributes are checked separately.
@@ -2321,7 +2668,9 @@ fn check_source_dependencies(raw: &Value, owner: u32) -> Result<(), InfraError> 
     if owner != 10 {
         let database = number(&writer["databaseOid"])?;
         require(database != 0)?;
-        for (class, id) in std::iter::once((CLASS, source_id))
+        for (class, id) in physical_ids
+            .into_iter()
+            .map(|id| (CLASS, id))
             .chain(new_function_ids.into_iter().map(|id| (PROC, id)))
         {
             shared.push(json!({"dbid":database,"classid":class,"objid":id,"objsubid":0,"refclassid":1260,"refobjid":owner,"deptype":"o"}));

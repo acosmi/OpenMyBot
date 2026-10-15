@@ -954,14 +954,14 @@ fn compare_registered(observation: &ThreadOriginSchemaFacts) -> Result<(), Infra
 pub async fn capture(client: &Client) -> Result<ThreadOriginSchemaFacts, InfraError> {
     observation_on(client).await
 }
-/// Require the exact current native51 prefix, original origin oracle and history admission schema.
+/// Require the exact current native52 prefix, original origin oracle and history admission schema.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0051_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0051_VERSION)?;
+    let ledger = native::validate_known_prefix(client, native::NATIVE_0052_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_0052_VERSION)?;
     compare_registered(&observation_on(client).await?)?;
     super::thread_history_admission_schema::verify_schema(client).await
 }
-/// Explicit historical49 pre-upgrade branch; never qualifies as current51 admission.
+/// Explicit historical49 pre-upgrade branch; never qualifies as current52 admission.
 pub(crate) async fn verify_legacy0049(client: &Client) -> Result<(), InfraError> {
     let ledger = native::validate_known_prefix(client, native::NATIVE_0049_VERSION).await?;
     require(ledger.latest_version() == native::NATIVE_0049_VERSION)?;
@@ -973,6 +973,13 @@ pub(crate) async fn verify_legacy0050(client: &Client) -> Result<(), InfraError>
     require(ledger.latest_version() == native::NATIVE_0050_VERSION)?;
     compare_registered(&observation_on(client).await?)?;
     super::thread_history_admission_schema::verify_schema_legacy0050(client).await
+}
+/// Explicit historical51, preserving its original whole writer observation and oracle.
+pub(crate) async fn verify_legacy0051(client: &Client) -> Result<(), InfraError> {
+    let ledger = native::validate_known_prefix(client, native::NATIVE_0051_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_0051_VERSION)?;
+    compare_registered(&observation_on(client).await?)?;
+    super::thread_history_writer_schema::verify_schema_legacy0051(client).await
 }
 /// Only observes origin schema after the caller proves the exact native prefix on this original Tx.
 pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
