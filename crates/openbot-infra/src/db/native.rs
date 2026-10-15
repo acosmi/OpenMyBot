@@ -1924,6 +1924,26 @@ mod tests {
 
     #[test]
     fn real_migration_uses_the_ledger_not_object_existence_as_idempotency() {
+        // Exclude only these exact registered metadata postconditions, not migration DDL.
+        // Their catalog snapshots and assertions contain non-DDL IF NOT EXISTS text.
+        let writer_postcondition_parts = NATIVE_0051_SQL
+            .split("$thread_history_writer_postcondition$")
+            .collect::<Vec<_>>();
+        assert_eq!(writer_postcondition_parts.len(), 3);
+        assert_eq!(writer_postcondition_parts[1].len(), 450_383);
+        assert_eq!(
+            Sha256Digest::of(writer_postcondition_parts[1].as_bytes()).to_hex(),
+            "b3914b2ea4e2940b46ef4be6573db9483c9551fd0f2f476e7a2a8e636bbe9224",
+        );
+        let clear_postcondition_parts = NATIVE_0052_SQL
+            .split("$clear_postcondition$")
+            .collect::<Vec<_>>();
+        assert_eq!(clear_postcondition_parts.len(), 3);
+        assert_eq!(clear_postcondition_parts[1].len(), 16_753);
+        assert_eq!(
+            Sha256Digest::of(clear_postcondition_parts[1].as_bytes()).to_hex(),
+            "839c0e93ccc218b0d9104d1e41ad7c8883e3e80b9dafbd144132d47083f7c323",
+        );
         assert!(
             !statement_lines(NATIVE_0013_SQL)
                 .chain(statement_lines(NATIVE_0014_SQL))
@@ -1960,15 +1980,17 @@ mod tests {
                         .flat_map(statement_lines)
                 )
                 .chain(
-                    NATIVE_0051_SQL
-                        .split("$$")
+                    writer_postcondition_parts
+                        .into_iter()
                         .step_by(2)
+                        .flat_map(|sql| sql.split("$$").step_by(2))
                         .flat_map(statement_lines)
                 )
                 .chain(
-                    NATIVE_0052_SQL
-                        .split("$$")
+                    clear_postcondition_parts
+                        .into_iter()
                         .step_by(2)
+                        .flat_map(|sql| sql.split("$$").step_by(2))
                         .flat_map(statement_lines)
                 )
                 .chain(
