@@ -139,6 +139,9 @@ mod thread_history_writer;
 pub use gateway_authorization::journal::{
     CallbackErrorKind, CallbackStage, ClosedAttemptReceipt, ControlledCloseReason,
     CreatedAttemptOwner, GatewayAuthorizationCallbackError, GatewayAuthorizationCallbackWaitOwner,
+    GatewayAuthorizationEnrollmentAccountReason, GatewayAuthorizationEnrollmentCleanupState,
+    GatewayAuthorizationEnrollmentError, GatewayAuthorizationEnrollmentKind,
+    GatewayAuthorizationEnrollmentStage, GatewayAuthorizationEnrollmentWriteTerminal,
     GatewayAuthorizationJournal, GatewayAuthorizationJournalAck, GatewayAuthorizationJournalError,
     GatewayAuthorizationJournalErrorKind, GatewayAuthorizationJournalRuntimeOwner,
     GatewayAuthorizationTokenError, GatewayAuthorizationTokenKind, GatewayAuthorizationTokenOwner,

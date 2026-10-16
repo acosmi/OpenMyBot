@@ -1620,6 +1620,123 @@ mod fixture {
                 tls: Some(OwnedTls::new("journal")?),
             })
         }
+        pub(super) async fn new_enrollment(
+            config: DatabaseConfig,
+            size: usize,
+        ) -> Result<Self, String> {
+            let fixture = Self::new(config, size).await?;
+            let root = &fixture.tls.as_ref().ok_or("owned TLS absent")?.root;
+            std::fs::write(root.join("enrollment-mode"), b"owned-enrollment")
+                .map_err(|error| error.to_string())?;
+            Ok(fixture)
+        }
+        pub(super) fn enrollment_accounts(
+            &self,
+            pool: pool::DatabasePool,
+            vault: openbot_infra::vault::CredentialRecordVault,
+        ) -> Result<openbot_infra::gateway_authority::PostgresGatewayAccounts, String> {
+            let tls = self.tls.as_ref().ok_or("owned TLS absent")?;
+            if !tls.root.join("enrollment-mode").is_file() {
+                return Err("enrollment mode was not explicitly enabled".into());
+            }
+            openbot_infra::gateway_authority::PostgresGatewayAccounts::new(
+                pool,
+                vault,
+                DeploymentId::new(DEP),
+                TenantId::new(TENANT),
+                SecretBytes::new(vec![0x28; 32]),
+                tls.dialer()?,
+                &tls.endpoint(),
+            )
+            .map_err(|error| error.to_string())
+        }
+        pub(super) fn configure_profile(&self, value: &Value) -> Result<(), String> {
+            let root = &self.tls.as_ref().ok_or("owned TLS absent")?.root;
+            if !root.join("enrollment-mode").is_file() {
+                return Err("profile settings require explicit enrollment mode".into());
+            }
+            let fields = value
+                .as_object()
+                .ok_or("profile settings must be an object")?;
+            if fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "status" | "headers" | "raw" | "hold_headers" | "hold_body"
+                )
+            }) {
+                return Err("profile settings contain an unknown key".into());
+            }
+            let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+            if bytes.len() > 131072 {
+                return Err("owned profile settings exceeded budget".into());
+            }
+            let temporary = root.join("profile-settings.tmp");
+            std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+            std::fs::rename(temporary, root.join("profile-settings.json"))
+                .map_err(|error| error.to_string())
+        }
+        pub(super) fn release_profile_headers(&self) -> Result<(), String> {
+            let root = &self.tls.as_ref().ok_or("owned TLS absent")?.root;
+            std::fs::write(root.join("release-profile-headers"), b"owned")
+                .map_err(|error| error.to_string())
+        }
+        pub(super) fn release_profile_body(&self) -> Result<(), String> {
+            let root = &self.tls.as_ref().ok_or("owned TLS absent")?.root;
+            std::fs::write(root.join("release-profile-body"), b"owned")
+                .map_err(|error| error.to_string())
+        }
+        pub(super) async fn finish_enrollment(mut self) -> Result<(), String> {
+            self.resolver.close_request_bindings();
+            if let Some(runtime) = self.runtime.take() {
+                runtime.close();
+            }
+            let tls = self.tls.take().ok_or("owned TLS absent")?;
+            if !tls.root.join("enrollment-mode").is_file() {
+                return Err("enrollment finish requires explicit enrollment mode".into());
+            }
+            let captures = tls.captures()?;
+            for capture in &captures {
+                let method = capture["method"].as_str().ok_or("owned method absent")?;
+                let path = capture["path"].as_str().ok_or("owned path absent")?;
+                let profile = method == "GET" && path == "/api/oauth/profile";
+                let allowed = profile
+                    || (method == "GET"
+                        && path == "/.well-known/oauth-authorization-server/desktop")
+                    || (method == "POST"
+                        && matches!(path, "/oauth/desktop/register" | "/oauth/desktop/token"));
+                let expected_authorization = if profile {
+                    Value::String("Bearer owned-access-token".into())
+                } else {
+                    Value::Null
+                };
+                if !allowed || capture["authorization"] != expected_authorization {
+                    return Err("unexpected enrollment TLS dispatch".into());
+                }
+            }
+            let closed = tls.finish();
+            self.pool.close();
+            eprintln!(
+                "GATEWAY_ENROLLMENT_FIXTURE metadata_gets={} registration_posts={} token_posts={} profile_gets={} pool_closed={} individual_production_driver_join=UNPROVEN",
+                captures
+                    .iter()
+                    .filter(|v| v["path"] == "/.well-known/oauth-authorization-server/desktop")
+                    .count(),
+                captures
+                    .iter()
+                    .filter(|v| v["path"] == "/oauth/desktop/register")
+                    .count(),
+                captures
+                    .iter()
+                    .filter(|v| v["path"] == "/oauth/desktop/token")
+                    .count(),
+                captures
+                    .iter()
+                    .filter(|v| v["path"] == "/api/oauth/profile")
+                    .count(),
+                self.pool.is_closed(),
+            );
+            closed
+        }
         pub(super) async fn auth(&self) -> Result<AuthContext, String> {
             self.auth_cookie(COOKIE).await
         }
@@ -2169,7 +2286,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length',str(len(data))); self.send_header('Connection','close'); self.end_headers(); self.wfile.flush()
         record('events.jsonl',{'event':'headers_sent','path':self.path,'method':self.command,'status':status,'headers':headers,'body_bytes':len(data),'content_length':str(len(data))})
         return data
+    def do_profile(self):
+        self.connection.settimeout(6)
+        if not (root/'enrollment-mode').is_file() or self.path!='/api/oauth/profile': raise RuntimeError('owned enrollment profile path')
+        if self.headers.get_all('Authorization',[])!=['Bearer owned-access-token']: raise RuntimeError('owned profile bearer mismatch')
+        self.capture(b'')
+        record('events.jsonl',{'event':'profile_request_received','path':self.path,'method':'GET'})
+        settings=root/'profile-settings.json'
+        if settings.exists() and settings.stat().st_size>131072: raise RuntimeError('owned profile settings bound')
+        config=json.loads(settings.read_text()) if settings.exists() else {}
+        if not isinstance(config,dict) or set(config)-{'status','headers','raw','hold_headers','hold_body'}: raise RuntimeError('owned profile settings keys')
+        data=config.get('raw','{"id":"owned-account","uuid":"owned-account","account":{"uuid":"owned-account"},"organization":{"uuid":"owned-org"}}').encode('utf8')
+        if len(data)>131072: raise RuntimeError('owned profile response byte bound')
+        headers=config.get('headers',[['Content-Type','application/json']])
+        if len(headers)>128 or any(len(n)+len(v)>16384 for n,v in headers): raise RuntimeError('owned profile header budget')
+        status=config.get('status',200)
+        if type(status) is not int or not 100<=status<=599: raise RuntimeError('owned profile status')
+        outcome='stopped'
+        try:
+            if config.get('hold_headers'): wait_owned('release-profile-headers')
+            if not stop.is_set():
+                self.send_owned(status,headers,data)
+                if config.get('hold_body'):
+                    record('events.jsonl',{'event':'profile_body_pending','path':self.path,'method':'GET'})
+                    wait_owned('release-profile-body')
+                if not stop.is_set():
+                    self.wfile.write(data); self.wfile.flush(); record('events.jsonl',{'event':'body_sent','path':self.path,'method':'GET','bytes':len(data),'body_hex':data.hex()}); outcome='body_sent'
+        except (BrokenPipeError,ConnectionResetError,ssl.SSLEOFError) as closed:
+            record('events.jsonl',{'event':'peer_closed','path':self.path,'method':'GET','kind':type(closed).__name__}); outcome='peer_closed'
+        self.close_connection=True
+        record('events.jsonl',{'event':'response_finished','path':self.path,'method':'GET','outcome':outcome})
+        (root/'profile-response-finished').write_bytes(b'owned')
     def do_GET(self):
+        if (root/'enrollment-mode').is_file() and self.path=='/api/oauth/profile': self.do_profile(); return
         self.connection.settimeout(6)
         if self.path!='/.well-known/oauth-authorization-server/desktop': raise RuntimeError('owned discovery path')
         if self.headers.get('Authorization') is not None: raise RuntimeError('owned discovery carried bearer')
@@ -2241,9 +2390,54 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
         TokenSendRollback,
         CodeCommit,
         CodeReadbackRollback,
+        EnrollmentMetadataRollback,
+        EnrollmentProfileRollback,
+        EnrollmentCommit,
+        EnrollmentReadbackRollback,
     }
     impl TerminalStage {
+        fn is_enrollment(self) -> bool {
+            matches!(
+                self,
+                Self::EnrollmentMetadataRollback
+                    | Self::EnrollmentProfileRollback
+                    | Self::EnrollmentCommit
+                    | Self::EnrollmentReadbackRollback
+            )
+        }
+        fn enrollment_read_only(self) -> bool {
+            matches!(self, Self::EnrollmentReadbackRollback)
+        }
+        fn enrollment_sql_bits(self, body: &str) -> u8 {
+            match self {
+                Self::EnrollmentMetadataRollback | Self::EnrollmentProfileRollback => u8::from(
+                    body.starts_with("select ")
+                        && body.contains("from openbot_internal.gateway_authorization_attempts")
+                        && body.contains("for update"),
+                ),
+                Self::EnrollmentCommit => {
+                    u8::from(body.starts_with("insert into public.sdk_gateway_connections"))
+                        | (u8::from(body.starts_with("insert into public.sdk_gateway_secrets"))
+                            << 1)
+                        | (u8::from(body.starts_with("insert into public.audit_events")) << 2)
+                }
+                Self::EnrollmentReadbackRollback => {
+                    if !body.starts_with("select ")
+                        || body.contains("for update")
+                        || body.contains("for share")
+                    {
+                        return 0;
+                    }
+                    u8::from(body.contains("from public.sdk_gateway_connections"))
+                        | (u8::from(body.contains("from public.sdk_gateway_secrets")) << 1)
+                }
+                _ => 0,
+            }
+        }
         fn command(self) -> &'static [u8] {
+            if matches!(self, Self::EnrollmentCommit) {
+                return b"COMMIT\0";
+            }
             if matches!(self, Self::CodeCommit) {
                 b"COMMIT\0"
             } else {
@@ -2288,11 +2482,27 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
                         && body.contains("from openbot_internal.gateway_authorization_attempts")
                         && !body.contains("for update")
                 }
+                Self::EnrollmentMetadataRollback | Self::EnrollmentProfileRollback => {
+                    return if marker == Some("gateway_authorization_attempt_lock") {
+                        self.enrollment_sql_bits(body)
+                    } else {
+                        0
+                    };
+                }
+                Self::EnrollmentCommit | Self::EnrollmentReadbackRollback => {
+                    return self.enrollment_sql_bits(body);
+                }
             };
             let audit = body.starts_with("insert into public.audit_events");
             u8::from(journal) | (u8::from(audit) << 1)
         }
         fn complete_bits(self) -> u8 {
+            match self {
+                Self::EnrollmentCommit => return 7,
+                Self::EnrollmentReadbackRollback => return 3,
+                Self::EnrollmentMetadataRollback | Self::EnrollmentProfileRollback => return 1,
+                _ => {}
+            }
             if matches!(self, Self::CodeCommit) {
                 3
             } else {
@@ -2311,6 +2521,7 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
         stage_seen: AtomicUsize,
         begins: AtomicUsize,
         all_begins_after_arm: AtomicUsize,
+        enrollment_header_transactions: AtomicUsize,
         commits: AtomicUsize,
         rollbacks: AtomicUsize,
         command_acks: AtomicUsize,
@@ -2350,6 +2561,7 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
                 stage_seen: AtomicUsize::new(0),
                 begins: AtomicUsize::new(0),
                 all_begins_after_arm: AtomicUsize::new(0),
+                enrollment_header_transactions: AtomicUsize::new(0),
                 commits: AtomicUsize::new(0),
                 rollbacks: AtomicUsize::new(0),
                 command_acks: AtomicUsize::new(0),
@@ -2409,6 +2621,12 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
                 task: Some(task),
             }
         }
+        pub(super) fn arm_enrollment(&self) {
+            assert!(self.state.stage.is_enrollment());
+            assert_eq!(self.state.original_backend_pid.load(Ordering::SeqCst), 0);
+            assert!(!self.state.claimed.load(Ordering::SeqCst));
+            self.state.armed.store(true, Ordering::SeqCst);
+        }
         pub(super) async fn arm_original(&self, f: &Fixture) -> pool::ConnectionObservation {
             assert_eq!(f.pool.status().max_size, 1);
             let client = f.pool.get().await.unwrap();
@@ -2466,6 +2684,10 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
             );
             assert_eq!(self.state.begins.load(Ordering::SeqCst), 1);
             match self.state.stage {
+                TerminalStage::EnrollmentCommit => {
+                    assert_eq!(self.state.commits.load(Ordering::SeqCst), 1);
+                    assert_eq!(self.state.rollbacks.load(Ordering::SeqCst), 0);
+                }
                 TerminalStage::CodeCommit => {
                     assert_eq!(self.state.commits.load(Ordering::SeqCst), 1);
                     assert_eq!(self.state.rollbacks.load(Ordering::SeqCst), 0);
@@ -2575,6 +2797,7 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
         let client = async move {
             let mut stage_bits = 0;
             let mut seen_stage = false;
+            let mut skipped_enrollment_stage = false;
             let mut original_begin = false;
             let mut original_read_only = false;
             let mut token_code_seen = false;
@@ -2582,8 +2805,12 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
             let mut token_readback_finished = false;
             while let Some((tag, bytes)) = terminal_frame(&mut down_read).await? {
                 if client_state.armed.load(Ordering::SeqCst)
-                    && client_backend.load(Ordering::SeqCst)
-                        == client_state.original_backend_pid.load(Ordering::SeqCst)
+                    && (if client_state.stage.is_enrollment() {
+                        !client_state.claimed.load(Ordering::SeqCst)
+                    } else {
+                        client_backend.load(Ordering::SeqCst)
+                            == client_state.original_backend_pid.load(Ordering::SeqCst)
+                    })
                     && client_backend.load(Ordering::SeqCst) != 0
                 {
                     if tag == b'Q'
@@ -2594,6 +2821,7 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
                             .fetch_add(1, Ordering::SeqCst);
                         stage_bits = 0;
                         seen_stage = false;
+                        skipped_enrollment_stage = false;
                         let query =
                             std::str::from_utf8(&bytes).map_err(|_| "terminal BEGIN UTF8")?;
                         original_begin = query.contains("ISOLATION LEVEL READ COMMITTED");
@@ -2613,21 +2841,64 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
                             client_state.stage.sql_bits(sql)
                         };
                         stage_bits |= bits;
-                        if stage_bits == client_state.stage.complete_bits() && !seen_stage {
+                        if stage_bits == client_state.stage.complete_bits()
+                            && !seen_stage
+                            && !skipped_enrollment_stage
+                        {
                             if !original_begin
                                 || original_read_only
-                                    != matches!(
-                                        client_state.stage,
-                                        TerminalStage::CodeReadbackRollback
-                                    )
+                                    != (if client_state.stage.is_enrollment() {
+                                        client_state.stage.enrollment_read_only()
+                                    } else {
+                                        matches!(
+                                            client_state.stage,
+                                            TerminalStage::CodeReadbackRollback
+                                        )
+                                    })
                             {
                                 return Err(
                                     "terminal original business RC/read-only mode mismatch".into(),
                                 );
                             }
-                            seen_stage = true;
-                            client_state.begins.fetch_add(1, Ordering::SeqCst);
-                            client_state.stage_seen.fetch_add(1, Ordering::SeqCst);
+                            let header_ordinal = if matches!(
+                                client_state.stage,
+                                TerminalStage::EnrollmentMetadataRollback
+                                    | TerminalStage::EnrollmentProfileRollback
+                            ) {
+                                Some(
+                                    client_state
+                                        .enrollment_header_transactions
+                                        .fetch_add(1, Ordering::SeqCst)
+                                        + 1,
+                                )
+                            } else {
+                                None
+                            };
+                            skipped_enrollment_stage = matches!((client_state.stage, header_ordinal),
+                                (TerminalStage::EnrollmentMetadataRollback, Some(n)) if n != 1)
+                                || matches!((client_state.stage, header_ordinal),
+                                (TerminalStage::EnrollmentProfileRollback, Some(n)) if n != 2);
+                            if !skipped_enrollment_stage {
+                                if client_state.stage.is_enrollment() {
+                                    let pid = client_backend.load(Ordering::SeqCst);
+                                    match client_state.original_backend_pid.compare_exchange(
+                                        0,
+                                        pid,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(original) if original == pid => {}
+                                        Err(_) => return Err(
+                                            "enrollment selector matched a second original backend"
+                                                .into(),
+                                        ),
+                                    }
+                                }
+                                seen_stage = true;
+                                client_state.begins.fetch_add(1, Ordering::SeqCst);
+                                client_state.stage_seen.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                     }
                     if tag == b'Q' && bytes.eq_ignore_ascii_case(b"COMMIT\0") && token_code_seen {
@@ -2800,3 +3071,6 @@ if fatal.is_set(): raise RuntimeError('owned handler failed')
         Ok(Some((tag, bytes)))
     }
 }
+
+#[path = "gateway_enrollment_tests.rs"]
+mod enrollment;

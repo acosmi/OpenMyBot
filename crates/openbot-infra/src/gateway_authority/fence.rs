@@ -205,3 +205,158 @@ impl GatewayHttpAuthority for AuthorityInner {
         }))
     }
 }
+
+// Whole-owner enrollment uses the original token runner's one-use control shape.
+// No Current, Auth, transaction or grant is retained by this SDK Arc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnrollmentRequestKind {
+    Metadata,
+    Profile,
+}
+impl EnrollmentRequestKind {
+    fn request_kind(self) -> GatewayRequestKind {
+        match self {
+            Self::Metadata => GatewayRequestKind::OAuthDiscovery,
+            Self::Profile => GatewayRequestKind::AccountProfile,
+        }
+    }
+}
+pub(crate) struct EnrollmentAcquireControl {
+    pub(crate) request: GatewayRequestDescriptor,
+    pub(crate) cancel: CancellationToken,
+    pub(crate) reply:
+        tokio::sync::oneshot::Sender<Result<EnrollmentPermitControl, GatewayFenceError>>,
+}
+pub(crate) struct EnrollmentPermitControl {
+    pub(crate) release: tokio::sync::oneshot::Sender<()>,
+    pub(crate) ack: tokio::sync::oneshot::Receiver<Result<(), GatewayFenceError>>,
+}
+pub(crate) struct EnrollmentFenceControl {
+    pub(crate) acquire: tokio::sync::oneshot::Receiver<EnrollmentAcquireControl>,
+    pub(crate) call_end: tokio::sync::oneshot::Receiver<EnrollmentFenceEnd>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnrollmentFenceEnd {
+    HeadersRelease,
+    RequestEnded,
+    Cancelled,
+    Deadline,
+    CallAbandoned,
+}
+struct EnrollmentAuthority {
+    kind: EnrollmentRequestKind,
+    acquire: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<EnrollmentAcquireControl>>>,
+}
+#[async_trait]
+impl GatewayHttpAuthority for EnrollmentAuthority {
+    async fn before_request(
+        &self,
+        request: GatewayRequestDescriptor,
+        cancel: CancellationToken,
+    ) -> Result<Box<dyn GatewayHttpPermit>, GatewayFenceError> {
+        let sender = self
+            .acquire
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(GatewayFenceError::Refused)?;
+        if request.kind() != self.kind.request_kind()
+            || request.streaming()
+            || cancel.is_cancelled()
+        {
+            return Err(GatewayFenceError::Refused);
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        sender
+            .send(EnrollmentAcquireControl {
+                request,
+                cancel: cancel.clone(),
+                reply,
+            })
+            .map_err(|_| GatewayFenceError::Unavailable)?;
+        let control = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(GatewayFenceError::CleanupUnknown),
+            result = receive => result.map_err(|_| GatewayFenceError::CleanupUnknown)??,
+        };
+        Ok(Box::new(EnrollmentPermit {
+            control: Some(control),
+        }))
+    }
+}
+struct EnrollmentPermit {
+    control: Option<EnrollmentPermitControl>,
+}
+#[async_trait]
+impl GatewayHttpPermit for EnrollmentPermit {
+    async fn release_after_headers(mut self: Box<Self>) -> Result<(), GatewayFenceError> {
+        let control = self
+            .control
+            .take()
+            .ok_or(GatewayFenceError::CleanupUnknown)?;
+        control
+            .release
+            .send(())
+            .map_err(|_| GatewayFenceError::CleanupUnknown)?;
+        control
+            .ack
+            .await
+            .map_err(|_| GatewayFenceError::CleanupUnknown)?
+    }
+}
+struct EnrollmentEndSignal(
+    std::sync::Mutex<Option<tokio::sync::oneshot::Sender<EnrollmentFenceEnd>>>,
+);
+impl EnrollmentEndSignal {
+    fn send(&self, end: EnrollmentFenceEnd) {
+        if let Some(sender) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(end);
+        }
+    }
+}
+pub(crate) struct EnrollmentEndGuard {
+    signal: Arc<EnrollmentEndSignal>,
+    armed: bool,
+}
+impl EnrollmentEndGuard {
+    pub(crate) fn finish(mut self, end: EnrollmentFenceEnd) {
+        self.armed = false;
+        self.signal.send(end);
+    }
+}
+impl Drop for EnrollmentEndGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.signal.send(EnrollmentFenceEnd::CallAbandoned);
+        }
+    }
+}
+pub(crate) fn enrollment_headers_channel(
+    kind: EnrollmentRequestKind,
+) -> (
+    Arc<dyn GatewayHttpAuthority>,
+    EnrollmentFenceControl,
+    EnrollmentEndGuard,
+) {
+    let (acquire, acquire_receive) = tokio::sync::oneshot::channel();
+    let (call_end, call_end_receive) = tokio::sync::oneshot::channel();
+    (
+        Arc::new(EnrollmentAuthority {
+            kind,
+            acquire: std::sync::Mutex::new(Some(acquire)),
+        }),
+        EnrollmentFenceControl {
+            acquire: acquire_receive,
+            call_end: call_end_receive,
+        },
+        EnrollmentEndGuard {
+            signal: Arc::new(EnrollmentEndSignal(std::sync::Mutex::new(Some(call_end)))),
+            armed: true,
+        },
+    )
+}
