@@ -381,7 +381,7 @@ impl Fixture {
         fresh::apply(&mut c).await.map_err(text)?;
         c.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('artifact-refs-owner','artifact-refs-owner@example.test',0),('artifact-refs-other','artifact-refs-other@example.test',0);
             INSERT INTO public.user_roles(user_id,role) VALUES('artifact-refs-owner','user'),('artifact-refs-other','user');
-            INSERT INTO public.agents(id,name,type,configuration) VALUES('artifact-refs-bot','Artifact refs fixture','built_in','{}');
+            INSERT INTO public.agents(id,name,type,configuration) VALUES('artifact-refs-bot','Artifact refs fixture','built_in','{\"systemPrompt\":\"Owned artifact refs standing prompt.\"}');
             INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility) VALUES('artifact-refs-bot','artifact-refs-owner','Artifact refs','','refs','public');").await.map_err(text)?;
         let now = OffsetDateTime::now_utc();
         for (id, actor, cookie) in [
