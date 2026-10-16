@@ -52,6 +52,7 @@ async fn atomic_snapshot_bridges_active_text_cursor_live_terminal_and_materializ
                 .batch_execute(
                     "INSERT INTO public.users(id,email) VALUES
                        ('actor','actor@example.test'),('outsider','outsider@example.test');
+                     INSERT INTO public.user_roles(user_id,role) VALUES('actor','user');
                      INSERT INTO public.agents(id,name,type,configuration)
                        VALUES('bot-1','Bot One','built_in','{}');
                      INSERT INTO public.agent_profiles(
