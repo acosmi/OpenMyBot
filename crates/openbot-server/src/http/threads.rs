@@ -11,7 +11,7 @@ use std::future::poll_fn;
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -424,16 +424,15 @@ pub async fn websocket(
         }
         .into());
     }
-    let stream = state
-        .application()
-        .subscribe(
-            auth,
-            SubscriptionRequest::ThreadEvents {
-                thread_id: ThreadId::new(thread_id),
-                after_event_sequence: query.cursor,
-            },
-        )
-        .await?;
+    let (stream, authority) = super::realtime::subscribe(
+        &state,
+        auth,
+        SubscriptionRequest::ThreadEvents {
+            thread_id: ThreadId::new(thread_id),
+            after_event_sequence: query.cursor,
+        },
+    )
+    .await?;
     Ok(ws
         .protocols([THREAD_EVENTS_WS_PROTOCOL])
         .max_message_size(THREAD_EVENTS_WS_INPUT_LIMIT)
@@ -441,32 +440,35 @@ pub async fn websocket(
         .on_failed_upgrade(|error| {
             tracing::debug!(error = %error, "thread websocket upgrade 失败");
         })
-        .on_upgrade(move |socket| drive_thread_websocket(socket, stream)))
+        .on_upgrade(move |socket| drive_thread_websocket(socket, stream, authority)))
 }
 
-async fn drive_thread_websocket(mut socket: WebSocket, mut stream: AppEventStream) {
+async fn drive_thread_websocket(
+    mut socket: WebSocket,
+    mut stream: AppEventStream,
+    authority: super::realtime::RealtimeAuthority,
+) {
     loop {
         tokio::select! {
             event = poll_fn(|cx| stream.as_mut().poll_next(cx)) => {
                 let Some(event) = event else {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::NORMAL,
-                        reason: "stream_complete".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::NORMAL, "stream_complete").await;
                     return;
                 };
+                let terminal = matches!(&event, AppEvent::ThreadStreamError { .. });
                 let text = match serde_json::to_string(&event) {
                     Ok(text) => text,
                     Err(error) => {
                         tracing::error!(error = %error, "typed thread event 序列化失败");
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
-                            code: close_code::ERROR,
-                            reason: "event_encoding_failed".into(),
-                        }))).await;
+                        super::realtime::close(&mut socket, stream, close_code::ERROR, "event_encoding_failed").await;
                         return;
                     }
                 };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                if super::realtime::send(&mut socket, Message::Text(text.into()), &authority).await.is_err() {
+                    return;
+                }
+                if terminal {
+                    super::realtime::close(&mut socket, stream, close_code::ERROR, "thread_stream_failed").await;
                     return;
                 }
             }
@@ -474,10 +476,7 @@ async fn drive_thread_websocket(mut socket: WebSocket, mut stream: AppEventStrea
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return,
                 Some(Ok(Message::Text(_) | Message::Binary(_))) => {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::POLICY,
-                        reason: "thread_events_read_only".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::POLICY, "thread_events_read_only").await;
                     return;
                 }
                 Some(Err(error)) => {
@@ -507,16 +506,15 @@ pub async fn events(
     })?;
     // Standard Last-Event-ID on reconnect overrides the one-time native bootstrap cursor.
     let after_event_sequence = last_event_id(&headers)?.or(query.cursor);
-    let stream = state
-        .application()
-        .subscribe(
-            auth,
-            SubscriptionRequest::ThreadEvents {
-                thread_id: ThreadId::new(thread_id),
-                after_event_sequence,
-            },
-        )
-        .await?;
+    let (stream, _) = super::realtime::subscribe(
+        &state,
+        auth,
+        SubscriptionRequest::ThreadEvents {
+            thread_id: ThreadId::new(thread_id),
+            after_event_sequence,
+        },
+    )
+    .await?;
     Ok(Sse::new(ThreadSseStream { inner: stream }).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -1464,7 +1462,10 @@ mod tests {
             },
         ]);
         let visible = directory.clone();
-        let response = app(directory, FixedAuthResolver::granting(auth("u1")))
+        let router = app(directory, FixedAuthResolver::granting(auth("u1")));
+        // A live HTTP server retains its resolver while streaming the response body.
+        let response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
