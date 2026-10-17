@@ -3195,10 +3195,10 @@ async fn legacy_start_query_failure(
     v2_start_early_dataset_query_failure(p, config, tls, v2).await
 }
 
-/// Independent current-dataset start error classification at its EARLY schema observation.
-/// The heads table lock makes V2's earlier schema/capture read wait first. This deliberately
-/// does not claim an injected error at the later shared `history_closed_for_read` predicate.
-/// The original legacy case above retains that distinct exact closed-predicate witness.
+/// Independent current-dataset start error classification before its closed-head read or send.
+/// Its original AuthorizedStart user/target/model locks precede this dataset schema observation.
+/// The owned heads table lock stops a registered schema capture, without granting an H row lock.
+/// The original legacy case above retains its distinct exact closed-predicate witness.
 async fn v2_start_early_dataset_query_failure(
     p: &pool::DatabasePool,
     config: &pool::DatabaseConfig,
@@ -3247,11 +3247,70 @@ async fn v2_start_early_dataset_query_failure(
     let task = tokio::spawn(async move { provider.start(request).await });
     wait_blocked(&observer, starter, blocker).await?;
     let (_, query) = activity(&observer, starter).await?;
+    // These are the original CAPTURE_SQL prefixes in the already registered native V2 check.
+    let original_schema_prefixes = [
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('public'::text,'model_connections'::text),",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'run_model_selection_v2_snapshots'::text)",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'gateway_authorization_attempts'::text)",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'thread_origins'::text)",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'thread_history_heads'::text),",
+    ];
+    eprintln!(
+        "THREAD_HISTORY_V2_DATASET_WITNESS original_backend_pid={starter} blocker_pid={blocker} query={query:?}"
+    );
     require(
         query.contains("pg_catalog")
             && !query.contains("SELECT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads")
-            && row_level_locks(&observer, starter).await? == 0,
-        "V2 witness was not its early original dataset/schema read",
+            && original_schema_prefixes
+                .iter()
+                .any(|prefix| query.starts_with(*prefix))
+            && {
+                let rows = observer
+                    .query(
+                        "SELECT l.locktype,coalesce(n.nspname||'.'||c.relname,''),l.mode \
+                         FROM pg_catalog.pg_locks l \
+                         LEFT JOIN pg_catalog.pg_class c ON c.oid=l.relation \
+                         LEFT JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
+                         WHERE l.pid=$1 AND l.granted \
+                           AND (l.locktype IN ('tuple','advisory') \
+                             OR (l.locktype='relation' AND l.mode IN ('RowShareLock','RowExclusiveLock'))) \
+                         ORDER BY l.locktype COLLATE \"C\",coalesce(n.nspname||'.'||c.relname,'') COLLATE \"C\",l.mode COLLATE \"C\"",
+                        &[&starter],
+                    )
+                    .await
+                    .map_err(text)?;
+                let observed: Vec<(String, String, String)> = rows
+                    .into_iter()
+                    .map(|row| (row.get(0), row.get(1), row.get(2)))
+                    .collect();
+                let expected: Vec<(String, String, String)> = [
+                    "public.agent_profiles",
+                    "public.agents",
+                    "public.custom_model_catalogs",
+                    "public.model_connection_secrets",
+                    "public.model_connections",
+                    "public.runs",
+                    "public.thread_leases",
+                    "public.thread_memberships",
+                    "public.threads",
+                    "public.user_roles",
+                    "public.users",
+                ]
+                .into_iter()
+                .map(|relation| {
+                    (
+                        "relation".to_owned(),
+                        relation.to_owned(),
+                        "RowShareLock".to_owned(),
+                    )
+                })
+                .collect();
+                eprintln!(
+                    "THREAD_HISTORY_V2_DATASET_WITNESS original_backend_pid={starter} granted_row_level_classes={observed:?}"
+                );
+                observed == expected
+            },
+        "V2 witness was not its original dataset/schema read with exactly the original authority locks",
     )?;
     let terminated: bool = observer
         .query_one("SELECT pg_terminate_backend($1)", &[&starter])
