@@ -4,7 +4,7 @@ use core::future::poll_fn;
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue};
@@ -74,10 +74,7 @@ async fn drive_activity_socket(
         tokio::select! {
             event = poll_fn(|cx| stream.as_mut().poll_next(cx)) => {
                 let Some(event) = event else {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::NORMAL,
-                        reason: "stream_complete".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::NORMAL, "stream_complete").await;
                     return;
                 };
                 let (text, terminal) = match event {
@@ -85,10 +82,7 @@ async fn drive_activity_socket(
                         Ok(text) => (text, false),
                         Err(error) => {
                             tracing::error!(error = %error, "typed tool approval activity encoding failed");
-                            let _ = socket.send(Message::Close(Some(CloseFrame {
-                                code: close_code::ERROR,
-                                reason: "event_encoding_failed".into(),
-                            }))).await;
+                            super::realtime::close(&mut socket, stream, close_code::ERROR, "event_encoding_failed").await;
                             return;
                         }
                     },
@@ -101,10 +95,7 @@ async fn drive_activity_socket(
                     | AppEvent::ChannelActivity(_)
                     | AppEvent::ChannelStreamError { .. } => {
                         tracing::error!("approval subscription emitted non-approval event");
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
-                            code: close_code::ERROR,
-                            reason: "application_contract_failed".into(),
-                        }))).await;
+                        super::realtime::close(&mut socket, stream, close_code::ERROR, "application_contract_failed").await;
                         return;
                     }
                 };
@@ -112,10 +103,7 @@ async fn drive_activity_socket(
                     return;
                 }
                 if terminal {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::ERROR,
-                        reason: "approval_stream_failed".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::ERROR, "approval_stream_failed").await;
                     return;
                 }
             }
@@ -123,10 +111,7 @@ async fn drive_activity_socket(
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return,
                 Some(Ok(Message::Text(_) | Message::Binary(_))) => {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::POLICY,
-                        reason: "tool_approval_activity_read_only".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::POLICY, "tool_approval_activity_read_only").await;
                     return;
                 }
                 Some(Err(error)) => {

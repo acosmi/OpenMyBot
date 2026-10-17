@@ -205,6 +205,21 @@ async fn sign_out(address: SocketAddr, token: &str) -> Result<(), String> {
     )
 }
 
+async fn listener_count(pool: &pool::DatabasePool, expected: i64) -> Result<(), String> {
+    for _ in 0..100 {
+        let actual: i64 = pool.get().await.map_err(text)?
+            .query_one("SELECT count(*)::bigint FROM pg_stat_activity WHERE application_name='audit-realtime-listener'", &[])
+            .await.map_err(text)?.get(0);
+        if actual == expected {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err(format!(
+        "original LISTEN connections did not converge to {expected}"
+    ))
+}
+
 async fn matrix(protocol: Protocol) {
     let admin = admin_config("realtime_authority_postgres");
     with_temp_database(&admin, "realtime_authority", |config| async move {
@@ -298,6 +313,7 @@ async fn matrix(protocol: Protocol) {
                     if change=="database" { valid.closed_without(&marker).await?; }
                     else { valid.contains(&marker).await?; }
                     revoked.closed_without(&marker).await?;
+                    listener_count(&pool,if change=="database" { 0 } else { 1 }).await?;
                     if let Some(tx)=blocked_tx {
                         tx.rollback().await.map_err(text)?;
                         let mut reconnected=Client::connect(address,protocol,&thread,valid_token).await?;
@@ -313,13 +329,7 @@ async fn matrix(protocol: Protocol) {
             server.abort();
             let _=server.await;
             if cases.is_ok() {
-                let mut remaining=1_i64;
-                for _ in 0..100 {
-                    remaining=pool.get().await.map_err(text)?.query_one("SELECT count(*)::bigint FROM pg_stat_activity WHERE application_name='audit-realtime-listener'",&[]).await.map_err(text)?.get(0);
-                    if remaining==0 { break; }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                require(remaining==0,"the original realtime LISTEN connections did not close")?;
+                listener_count(&pool,0).await?;
             }
             cases
         }.await;
