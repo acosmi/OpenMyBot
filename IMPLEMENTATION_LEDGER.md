@@ -2087,3 +2087,6 @@ Revised validation now passes on the unchanged realtime Rust inputs: the HTTP su
 
 
 - V7-IMPL-042 / PR #217: Normally integrated main `2e8d3121`, preserving the delivered realtime authorization and stream-lifecycle changes alongside the existing artifact-reference implementation. The original artifact mapping and test hunks remain intact. Existing directed evidence retains its original candidate and inputs; changed Server inputs require successor validation and independent review. This integration does not deliver the task, full recovery, readiness or the overall backend goal.
+
+
+- V7-IMPL-042 / PR #217: Added the existing empty `artifact_refs` field to the realtime authorization test constructor introduced on main. This is a mechanical alignment with the artifact-reference command; the test behavior, assertions and authorization setup are unchanged. Directed Infra strict checks passed on the predecessor. The predecessor Server strict attempt failed on this missing field and remains a failed attempt; successor compilation and runtime verification are pending.

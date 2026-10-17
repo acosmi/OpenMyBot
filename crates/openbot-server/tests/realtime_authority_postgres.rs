@@ -269,7 +269,7 @@ async fn matrix(protocol: Protocol) {
                     let thread = ThreadIdentity::new(&DeploymentId::new("dep")).mint_from_entropy([index as u8+1;16]);
                     directory.begin_thread_run(BeginThreadRunRequest {
                         deployment:DeploymentId::new("dep"),tenant:TenantId::new("tenant"),actor:ActorId::new("writer"),auth_generation:AuthGeneration::new(0),
-                        command:BeginThreadRun { thread_id:thread.clone(),run_id:RunId::new(format!("run-{index}")),bot_id:BotId::new("bot"),anchor:ThreadRunAnchor::Channel{channel_id:ChannelId::new("channel")},message:"before invalidation".into(),model_selection:None,selected_skill_slugs:Vec::new() },
+                        command:BeginThreadRun { thread_id:thread.clone(),run_id:RunId::new(format!("run-{index}")),bot_id:BotId::new("bot"),anchor:ThreadRunAnchor::Channel{channel_id:ChannelId::new("channel")},message:"before invalidation".into(),model_selection:None,selected_skill_slugs:Vec::new(),artifact_refs:Vec::new() },
                     }).await.map_err(text)?;
                     let mut revoked = Client::connect(address,protocol,&thread,&token).await?;
                     let valid_token = if change=="signout" { other_token.as_str() } else { WRITER_TOKEN };
