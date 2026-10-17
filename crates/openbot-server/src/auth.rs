@@ -763,7 +763,7 @@ struct ServerSessionCurrentGuard {
 }
 
 const CURRENT_SESSION_SQL: &str = "SELECT s.id,s.user_id,s.token,s.expires_at,s.created_at,s.updated_at,s.auth_generation, \
-    u.auth_generation AS current_generation, \
+    coalesce(u.auth_generation,0) AS current_generation, \
     EXISTS(SELECT 1 FROM public.revoked_access ra WHERE ra.email=lower(u.email)) AS revoked, \
     ARRAY(SELECT ur.role::text FROM public.user_roles ur WHERE ur.user_id=u.id ORDER BY ur.role::text) AS roles \
     FROM public.sessions s JOIN public.users u ON u.id=s.user_id \
@@ -3552,23 +3552,52 @@ fn auth_row_error(error: tokio_postgres::Error) -> AppError {
 #[cfg(any(test, feature = "testkit"))]
 pub struct FixedAuthResolver {
     outcome: Result<ResolvedAuth, AppError>,
+    // Synthetic authority exists only in the explicit test/testkit resolver. Production
+    // subscriptions require their real resolver's original host/session binding.
+    binding_owner: Option<RequestBindingOwnerLease>,
 }
 
 #[cfg(any(test, feature = "testkit"))]
 impl FixedAuthResolver {
     /// 恒定放行成给定身份。
     #[must_use]
-    pub const fn granting(auth: AuthContext) -> Self {
-        Self {
-            outcome: Ok(ResolvedAuth::without_session(auth)),
-        }
+    pub fn granting(auth: AuthContext) -> Self {
+        Self::granting_resolved(ResolvedAuth::without_session(auth))
     }
 
     /// 恒定放行成调用方已构造的 live-session 结果；只供敏感写测试。
     #[must_use]
-    pub const fn granting_resolved(resolved: ResolvedAuth) -> Self {
+    pub fn granting_resolved(mut resolved: ResolvedAuth) -> Self {
+        if resolved.context.request_binding().is_some() {
+            return Self {
+                outcome: Ok(resolved),
+                binding_owner: None,
+            };
+        }
+        let (owner, issuer) =
+            RequestBindingOwnerLease::for_trusted_host(HostRequestBindingKind::ServerSession);
+        let context = &resolved.context;
+        let identity = ServerSessionBindingIdentity::from_verified_row(
+            "fixed-test-session".into(),
+            context.actor().clone(),
+            "fixed-test-hash-column".into(),
+            OffsetDateTime::UNIX_EPOCH,
+            context.auth_generation(),
+        );
+        let binding = issuer
+            .bind_server_session(
+                context,
+                identity,
+                Arc::new(FixedRequestGuard(context.clone())),
+            )
+            .expect("the fixed test session matches its explicit authority");
+        resolved.context = resolved
+            .context
+            .with_verified_request_binding(binding)
+            .expect("the fixed test binding matches its authority");
         Self {
             outcome: Ok(resolved),
+            binding_owner: Some(owner),
         }
     }
 
@@ -3577,13 +3606,56 @@ impl FixedAuthResolver {
     pub const fn rejecting(error: AppError) -> Self {
         Self {
             outcome: Err(error),
+            binding_owner: None,
         }
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+struct FixedRequestGuard(AuthContext);
+
+#[cfg(any(test, feature = "testkit"))]
+impl HostRequestBindingGuard for FixedRequestGuard {
+    fn verify_current<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), HostRequestBindingError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if auth == &self.0 {
+                Ok(())
+            } else {
+                Err(HostRequestBindingError::NotCurrent)
+            }
+        })
+    }
+
+    fn verify_current_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), HostRequestBindingError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if std::time::Instant::now() >= deadline {
+                return Err(HostRequestBindingError::Unavailable);
+            }
+            self.verify_current(auth).await
+        })
     }
 }
 
 #[cfg(any(test, feature = "testkit"))]
 #[async_trait]
 impl AuthResolver for FixedAuthResolver {
+    fn close_request_bindings(&self) {
+        if let Some(owner) = &self.binding_owner {
+            owner.close();
+        }
+    }
+
     async fn resolve(&self, _parts: &Parts) -> Result<AuthContext, AppError> {
         self.outcome.clone().map(ResolvedAuth::into_context)
     }
