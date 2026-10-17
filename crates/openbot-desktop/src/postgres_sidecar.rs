@@ -77,10 +77,8 @@ const INITDB_DEADLINE: Duration = Duration::from_secs(30);
 // explicitly read the existing private stdin pipe instead; no password file is created.
 #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
 const INITDB_PASSWORD_INPUT: &str = "--pwfile=/dev/stdin";
-#[cfg(all(feature = "postgres-supervisor", not(target_os = "macos")))]
-const INITDB_PASSWORD_INPUT: &str = "--pwprompt";
-#[cfg(feature = "postgres-supervisor")]
-const INITDB_PASSWORD_LINES: usize = if cfg!(target_os = "macos") { 1 } else { 2 };
+#[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
+const INITDB_PASSWORD_LINES: usize = 1;
 #[cfg(feature = "postgres-supervisor")]
 const READY_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(feature = "postgres-supervisor")]
@@ -1952,7 +1950,7 @@ async fn run_initdb(
         .arg(data_dir)
         .arg(format!("--username={DESKTOP_LOCAL_POSTGRES_ADMIN_USER}"))
         .args([
-            INITDB_PASSWORD_INPUT,
+            "--pwprompt",
             "--auth-host=scram-sha-256",
             "--auth-local=reject",
             "--encoding=UTF8",
@@ -1970,7 +1968,7 @@ async fn run_initdb(
             .stdin
             .take()
             .ok_or(PostgresSidecarError::InitdbFailed)?;
-        for _ in 0..INITDB_PASSWORD_LINES {
+        for _ in 0..2 {
             stdin
                 .write_all(secret.expose())
                 .await
