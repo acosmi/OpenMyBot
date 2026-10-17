@@ -61,6 +61,7 @@ pub mod memories;
 pub mod metrics;
 pub mod model_connections;
 pub mod plugins;
+mod realtime;
 #[cfg(test)]
 mod reconciliation_tests;
 pub mod remote_interrupts;

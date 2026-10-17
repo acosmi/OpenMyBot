@@ -53,10 +53,8 @@ pub async fn events(
         }
         .into());
     }
-    let stream = state
-        .application()
-        .subscribe(auth, SubscriptionRequest::ToolApprovalActivity)
-        .await?;
+    let (stream, authority) =
+        super::realtime::subscribe(&state, auth, SubscriptionRequest::ToolApprovalActivity).await?;
     Ok(ws
         .protocols([TOOL_APPROVAL_ACTIVITY_PROTOCOL])
         .max_message_size(TOOL_APPROVAL_INPUT_LIMIT)
@@ -64,12 +62,13 @@ pub async fn events(
         .on_failed_upgrade(|error| {
             tracing::debug!(error = %error, "tool approval websocket upgrade failed");
         })
-        .on_upgrade(move |socket| drive_activity_socket(socket, stream)))
+        .on_upgrade(move |socket| drive_activity_socket(socket, stream, authority)))
 }
 
 async fn drive_activity_socket(
     mut socket: WebSocket,
     mut stream: openbot_application::AppEventStream,
+    authority: super::realtime::RealtimeAuthority,
 ) {
     loop {
         tokio::select! {
@@ -109,7 +108,7 @@ async fn drive_activity_socket(
                         return;
                     }
                 };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                if super::realtime::send(&mut socket, Message::Text(text.into()), &authority).await.is_err() {
                     return;
                 }
                 if terminal {
