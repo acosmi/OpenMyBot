@@ -2090,3 +2090,13 @@ Revised validation now passes on the unchanged realtime Rust inputs: the HTTP su
 
 
 - V7-IMPL-042 / PR #217: Added the existing empty `artifact_refs` field to the realtime authorization test constructor introduced on main. This is a mechanical alignment with the artifact-reference command; the test behavior, assertions and authorization setup are unchanged. Directed Infra strict checks passed on the predecessor. The predecessor Server strict attempt failed on this missing field and remains a failed attempt; successor compilation and runtime verification are pending.
+
+
+### AUDIT-20261016-MACOS-INITDB — bind production Fresh initdb to its private pipe
+
+The current candidate limits explicit noninteractive password input to the production macOS Fresh initdb helper: `--pwfile=/dev/stdin` and one password line. The portable helper is restored byte-for-byte to its original prompt/two-line implementation on every platform. The verified executable, owned Child, observation/journal sequence, SCRAM, secret secrecy, existing timeout and error/cleanup paths remain present; no native unsafe, session effect, dependency, migration or public wire is added.
+
+The production-only candidate `0c41d851a61eb1be99a34268e91d9a15fe9c995c` passed all four fresh directed checks: full Local runtime library Clippy with `-D warnings`, the original genuine PostgreSQL 17.11 supervisor fixture (one passed, zero failed/ignored), the original controlled initdb failure-evidence regression (one passed, zero failed/ignored), and the lean sidecar library check. Independent finite source review passed all 12 checks with no P1/P2 finding; independent execution review and the exact-head delivery gate remain pending. Original process waits and serial resource release are recorded. The smaller test/lean feature graphs retain their existing dead-code diagnostics, and the compiler stripping warning remains recorded without suppression. All earlier candidate results and the earlier narrower strict failure retain their original identities. No controlling-TTY, protected fixture, Keychain, full session-isolation delivery or signed macOS release acceptance is claimed.
+
+
+- V7-IMPL-042 / PR #217: Normally integrated main `5cb2529d`, retaining its production macOS private-pipe initdb repair together with the existing empty artifact-reference constructor fields. Both implementation and audit ledger entries are preserved. Earlier directed results keep their original source identities; the changed Server and Desktop inputs require successor validation and independent evidence review. This integration does not deliver the task, full recovery, readiness or the overall backend goal.
