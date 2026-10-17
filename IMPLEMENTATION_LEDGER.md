@@ -2054,3 +2054,8 @@ The old-source probability control recorded 10 natural setup refusals in 10 runs
 ### AUDIT-20261016-CANCEL-FIXTURE — restore the original cancellation test prerequisite
 
 The existing run-cancellation integration fixture now assigns its initiating actor the required user role before Begin. This is one seed SQL line; the other actor, production ACL, shared harness, ignore status and every original assertion are unchanged. The single exact ignored test `durable_cancel_is_scoped_idempotent_and_poll_terminalizes_when_no_child_exists` passed with owned PostgreSQL 17.11: one test passed, zero failed, zero ignored. It reaches the existing cross-user rejection, durable/idempotent cancellation and missed-NOTIFY terminal convergence checks. The owned PG instance stopped normally. Source formatting and diff checks pass; no production change or release acceptance is claimed. Independent finite review and normal admin delivery are pending.
+
+
+### AUDIT-20261016-HISTORY-STATUS — align the bilingual progress description
+
+The English and Chinese READMEs now acknowledge the delivered bounded history clearing, completion-gated visibility and deleted-thread maintenance CLI. The existing stop/drain and authorization facts remain present. Both languages keep GUI history stop/clear delivery, complete recovery and signed-product acceptance open; no historical targeted evidence is relabeled as full release acceptance. Documentation only: checked against the existing clearing implementation, native migration, maintenance entry and merged delivery record; diff and table structure checks pass. Independent finite review and normal admin delivery are pending.
