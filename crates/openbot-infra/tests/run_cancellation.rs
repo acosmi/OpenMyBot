@@ -42,6 +42,7 @@ async fn durable_cancel_is_scoped_idempotent_and_poll_terminalizes_when_no_child
                 .batch_execute(
                     "INSERT INTO public.users(id,email) VALUES
                        ('actor','actor@example.test'),('other','other@example.test');
+                     INSERT INTO public.user_roles(user_id,role) VALUES('actor','user');
                      INSERT INTO public.agents(id,name,type,configuration)
                        VALUES('bot-1','Bot One','built_in','{}');
                      INSERT INTO public.agent_profiles(
