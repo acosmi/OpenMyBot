@@ -2103,3 +2103,6 @@ The production-only candidate `0c41d851a61eb1be99a34268e91d9a15fe9c995c` passed 
 
 
 - V7-IMPL-042 / PR #217: Corrected the independent V2 schema-read failure witness in the existing history-closure test. It now observes the original schema query while checking the existing qualification locks. The production lock sequence, legacy controls, failure result and no-network assertions are unchanged. The original failed run keeps its identity. The repaired candidate requires affected compilation, new list results and all three original runtime selectors; unchanged-input evidence requires independent applicability review. Task delivery, full recovery and readiness remain pending.
+
+
+- V7-IMPL-042 / PR #217: Corrected the existing V2 failure witness to distinguish valid index relation locks through their actual catalog type and base-table owner. The complete raw lock observation, exact eleven authority-table comparison, unexpected-lock rejection and subsequent failure/no-network assertions remain intact. Production behavior and the original failed run are unchanged. The successor requires the affected directed compilation, list and runtime checks; unchanged-input results retain their original evidence and require applicability review. Task delivery and readiness remain pending.

@@ -3267,10 +3267,18 @@ async fn v2_start_early_dataset_query_failure(
             && {
                 let rows = observer
                     .query(
-                        "SELECT l.locktype,coalesce(n.nspname||'.'||c.relname,''),l.mode \
+                        "SELECT l.locktype,coalesce(n.nspname||'.'||c.relname,''),l.mode, \
+                         CASE WHEN l.locktype='relation' AND l.mode='RowShareLock' \
+                           AND ((c.relkind='i' AND base.relkind='r') \
+                             OR (c.relkind='I' AND base.relkind='p')) \
+                           AND i.indisvalid AND i.indisready AND i.indislive \
+                         THEN base_ns.nspname||'.'||base.relname END \
                          FROM pg_catalog.pg_locks l \
                          LEFT JOIN pg_catalog.pg_class c ON c.oid=l.relation \
                          LEFT JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
+                         LEFT JOIN pg_catalog.pg_index i ON i.indexrelid=c.oid \
+                         LEFT JOIN pg_catalog.pg_class base ON base.oid=i.indrelid \
+                         LEFT JOIN pg_catalog.pg_namespace base_ns ON base_ns.oid=base.relnamespace \
                          WHERE l.pid=$1 AND l.granted \
                            AND (l.locktype IN ('tuple','advisory') \
                              OR (l.locktype='relation' AND l.mode IN ('RowShareLock','RowExclusiveLock'))) \
@@ -3279,8 +3287,8 @@ async fn v2_start_early_dataset_query_failure(
                     )
                     .await
                     .map_err(text)?;
-                let observed: Vec<(String, String, String)> = rows
-                    .into_iter()
+                let raw_observed: Vec<(String, String, String)> = rows
+                    .iter()
                     .map(|row| (row.get(0), row.get(1), row.get(2)))
                     .collect();
                 let expected: Vec<(String, String, String)> = [
@@ -3305,8 +3313,18 @@ async fn v2_start_early_dataset_query_failure(
                     )
                 })
                 .collect();
+                let observed: Vec<(String, String, String)> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        let derived_parent: Option<String> = row.get(3);
+                        derived_parent.as_ref().is_none_or(|parent| {
+                            !expected.iter().any(|(_, relation, _)| relation == parent)
+                        })
+                    })
+                    .map(|row| (row.get(0), row.get(1), row.get(2)))
+                    .collect();
                 eprintln!(
-                    "THREAD_HISTORY_V2_DATASET_WITNESS original_backend_pid={starter} granted_row_level_classes={observed:?}"
+                    "THREAD_HISTORY_V2_DATASET_WITNESS original_backend_pid={starter} granted_row_level_classes={raw_observed:?} authority_base_classes={observed:?}"
                 );
                 observed == expected
             },
