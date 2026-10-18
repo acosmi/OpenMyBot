@@ -307,7 +307,15 @@ async fn start_owned_desktop() -> Result<OwnedDesktop, String> {
             .args(["-w", "start"]),
         "pg_ctl start",
     )?;
-    sidecar.postmaster_pid = Some(sidecar.read_owned_postmaster_pid()?);
+    let captured_postmaster_pid = sidecar.read_owned_postmaster_pid()?;
+    sidecar.postmaster_pid = Some(captured_postmaster_pid);
+    eprintln!(
+        "BINDING_TEST_OWNED_LOCAL_ACTUAL_RESOURCE original_postmaster_pid={captured_postmaster_pid} controlled_app_root={} original_PID_file={}/postmaster.pid data_dir={} socket_root={}",
+        sidecar.app_root.display(),
+        sidecar.data_dir.display(),
+        sidecar.data_dir.display(),
+        sidecar.socket_dir.display()
+    );
     let admin = connect_for_attestation(port, SecretBytes::new(TEST_PASSWORD.as_bytes().to_vec()))
         .await
         .map_err(|e| e.to_string())?;

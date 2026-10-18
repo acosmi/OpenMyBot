@@ -2106,3 +2106,6 @@ The production-only candidate `0c41d851a61eb1be99a34268e91d9a15fe9c995c` passed 
 
 
 - V7-IMPL-042 / PR #217: Corrected the existing V2 failure witness to distinguish valid index relation locks through their actual catalog type and base-table owner. The complete raw lock observation, exact eleven authority-table comparison, unexpected-lock rejection and subsequent failure/no-network assertions remain intact. Production behavior and the original failed run are unchanged. The successor requires the affected directed compilation, list and runtime checks; unchanged-input results retain their original evidence and require applicability review. Task delivery and readiness remain pending.
+
+
+- V7-IMPL-042 / PR #217: Extended the existing owned test-PostgreSQL diagnostic markers in nine Desktop test files with the captured PID and original app, data and PID-file paths. Five helpers retain the original PID read, and three pass an already-observed Path through their test setup solely for this logging. Start, stop, waits, assertions and production behavior are unchanged. The predecessor's 94 directed runtime checks remain bound to their accepted inputs; the affected Desktop compilation, lists and runtime checks require validation on this successor. Independent code review and task delivery remain pending.

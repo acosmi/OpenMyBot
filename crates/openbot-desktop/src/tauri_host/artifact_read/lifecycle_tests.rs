@@ -660,18 +660,20 @@ impl LocalFixture {
                 let path = entry.map_err(|error| error.to_string())?.path();
                 if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("postgresql-17-")) && path.is_dir() {
                     let pid = std::fs::read_to_string(path.join("postmaster.pid")).map_err(|error| error.to_string())?.lines().next().ok_or("actual postmaster PID missing")?.parse::<u32>().map_err(|_| "actual postmaster PID invalid")?;
-                    require(pid > 1, "owned postmaster PID is invalid")?; pids.push(pid);
+                    require(pid > 1, "owned postmaster PID is invalid")?; pids.push((pid, path));
                 }
             }
             require(pids.len() == 1, "genuine Prepared did not own exactly one controlled sidecar")?;
-            Ok::<_, String>((artifact, payload, pids[0]))
+            Ok::<_, String>((artifact, payload, pids[0].0, pids[0].1.clone()))
         }.await;
         match populated {
-            Ok((artifact, payload, postmaster_pid)) => {
+            Ok((artifact, payload, postmaster_pid, postmaster_data_dir)) => {
                 root.1 = true;
                 eprintln!(
-                    "ARTIFACT_LIFECYCLE_LOCAL_ACTUAL_RESOURCE original_postmaster_pid={postmaster_pid} controlled_app_root={}",
-                    root.0.display()
+                    "ARTIFACT_LIFECYCLE_LOCAL_ACTUAL_RESOURCE original_postmaster_pid={postmaster_pid} controlled_app_root={} original_PID_file={}/postmaster.pid data_dir={}",
+                    root.0.display(),
+                    postmaster_data_dir.display(),
+                    postmaster_data_dir.display()
                 );
                 Ok(Self {
                     root,
