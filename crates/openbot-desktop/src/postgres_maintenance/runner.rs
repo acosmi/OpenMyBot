@@ -375,6 +375,44 @@ impl NativeOwner {
     }
 }
 
+pub(super) fn validate_secret_memory_budget(
+    source_max: u64,
+    copies: u64,
+    max_memory: u64,
+) -> Result<(), MaintenanceError> {
+    if !(1..=4096).contains(&source_max) || copies < 12 {
+        return Err(MaintenanceError::SecretInvalid);
+    }
+    // Keep the original known Rust reservoirs; native buffers cannot borrow their reservation.
+    let rust_secret_peak = 6_u64
+        .checked_mul(8192 + 8192 + 2 * 63)
+        .and_then(|n| n.checked_add(512 + 32 + 64 + 65 + 104))
+        .ok_or(MaintenanceError::SecretInvalid)?;
+    let copied_secret_peak = source_max
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(copies))
+        .ok_or(MaintenanceError::SecretInvalid)?;
+    // Two fixed secret[4097] reservoirs across fork plus the known UTF8 normalization bound.
+    // Reviewed plaintext-containing capacities only, not process RSS or all SASL state.
+    let normalized_secret_peak = 2_u64
+        .checked_mul(4097)
+        .and_then(|static_bytes| {
+            source_max
+                .checked_mul(292)
+                .and_then(|n| n.checked_add(static_bytes))
+        })
+        .and_then(|n| n.checked_add(8))
+        .ok_or(MaintenanceError::SecretInvalid)?;
+    let native_secret_peak = copied_secret_peak.max(normalized_secret_peak);
+    if rust_secret_peak
+        .checked_add(native_secret_peak)
+        .is_none_or(|n| n > max_memory)
+    {
+        return Err(MaintenanceError::SecretInvalid);
+    }
+    Ok(())
+}
+
 impl OwnedFixtureSource {
     fn new(
         bundle: VerifiedMaintenanceBundle,
@@ -384,26 +422,17 @@ impl OwnedFixtureSource {
         let p = profile.fields();
         // One fixed 32-byte random seed and its 64-byte textual representation; there is no caller
         // password, reuse, file spool, TTY, environment credential or recovery/master key.
-        // Charge known Rust reservoirs before any secret allocation: six bounded reader
-        // buffers/windows/carries, the version preview, seed, text, initdb line and control frame.
-        // The native upper copy inventory is additionally charged, including NUL in each copy.
-        // Opaque SASL/allocator/OS internals are explicitly outside a whole-memory wipe claim.
-        let rust_secret_peak = 6_u64
-            .checked_mul(8192 + 8192 + 2 * 63)
-            .and_then(|n| n.checked_add(512 + 32 + 64 + 65 + 104))
-            .ok_or(MaintenanceError::SecretInvalid)?;
-        let native_secret_peak = p
-            .max_source_secret_bytes
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(p.max_native_secret_copies))
-            .ok_or(MaintenanceError::SecretInvalid)?;
-        if p.max_source_secret_bytes < 64
-            || rust_secret_peak
-                .checked_add(native_secret_peak)
-                .is_none_or(|n| n > p.max_secret_memory_bytes)
-        {
+        if p.max_source_secret_bytes < 64 {
             return Err(MaintenanceError::SecretInvalid);
         }
+        // Prepay the original Rust reservation and known native allocated capacities before any
+        // random/secret allocation. Opaque SASL/allocator/OS internals and whole-memory wipe remain
+        // explicitly unproven; no default, budget increase, or borrowing supplies admission.
+        validate_secret_memory_budget(
+            p.max_source_secret_bytes,
+            p.max_native_secret_copies,
+            p.max_secret_memory_bytes,
+        )?;
         // max_files_per_process has an upstream minimum 25. This explicit fixture also needs its
         // own bounded original pipes/SQL socket/verification FDs; no global runtime RLIMIT claim.
         if !(32..=i32::MAX as u64).contains(&p.max_open_files) {

@@ -30,6 +30,33 @@ fn parse(v: &Value) -> Result<limits::MaintenanceProfile, MaintenanceError> {
 fn profile_requires_single_file_wal_blocks_spool_and_reserve_bounds() {
     let value = profile_value();
     let p = parse(&value).expect("finite unit profile");
+    for (source_max, copies, required) in [
+        (64_u64, 12_u64, 126_727_u64),
+        (4096, 32, 1_304_071),
+        (64, 1024, 166_397),
+        (3, 12, 108_915),
+    ] {
+        assert_eq!(
+            super::runner::validate_secret_memory_budget(source_max, copies, required),
+            Ok(())
+        );
+        assert_eq!(
+            super::runner::validate_secret_memory_budget(source_max, copies, required - 1),
+            Err(MaintenanceError::SecretInvalid)
+        );
+    }
+    for (source_max, copies) in [
+        (64_u64, 11_u64),
+        (4096, u64::MAX),
+        (1, u64::MAX / 2),
+        (0, 12),
+        (4097, 12),
+    ] {
+        assert_eq!(
+            super::runner::validate_secret_memory_budget(source_max, copies, u64::MAX),
+            Err(MaintenanceError::SecretInvalid)
+        );
+    }
     for key in value.as_object().expect("object").keys() {
         let mut missing = value.clone();
         missing.as_object_mut().expect("object").remove(key);
