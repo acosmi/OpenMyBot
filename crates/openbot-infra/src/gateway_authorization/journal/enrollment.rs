@@ -787,12 +787,10 @@ async fn run_headers(
             } else {
                 Err(fence_failure(failure.unwrap_or(Kind::CleanupUnknown)))
             });
-            failure.or_else(|| {
-                if released {
-                    None
-                } else {
-                    Some(Kind::BeforeAdoptionRefused)
-                }
+            failure.or(if released {
+                None
+            } else {
+                Some(Kind::BeforeAdoptionRefused)
             })
         }
     };
@@ -1040,10 +1038,10 @@ async fn read_adoption(
     (close_result(result, cleanup), ack, cleanup)
 }
 fn merge_reader<T>(reader: Result<T, Kind>, headers: &HeaderResult) -> Result<T, Kind> {
-    if headers.caused_reader {
-        if let Some(error) = headers.failure {
-            return Err(error);
-        }
+    if headers.caused_reader
+        && let Some(error) = headers.failure
+    {
+        return Err(error);
     }
     match reader {
         Err(error) => Err(error),
