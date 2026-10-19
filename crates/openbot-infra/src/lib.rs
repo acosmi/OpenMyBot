@@ -134,11 +134,15 @@ pub mod gateway_account;
 pub mod gateway_authority;
 #[cfg(feature = "server-runtime")]
 mod gateway_authorization;
+#[cfg(any(feature = "server-runtime", feature = "desktop-local-vault"))]
 mod thread_history_writer;
 #[cfg(feature = "server-runtime")]
 pub use gateway_authorization::journal::{
     CallbackErrorKind, CallbackStage, ClosedAttemptReceipt, ControlledCloseReason,
     CreatedAttemptOwner, GatewayAuthorizationCallbackError, GatewayAuthorizationCallbackWaitOwner,
+    GatewayAuthorizationEnrollmentAccountReason, GatewayAuthorizationEnrollmentCleanupState,
+    GatewayAuthorizationEnrollmentError, GatewayAuthorizationEnrollmentKind,
+    GatewayAuthorizationEnrollmentStage, GatewayAuthorizationEnrollmentWriteTerminal,
     GatewayAuthorizationJournal, GatewayAuthorizationJournalAck, GatewayAuthorizationJournalError,
     GatewayAuthorizationJournalErrorKind, GatewayAuthorizationJournalRuntimeOwner,
     GatewayAuthorizationTokenError, GatewayAuthorizationTokenKind, GatewayAuthorizationTokenOwner,

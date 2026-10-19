@@ -180,6 +180,16 @@ impl GatewayAccountClient {
         access_token: &SecretBytes,
         cancel: CancellationToken,
     ) -> Result<GatewayAccountIdentity, GatewayAccountError> {
+        let request = self.profile_request(metadata, access_token)?;
+        let body = self.execute_json(request, cancel).await?;
+        self.decode_profile(&body)
+    }
+
+    fn profile_request(
+        &self,
+        metadata: &GatewayDesktopMetadata,
+        access_token: &SecretBytes,
+    ) -> Result<HttpRequest, GatewayAccountError> {
         if metadata.issuer != self.origin || metadata.sdk_metadata.issuer != self.origin {
             return Err(GatewayAccountError::Configuration);
         }
@@ -206,9 +216,12 @@ impl GatewayAccountClient {
             body: Vec::new(),
             context: HttpContext::buffered(HttpPurpose::Api, 10_000),
         };
-        let body = self.execute_json(request, cancel).await?;
+        Ok(request)
+    }
+
+    fn decode_profile(&self, body: &[u8]) -> Result<GatewayAccountIdentity, GatewayAccountError> {
         let raw: RawProfile =
-            serde_json::from_slice(&body).map_err(|_| GatewayAccountError::ProfileInvalid)?;
+            serde_json::from_slice(body).map_err(|_| GatewayAccountError::ProfileInvalid)?;
         let id = raw.id.ok_or(GatewayAccountError::ProfileInvalid)?;
         let uuid = raw.uuid.ok_or(GatewayAccountError::ProfileInvalid)?;
         let account = raw.account.ok_or(GatewayAccountError::ProfileInvalid)?;
@@ -239,6 +252,137 @@ impl GatewayAccountClient {
         })
     }
 
+    pub(crate) async fn fetch_metadata_for_enrollment(
+        &self,
+        current: &crate::gateway_authorization::journal::enrollment::EnrollmentCurrent<'_>,
+    ) -> Result<GatewayDesktopMetadata, EnrollmentAccountReadError> {
+        current
+            .check()
+            .map_err(EnrollmentAccountReadError::Current)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        let request = HttpRequest {
+            method: Method::GET,
+            url: self.discovery_url.clone(),
+            headers,
+            body: Vec::new(),
+            context: HttpContext::buffered(HttpPurpose::OAuthDiscovery, 10_000),
+        };
+        let body = self.execute_json_for_enrollment(request, current).await?;
+        current
+            .check()
+            .map_err(EnrollmentAccountReadError::Current)?;
+        let raw: RawMetadata = serde_json::from_slice(&body).map_err(|_| {
+            EnrollmentAccountReadError::Account(GatewayAccountError::MetadataInvalid)
+        })?;
+        let result =
+            validate_metadata(raw, &self.origin).map_err(EnrollmentAccountReadError::Account);
+        current
+            .check()
+            .map_err(EnrollmentAccountReadError::Current)?;
+        result
+    }
+
+    pub(crate) async fn fetch_profile_for_enrollment(
+        &self,
+        metadata: &GatewayDesktopMetadata,
+        access_token: &SecretBytes,
+        current: &crate::gateway_authorization::journal::enrollment::EnrollmentCurrent<'_>,
+    ) -> Result<GatewayAccountIdentity, EnrollmentAccountReadError> {
+        current
+            .check()
+            .map_err(EnrollmentAccountReadError::Current)?;
+        let request = self
+            .profile_request(metadata, access_token)
+            .map_err(EnrollmentAccountReadError::Account)?;
+        let body = self.execute_json_for_enrollment(request, current).await?;
+        current
+            .check()
+            .map_err(EnrollmentAccountReadError::Current)?;
+        let result = self
+            .decode_profile(&body)
+            .map_err(EnrollmentAccountReadError::Account);
+        current
+            .check()
+            .map_err(EnrollmentAccountReadError::Current)?;
+        result
+    }
+
+    async fn execute_json_for_enrollment(
+        &self,
+        request: HttpRequest,
+        current: &crate::gateway_authorization::journal::enrollment::EnrollmentCurrent<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, EnrollmentAccountReadError> {
+        current
+            .check()
+            .map_err(EnrollmentAccountReadError::Current)?;
+        let deadline = current
+            .deadline()
+            .map_err(EnrollmentAccountReadError::Current)?
+            .min(Instant::now().checked_add(REQUEST_TIMEOUT).ok_or(
+                EnrollmentAccountReadError::Account(GatewayAccountError::Timeout),
+            )?);
+        let cancel = current.original_parent().clone();
+        let execute = self.transport.execute(request, cancel.clone());
+        let mut execute = std::pin::pin!(execute);
+        let observed = std::future::poll_fn(|cx| {
+            enrollment_poll_bookended(
+                || enrollment_check(current, deadline),
+                || execute.as_mut().poll(cx),
+            )
+        });
+        let mut response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(EnrollmentAccountReadError::Account(GatewayAccountError::Cancelled)),
+            () = tokio::time::sleep_until(deadline) => return Err(EnrollmentAccountReadError::Account(GatewayAccountError::Timeout)),
+            result = observed => result?.map_err(|e| EnrollmentAccountReadError::Account(map_transport(e)))?,
+        };
+        enrollment_check(current, deadline)?;
+        if response.status != StatusCode::OK {
+            return Err(EnrollmentAccountReadError::Account(
+                GatewayAccountError::HttpStatus(response.status.as_u16()),
+            ));
+        }
+        validate_json_content_type(&response.headers)
+            .map_err(EnrollmentAccountReadError::Account)?;
+        enrollment_check(current, deadline)?;
+        let mut body = Zeroizing::new(Vec::with_capacity(RESPONSE_MAX_BYTES));
+        loop {
+            // One closure performs exactly one original body.poll_next. Every result,
+            // including Pending/Err/EOF, is postchecked before it leaves this closure.
+            let observed = std::future::poll_fn(|cx| {
+                enrollment_poll_bookended(
+                    || enrollment_check(current, deadline),
+                    || futures_util::Stream::poll_next(response.body.as_mut(), cx),
+                )
+            });
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(EnrollmentAccountReadError::Account(GatewayAccountError::Cancelled)),
+                () = tokio::time::sleep_until(deadline) => return Err(EnrollmentAccountReadError::Account(GatewayAccountError::Timeout)),
+                result = observed => result?,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = chunk.map_err(|e| EnrollmentAccountReadError::Account(map_transport(e)))?;
+            let next_len =
+                body.len()
+                    .checked_add(chunk.len())
+                    .ok_or(EnrollmentAccountReadError::Account(
+                        GatewayAccountError::BodyTooLarge,
+                    ))?;
+            if next_len > RESPONSE_MAX_BYTES {
+                return Err(EnrollmentAccountReadError::Account(
+                    GatewayAccountError::BodyTooLarge,
+                ));
+            }
+            body.extend_from_slice(chunk.as_ref());
+        }
+        enrollment_check(current, deadline)?;
+        Ok(body)
+    }
+
     async fn execute_json(
         &self,
         request: HttpRequest,
@@ -264,6 +408,41 @@ impl fmt::Debug for GatewayAccountClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("GatewayAccountClient([redacted])")
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum EnrollmentAccountReadError {
+    Account(GatewayAccountError),
+    Current(crate::gateway_authorization::journal::GatewayAuthorizationJournalError),
+}
+fn enrollment_check(
+    current: &crate::gateway_authorization::journal::enrollment::EnrollmentCurrent<'_>,
+    deadline: Instant,
+) -> Result<(), EnrollmentAccountReadError> {
+    current
+        .check()
+        .map_err(EnrollmentAccountReadError::Current)?;
+    if Instant::now() >= deadline {
+        return Err(EnrollmentAccountReadError::Account(
+            GatewayAccountError::Timeout,
+        ));
+    }
+    Ok(())
+}
+// Private pure lemma. Production reaches it only through the sealed current readers above.
+fn enrollment_poll_bookended<T, E>(
+    mut check: impl FnMut() -> Result<(), E>,
+    poll: impl FnOnce() -> std::task::Poll<T>,
+) -> std::task::Poll<Result<T, E>> {
+    use std::task::Poll;
+    if let Err(error) = check() {
+        return Poll::Ready(Err(error));
+    }
+    let result = poll();
+    if let Err(error) = check() {
+        return Poll::Ready(Err(error));
+    }
+    result.map(Ok)
 }
 
 async fn read_json_response(
@@ -665,4 +844,62 @@ where
         return Err(E::custom("duplicate selected gateway field"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod enrollment_bookend_tests {
+    use super::enrollment_poll_bookended;
+    use std::cell::Cell;
+    use std::task::Poll;
+
+    #[test]
+    fn p05_body_pending_ready_error_eof_bookends() {
+        // Pure per-poll lemma only; no real HTTP/body/Host/PG acceptance credit.
+        let polls = Cell::new(0);
+        let refused: Poll<Result<Option<Result<&[u8], ()>>, &str>> = enrollment_poll_bookended(
+            || Err("before"),
+            || {
+                polls.set(polls.get() + 1);
+                Poll::Pending
+            },
+        );
+        assert_eq!(refused, Poll::Ready(Err("before")));
+        assert_eq!(polls.get(), 0);
+        for raw in [
+            Poll::Pending,
+            Poll::Ready(Some(Ok(&b"owned"[..]))),
+            Poll::Ready(Some(Err(()))),
+            Poll::Ready(None),
+        ] {
+            let checks = Cell::new(0);
+            let result = enrollment_poll_bookended(
+                || {
+                    let n = checks.get();
+                    checks.set(n + 1);
+                    if n == 0 { Ok(()) } else { Err("after") }
+                },
+                || {
+                    polls.set(polls.get() + 1);
+                    raw
+                },
+            );
+            assert_eq!(result, Poll::Ready(Err("after")));
+            assert_eq!(checks.get(), 2);
+        }
+        assert_eq!(polls.get(), 4);
+        let checks = Cell::new(0);
+        let chunks: [Option<Result<&[u8], ()>>; 3] =
+            [Some(Ok(&b"a"[..])), Some(Ok(&b"b"[..])), None];
+        for raw in chunks {
+            let result: Poll<Result<_, ()>> = enrollment_poll_bookended(
+                || {
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                },
+                || Poll::Ready(raw),
+            );
+            assert_eq!(result, Poll::Ready(Ok(raw)));
+        }
+        assert_eq!(checks.get(), 6);
+    }
 }

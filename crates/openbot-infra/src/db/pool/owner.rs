@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use deadpool_postgres::{Client, ClientWrapper, Connect, ObjectId, Pool};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_postgres::{Client as PgClient, Config as PgConfig, Error as PgError, NoTls};
 
@@ -288,6 +288,23 @@ impl OwnerSupervisor {
     }
 
     pub(super) async fn checkout(self: &Arc<Self>, stock: &Pool) -> Result<ClientLease, PoolError> {
+        self.checkout_inner(stock, None).await
+    }
+
+    #[cfg(feature = "server-runtime")]
+    pub(super) async fn checkout_with_session_permit(
+        self: &Arc<Self>,
+        stock: &Pool,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<ClientLease, PoolError> {
+        self.checkout_inner(stock, Some(permit)).await
+    }
+
+    async fn checkout_inner(
+        self: &Arc<Self>,
+        stock: &Pool,
+        session_permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<ClientLease, PoolError> {
         if let Some(error) = self.current_fault() {
             stock.close();
             return Err(error);
@@ -295,7 +312,7 @@ impl OwnerSupervisor {
         if stock.is_closed() {
             return Err(PoolError::Closed);
         }
-        let trace = Arc::new(CheckoutTrace::new(self));
+        let trace = Arc::new(CheckoutTrace::new(self, session_permit));
         let mut cancellation = CheckoutCancellation {
             trace: Arc::clone(&trace),
             armed: true,
@@ -320,7 +337,11 @@ impl OwnerSupervisor {
         })?;
         // actual get → actual ID → registry bind → lease 移交连续完成；其间没有 await。
         let id = Client::id(&object);
-        let owner = match self.bind(id, &trace) {
+        let owner = match self.bind(id, &trace).and_then(|owner| {
+            // bind's registry guard is gone before taking owner/custody locks.
+            trace.attach_session_permit(&owner)?;
+            Ok(owner)
+        }) {
             Ok(owner) => owner,
             Err(error) => {
                 self.fail(error);
@@ -385,16 +406,81 @@ impl OwnerSupervisor {
     }
 }
 
+/// One existing gateway-session permit, held by at most one original driver.
+/// It neither creates capacity nor treats wrapper Drop as original destruction.
+struct SessionPermitCustody {
+    state: Mutex<SessionPermitState>,
+}
+
+enum SessionPermitState {
+    Unattached(OwnedSemaphorePermit),
+    Attached {
+        original_sequence: usize,
+        permit: OwnedSemaphorePermit,
+    },
+    Released,
+}
+
+impl SessionPermitCustody {
+    fn new(permit: OwnedSemaphorePermit) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SessionPermitState::Unattached(permit)),
+        })
+    }
+
+    // Caller holds DriverOwner.session_custody: fixed owner -> custody lock order.
+    fn attach(&self, original_sequence: usize) -> Result<(), PoolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PoolError::OwnershipUnavailable)?;
+        match &*state {
+            SessionPermitState::Attached {
+                original_sequence: attached,
+                ..
+            } if *attached == original_sequence => return Ok(()),
+            SessionPermitState::Unattached(_) => {}
+            _ => return Err(PoolError::OwnershipUnavailable),
+        }
+        let previous = std::mem::replace(&mut *state, SessionPermitState::Released);
+        if let SessionPermitState::Unattached(permit) = previous {
+            *state = SessionPermitState::Attached {
+                original_sequence,
+                permit,
+            };
+            Ok(())
+        } else {
+            Err(PoolError::OwnershipUnavailable)
+        }
+    }
+
+    // Only the exact original resource's actual destruction path may release it.
+    fn finish(&self, original_sequence: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !matches!(&*state, SessionPermitState::Attached { original_sequence: attached, .. }
+            if *attached == original_sequence)
+        {
+            return;
+        }
+        let previous = std::mem::replace(&mut *state, SessionPermitState::Released);
+        if let SessionPermitState::Attached { permit, .. } = previous {
+            drop(permit);
+        }
+    }
+}
+
 struct CheckoutTrace {
     supervisor: Weak<OwnerSupervisor>,
     created: Mutex<Vec<Arc<DriverOwner>>>,
+    session_custody: Option<Arc<SessionPermitCustody>>,
 }
 
 impl CheckoutTrace {
-    fn new(supervisor: &Arc<OwnerSupervisor>) -> Self {
+    fn new(supervisor: &Arc<OwnerSupervisor>, permit: Option<OwnedSemaphorePermit>) -> Self {
         Self {
             supervisor: Arc::downgrade(supervisor),
             created: Mutex::new(Vec::new()),
+            session_custody: permit.map(SessionPermitCustody::new),
         }
     }
 
@@ -402,7 +488,16 @@ impl CheckoutTrace {
         self.supervisor.ptr_eq(&Arc::downgrade(supervisor))
     }
 
+    fn attach_session_permit(&self, owner: &DriverOwner) -> Result<(), PoolError> {
+        match &self.session_custody {
+            Some(custody) => owner.attach_session_custody(custody),
+            None => Ok(()),
+        }
+    }
+
     fn record(&self, owner: Arc<DriverOwner>) -> Result<(), PoolError> {
+        // Before spawn/first original-connect poll, without registry/created locks.
+        self.attach_session_permit(&owner)?;
         let mut created = self
             .created
             .lock()
@@ -456,6 +551,7 @@ struct DriverOwner {
     supervisor: Weak<OwnerSupervisor>,
     state: watch::Sender<ConnectionSnapshot>,
     abort: Mutex<Option<AbortHandle>>,
+    session_custody: Mutex<Option<Arc<SessionPermitCustody>>>,
 }
 
 impl DriverOwner {
@@ -466,7 +562,27 @@ impl DriverOwner {
             supervisor: Arc::downgrade(supervisor),
             state,
             abort: Mutex::new(None),
+            session_custody: Mutex::new(None),
         })
+    }
+
+    fn attach_session_custody(&self, custody: &Arc<SessionPermitCustody>) -> Result<(), PoolError> {
+        let mut held = self
+            .session_custody
+            .lock()
+            .map_err(|_| PoolError::OwnershipUnavailable)?;
+        if self.snapshot().destruction.is_some() {
+            return Err(PoolError::OwnershipUnavailable);
+        }
+        if held
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, custody))
+        {
+            return Err(PoolError::OwnershipUnavailable);
+        }
+        custody.attach(self.sequence)?;
+        *held = Some(Arc::clone(custody));
+        Ok(())
     }
 
     fn snapshot(&self) -> ConnectionSnapshot {
@@ -512,6 +628,11 @@ impl DriverOwner {
 
     /// 调用者必须已经 drop 原资源；这里仅登记之后的事实，并从 held registry 移走它。
     fn finish_after_drop(&self, destruction: ConnectionDestruction) {
+        // Serialize late attachment with actual destruction; never nest registry locks.
+        let held = self
+            .session_custody
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut first = false;
         self.state.send_modify(|state| {
             if state.destruction.is_some() {
@@ -527,6 +648,10 @@ impl DriverOwner {
             state.destruction = Some(destruction);
             first = true;
         });
+        if first && let Some(custody) = held.as_ref() {
+            custody.finish(self.sequence);
+        }
+        drop(held);
         if first && let Some(supervisor) = self.supervisor.upgrade() {
             supervisor.finish(self.sequence, self.snapshot());
         }
@@ -797,6 +922,44 @@ impl Drop for ClientLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p09_one_session_permit_cannot_bind_two_original_owners() {
+        // Pure custody state model; no PG resource or physical-close credit.
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let custody = SessionPermitCustody::new(Arc::clone(&permits).try_acquire_owned().unwrap());
+        let supervisor = OwnerSupervisor::new();
+        let first = DriverOwner::new(1, &supervisor);
+        let second = DriverOwner::new(2, &supervisor);
+        assert_eq!(first.attach_session_custody(&custody), Ok(()));
+        assert_eq!(first.attach_session_custody(&custody), Ok(()));
+        assert_eq!(
+            second.attach_session_custody(&custody),
+            Err(PoolError::OwnershipUnavailable)
+        );
+        assert_eq!(permits.available_permits(), 0);
+        second.finish_after_drop(ConnectionDestruction::ConnectingOwnerDestroyedBeforeStart);
+        assert_eq!(permits.available_permits(), 0);
+        first.finish_after_drop(ConnectionDestruction::ConnectingOwnerDestroyedBeforeStart);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn p10_finished_owner_cannot_capture_a_late_session_hold() {
+        // Pure attach/finish ordering, not an actual driver-destruction observation.
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let custody = SessionPermitCustody::new(Arc::clone(&permits).try_acquire_owned().unwrap());
+        let supervisor = OwnerSupervisor::new();
+        let finished = DriverOwner::new(1, &supervisor);
+        finished.finish_after_drop(ConnectionDestruction::ConnectingOwnerDestroyedBeforeStart);
+        assert_eq!(
+            finished.attach_session_custody(&custody),
+            Err(PoolError::OwnershipUnavailable)
+        );
+        assert_eq!(permits.available_permits(), 0);
+        drop(custody);
+        assert_eq!(permits.available_permits(), 1);
+    }
 
     #[test]
     fn creation_counter_rejects_exhaustion_without_id_wrap() {

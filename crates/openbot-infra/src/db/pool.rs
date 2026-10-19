@@ -126,8 +126,39 @@ impl DatabasePool {
             lease: Some(lease),
             deadline,
             disposition: TransactionDisposition::Unstarted,
+            always_retire: false,
         };
         if Instant::now() >= deadline {
+            return Err(PoolError::DeadlineExceeded);
+        }
+        Ok(client)
+    }
+
+    /// Same original session permit is transferred before the first stock checkout poll.
+    /// This path permanently retires its original resource, including timely-ACK cancellation.
+    #[cfg(feature = "server-runtime")]
+    pub(crate) async fn get_guarded_with_session_permit(
+        &self,
+        original_deadline: Instant,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<GuardedClient, PoolError> {
+        if Instant::now() >= original_deadline {
+            return Err(PoolError::DeadlineExceeded);
+        }
+        let lease = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(original_deadline),
+            self.supervisor
+                .checkout_with_session_permit(&self.stock, permit),
+        )
+        .await
+        .map_err(|_| PoolError::DeadlineExceeded)??;
+        let client = GuardedClient {
+            lease: Some(lease),
+            deadline: original_deadline,
+            disposition: TransactionDisposition::Unstarted,
+            always_retire: true,
+        };
+        if Instant::now() >= original_deadline {
             return Err(PoolError::DeadlineExceeded);
         }
         Ok(client)
@@ -276,6 +307,7 @@ pub(crate) struct GuardedClient {
     lease: Option<ClientLease>,
     deadline: Instant,
     disposition: TransactionDisposition,
+    always_retire: bool,
 }
 
 impl fmt::Debug for GuardedClient {
@@ -285,6 +317,15 @@ impl fmt::Debug for GuardedClient {
 }
 
 impl GuardedClient {
+    /// Retire this exact lease; the observation is not a closed acknowledgement.
+    #[cfg(feature = "server-runtime")]
+    pub(crate) fn retire_original(mut self) -> ConnectionObservation {
+        let lease = self.lease.take().expect("unconsumed guarded client");
+        let observation = lease.observation();
+        lease.release(false);
+        observation
+    }
+
     /// 只借这个原 client 的 immutable PG 查询面；不暴露 stock Object 或 mutable loan。
     pub(crate) fn as_client(&self) -> &tokio_postgres::Client {
         self.lease
@@ -354,11 +395,13 @@ impl GuardedClient {
 
 impl Drop for GuardedClient {
     fn drop(&mut self) {
-        let reusable = matches!(
-            self.disposition,
-            TransactionDisposition::CommitAcknowledged
-                | TransactionDisposition::RollbackAcknowledged
-        ) && Instant::now() < self.deadline;
+        let reusable = !self.always_retire
+            && matches!(
+                self.disposition,
+                TransactionDisposition::CommitAcknowledged
+                    | TransactionDisposition::RollbackAcknowledged
+            )
+            && Instant::now() < self.deadline;
         if let Some(lease) = self.lease.take() {
             lease.release(reusable);
         }
@@ -379,6 +422,23 @@ impl fmt::Debug for GuardedTransaction<'_> {
 }
 
 impl<'a> GuardedTransaction<'a> {
+    /// Only shorten the original owner cap, preserving its actual ACK classification.
+    #[cfg(feature = "server-runtime")]
+    pub(crate) async fn commit_before(mut self, cap: Instant) -> Result<(), TransactionOwnerError> {
+        self.deadline = self.deadline.min(cap);
+        self.commit().await
+    }
+
+    /// Only shorten the original owner cap; no external timeout replaces its ACK result.
+    #[cfg(feature = "server-runtime")]
+    pub(crate) async fn rollback_before(
+        mut self,
+        cap: Instant,
+    ) -> Result<(), TransactionOwnerError> {
+        self.deadline = self.deadline.min(cap);
+        self.rollback().await
+    }
+
     /// 不可变借用同一个原 PG 事务；所有外部 SQL await 必须继续使用原入口 deadline。
     pub(crate) fn as_transaction(&self) -> &tokio_postgres::Transaction<'a> {
         self.transaction

@@ -2051,6 +2051,9 @@ The old-source probability control recorded 10 natural setup refusals in 10 runs
 - Authorized resource maintenance retained branches and Git objects while normally retiring 27 inactive historical worktrees, 1,741 ordinary static-cache files, two verified old expanded application bundles, and verified cold archival originals. The adjusted known logical reduction is 9,031,606,606 bytes; earlier partial measurements are included, not additive. A separate authorized 51-program historical archival batch reduced logical occupancy by 3,005,681,728 bytes; 697,691 bytes of additional durable records are accounted for separately, and seven current programs were retained. Current validation maintenance removed 1,397,931,294 bytes of exact ordinary static cache and 2,186,069,089 bytes from the explicitly authorized 42 empty owned test clusters. Logs, failures, frozen inputs and executable evidence were retained. These are logical occupancy facts; exclusive APFS reclamation and whole-project cleanup are not established, and no product acceptance is created by cleanup.
 
 
+- V7-IMPL-043 source checkpoint: Added bounded consumption of the original SDK token owner into a connection with its reserved ID, using current Host checks, real metadata/profile requests, atomic PostgreSQL/Vault persistence, explicit terminal acknowledgements and readback. Independent source review and named formatting checks completed. Directed Rust compilation, the SDK dependency guard and all 67 planned tests (26 new cases and 41 existing regressions) are pending; this source checkpoint does not establish runtime acceptance, recovery, readiness or delivery.
+
+
 ### AUDIT-20261016-CANCEL-FIXTURE — restore the original cancellation test prerequisite
 
 The existing run-cancellation integration fixture now assigns its initiating actor the required user role before Begin. This is one seed SQL line; the other actor, production ACL, shared harness, ignore status and every original assertion are unchanged. The single exact ignored test `durable_cancel_is_scoped_idempotent_and_poll_terminalizes_when_no_child_exists` passed with owned PostgreSQL 17.11: one test passed, zero failed, zero ignored. It reaches the existing cross-user rejection, durable/idempotent cancellation and missed-NOTIFY terminal convergence checks. The owned PG instance stopped normally. Source formatting and diff checks pass; no production change or release acceptance is claimed. Independent finite review and normal admin delivery are pending.
@@ -2118,6 +2121,41 @@ The production-only candidate `0c41d851a61eb1be99a34268e91d9a15fe9c995c` passed 
   The Local results preserve the original finite shutdown evidence and its limits: complete daemon postmaster Child waits, individual Tokio driver joins and six prepared-bundle startup identities remain unproven. The original failures and diagnostics remain recorded. Exact-head delivery review and merge are pending; general recovery, release readiness and the overall backend goal remain open. Full CI and manual Actions were not run.
 
 
+- V7-IMPL-043 / PR #218: Normally integrated main `5646c1ef`, preserving the original SDK token-owner enrollment implementation and the delivered artifact-reference and audit changes. Both factual ledger histories remain intact. All 14 enrollment product-file blobs are unchanged from source `0544046`; the new combined candidate still requires directed compilation, the SDK dependency guard, all 67 planned tests and independent review. This integration does not establish task delivery, complete recovery or release readiness.
+
+
+### V7-IMPL-043: strict validation repair candidate
+
+The first directed Infra server-runtime strict check reported two Clippy diagnostics in the token enrollment implementation. Replace a side-effect-free lazy Option fallback with its eager value and combine the existing short-circuit reader-failure condition into a let-chain. API, schema, feature edges, error ordering, resource closure and test assertions are unchanged. The original exit 101 evidence is retained; independent review and exact candidate validation remain pending.
+
+
+### V7-IMPL-043: minimal feature compatibility repair candidate
+
+Match the private history writer module and its native transaction-validation leaf to their existing server-runtime or desktop-local-vault consumers. This removes unreachable private leaves from the minimal graph while retaining the vault generic repository definition and both active feature graphs. SQL bodies, validation, error classification and public interfaces are unchanged. The original minimal strict diagnostics are retained; independent review and precise candidate checks remain pending.
+
+
+### V7-IMPL-043: Server test target compilation repair candidate
+
+Add the existing SecretBytes type import used by two enrollment vectors and explicitly reject the four enrollment-only terminal stages in the original token-dispatch test helper. Its three token branches, fixture behavior and all planned test names remain unchanged. The previous Server lib-test compile exited 101 and is retained. Independent source review accepts these two test-only changes; the new precise candidate still requires Server test compilation, original harness lists and all 67 runtime cases. Earlier strict and SDK evidence retains its original scope, including the Desktop host-tool warning.
+
+
+### 2026-10-19 - V7-IMPL-043 cold cancellation fixture
+
+The first directed Infra runtime passed 19 pure cases, then failed q01 because the fresh single-connection test pool had already been probed; q02 did not run. The fixture now uses the existing unprobed pool constructor, preserving every assertion, permit limit, cancellation and wait sequence. Production code and q02 are byte-identical. Independent source review accepted this single test-only hunk. Current candidate compile, lists and runtime remain pending; prior results retain their original candidate attribution.
+
+
+V7-IMPL-043 test maintenance: Correct two enrollment test SQL column identifiers to the existing audit target_type column, covering the persisted count and owned rejection trigger. Existing predicates, assertions, production schema and authorization remain unchanged. The observed failed run is retained; compilation and runtime of this repair are not yet validated.
+
+
+### 2026-10-19 - V7-IMPL-043 implementation acceptance
+
+Completed the SDK whole-token enrollment implementation at product source `d8ed080335bf4ad0918f445e82587d5fc058cbcd`. Enrollment retains the original token owner and the existing authority, journal and resource boundaries; public API and migration contracts remain within the registered task.
+
+Independent review accepted five directed strict checks, the SDK dependency guard, three test-harness build results, six executable-list results and all 67 selected runtime cases: 19 pure cases and 48 cases using owned PostgreSQL. The final Server source passed its 34 exact cases. The earlier Infra 21 and Gateway 12 results retain their original source attribution and are reused after independent input-applicability review, as are the earlier strict and SDK results. Owned PostgreSQL shutdown acknowledgments, original postmaster waits, empty temporary-database tails and shared-resource release were accepted within their recorded scope.
+
+The original failed attempts and host LLVM diagnostic remain preserved. Individual production driver joins, continuous physical concurrency bounds and SDK allocator internals remain unproven. This ledger-only successor still requires precise delivery review and normal merge; complete recovery, release readiness and the overall backend goal remain open. Full CI and manual Actions were not run.
+
+
 - V7-IMPL-044: Added an independent PostgreSQL 17.11 maintenance toolchain source candidate, including a controlled build recipe, authenticated four-program inventory, closed Desktop consumer and owned backup/restore fixtures. The build and native owners preserve finite operation budgets and original child, worker, pipe and driver ownership.
 
   Finite independent source reviews have covered the recorded changes and closed their reported concrete findings. Complete native reachability and secret-copy review, directed compilation, executable lists, 16 ordinary cases, actual authenticated native bundle construction and six explicitly ignored native cases remain pending. This is a source candidate; native usability, production release, full recovery and backend completion are not claimed. Full CI and manual Actions were not run.
@@ -2144,3 +2182,6 @@ The first targeted Rust strict check reported ten Clippy errors in the existing 
 - V7-IMPL-044 / PR #223: The targeted Desktop strict check reached seventeen diagnostics after the bounded preview repair. Fifteen diagnostics in the maintenance module now use equivalent short-circuit expressions, checked capacity arithmetic and private argument tuples with the same values. Independent source review passed 149 checks, including complete inverse reconstruction, unchanged protocol assertions, original waits and other product inputs. Two dead-code diagnostics in unchanged legacy sidecar files remain unresolved.
 
   The preceding source produced a non-test xtask binary with independent build acceptance; its original source identity is retained. Current candidate compilation, ordinary cases, authenticated native construction and recovery acceptance remain pending. The original failures and LLVM stripping warning remain recorded. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: Normally integrated delivered SDK enrollment main 83055ce0. The original maintenance toolchain product files, dependency pins, native patch and build profile remain unchanged. Both factual ledger histories are retained. Earlier maintenance build evidence keeps its original source attribution and requires applicability review on this combined candidate; actual native toolchain build, bundle verification and owned PostgreSQL acceptance remain pending.

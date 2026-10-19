@@ -33,10 +33,16 @@ use zeroize::Zeroizing;
 mod authority_sql;
 mod callback;
 mod current;
+pub(crate) mod enrollment;
 mod registration;
 #[cfg(test)]
 mod tests;
 mod token;
+pub use enrollment::{
+    GatewayAuthorizationEnrollmentAccountReason, GatewayAuthorizationEnrollmentCleanupState,
+    GatewayAuthorizationEnrollmentError, GatewayAuthorizationEnrollmentKind,
+    GatewayAuthorizationEnrollmentStage, GatewayAuthorizationEnrollmentWriteTerminal,
+};
 
 pub use callback::{
     CallbackErrorKind, CallbackStage, GatewayAuthorizationCallbackError,
@@ -1830,3 +1836,20 @@ redacted!(
     TokenCaptureOwner,
     GatewayAuthorizationTokenOwner
 );
+
+impl GatewayAuthorizationJournal {
+    /// Consume the original whole token owner into only its same-ID gateway adoption.
+    pub async fn enroll_token_owner(
+        self: &Arc<Self>,
+        auth: &AuthContext,
+        owner: GatewayAuthorizationTokenOwner,
+        accounts: &crate::gateway_authority::PostgresGatewayAccounts,
+        name: &str,
+        outcomes: Arc<dyn crate::gateway_transport::GatewayHttpOutcomes>,
+    ) -> Result<
+        crate::gateway_authority::GatewayConnectionReceipt,
+        GatewayAuthorizationEnrollmentError,
+    > {
+        enrollment::enroll(self, auth, owner, accounts, name, outcomes).await
+    }
+}
