@@ -642,10 +642,10 @@ impl OwnedFixtureSource {
         let sql = self.connect_ready(source_index).await?;
         let payload = bundle::encode_hex(&self.operation);
         let setup = format!(
-            "CREATE TABLE wrokbot_maintenance_sentinel(id bigint PRIMARY KEY,payload text NOT NULL); \
+            "BEGIN; CREATE TABLE wrokbot_maintenance_sentinel(id bigint PRIMARY KEY,payload text NOT NULL); \
             INSERT INTO wrokbot_maintenance_sentinel VALUES(1,'owned-{payload}'); \
             CREATE TABLE wrokbot_maintenance_rollback(id bigint PRIMARY KEY); \
-            BEGIN; INSERT INTO wrokbot_maintenance_rollback VALUES(1); ROLLBACK;"
+            COMMIT; BEGIN; INSERT INTO wrokbot_maintenance_rollback VALUES(1); ROLLBACK;"
         );
         self.query_owned(sql, setup, true).await?;
         self.query_owned(sql, "SELECT pg_switch_wal()".to_owned(), false)

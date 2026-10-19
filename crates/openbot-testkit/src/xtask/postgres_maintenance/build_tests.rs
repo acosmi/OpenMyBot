@@ -397,7 +397,26 @@ fn build_profile_and_child_deadline_are_explicit() {
     };
     // This isolates archive-capacity admission; it does not authenticate a fixture as PG source.
     let environment = serde_json::to_value(&profile.recipe.environment).unwrap();
-    assert_eq!(environment.as_object().unwrap().len(), 11);
+    assert_eq!(
+        environment
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "AR",
+            "CC",
+            "CFLAGS",
+            "CPPFLAGS",
+            "LC_ALL",
+            "LDFLAGS",
+            "MACOSX_DEPLOYMENT_TARGET",
+            "PATH",
+            "RANLIB",
+            "SDKROOT",
+        ])
+    );
     assert!(environment.get("DEVELOPER_DIR").is_none());
     assert_ne!(
         actual_recipe_hash(&profile.recipe).unwrap(),

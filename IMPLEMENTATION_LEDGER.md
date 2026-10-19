@@ -2211,3 +2211,8 @@ V7-IMPL-044 / PR #223: Targeted Clippy returned 101 for two redundant u64 conver
 
 
 V7-IMPL-044 / PR #223: The native build failed while linking stock PostgreSQL programs because the common logging archive referenced the maintenance owner's hook. The hook is now compiled only for the distinct maintenance role, which links a private frontend logging object with its existing owner. Source pins match the finite two-family repair. Independent source review passed; actual native linkage, bundle validation, backup, recovery and restart acceptance remain pending. Earlier failures are retained. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The owned maintenance fixture now commits its fixed table and sentinel setup before its separate rollback probe. The build test checks the exact ten serialized environment keys while retaining the separate developer-tool binding and subsequent capacity assertions. Independent source review passed for both finite repairs.
+
+Earlier directed results remain fifteen passing ordinary tests and one failure; the first native attempt also failed before the backup helper started. Validation of this candidate remains pending. Earlier failures and the strict legacy-file scope hold are retained. Full CI and manual Actions were not run.
