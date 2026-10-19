@@ -256,6 +256,7 @@ pub async fn begin_run(
     let thread_id = ThreadId::new(thread_id);
     let command = match body {
         DecodedBeginThreadRunBody::Legacy(body) => AppCommand::BeginThreadRun(BeginThreadRun {
+            artifact_refs: body.artifact_refs,
             model_selection: body.model_selection,
             selected_skill_slugs: body.selected_skill_slugs,
             thread_id,
@@ -265,6 +266,7 @@ pub async fn begin_run(
             message: body.message,
         }),
         DecodedBeginThreadRunBody::V2(body) => AppCommand::BeginThreadRunV2(BeginThreadRunV2 {
+            artifact_refs: body.artifact_refs,
             model_selection: body.model_selection,
             selected_skill_slugs: body.selected_skill_slugs,
             thread_id,
@@ -1100,6 +1102,7 @@ mod tests {
                     tenant: TenantId::new("tenant-test"),
                     actor: ActorId::new("u1"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: Some(
                             openbot_contracts::model_connections::RunModelSelection {
                                 connection_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
@@ -1117,6 +1120,38 @@ mod tests {
                     },
                 }]
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_refs_v1_v2_body_mapping_reaches_the_original_shape_guard() {
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for selection in [
+            serde_json::Value::Null,
+            serde_json::json!({
+                "schemaVersion": 2, "source": "custom",
+                "connectionId": "0196ea23-b506-73c8-8153-213383fdc24a",
+                "expectedConnectionRevision": 1, "modelId": "model",
+                "expectedCatalogRevision": 1
+            }),
+        ] {
+            let directory = FakeThreadDirectory::new(Ok(true));
+            let visible = directory.clone();
+            let wire = serde_json::json!({
+                "runId": "artifact-forwarding", "botId": "agent-1",
+                "anchor": {"kind": "direct_bot"}, "message": "unchanged",
+                "modelSelection": selection, "artifactRefs": ["not-a-uuid-v7"]
+            });
+            let (status, _, body) = begin_request(
+                app(directory, FixedAuthResolver::granting(auth("u1"))),
+                Some("https://app.example.test"),
+                thread,
+                &wire.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "malformed_payload");
+            assert!(visible.begin_calls().is_empty());
         }
     }
 

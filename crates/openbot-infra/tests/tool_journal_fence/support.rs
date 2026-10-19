@@ -62,6 +62,7 @@ impl Fixture {
                 actor: ActorId::new(ACTOR),
                 auth_generation: AuthGeneration::new(0),
                 command: BeginThreadRun {
+                    artifact_refs: Vec::new(),
                     model_selection: None,
                     selected_skill_slugs: Vec::new(),
                     thread_id: thread,

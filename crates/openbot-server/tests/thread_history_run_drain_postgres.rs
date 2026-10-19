@@ -385,6 +385,7 @@ impl Fixture {
             actor: auth.actor().clone(),
             auth_generation: auth.auth_generation(),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment()).mint_from_entropy(entropy),
                 run_id: RunId::new(format!("owned-drain-run-{index}")),
                 bot_id: BotId::new(BOT),
@@ -1745,6 +1746,7 @@ async fn thread_history_run_drain_streaming_and_custom_v2_start_window_terminate
                 actor: a.actor().clone(),
                 auth_generation: a.auth_generation(),
                 command: BeginThreadRunV2 {
+                    artifact_refs: Vec::new(),
                     thread_id: base.command.thread_id.clone(),
                     run_id: base.command.run_id.clone(),
                     bot_id: base.command.bot_id.clone(),

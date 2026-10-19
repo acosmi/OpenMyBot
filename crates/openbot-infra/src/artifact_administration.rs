@@ -872,6 +872,37 @@ impl PostgresArtifactAdministration {
             "available" => {}
             _ => return Err(corrupt("read_status")),
         }
+        let DecodedArtifactReadPayload {
+            source,
+            workspace,
+            length,
+            sha256,
+            cleanup_armed,
+        } = self.decode_available_read_payload(auth, row)?;
+        if cleanup_armed {
+            return Err(unavailable());
+        }
+        let blob = ArtifactBlob::from_record(
+            Uuid::parse_str(&source.artifact_id).map_err(|_| corrupt("read_artifact_id"))?,
+            length,
+            parse_digest(&sha256)?,
+        )
+        .map_err(|_| corrupt("read_blob_binding"))?;
+        Ok(ObservedArtifactReadRecord {
+            store: Arc::clone(&self.store),
+            blob,
+            auth_snapshot: auth.clone(),
+            source_snapshot: source,
+            workspace_snapshot: workspace,
+        })
+    }
+
+    // Shared actual available-row invariants; this makes no byte allocation, FD or read grant.
+    fn decode_available_read_payload(
+        &self,
+        auth: &AuthContext,
+        row: &Row,
+    ) -> Result<DecodedArtifactReadPayload, ArtifactAdministrationError> {
         let source = decode_receipt(row)?; // Actual row IDs, never a historical receipt lookup.
         if source.owner_actor_id != *auth.actor()
             || canonical_artifact_uuid_v7(&source.artifact_id).as_deref()
@@ -941,25 +972,49 @@ impl PostgresArtifactAdministration {
             &source.artifact_id,
         )
         .map_err(|_| corrupt("read_cleanup_fence"))?;
-        if let Some(fence) = decode_read_cleanup_fence(row, &record_key)? {
-            return Err(match fence.phase() {
-                ArtifactCleanupFencePhase::Armed => unavailable(),
-                ArtifactCleanupFencePhase::Completed => corrupt("read_cleanup_fence"),
-            });
-        }
-        let blob = ArtifactBlob::from_record(
-            Uuid::parse_str(&source.artifact_id).map_err(|_| corrupt("read_artifact_id"))?,
+        let cleanup_armed = match decode_read_cleanup_fence(row, &record_key)? {
+            None => false,
+            Some(fence) => match fence.phase() {
+                ArtifactCleanupFencePhase::Armed => true,
+                ArtifactCleanupFencePhase::Completed => return Err(corrupt("read_cleanup_fence")),
+            },
+        };
+        Ok(DecodedArtifactReadPayload {
+            source,
+            workspace,
             length,
-            parse_digest(&sha256)?,
-        )
-        .map_err(|_| corrupt("read_blob_binding"))?;
-        Ok(ObservedArtifactReadRecord {
-            store: Arc::clone(&self.store),
-            blob,
-            auth_snapshot: auth.clone(),
-            source_snapshot: source,
-            workspace_snapshot: workspace,
+            sha256,
+            cleanup_armed,
         })
+    }
+
+    fn decode_run_input_metadata(
+        &self,
+        auth: &AuthContext,
+        row: &Row,
+    ) -> Result<
+        openbot_application::artifacts::RunInputArtifactMetadataObservation,
+        ArtifactAdministrationError,
+    > {
+        if !value::<bool>(row, "current_store_binding")?
+            || !self.store.matches_registry_owner(&self.registry)
+        {
+            return Err(unavailable());
+        }
+        match value::<String>(row, "status")?.as_str() {
+            "available" => {}
+            "failed_partial" | "deleted" | "expired" => {
+                return Err(ArtifactAdministrationError::NotVisible);
+            }
+            _ => return Err(corrupt("read_status")),
+        }
+        let cleanup_armed = self.decode_available_read_payload(auth, row)?.cleanup_armed;
+        Ok(
+            openbot_application::artifacts::RunInputArtifactMetadataObservation {
+                metadata: decode_metadata(row)?,
+                cleanup_armed,
+            },
+        )
     }
 
     async fn connection(
@@ -1744,6 +1799,25 @@ impl PostgresArtifactAdministration {
 
 #[async_trait]
 impl ArtifactAdministration for PostgresArtifactAdministration {
+    async fn observe_run_input_metadata_current(
+        &self,
+        auth: &AuthContext,
+        canonical_artifact_id: &str,
+        original_preread_deadline: std::time::Instant,
+    ) -> Result<
+        openbot_application::artifacts::RunInputArtifactMetadataObservation,
+        openbot_contracts::error::AppError,
+    > {
+        let authority = self.read_authority.get().ok_or(
+            openbot_contracts::error::AppError::DependencyUnavailable {
+                dependency: "artifacts",
+            },
+        )?;
+        authority
+            .run_input_metadata_current(auth, canonical_artifact_id, original_preread_deadline)
+            .await
+    }
+
     async fn prepare_host_bound_artifact_read(
         &self,
         auth: &AuthContext,
@@ -1999,6 +2073,14 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
         Ok(metadata)
         }).await.map_err(|_| unavailable())?
     }
+}
+
+struct DecodedArtifactReadPayload {
+    source: ArtifactRegistrationReceipt,
+    workspace: ArtifactWorkspaceKey,
+    length: u64,
+    sha256: String,
+    cleanup_armed: bool,
 }
 
 struct Source {

@@ -859,6 +859,9 @@ pub struct BeginThreadRun {
     /// Explicitly selected granted skills, in invocation order. Rust resolves instruction bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_skill_slugs: Vec<String>,
+    /// Referenced artifacts, in caller order; authority is checked during admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
 }
 
 /// Native HTTP body for beginning a run on the thread identified by the route path.
@@ -879,6 +882,9 @@ pub struct BeginThreadRunBody {
     /// Explicit skill selection; omitted/empty preserves the original no-skill request.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_skill_slugs: Vec<String>,
+    /// Referenced artifacts, in caller order; authority is checked during admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
 }
 
 /// v2 foreground 输入；模型、凭据、scope 和 dataset 权限由原事务重新核验。
@@ -900,6 +906,9 @@ pub struct BeginThreadRunV2 {
     /// 有序技能选择，省略表示空集合。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_skill_slugs: Vec<String>,
+    /// Referenced artifacts, in caller order; authority is checked during admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
 }
 
 impl core::fmt::Debug for BeginThreadRunV2 {
@@ -925,6 +934,9 @@ pub struct BeginThreadRunV2Body {
     /// 有序技能选择，省略表示空集合。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_skill_slugs: Vec<String>,
+    /// Referenced artifacts, in caller order; authority is checked during admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
 }
 
 impl core::fmt::Debug for BeginThreadRunV2Body {
@@ -1348,6 +1360,69 @@ mod tests {
     use super::*;
     use time::macros::datetime;
 
+    #[test]
+    fn artifact_refs_dtos_preserve_omitted_empty_and_ordered_wire() {
+        macro_rules! check {
+            ($dto:ty, $original:expr) => {{
+                let original = $original;
+                let omitted: $dto = serde_json::from_value(original.clone()).unwrap();
+                assert!(omitted.artifact_refs.is_empty());
+                assert_eq!(serde_json::to_value(&omitted).unwrap(), original);
+                let original_bytes = serde_json::to_vec(&omitted).unwrap();
+
+                let mut empty_wire = original.clone();
+                empty_wire["artifactRefs"] = serde_json::json!([]);
+                let empty: $dto = serde_json::from_value(empty_wire).unwrap();
+                assert_eq!(empty, omitted);
+                assert_eq!(serde_json::to_vec(&empty).unwrap(), original_bytes);
+
+                let refs = vec![
+                    "0196ea23-b507-73c8-8153-213383fdc24a".to_owned(),
+                    "0196ea23-b506-73c8-8153-213383fdc24a".to_owned(),
+                ];
+                let mut populated = omitted;
+                populated.artifact_refs = refs.clone();
+                let wire = serde_json::to_value(&populated).unwrap();
+                assert_eq!(wire["artifactRefs"], serde_json::json!(refs));
+                let round_trip: $dto = serde_json::from_value(wire).unwrap();
+                assert_eq!(round_trip, populated);
+
+                let mut unknown = original.clone();
+                unknown["artifactRef"] = serde_json::json!([]);
+                assert!(serde_json::from_value::<$dto>(unknown).is_err());
+                for malformed in [
+                    serde_json::Value::Null,
+                    serde_json::json!("not-an-array"),
+                    serde_json::json!([1]),
+                ] {
+                    let mut value = original.clone();
+                    value["artifactRefs"] = malformed;
+                    assert!(serde_json::from_value::<$dto>(value).is_err());
+                }
+            }};
+        }
+
+        let body = serde_json::json!({
+            "runId": "run-1", "botId": "bot-1",
+            "anchor": {"kind": "direct_bot"}, "message": "unchanged"
+        });
+        check!(BeginThreadRunBody, body.clone());
+        let mut command = body.clone();
+        command["threadId"] = serde_json::json!("thread-1");
+        check!(BeginThreadRun, command);
+
+        let mut v2_body = body;
+        v2_body["modelSelection"] = serde_json::json!({
+            "schemaVersion": 2, "source": "custom",
+            "connectionId": "0196ea23-b506-73c8-8153-213383fdc24a",
+            "expectedConnectionRevision": 1, "modelId": "model",
+            "expectedCatalogRevision": 1
+        });
+        check!(BeginThreadRunV2Body, v2_body.clone());
+        v2_body["threadId"] = serde_json::json!("thread-1");
+        check!(BeginThreadRunV2, v2_body);
+    }
+
     fn sample_summary() -> ChannelSummary {
         ChannelSummary {
             id: ChannelId::new("legacy-channel-42"),
@@ -1520,6 +1595,7 @@ mod tests {
         let begin = BeginThreadRunBody {
             model_selection: None,
             selected_skill_slugs: Vec::new(),
+            artifact_refs: Vec::new(),
             run_id: RunId::new("run-1"),
             bot_id: BotId::new("bot-1"),
             anchor: ThreadRunAnchor::Channel {
@@ -1721,6 +1797,7 @@ mod tests {
         let begin = AppCommand::BeginThreadRun(BeginThreadRun {
             model_selection: None,
             selected_skill_slugs: Vec::new(),
+            artifact_refs: Vec::new(),
             thread_id: ThreadId::new("550e8400-e29b-81d4-a716-446655440000"),
             run_id: RunId::new("run-1"),
             bot_id: BotId::new("bot-1"),

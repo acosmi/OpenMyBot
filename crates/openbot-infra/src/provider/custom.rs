@@ -602,7 +602,7 @@ mod v2_vault_tests {
                     api_key:ModelApiKey::new(Zeroizing::new("OWNED_V2_VAULT_CALL_CANARY".into())).unwrap()}).await.unwrap();
                 let mut entropy=[0u8;16];entropy[8..].copy_from_slice(&(500+mode).to_be_bytes());
                 let req=BeginThreadRunV2Request{deployment:DeploymentId::new(DEP),tenant:TenantId::new(TENANT),actor:ActorId::new("alice"),auth_generation:AuthGeneration::new(7),
-                    command:BeginThreadRunV2{thread_id:ThreadIdentity::new(&DeploymentId::new(DEP)).mint_from_entropy(entropy),run_id:RunId::new(format!("owned-vault-run-{mode}")),
+                    command:BeginThreadRunV2{artifact_refs: Vec::new(),thread_id:ThreadIdentity::new(&DeploymentId::new(DEP)).mint_from_entropy(entropy),run_id:RunId::new(format!("owned-vault-run-{mode}")),
                         bot_id:BotId::new("bot"),anchor:ThreadRunAnchor::DirectBot,message:"Owned vault observation words".into(),selected_skill_slugs:vec![],
                         model_selection:RunModelSelectionV2::new(ModelSelectionIntentSource::Custom,model.id.clone(),model.revision,format!("custom:{}",model.id),1).unwrap()}};
                 directory.begin_thread_run_v2(req.clone()).await.unwrap();
@@ -783,6 +783,7 @@ mod v2_vault_tests {
                 actor: ActorId::new("alice"),
                 auth_generation: AuthGeneration::new(7),
                 command: BeginThreadRunV2 {
+                    artifact_refs: Vec::new(),
                     thread_id: ThreadIdentity::new(self.auth.deployment())
                         .mint_from_entropy(entropy),
                     run_id: RunId::new(format!("owned-concurrent-run-{index}")),

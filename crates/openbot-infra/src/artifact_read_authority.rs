@@ -1,7 +1,7 @@
 //! Private original-host first-chunk consumer. The final own-Pool RC statement observes host
 //! and source together; the original FD and initialized RAII buffer survive every final await.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,7 @@ pub struct PostgresArtifactReadAuthority {
     administration: Weak<PostgresArtifactAdministration>,
     identity: Arc<()>,
     lifecycle: Arc<ArtifactReadLifecycle>,
+    run_input_metadata_targets: Mutex<Vec<Weak<RequestedRunInputMetadataTarget>>>,
     #[cfg(test)]
     save_receipt_rollback_gate: Mutex<Option<save_receipt::SaveReceiptRollbackGate>>,
     #[cfg(test)]
@@ -179,6 +180,7 @@ impl PostgresArtifactReadAuthority {
             administration: Arc::downgrade(administration),
             identity: Arc::new(()),
             lifecycle: ArtifactReadLifecycle::new(),
+            run_input_metadata_targets: Mutex::new(Vec::new()),
             #[cfg(test)]
             save_receipt_rollback_gate: Mutex::new(None),
             #[cfg(test)]
@@ -193,6 +195,81 @@ impl PostgresArtifactReadAuthority {
     /// The exact same authority/root inventory, never a request-created tracker.
     pub fn read_lifecycle(&self) -> Arc<ArtifactReadLifecycle> {
         Arc::clone(&self.lifecycle)
+    }
+
+    /// A Requested-only observation; the original Host control protocol never asks for a FD.
+    pub(super) async fn run_input_metadata_current(
+        self: &Arc<Self>,
+        auth: &AuthContext,
+        artifact_id: &str,
+        deadline: Instant,
+    ) -> Result<openbot_application::artifacts::RunInputArtifactMetadataObservation, AppError> {
+        remaining(deadline)?;
+        if openbot_contracts::artifacts::canonical_artifact_uuid_v7(artifact_id).as_deref()
+            != Some(artifact_id)
+        {
+            return Err(ArtifactReadCurrentError::Unavailable.into());
+        }
+        let original = auth.request_binding().ok_or_else(host_unavailable)?;
+        let target = Arc::new(RequestedRunInputMetadataTarget {
+            id: artifact_id.to_owned(),
+            auth: auth.clone(),
+            identity: Arc::clone(&self.identity),
+            result: Mutex::new(None),
+            closure_unproven: AtomicBool::new(false),
+        });
+        {
+            let mut targets = self
+                .run_input_metadata_targets
+                .try_lock()
+                .map_err(|_| host_unavailable())?;
+            targets.retain(|target| target.strong_count() != 0);
+            targets.push(Arc::downgrade(&target));
+        }
+        let _registration = RunInputMetadataRegistration {
+            authority: self,
+            target: Arc::downgrade(&target),
+        };
+        // A filled inner result is never a substitute for complete outer Host/control success.
+        let witness = original
+            .verify_artifact_read_control_current_before(auth, target.as_ref(), deadline)
+            .await?;
+        original.verify_artifact_read_control_tail(auth, witness.as_ref(), deadline)?;
+        remaining(deadline)?;
+        if target.closure_unproven.load(Ordering::SeqCst) {
+            return Err(ArtifactReadCurrentError::Unavailable.into());
+        }
+        let result = target
+            .result
+            .try_lock()
+            .map_err(|_| host_unavailable())?
+            .take()
+            .ok_or_else(host_unavailable)?;
+        original.verify_artifact_read_control_tail(auth, witness.as_ref(), deadline)?;
+        remaining(deadline)?;
+        if target.closure_unproven.load(Ordering::SeqCst) {
+            return Err(ArtifactReadCurrentError::Unavailable.into());
+        }
+        result.map_err(Into::into)
+    }
+
+    fn run_input_metadata_target(
+        &self,
+        target: &dyn ArtifactReadCurrentTarget,
+    ) -> Result<Option<Arc<RequestedRunInputMetadataTarget>>, ArtifactReadCurrentError> {
+        let mut targets = self
+            .run_input_metadata_targets
+            .try_lock()
+            .map_err(|_| host_unavailable())?;
+        targets.retain(|target| target.strong_count() != 0);
+        Ok(targets.iter().filter_map(Weak::upgrade).find(|candidate| {
+            // Compare the actual upgraded Arc's data, never a codegen-dependent trait vtable.
+            std::ptr::addr_eq(candidate.as_ref() as &dyn ArtifactReadCurrentTarget, target)
+                && candidate.matches_authority(&self.identity)
+                && candidate.matches_auth(&candidate.auth)
+                && candidate.lookup_id() == target.lookup_id()
+                && target.matches_auth(&candidate.auth)
+        }))
     }
 
     pub(super) async fn prepare_host_bound_artifact_read(
@@ -826,6 +903,7 @@ impl PostgresArtifactReadAuthority {
         deadline: Instant,
         rollback_guard: &JointRollbackGuard<'_>,
     ) -> Result<Box<dyn ArtifactReadTailWitness>, ArtifactReadCurrentError> {
+        let run_input_metadata = self.run_input_metadata_target(target)?;
         rollback_guard.schema_started();
         let mut client = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline.min(Instant::now() + super::WAIT)),
@@ -894,6 +972,15 @@ impl PostgresArtifactReadAuthority {
             // Host classification is first even for a missing/invisible/gone source. Retain the
             // current host witness on error paths, so rollback cannot outlive its clock/owner.
             let witness = decode_host(administration, auth, &row, &host)?;
+            if let Some(collected) = &run_input_metadata {
+                let observation = (|| {
+                    let id: Option<String> = super::value(&row, "artifact_id").map_err(source_error)?;
+                    if id.is_none() { return Err(ArtifactReadCurrentError::NotVisible); }
+                    administration.decode_run_input_metadata(auth, &row).map_err(source_error)
+                })();
+                return Ok::<_, ArtifactReadCurrentError>((witness,
+                    CurrentSourceObservation::RunInput { target: Arc::clone(collected), observation: Box::new(observation) }));
+            }
             let source = (|| {
                 let id: Option<String> = super::value(&row, "artifact_id").map_err(source_error)?;
                 if id.is_none() { return Err(ArtifactReadCurrentError::NotVisible); }
@@ -906,7 +993,7 @@ impl PostgresArtifactReadAuthority {
                 }) { return Err(ArtifactReadCurrentError::Unavailable); }
                 Ok(())
             })();
-            Ok::<_, ArtifactReadCurrentError>((witness, source))
+            Ok::<_, ArtifactReadCurrentError>((witness, CurrentSourceObservation::Body(source)))
         }.await;
         // Every real statement result, including host/source errors, awaits explicit rollback.
         // A dropped/timeout future is not reported as acknowledged rollback or worker completion.
@@ -924,7 +1011,13 @@ impl PostgresArtifactReadAuthority {
         remaining(deadline)?;
         rollback?;
         let (witness, source) = outcome?;
-        source?;
+        match source {
+            CurrentSourceObservation::Body(source) => source?,
+            CurrentSourceObservation::RunInput {
+                target,
+                observation,
+            } => target.publish(*observation)?,
+        }
         Ok(Box::new(witness))
     }
 }
@@ -1196,6 +1289,87 @@ impl ArtifactReadCurrentTarget for ActualArtifactReadTarget {
             .map_err(|_| ArtifactReadCurrentError::Unavailable)?
             .verify_physical_current()
             .map_err(|_| ArtifactReadCurrentError::Unavailable)
+    }
+}
+
+enum CurrentSourceObservation {
+    Body(Result<(), ArtifactReadCurrentError>),
+    RunInput {
+        target: Arc<RequestedRunInputMetadataTarget>,
+        observation: Box<
+            Result<
+                openbot_application::artifacts::RunInputArtifactMetadataObservation,
+                ArtifactReadCurrentError,
+            >,
+        >,
+    },
+}
+
+struct RequestedRunInputMetadataTarget {
+    id: String,
+    auth: AuthContext,
+    identity: Arc<()>,
+    result: Mutex<
+        Option<
+            Result<
+                openbot_application::artifacts::RunInputArtifactMetadataObservation,
+                ArtifactReadCurrentError,
+            >,
+        >,
+    >,
+    closure_unproven: AtomicBool,
+}
+impl RequestedRunInputMetadataTarget {
+    fn publish(
+        &self,
+        observation: Result<
+            openbot_application::artifacts::RunInputArtifactMetadataObservation,
+            ArtifactReadCurrentError,
+        >,
+    ) -> Result<(), ArtifactReadCurrentError> {
+        if self.closure_unproven.load(Ordering::SeqCst) {
+            return Err(ArtifactReadCurrentError::Unavailable);
+        }
+        let mut result = self.result.try_lock().map_err(|_| host_unavailable())?;
+        if result.is_some() {
+            return Err(ArtifactReadCurrentError::Unavailable);
+        }
+        *result = Some(observation);
+        Ok(())
+    }
+}
+impl ArtifactReadCurrentTarget for RequestedRunInputMetadataTarget {
+    fn mark_rollback_unproven(&self) {
+        self.closure_unproven.store(true, Ordering::SeqCst);
+    }
+    fn lookup_id(&self) -> &str {
+        &self.id
+    }
+    fn matches_authority(&self, identity: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, identity)
+    }
+    fn matches_auth(&self, auth: &AuthContext) -> bool {
+        same_original_auth(&self.auth, auth)
+    }
+    fn matches_current_record(&self, _actual: ArtifactReadRecordFacts<'_>) -> bool {
+        false
+    }
+    fn verify_physical_current(&self) -> Result<(), ArtifactReadCurrentError> {
+        Err(ArtifactReadCurrentError::Unavailable)
+    }
+}
+
+struct RunInputMetadataRegistration<'a> {
+    authority: &'a PostgresArtifactReadAuthority,
+    target: Weak<RequestedRunInputMetadataTarget>,
+}
+impl Drop for RunInputMetadataRegistration<'_> {
+    fn drop(&mut self) {
+        // No wait during cancellation. A missed removal leaves only a Weak pruned on next use.
+        if let Ok(mut targets) = self.authority.run_input_metadata_targets.try_lock() {
+            targets
+                .retain(|target| !Weak::ptr_eq(target, &self.target) && target.strong_count() != 0);
+        }
     }
 }
 

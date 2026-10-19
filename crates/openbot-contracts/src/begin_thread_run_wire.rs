@@ -64,7 +64,7 @@ impl<'de> Deserialize<'de> for BodyProbe<'de> {
             }
 
             fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-                let mut seen = [false; 6];
+                let mut seen = [false; 7];
                 let mut selection = None;
                 while let Some(key) = map.next_key::<String>()? {
                     let index = match key.as_str() {
@@ -74,6 +74,7 @@ impl<'de> Deserialize<'de> for BodyProbe<'de> {
                         "anchor" => 3,
                         "message" => 4,
                         "selectedSkillSlugs" => 5,
+                        "artifactRefs" => 6,
                         _ => return Err(de::Error::custom("invalid_begin_thread_run_body")),
                     };
                     if seen[index] {
@@ -197,4 +198,109 @@ pub fn decode_begin_thread_run_body(
         return Err(malformed);
     }
     Ok(DecodedBeginThreadRunBody::V2(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::versioned_model_selection::MAX_MODEL_SELECTION_JSON_BYTES;
+
+    const V2: &str = r#"{"schemaVersion":2,"source":"custom","connectionId":"0196ea23-b506-73c8-8153-213383fdc24a","expectedConnectionRevision":1,"modelId":"m\u006fdel","expectedCatalogRevision":1}"#;
+    const REFS: &str =
+        r#"["0196ea23-b507-73c8-8153-213383fdc24a","0196ea23-b506-73c8-8153-213383fdc24a"]"#;
+
+    fn body(selection: Option<&str>, refs: &str) -> String {
+        let selection = selection.unwrap_or("null");
+        format!(
+            r#"{{"modelSelection":{selection},"runId":"run-1","botId":"bot-1","anchor":{{"kind":"direct_bot"}},"message":"unchanged","selectedSkillSlugs":[],"artifactRefs":{refs}}}"#
+        )
+    }
+
+    #[test]
+    fn artifact_refs_seventh_key_preserves_v1_v2_and_reference_order() {
+        let expected = vec![
+            "0196ea23-b507-73c8-8153-213383fdc24a".to_owned(),
+            "0196ea23-b506-73c8-8153-213383fdc24a".to_owned(),
+        ];
+        for selection in [None, Some(V2)] {
+            let input = body(selection, REFS);
+            match decode_begin_thread_run_body(input.as_bytes()).unwrap() {
+                DecodedBeginThreadRunBody::Legacy(value) => {
+                    assert!(selection.is_none());
+                    assert_eq!(value.artifact_refs, expected);
+                }
+                DecodedBeginThreadRunBody::V2(value) => {
+                    assert!(selection.is_some());
+                    assert_eq!(value.artifact_refs, expected);
+                    assert_eq!(value.model_selection.model_id(), "model");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_refs_duplicate_key_and_escaped_alias_stay_malformed() {
+        for selection in [None, Some(V2)] {
+            let input = body(selection, REFS);
+            let prefix = input.strip_suffix('}').unwrap();
+            for duplicate in [
+                format!(r#"{prefix},"artifactRefs":[]}}"#),
+                format!(r#"{prefix},"artifact\u0052efs":[]}}"#),
+            ] {
+                assert_eq!(
+                    decode_begin_thread_run_body(duplicate.as_bytes()),
+                    Err(BeginThreadRunDecodeError::MalformedBody)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_refs_wrong_json_shape_and_unknown_key_stay_malformed() {
+        for selection in [None, Some(V2)] {
+            for refs in ["null", r#""not-an-array""#, "[null]", "[1]", "{}"] {
+                let input = body(selection, refs);
+                assert_eq!(
+                    decode_begin_thread_run_body(input.as_bytes()),
+                    Err(BeginThreadRunDecodeError::MalformedBody)
+                );
+            }
+            let input = body(selection, REFS);
+            let prefix = input.strip_suffix('}').unwrap();
+            let unknown = format!(r#"{prefix},"artifactRef":[]}}"#);
+            assert_eq!(
+                decode_begin_thread_run_body(unknown.as_bytes()),
+                Err(BeginThreadRunDecodeError::MalformedBody)
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_refs_preserve_original_v2_selection_lexeme_budget() {
+        let padding = " ".repeat(MAX_MODEL_SELECTION_JSON_BYTES - V2.len());
+        let exact = format!("{padding}{V2}");
+        let input = body(Some(&exact), REFS);
+        let DecodedBeginThreadRunBody::V2(value) =
+            decode_begin_thread_run_body(input.as_bytes()).unwrap()
+        else {
+            panic!("original v2 selection must remain v2");
+        };
+        assert_eq!(value.model_selection.model_id(), "model");
+        let oversized = format!(" {exact}");
+        let input = body(Some(&oversized), REFS);
+        assert_eq!(
+            decode_begin_thread_run_body(input.as_bytes()),
+            Err(BeginThreadRunDecodeError::ModelSelectionTooLarge)
+        );
+    }
+
+    #[test]
+    fn artifact_refs_omitted_in_original_legacy_sequence_defaults_empty() {
+        let input = br#"[null,"run-1","bot-1",{"kind":"direct_bot"},"unchanged",[]]"#;
+        let DecodedBeginThreadRunBody::Legacy(value) = decode_begin_thread_run_body(input).unwrap()
+        else {
+            panic!("original sequence must remain legacy");
+        };
+        assert!(value.artifact_refs.is_empty());
+    }
 }

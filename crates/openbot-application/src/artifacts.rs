@@ -76,9 +76,30 @@ impl ArtifactAdministrationError {
     }
 }
 
+/// A zero-body current observation for run input admission, never a later read or write grant.
+pub struct RunInputArtifactMetadataObservation {
+    /// Actual metadata, retaining the existing closed status variants.
+    pub metadata: ArtifactMetadata,
+    /// Whether this available object has the complete valid armed cleanup fence.
+    pub cleanup_armed: bool,
+}
+
 /// Shared authenticated port; each implementation owns its current transaction and byte proof.
 #[async_trait]
 pub trait ArtifactAdministration: Send + Sync {
+    /// Observe current Host/source metadata and valid armed state under the shared preread limit.
+    /// Unsupported adapters must not fall back to a save producer or infer an unarmed record.
+    async fn observe_run_input_metadata_current(
+        &self,
+        _auth: &AuthContext,
+        _canonical_artifact_id: &str,
+        _original_preread_deadline: std::time::Instant,
+    ) -> Result<RunInputArtifactMetadataObservation, AppError> {
+        Err(AppError::DependencyUnavailable {
+            dependency: "artifacts",
+        })
+    }
+
     /// Prepare the same actual retained FD before publishing a memory-only reader locator.
     /// The immutable deadline was anchored by Application before its first await.
     async fn prepare_host_bound_artifact_read(
@@ -411,7 +432,7 @@ pub async fn get_artifact_metadata(
     Ok(metadata)
 }
 
-async fn require_current_request_binding(auth: &AuthContext) -> Result<(), AppError> {
+pub(crate) async fn require_current_request_binding(auth: &AuthContext) -> Result<(), AppError> {
     use openbot_contracts::request_binding::HostRequestBindingError;
     let binding = auth
         .request_binding()

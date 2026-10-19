@@ -20,6 +20,9 @@ pub(super) fn input_content(command: &BeginThreadRun) -> Value {
     if !command.selected_skill_slugs.is_empty() {
         content["selectedSkillSlugs"] = json!(command.selected_skill_slugs);
     }
+    if !command.artifact_refs.is_empty() {
+        content["artifactRefs"] = json!(command.artifact_refs);
+    }
     if let Some(selection) = &command.model_selection {
         content["modelSelection"] = json!(selection);
     }
@@ -35,6 +38,9 @@ pub(super) fn input_content_v2(command: &BeginThreadRunV2) -> Value {
     });
     if !command.selected_skill_slugs.is_empty() {
         content["selectedSkillSlugs"] = json!(command.selected_skill_slugs);
+    }
+    if !command.artifact_refs.is_empty() {
+        content["artifactRefs"] = json!(command.artifact_refs);
     }
     content
 }

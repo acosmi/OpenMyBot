@@ -252,6 +252,7 @@ impl Fixture {
             actor: ActorId::new("alice"),
             auth_generation: AuthGeneration::new(7),
             command: BeginThreadRunV2 {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&DeploymentId::new(DEP)).mint_from_entropy(entropy),
                 run_id: RunId::new(format!("custom-run-{index}")),
                 bot_id: BotId::new("bot"),
@@ -1182,6 +1183,7 @@ async fn unconfigured_constructor_closes_v2_and_keeps_actual_legacy_v1_route() {
             actor: ActorId::new("alice"),
             auth_generation: AuthGeneration::new(7),
             command: openbot_contracts::command::BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&DeploymentId::new(DEP)).mint_from_entropy(entropy),
                 run_id: RunId::new("owned-v2-legacy-compat-121"),
                 bot_id: BotId::new("bot"),

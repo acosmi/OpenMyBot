@@ -103,6 +103,7 @@ fn auth() -> AuthContext {
 fn command(raw: &[u8]) -> AppCommand {
     match decode_begin_thread_run_body(raw).unwrap() {
         DecodedBeginThreadRunBody::Legacy(body) => AppCommand::BeginThreadRun(BeginThreadRun {
+            artifact_refs: Vec::new(),
             model_selection: body.model_selection,
             thread_id: ThreadId::new(THREAD),
             run_id: body.run_id,
@@ -112,6 +113,7 @@ fn command(raw: &[u8]) -> AppCommand {
             selected_skill_slugs: body.selected_skill_slugs,
         }),
         DecodedBeginThreadRunBody::V2(body) => AppCommand::BeginThreadRunV2(BeginThreadRunV2 {
+            artifact_refs: Vec::new(),
             model_selection: body.model_selection,
             thread_id: ThreadId::new(THREAD),
             run_id: body.run_id,

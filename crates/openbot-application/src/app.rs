@@ -896,10 +896,10 @@ where
                 get_thread_status(&self.threads, auth, &thread_id).await?,
             )),
             AppCommand::BeginThreadRun(command) => Ok(AppReply::ThreadRunStarted(
-                begin_thread_run(&self.threads, auth, command).await?,
+                begin_thread_run(&self.threads, self.artifacts.as_ref(), auth, command).await?,
             )),
             AppCommand::BeginThreadRunV2(command) => Ok(AppReply::ThreadRunStarted(
-                begin_thread_run_v2(&self.threads, auth, command).await?,
+                begin_thread_run_v2(&self.threads, self.artifacts.as_ref(), auth, command).await?,
             )),
             AppCommand::CancelThreadRun(command) => Ok(AppReply::ThreadRunCancellation(
                 cancel_thread_run(&self.threads, auth, command).await?,
@@ -1604,6 +1604,7 @@ mod tests {
             AppCommand::BeginThreadRun(BeginThreadRun {
                 model_selection: None,
                 selected_skill_slugs: Vec::new(),
+                artifact_refs: Vec::new(),
                 thread_id: ThreadId::new("550e8400-e29b-81d4-a716-446655440000"),
                 run_id: RunId::new("run-thread"),
                 bot_id: BotId::new("bot-1"),
@@ -1960,6 +1961,7 @@ mod tests {
             AppCommand::BeginThreadRun(BeginThreadRun {
                 model_selection: None,
                 selected_skill_slugs: Vec::new(),
+                artifact_refs: Vec::new(),
                 thread_id: thread_id.clone(),
                 run_id: run_id.clone(),
                 bot_id: BotId::new("bot-1"),

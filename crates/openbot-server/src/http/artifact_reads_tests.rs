@@ -305,6 +305,7 @@ impl Fixture {
             actor: ActorId::new(OWNER),
             auth_generation: AuthGeneration::new(0),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([8; 16]),
                 run_id: RunId::new("actual/current-read-run%成果"),
                 bot_id: BotId::new("current-read-bot"),
@@ -1029,6 +1030,7 @@ impl ActualSingleUserRead {
             actor: auth.actor().clone(),
             auth_generation: auth.auth_generation(),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([17; 16]),
                 run_id: RunId::new(format!("single-user-read-{}", Uuid::now_v7())),
                 bot_id: BotId::new("current-read-bot"),

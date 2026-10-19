@@ -53,6 +53,7 @@ fn request(
         tenant: TenantId::new("tenant-a"),
         actor: ActorId::new(actor),
         command: BeginThreadRun {
+            artifact_refs: Vec::new(),
             model_selection: None,
             selected_skill_slugs: Vec::new(),
             thread_id: ThreadIdentity::new(deployment).mint_from_entropy(entropy),
@@ -593,6 +594,7 @@ async fn existing_legacy_uuid_is_writable_but_a_new_foreign_uuid_is_rejected() {
                 tenant: TenantId::new("tenant-a"),
                 actor: ActorId::new("actor-a"),
                 command: BeginThreadRun {
+                    artifact_refs: Vec::new(),
                     model_selection: None,
                     selected_skill_slugs: Vec::new(),
                     thread_id: ThreadIdentity::new(&foreign_deployment).mint_from_entropy(entropy),

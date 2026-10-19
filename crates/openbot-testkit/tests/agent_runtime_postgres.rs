@@ -588,6 +588,7 @@ async fn provider_delta_flows_through_agent_host_into_replay_history_and_termina
                     tenant,
                     actor: ActorId::new("actor-a"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: None,
                         selected_skill_slugs: Vec::new(),
                         thread_id: thread.clone(),
@@ -1710,6 +1711,7 @@ async fn remote_agui_row_routes_through_safe_sse_into_durable_text_reasoning_and
                     tenant: tenant.clone(),
                     actor: ActorId::new("actor-a"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: None,
                         selected_skill_slugs: Vec::new(),
                         thread_id: thread,
@@ -2168,6 +2170,7 @@ async fn remote_agui_interrupt_resolves_through_application_and_makes_a_second_s
                     tenant: tenant.clone(),
                     actor: ActorId::new("actor-a"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: None,
                         selected_skill_slugs: Vec::new(),
                         thread_id: ThreadIdentity::new(&deployment).mint_from_entropy(entropy),
@@ -3280,6 +3283,7 @@ async fn begin_test_run_for_bot(
             tenant: tenant.clone(),
             actor: ActorId::new("actor-a"),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 model_selection: None,
                 selected_skill_slugs: Vec::new(),
                 thread_id: thread.clone(),

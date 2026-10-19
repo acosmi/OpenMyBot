@@ -1,5 +1,11 @@
 //! Native thread ID 与可见性用例（v3 §4.1 / §4.3，API ledger T-API-0035/0036）。
 
+use std::time::{Duration, Instant};
+
+use openbot_contracts::artifacts::{
+    ArtifactMetadata, ArtifactRecordMetadata, MAX_ARTIFACT_BYTES, canonical_artifact_uuid_v7,
+    is_valid_artifact_identity, is_valid_artifact_sha256,
+};
 use openbot_contracts::auth::AuthContext;
 use openbot_contracts::command::{
     BeginThreadRun, BeginThreadRunV2, CancelThreadRun, MAX_THREAD_MESSAGE_BYTES,
@@ -10,10 +16,13 @@ use openbot_contracts::error::AppError;
 use openbot_contracts::ids::ThreadId;
 use openbot_contracts::ids::thread::ThreadIdentity;
 
+use sha2::{Digest, Sha256};
+
+use crate::artifacts::{ArtifactAdministration, require_current_request_binding};
 use crate::ports::{
     BeginThreadRunRequest, BeginThreadRunV2Request, CancelThreadRunRequest,
-    ChannelActivitySubscription, ThreadConversationRequest, ThreadDirectory,
-    ThreadEventSubscription, ThreadHistoryRequest,
+    ChannelActivitySubscription, RunInputArtifactMaterial, ThreadConversationRequest,
+    ThreadDirectory, ThreadEventSubscription, ThreadHistoryRequest,
 };
 use crate::service::AppEventStream;
 
@@ -51,8 +60,9 @@ pub async fn get_thread_status<D: ThreadDirectory>(
 /// 校验 caller-controlled 字段后，把一次 foreground turn 交给唯一事务端口。
 pub async fn begin_thread_run<D: ThreadDirectory>(
     directory: &D,
+    artifacts: &dyn ArtifactAdministration,
     auth: &AuthContext,
-    command: BeginThreadRun,
+    mut command: BeginThreadRun,
 ) -> Result<ThreadRunStarted, AppError> {
     if !ThreadIdentity::is_plausible(&command.thread_id) {
         return Err(AppError::MalformedPayload { field: "thread_id" });
@@ -91,23 +101,41 @@ pub async fn begin_thread_run<D: ThreadDirectory>(
             field: "model_selection",
         });
     }
-    directory
-        .begin_thread_run(BeginThreadRunRequest {
-            auth_generation: auth.auth_generation(),
-            deployment: auth.deployment().clone(),
-            tenant: auth.tenant().clone(),
-            actor: auth.actor().clone(),
-            command,
-        })
-        .await
-        .map_err(|error| error.into_app_error())
+    normalize_artifact_refs(&mut command.artifact_refs)?;
+    let request = BeginThreadRunRequest {
+        auth_generation: auth.auth_generation(),
+        deployment: auth.deployment().clone(),
+        tenant: auth.tenant().clone(),
+        actor: auth.actor().clone(),
+        command,
+    };
+    if request.command.artifact_refs.is_empty() {
+        return directory
+            .begin_thread_run(request)
+            .await
+            .map_err(|error| error.into_app_error());
+    }
+    require_current_request_binding(auth).await?;
+    let replay = directory.observe_begin_replay(request.clone()).await;
+    require_current_request_binding(auth).await?;
+    if let Some(receipt) = replay.map_err(|error| error.into_app_error())? {
+        return Ok(receipt);
+    }
+    let materials =
+        preread_artifact_materials(artifacts, auth, &request.command.artifact_refs).await?;
+    let result = directory
+        .begin_thread_run_with_artifacts(request, materials)
+        .await;
+    require_current_request_binding(auth).await?;
+    result.map_err(|error| error.into_app_error())
 }
 
 /// 核验 v2 原值、消息及技能预算，再交唯一真实事务端口；不降为 v1。
 pub async fn begin_thread_run_v2<D: ThreadDirectory>(
     directory: &D,
+    artifacts: &dyn ArtifactAdministration,
     auth: &AuthContext,
-    command: BeginThreadRunV2,
+    mut command: BeginThreadRunV2,
 ) -> Result<ThreadRunStarted, AppError> {
     if !ThreadIdentity::is_plausible(&command.thread_id) {
         return Err(AppError::MalformedPayload { field: "thread_id" });
@@ -145,16 +173,199 @@ pub async fn begin_thread_run_v2<D: ThreadDirectory>(
             field: "model_selection",
         });
     }
-    directory
-        .begin_thread_run_v2(BeginThreadRunV2Request {
-            auth_generation: auth.auth_generation(),
-            deployment: auth.deployment().clone(),
-            tenant: auth.tenant().clone(),
-            actor: auth.actor().clone(),
-            command,
-        })
+    normalize_artifact_refs(&mut command.artifact_refs)?;
+    let request = BeginThreadRunV2Request {
+        auth_generation: auth.auth_generation(),
+        deployment: auth.deployment().clone(),
+        tenant: auth.tenant().clone(),
+        actor: auth.actor().clone(),
+        command,
+    };
+    if request.command.artifact_refs.is_empty() {
+        return directory
+            .begin_thread_run_v2(request)
+            .await
+            .map_err(|error| error.into_app_error());
+    }
+    require_current_request_binding(auth).await?;
+    let replay = directory.observe_begin_replay_v2(request.clone()).await;
+    require_current_request_binding(auth).await?;
+    if let Some(receipt) = replay.map_err(|error| error.into_app_error())? {
+        return Ok(receipt);
+    }
+    let materials =
+        preread_artifact_materials(artifacts, auth, &request.command.artifact_refs).await?;
+    let result = directory
+        .begin_thread_run_with_artifacts_v2(request, materials)
+        .await;
+    require_current_request_binding(auth).await?;
+    result.map_err(|error| error.into_app_error())
+}
+
+fn artifact_refs_malformed() -> AppError {
+    AppError::MalformedPayload {
+        field: "artifact_refs",
+    }
+}
+
+fn artifact_input_unavailable() -> AppError {
+    AppError::DependencyUnavailable {
+        dependency: "artifacts",
+    }
+}
+
+fn normalize_artifact_refs(refs: &mut Vec<String>) -> Result<(), AppError> {
+    if refs.len() > 8 {
+        return Err(artifact_refs_malformed());
+    }
+    let mut canonical = Vec::with_capacity(refs.len());
+    for id in refs.iter() {
+        let id = canonical_artifact_uuid_v7(id).ok_or_else(artifact_refs_malformed)?;
+        if canonical.contains(&id) {
+            return Err(artifact_refs_malformed());
+        }
+        canonical.push(id);
+    }
+    *refs = canonical;
+    Ok(())
+}
+
+fn require_preread_time(deadline: Instant) -> Result<(), AppError> {
+    if Instant::now() >= deadline {
+        Err(artifact_input_unavailable())
+    } else {
+        Ok(())
+    }
+}
+
+async fn preread_before<T>(
+    deadline: Instant,
+    future: impl std::future::Future<Output = Result<T, AppError>>,
+) -> Result<T, AppError> {
+    require_preread_time(deadline)?;
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
         .await
-        .map_err(|error| error.into_app_error())
+        .map_err(|_| artifact_input_unavailable())?
+}
+
+fn validate_input_metadata(
+    auth: &AuthContext,
+    id: &str,
+    record: &ArtifactRecordMetadata,
+) -> Result<(), AppError> {
+    if record.artifact_id != id
+        || &record.deployment_id != auth.deployment()
+        || &record.tenant_id != auth.tenant()
+        || &record.owner_actor_id != auth.actor()
+        || !is_valid_artifact_identity(record.deployment_id.as_str())
+        || !is_valid_artifact_identity(record.tenant_id.as_str())
+        || !is_valid_artifact_identity(record.owner_actor_id.as_str())
+        || !is_valid_artifact_identity(&record.dataset_id)
+        || !ThreadIdentity::is_plausible(&record.source_thread_id)
+        || !is_valid_artifact_identity(record.source_run_id.as_str())
+        || !is_valid_artifact_identity(&record.media_type)
+        || !is_valid_artifact_sha256(&record.sha256)
+        || record.byte_length > MAX_ARTIFACT_BYTES
+    {
+        return Err(artifact_input_unavailable());
+    }
+    Ok(())
+}
+
+fn input_media_is_text(media_type: &str) -> bool {
+    let essence = media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    essence.starts_with("text/") || essence == "application/json"
+}
+
+async fn preread_artifact_materials(
+    artifacts: &dyn ArtifactAdministration,
+    auth: &AuthContext,
+    refs: &[String],
+) -> Result<Vec<RunInputArtifactMaterial>, AppError> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(artifact_input_unavailable)?;
+    let mut observations = Vec::with_capacity(refs.len());
+    for id in refs {
+        require_preread_time(deadline)?;
+        preread_before(deadline, require_current_request_binding(auth)).await?;
+        let result = preread_before(
+            deadline,
+            artifacts.observe_run_input_metadata_current(auth, id, deadline),
+        )
+        .await;
+        // Keep even an error intact until the original Host postcheck has completed.
+        preread_before(deadline, require_current_request_binding(auth)).await?;
+        require_preread_time(deadline)?;
+        let observation = result?;
+        let ArtifactMetadata::Available(record) = observation.metadata else {
+            return Err(AppError::NotVisible);
+        };
+        observations.push((record, observation.cleanup_armed));
+    }
+    // Finish every reference's current visibility/status check before either refusal below.
+    for (id, (record, _)) in refs.iter().zip(&observations) {
+        validate_input_metadata(auth, id, record)?;
+    }
+    if observations.iter().any(|(_, armed)| *armed) {
+        return Err(artifact_input_unavailable());
+    }
+    let mut text_bytes = 0_u64;
+    for (record, _) in &observations {
+        if input_media_is_text(&record.media_type) {
+            if record.byte_length > 256 * 1024 {
+                return Err(artifact_refs_malformed());
+            }
+            text_bytes = text_bytes
+                .checked_add(record.byte_length)
+                .ok_or_else(artifact_refs_malformed)?;
+            if text_bytes > 1024 * 1024 {
+                return Err(artifact_refs_malformed());
+            }
+        }
+    }
+    let mut materials = Vec::with_capacity(observations.len());
+    for (record, _) in observations {
+        require_preread_time(deadline)?;
+        let body = if input_media_is_text(&record.media_type) {
+            preread_before(deadline, require_current_request_binding(auth)).await?;
+            let result = preread_before(
+                deadline,
+                artifacts.read_host_bound_chunk(auth, &record.artifact_id),
+            )
+            .await;
+            preread_before(deadline, require_current_request_binding(auth)).await?;
+            require_preread_time(deadline)?;
+            let bytes = result?.handoff(auth)?;
+            require_preread_time(deadline)?;
+            if u64::try_from(bytes.len()).ok() != Some(record.byte_length)
+                || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+            {
+                return Err(artifact_input_unavailable());
+            }
+            let text = String::from_utf8(bytes).map_err(|_| artifact_input_unavailable())?;
+            require_preread_time(deadline)?;
+            Some(text)
+        } else {
+            None
+        };
+        materials.push(RunInputArtifactMaterial {
+            artifact_id: record.artifact_id,
+            dataset_id: record.dataset_id,
+            sha256: record.sha256,
+            media_type: record.media_type,
+            byte_length: record.byte_length,
+            source_thread_id: record.source_thread_id,
+            source_run_id: record.source_run_id,
+            body,
+        });
+    }
+    require_preread_time(deadline)?;
+    Ok(materials)
 }
 
 /// Validate public identities, then persist cancellation through the single authority-aware port.
@@ -604,6 +815,7 @@ mod tests {
         BeginThreadRun {
             model_selection: None,
             selected_skill_slugs: Vec::new(),
+            artifact_refs: Vec::new(),
             thread_id: ThreadId::new("550e8400-e29b-81d4-a716-446655440000"),
             run_id: openbot_contracts::ids::RunId::new("run-1"),
             bot_id: openbot_contracts::ids::BotId::new("bot-1"),
@@ -640,6 +852,7 @@ mod tests {
             anchor: old.anchor,
             message: old.message,
             selected_skill_slugs: vec!["one".to_owned(), "two".to_owned()],
+            artifact_refs: Vec::new(),
         }
     }
 
@@ -648,7 +861,13 @@ mod tests {
         let directory = begin_directory(Err(ThreadDirectoryError::Unavailable));
         let command = begin_v2_command();
         assert_eq!(
-            begin_thread_run_v2(&directory, &auth(), command.clone()).await,
+            begin_thread_run_v2(
+                &directory,
+                &crate::artifacts::NoArtifactAdministration,
+                &auth(),
+                command.clone()
+            )
+            .await,
             Err(AppError::DependencyUnavailable {
                 dependency: "thread_directory"
             })
@@ -710,7 +929,13 @@ mod tests {
             dependency: "thread_directory",
         });
         assert_eq!(
-            begin_thread_run_v2(&directory, &auth(), begin_v2_command()).await,
+            begin_thread_run_v2(
+                &directory,
+                &crate::artifacts::NoArtifactAdministration,
+                &auth(),
+                begin_v2_command()
+            )
+            .await,
             closed
         );
         assert!(directory.0.calls.lock().unwrap().is_empty());
@@ -718,6 +943,7 @@ mod tests {
         assert_eq!(
             begin_thread_run_v2(
                 &crate::ports::NoThreadDirectory,
+                &crate::artifacts::NoArtifactAdministration,
                 &auth(),
                 begin_v2_command()
             )
@@ -725,9 +951,14 @@ mod tests {
             closed
         );
         assert_eq!(
-            begin_thread_run(&directory, &auth(), old_command)
-                .await
-                .unwrap(),
+            begin_thread_run(
+                &directory,
+                &crate::artifacts::NoArtifactAdministration,
+                &auth(),
+                old_command
+            )
+            .await
+            .unwrap(),
             expected
         );
         assert_eq!(directory.0.calls.lock().unwrap().len(), 1);
@@ -793,7 +1024,13 @@ mod tests {
         for command in commands {
             let directory = begin_directory(Err(ThreadDirectoryError::Unavailable));
             assert!(matches!(
-                begin_thread_run_v2(&directory, &auth(), command).await,
+                begin_thread_run_v2(
+                    &directory,
+                    &crate::artifacts::NoArtifactAdministration,
+                    &auth(),
+                    command
+                )
+                .await,
                 Err(AppError::MalformedPayload { .. })
             ));
             assert!(directory.calls.lock().unwrap().is_empty());
@@ -810,7 +1047,13 @@ mod tests {
         ] {
             let directory = begin_directory(Err(error));
             assert_eq!(
-                begin_thread_run_v2(&directory, &auth(), begin_v2_command()).await,
+                begin_thread_run_v2(
+                    &directory,
+                    &crate::artifacts::NoArtifactAdministration,
+                    &auth(),
+                    begin_v2_command()
+                )
+                .await,
                 Err(AppError::ReconciliationRequired { accepted: true })
             );
             assert!(directory.calls.lock().unwrap().is_empty());
@@ -838,9 +1081,14 @@ mod tests {
         let directory = begin_directory(Ok(expected.clone()));
         let command = begin_command();
         assert_eq!(
-            begin_thread_run(&directory, &auth(), command.clone())
-                .await
-                .unwrap(),
+            begin_thread_run(
+                &directory,
+                &crate::artifacts::NoArtifactAdministration,
+                &auth(),
+                command.clone()
+            )
+            .await
+            .unwrap(),
             expected
         );
         assert_eq!(
@@ -912,9 +1160,14 @@ mod tests {
         for (field, command) in invalid {
             let directory = begin_directory(Err(ThreadDirectoryError::Unavailable));
             assert_eq!(
-                begin_thread_run(&directory, &auth(), command)
-                    .await
-                    .unwrap_err(),
+                begin_thread_run(
+                    &directory,
+                    &crate::artifacts::NoArtifactAdministration,
+                    &auth(),
+                    command
+                )
+                .await
+                .unwrap_err(),
                 AppError::MalformedPayload { field }
             );
             assert!(directory.calls.lock().expect("fake lock").is_empty());
@@ -928,7 +1181,13 @@ mod tests {
             let mut command = begin_command();
             command.selected_skill_slugs = slugs;
             assert_eq!(
-                begin_thread_run(&directory, &auth(), command).await,
+                begin_thread_run(
+                    &directory,
+                    &crate::artifacts::NoArtifactAdministration,
+                    &auth(),
+                    command
+                )
+                .await,
                 Err(AppError::MalformedPayload {
                     field: "selected_skill_slugs"
                 }),
@@ -964,9 +1223,14 @@ mod tests {
         ] {
             let directory = begin_directory(Err(port));
             assert_eq!(
-                begin_thread_run(&directory, &auth(), begin_command())
-                    .await
-                    .unwrap_err(),
+                begin_thread_run(
+                    &directory,
+                    &crate::artifacts::NoArtifactAdministration,
+                    &auth(),
+                    begin_command()
+                )
+                .await
+                .unwrap_err(),
                 expected
             );
         }
@@ -1260,5 +1524,688 @@ mod tests {
             AppError::MalformedPayload { field: "thread_id" }
         );
         assert!(directory.calls.lock().expect("fake lock").is_empty());
+    }
+    const INPUT_A: &str = "019a7778-abcd-7abc-8abc-0123456789ab";
+    const INPUT_B: &str = "019a7778-abcd-7abc-8abc-0123456789ac";
+
+    // Synthetic witnesses below exercise only Application ordering, not a live Host or PG.
+    struct InputHostGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl openbot_contracts::HostRequestBindingGuard for InputHostGuard {
+        fn verify_current<'a>(
+            &'a self,
+            _auth: &'a AuthContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), openbot_contracts::HostRequestBindingError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(openbot_contracts::HostRequestBindingError::NotCurrent)
+                }
+            })
+        }
+    }
+
+    fn input_auth() -> (
+        openbot_contracts::RequestBindingOwnerLease,
+        AuthContext,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let auth = auth();
+        let (owner, issuer) = openbot_contracts::RequestBindingOwnerLease::for_trusted_host(
+            openbot_contracts::HostRequestBindingKind::DesktopWindow,
+        );
+        let binding = issuer
+            .bind_desktop_window(
+                &auth,
+                "input-ordering-unit".into(),
+                1,
+                std::sync::Arc::new(InputHostGuard(current.clone())),
+            )
+            .unwrap();
+        (
+            owner,
+            auth.with_verified_request_binding(binding).unwrap(),
+            current,
+        )
+    }
+
+    fn input_record(id: &str, media_type: &str, bytes: &[u8]) -> ArtifactRecordMetadata {
+        use openbot_contracts::artifacts::{ArtifactRetentionClass, ArtifactWorkspace};
+        let auth = auth();
+        let source = begin_command();
+        ArtifactRecordMetadata {
+            artifact_id: id.into(),
+            deployment_id: auth.deployment().clone(),
+            tenant_id: auth.tenant().clone(),
+            dataset_id: "input-dataset".into(),
+            owner_actor_id: auth.actor().clone(),
+            workspace: ArtifactWorkspace::Thread {
+                id: source.thread_id.as_str().into(),
+            },
+            source_thread_id: source.thread_id,
+            source_run_id: source.run_id,
+            source_call_seq: None,
+            source_attempt_seq: None,
+            media_type: media_type.into(),
+            byte_length: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            retention_class: ArtifactRetentionClass::ExplicitSaved,
+            saved_by: Some(auth.actor().clone()),
+            saved_at: Some(time::OffsetDateTime::UNIX_EPOCH),
+        }
+    }
+
+    struct InputTarget(String);
+    impl openbot_contracts::request_binding::ArtifactReadCurrentTarget for InputTarget {
+        fn lookup_id(&self) -> &str {
+            &self.0
+        }
+        fn matches_authority(&self, _: &std::sync::Arc<()>) -> bool {
+            true
+        }
+        fn matches_auth(&self, _: &AuthContext) -> bool {
+            true
+        }
+        fn matches_current_record(
+            &self,
+            _: openbot_contracts::request_binding::ArtifactReadRecordFacts<'_>,
+        ) -> bool {
+            true
+        }
+        fn verify_physical_current(
+            &self,
+        ) -> Result<(), openbot_contracts::request_binding::ArtifactReadCurrentError> {
+            Ok(())
+        }
+    }
+    struct InputTail;
+    impl openbot_contracts::request_binding::ArtifactReadTailWitness for InputTail {
+        fn verify_current(
+            &self,
+            _: &AuthContext,
+            deadline: Instant,
+        ) -> Result<(), openbot_contracts::request_binding::ArtifactReadCurrentError> {
+            if Instant::now() < deadline {
+                Ok(())
+            } else {
+                Err(openbot_contracts::request_binding::ArtifactReadCurrentError::Unavailable)
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct InputArtifacts {
+        records: Vec<(String, ArtifactMetadata, bool)>,
+        metadata_calls: Mutex<Vec<String>>,
+        deadlines: Mutex<Vec<Instant>>,
+        reads: std::sync::atomic::AtomicUsize,
+        body: Vec<u8>,
+        revoke_on_metadata: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        revoke_on_body: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+    #[async_trait]
+    impl ArtifactAdministration for InputArtifacts {
+        async fn observe_run_input_metadata_current(
+            &self,
+            _auth: &AuthContext,
+            id: &str,
+            deadline: Instant,
+        ) -> Result<crate::artifacts::RunInputArtifactMetadataObservation, AppError> {
+            self.metadata_calls.lock().unwrap().push(id.into());
+            self.deadlines.lock().unwrap().push(deadline);
+            if let Some(current) = &self.revoke_on_metadata {
+                current.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            let (_, metadata, armed) = self
+                .records
+                .iter()
+                .find(|(key, _, _)| key == id)
+                .ok_or(AppError::NotVisible)?;
+            Ok(crate::artifacts::RunInputArtifactMetadataObservation {
+                metadata: metadata.clone(),
+                cleanup_armed: *armed,
+            })
+        }
+        async fn read_host_bound_chunk(
+            &self,
+            auth: &AuthContext,
+            id: &str,
+        ) -> Result<crate::CurrentArtifactReadChunk, AppError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(current) = &self.revoke_on_body {
+                current.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err(AppError::NotVisible);
+            }
+            let mut pending =
+                openbot_contracts::artifact_read::PendingArtifactReadBuffer::new_initialized()
+                    .map_err(|_| artifact_input_unavailable())?;
+            pending.initialized_mut()[..self.body.len()].copy_from_slice(&self.body);
+            pending
+                .record_actual_length(self.body.len())
+                .map_err(|_| artifact_input_unavailable())?;
+            crate::CurrentArtifactReadChunk::from_trusted_observation(
+                pending,
+                auth.clone(),
+                std::sync::Arc::new(InputTarget(id.into())),
+                Box::new(InputTail),
+                Instant::now() + Duration::from_secs(5),
+            )
+        }
+        async fn save_run_message_text(
+            &self,
+            _: &AuthContext,
+            _: openbot_contracts::artifacts::SaveRunMessageTextArtifact,
+        ) -> Result<
+            openbot_contracts::artifacts::ArtifactRegistrationReceipt,
+            crate::artifacts::ArtifactAdministrationError,
+        > {
+            panic!("run input must never call the save producer")
+        }
+        async fn get_metadata(
+            &self,
+            _: &AuthContext,
+            _: &str,
+        ) -> Result<ArtifactMetadata, crate::artifacts::ArtifactAdministrationError> {
+            panic!("run input must use the dedicated zero-body current observer")
+        }
+    }
+
+    struct InputDirectory {
+        replay: Result<Option<ThreadRunStarted>, ThreadDirectoryError>,
+        write_result: Result<ThreadRunStarted, ThreadDirectoryError>,
+        observed_refs: Mutex<Vec<Vec<String>>>,
+        material_ids: Mutex<Vec<String>>,
+        revoke_on_observe: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        revoke_on_write: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+    impl InputDirectory {
+        fn miss() -> Self {
+            Self {
+                replay: Ok(None),
+                write_result: Err(ThreadDirectoryError::CommitUnknown),
+                observed_refs: Mutex::new(Vec::new()),
+                material_ids: Mutex::new(Vec::new()),
+                revoke_on_observe: None,
+                revoke_on_write: None,
+            }
+        }
+        fn observed(
+            &self,
+            refs: Vec<String>,
+        ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+            self.observed_refs.lock().unwrap().push(refs);
+            if let Some(current) = &self.revoke_on_observe {
+                current.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.replay.clone()
+        }
+        fn wrote(
+            &self,
+            materials: Vec<RunInputArtifactMaterial>,
+        ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+            *self.material_ids.lock().unwrap() =
+                materials.into_iter().map(|m| m.artifact_id).collect();
+            if let Some(current) = &self.revoke_on_write {
+                current.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.write_result.clone()
+        }
+    }
+    #[async_trait]
+    impl ThreadDirectory for InputDirectory {
+        async fn mint_thread_id(&self, _: &DeploymentId) -> Result<ThreadId, ThreadDirectoryError> {
+            panic!("input path must not mint before its original transaction")
+        }
+        async fn thread_known(
+            &self,
+            _: &DeploymentId,
+            _: &TenantId,
+            _: &ActorId,
+            _: &ThreadId,
+        ) -> Result<bool, ThreadDirectoryError> {
+            panic!("shape must not query the directory")
+        }
+        async fn observe_begin_replay(
+            &self,
+            request: BeginThreadRunRequest,
+        ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+            self.observed(request.command.artifact_refs)
+        }
+        async fn observe_begin_replay_v2(
+            &self,
+            request: BeginThreadRunV2Request,
+        ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+            self.observed(request.command.artifact_refs)
+        }
+        async fn begin_thread_run_with_artifacts(
+            &self,
+            _: BeginThreadRunRequest,
+            materials: Vec<RunInputArtifactMaterial>,
+        ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+            self.wrote(materials)
+        }
+        async fn begin_thread_run_with_artifacts_v2(
+            &self,
+            _: BeginThreadRunV2Request,
+            materials: Vec<RunInputArtifactMaterial>,
+        ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+            self.wrote(materials)
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_refs_shape_is_zero_ports_for_both_versions() {
+        let directory = InputDirectory::miss();
+        let artifacts = InputArtifacts::default();
+        for refs in [
+            vec!["not-an-artifact".into()],
+            vec![INPUT_A.into(), INPUT_A.to_uppercase()],
+            vec![INPUT_A.into(); 9],
+        ] {
+            let mut command = begin_command();
+            command.artifact_refs = refs.clone();
+            assert_eq!(
+                begin_thread_run(&directory, &artifacts, &auth(), command).await,
+                Err(artifact_refs_malformed())
+            );
+            let mut command = begin_v2_command();
+            command.artifact_refs = refs;
+            assert_eq!(
+                begin_thread_run_v2(&directory, &artifacts, &auth(), command).await,
+                Err(artifact_refs_malformed())
+            );
+        }
+        assert!(directory.observed_refs.lock().unwrap().is_empty());
+        assert!(directory.material_ids.lock().unwrap().is_empty());
+        assert!(artifacts.metadata_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artifact_replay_preserves_canonical_order_and_skips_all_artifact_observation() {
+        let (_lease, auth, _) = input_auth();
+        let mut directory = InputDirectory::miss();
+        let command = begin_command();
+        let receipt = ThreadRunStarted {
+            thread_id: command.thread_id,
+            run_id: command.run_id,
+            message_sequence: 7,
+            event_sequence: 9,
+            replayed: true,
+        };
+        directory.replay = Ok(Some(receipt.clone()));
+        let artifacts = InputArtifacts::default();
+        let mut command = begin_command();
+        command.artifact_refs = vec![INPUT_B.to_uppercase(), INPUT_A.into()];
+        assert_eq!(
+            begin_thread_run(&directory, &artifacts, &auth, command).await,
+            Ok(receipt.clone())
+        );
+        let mut command = begin_v2_command();
+        command.artifact_refs = vec![INPUT_B.into(), INPUT_A.to_uppercase()];
+        assert_eq!(
+            begin_thread_run_v2(&directory, &artifacts, &auth, command).await,
+            Ok(receipt)
+        );
+        assert_eq!(
+            *directory.observed_refs.lock().unwrap(),
+            vec![vec![INPUT_B.to_owned(), INPUT_A.to_owned()]; 2]
+        );
+        assert!(directory.material_ids.lock().unwrap().is_empty());
+        assert!(artifacts.metadata_calls.lock().unwrap().is_empty());
+        assert_eq!(artifacts.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn all_metadata_404_precedes_armed503_and_budget400_without_body_reads() {
+        let (_lease, auth, _) = input_auth();
+        let mut oversized = input_record(INPUT_A, "text/plain; charset=utf-8", b"x");
+        oversized.byte_length = 256 * 1024 + 1;
+        let second = input_record(INPUT_B, "text/plain; charset=utf-8", b"x");
+        for (visible_second, armed, expected) in [
+            (false, true, AppError::NotVisible),
+            (true, true, artifact_input_unavailable()),
+            (true, false, artifact_refs_malformed()),
+        ] {
+            let mut artifacts = InputArtifacts::default();
+            artifacts.records.push((
+                INPUT_A.into(),
+                ArtifactMetadata::Available(oversized.clone()),
+                armed,
+            ));
+            if visible_second {
+                artifacts.records.push((
+                    INPUT_B.into(),
+                    ArtifactMetadata::Available(second.clone()),
+                    false,
+                ));
+            }
+            let result =
+                preread_artifact_materials(&artifacts, &auth, &[INPUT_A.into(), INPUT_B.into()])
+                    .await;
+            assert!(matches!(result, Err(error) if error == expected));
+            assert_eq!(
+                *artifacts.metadata_calls.lock().unwrap(),
+                vec![INPUT_A.to_owned(), INPUT_B.to_owned()]
+            );
+            assert_eq!(artifacts.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let deadlines = artifacts.deadlines.lock().unwrap();
+            assert_eq!(deadlines.len(), 2);
+            assert_eq!(deadlines[0], deadlines[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn input_body_is_complete_verified_text_and_nontext_is_metadata_only() {
+        let (_lease, auth, _) = input_auth();
+        let text = input_record(INPUT_A, "text/plain; charset=utf-8", b"hello");
+        let mut binary = input_record(INPUT_B, "application/octet-stream", b"hello");
+        binary.byte_length = 60 * 1024 * 1024;
+        let artifacts = InputArtifacts {
+            records: vec![
+                (INPUT_A.into(), ArtifactMetadata::Available(text), false),
+                (INPUT_B.into(), ArtifactMetadata::Available(binary), false),
+            ],
+            body: b"hello".to_vec(),
+            ..InputArtifacts::default()
+        };
+        let materials =
+            preread_artifact_materials(&artifacts, &auth, &[INPUT_A.into(), INPUT_B.into()])
+                .await
+                .unwrap();
+        assert_eq!(materials.len(), 2);
+        assert_eq!(materials[0].artifact_id, INPUT_A);
+        assert_eq!(materials[0].body.as_deref(), Some("hello"));
+        assert_eq!(materials[1].artifact_id, INPUT_B);
+        assert!(materials[1].body.is_none());
+        assert_eq!(artifacts.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Media classification is pure; this does not claim JSON production/schema reachability.
+        assert!(input_media_is_text("APPLICATION/JSON; charset=utf-8"));
+        assert!(input_media_is_text("Text/Plain"));
+        assert!(!input_media_is_text("application/json-seq"));
+    }
+
+    #[tokio::test]
+    async fn wrong_body_length_digest_or_utf8_refuses_before_any_write() {
+        let (_lease, auth, _) = input_auth();
+        for index in 0..3 {
+            let body = if index == 2 {
+                vec![0xff]
+            } else {
+                b"hello".to_vec()
+            };
+            let mut record = input_record(INPUT_A, "text/plain", &body);
+            if index == 0 {
+                record.byte_length += 1;
+            }
+            if index == 1 {
+                record.sha256 = "0".repeat(64);
+            }
+            let artifacts = InputArtifacts {
+                records: vec![(INPUT_A.into(), ArtifactMetadata::Available(record), false)],
+                body,
+                ..InputArtifacts::default()
+            };
+            let directory = InputDirectory::miss();
+            let mut command = begin_command();
+            command.artifact_refs = vec![INPUT_A.into()];
+            assert_eq!(
+                begin_thread_run(&directory, &artifacts, &auth, command).await,
+                Err(artifact_input_unavailable())
+            );
+            assert!(directory.material_ids.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn host_postcheck_preserves_replay_metadata_body_and_write_errors() {
+        for phase in 0..4 {
+            let (_lease, auth, current) = input_auth();
+            let mut directory = InputDirectory::miss();
+            let mut artifacts = InputArtifacts::default();
+            if phase == 0 {
+                directory.replay = Err(ThreadDirectoryError::RequestConflict);
+                directory.revoke_on_observe = Some(current.clone());
+            } else if phase == 1 {
+                artifacts.revoke_on_metadata = Some(current.clone());
+            } else {
+                artifacts.records.push((
+                    INPUT_A.into(),
+                    ArtifactMetadata::Available(input_record(INPUT_A, "text/plain", b"hello")),
+                    false,
+                ));
+                artifacts.body = b"hello".to_vec();
+                if phase == 2 {
+                    artifacts.revoke_on_body = Some(current.clone());
+                }
+                if phase == 3 {
+                    directory.revoke_on_write = Some(current.clone());
+                }
+            }
+            let mut command = begin_command();
+            command.artifact_refs = vec![INPUT_A.into()];
+            assert_eq!(
+                begin_thread_run(&directory, &artifacts, &auth, command).await,
+                Err(AppError::Unauthenticated)
+            );
+        }
+        let (_lease, auth, _) = input_auth();
+        let directory = InputDirectory::miss();
+        let artifacts = InputArtifacts {
+            records: vec![(
+                INPUT_A.into(),
+                ArtifactMetadata::Available(input_record(
+                    INPUT_A,
+                    "application/octet-stream",
+                    b"hello",
+                )),
+                false,
+            )],
+            ..InputArtifacts::default()
+        };
+        let mut command = begin_v2_command();
+        command.artifact_refs = vec![INPUT_A.into()];
+        assert_eq!(
+            begin_thread_run_v2(&directory, &artifacts, &auth, command).await,
+            Err(AppError::ReconciliationRequired { accepted: true })
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_defaults_fail_closed_and_delegate_only_the_double_empty_pair() {
+        let directory = begin_directory(Err(ThreadDirectoryError::RequestConflict));
+        let auth = auth();
+        let request = |command| BeginThreadRunRequest {
+            auth_generation: auth.auth_generation(),
+            deployment: auth.deployment().clone(),
+            tenant: auth.tenant().clone(),
+            actor: auth.actor().clone(),
+            command,
+        };
+        let request_v2 = |command| BeginThreadRunV2Request {
+            auth_generation: auth.auth_generation(),
+            deployment: auth.deployment().clone(),
+            tenant: auth.tenant().clone(),
+            actor: auth.actor().clone(),
+            command,
+        };
+        assert!(matches!(
+            directory
+                .observe_begin_replay(request(begin_command()))
+                .await,
+            Err(ThreadDirectoryError::Unavailable)
+        ));
+        assert!(matches!(
+            directory
+                .observe_begin_replay_v2(request_v2(begin_v2_command()))
+                .await,
+            Err(ThreadDirectoryError::Unavailable)
+        ));
+        assert_eq!(
+            directory
+                .begin_thread_run_with_artifacts(request(begin_command()), Vec::new())
+                .await,
+            Err(ThreadDirectoryError::RequestConflict)
+        );
+        assert_eq!(
+            directory
+                .begin_thread_run_with_artifacts_v2(request_v2(begin_v2_command()), Vec::new())
+                .await,
+            Err(ThreadDirectoryError::RequestConflict)
+        );
+        let material = || RunInputArtifactMaterial {
+            artifact_id: INPUT_A.into(),
+            dataset_id: "input-dataset".into(),
+            sha256: "0".repeat(64),
+            media_type: "application/octet-stream".into(),
+            byte_length: 1,
+            source_thread_id: begin_command().thread_id,
+            source_run_id: begin_command().run_id,
+            body: None,
+        };
+        for refs_nonempty in [false, true] {
+            let mut command = begin_command();
+            let mut command_v2 = begin_v2_command();
+            if refs_nonempty {
+                command.artifact_refs = vec![INPUT_A.into()];
+                command_v2.artifact_refs = vec![INPUT_A.into()];
+            }
+            let materials = if refs_nonempty {
+                Vec::new()
+            } else {
+                vec![material()]
+            };
+            assert_eq!(
+                directory
+                    .begin_thread_run_with_artifacts(request(command), materials)
+                    .await,
+                Err(ThreadDirectoryError::Unavailable)
+            );
+            let materials = if refs_nonempty {
+                Vec::new()
+            } else {
+                vec![material()]
+            };
+            assert_eq!(
+                directory
+                    .begin_thread_run_with_artifacts_v2(request_v2(command_v2), materials)
+                    .await,
+                Err(ThreadDirectoryError::Unavailable)
+            );
+        }
+        assert_eq!(directory.calls.lock().unwrap().len(), 1);
+        assert_eq!(directory.v2_calls.lock().unwrap().len(), 1);
+        assert!(matches!(
+            crate::artifacts::NoArtifactAdministration
+                .observe_run_input_metadata_current(
+                    &auth,
+                    INPUT_A,
+                    Instant::now() + Duration::from_secs(5)
+                )
+                .await,
+            Err(AppError::DependencyUnavailable {
+                dependency: "artifacts"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_shared_preread_limit_does_not_poll_a_new_future() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = preread_before(Instant::now() - Duration::from_secs(1), async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert_eq!(result, Err(artifact_input_unavailable()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn nonempty_refs_require_host_before_the_replay_port() {
+        let directory = InputDirectory::miss();
+        let artifacts = InputArtifacts::default();
+        let mut command = begin_command();
+        command.artifact_refs = vec![INPUT_A.into()];
+        assert_eq!(
+            begin_thread_run(&directory, &artifacts, &auth(), command).await,
+            Err(AppError::DependencyUnavailable {
+                dependency: "host_request_binding"
+            })
+        );
+        let mut command = begin_v2_command();
+        command.artifact_refs = vec![INPUT_A.into()];
+        assert_eq!(
+            begin_thread_run_v2(&directory, &artifacts, &auth(), command).await,
+            Err(AppError::DependencyUnavailable {
+                dependency: "host_request_binding"
+            })
+        );
+        assert!(directory.observed_refs.lock().unwrap().is_empty());
+        assert!(artifacts.metadata_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nonavailable_metadata_is_404_without_synthetic_live_digest() {
+        use openbot_contracts::artifacts::ArtifactTombstone;
+        let (_lease, auth, _) = input_auth();
+        let record = input_record(INPUT_A, "text/plain", b"hello");
+        let tombstone = ArtifactTombstone {
+            artifact_id: INPUT_A.into(),
+            operation_id: "019a7779-abcd-7abc-8abc-0123456789ab".into(),
+            request_id: "019a7777-abcd-7abc-8abc-0123456789ab".into(),
+            owner_actor_id: auth.actor().clone(),
+            source_thread_id: record.source_thread_id.clone(),
+            source_run_id: record.source_run_id.clone(),
+            source_message_id: "message-1".into(),
+            source_call_seq: None,
+            source_attempt_seq: None,
+        };
+        for metadata in [
+            ArtifactMetadata::FailedPartial(record),
+            ArtifactMetadata::Deleted(tombstone.clone()),
+            ArtifactMetadata::Expired(tombstone),
+        ] {
+            let artifacts = InputArtifacts {
+                records: vec![(INPUT_A.into(), metadata, true)],
+                ..InputArtifacts::default()
+            };
+            assert!(matches!(
+                preread_artifact_materials(&artifacts, &auth, &[INPUT_A.into()]).await,
+                Err(AppError::NotVisible)
+            ));
+            assert_eq!(artifacts.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn total_text_budget_is_checked_after_all_metadata_and_before_first_body() {
+        let (_lease, auth, _) = input_auth();
+        let mut artifacts = InputArtifacts::default();
+        let mut refs = Vec::new();
+        for index in 1..=5 {
+            let id = format!("019a7778-abcd-7abc-8abc-{index:012x}");
+            let mut record = input_record(&id, "text/plain", b"hello");
+            record.byte_length = 256 * 1024;
+            artifacts
+                .records
+                .push((id.clone(), ArtifactMetadata::Available(record), false));
+            refs.push(id);
+        }
+        assert!(matches!(
+            preread_artifact_materials(&artifacts, &auth, &refs).await,
+            Err(AppError::MalformedPayload {
+                field: "artifact_refs"
+            })
+        ));
+        assert_eq!(*artifacts.metadata_calls.lock().unwrap(), refs);
+        assert_eq!(artifacts.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
