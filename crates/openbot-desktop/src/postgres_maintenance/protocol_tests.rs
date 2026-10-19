@@ -133,8 +133,7 @@ async fn eof_or_epipe_cancels_without_fabricating_worker_wait() {
         Arc::new(SecretBytes::new(b"fixture-private-secret".to_vec())),
         [7; 16],
         64,
-        now + 1_000_000_000,
-        now + 2_000_000_000,
+        (now + 1_000_000_000, now + 2_000_000_000),
     ));
     start.send(()).expect("original writer installed");
     let error = handle

@@ -189,9 +189,9 @@ impl CapacityMonitor<'_> {
         )?;
         let v =
             rustix::fs::fstatvfs(&self.root._directory).map_err(|_| MaintenanceError::IoFailure)?;
-        let free = u64::try_from(v.f_bavail)
-            .ok()
-            .and_then(|n| n.checked_mul(v.f_frsize))
+        let free = v
+            .f_bavail
+            .checked_mul(v.f_frsize)
             .ok_or(MaintenanceError::CapacityExceeded)?;
         let row = CapacityObservation {
             free_bytes: free,
@@ -550,9 +550,7 @@ impl OwnedFixtureSource {
             capacity.clock,
             secret,
             input,
-            max_status,
-            max_stderr,
-            preview,
+            (max_status, max_stderr, preview),
             closing,
         )?;
         let result = wait_program(owner, &mut capacity, closing, true).await;
@@ -675,9 +673,11 @@ impl OwnedFixtureSource {
             &self.clock,
             Arc::clone(&self.secret),
             false,
-            self.profile.fields().max_status_bytes,
-            self.profile.fields().max_stderr_bytes,
-            false,
+            (
+                self.profile.fields().max_status_bytes,
+                self.profile.fields().max_stderr_bytes,
+                false,
+            ),
             false,
         )?;
         self.postmasters.push(PostmasterOwner {
@@ -765,10 +765,9 @@ impl OwnedFixtureSource {
                         .postmasters
                         .get_mut(postmaster)
                         .and_then(|p| p.process.as_mut())
+                        && owner.child.try_wait()?.is_some()
                     {
-                        if owner.child.try_wait()?.is_some() {
-                            return Err(MaintenanceError::SourceWaitUnknown);
-                        }
+                        return Err(MaintenanceError::SourceWaitUnknown);
                     }
                     tokio::time::sleep(self.clock.effect_wait()?.min(Duration::from_millis(20)))
                         .await;
@@ -999,10 +998,9 @@ impl OwnedFixtureSource {
                         false,
                     )
                     .await
+                    && first.is_none()
                 {
-                    if first.is_none() {
-                        first = Some(error);
-                    }
+                    first = Some(error);
                 }
             }
             // No PID disappearance, pg_ctl status, signal success or elapsed C replaces this wait.
@@ -1103,18 +1101,18 @@ impl OwnedFixtureSource {
     }
     async fn close_original_sources(&mut self) -> Result<(), MaintenanceError> {
         let mut first = None;
-        if let Some(native) = self.native.as_ref() {
-            if native.wait.is_none() {
-                let _requested = native
-                    .control
-                    .try_send(Control::Cancel(self.clock.convergence()));
-            }
+        if let Some(native) = self.native.as_ref()
+            && native.wait.is_none()
+        {
+            let _requested = native
+                .control
+                .try_send(Control::Cancel(self.clock.convergence()));
         }
         for i in (0..self.postmasters.len()).rev() {
-            if let Err(error) = self.stop_postmaster(i).await {
-                if first.is_none() {
-                    first = Some(error);
-                }
+            if let Err(error) = self.stop_postmaster(i).await
+                && first.is_none()
+            {
+                first = Some(error);
             }
         }
         if let Some(native) = self.native.as_mut() {
@@ -1448,7 +1446,13 @@ async fn native_backup(
         false,
     )));
     owner.writer = Some(tokio::spawn(control_writer(
-        stdin, commands, start_rx, secret, op, max_secret, e, c,
+        stdin,
+        commands,
+        start_rx,
+        secret,
+        op,
+        max_secret,
+        (e, c),
     )));
     // All original owners have been installed and the two readers are resident before START.
     #[cfg(test)]
@@ -1463,16 +1467,16 @@ async fn native_backup(
     let mut fault_issued = false;
     let mut capacity_error = None;
     loop {
-        if capacity_error.is_none() {
-            if let Err(error) = source.capacity_check() {
-                capacity_error = Some(error);
-                if let Some(owner) = source.native.as_ref() {
-                    let _requested = owner.control.try_send(Control::Cancel(c));
-                }
-                // Stop our still-owned source through its original shutdown/wait path.
-                // The native helper is never killed to satisfy the capacity or C boundary.
-                source.stop_postmaster(request.postmaster).await?;
+        if capacity_error.is_none()
+            && let Err(error) = source.capacity_check()
+        {
+            capacity_error = Some(error);
+            if let Some(owner) = source.native.as_ref() {
+                let _requested = owner.control.try_send(Control::Cancel(c));
             }
+            // Stop our still-owned source through its original shutdown/wait path.
+            // The native helper is never killed to satisfy the capacity or C boundary.
+            source.stop_postmaster(request.postmaster).await?;
         }
         enum Observed {
             Wait(std::io::Result<ExitStatus>),
@@ -1721,8 +1725,7 @@ pub(super) async fn control_writer<W: AsyncWrite + Unpin>(
     secret: Arc<SecretBytes>,
     operation: [u8; 16],
     max_secret: u64,
-    e: u64,
-    c: u64,
+    (e, c): (u64, u64),
 ) -> Result<(), MaintenanceError> {
     start.await.map_err(|_| MaintenanceError::PipeJoinUnknown)?;
     let frame = protocol::secret_frame(&operation, secret.expose(), max_secret)?;
@@ -1884,9 +1887,7 @@ fn spawn_program(
     clock: &OperationClock,
     secret: Arc<SecretBytes>,
     write_secret: bool,
-    out_limit: u64,
-    err_limit: u64,
-    preview: bool,
+    (out_limit, err_limit, preview): (u64, u64, bool),
     closing: bool,
 ) -> Result<ProgramOwner, MaintenanceError> {
     let started = if closing {
@@ -2000,12 +2001,12 @@ async fn wait_program(
                 break None;
             }
         };
-        if capacity_error.is_none() {
-            if let Err(error) = capacity_monitor.observe(0) {
-                capacity_error = Some(error);
-                if !closing {
-                    break None;
-                }
+        if capacity_error.is_none()
+            && let Err(error) = capacity_monitor.observe(0)
+        {
+            capacity_error = Some(error);
+            if !closing {
+                break None;
             }
         }
         let observed = tokio::select! {
@@ -2020,15 +2021,14 @@ async fn wait_program(
     let (status, additional_errors) = match first {
         Some(Ok(status)) => (status, 0),
         _ => {
-            if term_on_deadline && clock.permit_closing_request().is_ok() {
-                if let Ok(raw) = i32::try_from(owner.pid) {
-                    if let Some(pid) = rustix::process::Pid::from_raw(raw) {
-                        // Only this still-unreaped original non-helper child. Never kill the WAL
-                        // leader or infer wait from signal success.
-                        let _requested =
-                            rustix::process::kill_process(pid, rustix::process::Signal::TERM);
-                    }
-                }
+            if term_on_deadline
+                && clock.permit_closing_request().is_ok()
+                && let Ok(raw) = i32::try_from(owner.pid)
+                && let Some(pid) = rustix::process::Pid::from_raw(raw)
+            {
+                // Only this still-unreaped original non-helper child. Never kill the WAL
+                // leader or infer wait from signal success.
+                let _requested = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
             }
             wait_original_child(&mut owner.child).await
         }
@@ -2567,16 +2567,15 @@ fn verify_physical_material(
                 verify_wal_header(&root.join(&row.path), status, number)?;
                 continue;
             }
-            if let Some(name) = name.strip_prefix("archive_status/") {
-                if row.bytes == 0
-                    && name.len() == 29
-                    && name.ends_with(".done")
-                    && name[..24]
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
-                {
-                    continue;
-                }
+            if let Some(name) = name.strip_prefix("archive_status/")
+                && row.bytes == 0
+                && name.len() == 29
+                && name.ends_with(".done")
+                && name[..24]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+            {
+                continue;
             }
         }
         return Err(MaintenanceError::ManifestInvalid);

@@ -186,7 +186,7 @@ impl MaterialCounters {
         }
         let blocks = len
             .checked_div(p.copy_block_bytes)
-            .and_then(|n| n.checked_add(u64::from(len % p.copy_block_bytes != 0)))
+            .and_then(|n| n.checked_add(u64::from(!len.is_multiple_of(p.copy_block_bytes))))
             .ok_or(MaintenanceError::CapacityExceeded)?;
         let files = self
             .files

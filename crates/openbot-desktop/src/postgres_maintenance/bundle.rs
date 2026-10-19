@@ -545,10 +545,9 @@ fn validate_manifest(m: &Manifest) -> Result<(), MaintenanceError> {
         }
         if let Some((_, path, bytes, sha256)) =
             FIXED_INTERNAL_TOOLS.iter().find(|row| row.0 == t.role)
+            && (t.path != *path || t.bytes != *bytes || t.sha256 != *sha256)
         {
-            if t.path != *path || t.bytes != *bytes || t.sha256 != *sha256 {
-                return Err(MaintenanceError::BuildToolUnavailable);
-            }
+            return Err(MaintenanceError::BuildToolUnavailable);
         }
     }
     if REQUIRED.iter().any(|role| !roles.contains(role)) {
@@ -817,7 +816,7 @@ fn decode_digest(s: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut b = [0; 32];
-    for (i, c) in s.as_bytes().chunks_exact(2).enumerate() {
+    for (i, c) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let n = |x: u8| {
             if x.is_ascii_digit() {
                 x - b'0'
