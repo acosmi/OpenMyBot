@@ -2132,3 +2132,8 @@ The first directed Infra server-runtime strict check reported two Clippy diagnos
 ### V7-IMPL-043: minimal feature compatibility repair candidate
 
 Match the private history writer module and its native transaction-validation leaf to their existing server-runtime or desktop-local-vault consumers. This removes unreachable private leaves from the minimal graph while retaining the vault generic repository definition and both active feature graphs. SQL bodies, validation, error classification and public interfaces are unchanged. The original minimal strict diagnostics are retained; independent review and precise candidate checks remain pending.
+
+
+### V7-IMPL-043: Server test target compilation repair candidate
+
+Add the existing SecretBytes type import used by two enrollment vectors and explicitly reject the four enrollment-only terminal stages in the original token-dispatch test helper. Its three token branches, fixture behavior and all planned test names remain unchanged. The previous Server lib-test compile exited 101 and is retained. Independent source review accepts these two test-only changes; the new precise candidate still requires Server test compilation, original harness lists and all 67 runtime cases. Earlier strict and SDK evidence retains its original scope, including the Desktop host-tool warning.

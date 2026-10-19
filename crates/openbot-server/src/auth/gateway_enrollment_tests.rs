@@ -3,7 +3,9 @@
 use super::fixture::Fixture;
 use super::*;
 use openbot_contracts::ids::ActorId;
-use openbot_domain::vault::{KeyVersion, SecretKind, SecretPrincipal, ServiceId, WrappingKey};
+use openbot_domain::vault::{
+    KeyVersion, SecretBytes, SecretKind, SecretPrincipal, ServiceId, WrappingKey,
+};
 use openbot_infra::gateway_authority::GatewayConnectionReceipt;
 use openbot_infra::gateway_transport::{GatewayAttempt, GatewayHttpOutcomes};
 use openbot_infra::vault::CredentialRecordVault;

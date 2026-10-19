@@ -504,6 +504,12 @@ async fn token_ack_case(
                 "one actual token POST even when send ACK unknown",
             )?;
         }
+        TerminalStage::EnrollmentMetadataRollback
+        | TerminalStage::EnrollmentProfileRollback
+        | TerminalStage::EnrollmentCommit
+        | TerminalStage::EnrollmentReadbackRollback => {
+            return Err("enrollment-only stage is unsupported by token ACK helper".into());
+        }
     }
     let next = f.row(old.attempt_id).await?;
     check(
