@@ -928,8 +928,8 @@ fn space(path: &Path, p: &Profile, remaining: u64) -> Result<()> {
     space_snapshot(&s, p, remaining)
 }
 fn space_snapshot(s: &rustix::fs::StatVfs, p: &Profile, remaining: u64) -> Result<()> {
-    let free = (s.f_bavail as u64)
-        .checked_mul(s.f_frsize as u64)
+    let free = s.f_bavail
+        .checked_mul(s.f_frsize)
         .context("maintenance_space_overflow")?;
     let need = remaining
         .checked_add(p.limits.capacity_reserve_bytes)
