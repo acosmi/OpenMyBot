@@ -2136,3 +2136,6 @@ The first locked targeted check refused to run because the Desktop package lock 
 ### 2026-10-19 - V7-IMPL-044 strict-check repairs
 
 The first targeted Rust strict check reported ten Clippy errors in the existing builder, manifest traversal and argument parser. Private traversal arguments now use tuples with the same values and shared cumulative counters; the remaining changes preserve short-circuit order and parser behavior. Independent source review passed 32 checks, including full inverse reconstruction and unchanged original wait/join and capacity guards. The original strict failure is retained. Current candidate strict, build, consumer and recovery acceptance remain pending.
+
+
+- V7-IMPL-044 / PR #223: The targeted Desktop strict check reported E0502 in the existing bounded output preview. The preview now computes its slice length before borrowing the sample mutably, preserving the 512-byte bound, byte order, secret detection, hashing, zeroization and original child and pipe waits. The original compiler failure is retained. Compilation has not yet been rerun on this repair; native acceptance remains pending.

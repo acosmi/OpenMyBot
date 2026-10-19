@@ -1854,7 +1854,8 @@ async fn drain_pipe<R: AsyncRead + Unpin>(
             carry.extend_from_slice(&window[window.len() - keep..]);
         }
         if preview && sample.len() < 512 {
-            sample.extend_from_slice(&buffer[..n.min(512 - sample.len())]);
+            let take = n.min(512 - sample.len());
+            sample.extend_from_slice(&buffer[..take]);
         }
         buffer[..n].zeroize();
     }
