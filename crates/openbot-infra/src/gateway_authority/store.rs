@@ -37,6 +37,19 @@ fn permits() -> Arc<Semaphore> {
         .clone()
 }
 
+/// Borrow the original shared eight permits; acquisition caller supplies one absolute subcap.
+pub(super) async fn acquire_enrollment_session_permit(
+    cancel: &CancellationToken,
+    acquisition_deadline: Instant,
+) -> Result<OwnedSemaphorePermit, GatewayAuthorityError> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(GatewayAuthorityError::Cancelled),
+        () = tokio::time::sleep_until(acquisition_deadline) => Err(GatewayAuthorityError::Timeout),
+        permit = permits().acquire_owned() => permit.map_err(|_| GatewayAuthorityError::Unavailable),
+    }
+}
+
 pub(super) struct DetachedSession {
     client: tokio::sync::Mutex<Option<ClientWrapper>>,
     permit: Mutex<Option<OwnedSemaphorePermit>>,
@@ -647,7 +660,7 @@ pub(super) async fn load_secret(
 }
 
 async fn append_audit(
-    tx: &deadpool_postgres::Transaction<'_>,
+    tx: &tokio_postgres::Transaction<'_>,
     scope: &Scope,
     audit_key: &[u8],
     change: &'static str,
@@ -1237,4 +1250,234 @@ pub(super) async fn clear_credentials(
         clear_credentials_inner(session, scope, audit_key),
     )
     .await
+}
+
+async fn enrollment_sql<T, E>(
+    scope: &Scope,
+    future: impl std::future::Future<Output = Result<T, E>>,
+    map: impl FnOnce(E) -> GatewayAuthorityError,
+) -> Result<T, GatewayAuthorityError> {
+    let deadline = scope.deadline.min(Instant::now() + SQL_TIMEOUT);
+    tokio::select! {
+        biased;
+        () = scope.cancel.cancelled() => Err(GatewayAuthorityError::Cancelled),
+        () = tokio::time::sleep_until(deadline) => Err(GatewayAuthorityError::Timeout),
+        result = future => result.map_err(map),
+    }
+}
+
+async fn append_enrollment_audit_before(
+    tx: &tokio_postgres::Transaction<'_>,
+    scope: &Scope,
+    audit_key: &[u8],
+) -> Result<(), GatewayAuthorityError> {
+    // Keep the original two audit utilities and fixed facts, each bounded by the original cap.
+    let (id, created_at) = enrollment_sql(scope, next_event_coordinates(tx), |_| {
+        GatewayAuthorityError::Unavailable
+    })
+    .await?;
+    let event = AuditEvent {
+        id,
+        actor: Some(scope.auth.actor().clone()),
+        event_type: AuditEventType::parse("configuration.changed")
+            .ok_or(GatewayAuthorityError::Corrupt)?,
+        target_kind: AuditLabel::new("sdk_gateway_connection"),
+        target_id: Some(
+            AuditIdentifier::new(scope.connection_id.to_string())
+                .map_err(|_| GatewayAuthorityError::Corrupt)?,
+        ),
+        payload: AuditPayload::from_facts(vec![AuditFact::ConfigurationChange(AuditLabel::new(
+            "gateway_connection_enrolled",
+        ))])
+        .map_err(|_| GatewayAuthorityError::Corrupt)?,
+        created_at,
+    };
+    enrollment_sql(
+        scope,
+        append_event_in_transaction(tx, &event, audit_key),
+        |_| GatewayAuthorityError::Unavailable,
+    )
+    .await
+    .map(|_| ())
+}
+
+// Exact fixed R367 inserts; only this connection INSERT's typed23505 maps Conflict.
+const ENROLLMENT_CONNECTION_INSERT: &str = "INSERT INTO public.sdk_gateway_connections(id,deployment_id,tenant_id,owner_user_id,name,issuer,client_id,account_id,organization_id,auth_contract_version,error_contract_version,enabled,revision,credential_generation,auth_generation,state,current_secret_id,pending_operation_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,2,1,true,1,1,$10,'ready',$11,NULL,$12,$12)";
+const ENROLLMENT_SECRET_INSERT: &str = "INSERT INTO public.sdk_gateway_secrets(id,connection_id,deployment_id,tenant_id,owner_user_id,credential_generation,encrypted_value,created_at) VALUES($1,$2,$3,$4,$5,1,$6,$7)";
+const ENROLLMENT_CONNECTION_READBACK: &str = "SELECT name,issuer,client_id,account_id,organization_id,auth_contract_version,error_contract_version,revision,credential_generation,auth_generation,state,current_secret_id,pending_operation_id FROM public.sdk_gateway_connections WHERE id=$1 AND deployment_id=$2 AND tenant_id=$3 AND owner_user_id=$4 AND enabled AND deleted_at IS NULL";
+const ENROLLMENT_SECRET_READBACK: &str = "SELECT encrypted_value FROM public.sdk_gateway_secrets WHERE id=$1 AND connection_id=$2 AND deployment_id=$3 AND tenant_id=$4 AND owner_user_id=$5 AND credential_generation=1 AND retired_at IS NULL";
+
+pub(super) async fn insert_enrollment_in_transaction(
+    tx: &tokio_postgres::Transaction<'_>,
+    vault: &CredentialRecordVault,
+    audit_key: &[u8],
+    scope: &Scope,
+    name: &str,
+    tokens: &acosmi::TokenSet,
+) -> Result<Uuid, GatewayAuthorityError> {
+    let secret_id = Uuid::now_v7();
+    let encrypted = seal_tokens(vault, secret_id, scope, 1, tokens)?;
+    let now: OffsetDateTime =
+        enrollment_sql(scope, tx.query_one("SELECT clock_timestamp()", &[]), |_| {
+            GatewayAuthorityError::Unavailable
+        })
+        .await?
+        .try_get(0)
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let inserted = enrollment_sql(
+        scope,
+        tx.execute(
+            ENROLLMENT_CONNECTION_INSERT,
+            &[
+                &scope.connection_id,
+                &scope.deployment.as_str(),
+                &scope.tenant.as_str(),
+                &scope.auth.actor().as_str(),
+                &name,
+                &scope.issuer,
+                &scope.client_id,
+                &scope.account_id,
+                &scope.organization_id,
+                &scope.auth_generation,
+                &secret_id,
+                &now,
+            ],
+        ),
+        |error: tokio_postgres::Error| {
+            if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+                GatewayAuthorityError::Conflict
+            } else {
+                GatewayAuthorityError::Unavailable
+            }
+        },
+    )
+    .await?;
+    if inserted != 1 {
+        return Err(GatewayAuthorityError::Corrupt);
+    }
+    let inserted = enrollment_sql(
+        scope,
+        tx.execute(
+            ENROLLMENT_SECRET_INSERT,
+            &[
+                &secret_id,
+                &scope.connection_id,
+                &scope.deployment.as_str(),
+                &scope.tenant.as_str(),
+                &scope.auth.actor().as_str(),
+                &encrypted,
+                &now,
+            ],
+        ),
+        |_| GatewayAuthorityError::Unavailable,
+    )
+    .await?;
+    if inserted != 1 {
+        return Err(GatewayAuthorityError::Corrupt);
+    }
+    let stored: String = enrollment_sql(
+        scope,
+        tx.query_one(
+            ENROLLMENT_SECRET_READBACK,
+            &[
+                &secret_id,
+                &scope.connection_id,
+                &scope.deployment.as_str(),
+                &scope.tenant.as_str(),
+                &scope.auth.actor().as_str(),
+            ],
+        ),
+        |_| GatewayAuthorityError::Unavailable,
+    )
+    .await?
+    .try_get(0)
+    .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let verified = open_tokens(vault, secret_id, &stored, scope, 1)
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    if !token_bytes_equal(&verified, tokens) {
+        return Err(GatewayAuthorityError::Corrupt);
+    }
+    append_enrollment_audit_before(tx, scope, audit_key).await?;
+    Ok(secret_id)
+}
+
+pub(super) async fn read_enrollment_in_transaction(
+    tx: &tokio_postgres::Transaction<'_>,
+    vault: &CredentialRecordVault,
+    scope: &Scope,
+    name: &str,
+    secret_id: Uuid,
+    original_tokens: &acosmi::TokenSet,
+) -> Result<(), GatewayAuthorityError> {
+    let row = enrollment_sql(
+        scope,
+        tx.query_opt(
+            ENROLLMENT_CONNECTION_READBACK,
+            &[
+                &scope.connection_id,
+                &scope.deployment.as_str(),
+                &scope.tenant.as_str(),
+                &scope.auth.actor().as_str(),
+            ],
+        ),
+        |_| GatewayAuthorityError::Unavailable,
+    )
+    .await?
+    .ok_or(GatewayAuthorityError::Corrupt)?;
+    if !binding_matches(&row, scope)?
+        || row
+            .try_get::<_, String>("name")
+            .map_err(|_| GatewayAuthorityError::Corrupt)?
+            != name
+        || row
+            .try_get::<_, i16>("auth_contract_version")
+            .map_err(|_| GatewayAuthorityError::Corrupt)?
+            != 2
+        || row
+            .try_get::<_, i16>("error_contract_version")
+            .map_err(|_| GatewayAuthorityError::Corrupt)?
+            != 1
+        || row
+            .try_get::<_, i64>("credential_generation")
+            .map_err(|_| GatewayAuthorityError::Corrupt)?
+            != 1
+        || row
+            .try_get::<_, String>("state")
+            .map_err(|_| GatewayAuthorityError::Corrupt)?
+            != "ready"
+        || row
+            .try_get::<_, Option<Uuid>>("current_secret_id")
+            .map_err(|_| GatewayAuthorityError::Corrupt)?
+            != Some(secret_id)
+        || row
+            .try_get::<_, Option<Uuid>>("pending_operation_id")
+            .map_err(|_| GatewayAuthorityError::Corrupt)?
+            .is_some()
+    {
+        return Err(GatewayAuthorityError::Corrupt);
+    }
+    let stored: String = enrollment_sql(
+        scope,
+        tx.query_opt(
+            ENROLLMENT_SECRET_READBACK,
+            &[
+                &secret_id,
+                &scope.connection_id,
+                &scope.deployment.as_str(),
+                &scope.tenant.as_str(),
+                &scope.auth.actor().as_str(),
+            ],
+        ),
+        |_| GatewayAuthorityError::Unavailable,
+    )
+    .await?
+    .ok_or(GatewayAuthorityError::Corrupt)?
+    .try_get(0)
+    .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let verified = open_tokens(vault, secret_id, &stored, scope, 1)
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    if !token_bytes_equal(&verified, original_tokens) {
+        return Err(GatewayAuthorityError::Corrupt);
+    }
+    Ok(())
 }

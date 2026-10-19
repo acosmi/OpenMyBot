@@ -3,6 +3,8 @@
 //! This module is an Infra-only assembly boundary. Its values are not renderer DTOs and neither
 //! enrollment nor an SDK token grants Wrok authorization by itself.
 
+mod enrollment;
+pub(crate) use enrollment::EnrollmentAdoption;
 mod fence;
 mod store;
 mod strict;
@@ -29,6 +31,10 @@ use crate::net::safe_http::SafeDialer;
 use crate::vault::CredentialRecordVault;
 
 use fence::EnrollmentFence;
+pub(crate) use fence::{
+    EnrollmentFenceControl, EnrollmentFenceEnd, EnrollmentPermitControl, EnrollmentRequestKind,
+    enrollment_headers_channel,
+};
 use store::DetachedSession;
 use strict::AuthorityInner;
 
