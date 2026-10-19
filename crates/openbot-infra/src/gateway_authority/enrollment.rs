@@ -301,8 +301,7 @@ mod tests {
 
             // A fresh single original checkout is cancelled after its actual connect
             // future starts, before this caller receives a lease. No unrelated owner exists.
-            let fresh = pool::connect(&config.with_max_pool_size(1))
-                .await
+            let fresh = pool::DatabasePool::build_unprobed(&config.with_max_pool_size(1))
                 .map_err(|e| e.to_string())?;
             let mut seven = Vec::new();
             for _ in 0..7 {

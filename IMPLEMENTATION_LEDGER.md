@@ -2137,3 +2137,8 @@ Match the private history writer module and its native transaction-validation le
 ### V7-IMPL-043: Server test target compilation repair candidate
 
 Add the existing SecretBytes type import used by two enrollment vectors and explicitly reject the four enrollment-only terminal stages in the original token-dispatch test helper. Its three token branches, fixture behavior and all planned test names remain unchanged. The previous Server lib-test compile exited 101 and is retained. Independent source review accepts these two test-only changes; the new precise candidate still requires Server test compilation, original harness lists and all 67 runtime cases. Earlier strict and SDK evidence retains its original scope, including the Desktop host-tool warning.
+
+
+### 2026-10-19 - V7-IMPL-043 cold cancellation fixture
+
+The first directed Infra runtime passed 19 pure cases, then failed q01 because the fresh single-connection test pool had already been probed; q02 did not run. The fixture now uses the existing unprobed pool constructor, preserving every assertion, permit limit, cancellation and wait sequence. Production code and q02 are byte-identical. Independent source review accepted this single test-only hunk. Current candidate compile, lists and runtime remain pending; prior results retain their original candidate attribution.
