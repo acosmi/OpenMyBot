@@ -8,8 +8,8 @@ archive_sha256 = "5367f6fb2ec97efe1eb2e0c7926bb33438e51b0bd3a9733b88498056a7dc9a
 
 [patch]
 path = "tools/patches/postgresql-17.11-wrokbot-basebackup-owner-v1.patch"
-bytes = 43812
-sha256 = "ad45f8239670600583c93aacdcf82a3be894287c58801fb4ab2c08bc12e41fde"
+bytes = 44068
+sha256 = "4754a28b2dedd2cedf466d07ef7290d686f6dec25f5872ffd7dfd9039f06f945"
 
 [bundle]
 schema = "openbot-postgres-maintenance-bundle"
@@ -63,7 +63,7 @@ after = { bytes = 1699, sha256 = "8604f231d1ffa24f3f43be1589bbab24bb5bb046953207
 [[derived_sources]]
 path = "src/bin/pg_basebackup/Makefile"
 before = { bytes = 2872, sha256 = "0bcf25cdbdf65e076073ecfc4a2f6e2728d16004ef772bd2e7ef8e85787c309f" }
-after = { bytes = 3270, sha256 = "0c7814fb52791acee99a8733346206e53bc30556b226909f2fcbead8a21849a4" }
+after = { bytes = 3443, sha256 = "5f7c9355367e48ae9e9fef98e0c807944ce1649a9599375704e8805863863d62" }
 
 [[derived_sources]]
 path = "src/interfaces/libpq/fe-connect.c"
@@ -73,4 +73,4 @@ after = { bytes = 201599, sha256 = "034a5a7814e333652b15c189e74a676fac971528ef2a
 [[derived_sources]]
 path = "src/common/logging.c"
 before = { bytes = 7132, sha256 = "6693ad39602a196ee2fa8a963dbf9ce7023b31b2d0de5c6ddce3b9a413193a30" }
-after = { bytes = 7389, sha256 = "d66ded57d5255bbe3fc272c3588e4f61d557df4494d0af2b559abfa63cd94ae0" }
+after = { bytes = 7463, sha256 = "8cf4f3e95fa72e71b0d769cb35dcf27f1a0f2dbeed6315f55d78946bca220b39" }

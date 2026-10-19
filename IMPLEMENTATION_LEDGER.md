@@ -2208,3 +2208,6 @@ The builder now holds owned directory descriptors and checks identities while wa
 
 
 V7-IMPL-044 / PR #223: Targeted Clippy returned 101 for two redundant u64 conversions in the builder's free-space calculation. Both conversions are removed; checked multiplication, overflow handling and capacity checks retain their original behavior. Independent source review passed for this finite repair. Current strict validation, a new non-test producer and native build/recovery/restart acceptance remain pending. Original failures are retained; full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The native build failed while linking stock PostgreSQL programs because the common logging archive referenced the maintenance owner's hook. The hook is now compiled only for the distinct maintenance role, which links a private frontend logging object with its existing owner. Source pins match the finite two-family repair. Independent source review passed; actual native linkage, bundle validation, backup, recovery and restart acceptance remain pending. Earlier failures are retained. Full CI and manual Actions were not run.

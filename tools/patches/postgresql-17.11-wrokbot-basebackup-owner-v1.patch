@@ -1215,14 +1215,17 @@
 +#endif
 --- a/src/bin/pg_basebackup/Makefile
 +++ b/src/bin/pg_basebackup/Makefile
-@@ -46,6 +46,14 @@
+@@ -46,6 +46,17 @@
  
  all: pg_basebackup pg_createsubscriber pg_receivewal pg_recvlogical
  
 +# Independent role: stock objects/executables retain their original semantics.
-+WROKOBJS = $(patsubst %.o,%.wrok.o,$(BBOBJS) $(OBJS)) wrokbot_owner.wrok.o
++WROKOBJS = $(patsubst %.o,%.wrok.o,$(BBOBJS) $(OBJS)) wrokbot_owner.wrok.o logging.wrok.o
 +%.wrok.o: %.c
 +	$(CC) $(CFLAGS) $(CPPFLAGS) -DWROKBOT_PG_MAINTENANCE -c $< -o $@
++
++logging.wrok.o: $(top_srcdir)/src/common/logging.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -DUSE_PRIVATE_ENCODING_FUNCS -DWROKBOT_PG_MAINTENANCE -c $< -o $@
 +
 +wrokbot-pg-basebackup: $(WROKOBJS) | submake-libpq submake-libpgport submake-libpgfeutils
 +	$(CC) $(CFLAGS) $(WROKOBJS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
@@ -1286,22 +1289,26 @@
  
 --- a/src/common/logging.c
 +++ b/src/common/logging.c
-@@ -17,6 +17,8 @@
+@@ -17,6 +17,10 @@
  #include <unistd.h>
  
  #include "common/logging.h"
 +
++#ifdef WROKBOT_PG_MAINTENANCE
 +extern void wrokbot_owner_redacted_log(int is_error) __attribute__((weak));
++#endif
  
  enum pg_log_level __pg_log_level;
  
-@@ -222,6 +224,9 @@
+@@ -222,6 +226,11 @@
  	va_list		ap2;
  	size_t		required_len;
  	char	   *buf;
 +
++#ifdef WROKBOT_PG_MAINTENANCE
 +	/* Only the distinct maintenance executable supplies this weak hook. */
 +	if (wrokbot_owner_redacted_log != NULL) { wrokbot_owner_redacted_log(level >= PG_LOG_WARNING); return; }
++#endif
  
  	Assert(progname);
  	Assert(level);
