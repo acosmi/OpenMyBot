@@ -145,6 +145,8 @@ mod local_confirmation_native;
 mod local_confirmation_service;
 #[cfg(feature = "os-key-store")]
 pub mod os_secret_store;
+#[cfg(all(feature = "postgres-maintenance", target_os = "macos"))]
+pub mod postgres_maintenance;
 #[cfg(feature = "postgres-sidecar")]
 pub mod postgres_sidecar;
 pub mod preferences;
