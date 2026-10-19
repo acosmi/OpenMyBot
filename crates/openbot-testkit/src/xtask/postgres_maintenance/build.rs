@@ -613,7 +613,7 @@ fn validate_profile(p: &Profile, pins: &Pins) -> Result<()> {
         "--without-icu",
         "--without-readline",
         "--without-zlib",
-        "--without-ssl",
+        "--without-openssl",
         "--without-gssapi",
         "--without-ldap",
         "--without-libxml",
