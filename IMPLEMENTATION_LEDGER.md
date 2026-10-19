@@ -2131,3 +2131,8 @@ The production-only candidate `0c41d851a61eb1be99a34268e91d9a15fe9c995c` passed 
 ### 2026-10-19 - V7-IMPL-044 existing dependency lock projection
 
 The first locked targeted check refused to run because the Desktop package lock entry omitted its declared rustix dependency. The lock now adds that one edge to the already locked rustix 1.1.4 package. All 841 package identities and checksums, all registry blocks, and every other package block remain unchanged; removing the single edge restores the full previous lock bytes. Independent review accepted the correction. The original refusal is retained; candidate checks and native build, consumer and recovery gates remain pending.
+
+
+### 2026-10-19 - V7-IMPL-044 strict-check repairs
+
+The first targeted Rust strict check reported ten Clippy errors in the existing builder, manifest traversal and argument parser. Private traversal arguments now use tuples with the same values and shared cumulative counters; the remaining changes preserve short-circuit order and parser behavior. Independent source review passed 32 checks, including full inverse reconstruction and unchanged original wait/join and capacity guards. The original strict failure is retained. Current candidate strict, build, consumer and recovery acceptance remain pending.

@@ -51,11 +51,11 @@ pub(crate) fn run(root: &Path, args: &[String]) -> Result<()> {
 }
 #[cfg(target_os = "macos")]
 fn parse_options(args: &[String]) -> Result<BTreeMap<String, String>> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         bail!("maintenance_option_value_required");
     }
     let mut out = BTreeMap::new();
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         let key = pair[0]
             .strip_prefix("--")
             .filter(|s| !s.is_empty())

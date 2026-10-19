@@ -720,10 +720,10 @@ fn sdk_digest(root: &Path, p: &Profile, b: &Budget) -> Result<String> {
         p: &Profile,
         b: &Budget,
         out: &mut Sha256,
-        n: &mut u64,
-        bytes: &mut u64,
+        totals: (&mut u64, &mut u64),
         depth: u32,
     ) -> Result<()> {
+        let (n, bytes) = totals;
         if depth > 64 {
             bail!("maintenance_sdk_depth");
         }
@@ -747,7 +747,7 @@ fn sdk_digest(root: &Path, p: &Profile, b: &Budget) -> Result<String> {
             out.update((m.mode() & 0o777).to_be_bytes());
             if m.is_dir() {
                 out.update([1]);
-                walk(root, &path, p, b, out, n, bytes, depth + 1)?;
+                walk(root, &path, p, b, out, (&mut *n, &mut *bytes), depth + 1)?;
             } else if m.file_type().is_symlink() {
                 out.update([2]);
                 let target = fs::read_link(&path)?;
@@ -777,7 +777,7 @@ fn sdk_digest(root: &Path, p: &Profile, b: &Budget) -> Result<String> {
     }
     let mut digest = Sha256::new();
     digest.update(b"wrokbot-maintenance-sdk-tree-v1\0");
-    walk(root, root, p, b, &mut digest, &mut 0, &mut 0, 0)?;
+    walk(root, root, p, b, &mut digest, (&mut 0, &mut 0), 0)?;
     Ok(format!("{:x}", digest.finalize()))
 }
 fn verify_tools(p: &Profile, b: &Budget) -> Result<Vec<BuildTool>> {
@@ -1044,16 +1044,18 @@ fn command(
             if now >= b.close {
                 failed = true;
             }
-            if failed && same_original_child && now < b.close {
-                if let Some(pid) = pid {
-                    if !term_sent {
-                        let _ = kill_process_group(pid, Signal::TERM);
-                        term_sent = true;
-                    }
-                    if now >= kill_at && !kill_sent {
-                        let _ = kill_process_group(pid, Signal::KILL);
-                        kill_sent = true;
-                    }
+            if failed
+                && same_original_child
+                && now < b.close
+                && let Some(pid) = pid
+            {
+                if !term_sent {
+                    let _ = kill_process_group(pid, Signal::TERM);
+                    term_sent = true;
+                }
+                if now >= kill_at && !kill_sent {
+                    let _ = kill_process_group(pid, Signal::KILL);
+                    kill_sent = true;
                 }
             }
         }
@@ -1478,15 +1480,14 @@ fn copy_bundle_file(
 fn copy_tree(
     source: &Path,
     target: &Path,
-    inside: &Path,
-    p: &Profile,
-    b: &Budget,
-    sum: &mut u64,
-    count: &mut u64,
+    context: (&Path, &Profile, &Budget),
+    totals: (&mut u64, &mut u64),
     depth: u32,
     seen: &mut BTreeSet<(u64, u64)>,
     runtime_lib: bool,
 ) -> Result<()> {
+    let (inside, p, b) = context;
+    let (sum, count) = totals;
     if depth > 64 {
         bail!("maintenance_install_depth");
     }
@@ -1516,11 +1517,8 @@ fn copy_tree(
             copy_tree(
                 &real,
                 &dest,
-                inside,
-                p,
-                b,
-                sum,
-                count,
+                (inside, p, b),
+                (&mut *sum, &mut *count),
                 depth + 1,
                 seen,
                 runtime_lib,
@@ -1557,25 +1555,24 @@ fn validate_loader(root: &Path, file: &Path, libraries: &str, commands: &str) ->
             rpath = true;
             continue;
         }
-        if rpath {
-            if let Some(path) = line
+        if rpath
+            && let Some(path) = line
                 .strip_prefix("path ")
                 .and_then(|s| s.split(" (offset ").next())
-            {
-                let candidate = if let Some(rest) = path.strip_prefix("@loader_path/") {
-                    file.parent().unwrap().join(rest)
-                } else if let Some(rest) = path.strip_prefix("@executable_path/") {
-                    root.join("bin").join(rest)
-                } else {
-                    bail!("maintenance_rpath_invalid");
-                };
-                let real = fs::canonicalize(candidate)?;
-                if !real.starts_with(root) || !real.is_dir() {
-                    bail!("maintenance_rpath_escape");
-                }
-                rpaths.push(real);
-                rpath = false;
+        {
+            let candidate = if let Some(rest) = path.strip_prefix("@loader_path/") {
+                file.parent().unwrap().join(rest)
+            } else if let Some(rest) = path.strip_prefix("@executable_path/") {
+                root.join("bin").join(rest)
+            } else {
+                bail!("maintenance_rpath_invalid");
+            };
+            let real = fs::canonicalize(candidate)?;
+            if !real.starts_with(root) || !real.is_dir() {
+                bail!("maintenance_rpath_escape");
             }
+            rpaths.push(real);
+            rpath = false;
         }
     }
     if rpath {
@@ -1583,7 +1580,6 @@ fn validate_loader(root: &Path, file: &Path, libraries: &str, commands: &str) ->
     }
     for line in libraries.lines().skip(1) {
         let dep = line
-            .trim()
             .split_whitespace()
             .next()
             .context("maintenance_library_empty")?;
@@ -1795,11 +1791,8 @@ pub(super) fn build(
     copy_tree(
         &installed.join("lib"),
         &resource.join("lib"),
-        &installed,
-        &p,
-        &budget,
-        &mut sum,
-        &mut count,
+        (&installed, &p, &budget),
+        (&mut sum, &mut count),
         0,
         &mut BTreeSet::new(),
         true,
@@ -1807,11 +1800,8 @@ pub(super) fn build(
     copy_tree(
         &installed.join("share"),
         &resource.join("share"),
-        &installed,
-        &p,
-        &budget,
-        &mut sum,
-        &mut count,
+        (&installed, &p, &budget),
+        (&mut sum, &mut count),
         0,
         &mut BTreeSet::new(),
         false,

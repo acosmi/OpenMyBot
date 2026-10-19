@@ -377,13 +377,13 @@ pub(super) fn collect(root: &Path, max_files: u64, max_bytes: u64) -> Result<Vec
         dir: &Path,
         out: &mut Vec<FileEntry>,
         sum: &mut u64,
-        max_files: u64,
-        max_bytes: u64,
+        limits: (u64, u64),
         depth: usize,
         nodes: &mut u64,
     ) -> Result<()> {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
+        let (max_files, max_bytes) = limits;
         if depth > 64 {
             bail!("maintenance_tree_depth");
         }
@@ -408,7 +408,7 @@ pub(super) fn collect(root: &Path, max_files: u64, max_bytes: u64) -> Result<Vec
                 if fs::read_dir(&p)?.next().is_none() {
                     bail!("maintenance_empty_extra_directory");
                 }
-                walk(root, &p, out, sum, max_files, max_bytes, depth + 1, nodes)?;
+                walk(root, &p, out, sum, limits, depth + 1, nodes)?;
             } else if m.is_file() {
                 if rel == INNER_FILE {
                     continue;
@@ -441,7 +441,13 @@ pub(super) fn collect(root: &Path, max_files: u64, max_bytes: u64) -> Result<Vec
     }
     let mut out = Vec::new();
     walk(
-        root, root, &mut out, &mut 0, max_files, max_bytes, 0, &mut 0,
+        root,
+        root,
+        &mut out,
+        &mut 0,
+        (max_files, max_bytes),
+        0,
+        &mut 0,
     )?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -455,10 +461,10 @@ pub(super) fn inspect(root: &Path, expected_outer: Option<&str>) -> Result<Inspe
     }
     let outer_bytes = read_regular(&root.join(OUTER_FILE), 1024 * 1024)?;
     let outer_digest = digest_bytes(&outer_bytes);
-    if let Some(expected) = expected_outer {
-        if !valid_sha(expected) || expected != outer_digest.sha256 {
-            bail!("maintenance_outer_untrusted");
-        }
+    if let Some(expected) = expected_outer
+        && (!valid_sha(expected) || expected != outer_digest.sha256)
+    {
+        bail!("maintenance_outer_untrusted");
     }
     let outer: Outer = serde_json::from_slice(&outer_bytes)?;
     if outer.schema != "wrokbot-pg-maintenance-release"
@@ -556,10 +562,9 @@ pub(super) fn inspect(root: &Path, expected_outer: Option<&str>) -> Result<Inspe
         }
         if let Some((_, path, bytes, sha256)) =
             FIXED_INTERNAL_TOOLS.iter().find(|row| row.0 == t.role)
+            && (t.path != *path || t.bytes != *bytes || t.sha256 != *sha256)
         {
-            if t.path != *path || t.bytes != *bytes || t.sha256 != *sha256 {
-                bail!("maintenance_tool_provenance");
-            }
+            bail!("maintenance_tool_provenance");
         }
     }
     for required in [
