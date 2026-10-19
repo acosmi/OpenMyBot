@@ -2145,3 +2145,12 @@ The first directed Infra runtime passed 19 pure cases, then failed q01 because t
 
 
 V7-IMPL-043 test maintenance: Correct two enrollment test SQL column identifiers to the existing audit target_type column, covering the persisted count and owned rejection trigger. Existing predicates, assertions, production schema and authorization remain unchanged. The observed failed run is retained; compilation and runtime of this repair are not yet validated.
+
+
+### 2026-10-19 - V7-IMPL-043 implementation acceptance
+
+Completed the SDK whole-token enrollment implementation at product source `d8ed080335bf4ad0918f445e82587d5fc058cbcd`. Enrollment retains the original token owner and the existing authority, journal and resource boundaries; public API and migration contracts remain within the registered task.
+
+Independent review accepted five directed strict checks, the SDK dependency guard, three test-harness build results, six executable-list results and all 67 selected runtime cases: 19 pure cases and 48 cases using owned PostgreSQL. The final Server source passed its 34 exact cases. The earlier Infra 21 and Gateway 12 results retain their original source attribution and are reused after independent input-applicability review, as are the earlier strict and SDK results. Owned PostgreSQL shutdown acknowledgments, original postmaster waits, empty temporary-database tails and shared-resource release were accepted within their recorded scope.
+
+The original failed attempts and host LLVM diagnostic remain preserved. Individual production driver joins, continuous physical concurrency bounds and SDK allocator internals remain unproven. This ledger-only successor still requires precise delivery review and normal merge; complete recovery, release readiness and the overall backend goal remain open. Full CI and manual Actions were not run.
