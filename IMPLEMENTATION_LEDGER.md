@@ -2127,3 +2127,8 @@ The production-only candidate `0c41d851a61eb1be99a34268e91d9a15fe9c995c` passed 
 ### V7-IMPL-043: strict validation repair candidate
 
 The first directed Infra server-runtime strict check reported two Clippy diagnostics in the token enrollment implementation. Replace a side-effect-free lazy Option fallback with its eager value and combine the existing short-circuit reader-failure condition into a let-chain. API, schema, feature edges, error ordering, resource closure and test assertions are unchanged. The original exit 101 evidence is retained; independent review and exact candidate validation remain pending.
+
+
+### V7-IMPL-043: minimal feature compatibility repair candidate
+
+Match the private history writer module and its native transaction-validation leaf to their existing server-runtime or desktop-local-vault consumers. This removes unreachable private leaves from the minimal graph while retaining the vault generic repository definition and both active feature graphs. SQL bodies, validation, error classification and public interfaces are unchanged. The original minimal strict diagnostics are retained; independent review and precise candidate checks remain pending.

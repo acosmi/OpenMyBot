@@ -1565,6 +1565,7 @@ async fn validate_custom_model_v2_legacy_0047_in_transaction(
 
 /// Exact current native prefix and complete historical origin schema on the original transaction.
 /// No checkout, migration, authority grant or transaction close occurs here.
+#[cfg(any(feature = "server-runtime", feature = "desktop-local-vault"))]
 pub(crate) async fn validate_thread_origin_in_transaction(
     tx: &tokio_postgres::Transaction<'_>,
 ) -> Result<(), InfraError> {
