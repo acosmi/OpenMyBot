@@ -2126,3 +2126,8 @@ The production-only candidate `0c41d851a61eb1be99a34268e91d9a15fe9c995c` passed 
 - V7-IMPL-044 / PR #223: Repair the native helper source so connection startup enables nonblocking operation before further polling, server notices cannot emit raw text through the default callback, and the original effect deadline is checked directly before the BASE_BACKUP send. Precharge the known static secret buffers, normalized password temporaries and fork copies in both the native owner and Rust consumer, while retaining the explicit larger copy reserve. Existing unit selectors gain exact-boundary and overflow vectors.
 
   Finite implementation reviews accept these source changes with the original worker waits, protocol, profile fields and test denominator preserved. The budget-review design contribution is disclosed. Final whole-source independent review, compilation, lists, 16 ordinary cases, native build and six native cases remain pending; native usability, signing, production distribution and full recovery are not claimed. Original failures and unproven memory boundaries are retained.
+
+
+### 2026-10-19 - V7-IMPL-044 existing dependency lock projection
+
+The first locked targeted check refused to run because the Desktop package lock entry omitted its declared rustix dependency. The lock now adds that one edge to the already locked rustix 1.1.4 package. All 841 package identities and checksums, all registry blocks, and every other package block remain unchanged; removing the single edge restores the full previous lock bytes. Independent review accepted the correction. The original refusal is retained; candidate checks and native build, consumer and recovery gates remain pending.
