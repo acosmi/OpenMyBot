@@ -355,6 +355,7 @@ impl Fixture {
             actor: auth.actor().clone(),
             auth_generation: auth.auth_generation(),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment()).mint_from_entropy(entropy),
                 run_id: RunId::new(format!("owned-stop-run-{index}")),
                 bot_id: BotId::new(BOT),
@@ -492,6 +493,7 @@ impl Fixture {
             actor: auth.actor().clone(),
             auth_generation: auth.auth_generation(),
             command: BeginThreadRunV2 {
+                artifact_refs: Vec::new(),
                 thread_id: req.command.thread_id.clone(),
                 run_id: RunId::new(run),
                 bot_id: req.command.bot_id.clone(),
@@ -1455,6 +1457,20 @@ async fn thread_history_stop_clear_exact_replay_returns_original_and_other_reque
         f.sql("DELETE FROM public.revoked_access WHERE email='stop-a@example.test'")
             .await?;
         replayed(&f.close(&next, &j1, &first).await, &j1, &first, &operation)?;
+        // The same refusal must not persist a lazily minted H for a pre-head Thread.
+        let (_, lazy_j) = f.settled(&next, 303).await?;
+        drop_head(&f, &lazy_j).await?;
+        check(f.phase(&lazy_j).await?.is_none(), "owned lazy premise still has a head")?;
+        let lazy_before = f.hq().await?;
+        let lazy_facts = f.facts().await?;
+        conflict(&f.close(&next, &lazy_j, &first).await)?;
+        check(
+            f.phase(&lazy_j).await?.is_none()
+                && f.intents(&lazy_j).await? == 0
+                && f.hq().await? == lazy_before
+                && f.facts().await? == lazy_facts,
+            "refused cross-J request persisted a lazy head or any other write",
+        )?;
         f.finish().await
     })
     .await;
@@ -2247,6 +2263,104 @@ async fn thread_history_stop_clear_real_single_user_owner_closes_and_synthetic_o
         )?;
         drop(resolver);
         drop(authority);
+        f.finish().await
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly owned loopback PostgreSQL17.11"]
+async fn thread_history_stop_clear_two_original_producers_on_same_j_keep_one_intent() {
+    owned("stop-two-producers", 7, |f| async move {
+        let a = f.auth(A, 1).await?;
+        let (_, j) = f.settled(&a, 990).await?;
+        let other = Arc::new(
+            PostgresThreadHistoryAuthority::new(
+                f.pool.clone(),
+                DeploymentId::new(DEP),
+                TenantId::new(TENANT),
+            )
+            .map_err(text)?,
+        );
+        other.enroll_original_registry(&f.registry).map_err(text)?;
+        let resolver = PostgresSessionAuthResolver::new(
+            f.pool.clone(),
+            SESSION_KEY,
+            openbot_infra::auth::config::default_session_lifetime(),
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+        )
+        .map_err(text)?;
+        resolver
+            .install_thread_history_authority(&other)
+            .map_err(text)?;
+        let parts = http::Request::builder()
+            .uri("/owned-two-producers")
+            .header(
+                "cookie",
+                format!("openbot_session=owned-stop-cookie-{A}-01"),
+            )
+            .body(())
+            .map_err(text)?
+            .into_parts()
+            .0;
+        let b = resolver.resolve(&parts).await.map_err(text)?;
+        let left = request_id();
+        let right = request_id();
+        let (one, two) = tokio::join!(
+            f.close(&a, &j, &left),
+            other.close_for_stop_clear_before(&b, &j, &right, deadline()),
+        );
+        let one_committed = one
+            .as_ref()
+            .is_ok_and(|x| x.confirmation() == Confirmation::CommitAcknowledged);
+        let two_committed = two
+            .as_ref()
+            .is_ok_and(|x| x.confirmation() == Confirmation::CommitAcknowledged);
+        check(
+            one_committed != two_committed,
+            "two producers did not select exactly one original commit",
+        )?;
+        let (winner, loser, winner_result) = if one_committed {
+            check(
+                matches!(two, Err(Stop::Conflict | Stop::Unavailable)),
+                "second producer had an unexpected refusal",
+            )?;
+            (&left, &right, &one)
+        } else {
+            check(
+                matches!(one, Err(Stop::Conflict | Stop::Unavailable)),
+                "first producer had an unexpected refusal",
+            )?;
+            (&right, &left, &two)
+        };
+        let operation = committed(winner_result, &a, &j, winner)?;
+        check(
+            f.intents(&j).await? == 1,
+            "same-J producers persisted two intents",
+        )?;
+        let before = f.hq().await?;
+        conflict(&f.close(&a, &j, loser).await)?;
+        conflict(
+            &other
+                .close_for_stop_clear_before(&b, &j, loser, deadline())
+                .await,
+        )?;
+        replayed(&f.close(&a, &j, winner).await, &j, winner, &operation)?;
+        replayed(
+            &other
+                .close_for_stop_clear_before(&b, &j, winner, deadline())
+                .await,
+            &j,
+            winner,
+            &operation,
+        )?;
+        check(
+            f.hq().await? == before,
+            "mutual refusal or exact replay rewrote the winning intent",
+        )?;
+        resolver.close_request_bindings();
+        drop((resolver, other, b));
         f.finish().await
     })
     .await;

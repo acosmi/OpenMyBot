@@ -1288,6 +1288,7 @@ pub async fn begin_thread_run_with_skills_and_model(
                 anchor,
                 message: message.to_owned(),
                 selected_skill_slugs: selected_skill_slugs.to_vec(),
+                artifact_refs: Vec::new(),
             })
             .map_err(|_| ApiError::InvalidResponse)?;
         let response = Request::send(request).await?;

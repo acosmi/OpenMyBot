@@ -208,6 +208,7 @@ impl Fixture {
             tenant,
             actor: ActorId::new(OWNER),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: if channel {
                     ThreadIdentity::new(&DeploymentId::new(DEPLOYMENT)).mint_from_entropy([2; 16])
                 } else {

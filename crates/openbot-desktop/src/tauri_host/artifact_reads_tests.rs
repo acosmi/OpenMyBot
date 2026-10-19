@@ -725,6 +725,7 @@ impl LocalFixture {
                 .clone();
             let payload = PAYLOAD.to_owned();
             let begin = BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment()).mint_from_entropy([9; 16]),
                 run_id: RunId::new("actual/local-lifecycle-run"),
                 bot_id: BotId::new("desktop-assistant"),
@@ -917,24 +918,26 @@ impl LocalFixture {
                         .parse::<u32>()
                         .map_err(|_| "actual postmaster PID invalid")?;
                     require(pid > 1, "owned postmaster PID is invalid")?;
-                    pids.push(pid);
+                    pids.push((pid, path));
                 }
             }
             require(
                 pids.len() == 1,
                 "genuine Prepared did not own exactly one controlled sidecar",
             )?;
-            Ok::<_, String>((artifact, pids[0]))
+            Ok::<_, String>((artifact, pids[0].0, pids[0].1.clone()))
         }
         .await;
         match populated {
-            Ok((artifact, postmaster_pid)) => {
+            Ok((artifact, postmaster_pid, postmaster_data_dir)) => {
                 // Active sidecar resources must survive an unexpected test panic. Only
                 // finish() may permit root removal after genuine shutdown and PID-gone proof.
                 root.1 = false;
                 eprintln!(
-                    "PUBLIC_ARTIFACT_LOCAL_ACTUAL_RESOURCE original_postmaster_pid={postmaster_pid} controlled_app_root={}",
-                    root.0.display()
+                    "PUBLIC_ARTIFACT_LOCAL_ACTUAL_RESOURCE original_postmaster_pid={postmaster_pid} controlled_app_root={} original_PID_file={}/postmaster.pid data_dir={}",
+                    root.0.display(),
+                    postmaster_data_dir.display(),
+                    postmaster_data_dir.display()
                 );
                 Ok(Self {
                     root,

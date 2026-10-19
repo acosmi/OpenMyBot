@@ -262,6 +262,7 @@ fn begin_v1(
         actor: ActorId::new("alice"),
         auth_generation: AuthGeneration::new(7),
         command: BeginThreadRun {
+            artifact_refs: Vec::new(),
             thread_id: thread_for(index),
             run_id: RunId::new(format!("closure-run-{index}")),
             bot_id: BotId::new("bot"),
@@ -866,6 +867,7 @@ impl V2 {
             actor: ActorId::new("alice"),
             auth_generation: AuthGeneration::new(7),
             command: BeginThreadRunV2 {
+                artifact_refs: Vec::new(),
                 thread_id: thread_for(index),
                 run_id: RunId::new(format!("closure-run-{index}")),
                 bot_id: BotId::new("bot"),
@@ -1278,10 +1280,12 @@ const TEST_KEY_DER_BASE64: &str =
 
 struct LocalResolver {
     address: SocketAddr,
+    resolved: Arc<AtomicUsize>,
 }
 #[async_trait]
 impl DnsResolver for LocalResolver {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, DnsUnavailable> {
+        self.resolved.fetch_add(1, Ordering::SeqCst);
         if host != "idp.test" || port != self.address.port() {
             return Err(DnsUnavailable);
         }
@@ -1296,6 +1300,7 @@ struct Tls {
     root: CertificateDer<'static>,
     accepted: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
+    resolved: Arc<AtomicUsize>,
     gate: Arc<Semaphore>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
@@ -1320,6 +1325,7 @@ impl Tls {
         let address = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(AtomicUsize::new(0));
+        let resolved = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(Semaphore::new(0));
         let (stop, mut stopped) = oneshot::channel();
         let (seen_accept, seen_request, held) = (accepted.clone(), requests.clone(), gate.clone());
@@ -1365,6 +1371,7 @@ impl Tls {
             root,
             accepted,
             requests,
+            resolved,
             gate,
             stop: Some(stop),
             task: Some(task),
@@ -1380,6 +1387,7 @@ impl Tls {
             EgressPolicy::new(CidrAllowlist::parse_exact(["127.0.0.1/32"]).unwrap()),
             Arc::new(LocalResolver {
                 address: self.address,
+                resolved: self.resolved.clone(),
             }),
             [self.root.clone()],
         )
@@ -3183,5 +3191,172 @@ async fn legacy_start_query_failure(
         "a failed closed-head read closed or removed the head",
     )?;
     drop((observer, heads, c));
+    close_pool(starter_pool).await?;
+    v2_start_early_dataset_query_failure(p, config, tls, v2).await
+}
+
+/// Independent current-dataset start error classification before its closed-head read or send.
+/// Its original AuthorizedStart user/target/model locks precede this dataset schema observation.
+/// The owned heads table lock stops a registered schema capture, without granting an H row lock.
+/// The original legacy case above retains its distinct exact closed-predicate witness.
+async fn v2_start_early_dataset_query_failure(
+    p: &pool::DatabasePool,
+    config: &pool::DatabaseConfig,
+    tls: &Tls,
+    v2: &V2,
+) -> TestResult {
+    let model = v2
+        .model(CustomModelProtocol::OpenaiResponses, &tls.endpoint())
+        .await?;
+    let begin = v2.request(79, &model);
+    v2.directory
+        .begin_thread_run_v2(begin.clone())
+        .await
+        .map_err(text)?;
+    let request = v2
+        .context(p)
+        .load(&lease_of(&begin.command.run_id, &begin.command.thread_id))
+        .await
+        .map_err(text)?;
+    let (starter_pool, starter) = dedicated(config, "closure_v2_early_dataset_starter").await?;
+    // A V2 binding cannot be borrowed from a same-DSN different Pool. Enrol this pool's actual
+    // registry via the existing V2 assembly; it observes the same real persisted dataset tuple.
+    let original = V2::new(&starter_pool, config).await?;
+    let provider = PostgresCustomModelProvider::new(
+        starter_pool.clone(),
+        vault(0x71),
+        DeploymentId::new(DEP),
+        TenantId::new(TENANT),
+        tls.dialer(),
+        SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(20)).map_err(text)?,
+        Some(Duration::from_secs(2)),
+    )
+    .map_err(text)?
+    .with_model_dataset_binding(original.binding.clone())
+    .map_err(text)?;
+    let sends = tls.requests();
+    let accepts = tls.accepted.load(Ordering::SeqCst);
+    let resolves = tls.resolved.load(Ordering::SeqCst);
+    let observer = p.get().await.map_err(text)?;
+    let heads = p.get().await.map_err(text)?;
+    let blocker = hold(
+        &heads,
+        "LOCK TABLE openbot_internal.thread_history_heads IN ACCESS EXCLUSIVE MODE",
+    )
+    .await?;
+    let task = tokio::spawn(async move { provider.start(request).await });
+    wait_blocked(&observer, starter, blocker).await?;
+    let (_, query) = activity(&observer, starter).await?;
+    // These are the original CAPTURE_SQL prefixes in the already registered native V2 check.
+    let original_schema_prefixes = [
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('public'::text,'model_connections'::text),",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'run_model_selection_v2_snapshots'::text)",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'gateway_authorization_attempts'::text)",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'thread_origins'::text)",
+        "WITH\nwanted_relations(schema_name, relation_name) AS (\n VALUES ('openbot_internal'::text,'thread_history_heads'::text),",
+    ];
+    eprintln!(
+        "THREAD_HISTORY_V2_DATASET_WITNESS original_backend_pid={starter} blocker_pid={blocker} query={query:?}"
+    );
+    require(
+        query.contains("pg_catalog")
+            && !query.contains("SELECT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads")
+            && original_schema_prefixes
+                .iter()
+                .any(|prefix| query.starts_with(*prefix))
+            && {
+                let rows = observer
+                    .query(
+                        "SELECT l.locktype,coalesce(n.nspname||'.'||c.relname,''),l.mode, \
+                         CASE WHEN l.locktype='relation' AND l.mode='RowShareLock' \
+                           AND ((c.relkind='i' AND base.relkind='r') \
+                             OR (c.relkind='I' AND base.relkind='p')) \
+                           AND i.indisvalid AND i.indisready AND i.indislive \
+                         THEN base_ns.nspname||'.'||base.relname END \
+                         FROM pg_catalog.pg_locks l \
+                         LEFT JOIN pg_catalog.pg_class c ON c.oid=l.relation \
+                         LEFT JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
+                         LEFT JOIN pg_catalog.pg_index i ON i.indexrelid=c.oid \
+                         LEFT JOIN pg_catalog.pg_class base ON base.oid=i.indrelid \
+                         LEFT JOIN pg_catalog.pg_namespace base_ns ON base_ns.oid=base.relnamespace \
+                         WHERE l.pid=$1 AND l.granted \
+                           AND (l.locktype IN ('tuple','advisory') \
+                             OR (l.locktype='relation' AND l.mode IN ('RowShareLock','RowExclusiveLock'))) \
+                         ORDER BY l.locktype COLLATE \"C\",coalesce(n.nspname||'.'||c.relname,'') COLLATE \"C\",l.mode COLLATE \"C\"",
+                        &[&starter],
+                    )
+                    .await
+                    .map_err(text)?;
+                let raw_observed: Vec<(String, String, String)> = rows
+                    .iter()
+                    .map(|row| (row.get(0), row.get(1), row.get(2)))
+                    .collect();
+                let expected: Vec<(String, String, String)> = [
+                    "public.agent_profiles",
+                    "public.agents",
+                    "public.custom_model_catalogs",
+                    "public.model_connection_secrets",
+                    "public.model_connections",
+                    "public.runs",
+                    "public.thread_leases",
+                    "public.thread_memberships",
+                    "public.threads",
+                    "public.user_roles",
+                    "public.users",
+                ]
+                .into_iter()
+                .map(|relation| {
+                    (
+                        "relation".to_owned(),
+                        relation.to_owned(),
+                        "RowShareLock".to_owned(),
+                    )
+                })
+                .collect();
+                let observed: Vec<(String, String, String)> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        let derived_parent: Option<String> = row.get(3);
+                        derived_parent.as_ref().is_none_or(|parent| {
+                            !expected.iter().any(|(_, relation, _)| relation == parent)
+                        })
+                    })
+                    .map(|row| (row.get(0), row.get(1), row.get(2)))
+                    .collect();
+                eprintln!(
+                    "THREAD_HISTORY_V2_DATASET_WITNESS original_backend_pid={starter} granted_row_level_classes={raw_observed:?} authority_base_classes={observed:?}"
+                );
+                observed == expected
+            },
+        "V2 witness was not its original dataset/schema read with exactly the original authority locks",
+    )?;
+    let terminated: bool = observer
+        .query_one("SELECT pg_terminate_backend($1)", &[&starter])
+        .await
+        .map_err(text)?
+        .get(0);
+    require(terminated, "owned early V2 backend was not terminated")?;
+    release(&heads).await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .map_err(|_| "the failed early V2 schema read never returned".to_owned())?
+        .map_err(text)?;
+    require(
+        matches!(outcome, Err(ProviderPortError::Unavailable)),
+        "V2 early dataset query error read as closed, admitted or invalid request",
+    )?;
+    require(
+        tls.resolved.load(Ordering::SeqCst) == resolves
+            && tls.requests() == sends
+            && tls.accepted.load(Ordering::SeqCst) == accepts,
+        "V2 early query failure reached owned DNS/TLS/HTTP endpoint",
+    )?;
+    let c = p.get().await.map_err(text)?;
+    require(
+        head_phase(&c, &begin.command.thread_id).await?.as_deref() == Some("open"),
+        "V2 early schema failure closed or removed its original head",
+    )?;
+    drop((observer, heads, c));
+    original.finish().await;
     close_pool(starter_pool).await
 }

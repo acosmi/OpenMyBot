@@ -2842,6 +2842,7 @@ impl DesktopTauriProtocol {
                 let command = match body {
                     DecodedBeginThreadRunBody::Legacy(body) => {
                         AppCommand::BeginThreadRun(BeginThreadRun {
+                            artifact_refs: body.artifact_refs,
                             model_selection: body.model_selection,
                             selected_skill_slugs: body.selected_skill_slugs,
                             thread_id,
@@ -2853,6 +2854,7 @@ impl DesktopTauriProtocol {
                     }
                     DecodedBeginThreadRunBody::V2(body) => {
                         AppCommand::BeginThreadRunV2(BeginThreadRunV2 {
+                            artifact_refs: body.artifact_refs,
                             model_selection: body.model_selection,
                             selected_skill_slugs: body.selected_skill_slugs,
                             thread_id,
@@ -7039,6 +7041,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_refs_local_v1_v2_body_mapping_reaches_application_shape_guard() {
+        let (protocol, root) = protocol();
+        protocol.bind_window("artifact-refs", auth(), None).unwrap();
+        for selection in [
+            serde_json::Value::Null,
+            json!({
+                "schemaVersion": 2, "source": "custom",
+                "connectionId": "0196ea23-b506-73c8-8153-213383fdc24a",
+                "expectedConnectionRevision": 1, "modelId": "model",
+                "expectedCatalogRevision": 1
+            }),
+        ] {
+            let wire = json!({
+                "runId": "artifact-forwarding", "botId": "agent-one",
+                "anchor": {"kind": "direct_bot"}, "message": "unchanged",
+                "modelSelection": selection, "artifactRefs": ["not-a-uuid-v7"]
+            });
+            let response = protocol
+                .handle(
+                    "artifact-refs",
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/threads/550e8400-e29b-41d4-a716-446655440000/runs")
+                        .body(serde_json::to_vec(&wire).unwrap())
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(response.body()).unwrap()["code"],
+                "malformed_payload"
+            );
+        }
+        assert!(protocol.unbind_window("artifact-refs").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn channel_and_thread_unary_routes_share_typed_application_without_fake_streaming() {
         const SECRET: &str = "DESKTOP_CHANNEL_MESSAGE_SECRET";
         let (protocol, root) = protocol();
@@ -7155,6 +7195,7 @@ mod tests {
 
         let run_id = RunId::new("desktop-run-1");
         let begin_body = serde_json::to_vec(&BeginThreadRunBody {
+            artifact_refs: Vec::new(),
             model_selection: None,
             selected_skill_slugs: vec!["skill-one".to_owned()],
             run_id: run_id.clone(),

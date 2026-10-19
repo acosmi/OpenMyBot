@@ -629,6 +629,7 @@ fn request(actor: &str, index: u64) -> BeginThreadRunRequest {
         actor: ActorId::new(actor),
         auth_generation: AuthGeneration::new(7),
         command: BeginThreadRun {
+            artifact_refs: Vec::new(),
             thread_id: ThreadIdentity::new(&deployment).mint_from_entropy(entropy),
             run_id: RunId::new(format!("owned-origin-run-{index}")),
             bot_id: BotId::new("origin-bot"),
@@ -1308,6 +1309,7 @@ impl ModelFixture {
             actor: ActorId::new("alice"),
             auth_generation: AuthGeneration::new(7),
             command: BeginThreadRunV2 {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&DeploymentId::new(DEP)).mint_from_entropy(entropy),
                 run_id: RunId::new(format!("owned-v2-run-{index}")),
                 bot_id: BotId::new("bot"),

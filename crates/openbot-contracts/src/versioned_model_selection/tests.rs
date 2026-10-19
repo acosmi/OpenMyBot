@@ -170,7 +170,7 @@ fn v2_three_sources_round_trip_six_fields_only() {
             versioned
         );
         assert_eq!(
-            serde_json::to_value(&source).unwrap(),
+            serde_json::to_value(source).unwrap(),
             json!(source.as_str())
         );
         assert_eq!(

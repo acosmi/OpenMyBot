@@ -71,6 +71,7 @@ impl Fixture {
             tenant: TenantId::new("tenant-a"),
             actor: ActorId::new("actor-a"),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([7; 16]),
                 run_id: RunId::new("opaque/run%原始"),
                 bot_id: BotId::new("bot-a"),

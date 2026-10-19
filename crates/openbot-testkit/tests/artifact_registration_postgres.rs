@@ -188,6 +188,7 @@ impl Fixture {
             actor: ActorId::new("actor-a"),
             auth_generation: AuthGeneration::new(0),
             command: BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&deployment).mint_from_entropy([11; 16]),
                 run_id: RunId::new("actual/host-run%成果"),
                 bot_id: BotId::new("bot-a"),

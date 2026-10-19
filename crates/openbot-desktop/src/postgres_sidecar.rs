@@ -73,6 +73,12 @@ const LOCK_NONCE_BYTES: usize = 16;
 const VERSION_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg(feature = "postgres-supervisor")]
 const INITDB_DEADLINE: Duration = Duration::from_secs(30);
+// PostgreSQL's interactive prompt prefers the controlling terminal over stdin. On macOS,
+// explicitly read the existing private stdin pipe instead; no password file is created.
+#[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
+const INITDB_PASSWORD_INPUT: &str = "--pwfile=/dev/stdin";
+#[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
+const INITDB_PASSWORD_LINES: usize = 1;
 #[cfg(feature = "postgres-supervisor")]
 const READY_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(feature = "postgres-supervisor")]
@@ -1854,7 +1860,7 @@ async fn run_initdb_with_helper(
         .arg(data_dir)
         .arg(format!("--username={DESKTOP_LOCAL_POSTGRES_ADMIN_USER}"))
         .args([
-            "--pwprompt",
+            INITDB_PASSWORD_INPUT,
             "--auth-host=scram-sha-256",
             "--auth-local=reject",
             "--encoding=UTF8",
@@ -1895,7 +1901,7 @@ async fn run_initdb_with_helper(
             .stdin
             .take()
             .ok_or(PostgresSidecarError::InitdbFailed)?;
-        for _ in 0..2 {
+        for _ in 0..INITDB_PASSWORD_LINES {
             stdin
                 .write_all(secret.expose())
                 .await
@@ -3925,6 +3931,7 @@ mod tests {
             .execute(
                 prepared.auth_context().clone(),
                 AppCommand::BeginThreadRun(BeginThreadRun {
+                    artifact_refs: Vec::new(),
                     model_selection: None,
                     selected_skill_slugs: Vec::new(),
                     thread_id: minted.thread_id,

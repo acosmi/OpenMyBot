@@ -15,7 +15,7 @@ use openbot_contracts::command::{
     ThreadHistory, ThreadRunCancellation, ThreadRunStarted,
 };
 use openbot_contracts::error::{AppError, IdentityConflictReason};
-use openbot_contracts::ids::{ActorId, BotId, ChannelId, DeploymentId, TenantId, ThreadId};
+use openbot_contracts::ids::{ActorId, BotId, ChannelId, DeploymentId, RunId, TenantId, ThreadId};
 use openbot_contracts::memory::{
     CorrectMemory, MemoryControl, MemoryMutation, MemoryPage, MemoryRecall, MemoryRecord,
     RecallMemories, RememberMemory, UpdateMemoryControl,
@@ -675,6 +675,28 @@ pub struct BeginThreadRunV2Request {
     pub command: BeginThreadRunV2,
 }
 
+/// Ordered, non-wire input facts; the original begin transaction must recheck their authority.
+///
+/// Body text is deliberately excluded from Debug and serde implementations.
+pub struct RunInputArtifactMaterial {
+    /// Canonical UUIDv7 in the original reference order.
+    pub artifact_id: String,
+    /// Actual preread registry dataset.
+    pub dataset_id: String,
+    /// Actual full-object lowercase SHA-256.
+    pub sha256: String,
+    /// Actual observed media type.
+    pub media_type: String,
+    /// Actual full-object length, never a truncated body length.
+    pub byte_length: u64,
+    /// Original source Thread.
+    pub source_thread_id: ThreadId,
+    /// Original source Run.
+    pub source_run_id: RunId,
+    /// Complete verified UTF-8 text, or no body for a nontext reference.
+    pub body: Option<String>,
+}
+
 /// Authoritative scope combined with one durable cancellation candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelThreadRunRequest {
@@ -801,6 +823,48 @@ pub trait ThreadDirectory: Send + Sync {
         _request: BeginThreadRunV2Request,
     ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
         Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Observe only an exact original receipt, closing the read transaction on both hit and miss.
+    async fn observe_begin_replay(
+        &self,
+        _request: BeginThreadRunRequest,
+    ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Observe the original v2 receipt without calling either begin producer.
+    async fn observe_begin_replay_v2(
+        &self,
+        _request: BeginThreadRunV2Request,
+    ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Admit ordered preread material only through an implementation of the original transaction.
+    async fn begin_thread_run_with_artifacts(
+        &self,
+        request: BeginThreadRunRequest,
+        materials: Vec<RunInputArtifactMaterial>,
+    ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        if request.command.artifact_refs.is_empty() && materials.is_empty() {
+            self.begin_thread_run(request).await
+        } else {
+            Err(ThreadDirectoryError::Unavailable)
+        }
+    }
+
+    /// Keep v2 admission separate, with compatibility only when both reference inputs are empty.
+    async fn begin_thread_run_with_artifacts_v2(
+        &self,
+        request: BeginThreadRunV2Request,
+        materials: Vec<RunInputArtifactMaterial>,
+    ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        if request.command.artifact_refs.is_empty() && materials.is_empty() {
+            self.begin_thread_run_v2(request).await
+        } else {
+            Err(ThreadDirectoryError::Unavailable)
+        }
     }
 
     /// Persist a replay-safe internal cancellation request before signalling any local child.

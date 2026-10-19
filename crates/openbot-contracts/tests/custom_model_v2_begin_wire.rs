@@ -49,7 +49,7 @@ fn all_standard_json_boundary_whitespace_counts_in_original_span() {
 fn interior_json_whitespace_counts_without_changing_the_original_v2_intent() {
     let expected = decode_begin_thread_run_body(body(V2).as_bytes()).unwrap();
     let remaining = 4096 - V2.len();
-    for whitespace in [b' ', b'\t', b'\r', b'\n'] {
+    for whitespace in *b" \t\r\n" {
         let padding = String::from_utf8(vec![whitespace; remaining]).unwrap();
         let exact_selection = format!("{{{padding}{}", &V2[1..]);
         assert_eq!(exact_selection.len(), 4096);

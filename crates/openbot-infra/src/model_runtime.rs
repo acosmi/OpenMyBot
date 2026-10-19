@@ -1155,7 +1155,7 @@ async fn load_current_v2(
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "text" | "modelSelection" | "runAnchor" | "selectedSkillSlugs"
+            "text" | "modelSelection" | "runAnchor" | "selectedSkillSlugs" | "artifactRefs"
         )
     }) || object
         .get("text")
@@ -1169,6 +1169,10 @@ async fn load_current_v2(
         if !openbot_contracts::command::valid_selected_skill_slugs(&skills) {
             return Err(bad());
         }
+    }
+    if let Some(value) = object.get("artifactRefs") {
+        let refs: Vec<String> = serde_json::from_value(value.clone()).map_err(|_| bad())?;
+        crate::thread_directory::artifact_refs::validate_ids(&refs).map_err(|_| bad())?;
     }
     let intent_value = input.get("modelSelection").cloned().ok_or_else(bad)?;
     let selection: RunModelSelectionV2 = serde_json::from_value(intent_value).map_err(|_| bad())?;

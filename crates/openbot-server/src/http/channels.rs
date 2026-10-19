@@ -42,7 +42,7 @@ use std::future::poll_fn;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, Query, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -445,10 +445,8 @@ pub async fn events(
         }
         .into());
     }
-    let stream = state
-        .application()
-        .subscribe(auth, SubscriptionRequest::ChannelActivity)
-        .await?;
+    let (stream, authority) =
+        super::realtime::subscribe(&state, auth, SubscriptionRequest::ChannelActivity).await?;
     Ok(ws
         .protocols([CHANNEL_ACTIVITY_PROTOCOL])
         .max_message_size(CHANNEL_ACTIVITY_INPUT_LIMIT)
@@ -456,21 +454,19 @@ pub async fn events(
         .on_failed_upgrade(|error| {
             tracing::debug!(error = %error, "channel activity websocket upgrade failed");
         })
-        .on_upgrade(move |socket| drive_channel_websocket(socket, stream)))
+        .on_upgrade(move |socket| drive_channel_websocket(socket, stream, authority)))
 }
 
 async fn drive_channel_websocket(
     mut socket: WebSocket,
     mut stream: openbot_application::AppEventStream,
+    authority: super::realtime::RealtimeAuthority,
 ) {
     loop {
         tokio::select! {
             event = poll_fn(|cx| stream.as_mut().poll_next(cx)) => {
                 let Some(event) = event else {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::NORMAL,
-                        reason: "stream_complete".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::NORMAL, "stream_complete").await;
                     return;
                 };
                 let (text, terminal) = match event {
@@ -478,10 +474,7 @@ async fn drive_channel_websocket(
                         Ok(text) => (text, false),
                         Err(error) => {
                             tracing::error!(error = %error, "typed channel activity encoding failed");
-                            let _ = socket.send(Message::Close(Some(CloseFrame {
-                                code: close_code::ERROR,
-                                reason: "event_encoding_failed".into(),
-                            }))).await;
+                            super::realtime::close(&mut socket, stream, close_code::ERROR, "event_encoding_failed").await;
                             return;
                         }
                     },
@@ -494,21 +487,15 @@ async fn drive_channel_websocket(
                     | AppEvent::ToolApprovalActivity(_)
                     | AppEvent::ToolApprovalStreamError { .. } => {
                         tracing::error!("channel subscription emitted non-channel event");
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
-                            code: close_code::ERROR,
-                            reason: "application_contract_failed".into(),
-                        }))).await;
+                        super::realtime::close(&mut socket, stream, close_code::ERROR, "application_contract_failed").await;
                         return;
                     }
                 };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                if super::realtime::send(&mut socket, Message::Text(text.into()), &authority).await.is_err() {
                     return;
                 }
                 if terminal {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::ERROR,
-                        reason: "channel_stream_failed".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::ERROR, "channel_stream_failed").await;
                     return;
                 }
             }
@@ -516,10 +503,7 @@ async fn drive_channel_websocket(
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return,
                 Some(Ok(Message::Text(_) | Message::Binary(_))) => {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::POLICY,
-                        reason: "channel_activity_read_only".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::POLICY, "channel_activity_read_only").await;
                     return;
                 }
                 Some(Err(error)) => {

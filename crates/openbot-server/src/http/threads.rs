@@ -11,7 +11,7 @@ use std::future::poll_fn;
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -256,6 +256,7 @@ pub async fn begin_run(
     let thread_id = ThreadId::new(thread_id);
     let command = match body {
         DecodedBeginThreadRunBody::Legacy(body) => AppCommand::BeginThreadRun(BeginThreadRun {
+            artifact_refs: body.artifact_refs,
             model_selection: body.model_selection,
             selected_skill_slugs: body.selected_skill_slugs,
             thread_id,
@@ -265,6 +266,7 @@ pub async fn begin_run(
             message: body.message,
         }),
         DecodedBeginThreadRunBody::V2(body) => AppCommand::BeginThreadRunV2(BeginThreadRunV2 {
+            artifact_refs: body.artifact_refs,
             model_selection: body.model_selection,
             selected_skill_slugs: body.selected_skill_slugs,
             thread_id,
@@ -424,16 +426,15 @@ pub async fn websocket(
         }
         .into());
     }
-    let stream = state
-        .application()
-        .subscribe(
-            auth,
-            SubscriptionRequest::ThreadEvents {
-                thread_id: ThreadId::new(thread_id),
-                after_event_sequence: query.cursor,
-            },
-        )
-        .await?;
+    let (stream, authority) = super::realtime::subscribe(
+        &state,
+        auth,
+        SubscriptionRequest::ThreadEvents {
+            thread_id: ThreadId::new(thread_id),
+            after_event_sequence: query.cursor,
+        },
+    )
+    .await?;
     Ok(ws
         .protocols([THREAD_EVENTS_WS_PROTOCOL])
         .max_message_size(THREAD_EVENTS_WS_INPUT_LIMIT)
@@ -441,32 +442,35 @@ pub async fn websocket(
         .on_failed_upgrade(|error| {
             tracing::debug!(error = %error, "thread websocket upgrade 失败");
         })
-        .on_upgrade(move |socket| drive_thread_websocket(socket, stream)))
+        .on_upgrade(move |socket| drive_thread_websocket(socket, stream, authority)))
 }
 
-async fn drive_thread_websocket(mut socket: WebSocket, mut stream: AppEventStream) {
+async fn drive_thread_websocket(
+    mut socket: WebSocket,
+    mut stream: AppEventStream,
+    authority: super::realtime::RealtimeAuthority,
+) {
     loop {
         tokio::select! {
             event = poll_fn(|cx| stream.as_mut().poll_next(cx)) => {
                 let Some(event) = event else {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::NORMAL,
-                        reason: "stream_complete".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::NORMAL, "stream_complete").await;
                     return;
                 };
+                let terminal = matches!(&event, AppEvent::ThreadStreamError { .. });
                 let text = match serde_json::to_string(&event) {
                     Ok(text) => text,
                     Err(error) => {
                         tracing::error!(error = %error, "typed thread event 序列化失败");
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
-                            code: close_code::ERROR,
-                            reason: "event_encoding_failed".into(),
-                        }))).await;
+                        super::realtime::close(&mut socket, stream, close_code::ERROR, "event_encoding_failed").await;
                         return;
                     }
                 };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                if super::realtime::send(&mut socket, Message::Text(text.into()), &authority).await.is_err() {
+                    return;
+                }
+                if terminal {
+                    super::realtime::close(&mut socket, stream, close_code::ERROR, "thread_stream_failed").await;
                     return;
                 }
             }
@@ -474,10 +478,7 @@ async fn drive_thread_websocket(mut socket: WebSocket, mut stream: AppEventStrea
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return,
                 Some(Ok(Message::Text(_) | Message::Binary(_))) => {
-                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::POLICY,
-                        reason: "thread_events_read_only".into(),
-                    }))).await;
+                    super::realtime::close(&mut socket, stream, close_code::POLICY, "thread_events_read_only").await;
                     return;
                 }
                 Some(Err(error)) => {
@@ -507,16 +508,15 @@ pub async fn events(
     })?;
     // Standard Last-Event-ID on reconnect overrides the one-time native bootstrap cursor.
     let after_event_sequence = last_event_id(&headers)?.or(query.cursor);
-    let stream = state
-        .application()
-        .subscribe(
-            auth,
-            SubscriptionRequest::ThreadEvents {
-                thread_id: ThreadId::new(thread_id),
-                after_event_sequence,
-            },
-        )
-        .await?;
+    let (stream, _) = super::realtime::subscribe(
+        &state,
+        auth,
+        SubscriptionRequest::ThreadEvents {
+            thread_id: ThreadId::new(thread_id),
+            after_event_sequence,
+        },
+    )
+    .await?;
     Ok(Sse::new(ThreadSseStream { inner: stream }).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -1102,6 +1102,7 @@ mod tests {
                     tenant: TenantId::new("tenant-test"),
                     actor: ActorId::new("u1"),
                     command: BeginThreadRun {
+                        artifact_refs: Vec::new(),
                         model_selection: Some(
                             openbot_contracts::model_connections::RunModelSelection {
                                 connection_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
@@ -1119,6 +1120,38 @@ mod tests {
                     },
                 }]
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_refs_v1_v2_body_mapping_reaches_the_original_shape_guard() {
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for selection in [
+            serde_json::Value::Null,
+            serde_json::json!({
+                "schemaVersion": 2, "source": "custom",
+                "connectionId": "0196ea23-b506-73c8-8153-213383fdc24a",
+                "expectedConnectionRevision": 1, "modelId": "model",
+                "expectedCatalogRevision": 1
+            }),
+        ] {
+            let directory = FakeThreadDirectory::new(Ok(true));
+            let visible = directory.clone();
+            let wire = serde_json::json!({
+                "runId": "artifact-forwarding", "botId": "agent-1",
+                "anchor": {"kind": "direct_bot"}, "message": "unchanged",
+                "modelSelection": selection, "artifactRefs": ["not-a-uuid-v7"]
+            });
+            let (status, _, body) = begin_request(
+                app(directory, FixedAuthResolver::granting(auth("u1"))),
+                Some("https://app.example.test"),
+                thread,
+                &wire.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "malformed_payload");
+            assert!(visible.begin_calls().is_empty());
         }
     }
 
@@ -1464,7 +1497,10 @@ mod tests {
             },
         ]);
         let visible = directory.clone();
-        let response = app(directory, FixedAuthResolver::granting(auth("u1")))
+        let router = app(directory, FixedAuthResolver::granting(auth("u1")));
+        // A live HTTP server retains its resolver while streaming the response body.
+        let response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::GET)

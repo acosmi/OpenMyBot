@@ -851,6 +851,7 @@ mod physical_lineage_tests {
                 actor: self.auth.actor().clone(),
                 auth_generation: self.auth.auth_generation(),
                 command: BeginThreadRunV2 {
+                    artifact_refs: Vec::new(),
                     thread_id: ThreadIdentity::new(self.auth.deployment())
                         .mint_from_entropy(entropy),
                     run_id: RunId::new(format!("owned-lineage-run-{number}")),

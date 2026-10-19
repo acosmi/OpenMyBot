@@ -493,6 +493,25 @@ impl AppError {
 /// 任何落在此集合之外的状态码都说明有人在错误映射里发明了新语义。
 pub const HTTP_STATUS_DOMAIN: &[u16] = &[200, 202, 400, 401, 403, 404, 409, 410, 502, 503];
 
+impl From<crate::request_binding::ArtifactReadCurrentError> for AppError {
+    fn from(error: crate::request_binding::ArtifactReadCurrentError) -> Self {
+        use crate::request_binding::{ArtifactReadCurrentError as Error, HostRequestBindingError};
+        match error {
+            Error::Host(HostRequestBindingError::NotCurrent) => Self::Unauthenticated,
+            Error::Host(
+                HostRequestBindingError::Missing | HostRequestBindingError::Unavailable,
+            ) => Self::DependencyUnavailable {
+                dependency: "host_request_binding",
+            },
+            Error::NotVisible => Self::NotVisible,
+            Error::Gone(status) => Self::ArtifactGone { status },
+            Error::Unavailable => Self::DependencyUnavailable {
+                dependency: "artifacts",
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,23 +852,5 @@ mod tests {
     fn app_error_is_a_std_error() {
         let error: Box<dyn std::error::Error> = Box::new(AppError::NotVisible);
         assert_eq!(error.to_string(), "not_visible");
-    }
-}
-impl From<crate::request_binding::ArtifactReadCurrentError> for AppError {
-    fn from(error: crate::request_binding::ArtifactReadCurrentError) -> Self {
-        use crate::request_binding::{ArtifactReadCurrentError as Error, HostRequestBindingError};
-        match error {
-            Error::Host(HostRequestBindingError::NotCurrent) => Self::Unauthenticated,
-            Error::Host(
-                HostRequestBindingError::Missing | HostRequestBindingError::Unavailable,
-            ) => Self::DependencyUnavailable {
-                dependency: "host_request_binding",
-            },
-            Error::NotVisible => Self::NotVisible,
-            Error::Gone(status) => Self::ArtifactGone { status },
-            Error::Unavailable => Self::DependencyUnavailable {
-                dependency: "artifacts",
-            },
-        }
     }
 }

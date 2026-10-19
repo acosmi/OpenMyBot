@@ -118,8 +118,8 @@ pub use approval_admin::{
 pub use artifact_save_receipt::get_artifact_save_receipt;
 pub use artifacts::{
     ArtifactAdministration, ArtifactAdministrationError, CurrentArtifactReadChunk,
-    NoArtifactAdministration, get_artifact_metadata, get_source_run_artifact_ids,
-    save_run_message_text_artifact,
+    NoArtifactAdministration, RunInputArtifactMetadataObservation, get_artifact_metadata,
+    get_source_run_artifact_ids, save_run_message_text_artifact,
 };
 pub mod artifact_read_lifecycle;
 pub mod artifact_read_protocol;
@@ -178,9 +178,9 @@ pub use ports::{
     NoPolicyAdministration, NoThreadDirectory, OwnedCredentialRetirementError,
     OwnedCredentialRetirer, PeopleAdministration, PeoplePageRequest, PeoplePortError,
     PolicyAdministration, PolicyAdministrationError, PortError, RecallMemoriesRequest,
-    RememberMemoryRequest, RoutingAuditRecord, RunEffectReceiptsRequest, RunReconciliationRequest,
-    ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription,
-    ThreadHistoryRequest, UpdateMemoryControlRequest,
+    RememberMemoryRequest, RoutingAuditRecord, RunEffectReceiptsRequest, RunInputArtifactMaterial,
+    RunReconciliationRequest, ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError,
+    ThreadEventSubscription, ThreadHistoryRequest, UpdateMemoryControlRequest,
 };
 pub use provider::{
     AgentAudit, AgentAuditError, AgentAuditKind, AgentAuthorizationError, AgentAuthorizationSource,

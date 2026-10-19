@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use openbot_application::{
     AppEventStream, BeginThreadRunRequest, BeginThreadRunV2Request, CancelThreadRunRequest,
-    ChannelActivitySubscription, ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError,
-    ThreadEventSubscription, ThreadHistoryRequest,
+    ChannelActivitySubscription, RunInputArtifactMaterial, ThreadConversationRequest,
+    ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription, ThreadHistoryRequest,
 };
 use openbot_contracts::command::{
     AppEvent, ChannelActivityEvent, ThreadConversationSnapshot, ThreadForegroundRunState,
@@ -34,6 +34,7 @@ use crate::run_runtime::{
 use crate::thread_id::mint_thread_id;
 use crate::thread_listener::ThreadListenerDatabase;
 
+pub(crate) mod artifact_refs;
 mod effect_receipts;
 mod reconciliation;
 pub(crate) mod reconciliation_visibility;
@@ -99,6 +100,31 @@ fn map_v2_replay_end_error(error: crate::db::pool::TransactionOwnerError) -> Thr
         | E::CommitUnknown
         | E::CommitAcknowledgedAfterDeadline => ThreadDirectoryError::ReplayClosureUnproven,
     }
+}
+
+// A miss or refusal cannot be promoted to an accepted/unknown receipt. Only an already
+// verified exact receipt retains the original replay-closure/late-ACK reconciliation class.
+fn close_replay_observation(
+    outcome: Result<Option<ThreadRunStarted>, ThreadDirectoryError>,
+    rollback: Result<(), crate::db::pool::TransactionOwnerError>,
+    deadline: std::time::Instant,
+) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+    let exact_receipt = matches!(&outcome, Ok(Some(_)));
+    if let Err(error) = rollback {
+        return Err(if exact_receipt {
+            map_v2_replay_end_error(error)
+        } else {
+            map_v2_begin_error(error)
+        });
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(if exact_receipt {
+            ThreadDirectoryError::AcknowledgedAfterDeadline
+        } else {
+            ThreadDirectoryError::Unavailable
+        });
+    }
+    outcome
 }
 
 #[derive(Clone)]
@@ -169,12 +195,263 @@ impl PostgresThreadDirectory {
         Ok(self)
     }
 
+    async fn begin_legacy_with_materials(
+        &self,
+        request: BeginThreadRunRequest,
+        materials: Vec<RunInputArtifactMaterial>,
+    ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        artifact_refs::validate_materials(&request.command.artifact_refs, &materials)?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(ThreadDirectoryError::Unavailable)?;
+        let mut client = self.pool.get().await.map_err(|error| {
+            tracing::error!(error = %error, "begin thread run 获取数据库连接失败");
+            ThreadDirectoryError::Unavailable
+        })?;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+            .start()
+            .await
+            .map_err(|error| unavailable("begin thread run 开始事务失败", error))?;
+        transaction
+            .batch_execute("SET LOCAL lock_timeout='5s'")
+            .await
+            .map_err(|error| unavailable("begin thread run 设置锁等待限制失败", error))?;
+        let outcome = apply_begin(&transaction, runtime, &request, &materials).await;
+        match outcome {
+            Ok(BeginOutcome::Replayed(receipt)) => {
+                if let Err(error) = transaction.rollback().await {
+                    tracing::warn!(error = %error, "幂等 replay 只读事务 rollback 失败");
+                    if !materials.is_empty() {
+                        return Err(ThreadDirectoryError::ReplayClosureUnproven);
+                    }
+                }
+                Ok(receipt)
+            }
+            Ok(BeginOutcome::Created(receipt)) => {
+                transaction.commit().await.map_err(|error| {
+                    tracing::error!(error = %error, "begin thread run commit 结果未知");
+                    ThreadDirectoryError::CommitUnknown
+                })?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    tracing::warn!(error = %rollback_error, "begin thread run 失败事务 rollback 未确认");
+                    if !materials.is_empty() {
+                        return Err(ThreadDirectoryError::Unavailable);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn begin_v2_with_materials(
+        &self,
+        request: BeginThreadRunV2Request,
+        materials: Vec<RunInputArtifactMaterial>,
+    ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        artifact_refs::validate_materials(&request.command.artifact_refs, &materials)?;
+        let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
+        use openbot_contracts::versioned_model_selection::{
+            ModelSelectionIntentSource, VersionedRunModelSelection,
+        };
+        if request.command.model_selection.source() != ModelSelectionIntentSource::Custom
+            || !VersionedRunModelSelection::V2(request.command.model_selection.clone()).is_valid()
+        {
+            return Err(ThreadDirectoryError::InvalidInput {
+                field: "model_selection",
+            });
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(ThreadDirectoryError::Unavailable)?;
+        let progress = V2BeginProgress::default();
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.begin_v2_guarded(&request, runtime, deadline, &progress, &materials),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(error) = progress.failure.lock().ok().and_then(|failure| *failure) {
+                    return Err(error);
+                }
+                Err(
+                    match progress.stage.load(std::sync::atomic::Ordering::SeqCst) {
+                        V2_REPLAY_VERIFIED => ThreadDirectoryError::ReplayClosureUnproven,
+                        V2_COMMIT_ENTERED => ThreadDirectoryError::CommitUnknown,
+                        _ => ThreadDirectoryError::Unavailable,
+                    },
+                )
+            }
+        }
+    }
+
+    async fn observe_legacy_replay_guarded(
+        &self,
+        request: &BeginThreadRunRequest,
+        deadline: std::time::Instant,
+        progress: &V2BeginProgress,
+    ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get_guarded(deadline)
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let original = client
+            .begin_read_committed()
+            .await
+            .map_err(map_v2_begin_error)?;
+        let outcome = async {
+            let transaction = original.as_transaction();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis().max(1).to_string();
+            transaction.query_one("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)", &[&remaining])
+                .await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+    // One same-transaction observation of the strict current schema, before any lock;
+    // writer admission and the channel source below consume this proof.
+    let _schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
+        .await
+        .map_err(origin_error)?;
+    crate::model_runtime::validate_actor(transaction, request).await?;
+    skills::validate_actor(transaction, request).await?;
+    let command = &request.command;
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&command.thread_id.as_str()],
+        )
+        .await
+        .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
+
+    let existing_thread = load_thread(transaction, request).await?;
+    if existing_thread.is_some() {
+        crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
+            .await
+            .map_err(origin_error)?;
+    }
+    if existing_thread
+        .as_ref()
+        .is_some_and(|state| state.status == "deleted")
+    {
+        return Err(ThreadDirectoryError::NotVisible);
+    }
+    if existing_thread.is_some() && request.command.model_selection.is_some() {
+        crate::model_runtime::validate_thread(transaction, request).await?;
+    }
+    if let Some(receipt) = replay_existing(transaction, request).await? {
+        // Preserve historical replay's original authority checks; still reject damaged occupancy.
+        checked_thread_occupancy(transaction, &command.thread_id).await?;
+        return Ok(Some(receipt));
+    }
+
+    Ok(None)
+        }.await;
+        if matches!(&outcome, Ok(Some(_))) {
+            progress
+                .stage
+                .store(V2_REPLAY_VERIFIED, std::sync::atomic::Ordering::SeqCst);
+        }
+        let rollback = original.rollback().await;
+        close_replay_observation(outcome, rollback, deadline)
+    }
+
+    async fn observe_v2_replay_guarded(
+        &self,
+        request: &BeginThreadRunV2Request,
+        deadline: std::time::Instant,
+        progress: &V2BeginProgress,
+    ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+        let binding = self
+            .model_dataset_binding
+            .as_ref()
+            .ok_or(ThreadDirectoryError::Unavailable)?;
+        if !binding.matches_pool_scope(&self.pool, &request.deployment, &request.tenant) {
+            return Err(ThreadDirectoryError::Corrupt {
+                field: "model_dataset_binding",
+            });
+        }
+        let mut checkout = binding
+            .checkout(deadline)
+            .await
+            .map_err(map_dataset_error)?;
+        let original = checkout
+            .begin_read_committed()
+            .await
+            .map_err(map_v2_begin_error)?;
+        let outcome = async {
+            let model_transaction = &original;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now()).as_millis().max(1).to_string();
+            original.as_transaction().query_one("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)", &[&remaining])
+                .await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+    let transaction = model_transaction.as_transaction();
+    // One same-transaction observation of the strict current schema, before any lock;
+    // writer admission and the channel source below consume this proof.
+    let _schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
+        .await
+        .map_err(|error| match error {
+            InfraError::RepositoryInvariant {
+                code: "thread_origin_native_prefix_invalid",
+            } => ThreadDirectoryError::Corrupt {
+                field: "model_dataset_binding",
+            },
+            error => origin_error(error),
+        })?;
+    crate::model_runtime::validate_actor_v2(transaction, request).await?;
+    skills::validate_v2_slugs(request)?;
+    let command = &request.command;
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&command.thread_id.as_str()],
+        )
+        .await
+        .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
+
+    let existing_thread = load_thread_v2(transaction, request).await?;
+    if existing_thread.is_some() {
+        crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
+            .await
+            .map_err(origin_error)?;
+    }
+    if existing_thread
+        .as_ref()
+        .is_some_and(|state| state.status == "deleted")
+    {
+        return Err(ThreadDirectoryError::NotVisible);
+    }
+    if existing_thread.is_some() {
+        crate::model_runtime::validate_thread_v2(transaction, request).await?;
+    }
+    if let Some(receipt) = replay_existing_v2(model_transaction, request).await? {
+        // Preserve historical replay's original authority checks; still reject damaged occupancy.
+        checked_thread_occupancy(transaction, &command.thread_id).await?;
+        return Ok(Some(receipt));
+    }
+
+    Ok(None)
+        }.await;
+        if matches!(&outcome, Ok(Some(_))) {
+            progress
+                .stage
+                .store(V2_REPLAY_VERIFIED, std::sync::atomic::Ordering::SeqCst);
+        }
+        let rollback = original.rollback().await;
+        close_replay_observation(outcome, rollback, deadline)
+    }
+
     async fn begin_v2_guarded(
         &self,
         request: &BeginThreadRunV2Request,
         runtime: &RuntimeLease,
         deadline: std::time::Instant,
         progress: &V2BeginProgress,
+        materials: &[RunInputArtifactMaterial],
     ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
         let binding = self
             .model_dataset_binding
@@ -206,7 +483,7 @@ impl PostgresThreadDirectory {
             )
             .await
             .map_err(|_| ThreadDirectoryError::Unavailable)?;
-        let outcome = apply_begin_v2(&transaction, runtime, request).await;
+        let outcome = apply_begin_v2(&transaction, runtime, request, materials).await;
         match outcome {
             Ok(BeginOutcome::Replayed(receipt)) => {
                 progress
@@ -239,11 +516,26 @@ impl PostgresThreadDirectory {
                 Ok(receipt)
             }
             Err(error) => {
-                if let Ok(mut failure) = progress.failure.lock() {
+                // Preserve the legacy empty-input classification. New references cannot
+                // publish a refusal until the original transaction has really closed.
+                if materials.is_empty()
+                    && let Ok(mut failure) = progress.failure.lock()
+                {
                     *failure = Some(error);
                 }
                 if let Err(end) = transaction.rollback().await {
                     tracing::warn!(state=?end,"custom v2 rejected transaction closure not timely");
+                    if !materials.is_empty() {
+                        return Err(ThreadDirectoryError::Unavailable);
+                    }
+                }
+                if !materials.is_empty() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ThreadDirectoryError::Unavailable);
+                    }
+                    if let Ok(mut failure) = progress.failure.lock() {
+                        *failure = Some(error);
+                    }
                 }
                 Err(error)
             }
@@ -257,42 +549,18 @@ impl ThreadDirectory for PostgresThreadDirectory {
         &self,
         request: BeginThreadRunV2Request,
     ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
-        let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
-        use openbot_contracts::versioned_model_selection::{
-            ModelSelectionIntentSource, VersionedRunModelSelection,
-        };
-        if request.command.model_selection.source() != ModelSelectionIntentSource::Custom
-            || !VersionedRunModelSelection::V2(request.command.model_selection.clone()).is_valid()
-        {
-            return Err(ThreadDirectoryError::InvalidInput {
-                field: "model_selection",
-            });
+        if !request.command.artifact_refs.is_empty() {
+            return Err(ThreadDirectoryError::Unavailable);
         }
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(ThreadDirectoryError::Unavailable)?;
-        let progress = V2BeginProgress::default();
-        match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.begin_v2_guarded(&request, runtime, deadline, &progress),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                if let Some(error) = progress.failure.lock().ok().and_then(|failure| *failure) {
-                    return Err(error);
-                }
-                Err(
-                    match progress.stage.load(std::sync::atomic::Ordering::SeqCst) {
-                        V2_REPLAY_VERIFIED => ThreadDirectoryError::ReplayClosureUnproven,
-                        V2_COMMIT_ENTERED => ThreadDirectoryError::CommitUnknown,
-                        _ => ThreadDirectoryError::Unavailable,
-                    },
-                )
-            }
-        }
+        self.begin_v2_with_materials(request, Vec::new()).await
+    }
+
+    async fn begin_thread_run_with_artifacts_v2(
+        &self,
+        request: BeginThreadRunV2Request,
+        materials: Vec<RunInputArtifactMaterial>,
+    ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        self.begin_v2_with_materials(request, materials).await
     }
 
     async fn run_effect_receipts(
@@ -364,45 +632,81 @@ impl ThreadDirectory for PostgresThreadDirectory {
         &self,
         request: BeginThreadRunRequest,
     ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(ThreadDirectoryError::Unavailable)?;
-        let mut client = self.pool.get().await.map_err(|error| {
-            tracing::error!(error = %error, "begin thread run 获取数据库连接失败");
-            ThreadDirectoryError::Unavailable
-        })?;
-        let transaction = client
-            .build_transaction()
-            .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-            .start()
-            .await
-            .map_err(|error| unavailable("begin thread run 开始事务失败", error))?;
-        transaction
-            .batch_execute("SET LOCAL lock_timeout='5s'")
-            .await
-            .map_err(|error| unavailable("begin thread run 设置锁等待限制失败", error))?;
-        let outcome = apply_begin(&transaction, runtime, &request).await;
-        match outcome {
-            Ok(BeginOutcome::Replayed(receipt)) => {
-                if let Err(error) = transaction.rollback().await {
-                    tracing::warn!(error = %error, "幂等 replay 只读事务 rollback 失败");
-                }
-                Ok(receipt)
+        if !request.command.artifact_refs.is_empty() {
+            return Err(ThreadDirectoryError::Unavailable);
+        }
+        self.begin_legacy_with_materials(request, Vec::new()).await
+    }
+
+    async fn begin_thread_run_with_artifacts(
+        &self,
+        request: BeginThreadRunRequest,
+        materials: Vec<RunInputArtifactMaterial>,
+    ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        self.begin_legacy_with_materials(request, materials).await
+    }
+
+    async fn observe_begin_replay(
+        &self,
+        request: BeginThreadRunRequest,
+    ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+        artifact_refs::validate_ids(&request.command.artifact_refs)?;
+        if self.runtime.is_none() {
+            return Err(ThreadDirectoryError::Unavailable);
+        }
+        let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
+        let progress = V2BeginProgress::default();
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.observe_legacy_replay_guarded(&request, deadline, &progress),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_)
+                if progress.stage.load(std::sync::atomic::Ordering::SeqCst)
+                    == V2_REPLAY_VERIFIED =>
+            {
+                Err(ThreadDirectoryError::ReplayClosureUnproven)
             }
-            Ok(BeginOutcome::Created(receipt)) => {
-                transaction.commit().await.map_err(|error| {
-                    tracing::error!(error = %error, "begin thread run commit 结果未知");
-                    ThreadDirectoryError::CommitUnknown
-                })?;
-                Ok(receipt)
+            Err(_) => Err(ThreadDirectoryError::Unavailable),
+        }
+    }
+
+    async fn observe_begin_replay_v2(
+        &self,
+        request: BeginThreadRunV2Request,
+    ) -> Result<Option<ThreadRunStarted>, ThreadDirectoryError> {
+        use openbot_contracts::versioned_model_selection::{
+            ModelSelectionIntentSource, VersionedRunModelSelection,
+        };
+        artifact_refs::validate_ids(&request.command.artifact_refs)?;
+        if request.command.model_selection.source() != ModelSelectionIntentSource::Custom
+            || !VersionedRunModelSelection::V2(request.command.model_selection.clone()).is_valid()
+        {
+            return Err(ThreadDirectoryError::InvalidInput {
+                field: "model_selection",
+            });
+        }
+        if self.runtime.is_none() {
+            return Err(ThreadDirectoryError::Unavailable);
+        }
+        let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
+        let progress = V2BeginProgress::default();
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.observe_v2_replay_guarded(&request, deadline, &progress),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_)
+                if progress.stage.load(std::sync::atomic::Ordering::SeqCst)
+                    == V2_REPLAY_VERIFIED =>
+            {
+                Err(ThreadDirectoryError::ReplayClosureUnproven)
             }
-            Err(error) => {
-                if let Err(rollback_error) = transaction.rollback().await {
-                    tracing::warn!(error = %rollback_error, "begin thread run 失败事务 rollback 未确认");
-                }
-                Err(error)
-            }
+            Err(_) => Err(ThreadDirectoryError::Unavailable),
         }
     }
 
@@ -1419,12 +1723,27 @@ async fn apply_begin(
     transaction: &Transaction<'_>,
     runtime: &RuntimeLease,
     request: &BeginThreadRunRequest,
+    materials: &[RunInputArtifactMaterial],
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     // One same-transaction observation of the strict current schema, before any lock;
     // writer admission and the channel source below consume this proof.
     let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
         .await
         .map_err(origin_error)?;
+    // New artifact inputs must serialize with the original cleanup actor UPDATE
+    // before any Thread/lease/artifact locks. Empty legacy begins keep their path.
+    if !materials.is_empty()
+        && crate::thread_origin::current_native_actor(
+            transaction,
+            request.actor.as_str(),
+            request.auth_generation,
+        )
+        .await
+        .map_err(origin_error)?
+        .is_none()
+    {
+        return Err(ThreadDirectoryError::NotVisible);
+    }
     crate::model_runtime::validate_actor(transaction, request).await?;
     skills::validate_actor(transaction, request).await?;
     let command = &request.command;
@@ -1522,9 +1841,20 @@ async fn apply_begin(
     }
     let skill_snapshots = skills::resolve(transaction, request).await?;
     let model_snapshot = crate::model_runtime::resolve(transaction, request).await?;
+    artifact_refs::verify_current(
+        transaction,
+        &schema,
+        (&request.deployment, &request.tenant),
+        &request.actor,
+        request.auth_generation.get(),
+        &command.thread_id,
+        materials,
+    )
+    .await?;
     let user_message_seq = state
         .next_message_seq
         .checked_add(skill_snapshots.len() as i64)
+        .and_then(|sequence| sequence.checked_add(materials.len() as i64))
         .ok_or(ThreadDirectoryError::Corrupt {
             field: "next_message_seq",
         })?;
@@ -1682,6 +2012,21 @@ async fn apply_begin(
             .await
             .map_err(|error| write_error("写 selected skill snapshot 失败", error))?;
     }
+    artifact_refs::insert_messages(
+        transaction,
+        &command.run_id,
+        &command.thread_id,
+        &request.actor,
+        state
+            .next_message_seq
+            .checked_add(skill_snapshots.len() as i64)
+            .ok_or(ThreadDirectoryError::Corrupt {
+                field: "next_message_seq",
+            })?,
+        now,
+        materials,
+    )
+    .await?;
     transaction
         .execute(
             "INSERT INTO public.messages( \
@@ -2110,6 +2455,7 @@ async fn apply_begin_v2(
     model_transaction: &crate::model_dataset::ModelDatasetTransaction<'_>,
     runtime: &RuntimeLease,
     request: &BeginThreadRunV2Request,
+    materials: &[RunInputArtifactMaterial],
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     let transaction = model_transaction.as_transaction();
     // One same-transaction observation of the strict current schema, before any lock;
@@ -2226,9 +2572,20 @@ async fn apply_begin_v2(
         fencing,
     )
     .await?;
+    artifact_refs::verify_current(
+        transaction,
+        &schema,
+        (&request.deployment, &request.tenant),
+        &request.actor,
+        request.auth_generation.get(),
+        &command.thread_id,
+        materials,
+    )
+    .await?;
     let user_message_seq = state
         .next_message_seq
         .checked_add(skill_snapshots.len() as i64)
+        .and_then(|sequence| sequence.checked_add(materials.len() as i64))
         .ok_or(ThreadDirectoryError::Corrupt {
             field: "next_message_seq",
         })?;
@@ -2389,6 +2746,21 @@ async fn apply_begin_v2(
             .await
             .map_err(|error| write_error("写 selected skill snapshot 失败", error))?;
     }
+    artifact_refs::insert_messages(
+        transaction,
+        &command.run_id,
+        &command.thread_id,
+        &request.actor,
+        state
+            .next_message_seq
+            .checked_add(skill_snapshots.len() as i64)
+            .ok_or(ThreadDirectoryError::Corrupt {
+                field: "next_message_seq",
+            })?,
+        now,
+        materials,
+    )
+    .await?;
     transaction
         .execute(
             "INSERT INTO public.messages( \

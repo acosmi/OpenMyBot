@@ -200,6 +200,7 @@ impl Fixture {
             actor: ActorId::new("alice"),
             auth_generation: AuthGeneration::new(7),
             command: BeginThreadRunV2 {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(&DeploymentId::new(DEP)).mint_from_entropy(entropy),
                 run_id: RunId::new(format!("owned-v2-run-{index}")),
                 bot_id: BotId::new("bot"),
@@ -405,6 +406,7 @@ async fn durable_receipt_keeps_original_definition_and_rejects_complete_intent_d
         let legacy_request=|r:&BeginThreadRunV2Request| openbot_application::BeginThreadRunRequest {
             deployment:r.deployment.clone(),tenant:r.tenant.clone(),actor:r.actor.clone(),auth_generation:r.auth_generation,
             command:openbot_contracts::command::BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id:r.command.thread_id.clone(),run_id:r.command.run_id.clone(),bot_id:r.command.bot_id.clone(),
                 anchor:r.command.anchor.clone(),message:r.command.message.clone(),selected_skill_slugs:r.command.selected_skill_slugs.clone(),
                 model_selection:Some(openbot_contracts::model_connections::RunModelSelection{

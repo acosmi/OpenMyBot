@@ -415,6 +415,7 @@ impl LocalFixture {
                 .clone();
             let payload = "genuine Local source IDs text".to_owned();
             let begin = BeginThreadRun {
+                artifact_refs: Vec::new(),
                 thread_id: ThreadIdentity::new(auth.deployment()).mint_from_entropy([9; 16]),
                 run_id: RunId::new("actual/local-lifecycle-run"),
                 bot_id: BotId::new("desktop-assistant"),
@@ -515,8 +516,13 @@ impl LocalFixture {
                 // Keep a live owned sidecar root until explicit shutdown and PID observation.
                 root.1 = false;
                 eprintln!(
-                    "SAVE_RECEIPT_LOCAL_ACTUAL_RESOURCE original_postmaster_pid={postmaster_pid} controlled_app_root={}",
-                    root.0.display()
+                    "SAVE_RECEIPT_LOCAL_ACTUAL_RESOURCE original_postmaster_pid={postmaster_pid} controlled_app_root={} original_PID_file={} data_dir={}",
+                    root.0.display(),
+                    postmaster_file.display(),
+                    postmaster_file
+                        .display()
+                        .to_string()
+                        .trim_end_matches("/postmaster.pid")
                 );
                 Ok(Self {
                     root,
