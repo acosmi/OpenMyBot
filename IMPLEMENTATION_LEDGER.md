@@ -2142,3 +2142,6 @@ Add the existing SecretBytes type import used by two enrollment vectors and expl
 ### 2026-10-19 - V7-IMPL-043 cold cancellation fixture
 
 The first directed Infra runtime passed 19 pure cases, then failed q01 because the fresh single-connection test pool had already been probed; q02 did not run. The fixture now uses the existing unprobed pool constructor, preserving every assertion, permit limit, cancellation and wait sequence. Production code and q02 are byte-identical. Independent source review accepted this single test-only hunk. Current candidate compile, lists and runtime remain pending; prior results retain their original candidate attribution.
+
+
+V7-IMPL-043 test maintenance: Correct two enrollment test SQL column identifiers to the existing audit target_type column, covering the persisted count and owned rejection trigger. Existing predicates, assertions, production schema and authorization remain unchanged. The observed failed run is retained; compilation and runtime of this repair are not yet validated.

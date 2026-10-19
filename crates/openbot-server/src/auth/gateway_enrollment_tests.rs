@@ -235,7 +235,7 @@ async fn persisted(
             .is_err(),
         "foreign Actor AAD cannot open",
     )?;
-    let audits: i64 = client.query_one("SELECT count(*) FROM public.audit_events WHERE event_type='configuration.changed' AND target_kind='sdk_gateway_connection' AND target_id=$1", &[&id.to_string()]).await.map_err(|e| e.to_string())?.get(0);
+    let audits: i64 = client.query_one("SELECT count(*) FROM public.audit_events WHERE event_type='configuration.changed' AND target_type='sdk_gateway_connection' AND target_id=$1", &[&id.to_string()]).await.map_err(|e| e.to_string())?.get(0);
     check(
         audits == 1,
         "one existing configuration.changed adoption audit",
@@ -758,7 +758,7 @@ async fn r08_vault_or_audit_failure_rolls_back_atomically() {
         let accounts = f.enrollment_accounts(f.pool.clone(), vault())?;
         let journal_audits = f.audits().await?;
         let client = f.pool.get().await.map_err(|e| e.to_string())?;
-        client.batch_execute("CREATE FUNCTION public.owned_enrollment_audit_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_type='configuration.changed' AND NEW.target_kind='sdk_gateway_connection' THEN RAISE EXCEPTION 'owned_enrollment_audit_reject'; END IF; RETURN NEW; END $$; CREATE TRIGGER owned_enrollment_audit_reject BEFORE INSERT ON public.audit_events FOR EACH ROW EXECUTE FUNCTION public.owned_enrollment_audit_reject();").await.map_err(|e| e.to_string())?;
+        client.batch_execute("CREATE FUNCTION public.owned_enrollment_audit_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_type='configuration.changed' AND NEW.target_type='sdk_gateway_connection' THEN RAISE EXCEPTION 'owned_enrollment_audit_reject'; END IF; RETURN NEW; END $$; CREATE TRIGGER owned_enrollment_audit_reject BEFORE INSERT ON public.audit_events FOR EACH ROW EXECUTE FUNCTION public.owned_enrollment_audit_reject();").await.map_err(|e| e.to_string())?;
         drop(client);
         let error = rejected(f.journal.enroll_token_owner(&auth, owner, &accounts, "atomic audit", Arc::new(Outcomes::default())).await)?;
         check(error.stage() == Stage::Write && error.kind() == Kind::Unavailable, "actual adoption audit statement failed")?;
