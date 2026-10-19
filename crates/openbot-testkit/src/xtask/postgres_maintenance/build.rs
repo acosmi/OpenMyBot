@@ -970,16 +970,20 @@ fn command(
                 Ok(out)
             })
     };
+    let mut first_failure = pid.is_none().then_some("pid");
+    let mut first_owned_error: Option<anyhow::Error> = None;
     let mut failed = pid.is_none();
     let stdout = match child.stdout.take() {
         Some(pipe) => match drain(Box::new(pipe), Arc::clone(&count), Arc::clone(&overflow)) {
             Ok(join) => Some(join),
             Err(_) => {
+                first_failure.get_or_insert("stdout_drain_spawn");
                 failed = true;
                 None
             }
         },
         None => {
+            first_failure.get_or_insert("stdout_pipe");
             failed = true;
             None
         }
@@ -988,11 +992,13 @@ fn command(
         Some(pipe) => match drain(Box::new(pipe), count, Arc::clone(&overflow)) {
             Ok(join) => Some(join),
             Err(_) => {
+                first_failure.get_or_insert("stderr_drain_spawn");
                 failed = true;
                 None
             }
         },
         None => {
+            first_failure.get_or_insert("stderr_pipe");
             failed = true;
             None
         }
@@ -1011,37 +1017,49 @@ fn command(
                     same_original_child = true;
                     leader_exited = s.exited() || s.killed() || s.dumped();
                     if !s.exited() || s.exit_status() != Some(0) {
+                        first_failure.get_or_insert("leader_status");
                         failed = true;
                     }
                 }
                 Ok(None) => same_original_child = true,
-                Err(_) => failed = true,
+                Err(_) => {
+                    first_failure.get_or_insert("waitid");
+                    failed = true;
+                }
             }
         } else {
             match child.try_wait() {
                 Ok(Some(_)) => leader_exited = true,
                 Ok(None) => {}
-                Err(_) => failed = true,
+                Err(_) => {
+                    first_failure.get_or_insert("try_wait");
+                    failed = true;
+                }
             }
         }
         let now = match clock() {
             Ok(n) => Some(n),
             Err(_) => {
+                first_failure.get_or_insert("clock");
                 failed = true;
                 None
             }
         };
         if let Some(now) = now {
             if now >= b.end || now < last_observation {
+                first_failure.get_or_insert("effect_or_clock_reversal");
                 failed = true;
             }
             if last_observation == 0 || now.saturating_sub(last_observation) >= 100_000_000 {
-                if observe_owned(p, b).is_err() {
+                if let Err(error) = observe_owned(p, b) {
+                    first_failure.get_or_insert("owned_observation");
+                    first_owned_error.get_or_insert(error);
                     failed = true;
                 }
                 last_observation = now;
             }
             if now >= b.close {
+                first_failure.get_or_insert("convergence_deadline");
                 failed = true;
             }
             if failed
@@ -1060,6 +1078,7 @@ fn command(
             }
         }
         if overflow.load(Ordering::SeqCst) {
+            first_failure.get_or_insert("output_overflow");
             failed = true;
         }
         let pipes_done = stdout.as_ref().is_none_or(|j| j.is_finished())
@@ -1075,6 +1094,7 @@ fn command(
         match child.wait() {
             Ok(s) => break s,
             Err(_) => {
+                first_failure.get_or_insert("original_wait");
                 failed = true;
                 thread::sleep(Duration::from_millis(10));
             }
@@ -1082,18 +1102,67 @@ fn command(
     };
     let out = stdout.map(|j| j.join());
     let err = stderr.map(|j| j.join());
+    let stdout_join_ok = matches!(&out, Some(Ok(Ok(_))));
+    let stderr_join_ok = matches!(&err, Some(Ok(Ok(_))));
     let out = match out {
         Some(Ok(Ok(v))) => v,
         _ => {
+            first_failure.get_or_insert("stdout_join_or_read");
             failed = true;
             Vec::new()
         }
     };
-    if !matches!(err, Some(Ok(Ok(_)))) {
+    if !matches!(&err, Some(Ok(Ok(_)))) {
+        first_failure.get_or_insert("stderr_join_or_read");
         failed = true;
     }
     if failed || !status.success() || overflow.load(Ordering::SeqCst) {
-        bail!("maintenance_build_command_failed");
+        let stderr_bytes = match &err {
+            Some(Ok(Ok(bytes))) => bytes.as_slice(),
+            _ => &[],
+        };
+        let owned_io = first_owned_error
+            .as_ref()
+            .and_then(|error| error.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error);
+        struct BoundedOwnedDisplay {
+            bytes: [u8; 2048],
+            len: usize,
+        }
+        impl std::fmt::Write for BoundedOwnedDisplay {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                let count = text.len().min(self.bytes.len() - self.len);
+                self.bytes[self.len..self.len + count]
+                    .copy_from_slice(&text.as_bytes()[..count]);
+                self.len += count;
+                if count < text.len() {
+                    Err(std::fmt::Error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut owned_text = BoundedOwnedDisplay {
+            bytes: [0; 2048],
+            len: 0,
+        };
+        let owned_format_complete = first_owned_error.as_ref().is_none_or(|error| {
+            std::fmt::write(&mut owned_text, format_args!("{error}")).is_ok()
+        });
+        // Pure diagnostic tails of already collected bytes; no collection cap is increased.
+        bail!(
+            "maintenance_build_command_failed: program={program:?}; status={status}; \
+             first_failure={first_failure:?}; failed={failed}; overflow={}; \
+             stdout_join_ok={stdout_join_ok}; stderr_join_ok={stderr_join_ok}; \
+             stdout_bytes={}; stderr_bytes={}; stdout_tail={:?}; stderr_tail={:?}; \
+             owned_io={owned_io:?}; owned_format_complete={owned_format_complete}; owned_error_prefix={:?}",
+            overflow.load(Ordering::SeqCst),
+            out.len(),
+            stderr_bytes.len(),
+            String::from_utf8_lossy(&out[out.len().saturating_sub(2048)..]),
+            String::from_utf8_lossy(&stderr_bytes[stderr_bytes.len().saturating_sub(8192)..]),
+            String::from_utf8_lossy(&owned_text.bytes[..owned_text.len]),
+        );
     }
     observe_owned(p, b)?;
     b.check()?;
