@@ -390,7 +390,7 @@
 +{
 + struct timespec t;
 + if (clock_gettime(CLOCK_MONOTONIC,&t) || t.tv_sec < 0 || t.tv_nsec < 0 ||
-+     t.tv_nsec >= 1000000000L || (uint64)t.tv_sec > UINT64_MAX/1000000000ULL) {
++	 t.tv_nsec >= 1000000000L || (uint64)t.tv_sec > UINT64_MAX/1000000000ULL) {
 +  if(finalized){failure=4;return 0;}wrok_fail(4);
 + }
 + return uadd((uint64)t.tv_sec*1000000000ULL,(uint64)t.tv_nsec);
@@ -441,10 +441,10 @@
 +  if (control_bytes>lim[L_CONTROL] || cancel_used>48) { failure=3; return; }
 +  if (cancel_used>=40) {
 +   if (memcmp(cancel_frame,"WRKPGM01",8) || get_be(cancel_frame+8,2)!=1 ||
-+       get_be(cancel_frame+10,2)!=3 || get_be(cancel_frame+12,2)!=40 ||
-+       get_be(cancel_frame+14,2)!=0 || memcmp(cancel_frame+16,operation,16) ||
-+       get_be(cancel_frame+32,4)!=2 || get_be(cancel_frame+36,4)!=8) {
-+    failure=3; return;
++	   get_be(cancel_frame+10,2)!=3 || get_be(cancel_frame+12,2)!=40 ||
++	   get_be(cancel_frame+14,2)!=0 || memcmp(cancel_frame+16,operation,16) ||
++	   get_be(cancel_frame+32,4)!=2 || get_be(cancel_frame+36,4)!=8) {
++	failure=3; return;
 +   }
 +  }
 +  if (cancel_used==48) {
@@ -529,8 +529,8 @@
 + unsigned char h[40]; uint64 size;
 + read_exact(h,40);
 + if (memcmp(h,"WRKPGM01",8) || get_be(h+8,2)!=1 || get_be(h+10,2)!=kind ||
-+     get_be(h+12,2)!=40 || get_be(h+14,2) || memcmp(h+16,operation,16) ||
-+     get_be(h+32,4)!=seq) wrok_fail(3);
++	 get_be(h+12,2)!=40 || get_be(h+14,2) || memcmp(h+16,operation,16) ||
++	 get_be(h+32,4)!=seq) wrok_fail(3);
 + size=get_be(h+36,4);
 + if (size>*n) wrok_fail(3);
 + *n=(size_t)size;
@@ -541,8 +541,8 @@
 +{
 + unsigned char record[168]={0}; unsigned char *b=record+40;
 + uint64 flags=(original_worker>0 ? 1:0)|(worker_waited ? 2:0)|
-+              (!connections[0] && !connections[1] ? 4:0)|
-+              (!secret_len ? 8:0)|(event==8 ? 16:0);
++			  (!connections[0] && !connections[1] ? 4:0)|
++			  (!secret_len ? 8:0)|(event==8 ? 16:0);
 + if (worker || !initialized) return;
 + if (status_seq>=lim[L_RECORDS] || uadd(status_bytes,sizeof(record))>lim[L_STATUS]) {
 +  if (!failure) failure=3; return;
@@ -648,16 +648,16 @@
 +   size_t len=eq ? (size_t)(eq-s-10):0;const char *v=eq ? eq+1:NULL;
 +   if (!eq) wrok_fail(1);
 +   if (len==14 && !strncmp(s+10,"owner-protocol",14)) {
-+    if (proto || strcmp(v,"1")) wrok_fail(1);proto=true;continue;
++	if (proto || strcmp(v,"1")) wrok_fail(1);proto=true;continue;
 +   }
 +   if (len==9 && !strncmp(s+10,"operation",9)) {
-+    if (op_seen || strlen(v)!=32) wrok_fail(1);
-+    for (j=0;j<16;j++) {
-+     char a=v[j*2],b=v[j*2+1];int x=(a>='0'&&a<='9')?a-'0':(a>='a'&&a<='f')?a-'a'+10:-1;
-+     int y=(b>='0'&&b<='9')?b-'0':(b>='a'&&b<='f')?b-'a'+10:-1;
-+     if (x<0 || y<0) wrok_fail(1);operation[j]=(x<<4)|y;
-+    }
-+    op_seen=true;continue;
++	if (op_seen || strlen(v)!=32) wrok_fail(1);
++	for (j=0;j<16;j++) {
++	 char a=v[j*2],b=v[j*2+1];int x=(a>='0'&&a<='9')?a-'0':(a>='a'&&a<='f')?a-'a'+10:-1;
++	 int y=(b>='0'&&b<='9')?b-'0':(b>='a'&&b<='f')?b-'a'+10:-1;
++	 if (x<0 || y<0) wrok_fail(1);operation[j]=(x<<4)|y;
++	}
++	op_seen=true;continue;
 +   }
 +   for (j=0;j<L_COUNT;j++) if (strlen(limit_names[j])==len && !strncmp(s+10,limit_names[j],len)) break;
 +   if (j==L_COUNT || seen[j]) wrok_fail(1);
@@ -665,7 +665,7 @@
 +  }
 +  if (strncmp(s,"--",2)) wrok_fail(1);
 +  for (j=0;j<12;j++) if ((eq ? (size_t)(eq-s-2):strlen(s+2))==strlen(stock_names[j]) &&
-+        !strncmp(s+2,stock_names[j],strlen(stock_names[j]))) break;
++		!strncmp(s+2,stock_names[j],strlen(stock_names[j]))) break;
 +  if (j==12 || stock_seen[j]) wrok_fail(1);stock_seen[j]=true;
 +  if (j<4 && (!eq || strcmp(eq+1,fixed[j]))) wrok_fail(1);
 +  if (j>=4 && j<=6 && eq) wrok_fail(1);
@@ -679,21 +679,21 @@
 + for(j=0;j<L_COUNT;j++) if(!seen[j])wrok_fail(1);
 + for(j=0;j<12;j++) if(!stock_seen[j])wrok_fail(1);
 + if(!proto || !op_seen || !(lim[L_T0]<lim[L_E] && lim[L_E]<lim[L_C]) ||
-+    lim[L_SECRET]>4096 || lim[L_SECCOPIES]<12 ||
-+    lim[L_SECMEM]<umul(uadd(lim[L_SECRET],1),lim[L_SECCOPIES]) ||
-+    lim[L_SECMEM]<uadd(umul(2,4097),uadd(umul(292,lim[L_SECRET]),8)) ||
-+    lim[L_CONTROL]<uadd(128,lim[L_SECRET]) || lim[L_RECORDS]<8 ||
-+    lim[L_RECORDS]>UINT32_MAX || lim[L_STATUS]<umul(lim[L_RECORDS],168) ||
-+    lim[L_BLOCK]>4194304 || lim[L_WALTL]!=1 || lim[L_PLAIN]<=uadd(lim[L_WAL],lim[L_MANIFEST]) ||
-+    lim[L_FILES]<=uadd(umul(lim[L_WALSEGS],2),8) || lim[L_DIRS]<=8 || lim[L_SINGLE]<lim[L_MANIFEST] ||
-+    lim[L_SPOOL]<lim[L_PLAIN] || lim[L_FDS]<32 || lim[L_STDERR]<30) wrok_fail(1);
++	lim[L_SECRET]>4096 || lim[L_SECCOPIES]<12 ||
++	lim[L_SECMEM]<umul(uadd(lim[L_SECRET],1),lim[L_SECCOPIES]) ||
++	lim[L_SECMEM]<uadd(umul(2,4097),uadd(umul(292,lim[L_SECRET]),8)) ||
++	lim[L_CONTROL]<uadd(128,lim[L_SECRET]) || lim[L_RECORDS]<8 ||
++	lim[L_RECORDS]>UINT32_MAX || lim[L_STATUS]<umul(lim[L_RECORDS],168) ||
++	lim[L_BLOCK]>4194304 || lim[L_WALTL]!=1 || lim[L_PLAIN]<=uadd(lim[L_WAL],lim[L_MANIFEST]) ||
++	lim[L_FILES]<=uadd(umul(lim[L_WALSEGS],2),8) || lim[L_DIRS]<=8 || lim[L_SINGLE]<lim[L_MANIFEST] ||
++	lim[L_SPOOL]<lim[L_PLAIN] || lim[L_FDS]<32 || lim[L_STDERR]<30) wrok_fail(1);
 + for (i=1;i<out;i++) if (!strncmp((*argv)[i],"--label=",8)) {
 +  char expected[64],hex[33];for(j=0;j<16;j++)sprintf(hex+j*2,"%02x",operation[j]);
 +  snprintf(expected,sizeof(expected),"wrokbot-maintenance-%s",hex);
 +  if(strcmp((*argv)[i]+8,expected))wrok_fail(1);
 + }
 + if(!host || host[0]!='/' || !role || !*role || strlen(role)>63 ||
-+    !target || target[0]!='/' || strlen(target)>=MAXPGPATH)wrok_fail(1);
++	!target || target[0]!='/' || strlen(target)>=MAXPGPATH)wrok_fail(1);
 + for(const char *s=role;*s;s++)if(!((*s>='a'&&*s<='z')||(*s>='0'&&*s<='9')||*s=='_'))wrok_fail(1);
 + {
 +  char *parent=pg_strdup(target),*slash=strrchr(parent,'/');struct stat m;char canonical[MAXPGPATH];
@@ -704,7 +704,7 @@
 +  if(root_parent<0 || fstat(root_parent,&m) || m.st_uid!=geteuid() || (m.st_mode&0777)!=0700)wrok_fail(1);
 +  if(lstat(target,&m)==0 || errno!=ENOENT)wrok_fail(1);
 +  if(!realpath(host,canonical) || strcmp(host,canonical) || lstat(host,&m) ||
-+     !S_ISDIR(m.st_mode)||m.st_uid!=geteuid()||(m.st_mode&0777)!=0700)wrok_fail(1);
++	 !S_ISDIR(m.st_mode)||m.st_uid!=geteuid()||(m.st_mode&0777)!=0700)wrok_fail(1);
 +  free(parent);
 + }
 + output_root=pg_strdup(target);
@@ -746,7 +746,7 @@
 +  s=PQconnectPoll(c);
 +  if(s==PGRES_POLLING_OK)break;
 +  if(s==PGRES_POLLING_FAILED ||
-+     wait_fd(PQsocket(c),s==PGRES_POLLING_WRITING?POLLOUT:POLLIN,-1,-1,false)<0)wrok_fail(failure?failure:8);
++	 wait_fd(PQsocket(c),s==PGRES_POLLING_WRITING?POLLOUT:POLLIN,-1,-1,false)<0)wrok_fail(failure?failure:8);
 + }
 + if(PQserverVersion(c)!=170011)wrok_fail(8);
 + return c;
@@ -884,7 +884,7 @@
 +{
 + start_lsn=lsn(start);stop_lsn=lsn(stop);
 + if(stop_lsn<=start_lsn || stop_lsn-start_lsn>lim[L_WALSPAN] ||
-+    !segment_bytes || (stop_lsn-1)/segment_bytes-start_lsn/segment_bytes+1>lim[L_WALSEGS])
++	!segment_bytes || (stop_lsn-1)/segment_bytes-start_lsn/segment_bytes+1>lim[L_WALSEGS])
 +  wrok_fail(10);
 +}
 +void wrok_data_complete(void){status(4);}
@@ -940,7 +940,7 @@
 +{
 + int fd=openat(parent,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);struct stat s;
 + if(fd<0||fstat(fd,&s)||!S_ISDIR(s.st_mode)||s.st_uid!=geteuid()||
-+    (s.st_mode&0777)!=0700)wrok_fail(11);
++	(s.st_mode&0777)!=0700)wrok_fail(11);
 + return fd;
 +}
 +void
@@ -963,14 +963,14 @@
 + for(i=0;i<3;i++)
 +  if(strlen(prebuilt_names[i])==n&&!strncmp(name,prebuilt_names[i],n))break;
 + if(i==3||prebuilt_fds[i]<0||fstat(prebuilt_fds[i],&held)||
-+    fstatat(parent,leaf,&named,AT_SYMLINK_NOFOLLOW))return false;
++	fstatat(parent,leaf,&named,AT_SYMLINK_NOFOLLOW))return false;
 + fd=openat(parent,leaf,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
 + if(fd<0)return false;
 + if(fstat(fd,&opened)){close(fd);return false;}close(fd);
 + return S_ISDIR(named.st_mode)&&S_ISDIR(opened.st_mode)&&
-+        named.st_uid==geteuid()&&(named.st_mode&0777)==0700&&
-+        held.st_dev==named.st_dev&&held.st_ino==named.st_ino&&
-+        held.st_dev==opened.st_dev&&held.st_ino==opened.st_ino;
++		named.st_uid==geteuid()&&(named.st_mode&0777)==0700&&
++		held.st_dev==named.st_dev&&held.st_ino==named.st_ino&&
++		held.st_dev==opened.st_dev&&held.st_ino==opened.st_ino;
 +}
 +/* The extractor uses held directory descriptors, never the stock fopen(path) leg. */
 +typedef struct WrokExtractor {
@@ -1004,7 +1004,7 @@
 +}
 +static void
 +extract_content(bbstreamer *s,bbstreamer_member *m,const char *data,int len,
-+                bbstreamer_archive_context context)
++				bbstreamer_archive_context context)
 +{
 + WrokExtractor *x=(WrokExtractor *)s;
 + if(!wrok_check())wrok_fail(failure);
@@ -1021,10 +1021,10 @@
 +   directories=uadd(directories,1);
 +   if(directories>lim[L_DIRS]-8||size)wrok_fail(7);
 +   if(mkdirat(parent,leaf,0700)) {
-+    struct stat st;
-+    if(errno!=EEXIST || !same_prebuilt(name,parent,leaf) ||
-+       fstatat(parent,leaf,&st,AT_SYMLINK_NOFOLLOW)||!S_ISDIR(st.st_mode))
-+     wrok_fail(11);
++	struct stat st;
++	if(errno!=EEXIST || !same_prebuilt(name,parent,leaf) ||
++	   fstatat(parent,leaf,&st,AT_SYMLINK_NOFOLLOW)||!S_ISDIR(st.st_mode))
++	 wrok_fail(11);
 +   }
 +  } else {
 +   uint64 reserve=uadd(lim[L_WAL],lim[L_MANIFEST]);
@@ -1032,11 +1032,11 @@
 +   total_files=uadd(total_files,1);total_bytes=uadd(total_bytes,size);
 +   io_blocks=uadd(io_blocks,blocks_for(size));
 +   {
-+    uint64 reserved_blocks=uadd(umul(lim[L_WALSEGS],blocks_for(segment_bytes)),
-+                                  blocks_for(lim[L_MANIFEST]));
-+    if(total_files>lim[L_FILES]-umul(lim[L_WALSEGS],2)-8 ||
-+       total_bytes>lim[L_PLAIN]-reserve || reserved_blocks>=lim[L_BLOCKS] ||
-+       io_blocks>lim[L_BLOCKS]-reserved_blocks)wrok_fail(7);
++	uint64 reserved_blocks=uadd(umul(lim[L_WALSEGS],blocks_for(segment_bytes)),
++								  blocks_for(lim[L_MANIFEST]));
++	if(total_files>lim[L_FILES]-umul(lim[L_WALSEGS],2)-8 ||
++	   total_bytes>lim[L_PLAIN]-reserve || reserved_blocks>=lim[L_BLOCKS] ||
++	   io_blocks>lim[L_BLOCKS]-reserved_blocks)wrok_fail(7);
 +   }
 +   check_space();
 +   x->file=openat(parent,leaf,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
@@ -1082,8 +1082,8 @@
 + x->base.bbs_ops=&extractor_ops;x->file=-1;
 + x->rootfd=open(root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
 + if(x->rootfd<0||fstat(x->rootfd,&st)||st.st_uid!=geteuid()||
-+    (st.st_mode&0777)!=0700||strcmp(root,output_root)||output_fd<0||fstat(output_fd,&held)||
-+    st.st_dev!=held.st_dev||st.st_ino!=held.st_ino)wrok_fail(11);
++	(st.st_mode&0777)!=0700||strcmp(root,output_root)||output_fd<0||fstat(output_fd,&held)||
++	st.st_dev!=held.st_dev||st.st_ino!=held.st_ino)wrok_fail(11);
 + return &x->base;
 +}
 +static void
@@ -1108,10 +1108,10 @@
 +   total_files=uadd(total_files,1);total_bytes=uadd(total_bytes,n);
 +   io_blocks=uadd(io_blocks,blocks_for(n));
 +   if(n>lim[L_SINGLE]||total_files>lim[L_FILES]||total_bytes>lim[L_PLAIN]||
-+      total_bytes>lim[L_SPOOL]||io_blocks>lim[L_BLOCKS])wrok_fail(7);
++	  total_bytes>lim[L_SPOOL]||io_blocks>lim[L_BLOCKS])wrok_fail(7);
 +   if(!strncmp(path,"pg_wal/",7)&&strlen(path+7)==24) {
-+    wal_files=uadd(wal_files,1);wal_bytes=uadd(wal_bytes,n);
-+    if(wal_files>lim[L_WALSEGS]||wal_bytes>lim[L_WAL])wrok_fail(7);
++	wal_files=uadd(wal_files,1);wal_bytes=uadd(wal_bytes,n);
++	if(wal_files>lim[L_WALSEGS]||wal_bytes>lim[L_WAL])wrok_fail(7);
 +   }
 +   if(!strcmp(path,"backup_manifest") && (n==0||n>lim[L_MANIFEST]))wrok_fail(7);
 +   fd=openat(dir,entry->d_name,O_RDONLY|O_NOFOLLOW);
@@ -1129,7 +1129,7 @@
 + total_files=total_bytes=wal_files=wal_bytes=directories=io_blocks=0;
 + count_tree(fd,0,"");
 + if(!wal_files||!wal_bytes||fstatat(fd,"backup_manifest",&m,AT_SYMLINK_NOFOLLOW)||
-+    !S_ISREG(m.st_mode)||!m.st_size||fsync(fd))wrok_fail(7);
++	!S_ISREG(m.st_mode)||!m.st_size||fsync(fd))wrok_fail(7);
 + close(fd);
 +}
 +
@@ -1144,7 +1144,7 @@
 +  if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;
 +  if(!wrok_check())wrok_fail(failure);
 +  if(++allocation_nodes>uadd(lim[L_FILES],lim[L_DIRS])||
-+     fstatat(dir,e->d_name,&m,AT_SYMLINK_NOFOLLOW))wrok_fail(7);
++	 fstatat(dir,e->d_name,&m,AT_SYMLINK_NOFOLLOW))wrok_fail(7);
 +  if(S_ISDIR(m.st_mode)) {
 +   int fd=openat(dir,e->d_name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
 +   if(fd<0)wrok_fail(11);
@@ -1266,8 +1266,8 @@
 +wrokbot_conninfo_value_free(PQconninfoOption *option)
 +{
 + if (option->val != NULL &&
-+     (strcmp(option->keyword, "password") == 0 ||
-+      strcmp(option->keyword, "sslpassword") == 0))
++	 (strcmp(option->keyword, "password") == 0 ||
++	  strcmp(option->keyword, "sslpassword") == 0))
 +  explicit_bzero(option->val, strlen(option->val));
 + free(option->val);
 +}

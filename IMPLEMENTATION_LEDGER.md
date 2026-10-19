@@ -2185,3 +2185,8 @@ The first targeted Rust strict check reported ten Clippy errors in the existing 
 
 
 V7-IMPL-044 / PR #223: Normally integrated delivered SDK enrollment main 83055ce0. The original maintenance toolchain product files, dependency pins, native patch and build profile remain unchanged. Both factual ledger histories are retained. Earlier maintenance build evidence keeps its original source attribution and requires applicability review on this combined candidate; actual native toolchain build, bundle verification and owned PostgreSQL acceptance remain pending.
+
+
+V7-IMPL-044 / PR #223: The first native build stopped before configure at the strict patch check. A separate read-only reproduction identified 54 added C lines with leading indentation rejected by the existing whitespace policy. Only those leading prefixes were normalized to the source tree's four-column tab policy; patch and two postimage pins were updated to the resulting bytes. Independent review passed 250 finite checks, including full inverse reconstruction, unchanged C tokens and all eleven source bindings. The new patch passed the same strict read-only check with exit 0.
+
+The original build failure and diagnostic warnings are retained. Current candidate strict and non-test producer compilation, actual native construction, bundle and consumer verification, owned PostgreSQL recovery and restart acceptance remain pending. Full CI and manual Actions were not run.
