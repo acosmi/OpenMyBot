@@ -2229,3 +2229,5 @@ The existing test-only owner now emits two fixed diagnostic lines for its closed
 
 
 Adds bounded, redacted pre-start diagnostics to the owned PostgreSQL maintenance helper and recognizes only fixed closed codes in the ignored native test. Original status frames, limits, waits and failure retention remain unchanged. This source update requires a new authenticated toolchain build and targeted acceptance; the prior empty-status helper failure remains unresolved.
+
+- V7-IMPL-044: prevent duplicate control-pipe descriptors in native polling. A local macOS pipe check reproduced readiness reported only for the second duplicate; the single-descriptor form reported the primary descriptor ready. Native backup/restore validation is pending for this correction.

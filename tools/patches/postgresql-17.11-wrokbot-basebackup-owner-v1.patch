@@ -478,7 +478,7 @@
 +  timeout=remaining>100 ? 100 : (long)remaining;
 +  if (maximum_ms>=0 && timeout>maximum_ms) timeout=maximum_ms;
 +  if (fd>=0) { which=count; p[count++]=(struct pollfd){fd,events,0}; }
-+  if (!worker) p[count++]=(struct pollfd){STDIN_FILENO,POLLIN|POLLHUP,0};
++  if (!worker && fd!=STDIN_FILENO) p[count++]=(struct pollfd){STDIN_FILENO,POLLIN|POLLHUP,0};
 +  if (stop>=0) p[count++]=(struct pollfd){stop,POLLIN|POLLHUP,0};
 +  r=poll(p,count,(int)timeout);
 +  if (r<0 && errno==EINTR) continue;
