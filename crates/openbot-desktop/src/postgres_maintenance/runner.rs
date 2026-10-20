@@ -3173,10 +3173,64 @@ pub(super) async fn owned_test_case(
     }
     .await;
     let mut error = result.err();
+    let _diagnostic = writeln!(
+        std::io::stderr().lock(),
+        "WROKBOT_PG_MAINTENANCE_TEST_RESULT result_error={error:?}"
+    );
     if let Err(close_error) = source.close_original_sources().await {
         if error.is_none() {
             error = Some(close_error);
         }
+    }
+    if !source.original_owners_closed() {
+        let native = source.native.as_ref();
+        let wait = native.and_then(|owner| owner.wait.as_ref());
+        let trail = native.and_then(|owner| owner.trail.as_ref());
+        let _diagnostic = writeln!(
+            std::io::stderr().lock(),
+            concat!(
+                "WROKBOT_PG_MAINTENANCE_TEST_RETAINED ",
+                "native={} helper_wait={} helper_exit_code={:?} helper_signal={:?} ",
+                "stdin_joined={:?} stdout_joined={:?} stderr_joined={:?} ",
+                "trail_records={:?} terminal_error={:?} worker_created={:?} worker_wait={:?} ",
+                "postmasters_total={} postmasters_stopped={} ",
+                "connecting_pending={} connecting_started={} connecting_joined={} ",
+                "sql_total={} queries_pending={} drivers_joined={}"
+            ),
+            native.is_some(),
+            wait.is_some(),
+            wait.and_then(ExitStatus::code),
+            wait.and_then(ExitStatus::signal),
+            native.map(|owner| owner.writer_joined),
+            native.map(|owner| owner.reader_joined),
+            native.map(|owner| owner.stderr_joined),
+            trail.map(|trail| trail.records().len()),
+            trail
+                .and_then(StatusTrail::terminal)
+                .map(|record| record.error),
+            trail.map(StatusTrail::worker_created),
+            trail.map(StatusTrail::worker_wait_observed),
+            source.postmasters.len(),
+            source
+                .postmasters
+                .iter()
+                .filter(|owner| owner.stopped)
+                .count(),
+            source.connecting.is_some(),
+            source.connection_attempts,
+            source.connection_attempts_joined,
+            source.sql.len(),
+            source
+                .sql
+                .iter()
+                .filter(|owner| owner.query.is_some())
+                .count(),
+            source
+                .sql
+                .iter()
+                .filter(|owner| owner.driver_joined)
+                .count()
+        );
     }
     // A negative assertion is evaluated only after the original owners have closed. If the
     // trusted helper never supplies its original worker wait, keep the same source/roots resident.
