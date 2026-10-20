@@ -2154,3 +2154,92 @@ Completed the SDK whole-token enrollment implementation at product source `d8ed0
 Independent review accepted five directed strict checks, the SDK dependency guard, three test-harness build results, six executable-list results and all 67 selected runtime cases: 19 pure cases and 48 cases using owned PostgreSQL. The final Server source passed its 34 exact cases. The earlier Infra 21 and Gateway 12 results retain their original source attribution and are reused after independent input-applicability review, as are the earlier strict and SDK results. Owned PostgreSQL shutdown acknowledgments, original postmaster waits, empty temporary-database tails and shared-resource release were accepted within their recorded scope.
 
 The original failed attempts and host LLVM diagnostic remain preserved. Individual production driver joins, continuous physical concurrency bounds and SDK allocator internals remain unproven. This ledger-only successor still requires precise delivery review and normal merge; complete recovery, release readiness and the overall backend goal remain open. Full CI and manual Actions were not run.
+
+
+- V7-IMPL-044: Added an independent PostgreSQL 17.11 maintenance toolchain source candidate, including a controlled build recipe, authenticated four-program inventory, closed Desktop consumer and owned backup/restore fixtures. The build and native owners preserve finite operation budgets and original child, worker, pipe and driver ownership.
+
+  Finite independent source reviews have covered the recorded changes and closed their reported concrete findings. Complete native reachability and secret-copy review, directed compilation, executable lists, 16 ordinary cases, actual authenticated native bundle construction and six explicitly ignored native cases remain pending. This is a source candidate; native usability, production release, full recovery and backend completion are not claimed. Full CI and manual Actions were not run.
+
+
+- V7-IMPL-044 / PR #223: Repair the native helper source so connection startup enables nonblocking operation before further polling, server notices cannot emit raw text through the default callback, and the original effect deadline is checked directly before the BASE_BACKUP send. Precharge the known static secret buffers, normalized password temporaries and fork copies in both the native owner and Rust consumer, while retaining the explicit larger copy reserve. Existing unit selectors gain exact-boundary and overflow vectors.
+
+  Finite implementation reviews accept these source changes with the original worker waits, protocol, profile fields and test denominator preserved. The budget-review design contribution is disclosed. Final whole-source independent review, compilation, lists, 16 ordinary cases, native build and six native cases remain pending; native usability, signing, production distribution and full recovery are not claimed. Original failures and unproven memory boundaries are retained.
+
+
+### 2026-10-19 - V7-IMPL-044 existing dependency lock projection
+
+The first locked targeted check refused to run because the Desktop package lock entry omitted its declared rustix dependency. The lock now adds that one edge to the already locked rustix 1.1.4 package. All 841 package identities and checksums, all registry blocks, and every other package block remain unchanged; removing the single edge restores the full previous lock bytes. Independent review accepted the correction. The original refusal is retained; candidate checks and native build, consumer and recovery gates remain pending.
+
+
+### 2026-10-19 - V7-IMPL-044 strict-check repairs
+
+The first targeted Rust strict check reported ten Clippy errors in the existing builder, manifest traversal and argument parser. Private traversal arguments now use tuples with the same values and shared cumulative counters; the remaining changes preserve short-circuit order and parser behavior. Independent source review passed 32 checks, including full inverse reconstruction and unchanged original wait/join and capacity guards. The original strict failure is retained. Current candidate strict, build, consumer and recovery acceptance remain pending.
+
+
+- V7-IMPL-044 / PR #223: The targeted Desktop strict check reported E0502 in the existing bounded output preview. The preview now computes its slice length before borrowing the sample mutably, preserving the 512-byte bound, byte order, secret detection, hashing, zeroization and original child and pipe waits. The original compiler failure is retained. Compilation has not yet been rerun on this repair; native acceptance remains pending.
+
+
+- V7-IMPL-044 / PR #223: The targeted Desktop strict check reached seventeen diagnostics after the bounded preview repair. Fifteen diagnostics in the maintenance module now use equivalent short-circuit expressions, checked capacity arithmetic and private argument tuples with the same values. Independent source review passed 149 checks, including complete inverse reconstruction, unchanged protocol assertions, original waits and other product inputs. Two dead-code diagnostics in unchanged legacy sidecar files remain unresolved.
+
+  The preceding source produced a non-test xtask binary with independent build acceptance; its original source identity is retained. Current candidate compilation, ordinary cases, authenticated native construction and recovery acceptance remain pending. The original failures and LLVM stripping warning remain recorded. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: Normally integrated delivered SDK enrollment main 83055ce0. The original maintenance toolchain product files, dependency pins, native patch and build profile remain unchanged. Both factual ledger histories are retained. Earlier maintenance build evidence keeps its original source attribution and requires applicability review on this combined candidate; actual native toolchain build, bundle verification and owned PostgreSQL acceptance remain pending.
+
+
+V7-IMPL-044 / PR #223: The first native build stopped before configure at the strict patch check. A separate read-only reproduction identified 54 added C lines with leading indentation rejected by the existing whitespace policy. Only those leading prefixes were normalized to the source tree's four-column tab policy; patch and two postimage pins were updated to the resulting bytes. Independent review passed 250 finite checks, including full inverse reconstruction, unchanged C tokens and all eleven source bindings. The new patch passed the same strict read-only check with exit 0.
+
+The original build failure and diagnostic warnings are retained. Current candidate strict and non-test producer compilation, actual native construction, bundle and consumer verification, owned PostgreSQL recovery and restart acceptance remain pending. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The second native build applied the corrected patch and reached configure, which rejected --without-ssl in its argument-required SSL option handler. The builder now fixes --without-openssl in the same nine-argument closed recipe. PostgreSQL 17.11 accepts that boolean option and retains the intended build without TLS. All other parser, time, capacity and tool guards remain unchanged.
+
+Independent review confirmed the original failure, normal child waits and shared lock release. Independent source review passed 44 finite checks for the one-parameter repair and its explicit build profile. This changed compiler input requires a current targeted strict check and a new non-test xtask producer; actual native construction, bundle and consumer verification, recovery and restart acceptance remain pending. Both original failed builds are retained. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The latest native build completed configure and generated the server binary, then stopped before the complete tools and release bundle were available. The original process waits and shared lock release completed; the exact inner failure remains unknown.
+
+The builder now preserves the first observed failure category, original exit status and bounded escaped diagnostic output after its original wait and both pipe joins. A fixed-capacity formatter bounds the retained owner-observation message. Existing time, process, file, output and permission guards remain unchanged. Independent source review covers this diagnostic change; current targeted strict validation, the rebuilt non-test producer and another native build remain separate gates. The failed build inputs and outputs are retained. Native bundle, consumer, recovery and restart acceptance remain pending. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The fourth native build reported an owned-tree observation ENOENT during configure. The exact missing entry remains unproven; original process waits and shared lock release completed. Earlier failed builds retain their original findings.
+
+The builder now holds owned directory descriptors and checks identities while walking relative to them without following links. Only the active command observation tolerates a successfully enumerated child disappearing; static boundaries and final tree checks remain strict. File and byte observations remain separate from uncertain retained-capacity credit. Explicit per-volume limits, time bounds, process limits, original waits and pipe joins remain in force. Independent source review passed 58 finite checks for this candidate. Current targeted strict validation, a new non-test producer, actual native bundle, consumer, recovery and restart acceptance remain pending. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: Targeted Clippy returned 101 for two redundant u64 conversions in the builder's free-space calculation. Both conversions are removed; checked multiplication, overflow handling and capacity checks retain their original behavior. Independent source review passed for this finite repair. Current strict validation, a new non-test producer and native build/recovery/restart acceptance remain pending. Original failures are retained; full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The native build failed while linking stock PostgreSQL programs because the common logging archive referenced the maintenance owner's hook. The hook is now compiled only for the distinct maintenance role, which links a private frontend logging object with its existing owner. Source pins match the finite two-family repair. Independent source review passed; actual native linkage, bundle validation, backup, recovery and restart acceptance remain pending. Earlier failures are retained. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The owned maintenance fixture now commits its fixed table and sentinel setup before its separate rollback probe. The build test checks the exact ten serialized environment keys while retaining the separate developer-tool binding and subsequent capacity assertions. Independent source review passed for both finite repairs.
+
+Earlier directed results remain fifteen passing ordinary tests and one failure; the first native attempt also failed before the backup helper started. Validation of this candidate remains pending. Earlier failures and the strict legacy-file scope hold are retained. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The maintenance helper now reports connection and owned-buffer closure only after its original common cleanup completes. Normal streamed-WAL completion waits for the original worker without emitting a cancellation event. Actual stop paths retain that event and recheck the original convergence limit after the bounded status write and before signalling.
+
+Independent source review passed 43 finite checks for the producer correction and its exact source pins. Product-patch parsing and Git whitespace checks passed. A new native bundle and directed consumer, backup, restore and restart validation remain required. Earlier source-authentication and ordinary-test results retain their original candidate bindings; the original in-flight native run remains unresolved. Earlier failures and the strict legacy-file scope hold are retained. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: Candidate 89d49aee completed the native-tool build, trusted consumer verification and sixteen ordinary directed tests under their separate reviews. Its first owned native backup/restore test was administratively withdrawn without acceptance; internal wait, join and wipe results remain unknown, and its original data and evidence are retained.
+
+The existing test-only owner now emits two fixed diagnostic lines for its closed error and original owner state before the retained loop. The diagnostics contain only closed error codes, booleans and counts. Original lifecycle, time bounds, control, waits, joins and acceptance assertions remain unchanged. Output may be delayed or lost and does not establish closure. Independent source review covers this finite diagnostic change; new-candidate compilation, native backup, restore and restart acceptance remain pending. The strict legacy-file scope hold and earlier failures remain recorded. Full CI and manual Actions were not run.
+
+
+Adds bounded, redacted pre-start diagnostics to the owned PostgreSQL maintenance helper and recognizes only fixed closed codes in the ignored native test. Original status frames, limits, waits and failure retention remain unchanged. This source update requires a new authenticated toolchain build and targeted acceptance; the prior empty-status helper failure remains unresolved.
+
+- V7-IMPL-044: prevent duplicate control-pipe descriptors in native polling. A local macOS pipe check reproduced readiness reported only for the second duplicate; the single-descriptor form reported the primary descriptor ready. Native backup/restore validation is pending for this correction.
+
+
+V7-IMPL-044 / PR #223: the test-only post-worker disconnect fixture now requests termination of only its own matching replication sessions before ordinary source cleanup. It keeps the original helper, worker, SQL-driver, pipe and source waits and the existing negative assertions. Request acknowledgement is not proof of process exit.
+
+The previous frozen candidate completed six native test units covering ten scenarios: five units passed and the post-worker disconnect unit failed its original assertion. The correction requires fresh affected-libtest compilation and directed acceptance. No production interface, native flag, profile, dependency or migration changed; earlier failures and the strict legacy-file scope hold remain. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The native PostgreSQL maintenance toolchain completed its directed acceptance. The corrected disconnect test passed both original scenarios on candidate c1111646: before worker creation the helper returned ConnectionFailed (8); after the test requested termination of its two owned replication sessions, the real worker returned BackupFailed (9). Original child waits, SQL-driver and pipe joins, source closure and all three shared-resource leases completed. Source, tool and executable bookends matched.
+
+The affected Desktop libtest was compiled again and both declaration lists were checked on c1111646 (117 total, 6 ignored). Five other native test units, covering eight scenarios including streamed-WAL restore and restart, retain their original successful executions and independently reviewed source applicability. Sixteen ordinary directed tests and trusted-consumer verification likewise retain their separately qualified original evidence. These are distinct evidence roles, not six fresh native executions on the final candidate.
+
+This delivery is limited to the maintenance toolchain prerequisite. Complete application capture, sealed backup and restore activation remain unfinished. Earlier failures, administrative unknown outcomes and the two-file strict legacy scope hold remain recorded; source authentication does not establish platform signing or production release acceptance. Full CI and manual Actions were not run.

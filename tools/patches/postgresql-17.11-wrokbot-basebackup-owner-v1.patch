@@ -1,0 +1,1373 @@
+--- a/src/bin/pg_basebackup/pg_basebackup.c
++++ b/src/bin/pg_basebackup/pg_basebackup.c
+@@ -37,6 +37,9 @@
+ #include "getopt_long.h"
+ #include "receivelog.h"
+ #include "streamutil.h"
++#ifdef WROKBOT_PG_MAINTENANCE
++#include "wrokbot_owner.h"
++#endif
+ 
+ #define ERRCODE_DATA_CORRUPTED	"XX001"
+ 
+@@ -307,8 +310,12 @@
+ static void
+ kill_bgchild_atexit(void)
+ {
++	#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_worker_wait(bgchild, true);
++	#else
+ 	if (bgchild > 0 && !bgchild_exited)
+ 		kill(bgchild, SIGTERM);
++	#endif
+ }
+ #endif
+ 
+@@ -713,6 +720,10 @@
+ 		}
+ 	}
+ 
++#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_prebuilt_directories();
++#endif
++
+ 	/*
+ 	 * Start a child process and tell it to start streaming. On Unix, this is
+ 	 * a fork(). On Windows, we create a thread.
+@@ -722,6 +733,10 @@
+ 	if (bgchild == 0)
+ 	{
+ 		/* in child process */
++		#ifdef WROKBOT_PG_MAINTENANCE
++		wrok_worker_child(conn, bgpipe[1], bgpipe[0]);
++		conn = NULL;
++		#endif
+ 		exit(LogStreamerMain(param));
+ 	}
+ 	else if (bgchild < 0)
+@@ -730,6 +745,10 @@
+ 	/*
+ 	 * Else we are in the parent process and all is well.
+ 	 */
++	#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_worker_parent(bgchild, param->bgconn);
++	param->bgconn = NULL;
++	#endif
+ 	atexit(kill_bgchild_atexit);
+ #else							/* WIN32 */
+ 	bgchild = _beginthreadex(NULL, 0, (void *) LogStreamerMain, param, 0, NULL);
+@@ -1160,9 +1179,14 @@
+ 			directory = psprintf("%s/%s", basedir, spclocation);
+ 		else
+ 			directory = get_tablespace_mapping(spclocation);
++		#ifdef WROKBOT_PG_MAINTENANCE
++		if (spclocation != NULL) wrok_fail(7);
++		streamer = wrok_extractor_new(directory);
++		#else
+ 		streamer = bbstreamer_extractor_new(directory,
+ 											get_tablespace_mapping,
+ 											progress_update_filename);
++		#endif
+ 	}
+ 	else
+ 	{
+@@ -1296,7 +1320,11 @@
+ 	/* If we wrote the backup manifest to a file, close the file. */
+ 	if (state.manifest_file !=NULL)
+ 	{
++		#ifdef WROKBOT_PG_MAINTENANCE
++		if (fclose(state.manifest_file) != 0) wrok_fail(11);
++		#else
+ 		fclose(state.manifest_file);
++		#endif
+ 		state.manifest_file = NULL;
+ 	}
+ 
+@@ -1421,6 +1449,9 @@
+ 				else if (state->manifest_file !=NULL)
+ 				{
+ 					/* Manifest data, write to disk. */
++					#ifdef WROKBOT_PG_MAINTENANCE
++					wrok_manifest_bytes(r - 1);
++					#endif
+ 					if (fwrite(copybuf + 1, r - 1, 1,
+ 							   state->manifest_file) != 1)
+ 					{
+@@ -1491,8 +1522,12 @@
+ 						snprintf(state->manifest_filename,
+ 								 sizeof(state->manifest_filename),
+ 								 "%s/backup_manifest.tmp", basedir);
++						#ifdef WROKBOT_PG_MAINTENANCE
++						state->manifest_file = wrok_manifest_open();
++						#else
+ 						state->manifest_file =
+ 							fopen(state->manifest_filename, "wb");
++						#endif
+ 						if (state->manifest_file == NULL)
+ 							pg_fatal("could not create file \"%s\": %m",
+ 									 state->manifest_filename);
+@@ -1701,7 +1736,11 @@
+ 
+ 	snprintf(state.filename, sizeof(state.filename),
+ 			 "%s/backup_manifest.tmp", basedir);
++	#ifdef WROKBOT_PG_MAINTENANCE
++	state.file = wrok_manifest_open();
++	#else
+ 	state.file = fopen(state.filename, "wb");
++	#endif
+ 	if (state.file == NULL)
+ 		pg_fatal("could not create file \"%s\": %m", state.filename);
+ 
+@@ -1718,6 +1757,9 @@
+ {
+ 	WriteManifestState *state = callback_data;
+ 
++	#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_manifest_bytes(r);
++	#endif
+ 	errno = 0;
+ 	if (fwrite(copybuf, r, 1, state->file) != 1)
+ 	{
+@@ -1825,6 +1867,9 @@
+ 	 */
+ 	if (!RunIdentifySystem(conn, &sysidentifier, &latesttli, NULL, NULL))
+ 		exit(1);
++	#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_identity(sysidentifier, latesttli, WalSegSz);
++	#endif
+ 
+ 	/*
+ 	 * If the user wants an incremental backup, we must upload the manifest
+@@ -2004,6 +2049,9 @@
+ 		basebkp = psprintf("BASE_BACKUP %s", buf.data);
+ 
+ 	/* OK, try to start the backup. */
++	#ifdef WROKBOT_PG_MAINTENANCE
++	if (!wrok_check()) wrok_fail(5);
++	#endif
+ 	if (PQsendQuery(conn, basebkp) == 0)
+ 		pg_fatal("could not send replication command \"%s\": %s",
+ 				 "BASE_BACKUP", PQerrorMessage(conn));
+@@ -2054,6 +2102,9 @@
+ 	 */
+ 	totalsize_kb = totaldone = 0;
+ 	tablespacecount = PQntuples(res);
++	#ifdef WROKBOT_PG_MAINTENANCE
++	if (tablespacecount != 1 || !PQgetisnull(res, 0, 1)) wrok_fail(7);
++	#endif
+ 	for (i = 0; i < PQntuples(res); i++)
+ 	{
+ 		totalsize_kb += atol(PQgetvalue(res, i, 2));
+@@ -2191,6 +2242,10 @@
+ 	if (PQntuples(res) != 1)
+ 		pg_fatal("no write-ahead log end position returned from server");
+ 	strlcpy(xlogend, PQgetvalue(res, 0, 0), sizeof(xlogend));
++	#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_range(xlogstart, xlogend);
++	wrok_data_complete();
++	#endif
+ 	if (verbose && includewal != NO_WAL)
+ 		pg_log_info("write-ahead log end point: %s", xlogend);
+ 	PQclear(res);
+@@ -2238,6 +2293,9 @@
+ 		if (write(bgpipe[1], xlogend, strlen(xlogend)) != strlen(xlogend))
+ 			pg_fatal("could not send command to background pipe: %m");
+ 
++		#ifdef WROKBOT_PG_MAINTENANCE
++		wrok_worker_wait(bgchild, false);
++		#else
+ 		/* Just wait for the background process to exit */
+ 		r = waitpid(bgchild, &status, 0);
+ 		if (r == (pid_t) -1)
+@@ -2247,6 +2305,7 @@
+ 		if (status != 0)
+ 			pg_fatal("%s", wait_result_to_str(status));
+ 		/* Exited normally, we're happy! */
++		#endif
+ #else							/* WIN32 */
+ 
+ 		/*
+@@ -2401,6 +2460,9 @@
+ 	CompressionLocation compressloc = COMPRESS_LOCATION_UNSPECIFIED;
+ 	pg_compress_specification client_compress;
+ 
++	#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_owner_init(&argc, &argv);
++	#endif
+ 	pg_logging_init(argv[0]);
+ 	progname = get_progname(argv[0]);
+ 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_basebackup"));
+@@ -2875,6 +2937,9 @@
+ 	BaseBackup(compression_algorithm, compression_detail, compressloc,
+ 			   &client_compress, incremental_manifest);
+ 
++	#ifdef WROKBOT_PG_MAINTENANCE
++	wrok_success();
++	#endif
+ 	success = true;
+ 	return 0;
+ }
+--- a/src/bin/pg_basebackup/streamutil.c
++++ b/src/bin/pg_basebackup/streamutil.c
+@@ -28,6 +28,9 @@
+ #include "pqexpbuffer.h"
+ #include "receivelog.h"
+ #include "streamutil.h"
++#ifdef WROKBOT_PG_MAINTENANCE
++#include "wrokbot_owner.h"
++#endif
+ 
+ #define ERRCODE_DUPLICATE_OBJECT  "42710"
+ 
+@@ -74,6 +77,10 @@
+ 	PQconninfoOption *conn_opt;
+ 	char	   *err_msg = NULL;
+ 
++	#ifdef WROKBOT_PG_MAINTENANCE
++	return wrok_connect(dbhost, dbport, dbuser);
++	#endif
++
+ 	/*
+ 	 * pg_recvlogical uses dbname only; others use connection_string only.
+ 	 * (Note: both variables will be NULL if there's no command line options.)
+--- a/src/bin/pg_basebackup/receivelog.c
++++ b/src/bin/pg_basebackup/receivelog.c
+@@ -24,6 +24,9 @@
+ #include "libpq-fe.h"
+ #include "receivelog.h"
+ #include "streamutil.h"
++#ifdef WROKBOT_PG_MAINTENANCE
++#include "wrokbot_owner.h"
++#endif
+ 
+ /* currently open WAL file */
+ static Walfile *walfile = NULL;
+@@ -882,6 +885,9 @@
+ 	struct timeval timeout;
+ 	struct timeval *timeoutptr;
+ 
++	#ifdef WROKBOT_PG_MAINTENANCE
++	return wrok_poll_pg(conn, false, stop_socket, timeout_ms);
++	#endif
+ 	connsocket = PQsocket(conn);
+ 	if (connsocket < 0)
+ 	{
+--- a/src/bin/pg_basebackup/walmethods.c
++++ b/src/bin/pg_basebackup/walmethods.c
+@@ -10,6 +10,9 @@
+  */
+ 
+ #include "postgres_fe.h"
++#ifdef WROKBOT_PG_MAINTENANCE
++#include "wrokbot_owner.h"
++#endif
+ 
+ #include <sys/stat.h>
+ #include <time.h>
+@@ -144,7 +147,12 @@
+ 	 * does not do any system calls to fsync() to make changes permanent on
+ 	 * disk.
+ 	 */
++	#ifdef WROKBOT_PG_MAINTENANCE
++	if (temp_suffix != NULL) wrok_fail(7);
++	fd = wrok_wal_open(pathname, pad_to_size);
++	#else
+ 	fd = open(tmppath, O_WRONLY | O_CREAT | PG_BINARY, pg_file_create_mode);
++	#endif
+ 	if (fd < 0)
+ 	{
+ 		wwmethod->lasterrno = errno;
+@@ -307,6 +315,10 @@
+ 	DirectoryMethodFile *df = (DirectoryMethodFile *) f;
+ 
+ 	Assert(f != NULL);
++	#ifdef WROKBOT_PG_MAINTENANCE
++	if (count > (size_t) WalSegSz || df->base.currpos > WalSegSz - count) wrok_fail(7);
++	wrok_wal_write(count);
++	#endif
+ 	clear_error(f->wwmethod);
+ 
+ #ifdef HAVE_LIBZ
+--- /dev/null
++++ b/src/bin/pg_basebackup/wrokbot_owner.c
+@@ -0,0 +1,933 @@
++/*
++ * Distinct PG17.11 WrokBot maintenance helper. Never linked into the v1 bundle.
++ * No password option/environment/passfile/prompt. No monitor thread before fork.
++ */
++#include "postgres_fe.h"
++#define WROKBOT_OWNER_IMPLEMENTATION
++#include "wrokbot_owner.h"
++#include "libpq-int.h"
++#include "common/fe_memutils.h"
++#include <dirent.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <sys/resource.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <sys/wait.h>
++#include <time.h>
++#include <unistd.h>
++
++enum {
++ L_T0,L_E,L_C,L_SECRET,L_SECMEM,L_SECCOPIES,L_CONTROL,L_STATUS,L_RECORDS,
++ L_STDERR,L_FILES,L_DIRS,L_PATH,L_DEPTH,L_SINGLE,L_PLAIN,L_WAL,L_WALSEGS,
++ L_WALSPAN,L_WALTL,L_MANIFEST,L_BLOCKS,L_BLOCK,L_SPOOL,L_RESTORE,L_FDS,
++ L_JOURNAL,L_RESERVE,L_FREE,L_COUNT
++};
++static const char *limit_names[L_COUNT] = {
++ "t0-ns","effect-deadline-ns","convergence-deadline-ns","max-source-secret-bytes",
++ "max-secret-memory-bytes","max-native-secret-copies","max-control-bytes",
++ "max-status-bytes","max-status-records","max-stderr-bytes","max-material-files",
++ "max-directories","max-path-bytes","max-depth","max-single-file-bytes",
++ "max-material-plain-bytes","max-wal-bytes","max-wal-segments","max-wal-span-bytes",
++ "max-wal-timelines","max-backup-manifest-bytes","max-total-copy-blocks",
++ "copy-block-bytes","max-spool-bytes","max-restore-check-bytes","max-open-files",
++ "max-journal-bytes","capacity-reserve-bytes","free-floor-bytes"
++};
++static uint64 lim[L_COUNT], control_bytes, status_bytes, diagnostic_bytes;
++static uint32 status_seq;
++static unsigned char operation[16], secret[4097], cancel_frame[49];
++static size_t secret_len, cancel_used;
++static unsigned int failure;
++static bool initialized, worker, terminal_success, waiting_worker, finalized;
++static pid_t original_worker = -1;
++static int worker_status, root_parent = -1, output_fd = -1;
++static int prebuilt_fds[3]={-1,-1,-1};
++static const char *prebuilt_names[3]={"pg_wal","pg_wal/archive_status","pg_wal/summaries"};
++static void close_prebuilt(void);
++static bool worker_waited;
++static uint64 system_id, start_lsn, stop_lsn, total_bytes, total_files;
++static uint64 wal_bytes, wal_files, directories, io_blocks, manifest_bytes, wal_reserved;
++static uint64 allocated_cache, space_checked_ns, allocation_nodes;
++static uint64 allocated_tree(int, unsigned int);
++static uint32 timeline, segment_bytes;
++static char *output_root;
++static PGconn *connections[2];
++static bool final_close_complete;
++static unsigned int prestatus_stage;
++static uint64 wait_observed_ns;
++static void verify_output(void);
++
++static uint64
++uadd(uint64 a, uint64 b)
++{
++ if (UINT64_MAX-a < b) wrok_fail(7);
++ return a+b;
++}
++static uint64
++umul(uint64 a, uint64 b)
++{
++ if (a && b > UINT64_MAX/a) wrok_fail(7);
++ return a*b;
++}
++static uint64
++blocks_for(uint64 n)
++{
++ if(!lim[L_BLOCK])wrok_fail(7);
++ return n/lim[L_BLOCK]+(n%lim[L_BLOCK]!=0);
++}
++static bool
++valid_utf8(const unsigned char *s,size_t n)
++{
++ size_t i=0;
++ while(i<n) {
++  unsigned int c=s[i++],need,min=0;
++  uint32 cp;
++  if(c<0x80){if(!c)return false;continue;}
++  if(c>=0xC2&&c<=0xDF){need=1;cp=c&0x1F;min=0x80;}
++  else if(c>=0xE0&&c<=0xEF){need=2;cp=c&0x0F;min=0x800;}
++  else if(c>=0xF0&&c<=0xF4){need=3;cp=c&7;min=0x10000;}
++  else return false;
++  if(n-i<need)return false;
++  while(need--){c=s[i++];if((c&0xC0)!=0x80)return false;cp=(cp<<6)|(c&0x3F);}
++  if(cp<min||cp>0x10FFFF||(cp>=0xD800&&cp<=0xDFFF))return false;
++ }
++ return true;
++}
++static uint64
++now_ns(void)
++{
++ struct timespec t;
++ if (clock_gettime(CLOCK_MONOTONIC,&t) || t.tv_sec < 0 || t.tv_nsec < 0 ||
++	 t.tv_nsec >= 1000000000L || (uint64)t.tv_sec > UINT64_MAX/1000000000ULL) {
++  if(finalized){failure=4;return 0;}wrok_fail(4);
++ }
++ return uadd((uint64)t.tv_sec*1000000000ULL,(uint64)t.tv_nsec);
++}
++static uint64
++decimal(const char *s)
++{
++ uint64 v=0;
++ if (!s || !*s || (s[0]=='0' && s[1])) wrok_fail(1);
++ for (;*s;s++) {
++  if (*s<'0' || *s>'9' || v>(UINT64_MAX-(*s-'0'))/10) wrok_fail(1);
++  v=v*10+(*s-'0');
++ }
++ if (!v) wrok_fail(1);
++ return v;
++}
++static uint64
++get_be(const unsigned char *p, unsigned int n)
++{
++ uint64 v=0;
++ while (n--) v=(v<<8)|*p++;
++ return v;
++}
++static void
++put_be(unsigned char *p, unsigned int n, uint64 v)
++{
++ while (n) { p[--n]=v&255; v>>=8; }
++}
++static void
++wipe_secret(void)
++{
++ explicit_bzero(secret,sizeof(secret)); secret_len=0;
++}
++bool wrok_is_worker(void) { return worker; }
++
++static void
++read_control(void)
++{
++ ssize_t n;
++ if (worker || !initialized || failure) return;
++ for (;;) {
++  n=read(STDIN_FILENO,cancel_frame+cancel_used,sizeof(cancel_frame)-cancel_used);
++  if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK)) return;
++  if (n<0 && errno==EINTR) continue;
++  if (n<=0) { failure=6; return; }
++  control_bytes=uadd(control_bytes,(uint64)n);
++  cancel_used+=n;
++  if (control_bytes>lim[L_CONTROL] || cancel_used>48) { failure=3; return; }
++  if (cancel_used>=40) {
++   if (memcmp(cancel_frame,"WRKPGM01",8) || get_be(cancel_frame+8,2)!=1 ||
++	   get_be(cancel_frame+10,2)!=3 || get_be(cancel_frame+12,2)!=40 ||
++	   get_be(cancel_frame+14,2)!=0 || memcmp(cancel_frame+16,operation,16) ||
++	   get_be(cancel_frame+32,4)!=2 || get_be(cancel_frame+36,4)!=8) {
++	failure=3; return;
++   }
++  }
++  if (cancel_used==48) {
++   uint64 c=get_be(cancel_frame+40,8);
++   if (c==0 || c>lim[L_C]) { failure=3; return; }
++   lim[L_C]=c; failure=now_ns()>=c?12:6; return;
++  }
++ }
++}
++bool
++wrok_check(void)
++{
++ if (initialized) {
++  read_control();
++  if (!failure && now_ns()>=lim[L_E]) failure=5;
++ }
++ return failure==0;
++}
++static int
++wait_fd(int fd, short events, int stop, long maximum_ms, bool closing)
++{
++ for (;;) {
++  struct pollfd p[3]; int count=0, which=-1, r;
++  uint64 now=now_ns(), end=closing ? lim[L_C] : lim[L_E], remaining;
++  long timeout;
++  if (!closing && !wrok_check()) return -1;
++  if (now>=end) { if (!failure) failure=5; return -1; }
++  remaining=(end-now+999999ULL)/1000000ULL;
++  timeout=remaining>100 ? 100 : (long)remaining;
++  if (maximum_ms>=0 && timeout>maximum_ms) timeout=maximum_ms;
++  if (fd>=0) { which=count; p[count++]=(struct pollfd){fd,events,0}; }
++  if (!worker && fd!=STDIN_FILENO) p[count++]=(struct pollfd){STDIN_FILENO,POLLIN|POLLHUP,0};
++  if (stop>=0) p[count++]=(struct pollfd){stop,POLLIN|POLLHUP,0};
++  r=poll(p,count,(int)timeout);
++  if (r<0 && errno==EINTR) continue;
++  if (r<0) { if (!failure) failure=11; return -1; }
++  if (!worker) read_control();
++  if (!closing && failure) return -1;
++  if (which>=0 && p[which].revents&(events|POLLERR|POLLHUP)) return 1;
++  if (stop>=0 && p[count-1].revents) return 0;
++  if (maximum_ms>=0) return 0;
++ }
++}
++int
++wrok_poll_pg(PGconn *c, bool writing, int stop, long timeout)
++{
++ return wait_fd(PQsocket(c),writing ? POLLOUT : POLLIN,stop,timeout,false);
++}
++static bool
++write_exact(int fd,const unsigned char *p,size_t n,bool closing)
++{
++ while (n) {
++  ssize_t r=write(fd,p,n);
++  if (r<0 && errno==EINTR) continue;
++  if (r<0 && (errno==EAGAIN || errno==EWOULDBLOCK)) {
++   if (wait_fd(fd,POLLOUT,-1,-1,closing)<0) return false;
++   continue;
++  }
++  if (r<=0) { if (!failure) failure=3; return false; }
++  p+=r;n-=r;
++ }
++ return true;
++}
++static void
++read_exact(unsigned char *p,size_t n)
++{
++ while (n) {
++  ssize_t r=read(STDIN_FILENO,p,n);
++  if (r<0 && errno==EINTR) continue;
++  if (r<0 && (errno==EAGAIN || errno==EWOULDBLOCK)) {
++   if (wait_fd(STDIN_FILENO,POLLIN,-1,-1,false)<0) wrok_fail(failure ? failure:3);
++   continue;
++  }
++  if (r<=0) wrok_fail(3);
++  p+=r;n-=r;control_bytes=uadd(control_bytes,(uint64)r);
++  if (control_bytes>lim[L_CONTROL]) wrok_fail(3);
++ }
++}
++static void
++read_frame(unsigned int kind,unsigned int seq,unsigned char *data,size_t *n)
++{
++ unsigned char h[40]; uint64 size;
++ read_exact(h,40);
++ if (memcmp(h,"WRKPGM01",8) || get_be(h+8,2)!=1 || get_be(h+10,2)!=kind ||
++	 get_be(h+12,2)!=40 || get_be(h+14,2) || memcmp(h+16,operation,16) ||
++	 get_be(h+32,4)!=seq) wrok_fail(3);
++ size=get_be(h+36,4);
++ if (size>*n) wrok_fail(3);
++ *n=(size_t)size;
++ if (size) read_exact(data,(size_t)size);
++}
++static void
++status(unsigned int event)
++{
++ unsigned char record[168]={0}; unsigned char *b=record+40;
++ uint64 flags=(original_worker>0 ? 1:0)|(worker_waited ? 2:0)|
++			  (final_close_complete && !connections[0] && !connections[1] ? 4:0)|
++			  (final_close_complete && !secret_len ? 8:0)|(event==8 ? 16:0);
++ if (worker || !initialized) return;
++ if (status_seq>=lim[L_RECORDS] || uadd(status_bytes,sizeof(record))>lim[L_STATUS]) {
++  if (!failure) failure=3; return;
++ }
++ memcpy(record,"WRKPGM01",8);put_be(record+8,2,1);put_be(record+10,2,0x8001);
++ put_be(record+12,2,40);memcpy(record+16,operation,16);
++ put_be(record+32,4,status_seq++);put_be(record+36,4,128);
++ put_be(b,2,event);put_be(b+2,2,failure);put_be(b+4,4,getpid());
++ put_be(b+8,4,original_worker>0 ? original_worker:0);put_be(b+12,4,(uint32)worker_status);
++ put_be(b+16,8,system_id);put_be(b+24,4,timeline);put_be(b+28,4,segment_bytes);
++ put_be(b+32,8,start_lsn);put_be(b+40,8,stop_lsn);
++ put_be(b+48,8,total_bytes);put_be(b+56,8,total_files);
++ put_be(b+64,8,wal_bytes);put_be(b+72,8,wal_files);
++ put_be(b+80,8,now_ns());put_be(b+88,8,wait_observed_ns);put_be(b+96,8,flags);
++ status_bytes+=sizeof(record);
++ (void)write_exact(STDOUT_FILENO,record,sizeof(record),failure!=0 || event>=6);
++}
++void
++wrokbot_owner_redacted_log(int is_error)
++{
++ if(!is_error)return;
++ static const unsigned char code[]="wrokbot_pg_maintenance_failed\n";
++ if (!failure) failure=9;
++ if (initialized && diagnostic_bytes+sizeof(code)-1<=lim[L_STDERR]) {
++  diagnostic_bytes+=sizeof(code)-1;
++  (void)write_exact(STDERR_FILENO,code,sizeof(code)-1,true);
++ }
++}
++static void
++close_all(void)
++{
++ unsigned int i;
++ for (i=0;i<2;i++) if (connections[i]) { PGconn *c=connections[i];connections[i]=NULL;PQfinish(c); }
++ wipe_secret();
++ final_close_complete=true;
++}
++static void
++owner_exit(void)
++{
++ if (finalized) return;
++ finalized=true;
++ if (!worker && !terminal_success && !failure) failure=9;
++ if (!worker && original_worker>0 && !worker_waited)
++  wrok_worker_wait(original_worker,true);
++ close_all();
++ /* The profile and its stderr bound were fully accepted before stage 1. */
++ if (!worker && !status_seq && prestatus_stage>=1 && prestatus_stage<=18 &&
++	 failure>=1 && failure<=12) {
++  int saved_errno=errno, flags=-1;
++  bool changed=false, ready=false;
++  unsigned char code[]="W44PRE:00:00\n";
++  struct timespec t;
++  struct stat m;
++  struct pollfd p={STDERR_FILENO,POLLOUT,0};
++  if (!clock_gettime(CLOCK_MONOTONIC,&t) && t.tv_sec>=0 && t.tv_nsec>=0 &&
++	  t.tv_nsec<1000000000L &&
++	  (uint64)t.tv_sec<=(UINT64_MAX-(uint64)t.tv_nsec)/1000000000ULL) {
++   uint64 observed=(uint64)t.tv_sec*1000000000ULL+(uint64)t.tv_nsec;
++   if (observed>=lim[L_T0] && observed<lim[L_C] &&
++	   lim[L_STDERR]>=sizeof(code)-1 &&
++	   diagnostic_bytes<=lim[L_STDERR]-(sizeof(code)-1) &&
++	   !fstat(STDERR_FILENO,&m) && S_ISFIFO(m.st_mode) &&
++	   (flags=fcntl(STDERR_FILENO,F_GETFL))>=0) {
++	if (flags&O_NONBLOCK) ready=true;
++	else if (!fcntl(STDERR_FILENO,F_SETFL,flags|O_NONBLOCK)) {
++	 changed=true;ready=true;
++	}
++	if (ready && poll(&p,1,0)==1 && (p.revents&POLLOUT) &&
++		!(p.revents&(POLLERR|POLLHUP|POLLNVAL))) {
++	 code[7]=(unsigned char)('0'+prestatus_stage/10);
++	 code[8]=(unsigned char)('0'+prestatus_stage%10);
++	 code[10]=(unsigned char)('0'+failure/10);
++	 code[11]=(unsigned char)('0'+failure%10);
++	 diagnostic_bytes+=sizeof(code)-1;
++	 (void)write(STDERR_FILENO,code,sizeof(code)-1);
++	}
++	if (changed) (void)fcntl(STDERR_FILENO,F_SETFL,flags);
++   }
++  }
++  errno=saved_errno;
++ }
++ if (!worker && terminal_success && now_ns()>=lim[L_E] && !failure)failure=5;
++ if (!worker) {
++  status(7);
++  if (terminal_success && failure) terminal_success=false;
++  status(8);
++ }
++ close_prebuilt();
++ if (root_parent>=0) { close(root_parent);root_parent=-1; }
++ if(failure)_Exit(1);
++}
++void
++wrok_fail(unsigned int code)
++{
++ if (!failure) failure=code;
++ exit(1); /* atexit retains and reaps the original WAL child before returning. */
++}
++static void
++nonblock(int fd)
++{
++ int v=fcntl(fd,F_GETFL);
++ if (v<0 || fcntl(fd,F_SETFL,v|O_NONBLOCK)<0) wrok_fail(3);
++}
++static void
++check_space(void)
++{
++ struct statvfs s; uint64 free_bytes, needed;
++ if (root_parent<0 || fstatvfs(root_parent,&s)) wrok_fail(11);
++ free_bytes=umul((uint64)s.f_bavail,(uint64)s.f_frsize);
++ needed=uadd(lim[L_RESERVE],lim[L_RESTORE]);
++ {
++  uint64 now=now_ns();
++  if(output_root && (!space_checked_ns || now-space_checked_ns>=100000000ULL)) {
++   int fd=open(output_root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
++   if(fd>=0){allocation_nodes=0;allocated_cache=allocated_tree(fd,0);close(fd);}
++   else if(errno!=ENOENT)wrok_fail(11);
++   space_checked_ns=now;
++  }
++  if(allocated_cache>lim[L_SPOOL])wrok_fail(7);
++  needed=uadd(needed,lim[L_SPOOL]-allocated_cache);
++ }
++ if (free_bytes<lim[L_FREE] || free_bytes-lim[L_FREE]<needed) wrok_fail(7);
++}
++void
++wrok_owner_init(int *argc,char ***argv)
++{
++ static const char *stock_names[]={"format","wal-method","manifest-checksums","checkpoint",
++  "no-password","no-clean","no-slot","pgdata","host","port","username","label"};
++ static const char *fixed[]={"plain","stream","SHA256","fast",NULL,NULL,NULL};
++ bool seen[L_COUNT]={0}, stock_seen[12]={0}, op_seen=false, proto=false;
++ int i,j,out=1; char *target=NULL,*host=NULL,*role=NULL; struct rlimit fds;
++ if (*argc==2 && !strcmp((*argv)[1],"--version")) {
++  puts("wrokbot-maintenance protocol1 PG" PG_VERSION);exit(0);
++ }
++ signal(SIGPIPE,SIG_IGN);
++ atexit(owner_exit);
++ for (i=1;i<*argc;i++) {
++  char *s=(*argv)[i],*eq=strchr(s,'=');
++  if (!strncmp(s,"--wrokbot-",10)) {
++   size_t len=eq ? (size_t)(eq-s-10):0;const char *v=eq ? eq+1:NULL;
++   if (!eq) wrok_fail(1);
++   if (len==14 && !strncmp(s+10,"owner-protocol",14)) {
++	if (proto || strcmp(v,"1")) wrok_fail(1);proto=true;continue;
++   }
++   if (len==9 && !strncmp(s+10,"operation",9)) {
++	if (op_seen || strlen(v)!=32) wrok_fail(1);
++	for (j=0;j<16;j++) {
++	 char a=v[j*2],b=v[j*2+1];int x=(a>='0'&&a<='9')?a-'0':(a>='a'&&a<='f')?a-'a'+10:-1;
++	 int y=(b>='0'&&b<='9')?b-'0':(b>='a'&&b<='f')?b-'a'+10:-1;
++	 if (x<0 || y<0) wrok_fail(1);operation[j]=(x<<4)|y;
++	}
++	op_seen=true;continue;
++   }
++   for (j=0;j<L_COUNT;j++) if (strlen(limit_names[j])==len && !strncmp(s+10,limit_names[j],len)) break;
++   if (j==L_COUNT || seen[j]) wrok_fail(1);
++   seen[j]=true;lim[j]=decimal(v);continue;
++  }
++  if (strncmp(s,"--",2)) wrok_fail(1);
++  for (j=0;j<12;j++) if ((eq ? (size_t)(eq-s-2):strlen(s+2))==strlen(stock_names[j]) &&
++		!strncmp(s+2,stock_names[j],strlen(stock_names[j]))) break;
++  if (j==12 || stock_seen[j]) wrok_fail(1);stock_seen[j]=true;
++  if (j<4 && (!eq || strcmp(eq+1,fixed[j]))) wrok_fail(1);
++  if (j>=4 && j<=6 && eq) wrok_fail(1);
++  if (j>=7 && (!eq || !eq[1])) wrok_fail(1);
++  if (j==7) target=eq+1;
++  if (j==8) host=eq+1;
++  if (j==10) role=eq+1;
++  if (j==9 && decimal(eq+1)>65535) wrok_fail(1);
++   (*argv)[out++]=s;
++ }
++ for(j=0;j<L_COUNT;j++) if(!seen[j])wrok_fail(1);
++ for(j=0;j<12;j++) if(!stock_seen[j])wrok_fail(1);
++ if(!proto || !op_seen || !(lim[L_T0]<lim[L_E] && lim[L_E]<lim[L_C]) ||
++	lim[L_SECRET]>4096 || lim[L_SECCOPIES]<12 ||
++	lim[L_SECMEM]<umul(uadd(lim[L_SECRET],1),lim[L_SECCOPIES]) ||
++	lim[L_SECMEM]<uadd(umul(2,4097),uadd(umul(292,lim[L_SECRET]),8)) ||
++	lim[L_CONTROL]<uadd(128,lim[L_SECRET]) || lim[L_RECORDS]<8 ||
++	lim[L_RECORDS]>UINT32_MAX || lim[L_STATUS]<umul(lim[L_RECORDS],168) ||
++	lim[L_BLOCK]>4194304 || lim[L_WALTL]!=1 || lim[L_PLAIN]<=uadd(lim[L_WAL],lim[L_MANIFEST]) ||
++	lim[L_FILES]<=uadd(umul(lim[L_WALSEGS],2),8) || lim[L_DIRS]<=8 || lim[L_SINGLE]<lim[L_MANIFEST] ||
++	lim[L_SPOOL]<lim[L_PLAIN] || lim[L_FDS]<32 || lim[L_STDERR]<30) wrok_fail(1);
++ prestatus_stage=1;
++ for (i=1;i<out;i++) if (!strncmp((*argv)[i],"--label=",8)) {
++  char expected[64],hex[33];for(j=0;j<16;j++)sprintf(hex+j*2,"%02x",operation[j]);
++  snprintf(expected,sizeof(expected),"wrokbot-maintenance-%s",hex);
++  if(strcmp((*argv)[i]+8,expected))wrok_fail(1);
++ }
++ prestatus_stage=2;
++ if(!host || host[0]!='/' || !role || !*role || strlen(role)>63 ||
++	!target || target[0]!='/' || strlen(target)>=MAXPGPATH)wrok_fail(1);
++ for(const char *s=role;*s;s++)if(!((*s>='a'&&*s<='z')||(*s>='0'&&*s<='9')||*s=='_'))wrok_fail(1);
++ prestatus_stage=3;
++ {
++  char *parent=pg_strdup(target),*slash=strrchr(parent,'/');struct stat m;char canonical[MAXPGPATH];
++  if(!slash || !slash[1] || !strcmp(slash+1,".") || !strcmp(slash+1,".."))wrok_fail(1);
++  *slash=0;
++  prestatus_stage=4;
++  if(!realpath(parent,canonical) || strcmp(parent,canonical))wrok_fail(1);
++  prestatus_stage=5;
++  root_parent=open(parent,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
++  if(root_parent<0 || fstat(root_parent,&m) || m.st_uid!=geteuid() || (m.st_mode&0777)!=0700)wrok_fail(1);
++  prestatus_stage=6;
++  if(lstat(target,&m)==0 || errno!=ENOENT)wrok_fail(1);
++  prestatus_stage=7;
++  if(!realpath(host,canonical) || strcmp(host,canonical) || lstat(host,&m) ||
++	 !S_ISDIR(m.st_mode)||m.st_uid!=geteuid()||(m.st_mode&0777)!=0700)wrok_fail(1);
++  free(parent);
++ }
++ prestatus_stage=8;
++ output_root=pg_strdup(target);
++ prestatus_stage=9;
++ if(getrlimit(RLIMIT_NOFILE,&fds)||lim[L_FDS]>fds.rlim_max)wrok_fail(1);
++ prestatus_stage=10;
++ fds.rlim_cur=(rlim_t)lim[L_FDS];if(setrlimit(RLIMIT_NOFILE,&fds))wrok_fail(1);
++ *argc=out;(*argv)[out]=NULL;
++ prestatus_stage=11;
++ nonblock(0);
++ prestatus_stage=12;
++ nonblock(1);
++ prestatus_stage=13;
++ nonblock(2);
++ prestatus_stage=14;
++ check_space();
++ prestatus_stage=15;
++ { size_t n=(size_t)lim[L_SECRET];read_frame(1,0,secret,&n);if(!n||!valid_utf8(secret,n))wrok_fail(2);
++   secret_len=n;secret[n]=0;n=0;prestatus_stage=16;read_frame(2,1,NULL,&n); }
++ prestatus_stage=17;
++ initialized=true;
++ if(!wrok_check())wrok_fail(failure);
++ prestatus_stage=18;
++ status(1);
++}
++static void
++wrok_ignore_notice(void *arg,const char *message)
++{
++ (void)arg;
++ (void)message;
++}
++PGconn *
++wrok_connect(const char *host,const char *port,const char *user)
++{
++ const char *keys[]={"host","port","user","password","dbname","replication",
++  "application_name","options","sslmode","gssencmode",NULL};
++ const char *values[]={host,port,user,(const char *)secret,"replication","true",
++  "wrokbot-pg-basebackup","-c session_preload_libraries= -c local_preload_libraries=",
++  "disable","disable",NULL};
++ PGconn *c;
++ if(!secret_len||!wrok_check())wrok_fail(failure?failure:2);
++ c=PQconnectStartParams(keys,values,0);
++ if(!c)wrok_fail(8);
++ if(!connections[0])connections[0]=c;else if(!connections[1])connections[1]=c;else wrok_fail(8);
++ PQsetNoticeProcessor(c,wrok_ignore_notice,NULL);
++ if(PQsetnonblocking(c,1))wrok_fail(8);
++ for(;;) {
++  PostgresPollingStatusType s;
++  if(!wrok_check())wrok_fail(8);
++  s=PQconnectPoll(c);
++  if(s==PGRES_POLLING_OK)break;
++  if(s==PGRES_POLLING_FAILED ||
++	 wait_fd(PQsocket(c),s==PGRES_POLLING_WRITING?POLLOUT:POLLIN,-1,-1,false)<0)wrok_fail(failure?failure:8);
++ }
++ if(PQserverVersion(c)!=170011)wrok_fail(8);
++ return c;
++}
++int
++wrok_flush(PGconn *c)
++{
++ for(;;) {
++  int n;
++  if(!wrok_check())return -1;
++  n=PQflush(c);if(n<=0)return n;
++  if(wrok_poll_pg(c,true,-1,-1)<0)return -1;
++ }
++}
++PGresult *
++wrok_result(PGconn *c)
++{
++ if(wrok_flush(c)<0)wrok_fail(failure?failure:8);
++ while(PQisBusy(c)) {
++  if(wrok_poll_pg(c,false,-1,-1)<0||!PQconsumeInput(c))wrok_fail(failure?failure:8);
++ }
++ return PQgetResult(c);
++}
++PGresult *
++wrok_exec(PGconn *c,const char *query)
++{
++ PGresult *r,*last=NULL;
++ if(!wrok_check()||!PQsendQuery(c,query))wrok_fail(failure?failure:8);
++ while((r=wrok_result(c))!=NULL) {
++  if(last)PQclear(last);last=r;
++  if(PQresultStatus(r)==PGRES_COPY_IN||PQresultStatus(r)==PGRES_COPY_OUT||PQresultStatus(r)==PGRES_COPY_BOTH)break;
++ }
++ return last;
++}
++int
++wrok_copy(PGconn *c,char **b,int async)
++{
++ for(;;) {
++  int n;
++  if(!wrok_check())return -2;
++  n=PQgetCopyData(c,b,1);
++  if(n!=0||async)return n;
++  if(wrok_poll_pg(c,false,-1,-1)<0||!PQconsumeInput(c))return -2;
++ }
++}
++int
++wrok_put_copy(PGconn *c,const char *b,int len)
++{
++ for(;;) {
++  int n;
++  if(!wrok_check())return -1;
++  n=PQputCopyData(c,b,len);if(n!=0)return n;
++  if(wrok_flush(c)<0)return -1;
++ }
++}
++int
++wrok_put_end(PGconn *c,const char *e)
++{
++ for(;;) {
++  int n;if(!wrok_check())return -1;
++  n=PQputCopyEnd(c,e);if(n!=0)return n;
++  if(wrok_flush(c)<0)return -1;
++ }
++}
++void
++wrok_finish(PGconn *c)
++{
++ for(int i=0;i<2;i++)if(connections[i]==c)connections[i]=NULL;
++ PQfinish(c);
++}
++static void
++discard_fork_connection(PGconn *c)
++{
++ if(!c)return;
++ /* Only this fork's descriptor is closed: no Terminate reaches the other owner. */
++ if(c->sock!=PGINVALID_SOCKET){close(c->sock);c->sock=PGINVALID_SOCKET;}
++ wrok_finish(c);
++}
++void
++wrok_worker_parent(pid_t pid,PGconn *wal_conn)
++{
++ original_worker=pid;discard_fork_connection(wal_conn);wipe_secret();status(3);
++}
++void
++wrok_worker_child(PGconn *leader_conn,int pipe_write,int pipe_read)
++{
++ worker=true;original_worker=-1;
++ close(STDIN_FILENO);close(STDOUT_FILENO);close(pipe_write);
++ discard_fork_connection(leader_conn);wipe_secret();
++ (void)pipe_read;
++}
++void
++wrok_worker_wait(pid_t pid,bool stop)
++{
++ pid_t got;
++ if(worker || worker_waited || pid<=0)return;
++ waiting_worker=true;
++ if(stop)status(5);
++ if(stop && now_ns()<lim[L_C]) {
++  if(kill(pid,SIGTERM)<0 && errno!=ESRCH && !failure)failure=10;
++ }
++ for(;;) {
++  got=waitpid(pid,&worker_status,WNOHANG);
++  if(got==pid){worker_waited=true;wait_observed_ns=now_ns();break;}
++  if(got<0&&errno==EINTR)continue;
++  if(got<0){failure=12;break;}
++  if(!wrok_check() && !stop && now_ns()<lim[L_C]) {
++   stop=true;status(5);
++   if(now_ns()<lim[L_C])(void)kill(pid,SIGTERM);
++  }
++  if(now_ns()>=lim[L_C])failure=12;
++  /* This is observation of the original wait, not new effect or budget renewal. */
++  (void)poll(NULL,0,10);
++ }
++ if(!worker_waited||!WIFEXITED(worker_status)||WEXITSTATUS(worker_status)!=0) {
++  if(!failure)failure=10;
++ }
++ status(6);waiting_worker=false;
++}
++void
++wrok_identity(const char *id,uint32 tli,uint64 seg)
++{
++ system_id=decimal(id);timeline=tli;segment_bytes=(uint32)seg;
++ if(!tli||!seg||seg>lim[L_SINGLE])wrok_fail(7);
++ status(2);
++}
++static uint64
++lsn(const char *s)
++{
++ unsigned int a,b;char tail;
++ if(sscanf(s,"%X/%X%c",&a,&b,&tail)!=2)wrok_fail(10);
++ return ((uint64)a<<32)|b;
++}
++void
++wrok_range(const char *start,const char *stop)
++{
++ start_lsn=lsn(start);stop_lsn=lsn(stop);
++ if(stop_lsn<=start_lsn || stop_lsn-start_lsn>lim[L_WALSPAN] ||
++	!segment_bytes || (stop_lsn-1)/segment_bytes-start_lsn/segment_bytes+1>lim[L_WALSEGS])
++  wrok_fail(10);
++}
++void wrok_data_complete(void){status(4);}
++void wrok_success(void){if(!wrok_check())wrok_fail(failure);verify_output();if(fsync(root_parent))wrok_fail(11);if(!wrok_check())wrok_fail(failure);terminal_success=true;}
++void
++wrok_manifest_bytes(size_t n)
++{
++ manifest_bytes=uadd(manifest_bytes,n);
++ if(manifest_bytes>lim[L_MANIFEST])wrok_fail(7);
++ check_space();
++}
++int
++wrok_wal_open(const char *name,uint64 pad)
++{
++ const char *segment=name;size_t n=strlen(name);bool marker=false;
++ if(!strncmp(name,"archive_status/",15)){
++  segment=name+15;n=strlen(segment);
++  if(n!=29||strcmp(segment+24,".done")||pad)wrok_fail(7);
++  n=24;marker=true;
++ }
++ if(!worker||n!=24||pad>lim[L_SINGLE])wrok_fail(7);
++ for(size_t i=0;i<n;i++)if(!((segment[i]>='0'&&segment[i]<='9')||(segment[i]>='A'&&segment[i]<='F')))wrok_fail(7);
++ if(!marker) {
++  if(!pad||pad!=segment_bytes)wrok_fail(7);
++  wal_files=uadd(wal_files,1);wal_reserved=uadd(wal_reserved,pad);
++  io_blocks=uadd(io_blocks,blocks_for(pad));
++  if(wal_files>lim[L_WALSEGS]||wal_reserved>lim[L_WAL]||io_blocks>lim[L_BLOCKS])wrok_fail(7);
++ }
++ space_checked_ns=0;check_space();
++ {
++  int parent=prebuilt_fds[marker?1:0];
++  int fd;
++  if(parent<0)wrok_fail(11);
++  fd=openat(parent,segment,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
++  if(fd<0)wrok_fail(11);return fd;
++ }
++}
++void
++wrok_wal_write(size_t n)
++{
++ wal_bytes=uadd(wal_bytes,n);
++ if(wal_bytes>lim[L_WAL]||!wrok_check())wrok_fail(failure?failure:7);
++ check_space();
++}
++static void
++close_prebuilt(void)
++{
++ for(int i=0;i<3;i++)if(prebuilt_fds[i]>=0){close(prebuilt_fds[i]);prebuilt_fds[i]=-1;}
++ if(output_fd>=0){close(output_fd);output_fd=-1;}
++}
++static int
++private_directory(int parent,const char *name)
++{
++ int fd=openat(parent,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);struct stat s;
++ if(fd<0||fstat(fd,&s)||!S_ISDIR(s.st_mode)||s.st_uid!=geteuid()||
++	(s.st_mode&0777)!=0700)wrok_fail(11);
++ return fd;
++}
++void
++wrok_prebuilt_directories(void)
++{
++ const char *leaf=strrchr(output_root,'/');struct stat s;
++ if(output_fd>=0||!leaf||!leaf[1])wrok_fail(11);
++ output_fd=private_directory(root_parent,leaf+1);
++ prebuilt_fds[0]=private_directory(output_fd,"pg_wal");
++ prebuilt_fds[1]=private_directory(prebuilt_fds[0],"archive_status");
++ prebuilt_fds[2]=private_directory(prebuilt_fds[0],"summaries");
++ if(fstat(output_fd,&s)||s.st_uid!=geteuid())wrok_fail(11);
++}
++static bool
++same_prebuilt(const char *name,int parent,const char *leaf)
++{
++ struct stat held,named,opened;
++ size_t n=strlen(name);int i,fd;
++ if(n && name[n-1]=='/')n--;
++ for(i=0;i<3;i++)
++  if(strlen(prebuilt_names[i])==n&&!strncmp(name,prebuilt_names[i],n))break;
++ if(i==3||prebuilt_fds[i]<0||fstat(prebuilt_fds[i],&held)||
++	fstatat(parent,leaf,&named,AT_SYMLINK_NOFOLLOW))return false;
++ fd=openat(parent,leaf,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
++ if(fd<0)return false;
++ if(fstat(fd,&opened)){close(fd);return false;}close(fd);
++ return S_ISDIR(named.st_mode)&&S_ISDIR(opened.st_mode)&&
++		named.st_uid==geteuid()&&(named.st_mode&0777)==0700&&
++		held.st_dev==named.st_dev&&held.st_ino==named.st_ino&&
++		held.st_dev==opened.st_dev&&held.st_ino==opened.st_ino;
++}
++/* The extractor uses held directory descriptors, never the stock fopen(path) leg. */
++typedef struct WrokExtractor {
++ bbstreamer base;
++ int rootfd, file;
++ uint64 remaining, allocated;
++} WrokExtractor;
++static int
++member_parent(int root,const char *name,char *leaf)
++{
++ char path[MAXPGPATH],*save,*piece,*next;
++ int dir=dup(root);
++ unsigned int depth=0;
++ size_t length=strlen(name);
++ if(dir<0||!length||length>=sizeof(path)||length>lim[L_PATH])wrok_fail(7);
++ memcpy(path,name,length+1);
++ if(path[length-1]=='/')path[--length]=0;
++ if(!length||path[0]=='/'||strstr(path,"//")||strchr(path,'\\'))wrok_fail(7);
++ piece=strtok_r(path,"/",&save);
++ while(piece) {
++  if(!strcmp(piece,".")||!strcmp(piece,"..")||!piece[0]||++depth>lim[L_DEPTH])wrok_fail(7);
++  next=strtok_r(NULL,"/",&save);
++  if(!next){strlcpy(leaf,piece,MAXPGPATH);return dir;}
++  {
++   int child=openat(dir,piece,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
++   close(dir);dir=child;if(dir<0)wrok_fail(11);
++  }
++  piece=next;
++ }
++ wrok_fail(7);
++}
++static void
++extract_content(bbstreamer *s,bbstreamer_member *m,const char *data,int len,
++				bbstreamer_archive_context context)
++{
++ WrokExtractor *x=(WrokExtractor *)s;
++ if(!wrok_check())wrok_fail(failure);
++ if(len<0)wrok_fail(7);
++ if(context==BBSTREAMER_MEMBER_HEADER) {
++  char leaf[MAXPGPATH];int parent;uint64 size;const char *name;
++  if(!m||x->file>=0||m->is_link||m->size<0)wrok_fail(7);
++  name=m->pathname;
++  /* PG17.11 emits this one fixed root prefix; a second ./ still fails below. */
++  if(!strncmp(name,"./",2))name+=2;
++  parent=member_parent(x->rootfd,name,leaf);
++  size=(uint64)m->size;
++  if(m->is_directory) {
++   directories=uadd(directories,1);
++   if(directories>lim[L_DIRS]-8||size)wrok_fail(7);
++   if(mkdirat(parent,leaf,0700)) {
++	struct stat st;
++	if(errno!=EEXIST || !same_prebuilt(name,parent,leaf) ||
++	   fstatat(parent,leaf,&st,AT_SYMLINK_NOFOLLOW)||!S_ISDIR(st.st_mode))
++	 wrok_fail(11);
++   }
++  } else {
++   uint64 reserve=uadd(lim[L_WAL],lim[L_MANIFEST]);
++   if(size>lim[L_SINGLE]||reserve>=lim[L_PLAIN])wrok_fail(7);
++   total_files=uadd(total_files,1);total_bytes=uadd(total_bytes,size);
++   io_blocks=uadd(io_blocks,blocks_for(size));
++   {
++	uint64 reserved_blocks=uadd(umul(lim[L_WALSEGS],blocks_for(segment_bytes)),
++								  blocks_for(lim[L_MANIFEST]));
++	if(total_files>lim[L_FILES]-umul(lim[L_WALSEGS],2)-8 ||
++	   total_bytes>lim[L_PLAIN]-reserve || reserved_blocks>=lim[L_BLOCKS] ||
++	   io_blocks>lim[L_BLOCKS]-reserved_blocks)wrok_fail(7);
++   }
++   check_space();
++   x->file=openat(parent,leaf,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
++   if(x->file<0)wrok_fail(11);
++   x->remaining=size;x->allocated=0;
++  }
++  close(parent);
++ } else if(context==BBSTREAMER_MEMBER_CONTENTS) {
++  if(!m||m->is_directory||x->file<0||((uint64)len)>x->remaining)wrok_fail(7);
++  while(len) {
++   size_t n=(uint64)len>lim[L_BLOCK]?(size_t)lim[L_BLOCK]:(size_t)len;
++   if(!wrok_check())wrok_fail(failure);
++   check_space();
++   if(!write_exact(x->file,(const unsigned char *)data,n,false))wrok_fail(11);
++   data+=n;len-=n;x->remaining-=n;
++  }
++ } else if(context==BBSTREAMER_MEMBER_TRAILER) {
++  if(x->file>=0) {
++   if(x->remaining||fsync(x->file)||close(x->file))wrok_fail(11);
++   x->file=-1;
++  }
++ } else if(context==BBSTREAMER_ARCHIVE_TRAILER) {
++  if(x->file>=0)wrok_fail(7);
++ } else wrok_fail(7);
++}
++static void extract_finalize(bbstreamer *s) {
++ WrokExtractor *x=(WrokExtractor *)s;
++ if(x->file>=0||fsync(x->rootfd))wrok_fail(11);
++}
++static void extract_free(bbstreamer *s) {
++ WrokExtractor *x=(WrokExtractor *)s;
++ if(x->file>=0)wrok_fail(11);
++ close(x->rootfd);pfree(x);
++}
++static const bbstreamer_ops extractor_ops={
++ .content=extract_content,.finalize=extract_finalize,.free=extract_free
++};
++bbstreamer *
++wrok_extractor_new(const char *root)
++{
++ WrokExtractor *x=palloc0(sizeof(*x));
++ struct stat st,held;
++ x->base.bbs_ops=&extractor_ops;x->file=-1;
++ x->rootfd=open(root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
++ if(x->rootfd<0||fstat(x->rootfd,&st)||st.st_uid!=geteuid()||
++	(st.st_mode&0777)!=0700||strcmp(root,output_root)||output_fd<0||fstat(output_fd,&held)||
++	st.st_dev!=held.st_dev||st.st_ino!=held.st_ino)wrok_fail(11);
++ return &x->base;
++}
++static void
++count_tree(int dir,unsigned int depth,const char *prefix)
++{
++ DIR *stream;struct dirent *entry;
++ if(depth>lim[L_DEPTH])wrok_fail(7);
++ stream=fdopendir(dup(dir));if(!stream)wrok_fail(11);
++ while((entry=readdir(stream))) {
++  struct stat st;char path[MAXPGPATH];int fd;
++  if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,".."))continue;
++  if(!wrok_check())wrok_fail(failure);
++  if(snprintf(path,sizeof(path),"%s%s%s",prefix,*prefix?"/":"",entry->d_name)>=(int)sizeof(path))
++   wrok_fail(7);
++  if(strlen(path)>lim[L_PATH]||fstatat(dir,entry->d_name,&st,AT_SYMLINK_NOFOLLOW))wrok_fail(11);
++  if(S_ISDIR(st.st_mode)) {
++   directories=uadd(directories,1);if(directories>lim[L_DIRS])wrok_fail(7);
++   fd=openat(dir,entry->d_name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);if(fd<0)wrok_fail(11);
++   count_tree(fd,depth+1,path);if(fsync(fd)||close(fd))wrok_fail(11);
++  } else if(S_ISREG(st.st_mode)&&st.st_nlink==1&&st.st_size>=0) {
++   uint64 n=(uint64)st.st_size;
++   total_files=uadd(total_files,1);total_bytes=uadd(total_bytes,n);
++   io_blocks=uadd(io_blocks,blocks_for(n));
++   if(n>lim[L_SINGLE]||total_files>lim[L_FILES]||total_bytes>lim[L_PLAIN]||
++	  total_bytes>lim[L_SPOOL]||io_blocks>lim[L_BLOCKS])wrok_fail(7);
++   if(!strncmp(path,"pg_wal/",7)&&strlen(path+7)==24) {
++	wal_files=uadd(wal_files,1);wal_bytes=uadd(wal_bytes,n);
++	if(wal_files>lim[L_WALSEGS]||wal_bytes>lim[L_WAL])wrok_fail(7);
++   }
++   if(!strcmp(path,"backup_manifest") && (n==0||n>lim[L_MANIFEST]))wrok_fail(7);
++   fd=openat(dir,entry->d_name,O_RDONLY|O_NOFOLLOW);
++   if(fd<0||fsync(fd)||close(fd))wrok_fail(11);
++  } else wrok_fail(7);
++ }
++ closedir(stream);
++}
++static void
++verify_output(void)
++{
++ int fd=open(output_root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
++ struct stat m;
++ if(fd<0)wrok_fail(11);
++ total_files=total_bytes=wal_files=wal_bytes=directories=io_blocks=0;
++ count_tree(fd,0,"");
++ if(!wal_files||!wal_bytes||fstatat(fd,"backup_manifest",&m,AT_SYMLINK_NOFOLLOW)||
++	!S_ISREG(m.st_mode)||!m.st_size||fsync(fd))wrok_fail(7);
++ close(fd);
++}
++
++static uint64
++allocated_tree(int dir,unsigned int depth)
++{
++ DIR *d;struct dirent *e;uint64 total=0;
++ if(depth>lim[L_DEPTH]||depth>64)wrok_fail(7);
++ d=fdopendir(dup(dir));if(!d)wrok_fail(11);
++ while((e=readdir(d))) {
++  struct stat m;
++  if(!strcmp(e->d_name,".")||!strcmp(e->d_name,".."))continue;
++  if(!wrok_check())wrok_fail(failure);
++  if(++allocation_nodes>uadd(lim[L_FILES],lim[L_DIRS])||
++	 fstatat(dir,e->d_name,&m,AT_SYMLINK_NOFOLLOW))wrok_fail(7);
++  if(S_ISDIR(m.st_mode)) {
++   int fd=openat(dir,e->d_name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
++   if(fd<0)wrok_fail(11);
++   total=uadd(total,allocated_tree(fd,depth+1));close(fd);
++  } else if(!S_ISREG(m.st_mode)||m.st_nlink!=1)wrok_fail(7);
++  if(m.st_blocks<0)wrok_fail(7);
++  total=uadd(total,umul((uint64)m.st_blocks,512));
++ }
++ closedir(d);return total;
++}
++FILE *
++wrok_manifest_open(void)
++{
++ int root=open(output_root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW),fd;FILE *out;
++ if(root<0)wrok_fail(11);
++ check_space();
++ fd=openat(root,"backup_manifest.tmp",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
++ close(root);if(fd<0)wrok_fail(11);
++ out=fdopen(fd,"wb");if(!out){close(fd);wrok_fail(11);}return out;
++}
+--- /dev/null
++++ b/src/bin/pg_basebackup/wrokbot_owner.h
+@@ -0,0 +1,45 @@
++/* WrokBot maintenance v1: fixed owner, stdio and original WAL-child boundary. */
++#ifndef WROKBOT_OWNER_H
++#define WROKBOT_OWNER_H
++#include "libpq-fe.h"
++#include "streamutil.h"
++#include "bbstreamer.h"
++#include <sys/types.h>
++
++extern void wrok_owner_init(int *argc, char ***argv);
++extern PGconn *wrok_connect(const char *host, const char *port, const char *user);
++extern PGresult *wrok_exec(PGconn *, const char *);
++extern PGresult *wrok_result(PGconn *);
++extern int wrok_copy(PGconn *, char **, int);
++extern int wrok_put_copy(PGconn *, const char *, int);
++extern int wrok_put_end(PGconn *, const char *);
++extern int wrok_flush(PGconn *);
++extern void wrok_finish(PGconn *);
++extern int wrok_poll_pg(PGconn *, bool, int, long);
++extern void wrok_worker_parent(pid_t, PGconn *);
++extern void wrok_worker_child(PGconn *, int, int);
++extern void wrok_worker_wait(pid_t, bool);
++extern void wrok_identity(const char *, uint32, uint64);
++extern void wrok_range(const char *, const char *);
++extern void wrok_data_complete(void);
++extern void wrok_success(void);
++extern void wrok_manifest_bytes(size_t);
++extern FILE *wrok_manifest_open(void);
++extern int wrok_wal_open(const char *, uint64);
++extern void wrok_prebuilt_directories(void);
++extern void wrok_wal_write(size_t);
++extern bbstreamer *wrok_extractor_new(const char *);
++extern void wrok_fail(unsigned int) pg_attribute_noreturn();
++extern bool wrok_check(void);
++extern bool wrok_is_worker(void);
++
++#ifndef WROKBOT_OWNER_IMPLEMENTATION
++#define PQexec wrok_exec
++#define PQgetResult wrok_result
++#define PQgetCopyData wrok_copy
++#define PQputCopyData wrok_put_copy
++#define PQputCopyEnd wrok_put_end
++#define PQflush wrok_flush
++#define PQfinish wrok_finish
++#endif
++#endif
+--- a/src/bin/pg_basebackup/Makefile
++++ b/src/bin/pg_basebackup/Makefile
+@@ -46,6 +46,17 @@
+ 
+ all: pg_basebackup pg_createsubscriber pg_receivewal pg_recvlogical
+ 
++# Independent role: stock objects/executables retain their original semantics.
++WROKOBJS = $(patsubst %.o,%.wrok.o,$(BBOBJS) $(OBJS)) wrokbot_owner.wrok.o logging.wrok.o
++%.wrok.o: %.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) -DWROKBOT_PG_MAINTENANCE -c $< -o $@
++
++logging.wrok.o: $(top_srcdir)/src/common/logging.c
++	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -DUSE_PRIVATE_ENCODING_FUNCS -DWROKBOT_PG_MAINTENANCE -c $< -o $@
++
++wrokbot-pg-basebackup: $(WROKOBJS) | submake-libpq submake-libpgport submake-libpgfeutils
++	$(CC) $(CFLAGS) $(WROKOBJS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
++
+ pg_basebackup: $(BBOBJS) $(OBJS) | submake-libpq submake-libpgport submake-libpgfeutils
+ 	$(CC) $(CFLAGS) $(BBOBJS) $(OBJS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+ 
+--- a/src/interfaces/libpq/fe-connect.c
++++ b/src/interfaces/libpq/fe-connect.c
+@@ -429,6 +429,7 @@
+ static bool get_hexdigit(char digit, int *value);
+ static const char *conninfo_getval(PQconninfoOption *connOptions,
+ 								   const char *keyword);
++static void wrokbot_conninfo_value_free(PQconninfoOption *option);
+ static PQconninfoOption *conninfo_storeval(PQconninfoOption *connOptions,
+ 										   const char *keyword, const char *value,
+ 										   PQExpBuffer errorMessage, bool ignoreMissing, bool uri_decode);
+@@ -6157,7 +6158,7 @@
+ 				/*
+ 				 * Store the value, overriding previous settings
+ 				 */
+-				free(option->val);
++				wrokbot_conninfo_value_free(option);
+ 				option->val = strdup(pvalue);
+ 				if (!option->val)
+ 				{
+@@ -6925,7 +6926,7 @@
+ 		}
+ 	}
+ 
+-	free(option->val);
++	wrokbot_conninfo_value_free(option);
+ 	option->val = value_copy;
+ 
+ 	return option;
+@@ -7001,6 +7002,16 @@
+ }
+ 
+ 
++static void
++wrokbot_conninfo_value_free(PQconninfoOption *option)
++{
++ if (option->val != NULL &&
++	 (strcmp(option->keyword, "password") == 0 ||
++	  strcmp(option->keyword, "sslpassword") == 0))
++  explicit_bzero(option->val, strlen(option->val));
++ free(option->val);
++}
++
+ void
+ PQconninfoFree(PQconninfoOption *connOptions)
+ {
+@@ -7008,7 +7019,7 @@
+ 		return;
+ 
+ 	for (PQconninfoOption *option = connOptions; option->keyword != NULL; option++)
+-		free(option->val);
++		wrokbot_conninfo_value_free(option);
+ 	free(connOptions);
+ }
+ 
+--- a/src/common/logging.c
++++ b/src/common/logging.c
+@@ -17,6 +17,10 @@
+ #include <unistd.h>
+ 
+ #include "common/logging.h"
++
++#ifdef WROKBOT_PG_MAINTENANCE
++extern void wrokbot_owner_redacted_log(int is_error) __attribute__((weak));
++#endif
+ 
+ enum pg_log_level __pg_log_level;
+ 
+@@ -222,6 +226,11 @@
+ 	va_list		ap2;
+ 	size_t		required_len;
+ 	char	   *buf;
++
++#ifdef WROKBOT_PG_MAINTENANCE
++	/* Only the distinct maintenance executable supplies this weak hook. */
++	if (wrokbot_owner_redacted_log != NULL) { wrokbot_owner_redacted_log(level >= PG_LOG_WARNING); return; }
++#endif
+ 
+ 	Assert(progname);
+ 	Assert(level);

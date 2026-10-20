@@ -1,0 +1,76 @@
+schema = "wrokbot-pg-maintenance-pins"
+schema_version = 1
+
+[source]
+version = "17.11"
+archive_bytes = 28397423
+archive_sha256 = "5367f6fb2ec97efe1eb2e0c7926bb33438e51b0bd3a9733b88498056a7dc9a7e"
+
+[patch]
+path = "tools/patches/postgresql-17.11-wrokbot-basebackup-owner-v1.patch"
+bytes = 46170
+sha256 = "d31bf4c940f8ae14e4ec1f778c6dea2687f3b3fb237b7bbfc4f7cb75bf120d37"
+
+[bundle]
+schema = "openbot-postgres-maintenance-bundle"
+schema_version = 2
+release_epoch = 5
+
+[bundle.programs]
+postgres = "bin/postgres"
+initdb = "bin/initdb"
+pg_ctl = "bin/pg_ctl"
+basebackup = "bin/wrokbot-pg-basebackup"
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/pg_basebackup.c"
+before = { bytes = 83604, sha256 = "d9a30881c9eae368d076c37aa13a41d9b7eed4b612977d55c30b7dd8725f5527" }
+after = { bytes = 85182, sha256 = "2a18c059ded480daf7ca90aba31099028c999daede49dcab1ed42f9c7d6efbf5" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/streamutil.c"
+before = { bytes = 23689, sha256 = "314e5b3efcb991001676f071d4fc831bc387270e7f8c5687cb2b5f6b1bbc5eb2" }
+after = { bytes = 23839, sha256 = "7891d3d3c875b0b257e59dca6149d7f930f1c501d586b0e3966f8ee25af5957b" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/streamutil.h"
+before = { bytes = 2540, sha256 = "82451cfacf2e033cc33923563d14e7cdd41ae0c09e1f76e3d54ffa40e975e62d" }
+after = { bytes = 2540, sha256 = "82451cfacf2e033cc33923563d14e7cdd41ae0c09e1f76e3d54ffa40e975e62d" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/receivelog.c"
+before = { bytes = 34614, sha256 = "f058db52ba9fb0f5efd40fe61ca99e471ef1bc3ff44b8dbcd5680d77393f54cb" }
+after = { bytes = 34777, sha256 = "28ed515517a2439b8923ec1360d96fc10257adddc33e28388cda5c911e8f70ec" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/receivelog.h"
+before = { bytes = 1889, sha256 = "88e5bfdf7aec9dd7db8ee8b3d02bbbd25235513e72592d968c39b41f29a5ee6a" }
+after = { bytes = 1889, sha256 = "88e5bfdf7aec9dd7db8ee8b3d02bbbd25235513e72592d968c39b41f29a5ee6a" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/walmethods.c"
+before = { bytes = 33175, sha256 = "ba872a636367262868cb2d9b490515e53d2c3919de55222967cd36bdc9f0845a" }
+after = { bytes = 33517, sha256 = "16f06c58285c3930bddb87c1e9948645d468dfa6a6b027ae4116f157c4bc61cc" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/wrokbot_owner.c"
+after = { bytes = 32512, sha256 = "7bd16f362b5afab3e599ca8dce87d2f1f2669df91c50f34d13ab308684a2ff67" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/wrokbot_owner.h"
+after = { bytes = 1699, sha256 = "8604f231d1ffa24f3f43be1589bbab24bb5bb04695320705a12dcec5f6b27586" }
+
+[[derived_sources]]
+path = "src/bin/pg_basebackup/Makefile"
+before = { bytes = 2872, sha256 = "0bcf25cdbdf65e076073ecfc4a2f6e2728d16004ef772bd2e7ef8e85787c309f" }
+after = { bytes = 3443, sha256 = "5f7c9355367e48ae9e9fef98e0c807944ce1649a9599375704e8805863863d62" }
+
+[[derived_sources]]
+path = "src/interfaces/libpq/fe-connect.c"
+before = { bytes = 201211, sha256 = "9c189446b1b18faf81823636067c9cf9fb01215bdae5b036cc3bb0ebc84971a2" }
+after = { bytes = 201599, sha256 = "034a5a7814e333652b15c189e74a676fac971528ef2a4d7a8098e1870d8e9273" }
+
+[[derived_sources]]
+path = "src/common/logging.c"
+before = { bytes = 7132, sha256 = "6693ad39602a196ee2fa8a963dbf9ce7023b31b2d0de5c6ddce3b9a413193a30" }
+after = { bytes = 7463, sha256 = "8cf4f3e95fa72e71b0d769cb35dcf27f1a0f2dbeed6315f55d78946bca220b39" }

@@ -85,6 +85,9 @@ mod parity_overlay;
 #[path = "../xtask/postgres_source.rs"]
 mod postgres_source;
 
+#[path = "../xtask/postgres_maintenance.rs"]
+mod postgres_maintenance;
+
 #[path = "../xtask/checked_input.rs"]
 mod checked_input;
 
@@ -253,6 +256,9 @@ fn main() -> ExitCode {
         Some("engine") => workspace_root().and_then(|root| engine::run(&root, &args[1..])),
         Some("postgres") => {
             workspace_root().and_then(|root| postgres_source::run(&root, &args[1..]))
+        }
+        Some("postgres-maintenance") => {
+            workspace_root().and_then(|root| postgres_maintenance::run(&root, &args[1..]))
         }
         Some("electron-shim-check") => {
             workspace_root().and_then(|root| electron_shim::run(&root, &args[1..]))

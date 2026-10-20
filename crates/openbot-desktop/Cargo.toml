@@ -12,6 +12,11 @@ name = "wrok-bot"
 path = "src/bin/wrok-bot.rs"
 required-features = ["desktop-launcher"]
 
+[[bin]]
+name = "wrok-bot-pg-maintenance"
+path = "src/bin/wrok-bot-pg-maintenance.rs"
+required-features = ["postgres-maintenance"]
+
 [lints]
 workspace = true
 
@@ -27,6 +32,8 @@ tauri-host = ["dep:http", "dep:serde", "dep:serde_json", "dep:sys-locale", "dep:
 # Release-side PostgreSQL provenance, full bundle-tree verification and single-instance start lock.
 # This does not spawn PostgreSQL or provide an OS key-store adapter yet.
 postgres-sidecar = ["dep:getrandom", "dep:serde", "dep:serde_json", "dep:sha2"]
+# Separate authenticated native tools; no application installation or OS secret service.
+postgres-maintenance = ["postgres-sidecar", "dep:openbot-domain", "dep:tokio-postgres", "dep:rustix"]
 # Shared current-user generic-secret platform boundary for PG and application Vault formats.
 os-key-store = [
     "dep:openbot-domain",
@@ -80,7 +87,7 @@ openbot-agent = { workspace = true, optional = true }
 openbot-computer = { workspace = true, optional = true }
 # AuthContext / AppCommand / AppReply / AppEvent / AppError / ID newtype / Transport label。
 openbot-contracts.workspace = true
-# SecretBytes is enabled only for the explicit PostgreSQL OS-key-store feature.
+# SecretBytes is enabled only for explicit secret-store or maintenance features.
 openbot-domain = { workspace = true, optional = true }
 # Only the explicit Desktop Local composition feature crosses into PostgreSQL adapters. The
 # Server-only SSO default is disabled so supported Windows Desktop builds never acquire xmlsec.
@@ -125,6 +132,9 @@ url = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 sys-locale = { workspace = true, optional = true }
 tauri = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wrok-bot-macos-process = { workspace = true, optional = true }

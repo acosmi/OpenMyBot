@@ -2,6 +2,16 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=WROK_BOT_DESKTOP_RELEASE_SHA256");
+    println!("cargo:rerun-if-env-changed=WROK_BOT_PG_MAINTENANCE_BUNDLE_SHA256");
+    #[cfg(feature = "postgres-maintenance")]
+    if let Some(value) = std::env::var_os("WROK_BOT_PG_MAINTENANCE_BUNDLE_SHA256") {
+        assert!(
+            value.to_str().is_some_and(|s| s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            "maintenance_bundle_binding_invalid"
+        );
+    }
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         build_macos_launcher();
