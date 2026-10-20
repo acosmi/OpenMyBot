@@ -8,8 +8,8 @@ archive_sha256 = "5367f6fb2ec97efe1eb2e0c7926bb33438e51b0bd3a9733b88498056a7dc9a
 
 [patch]
 path = "tools/patches/postgresql-17.11-wrokbot-basebackup-owner-v1.patch"
-bytes = 44224
-sha256 = "9a690478def1d424a69354eb79382d6a45bbeffb6c535e7eaa71905166cde82b"
+bytes = 46150
+sha256 = "8788157eb8fe100e35286431755ecb28682b69e2e261a0f4d20d135e73d01b5c"
 
 [bundle]
 schema = "openbot-postgres-maintenance-bundle"
@@ -54,7 +54,7 @@ after = { bytes = 33517, sha256 = "16f06c58285c3930bddb87c1e9948645d468dfa6a6b02
 
 [[derived_sources]]
 path = "src/bin/pg_basebackup/wrokbot_owner.c"
-after = { bytes = 30622, sha256 = "5b7e438ef34f6aab105f42cee545b3ff9c20ce538b0bf992d1c205e4719e3165" }
+after = { bytes = 32492, sha256 = "d5c3f2973f11b23943a2d2849a935fdea36cf4ee17259c97e2dda29eb1b54aec" }
 
 [[derived_sources]]
 path = "src/bin/pg_basebackup/wrokbot_owner.h"

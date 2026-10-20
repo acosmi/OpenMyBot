@@ -290,7 +290,7 @@
  #ifdef HAVE_LIBZ
 --- /dev/null
 +++ b/src/bin/pg_basebackup/wrokbot_owner.c
-@@ -0,0 +1,877 @@
+@@ -0,0 +1,933 @@
 +/*
 + * Distinct PG17.11 WrokBot maintenance helper. Never linked into the v1 bundle.
 + * No password option/environment/passfile/prompt. No monitor thread before fork.
@@ -347,6 +347,7 @@
 +static char *output_root;
 +static PGconn *connections[2];
 +static bool final_close_complete;
++static unsigned int prestatus_stage;
 +static uint64 wait_observed_ns;
 +static void verify_output(void);
 +
@@ -589,6 +590,42 @@
 + if (!worker && original_worker>0 && !worker_waited)
 +  wrok_worker_wait(original_worker,true);
 + close_all();
++ /* The profile and its stderr bound were fully accepted before stage 1. */
++ if (!worker && !status_seq && prestatus_stage>=1 && prestatus_stage<=18 &&
++	 failure>=1 && failure<=12) {
++  int saved_errno=errno, flags=-1;
++  bool changed=false, ready=false;
++  unsigned char code[]="W44PRE:00:00\n";
++  struct timespec t;
++  struct stat m;
++  struct pollfd p={STDERR_FILENO,POLLOUT,0};
++  if (!clock_gettime(CLOCK_MONOTONIC,&t) && t.tv_sec>=0 && t.tv_nsec>=0 &&
++	  t.tv_nsec<1000000000L &&
++	  (uint64)t.tv_sec<=(UINT64_MAX-(uint64)t.tv_nsec)/1000000000ULL) {
++   uint64 observed=(uint64)t.tv_sec*1000000000ULL+(uint64)t.tv_nsec;
++   if (observed>=lim[L_T0] && observed<lim[L_C] &&
++	   lim[L_STDERR]>=sizeof(code)-1 &&
++	   diagnostic_bytes<=lim[L_STDERR]-(sizeof(code)-1) &&
++	   !fstat(STDERR_FILENO,&m) && S_ISFIFO(m.st_mode) &&
++	   (flags=fcntl(STDERR_FILENO,F_GETFL))>=0) {
++	if (flags&O_NONBLOCK) ready=true;
++	else if (!fcntl(STDERR_FILENO,F_SETFL,flags|O_NONBLOCK)) {
++	 changed=true;ready=true;
++	}
++	if (ready && poll(&p,1,0)==1 && (p.revents&POLLOUT) &&
++		!(p.revents&(POLLERR|POLLHUP|POLLNVAL))) {
++	 code[7]=(unsigned char)('0'+prestatus_stage/10);
++	 code[8]=(unsigned char)('0'+prestatus_stage%10);
++	 code[10]=(unsigned char)('0'+failure/10);
++	 code[11]=(unsigned char)('0'+failure%10);
++	 diagnostic_bytes+=sizeof(code)-1;
++	 (void)write(STDERR_FILENO,code,sizeof(code)-1);
++	}
++	if (changed) (void)fcntl(STDERR_FILENO,F_SETFL,flags);
++   }
++  }
++  errno=saved_errno;
++ }
 + if (!worker && terminal_success && now_ns()>=lim[L_E] && !failure)failure=5;
 + if (!worker) {
 +  status(7);
@@ -689,36 +726,55 @@
 +	lim[L_BLOCK]>4194304 || lim[L_WALTL]!=1 || lim[L_PLAIN]<=uadd(lim[L_WAL],lim[L_MANIFEST]) ||
 +	lim[L_FILES]<=uadd(umul(lim[L_WALSEGS],2),8) || lim[L_DIRS]<=8 || lim[L_SINGLE]<lim[L_MANIFEST] ||
 +	lim[L_SPOOL]<lim[L_PLAIN] || lim[L_FDS]<32 || lim[L_STDERR]<30) wrok_fail(1);
++ prestatus_stage=1;
 + for (i=1;i<out;i++) if (!strncmp((*argv)[i],"--label=",8)) {
 +  char expected[64],hex[33];for(j=0;j<16;j++)sprintf(hex+j*2,"%02x",operation[j]);
 +  snprintf(expected,sizeof(expected),"wrokbot-maintenance-%s",hex);
 +  if(strcmp((*argv)[i]+8,expected))wrok_fail(1);
 + }
++ prestatus_stage=2;
 + if(!host || host[0]!='/' || !role || !*role || strlen(role)>63 ||
 +	!target || target[0]!='/' || strlen(target)>=MAXPGPATH)wrok_fail(1);
 + for(const char *s=role;*s;s++)if(!((*s>='a'&&*s<='z')||(*s>='0'&&*s<='9')||*s=='_'))wrok_fail(1);
++ prestatus_stage=3;
 + {
 +  char *parent=pg_strdup(target),*slash=strrchr(parent,'/');struct stat m;char canonical[MAXPGPATH];
 +  if(!slash || !slash[1] || !strcmp(slash+1,".") || !strcmp(slash+1,".."))wrok_fail(1);
 +  *slash=0;
++  prestatus_stage=4;
 +  if(!realpath(parent,canonical) || strcmp(parent,canonical))wrok_fail(1);
++  prestatus_stage=5;
 +  root_parent=open(parent,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
 +  if(root_parent<0 || fstat(root_parent,&m) || m.st_uid!=geteuid() || (m.st_mode&0777)!=0700)wrok_fail(1);
++  prestatus_stage=6;
 +  if(lstat(target,&m)==0 || errno!=ENOENT)wrok_fail(1);
++  prestatus_stage=7;
 +  if(!realpath(host,canonical) || strcmp(host,canonical) || lstat(host,&m) ||
 +	 !S_ISDIR(m.st_mode)||m.st_uid!=geteuid()||(m.st_mode&0777)!=0700)wrok_fail(1);
 +  free(parent);
 + }
++ prestatus_stage=8;
 + output_root=pg_strdup(target);
++ prestatus_stage=9;
 + if(getrlimit(RLIMIT_NOFILE,&fds)||lim[L_FDS]>fds.rlim_max)wrok_fail(1);
++ prestatus_stage=10;
 + fds.rlim_cur=(rlim_t)lim[L_FDS];if(setrlimit(RLIMIT_NOFILE,&fds))wrok_fail(1);
 + *argc=out;(*argv)[out]=NULL;
-+ nonblock(0);nonblock(1);nonblock(2);
++ prestatus_stage=11;
++ nonblock(0);
++ prestatus_stage=12;
++ nonblock(1);
++ prestatus_stage=13;
++ nonblock(2);
++ prestatus_stage=14;
 + check_space();
++ prestatus_stage=15;
 + { size_t n=(size_t)lim[L_SECRET];read_frame(1,0,secret,&n);if(!n||!valid_utf8(secret,n))wrok_fail(2);
-+   secret_len=n;secret[n]=0;n=0;read_frame(2,1,NULL,&n); }
++   secret_len=n;secret[n]=0;n=0;prestatus_stage=16;read_frame(2,1,NULL,&n); }
++ prestatus_stage=17;
 + initialized=true;
 + if(!wrok_check())wrok_fail(failure);
++ prestatus_stage=18;
 + status(1);
 +}
 +static void

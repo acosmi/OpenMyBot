@@ -3186,6 +3186,38 @@ pub(super) async fn owned_test_case(
         let native = source.native.as_ref();
         let wait = native.and_then(|owner| owner.wait.as_ref());
         let trail = native.and_then(|owner| owner.trail.as_ref());
+        let stderr = native.and_then(|owner| owner.drain.as_ref());
+        let mut prestatus = None;
+        if let Some(stderr) = stderr
+            && stderr.report.bytes == 13
+            && !stderr.report.limit_exceeded
+            && !stderr.report.secret_found
+        {
+            'closed_codes: for stage in 1_u8..=18 {
+                for failure in 1_u8..=12 {
+                    let mut code = *b"W44PRE:00:00\n";
+                    code[7] = b'0' + stage / 10;
+                    code[8] = b'0' + stage % 10;
+                    code[10] = b'0' + failure / 10;
+                    code[11] = b'0' + failure % 10;
+                    let known_sha = Sha256::digest(code);
+                    let observed = stderr.report.sha256.as_bytes();
+                    let known = observed.len() == 64
+                        && known_sha
+                            .iter()
+                            .zip(observed.chunks_exact(2))
+                            .all(|(byte, pair)| {
+                                const HEX: &[u8; 16] = b"0123456789abcdef";
+                                pair[0] == HEX[usize::from(*byte >> 4)]
+                                    && pair[1] == HEX[usize::from(*byte & 15)]
+                            });
+                    if known {
+                        prestatus = Some((stage, failure));
+                        break 'closed_codes;
+                    }
+                }
+            }
+        }
         let _diagnostic = writeln!(
             std::io::stderr().lock(),
             concat!(
@@ -3195,7 +3227,9 @@ pub(super) async fn owned_test_case(
                 "trail_records={:?} terminal_error={:?} worker_created={:?} worker_wait={:?} ",
                 "postmasters_total={} postmasters_stopped={} ",
                 "connecting_pending={} connecting_started={} connecting_joined={} ",
-                "sql_total={} queries_pending={} drivers_joined={}"
+                "sql_total={} queries_pending={} drivers_joined={} ",
+                "native_stderr_bytes={:?} native_stderr_limit_exceeded={:?} ",
+                "native_stderr_secret_found={:?} prestatus_stage={:?} prestatus_first_error={:?}"
             ),
             native.is_some(),
             wait.is_some(),
@@ -3229,7 +3263,12 @@ pub(super) async fn owned_test_case(
                 .sql
                 .iter()
                 .filter(|owner| owner.driver_joined)
-                .count()
+                .count(),
+            stderr.map(|stderr| stderr.report.bytes),
+            stderr.map(|stderr| stderr.report.limit_exceeded),
+            stderr.map(|stderr| stderr.report.secret_found),
+            prestatus.map(|(stage, _)| stage),
+            prestatus.map(|(_, failure)| failure)
         );
     }
     // A negative assertion is evaluated only after the original owners have closed. If the
