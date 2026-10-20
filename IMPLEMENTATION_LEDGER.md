@@ -2231,3 +2231,8 @@ The existing test-only owner now emits two fixed diagnostic lines for its closed
 Adds bounded, redacted pre-start diagnostics to the owned PostgreSQL maintenance helper and recognizes only fixed closed codes in the ignored native test. Original status frames, limits, waits and failure retention remain unchanged. This source update requires a new authenticated toolchain build and targeted acceptance; the prior empty-status helper failure remains unresolved.
 
 - V7-IMPL-044: prevent duplicate control-pipe descriptors in native polling. A local macOS pipe check reproduced readiness reported only for the second duplicate; the single-descriptor form reported the primary descriptor ready. Native backup/restore validation is pending for this correction.
+
+
+V7-IMPL-044 / PR #223: the test-only post-worker disconnect fixture now requests termination of only its own matching replication sessions before ordinary source cleanup. It keeps the original helper, worker, SQL-driver, pipe and source waits and the existing negative assertions. Request acknowledgement is not proof of process exit.
+
+The previous frozen candidate completed six native test units covering ten scenarios: five units passed and the post-worker disconnect unit failed its original assertion. The correction requires fresh affected-libtest compilation and directed acceptance. No production interface, native flag, profile, dependency or migration changed; earlier failures and the strict legacy-file scope hold remain. Full CI and manual Actions were not run.

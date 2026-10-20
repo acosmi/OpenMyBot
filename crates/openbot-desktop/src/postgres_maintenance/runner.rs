@@ -1547,6 +1547,44 @@ async fn native_backup(
                             }
                         }
                         OwnedNativeTestScenario::DisconnectAfterWorker => {
+                            let sql = source
+                                .sql
+                                .iter()
+                                .position(|sql| {
+                                    sql.postmaster == request.postmaster
+                                        && sql.client.is_some()
+                                        && sql.query.is_none()
+                                        && !sql.driver_joined
+                                })
+                                .ok_or(MaintenanceError::ConnectionFailed)?;
+                            let rows = source
+                                .query_owned(
+                                    sql,
+                                    "SELECT pid, pg_catalog.pg_terminate_backend(pid) AS requested FROM pg_catalog.pg_stat_activity WHERE backend_type = 'walsender' AND usename = current_user AND application_name = 'wrokbot-pg-basebackup' AND client_addr IS NULL AND pid <> pg_catalog.pg_backend_pid()".to_owned(),
+                                    false,
+                                )
+                                .await?;
+                            if !(1..=2).contains(&rows.len()) {
+                                return Err(MaintenanceError::ConnectionFailed);
+                            }
+                            let mut server_walsender_pids = Vec::with_capacity(rows.len());
+                            for row in rows {
+                                let pid: i32 = row
+                                    .try_get("pid")
+                                    .map_err(|_| MaintenanceError::ConnectionFailed)?;
+                                let requested: bool = row
+                                    .try_get("requested")
+                                    .map_err(|_| MaintenanceError::ConnectionFailed)?;
+                                if pid <= 0 || !requested {
+                                    return Err(MaintenanceError::ConnectionFailed);
+                                }
+                                server_walsender_pids.push(pid);
+                            }
+                            let _diagnostic = writeln!(
+                                std::io::stderr().lock(),
+                                "WROKBOT_PG_MAINTENANCE_TEST_DISCONNECT_REQUESTED postmaster={} server_walsender_pids={server_walsender_pids:?}",
+                                request.postmaster
+                            );
                             source.stop_postmaster(request.postmaster).await?;
                         }
                         _ => {}
