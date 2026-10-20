@@ -2216,3 +2216,8 @@ V7-IMPL-044 / PR #223: The native build failed while linking stock PostgreSQL pr
 V7-IMPL-044 / PR #223: The owned maintenance fixture now commits its fixed table and sentinel setup before its separate rollback probe. The build test checks the exact ten serialized environment keys while retaining the separate developer-tool binding and subsequent capacity assertions. Independent source review passed for both finite repairs.
 
 Earlier directed results remain fifteen passing ordinary tests and one failure; the first native attempt also failed before the backup helper started. Validation of this candidate remains pending. Earlier failures and the strict legacy-file scope hold are retained. Full CI and manual Actions were not run.
+
+
+V7-IMPL-044 / PR #223: The maintenance helper now reports connection and owned-buffer closure only after its original common cleanup completes. Normal streamed-WAL completion waits for the original worker without emitting a cancellation event. Actual stop paths retain that event and recheck the original convergence limit after the bounded status write and before signalling.
+
+Independent source review passed 43 finite checks for the producer correction and its exact source pins. Product-patch parsing and Git whitespace checks passed. A new native bundle and directed consumer, backup, restore and restart validation remain required. Earlier source-authentication and ordinary-test results retain their original candidate bindings; the original in-flight native run remains unresolved. Earlier failures and the strict legacy-file scope hold are retained. Full CI and manual Actions were not run.

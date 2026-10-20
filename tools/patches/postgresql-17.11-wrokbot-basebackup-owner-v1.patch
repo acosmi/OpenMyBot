@@ -290,7 +290,7 @@
  #ifdef HAVE_LIBZ
 --- /dev/null
 +++ b/src/bin/pg_basebackup/wrokbot_owner.c
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,877 @@
 +/*
 + * Distinct PG17.11 WrokBot maintenance helper. Never linked into the v1 bundle.
 + * No password option/environment/passfile/prompt. No monitor thread before fork.
@@ -346,6 +346,7 @@
 +static uint32 timeline, segment_bytes;
 +static char *output_root;
 +static PGconn *connections[2];
++static bool final_close_complete;
 +static uint64 wait_observed_ns;
 +static void verify_output(void);
 +
@@ -541,8 +542,8 @@
 +{
 + unsigned char record[168]={0}; unsigned char *b=record+40;
 + uint64 flags=(original_worker>0 ? 1:0)|(worker_waited ? 2:0)|
-+			  (!connections[0] && !connections[1] ? 4:0)|
-+			  (!secret_len ? 8:0)|(event==8 ? 16:0);
++			  (final_close_complete && !connections[0] && !connections[1] ? 4:0)|
++			  (final_close_complete && !secret_len ? 8:0)|(event==8 ? 16:0);
 + if (worker || !initialized) return;
 + if (status_seq>=lim[L_RECORDS] || uadd(status_bytes,sizeof(record))>lim[L_STATUS]) {
 +  if (!failure) failure=3; return;
@@ -577,6 +578,7 @@
 + unsigned int i;
 + for (i=0;i<2;i++) if (connections[i]) { PGconn *c=connections[i];connections[i]=NULL;PQfinish(c); }
 + wipe_secret();
++ final_close_complete=true;
 +}
 +static void
 +owner_exit(void)
@@ -844,7 +846,7 @@
 + pid_t got;
 + if(worker || worker_waited || pid<=0)return;
 + waiting_worker=true;
-+ status(5);
++ if(stop)status(5);
 + if(stop && now_ns()<lim[L_C]) {
 +  if(kill(pid,SIGTERM)<0 && errno!=ESRCH && !failure)failure=10;
 + }
@@ -854,7 +856,8 @@
 +  if(got<0&&errno==EINTR)continue;
 +  if(got<0){failure=12;break;}
 +  if(!wrok_check() && !stop && now_ns()<lim[L_C]) {
-+   stop=true;(void)kill(pid,SIGTERM);
++   stop=true;status(5);
++   if(now_ns()<lim[L_C])(void)kill(pid,SIGTERM);
 +  }
 +  if(now_ns()>=lim[L_C])failure=12;
 +  /* This is observation of the original wait, not new effect or budget renewal. */
