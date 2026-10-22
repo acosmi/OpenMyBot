@@ -5,7 +5,7 @@
 <h1 align="center">Wrok Bot</h1>
 
 <p align="center">
-  <b>AI 工作台 · 智能体协作 · 浏览器与电脑操作</b><br>
+  <b>AI 员工 / 数字队友平台 · 能独立干活的 AI 同事</b><br>
   基于 Rust 构建 · 首版面向 macOS · 开发验证中
 </p>
 
@@ -23,7 +23,7 @@
 
 <p align="center"><a href="README.md">English</a> | <strong>简体中文</strong></p>
 
-Wrok Bot 是使用 Rust 构建的 AI 工作台，包含桌面宿主、服务端、Web 界面和开发中的移动客户端。项目目前处于开发验证阶段，首版优先面向 macOS。
+Wrok Bot 是一个使用 Rust 构建的 AI 员工 / 数字队友平台，定位为“能独立干活的 AI 同事”。平台包含桌面宿主、服务端、Web 界面和开发中的移动客户端。项目目前处于开发验证阶段，首版优先面向 macOS。
 
 官方网站：[wrokbot.com](https://wrokbot.com)（主域名）· [grokbot.si](https://grokbot.si)。
 

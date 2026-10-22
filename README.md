@@ -5,7 +5,7 @@
 <h1 align="center">Wrok Bot</h1>
 
 <p align="center">
-  <b>AI workbench · Agent collaboration · Browser and computer interaction</b><br>
+  <b>AI employee / digital teammate platform · AI coworkers who can work independently</b><br>
   Built with Rust · macOS first · In development
 </p>
 
@@ -23,7 +23,7 @@
 
 <p align="center"><strong>English</strong> | <a href="README.zh-CN.md">简体中文</a></p>
 
-Wrok Bot is an AI workbench built with Rust, with a desktop host, server, web interface, and a mobile client under development. The project is currently in development and validation, with macOS as the first release platform.
+Wrok Bot is an AI employee / digital teammate platform built with Rust, designed to provide AI coworkers who can get work done independently. The platform includes a desktop host, server, web interface, and a mobile client under development. The project is currently in development and validation, with macOS as the first release platform.
 
 Official websites: [wrokbot.com](https://wrokbot.com) (primary) · [grokbot.si](https://grokbot.si).
 

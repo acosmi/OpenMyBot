@@ -2254,3 +2254,10 @@ Current directed tests passed: 18 Desktop resource/control tests, 13 carrier tes
 Remaining work includes password-copy bounds for subscription lifetimes, the full SQL shared-buffer allocation bound, typed-canary zeroization and normal capture/replay/restore acceptance. This candidate remains Draft; merge and complete-backend acceptance are pending. Full CI and manual Actions were not run.
 
 Project websites: [wrokbot.com](https://wrokbot.com) (primary) and [grokbot.si](https://grokbot.si).
+
+
+### V7-IMPL-045: current main documentation integration
+
+The active PR224 candidate incorporates main be598bb18f23f7f37a2fef677afd2cd233c6f8da (PR225), retaining its AI employee / digital teammate positioning and the bilingual README badges and official links: wrokbot.com is primary; grokbot.si is the additional website.
+
+This integration changes the README files and this fact entry. Backend source is unchanged. The existing directed 18 Desktop, 13 Infra, and 30 Archive results remain attributed to their original C55 inputs; these 61 checks do not establish acceptance of later repair candidates, normal capture, recovery, or a complete release. No compilation or runtime validation was repeated for this documentation integration.
