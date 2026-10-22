@@ -22,7 +22,7 @@ use openbot_domain::agent::{
 };
 use openbot_domain::tool::metadata::ResourceLockKey;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::gateway::{AgentToolInvokeError, AgentToolInvoker, AgentToolReply, AgentToolScheduling};
 
@@ -94,7 +94,19 @@ impl BuiltInAgentConfig {
 pub struct BuiltInAgentRuntime {
     consumer: Arc<BuiltInAgentConsumer>,
     stop: watch::Sender<bool>,
-    supervisor: JoinHandle<()>,
+    supervisor: Option<JoinHandle<Result<(), BuiltInAgentStopFailure>>>,
+    capture_stop: Option<Result<(), BuiltInAgentStopFailure>>,
+    capture_stop_requested: bool,
+}
+
+/// Result of joining the original supervisor, activations and their original tool writers.
+/// No provider diagnostic or task payload crosses this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltInAgentStopFailure {
+    /// An original task was cancelled; persistent commit state must still be reconciled.
+    Cancelled,
+    /// An original task panicked.
+    Panicked,
 }
 
 impl core::fmt::Debug for BuiltInAgentRuntime {
@@ -160,7 +172,9 @@ impl BuiltInAgentRuntime {
         Ok(Self {
             consumer,
             stop,
-            supervisor,
+            supervisor: Some(supervisor),
+            capture_stop: None,
+            capture_stop_requested: false,
         })
     }
 
@@ -171,10 +185,32 @@ impl BuiltInAgentRuntime {
     }
 
     /// Cancel every active run and wait at most 5 seconds。
-    pub async fn stop(self) {
-        self.consumer.inner.stopped.store(true, Ordering::SeqCst);
-        self.stop.send_replace(true);
-        let _ = self.supervisor.await;
+    pub async fn stop(mut self) {
+        let _ = self.stop_for_capture().await;
+    }
+
+    /// Close admission and borrow the original handle until its actual join. Cancelling this
+    /// waiter retains the handle in `self`; a failed join can never become a later success.
+    pub async fn stop_for_capture(&mut self) -> Result<(), BuiltInAgentStopFailure> {
+        if let Some(result) = self.capture_stop {
+            return result;
+        }
+        if !self.capture_stop_requested {
+            self.consumer.inner.stopped.store(true, Ordering::SeqCst);
+            self.stop.send_replace(true);
+            self.capture_stop_requested = true;
+        }
+        let result = match self.supervisor.as_mut() {
+            Some(task) => match task.await {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => Err(BuiltInAgentStopFailure::Cancelled),
+                Err(_) => Err(BuiltInAgentStopFailure::Panicked),
+            },
+            None => Err(BuiltInAgentStopFailure::Cancelled),
+        };
+        self.supervisor = None;
+        self.capture_stop = Some(result);
+        result
     }
 }
 
@@ -216,6 +252,7 @@ impl RunDispatchConsumer for BuiltInAgentConsumer {
                 lease,
                 cancel,
                 active: false,
+                tool_owners: Arc::new(ActivationToolOwners::new()),
             },
         );
         RunDispatchDecision::Accepted
@@ -235,6 +272,7 @@ impl RunDispatchConsumer for BuiltInAgentConsumer {
         let activation = Activation {
             lease: lease.clone(),
             cancel: reservation.cancel.subscribe(),
+            tool_owners: Arc::clone(&reservation.tool_owners),
         };
         if self.inner.sender.try_send(activation).is_err() {
             reservations.remove(lease.run_id().as_str());
@@ -246,12 +284,15 @@ impl RunDispatchConsumer for BuiltInAgentConsumer {
 
     async fn revoke(&self, lease: &RunExecutionLease) -> RunCancellationDisposition {
         let mut reservations = self.inner.reservations.lock().await;
-        if reservations
-            .get(lease.run_id().as_str())
-            .is_some_and(|reservation| reservation.lease == *lease)
-            && let Some(reservation) = reservations.remove(lease.run_id().as_str())
+        if let Some(reservation) = reservations.get(lease.run_id().as_str())
+            && reservation.lease == *lease
         {
             reservation.cancel.send_replace(true);
+            // An active reservation is also the original tool-task custodian. Cancellation
+            // cannot remove it while an activation or one of its writers still owns work.
+            if !reservation.active {
+                reservations.remove(lease.run_id().as_str());
+            }
             return RunCancellationDisposition::ChildSignalled;
         }
         RunCancellationDisposition::NoLocalChild
@@ -278,11 +319,133 @@ struct Reservation {
     lease: RunExecutionLease,
     cancel: watch::Sender<bool>,
     active: bool,
+    tool_owners: Arc<ActivationToolOwners>,
 }
 
 struct Activation {
     lease: RunExecutionLease,
     cancel: watch::Receiver<bool>,
+    tool_owners: Arc<ActivationToolOwners>,
+}
+
+type OriginalToolResult = Result<AgentToolReply, AgentToolInvokeError>;
+
+// One existing bounded reservation owns these two original task slots. The activation only
+// borrows them; its cancellation or unwind never drops a writer's handle or its JoinSet.
+struct ActivationToolOwners {
+    serial: Mutex<Option<JoinHandle<OriginalToolResult>>>,
+    parallel: Mutex<JoinSet<ParallelToolOutcome>>,
+    first_failure: std::sync::Mutex<Option<BuiltInAgentStopFailure>>,
+    aborts: std::sync::Mutex<OriginalToolAbortControls>,
+}
+
+#[derive(Default)]
+struct OriginalToolAbortControls {
+    requested: bool,
+    serial: Option<AbortHandle>,
+    parallel: Vec<AbortHandle>,
+}
+
+impl ActivationToolOwners {
+    fn new() -> Self {
+        Self {
+            serial: Mutex::new(None),
+            parallel: Mutex::new(JoinSet::new()),
+            first_failure: std::sync::Mutex::new(None),
+            aborts: std::sync::Mutex::new(OriginalToolAbortControls::default()),
+        }
+    }
+
+    fn abort_controls(&self) -> std::sync::MutexGuard<'_, OriginalToolAbortControls> {
+        self.aborts.lock().unwrap_or_else(|poison| {
+            let mut first = self
+                .first_failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            first.get_or_insert(BuiltInAgentStopFailure::Panicked);
+            poison.into_inner()
+        })
+    }
+
+    fn retain_serial_abort(&self, child: &JoinHandle<OriginalToolResult>) {
+        let mut aborts = self.abort_controls();
+        let original = child.abort_handle();
+        if aborts.requested {
+            original.abort();
+        }
+        aborts.serial = Some(original);
+    }
+
+    fn retain_parallel_abort(&self, original: AbortHandle) {
+        let mut aborts = self.abort_controls();
+        if aborts.requested {
+            original.abort();
+        }
+        aborts.parallel.push(original);
+    }
+
+    fn release_joined_serial_abort(&self) {
+        self.abort_controls().serial = None;
+    }
+
+    fn release_joined_parallel_aborts(&self) {
+        self.abort_controls().parallel.clear();
+    }
+
+    fn observe_join<T>(&self, result: &Result<T, tokio::task::JoinError>) {
+        if let Err(error) = result {
+            let mut first = self.first_failure.lock().unwrap_or_else(|poison| {
+                let mut first = poison.into_inner();
+                first.get_or_insert(BuiltInAgentStopFailure::Panicked);
+                first
+            });
+            first.get_or_insert(if error.is_cancelled() {
+                BuiltInAgentStopFailure::Cancelled
+            } else {
+                BuiltInAgentStopFailure::Panicked
+            });
+        }
+    }
+
+    fn joined_result(&self) -> Result<(), BuiltInAgentStopFailure> {
+        let first = self.first_failure.lock().unwrap_or_else(|poison| {
+            let mut first = poison.into_inner();
+            first.get_or_insert(BuiltInAgentStopFailure::Panicked);
+            first
+        });
+        first.map_or(Ok(()), Err)
+    }
+
+    async fn join_originals(&self) -> Result<(), BuiltInAgentStopFailure> {
+        {
+            let mut serial = self.serial.lock().await;
+            if let Some(child) = serial.as_mut() {
+                let joined = child.await;
+                self.observe_join(&joined);
+                serial.take(); // only the actual original join permits releasing this slot
+                self.release_joined_serial_abort();
+            }
+        }
+        let mut parallel = self.parallel.lock().await;
+        while let Some(joined) = parallel.join_next().await {
+            self.observe_join(&joined);
+        }
+        self.release_joined_parallel_aborts();
+        self.joined_result()
+    }
+
+    fn abort_originals(&self) {
+        // The original shutdown abort phase never awaits a mutex held by an activation.
+        // A writer registered by an already-running poll observes this same latched request.
+        let mut aborts = self.abort_controls();
+        aborts.requested = true;
+        if let Some(original) = &aborts.serial {
+            original.abort();
+        }
+        for original in &aborts.parallel {
+            original.abort();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -361,6 +524,7 @@ struct ToolRunControl<'a> {
     lease: &'a RunExecutionLease,
     renew: &'a mut tokio::time::Interval,
     deadline: Option<tokio::time::Instant>,
+    tool_owners: &'a ActivationToolOwners,
 }
 
 fn schedule_tool_waves(tools: &dyn AgentToolInvoker, calls: Vec<AgentToolCall>) -> Vec<ToolWave> {
@@ -420,12 +584,44 @@ enum SamplingOutcome {
     Interrupted(ProviderRemoteInterruptBatch),
 }
 
+fn observe_activation_join(
+    joined: Result<Result<(), BuiltInAgentStopFailure>, tokio::task::JoinError>,
+    first_failure: &mut Option<BuiltInAgentStopFailure>,
+) {
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(failure)) => {
+            first_failure.get_or_insert(failure);
+        }
+        Err(error) => {
+            first_failure.get_or_insert(if error.is_cancelled() {
+                BuiltInAgentStopFailure::Cancelled
+            } else {
+                BuiltInAgentStopFailure::Panicked
+            });
+            tracing::error!(error = %error, "built-in Agent task panic/cancel");
+        }
+    }
+}
+
+async fn join_reserved_tool_owners(
+    owners: &[Arc<ActivationToolOwners>],
+    first_failure: &mut Option<BuiltInAgentStopFailure>,
+) {
+    for owner in owners {
+        if let Err(failure) = owner.join_originals().await {
+            first_failure.get_or_insert(failure);
+        }
+    }
+}
+
 async fn supervise(
     inner: Arc<Inner>,
     mut receiver: mpsc::Receiver<Activation>,
     mut stop: watch::Receiver<bool>,
-) {
+) -> Result<(), BuiltInAgentStopFailure> {
     let mut tasks = JoinSet::new();
+    let mut first_failure = None;
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -437,64 +633,99 @@ async fn supervise(
                 Some(activation) => {
                     let inner = inner.clone();
                     tasks.spawn(async move {
-                        execute_activation(inner.clone(), activation).await;
+                        execute_activation(inner.clone(), activation).await
                     });
                 }
                 None => break,
             },
             result = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(Err(error)) = result {
-                    tracing::error!(error = %error, "built-in Agent task panic/cancel");
+                if let Some(joined) = result {
+                    observe_activation_join(joined, &mut first_failure);
                 }
             }
         }
     }
     inner.stopped.store(true, Ordering::SeqCst);
-    {
+    let tool_owners = {
         let reservations = inner.reservations.lock().await;
+        let mut owners = Vec::with_capacity(reservations.len());
         for reservation in reservations.values() {
             reservation.cancel.send_replace(true);
+            owners.push(Arc::clone(&reservation.tool_owners));
+        }
+        owners
+    };
+    let deadline = tokio::time::Instant::now() + AGENT_SHUTDOWN_DEADLINE;
+    let mut original_deadline_reached = false;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(joined)) => observe_activation_join(joined, &mut first_failure),
+            Err(_) => {
+                first_failure.get_or_insert(BuiltInAgentStopFailure::Cancelled);
+                tasks.abort_all();
+                for owner in &tool_owners {
+                    owner.abort_originals();
+                }
+                while let Some(joined) = tasks.join_next().await {
+                    observe_activation_join(joined, &mut first_failure);
+                }
+                original_deadline_reached = true;
+                break;
+            }
+            Ok(None) => {}
         }
     }
-    let deadline = tokio::time::Instant::now() + AGENT_SHUTDOWN_DEADLINE;
-    while !tasks.is_empty() {
-        if tokio::time::timeout_at(deadline, tasks.join_next())
-            .await
-            .is_err()
-        {
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-            break;
+    // Every activation has actually joined. No activation can publish a new writer now;
+    // orphaned originals still belong to their existing, queue-capacity-bounded reservation.
+    if original_deadline_reached {
+        join_reserved_tool_owners(&tool_owners, &mut first_failure).await;
+    } else if tokio::time::timeout_at(
+        deadline,
+        join_reserved_tool_owners(&tool_owners, &mut first_failure),
+    )
+    .await
+    .is_err()
+    {
+        first_failure.get_or_insert(BuiltInAgentStopFailure::Cancelled);
+        for owner in &tool_owners {
+            owner.abort_originals();
         }
+        join_reserved_tool_owners(&tool_owners, &mut first_failure).await;
     }
     inner.reservations.lock().await.clear();
+    first_failure.map_or(Ok(()), Err)
 }
 
-async fn execute_activation(inner: Arc<Inner>, mut activation: Activation) {
+async fn execute_activation(
+    inner: Arc<Inner>,
+    mut activation: Activation,
+) -> Result<(), BuiltInAgentStopFailure> {
     if *activation.cancel.borrow() {
         cancel_before_execution(&inner, &activation.lease).await;
-        return;
+        return Ok(());
     }
     let permit = tokio::select! {
         changed = activation.cancel.changed() => {
             if changed.is_err() || *activation.cancel.borrow() {
                 cancel_before_execution(&inner, &activation.lease).await;
-                return;
+                return Ok(());
             }
-            return;
+            return Ok(());
         }
         permit = inner.semaphore.clone().acquire_owned() => match permit {
             Ok(permit) => permit,
             Err(_) => {
                 cleanup(&inner, &activation.lease).await;
-                return;
+                return Ok(());
             }
         }
     };
     let _permit = permit;
     execute_run(&inner, &mut activation).await;
+    let joined = activation.tool_owners.join_originals().await;
     inner.tools.release(activation.lease.run_id());
     cleanup(&inner, &activation.lease).await;
+    joined
 }
 
 async fn cancel_before_execution(inner: &Inner, lease: &RunExecutionLease) {
@@ -1055,6 +1286,7 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
                 lease,
                 renew: &mut renew,
                 deadline,
+                tool_owners: &activation.tool_owners,
             };
             for wave in schedule_tool_waves(inner.tools.as_ref(), calls) {
                 if !execute_tool_wave(inner, &mut state, &mut journal, &mut control, wave).await {
@@ -1202,19 +1434,33 @@ async fn invoke_serial_tool(
             )
             .await
     };
+    let owners = control.tool_owners;
+    let mut original = owners.serial.lock().await;
+    if original.is_some() {
+        drive_terminal_event(state, journal, AgentEvent::JournalCommitUnknown).await;
+        return None;
+    }
+    *original = Some(tokio::spawn(invocation)); // original owner stores it before the first await
+    let child = original.as_mut().expect("stored original tool task");
+    owners.retain_serial_abort(child);
     let outcome = if waits_for_human {
-        // The permit moves into the detached task as well: a cancelled human waiter remains inside
-        // the global tool budget until PostgreSQL reports terminal retirement.
-        match await_run_child(
-            tokio::spawn(invocation),
+        // The same original task keeps the permit until actual durable retirement. Cancellation
+        // drops only this borrowed wait; the reservation retains the original task for its join.
+        let waited = await_run_child(
+            child,
             control.cancel,
             control.renew,
             control.deadline,
             inner.runtime.as_ref(),
             lease,
         )
-        .await
-        {
+        .await;
+        if let ControlledChild::Ready(joined) = &waited {
+            owners.observe_join(joined);
+            original.take();
+            owners.release_joined_serial_abort();
+        }
+        match waited {
             ControlledChild::Ready(Ok(result)) => ControlledChild::Ready(result),
             ControlledChild::Ready(Err(error)) => {
                 tracing::error!(
@@ -1227,8 +1473,8 @@ async fn invoke_serial_tool(
             ControlledChild::LeaseLost => ControlledChild::LeaseLost,
         }
     } else {
-        match await_cancellable_tool_task(
-            tokio::spawn(invocation),
+        let waited = await_cancellable_tool_task(
+            (child, owners),
             &tool_cancel,
             control.cancel,
             control.renew,
@@ -1236,8 +1482,12 @@ async fn invoke_serial_tool(
             inner.runtime.as_ref(),
             lease,
         )
-        .await
-        {
+        .await;
+        // Every normal return of the cancellable helper includes the actual original join.
+        // Cancellation of this whole future cannot execute this take and retains the handle.
+        original.take();
+        owners.release_joined_serial_abort();
+        match waited {
             ControlledChild::Ready(Ok(result)) => ControlledChild::Ready(result),
             ControlledChild::Ready(Err(error)) => {
                 tracing::error!(
@@ -1250,6 +1500,7 @@ async fn invoke_serial_tool(
             ControlledChild::LeaseLost => ControlledChild::LeaseLost,
         }
     };
+    drop(original);
     if waits_for_human && matches!(&outcome, ControlledChild::Ready(_)) {
         let Ok((next, effects)) = reduce(state, AgentEvent::HumanReleased) else {
             return None;
@@ -1299,7 +1550,12 @@ async fn invoke_parallel_tool_wave(
 ) -> Option<Vec<(AgentToolCall, Result<AgentToolReply, AgentToolInvokeError>)>> {
     let lease = control.lease;
     let ever_started = Arc::new(AtomicBool::new(false));
-    let mut tasks = JoinSet::<ParallelToolOutcome>::new();
+    let owners = control.tool_owners;
+    let mut tasks = owners.parallel.lock().await;
+    if !tasks.is_empty() {
+        drive_terminal_event(state, journal, AgentEvent::JournalCommitUnknown).await;
+        return None;
+    }
     let count = calls.len();
     for (position, scheduled) in calls.into_iter().enumerate() {
         let tools = inner.tools.clone();
@@ -1307,7 +1563,7 @@ async fn invoke_parallel_tool_wave(
         let tool_semaphore = inner.tool_semaphore.clone();
         let tool_resources = inner.tool_resources.clone();
         let started = ever_started.clone();
-        tasks.spawn(async move {
+        let original = tasks.spawn(async move {
             let call = scheduled.call;
             let arguments = call.arguments.clone();
             let budget =
@@ -1324,6 +1580,7 @@ async fn invoke_parallel_tool_wave(
             };
             (position, call, outcome)
         });
+        owners.retain_parallel_abort(original);
     }
 
     let mut outputs = core::iter::repeat_with(|| None)
@@ -1333,7 +1590,7 @@ async fn invoke_parallel_tool_wave(
         tokio::select! {
             changed = control.cancel.changed() => {
                 if changed.is_err() || *control.cancel.borrow() {
-                    abort_tool_tasks(&mut tasks).await;
+                    abort_tool_tasks(&mut tasks, owners).await;
                     if ever_started.load(Ordering::Acquire) {
                         tool_interrupted(
                             state,
@@ -1355,7 +1612,7 @@ async fn invoke_parallel_tool_wave(
                 }
             }
             () = wait_optional(control.deadline) => {
-                abort_tool_tasks(&mut tasks).await;
+                abort_tool_tasks(&mut tasks, owners).await;
                 if ever_started.load(Ordering::Acquire) {
                     tool_interrupted(
                         state,
@@ -1377,18 +1634,21 @@ async fn invoke_parallel_tool_wave(
             }
             _ = control.renew.tick() => {
                 if inner.runtime.renew_lease(lease).await.is_err() {
-                    abort_tool_tasks(&mut tasks).await;
+                    abort_tool_tasks(&mut tasks, owners).await;
                     drive_terminal_event(state, journal, AgentEvent::LeaseLost).await;
                     return None;
                 }
             }
             joined = tasks.join_next() => {
+                if let Some(result) = joined.as_ref() {
+                    owners.observe_join(result);
+                }
                 match joined {
                     Some(Ok((position, call, outcome))) if position < outputs.len() => {
                         outputs[position] = Some((call, outcome));
                     }
                     Some(Ok(_)) | Some(Err(_)) | None => {
-                        abort_tool_tasks(&mut tasks).await;
+                        abort_tool_tasks(&mut tasks, owners).await;
                         drive_terminal_event(state, journal, AgentEvent::JournalCommitUnknown).await;
                         return None;
                     }
@@ -1396,6 +1656,7 @@ async fn invoke_parallel_tool_wave(
             }
         }
     }
+    owners.release_joined_parallel_aborts();
 
     if *control.cancel.borrow() {
         tool_interrupted(
@@ -1425,9 +1686,12 @@ async fn invoke_parallel_tool_wave(
     outputs.into_iter().collect()
 }
 
-async fn abort_tool_tasks(tasks: &mut JoinSet<ParallelToolOutcome>) {
+async fn abort_tool_tasks(tasks: &mut JoinSet<ParallelToolOutcome>, owners: &ActivationToolOwners) {
     tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    while let Some(joined) = tasks.join_next().await {
+        owners.observe_join(&joined);
+    }
+    owners.release_joined_parallel_aborts();
 }
 
 async fn append_tool_reply(
@@ -1497,7 +1761,7 @@ where
 }
 
 async fn await_cancellable_tool_task<T>(
-    mut child: JoinHandle<T>,
+    (child, owners): (&mut JoinHandle<T>, &ActivationToolOwners),
     tool_cancel: &ToolCancellationHandle,
     cancel: &mut watch::Receiver<bool>,
     renew: &mut tokio::time::Interval,
@@ -1508,23 +1772,29 @@ async fn await_cancellable_tool_task<T>(
     loop {
         tokio::select! {
             biased;
-            result = &mut child => return ControlledChild::Ready(result),
+            result = &mut *child => {
+                owners.observe_join(&result);
+                return ControlledChild::Ready(result);
+            }
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() {
                     tool_cancel.cancel(ToolCancellationReason::User);
-                    stop_cancellable_tool_task(&mut child, renew, runtime, lease).await;
+                    let joined = stop_cancellable_tool_task(child, renew, runtime, lease).await;
+                    owners.observe_join(&joined);
                     return ControlledChild::Cancelled(CancellationSource::User);
                 }
             }
             () = wait_optional(deadline) => {
                 tool_cancel.cancel(ToolCancellationReason::Deadline);
-                stop_cancellable_tool_task(&mut child, renew, runtime, lease).await;
+                let joined = stop_cancellable_tool_task(child, renew, runtime, lease).await;
+                owners.observe_join(&joined);
                 return ControlledChild::Cancelled(CancellationSource::Deadline);
             }
             _ = renew.tick() => {
                 if runtime.renew_lease(lease).await.is_err() {
                     tool_cancel.cancel(ToolCancellationReason::LeaseLost);
-                    stop_cancellable_tool_task(&mut child, renew, runtime, lease).await;
+                    let joined = stop_cancellable_tool_task(child, renew, runtime, lease).await;
+                    owners.observe_join(&joined);
                     return ControlledChild::LeaseLost;
                 }
             }
@@ -1537,21 +1807,19 @@ async fn stop_cancellable_tool_task<T>(
     renew: &mut tokio::time::Interval,
     runtime: &dyn RunRuntime,
     lease: &RunExecutionLease,
-) {
+) -> Result<T, tokio::task::JoinError> {
     let stop_deadline = tokio::time::Instant::now() + TOOL_CANCELLATION_GRACE;
     loop {
         tokio::select! {
-            _ = &mut *child => return,
+            joined = &mut *child => return joined,
             () = tokio::time::sleep_until(stop_deadline) => {
                 child.abort();
-                let _ = child.await;
-                return;
+                return child.await;
             }
             _ = renew.tick() => {
                 if runtime.renew_lease(lease).await.is_err() {
                     child.abort();
-                    let _ = child.await;
-                    return;
+                    return child.await;
                 }
             }
         }
@@ -4923,5 +5191,121 @@ mod tests {
             .unwrap(),
         );
         assert!(!bind_custom_model(&mut bound, &request, &run));
+    }
+}
+
+#[cfg(test)]
+mod capture_nested_writer_tests {
+    use super::*;
+    use openbot_contracts::ids::ToolCallId;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn cancelling_a_borrowed_wait_keeps_the_original_writer_for_its_join() {
+        let owners = Arc::new(ActivationToolOwners::new());
+        let (finish, finished) = oneshot::channel();
+        {
+            let mut serial = owners.serial.lock().await;
+            *serial = Some(tokio::spawn(async move {
+                finished.await.expect("release original writer");
+                AgentToolReply::new(ToolCallId::new("original"), "done".to_owned(), None)
+            }));
+            owners.retain_serial_abort(serial.as_ref().expect("original stored"));
+        }
+        let (entered, waiting) = oneshot::channel();
+        let borrowed = Arc::clone(&owners);
+        let observer = tokio::spawn(async move {
+            let mut serial = borrowed.serial.lock().await;
+            entered.send(()).expect("observer entered");
+            let joined = serial.as_mut().expect("original retained").await;
+            borrowed.observe_join(&joined);
+            serial.take();
+        });
+        waiting.await.expect("borrowed original wait");
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        assert!(owners.serial.lock().await.is_some());
+        finish.send(()).expect("finish original writer");
+        assert_eq!(owners.join_originals().await, Ok(()));
+        assert!(owners.serial.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn activation_unwind_leaves_nested_original_owned_and_failure_sticky() {
+        let owners = Arc::new(ActivationToolOwners::new());
+        {
+            let mut serial = owners.serial.lock().await;
+            *serial = Some(tokio::spawn(pending::<OriginalToolResult>()));
+            owners.retain_serial_abort(serial.as_ref().expect("original stored"));
+        }
+        let borrowed = Arc::clone(&owners);
+        let activation = tokio::spawn(async move {
+            let _borrowed_original = borrowed.serial.lock().await;
+            panic!("test activation unwind");
+        });
+        assert!(activation.await.unwrap_err().is_panic());
+        assert!(owners.serial.lock().await.is_some());
+        owners.abort_originals();
+        assert_eq!(
+            owners.join_originals().await,
+            Err(BuiltInAgentStopFailure::Cancelled)
+        );
+        assert_eq!(
+            owners.join_originals().await,
+            Err(BuiltInAgentStopFailure::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn original_abort_phase_does_not_wait_for_the_borrowed_task_slot() {
+        let owners = Arc::new(ActivationToolOwners::new());
+        let mut serial = owners.serial.lock().await;
+        *serial = Some(tokio::spawn(pending::<OriginalToolResult>()));
+        owners.retain_serial_abort(serial.as_ref().expect("original stored"));
+        owners.abort_originals(); // serial is still borrowed; requesting abort cannot await it
+        let joined = serial.as_mut().expect("original retained").await;
+        owners.observe_join(&joined);
+        assert!(joined.unwrap_err().is_cancelled());
+        serial.take();
+        owners.release_joined_serial_abort();
+        drop(serial);
+        assert_eq!(
+            owners.join_originals().await,
+            Err(BuiltInAgentStopFailure::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_original_registration_observes_the_same_latched_abort_request() {
+        let owners = ActivationToolOwners::new();
+        owners.abort_originals();
+        {
+            let mut serial = owners.serial.lock().await;
+            *serial = Some(tokio::spawn(pending::<OriginalToolResult>()));
+            owners.retain_serial_abort(serial.as_ref().expect("original stored"));
+        }
+        assert_eq!(
+            owners.join_originals().await,
+            Err(BuiltInAgentStopFailure::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_abort_records_each_actual_join_before_capture_result() {
+        let owners = ActivationToolOwners::new();
+        {
+            let mut tasks = owners.parallel.lock().await;
+            owners.retain_parallel_abort(tasks.spawn(pending::<ParallelToolOutcome>()));
+            owners.retain_parallel_abort(tasks.spawn(pending::<ParallelToolOutcome>()));
+            abort_tool_tasks(&mut tasks, &owners).await;
+        }
+        assert_eq!(
+            owners.join_originals().await,
+            Err(BuiltInAgentStopFailure::Cancelled)
+        );
+        assert_eq!(
+            owners.join_originals().await,
+            Err(BuiltInAgentStopFailure::Cancelled)
+        );
     }
 }

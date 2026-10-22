@@ -73,7 +73,7 @@ desktop-local-runtime = [
     "openbot-infra/server-runtime",
 ]
 # Reviewed macOS product entry; does not change the default typed library graph.
-desktop-launcher = ["desktop-local-runtime", "dep:tauri-build"]
+desktop-launcher = ["desktop-local-runtime", "postgres-maintenance", "dep:tauri-build"]
 
 [dependencies]
 # 唯一业务入口。transport 只穿过它，不实现任何业务规则（v3 §5.2）。

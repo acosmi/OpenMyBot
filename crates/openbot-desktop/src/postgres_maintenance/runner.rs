@@ -92,7 +92,7 @@ struct DrainResult {
     preview: Vec<u8>,
 }
 #[derive(Serialize)]
-struct ToolObservation {
+pub(super) struct ToolObservation {
     role: &'static str,
     pid: u32,
     started_ns: u64,
@@ -110,13 +110,13 @@ struct ToolObservation {
     stdout: Option<DrainReport>,
     stderr: Option<DrainReport>,
 }
-struct ToolResult {
+pub(super) struct ToolResult {
     observation: ToolObservation,
     preview: Vec<u8>,
     error: Option<MaintenanceError>,
 }
 
-struct ProgramOwner {
+pub(super) struct ProgramOwner {
     role: &'static str,
     child: Child,
     pid: u32,
@@ -326,7 +326,7 @@ pub(crate) struct NativeReceipt {
     closed_before_convergence_deadline: bool,
 }
 
-struct NativeOwner {
+pub(super) struct NativeOwner {
     child: Child,
     pid: u32,
     args_env_clean: bool,
@@ -365,7 +365,7 @@ pub(super) enum OwnedNativeTestScenario {
     Capacity,
 }
 impl NativeOwner {
-    fn physically_closed(&self) -> bool {
+    pub(super) fn physically_closed(&self) -> bool {
         self.pid != 0
             && self.wait.is_some()
             && self.writer_joined
@@ -1316,37 +1316,179 @@ pub(crate) async fn run_basebackup(
         }
     }
 }
+
+// A finite view over the two existing producers, never a tag that grants source authority.
+enum NativeSource<'a> {
+    Fixture(&'a mut OwnedFixtureSource),
+    #[cfg(feature = "desktop-launcher")]
+    Capture(&'a mut super::capture::CaptureSourceOwner),
+}
+impl NativeSource<'_> {
+    fn clock(&self) -> &OperationClock {
+        match self {
+            Self::Fixture(s) => &s.clock,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_clock(),
+        }
+    }
+    fn profile(&self) -> &super::limits::ProfileFields {
+        match self {
+            Self::Fixture(s) => s.profile.fields(),
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_profile().fields(),
+        }
+    }
+    fn bundle(&self) -> &VerifiedMaintenanceBundle {
+        match self {
+            Self::Fixture(s) => &s.bundle,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_bundle(),
+        }
+    }
+    fn operation(&self) -> [u8; 16] {
+        match self {
+            Self::Fixture(s) => s.operation,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_operation(),
+        }
+    }
+    fn secret(&self) -> &Arc<SecretBytes> {
+        match self {
+            Self::Fixture(s) => &s.secret,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_secret(),
+        }
+    }
+    fn port(&self) -> Result<u16, MaintenanceError> {
+        match self {
+            Self::Fixture(_) => Ok(PORT),
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(source) => source.native_port(),
+        }
+    }
+    fn role(&self) -> &'static str {
+        match self {
+            Self::Fixture(_) => ROLE,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(_) => openbot_contracts::desktop::DESKTOP_LOCAL_POSTGRES_ADMIN_USER,
+        }
+    }
+    fn root_path(&self) -> Result<&Path, MaintenanceError> {
+        match self {
+            Self::Fixture(s) => s.root_path(),
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => Ok(s.native_root()),
+        }
+    }
+    fn native(&self) -> &Option<NativeOwner> {
+        match self {
+            Self::Fixture(s) => &s.native,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_owner(),
+        }
+    }
+    fn native_mut(&mut self) -> &mut Option<NativeOwner> {
+        match self {
+            Self::Fixture(s) => &mut s.native,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_owner_mut(),
+        }
+    }
+    fn native_and_clock(&mut self) -> (&mut Option<NativeOwner>, &OperationClock) {
+        match self {
+            Self::Fixture(s) => (&mut s.native, &s.clock),
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_and_clock(),
+        }
+    }
+    fn validate_request(&self, request: &BasebackupRequest) -> Result<(), MaintenanceError> {
+        match self {
+            Self::Fixture(source) => {
+                if source
+                    .postmasters
+                    .get(request.postmaster)
+                    .is_none_or(|p| p.stopped)
+                    || request.output.exists()
+                    || !request.output.starts_with(source.root_path()?)
+                    || request.socket != source.source_socket()?
+                {
+                    return Err(MaintenanceError::InvalidArguments);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(source) => {
+                source.validate_native_request(&request.output, &request.socket, request.postmaster)
+            }
+        }
+    }
+    fn capacity_check(&mut self) -> Result<(), MaintenanceError> {
+        match self {
+            Self::Fixture(s) => s.capacity_check(),
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_capacity_check(),
+        }
+    }
+    fn check_owned_fd_budget(&self, additional: u64) -> Result<(), MaintenanceError> {
+        match self {
+            Self::Fixture(s) => s.check_owned_fd_budget(additional),
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) => s.native_fd_budget(additional),
+        }
+    }
+    async fn stop_postmaster(&mut self, index: usize) -> Result<(), MaintenanceError> {
+        match self {
+            Self::Fixture(s) => s.stop_postmaster(index).await,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(s) if index == 0 => s.stop_native_source().await,
+            #[cfg(feature = "desktop-launcher")]
+            Self::Capture(_) => Err(MaintenanceError::InvalidArguments),
+        }
+    }
+}
+
 async fn native_backup(
     source: &mut OwnedFixtureSource,
     request: &BasebackupRequest,
 ) -> Result<NativeReceipt, MaintenanceError> {
-    source.clock.permit_effect()?;
+    native_backup_protocol(&mut NativeSource::Fixture(source), request).await
+}
+
+/// The capture variant accepts only the already-owned trusted producer; no raw source constructor.
+#[cfg(feature = "desktop-launcher")]
+pub(super) async fn run_capture_native(
+    source: &mut super::capture::CaptureSourceOwner,
+) -> Result<NativeReceipt, MaintenanceError> {
+    let request = BasebackupRequest {
+        output: source.native_output().to_owned(),
+        socket: source.native_socket().to_owned(),
+        postmaster: 0,
+    };
+    native_backup_protocol(&mut NativeSource::Capture(source), &request).await
+}
+
+async fn native_backup_protocol(
+    source: &mut NativeSource<'_>,
+    request: &BasebackupRequest,
+) -> Result<NativeReceipt, MaintenanceError> {
+    source.clock().permit_effect()?;
     source.capacity_check()?;
-    if source
-        .postmasters
-        .get(request.postmaster)
-        .is_none_or(|p| p.stopped)
-        || request.output.exists()
-        || !request.output.starts_with(source.root_path()?)
-        || request.socket != source.source_socket()?
-    {
-        return Err(MaintenanceError::InvalidArguments);
-    }
-    let mut command = source.bundle.checked_command(Program::BaseBackup)?;
+    source.validate_request(request)?;
+    let mut command = source.bundle().checked_command(Program::BaseBackup)?;
     command.current_dir(source.root_path()?);
     for (name, value) in [
         ("owner-protocol", "1".to_owned()),
-        ("operation", bundle::encode_hex(&source.operation)),
-        ("t0-ns", source.clock.t0().to_string()),
-        ("effect-deadline-ns", source.clock.effect().to_string()),
+        ("operation", bundle::encode_hex(&source.operation())),
+        ("t0-ns", source.clock().t0().to_string()),
+        ("effect-deadline-ns", source.clock().effect().to_string()),
         (
             "convergence-deadline-ns",
-            source.clock.convergence().to_string(),
+            source.clock().convergence().to_string(),
         ),
     ] {
         command.arg(format!("--wrokbot-{name}={value}"));
     }
-    for (name, value) in source.profile.fields().native_fields() {
+    for (name, value) in source.profile().native_fields() {
         command.arg(format!("--wrokbot-{name}={value}"));
     }
     command.args([
@@ -1361,13 +1503,13 @@ async fn native_backup(
     for (name, value) in [
         ("--pgdata", request.output.as_os_str().to_owned()),
         ("--host", request.socket.as_os_str().to_owned()),
-        ("--port", OsString::from(PORT.to_string())),
-        ("--username", OsString::from(ROLE)),
+        ("--port", OsString::from(source.port()?.to_string())),
+        ("--username", OsString::from(source.role())),
         (
             "--label",
             OsString::from(format!(
                 "wrokbot-maintenance-{}",
-                bundle::encode_hex(&source.operation)
+                bundle::encode_hex(&source.operation())
             )),
         ),
     ] {
@@ -1377,11 +1519,11 @@ async fn native_backup(
         command.arg(argument);
     }
     source.check_owned_fd_budget(3)?;
-    let args_env_clean = command_secret_absent(&command, source.secret.expose());
+    let args_env_clean = command_secret_absent(&command, source.secret().expose());
     if !args_env_clean {
         return Err(MaintenanceError::SecretInvalid);
     }
-    source.clock.permit_effect()?;
+    source.clock().permit_effect()?;
     let mut child = command.spawn()?;
     let pid = child.id().unwrap_or(0);
     let stdin = child.stdin.take();
@@ -1390,7 +1532,7 @@ async fn native_backup(
     let (control, commands) = mpsc::channel(2);
     let (start_tx, start_rx) = oneshot::channel();
     let (events, mut event_reader) = mpsc::channel(8);
-    source.native = Some(NativeOwner {
+    *source.native_mut() = Some(NativeOwner {
         child,
         pid,
         args_env_clean,
@@ -1409,28 +1551,29 @@ async fn native_backup(
         drain: None,
         join_error: None,
     });
-    let owner = source
-        .native
-        .as_mut()
-        .ok_or(MaintenanceError::HelperWaitUnknown)?;
     let (stdin, stdout, stderr) = match (stdin, stdout, stderr) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => return Err(MaintenanceError::PipeJoinUnknown),
     };
-    let p = source.profile.fields();
+    let p = source.profile();
     let (op, t0, e, c) = (
-        source.operation,
-        source.clock.t0(),
-        source.clock.effect(),
-        source.clock.convergence(),
+        source.operation(),
+        source.clock().t0(),
+        source.clock().effect(),
+        source.clock().convergence(),
     );
     let (secret, max_secret, max_status, max_records, max_stderr) = (
-        Arc::clone(&source.secret),
+        Arc::clone(source.secret()),
         p.max_source_secret_bytes,
         p.max_status_bytes,
         p.max_status_records,
         p.max_stderr_bytes,
     );
+    let stderr_secret = Arc::clone(source.secret());
+    let owner = source
+        .native_mut()
+        .as_mut()
+        .ok_or(MaintenanceError::HelperWaitUnknown)?;
     owner.reader = Some(tokio::spawn(async move {
         read_status(
             stdout,
@@ -1442,7 +1585,7 @@ async fn native_backup(
     owner.stderr = Some(tokio::spawn(drain_pipe(
         stderr,
         max_stderr,
-        Some(Arc::clone(&source.secret)),
+        Some(stderr_secret),
         false,
     )));
     owner.writer = Some(tokio::spawn(control_writer(
@@ -1456,8 +1599,10 @@ async fn native_backup(
     )));
     // All original owners have been installed and the two readers are resident before START.
     #[cfg(test)]
-    if source.scenario == OwnedNativeTestScenario::ConnectionBeforeStart {
-        source.stop_postmaster(request.postmaster).await?;
+    if let NativeSource::Fixture(fixture) = source
+        && fixture.scenario == OwnedNativeTestScenario::ConnectionBeforeStart
+    {
+        fixture.stop_postmaster(request.postmaster).await?;
     }
     start_tx
         .send(())
@@ -1471,7 +1616,7 @@ async fn native_backup(
             && let Err(error) = source.capacity_check()
         {
             capacity_error = Some(error);
-            if let Some(owner) = source.native.as_ref() {
+            if let Some(owner) = source.native().as_ref() {
                 let _requested = owner.control.try_send(Control::Cancel(c));
             }
             // Stop our still-owned source through its original shutdown/wait path.
@@ -1485,7 +1630,7 @@ async fn native_backup(
         }
         let observed = {
             let owner = source
-                .native
+                .native_mut()
                 .as_mut()
                 .ok_or(MaintenanceError::HelperWaitUnknown)?;
             tokio::select! {
@@ -1498,12 +1643,13 @@ async fn native_backup(
         match observed {
             Observed::CapacityTick => {}
             Observed::Wait(Ok(status)) => {
+                let observed_ns = source.clock().observed();
                 let owner = source
-                    .native
+                    .native_mut()
                     .as_mut()
                     .ok_or(MaintenanceError::HelperWaitUnknown)?;
                 owner.wait = Some(status);
-                match source.clock.observed() {
+                match observed_ns {
                     Ok(now) => owner.wait_ns = Some(now),
                     Err(error) => {
                         owner.join_error.get_or_insert(error);
@@ -1513,7 +1659,7 @@ async fn native_backup(
             }
             Observed::Wait(Err(_)) => {
                 let owner = source
-                    .native
+                    .native_mut()
                     .as_mut()
                     .ok_or(MaintenanceError::HelperWaitUnknown)?;
                 owner.wait_errors = owner.wait_errors.saturating_add(1);
@@ -1524,30 +1670,33 @@ async fn native_backup(
                 #[cfg(not(test))]
                 let _observed_event = event;
                 #[cfg(test)]
-                if event == 3 && !fault_issued {
+                if let NativeSource::Fixture(fixture) = source
+                    && event == 3
+                    && !fault_issued
+                {
                     fault_issued = true;
-                    match source.scenario {
+                    match fixture.scenario {
                         OwnedNativeTestScenario::CancelAfterWorker => {
-                            if let Some(owner) = source.native.as_ref() {
+                            if let Some(owner) = fixture.native.as_ref() {
                                 let _sent = owner.control.try_send(Control::Cancel(c));
                             }
                         }
                         OwnedNativeTestScenario::EofAfterWorker => {
-                            if let Some(owner) = source.native.as_ref() {
+                            if let Some(owner) = fixture.native.as_ref() {
                                 let _sent = owner.control.try_send(Control::TestEof);
                             }
                         }
                         OwnedNativeTestScenario::TightDeadlineAfterWorker => {
                             // A valid current-time tighter C is already due when the helper
                             // receives it. The IPC itself is still bounded by the original C.
-                            let tighter = source.clock.observed()?.min(c);
-                            source.test_tighter_c = Some(tighter);
-                            if let Some(owner) = source.native.as_ref() {
+                            let tighter = fixture.clock.observed()?.min(c);
+                            fixture.test_tighter_c = Some(tighter);
+                            if let Some(owner) = fixture.native.as_ref() {
                                 let _sent = owner.control.try_send(Control::Cancel(tighter));
                             }
                         }
                         OwnedNativeTestScenario::DisconnectAfterWorker => {
-                            let sql = source
+                            let sql = fixture
                                 .sql
                                 .iter()
                                 .position(|sql| {
@@ -1557,7 +1706,7 @@ async fn native_backup(
                                         && !sql.driver_joined
                                 })
                                 .ok_or(MaintenanceError::ConnectionFailed)?;
-                            let rows = source
+                            let rows = fixture
                                 .query_owned(
                                     sql,
                                     "SELECT pid, pg_catalog.pg_terminate_backend(pid) AS requested FROM pg_catalog.pg_stat_activity WHERE backend_type = 'walsender' AND usename = current_user AND application_name = 'wrokbot-pg-basebackup' AND client_addr IS NULL AND pid <> pg_catalog.pg_backend_pid()".to_owned(),
@@ -1585,7 +1734,7 @@ async fn native_backup(
                                 "WROKBOT_PG_MAINTENANCE_TEST_DISCONNECT_REQUESTED postmaster={} server_walsender_pids={server_walsender_pids:?}",
                                 request.postmaster
                             );
-                            source.stop_postmaster(request.postmaster).await?;
+                            fixture.stop_postmaster(request.postmaster).await?;
                         }
                         _ => {}
                     }
@@ -1593,11 +1742,9 @@ async fn native_backup(
             }
         }
     }
-    let owner = source
-        .native
-        .as_mut()
-        .ok_or(MaintenanceError::HelperWaitUnknown)?;
-    settle_native(owner, &source.clock).await;
+    let (native, original_clock) = source.native_and_clock();
+    let owner = native.as_mut().ok_or(MaintenanceError::HelperWaitUnknown)?;
+    settle_native(owner, original_clock).await;
     if let Some(error) = capacity_error {
         return Err(error);
     }
@@ -1919,7 +2066,7 @@ fn command_secret_absent(command: &tokio::process::Command, secret: &[u8]) -> bo
             .get_envs()
             .any(|(k, v)| contains(k.as_bytes()) || v.is_some_and(|v| contains(v.as_bytes())))
 }
-fn spawn_program(
+pub(super) fn spawn_program(
     mut command: tokio::process::Command,
     role: &'static str,
     clock: &OperationClock,
@@ -1994,6 +2141,76 @@ fn spawn_program(
     })
 }
 
+impl ProgramOwner {
+    /// Current retained pipe-handle presence only; not creation history, join or closure.
+    pub(super) fn original_pipe_handles(&self) -> [bool; 3] {
+        [self.input.is_some(), self.output.is_some(), self.error.is_some()]
+    }
+    pub(super) fn original_child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+    pub(super) fn original_pid(&self) -> u32 {
+        self.pid
+    }
+}
+impl ToolResult {
+    pub(super) fn into_closed_observation(self) -> (ToolObservation, Option<MaintenanceError>) {
+        (self.observation, self.error)
+    }
+}
+impl ToolObservation {
+    /// Original stored wait/join-OK values. False readers keep the original ambiguity.
+    pub(super) fn original_wait_and_pipe_join_ok(&self) -> (bool, Option<bool>, bool, bool) {
+        (
+            self.original_child_wait,
+            self.stdin_writer_joined,
+            self.stdout_reader_joined,
+            self.stderr_reader_joined,
+        )
+    }
+    pub(super) fn closed_success(&self) -> bool {
+        self.original_child_wait
+            && self.exit_code == Some(0)
+            && self.stdin_writer_joined != Some(false)
+            && self.stdout_reader_joined
+            && self.stderr_reader_joined
+            && self.original_wait_errors == 0
+            && !self.deadline_expired
+    }
+}
+impl NativeReceipt {
+    /// Original native observations; these join values do not redefine ToolObservation's.
+    pub(super) fn original_wait_pipe_worker_observations(
+        &self,
+    ) -> (bool, [bool; 3], bool, bool) {
+        (
+            self.original_child_wait,
+            [
+                self.stdin_writer_joined,
+                self.stdout_reader_joined,
+                self.stderr_reader_joined,
+            ],
+            self.worker_created,
+            self.worker_wait_observed,
+        )
+    }
+    pub(super) fn terminal(&self) -> Result<StatusRecord, MaintenanceError> {
+        self.statuses
+            .last()
+            .copied()
+            .filter(|r| r.event == 8)
+            .ok_or(MaintenanceError::ManifestInvalid)
+    }
+}
+pub(super) fn verify_capture_physical_material(
+    backup: &Path,
+    profile: &MaintenanceProfile,
+    clock: &OperationClock,
+    native: &NativeReceipt,
+) -> Result<MaterialInventory, MaintenanceError> {
+    verify_physical_material(backup, profile, clock, &native.terminal()?)
+}
+
 // A wait error never substitutes PID disappearance for the original Child.wait. The same owner
 // remains resident across a clock failure, E/C expiry or repeated wait error.
 async fn wait_original_child(child: &mut Child) -> (ExitStatus, u64) {
@@ -2009,12 +2226,47 @@ async fn wait_original_child(child: &mut Child) -> (ExitStatus, u64) {
     }
 }
 async fn wait_program(
-    mut owner: ProgramOwner,
+    owner: ProgramOwner,
     capacity_monitor: &mut CapacityMonitor<'_>,
     closing: bool,
     term_on_deadline: bool,
 ) -> Result<ToolResult, MaintenanceError> {
     let clock = capacity_monitor.clock;
+    wait_program_with_capacity(
+        owner,
+        clock,
+        || capacity_monitor.observe(0),
+        closing,
+        term_on_deadline,
+    )
+    .await
+}
+
+#[cfg(feature = "desktop-launcher")]
+pub(super) async fn wait_capture_program(
+    owner: ProgramOwner,
+    source: &mut super::capture::CaptureSourceOwner,
+    closing: bool,
+    term_on_deadline: bool,
+) -> Result<ToolResult, MaintenanceError> {
+    let operation = source.shared_operation();
+    wait_program_with_capacity(
+        owner,
+        operation.original_clock(),
+        || source.native_capacity_check(),
+        closing,
+        term_on_deadline,
+    )
+    .await
+}
+
+async fn wait_program_with_capacity(
+    mut owner: ProgramOwner,
+    clock: &OperationClock,
+    mut observe_capacity: impl FnMut() -> Result<(), MaintenanceError>,
+    closing: bool,
+    term_on_deadline: bool,
+) -> Result<ToolResult, MaintenanceError> {
     let bound = if closing {
         clock.convergence()
     } else {
@@ -2040,7 +2292,7 @@ async fn wait_program(
             }
         };
         if capacity_error.is_none()
-            && let Err(error) = capacity_monitor.observe(0)
+            && let Err(error) = observe_capacity()
         {
             capacity_error = Some(error);
             if !closing {
@@ -2323,21 +2575,26 @@ fn write_fixture_config(
 }
 
 #[derive(Serialize)]
-struct MaterialFile {
-    path: String,
-    bytes: u64,
-    sha256: String,
-    allocated_bytes: u64,
+pub(super) struct MaterialFile {
+    pub(super) path: String,
+    pub(super) bytes: u64,
+    pub(super) sha256: String,
+    pub(super) allocated_bytes: u64,
 }
 #[derive(Serialize)]
-struct MaterialInventory {
-    files: Vec<MaterialFile>,
+pub(super) struct MaterialInventory {
+    pub(super) files: Vec<MaterialFile>,
     counters: MaterialCounters,
     manifest_sha256: String,
     manifest_checksum_verified: bool,
     all_manifest_file_checksums_verified: bool,
     wal_range_and_headers_verified: bool,
     all_regular_files_and_directories_synced: bool,
+}
+impl MaterialInventory {
+    pub(super) fn directory_count(&self) -> u64 {
+        self.counters.directories
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2978,7 +3235,7 @@ fn copy_empty_directories(
     }
     Ok(())
 }
-fn allocated_tree(root: &Path, max_files: u64) -> Result<u64, MaintenanceError> {
+pub(super) fn allocated_tree(root: &Path, max_files: u64) -> Result<u64, MaintenanceError> {
     fn walk(
         path: &Path,
         count: &mut u64,

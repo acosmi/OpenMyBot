@@ -50,6 +50,13 @@ use crate::{
     VerifiedDesktopWindowAuthority,
 };
 
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) mod capture;
+
 type PackageFactory = Box<
     dyn FnOnce(&DesktopLocalAuthority) -> Result<LoadedTenantPackage, TenantPackageError>
         + Send
@@ -368,6 +375,12 @@ pub struct DesktopLocalRuntimeConfig {
     release: DesktopLocalReleaseInput,
     application: DesktopLocalApplicationInput,
     package_factory: PackageFactory,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    capture_request: Option<crate::desktop_release::ReviewedNormalCaptureRequest>,
 }
 
 impl DesktopLocalRuntimeConfig {
@@ -387,7 +400,26 @@ impl DesktopLocalRuntimeConfig {
             release,
             application,
             package_factory: Box::new(package_factory),
+            #[cfg(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            ))]
+            capture_request: None,
         }
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) fn with_reviewed_normal_capture(
+        mut self,
+        request: Option<crate::desktop_release::ReviewedNormalCaptureRequest>,
+    ) -> Self {
+        self.capture_request = request;
+        self
     }
 }
 
@@ -564,6 +596,47 @@ impl DesktopLocalRuntimeState {
         }
     }
 
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    fn begin_native_exit_shutdown(
+        &self,
+        requested_code: Option<i32>,
+    ) -> Result<
+        Option<(
+            Box<dyn RuntimeShutdownOwner>,
+            Option<capture::NormalReadyExitToken>,
+        )>,
+        DesktopLocalRuntimeError,
+    > {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| DesktopLocalRuntimeError::State)?;
+        match inner.phase {
+            DesktopLocalRuntimePhase::StartingWindow | DesktopLocalRuntimePhase::Ready => {
+                let ready = if inner.phase == DesktopLocalRuntimePhase::Ready
+                    && (requested_code == Some(0)
+                        || requested_code.is_none() && inner.terminal_exit)
+                {
+                    Some(capture::NormalReadyExitToken::from_original_native_ready(
+                        &inner,
+                    )?)
+                } else {
+                    None
+                };
+                let owner = inner.owner.take().ok_or(DesktopLocalRuntimeError::State)?;
+                inner.phase = DesktopLocalRuntimePhase::Stopping;
+                inner.lifecycle = None;
+                self.changed.send_replace(());
+                Ok(Some((owner, ready)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn finish_shutdown(&self, succeeded: bool) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.phase = if succeeded {
@@ -691,6 +764,12 @@ impl Drop for StartupCompletion {
 struct DesktopLocalClosingCompletion {
     state: Arc<DesktopLocalRuntimeState>,
     exit: Option<(tauri::AppHandle<Wry>, i32)>,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    normal_ready: Option<capture::NormalReadyExitToken>,
 }
 
 struct DesktopLocalClosingObservation {
@@ -829,6 +908,12 @@ struct DesktopLocalBackgroundOwner {
     _remember_preference_repository:
         Arc<openbot_infra::approval_preferences::PostgresRememberPreferenceRepository>,
     read_lifecycle: Arc<openbot_infra::artifact_read_lifecycle::ArtifactReadLifecycle>,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    capture_armed: Option<capture::ArmedNormalCapture>,
 }
 
 impl Drop for DesktopLocalBackgroundOwner {
@@ -847,13 +932,25 @@ impl RuntimeShutdownOwner for DesktopLocalBackgroundOwner {
 }
 
 struct DesktopLocalClosingJob {
-    owner: Box<DesktopLocalBackgroundOwner>,
+    owner: Option<Box<DesktopLocalBackgroundOwner>>,
     deadline: Instant,
     tracker: Arc<openbot_infra::artifact_read_lifecycle::ArtifactReadLifecycle>,
-    reply: tokio::sync::oneshot::Sender<Result<(), DesktopLocalRuntimeError>>,
+    reply: Option<tokio::sync::oneshot::Sender<Result<(), DesktopLocalRuntimeError>>>,
     observation: Arc<DesktopLocalClosingObservation>,
     completion: ShutdownCompletion,
     startup_ok: bool,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    normal_ready: Option<capture::NormalReadyExitToken>,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    capture: Option<capture::CaptureJobCustody>,
 }
 
 fn start_owned_local_closing_job(
@@ -876,10 +973,33 @@ fn start_owned_local_closing_job(
             outcome: None,
         }),
     });
-    // Each operation runs even if another close or state installation failed.
-    let authority_ok = owner.lifecycle.shutdown_authority().is_ok();
+    let mut completion = completion;
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let normal_ready = completion
+        .as_mut()
+        .and_then(|completion| completion.normal_ready.take());
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let capturing = normal_ready.is_some() && owner.capture_armed.is_some();
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
+    let capturing = false;
+    // The original ordinary path keeps its exact ordering. Armed close first persists Intent.
+    let authority_ok = capturing || owner.lifecycle.shutdown_authority().is_ok();
     let tracker = Arc::clone(&owner.read_lifecycle);
-    tracker.close();
+    if !capturing {
+        tracker.close();
+    }
     let state_install_ok = match &completion {
         Some(completion) => completion
             .state
@@ -889,10 +1009,10 @@ fn start_owned_local_closing_job(
     };
     let (reply, receiver) = tokio::sync::oneshot::channel();
     let job = DesktopLocalClosingJob {
-        owner,
+        owner: Some(owner),
         deadline,
         tracker,
-        reply,
+        reply: Some(reply),
         observation: Arc::clone(&observation),
         completion: ShutdownCompletion {
             completion,
@@ -900,6 +1020,18 @@ fn start_owned_local_closing_job(
             completed: false,
         },
         startup_ok: authority_ok && state_install_ok,
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        normal_ready: if capturing { normal_ready } else { None },
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        capture: None,
     };
     // The actual owner and data plane belong to this job before the observer can be returned.
     tauri::async_runtime::spawn(run_owned_local_closing_job(job));
@@ -911,7 +1043,39 @@ fn start_owned_local_closing_job(
     }
 }
 
-async fn run_owned_local_closing_job(job: DesktopLocalClosingJob) {
+async fn run_owned_local_closing_job(mut job: DesktopLocalClosingJob) {
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    if let Some(ready) = job.normal_ready.take() {
+        job.observation
+            .update(|facts| facts.job_entered_at = Some(Instant::now()));
+        let result = capture::run_normal_exit_capture(&mut job, ready).await;
+        if result.is_err() {
+            // A capture refusal does not complete the original shutdown while live/unknown
+            // resources remain resident. Keep Stopping: finish(false) would schedule native
+            // exit(1) and destroy this very custody through process termination.
+            job.observation
+                .update(|facts| facts.outcome = Some(DesktopLocalClosingOutcome::Unknown));
+            observe_exit("capture", "closing_pending");
+            if let Some(reply) = job.reply.take() {
+                let _observed = reply.send(Err(DesktopLocalRuntimeError::Shutdown));
+            }
+            std::future::pending::<()>().await;
+            return;
+        }
+        let succeeded = job.completion.finish(true);
+        if let Some(reply) = job.reply.take() {
+            let _observed = reply.send(if succeeded {
+                Ok(())
+            } else {
+                Err(DesktopLocalRuntimeError::Shutdown)
+            });
+        }
+        return;
+    }
     let DesktopLocalClosingJob {
         mut owner,
         deadline,
@@ -920,7 +1084,21 @@ async fn run_owned_local_closing_job(job: DesktopLocalClosingJob) {
         observation,
         mut completion,
         startup_ok,
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+            normal_ready: _,
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+            capture: _,
     } = job;
+    let mut owner = owner.take().expect("original ordinary closing owner");
+    let reply = reply.expect("original ordinary closing observer");
     let mut observations_ok =
         observation.update(|facts| facts.job_entered_at = Some(Instant::now()));
     let agent_host = owner.agent_host.take();
@@ -1046,6 +1224,12 @@ impl PreparedDesktopLocalRuntime {
         let waiter = owner.start_closing(Some(DesktopLocalClosingCompletion {
             state: Arc::clone(&state),
             exit: None,
+            #[cfg(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            ))]
+            normal_ready: None,
         }));
         Ok((state, waiter))
     }
@@ -1228,7 +1412,7 @@ where
 fn run_desktop_local_app(app: App<Wry>) {
     app.run(|app_handle, event| {
         match event {
-            RunEvent::ExitRequested { api, .. } => {
+            RunEvent::ExitRequested { api, code, .. } => {
                 let state = app_handle.state::<Arc<DesktopLocalRuntimeState>>();
                 observe_exit("exit_requested", phase_code(state.phase()));
                 match state.phase() {
@@ -1242,7 +1426,12 @@ fn run_desktop_local_app(app: App<Wry>) {
                     DesktopLocalRuntimePhase::Ready => {
                         api.prevent_exit();
                         let _ = state.note_exit_requested();
-                        request_shutdown(Arc::clone(state.inner()), app_handle.clone(), 0);
+                        // The original native request code distinguishes normal exit from failure/restart.
+                        request_shutdown(
+                            Arc::clone(state.inner()),
+                            app_handle.clone(),
+                            code.unwrap_or(0),
+                        );
                     }
                     DesktopLocalRuntimePhase::Stopping => api.prevent_exit(),
                     DesktopLocalRuntimePhase::Stopped | DesktopLocalRuntimePhase::Failed => {}
@@ -1305,6 +1494,28 @@ fn start_shutdown(
     state: Arc<DesktopLocalRuntimeState>,
     exit: Option<(tauri::AppHandle<Wry>, i32)>,
 ) {
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let (owner, normal_ready) =
+        match state.begin_native_exit_shutdown(exit.as_ref().map(|(_, code)| *code)) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return,
+            Err(_) => {
+                state.finish_shutdown(false);
+                if let Some((app_handle, _)) = exit {
+                    exit_if_live(&state, &app_handle, 1);
+                }
+                return;
+            }
+        };
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
     let owner = match state.begin_shutdown() {
         Ok(Some(owner)) => owner,
         Ok(None) => return,
@@ -1317,7 +1528,16 @@ fn start_shutdown(
         }
     };
     observe_exit("shutdown", "begin");
-    drop(owner.start_closing(Some(DesktopLocalClosingCompletion { state, exit })));
+    drop(owner.start_closing(Some(DesktopLocalClosingCompletion {
+        state,
+        exit,
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        normal_ready,
+    })));
 }
 
 async fn finish_shutdown_stages(
@@ -1375,6 +1595,12 @@ pub(crate) async fn prepare_desktop_local_runtime(
         release,
         application,
         package_factory,
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        capture_request,
     } = config;
     let DesktopLocalReleaseInput {
         ui,
@@ -1398,29 +1624,183 @@ pub(crate) async fn prepare_desktop_local_runtime(
         allow_http: false,
     };
 
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let mut capture_resources = match capture_request.as_ref() {
+        Some(request) => Some(capture::prepare_original_capture_resources(
+            &request.profile.carrier_bounds().map_err(|_| DesktopLocalRuntimeError::Configuration)?,
+        ).map_err(|_| DesktopLocalRuntimeError::Configuration)?),
+        None => None,
+    };
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    let mut capture_control_footprint = None;
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    if let Some(app) = capture::open_app_data_read_only(app_data_root.as_path())
+        .map_err(|_| DesktopLocalRuntimeError::Authority)?
+    {
+        let observed = capture::control::inspect_startup_control_for_capture(
+            &app,
+            capture_request.as_ref().map(|request| &request.profile),
+            capture_resources.as_ref(),
+        )
+        .map_err(|_| DesktopLocalRuntimeError::Authority)?;
+        if capture_resources.is_some() { capture_control_footprint = Some(observed); }
+    }
+
     let authority_store = DesktopLocalAuthorityStore::new(app_data_root.clone());
     let installation = authority_store
         .load_or_create_installation()
         .map_err(|_| DesktopLocalRuntimeError::Authority)?;
     let package =
         package_factory(installation.authority()).map_err(|_| DesktopLocalRuntimeError::Package)?;
-    let sidecar = PostgresSidecarSupervisor::start(
-        postgres_bundle,
-        app_data_root.as_path(),
-        installation.authority().instance_id(),
-        installation.sidecar_data_dir(),
-        secret_store.as_ref(),
-        &postgres_key_store_service,
-    )
-    .await
-    .map_err(map_sidecar_error)?;
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let mut capture_installation = match capture_request.as_ref() {
+        Some(_) => Some(
+            installation
+                .retain_capture_installation()
+                .map_err(|_| DesktopLocalRuntimeError::Authority)?,
+        ),
+        None => None,
+    };
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let mut capture_control = match capture_request.as_ref() {
+        Some(request) => {
+            request
+                .profile
+                .validate_master_retention()
+                .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+            let app = capture::open_app_data_read_only(app_data_root.as_path())
+                .map_err(|_| DesktopLocalRuntimeError::Authority)?
+                .ok_or(DesktopLocalRuntimeError::Authority)?;
+            Some(
+                capture::CaptureControlOwner::prepare(
+                    &app, request,
+                    Arc::clone(capture_resources.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?),
+                    capture_control_footprint.take()
+                        .unwrap_or_else(capture::control::OriginalControlHistoryFootprint::unobserved),
+                )
+                    .map_err(|_| DesktopLocalRuntimeError::Configuration)?,
+            )
+        }
+        None => None,
+    };
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let capture_custody = match capture_request.as_ref() {
+        Some(request) => {
+            use openbot_infra::db::desktop_local::{
+                DesktopLocalDriverCustody, DesktopPoolJoinBounds,
+            };
+            let p = &request.profile.drivers;
+            let bounds = DesktopPoolJoinBounds::checked(
+                p.max_live_original_tasks,
+                p.max_unjoined_original_tasks,
+                p.max_pending_connects,
+                p.max_live_proxies,
+                p.max_owner_metadata_bytes,
+            )
+            .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+            Some(
+                DesktopLocalDriverCustody::prepare(bounds)
+                    .map_err(|_| DesktopLocalRuntimeError::Configuration)?,
+            )
+        }
+        None => None,
+    };
+    let start = async {
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        if let Some(request) = capture_request.as_ref() {
+            return PostgresSidecarSupervisor::start_with_capture_profile(
+                postgres_bundle,
+                app_data_root.as_path(),
+                installation.authority().instance_id(),
+                installation.sidecar_data_dir(),
+                secret_store.as_ref(),
+                &postgres_key_store_service,
+                &request.profile,
+            )
+            .await;
+        }
+        PostgresSidecarSupervisor::start(
+            postgres_bundle,
+            app_data_root.as_path(),
+            installation.authority().instance_id(),
+            installation.sidecar_data_dir(),
+            secret_store.as_ref(),
+            &postgres_key_store_service,
+        )
+        .await
+    };
+    let sidecar = start.await.map_err(map_sidecar_error)?;
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let prepared_data_plane = match capture_custody {
+        Some(custody) => {
+            crate::desktop_local_bootstrap::prepare_running_sidecar_retained(
+                installation,
+                sidecar,
+                &package,
+                custody,
+            )
+            .await
+        }
+        None => prepare_running_sidecar(installation, sidecar, &package).await,
+    }
+    .map_err(map_data_plane_error)?;
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
     let prepared_data_plane = prepare_running_sidecar(installation, sidecar, &package)
         .await
         .map_err(map_data_plane_error)?;
-    let vault_ready = match prepared_data_plane
-        .verify_application_key_material(secret_store.as_ref(), &vault_key_store_service, &package)
-        .await
-    {
+    let verify_vault = async {
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        if let Some(request) = capture_request.as_ref() {
+            return prepared_data_plane
+                .verify_application_key_material_for_capture(
+                    secret_store.as_ref(),
+                    &vault_key_store_service,
+                    &package,
+                    request,
+                )
+                .await;
+        }
+        prepared_data_plane
+            .verify_application_key_material(
+                secret_store.as_ref(),
+                &vault_key_store_service,
+                &package,
+            )
+            .await
+    };
+    let vault_ready = match verify_vault.await {
         Ok(material) => material,
         Err(error) => {
             let original = map_vault_error(error);
@@ -1431,6 +1811,18 @@ pub(crate) async fn prepare_desktop_local_runtime(
             });
         }
     };
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let (key_material, proof, database_origin, mut capture_vault) =
+        vault_ready.into_capture_parts();
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
     let (key_material, proof, database_origin) = vault_ready.into_parts();
     // Copy sealed provenance while the real verified canary and its actual database
     // owner are both live. Namespace strings cannot construct this proof.
@@ -1486,17 +1878,63 @@ pub(crate) async fn prepare_desktop_local_runtime(
     }
     // Bind the existing Computer screen-session port to one bounded Rust hub. This local
     // assembly has no Engine/source or viewer transport; absent targets still fail closed.
-    let screen_hub = match ScreenHub::new(DEFAULT_SCREEN_VIEWERS_PER_STREAM) {
-        Ok(hub) => hub,
-        Err(_) => {
-            return Err(
-                cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
-            );
-        }
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let (screen_sessions, mut capture_screen_seal): (
+        Arc<dyn openbot_application::ScreenSessionAdministration>,
+        Option<capture::materials::CaptureScreenAssemblySeal>,
+    ) = match capture_request.as_ref() {
+        Some(_) => match capture::materials::capture_screen_sessions_from_startup() {
+            Ok((service, seal)) => (service, Some(seal)),
+            Err(_) => {
+                return Err(
+                    cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                );
+            }
+        },
+        None => match ScreenHub::new(DEFAULT_SCREEN_VIEWERS_PER_STREAM) {
+            Ok(hub) => (Arc::new(ScreenSessionService::new(hub)), None),
+            Err(_) => {
+                return Err(
+                    cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                );
+            }
+        },
     };
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
+    let screen_sessions: Arc<dyn openbot_application::ScreenSessionAdministration> =
+        match ScreenHub::new(DEFAULT_SCREEN_VIEWERS_PER_STREAM) {
+            Ok(hub) => Arc::new(ScreenSessionService::new(hub)),
+            Err(_) => {
+                return Err(
+                    cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                );
+            }
+        };
     let auth = data_plane.auth_context().clone();
     let (credential_vault, audit_key, remote_assertions, mcp_oauth_state_key) =
         key_material.into_assembly_parts();
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let mut capture_audit_key = capture_request
+        .as_ref()
+        .map(|_| openbot_domain::vault::SecretBytes::new(audit_key.expose().to_vec()));
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let mut capture_artifact_store = None;
     let remember_preference_repository =
         match openbot_infra::approval_preferences::PostgresRememberPreferenceRepository::new(
             pool.clone(),
@@ -1546,6 +1984,22 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 );
             }
         };
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        if let Some(request) = capture_request.as_ref() {
+            if artifact_store
+                .arm_capture_barrier(request.profile.drivers.max_live_original_tasks)
+                .is_err()
+            {
+                return Err(
+                    cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                );
+            }
+            capture_artifact_store = Some(Arc::clone(&artifact_store));
+        }
         match openbot_infra::artifact_administration::PostgresArtifactAdministration::new(
             data_plane.artifact_dataset_owner(),
             artifact_store,
@@ -1580,6 +2034,76 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 );
             }
         };
+    let ui_preferences = Arc::new(DesktopUiPreferenceAdministration::new(
+        preference_authority,
+        app_data_root.as_path().join(DESKTOP_UI_PREFERENCES_FILE),
+    ));
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let (ui_preferences, mut capture_preferences, mut capture_resources) = match capture_request.as_ref() {
+        Some(request) => {
+            // One original pre-t0 book is shared by both components and carried into Armed.
+            // The local bounds remain ceilings; every actual component admission debits this
+            // same book. Other owners and opaque peaks still require original global closure.
+            let bounds = match request.profile.carrier_bounds() {
+                Ok(bounds) => bounds,
+                Err(_) => {
+                    return Err(
+                        cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                    );
+                }
+            };
+            let resources = match capture_resources.take() {
+                Some(resources) => resources,
+                None => {
+                    return Err(
+                        cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                    );
+                }
+            };
+            if ui_preferences
+                .bind_original_capture_resources(Arc::clone(&resources))
+                .is_err()
+            {
+                return Err(
+                    cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                );
+            }
+            let (adapter, mut preferences) = match ui_preferences
+                .prepare_capture_projection(bounds)
+            {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    return Err(
+                        cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                    );
+                }
+            };
+            let original_installation = match capture_installation.as_ref() {
+                Some(original) => original,
+                None => {
+                    return Err(
+                        cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                    );
+                }
+            };
+            if preferences
+                .verify_original_installation_root(original_installation.original_root())
+                .is_err()
+            {
+                return Err(
+                    cleanup_data_plane(data_plane, DesktopLocalRuntimeError::Application).await,
+                );
+            }
+            // This exact passive owner stays in the startup future across assembly and
+            // cleanup awaits, then moves into the original materials before publication.
+            (adapter, Some(preferences), Some(resources))
+        }
+        None => (ui_preferences, None, None),
+    };
     let assembly = match assemble_postgres_application(PostgresApplicationAssemblyInput {
         pool: pool.clone(),
         listener_database: listener_database.clone(),
@@ -1594,11 +2118,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
         remote_assertions,
         mcp_oauth_state_key,
         policy_store,
-        ui_preferences: Arc::new(DesktopUiPreferenceAdministration::new(
-            preference_authority,
-            app_data_root.as_path().join(DESKTOP_UI_PREFERENCES_FILE),
-        )),
-        screen_sessions: Arc::new(ScreenSessionService::new(screen_hub)),
+        ui_preferences,
+        screen_sessions,
         artifacts,
         #[cfg(target_os = "macos")]
         runtime_capabilities: Some(capability_factory.clone()),
@@ -1648,6 +2169,40 @@ pub(crate) async fn prepare_desktop_local_runtime(
             cleanup_assembly(data_plane, assembly, DesktopLocalRuntimeError::Application).await,
         );
     }
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    if capture_request.is_some() {
+        let bound = match (capture_screen_seal.as_mut(), capture_resources.as_ref()) {
+            (Some(seal), Some(resources)) => {
+                // The original seal was one Weak screen field. Charge only the added
+                // requested static layout in the same pre-t0 book, once before binding.
+                let added_metadata =
+                    core::mem::size_of::<capture::materials::CaptureScreenAssemblySeal>()
+                        .checked_sub(core::mem::size_of::<
+                            std::sync::Weak<dyn openbot_application::ScreenSessionAdministration>,
+                        >())
+                        .and_then(|bytes| u64::try_from(bytes).ok());
+                match added_metadata {
+                    Some(bytes) => capture::reserve_capture_resources(resources, 0, bytes)
+                        .and_then(|()| seal.bind_original_desktop_assembly(&assembly)),
+                    None => Err(
+                        openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::BoundsOverflow,
+                    ),
+                }
+            }
+            _ => Err(
+                openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::MaterialMissing,
+            ),
+        };
+        if bound.is_err() {
+            return Err(
+                cleanup_assembly(data_plane, assembly, DesktopLocalRuntimeError::Application).await,
+            );
+        }
+    }
     let agent_host = match start_desktop_agent_host(DesktopAgentHostInput {
         pool,
         model_dataset_binding: Arc::clone(&assembly.model_dataset_binding),
@@ -1677,6 +2232,52 @@ pub(crate) async fn prepare_desktop_local_runtime(
         }
     };
     let transport = Arc::new(InProcessTransport::new(Arc::clone(&assembly.application)));
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    if let Some(request) = capture_request.as_ref() {
+        // The fresh original transport has not been given to any consumer yet. Bind the
+        // exact same pre-t0 book; no replacement identity, allowance or clock is created.
+        let resources = match capture_resources.as_ref() {
+            Some(resources) => resources,
+            None => {
+                return Err(cleanup_agent_host(
+                    data_plane,
+                    assembly,
+                    agent_host,
+                    DesktopLocalRuntimeError::Application,
+                )
+                .await);
+            }
+        };
+        let bounds = match request.profile.carrier_bounds() {
+            Ok(bounds) => bounds,
+            Err(_) => {
+                return Err(cleanup_agent_host(
+                    data_plane,
+                    assembly,
+                    agent_host,
+                    DesktopLocalRuntimeError::Application,
+                )
+                .await);
+            }
+        };
+        if transport
+            .bind_original_capture_resources(Arc::clone(resources))
+            .and_then(|()| transport.arm_capture_retention(&bounds))
+            .is_err()
+        {
+            return Err(cleanup_agent_host(
+                data_plane,
+                assembly,
+                agent_host,
+                DesktopLocalRuntimeError::Application,
+            )
+            .await);
+        }
+    }
     let opened_protocol = match ui {
         DesktopUiResource::Path(dist) => DesktopTauriProtocol::open(dist, Arc::clone(&transport)),
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
@@ -1790,11 +2391,39 @@ pub(crate) async fn prepare_desktop_local_runtime(
                         .await);
                     }
                 };
-            Arc::new(
-                protocol.with_first_frame_projection(DesktopUiPreferenceStore::new(
+            #[cfg(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            ))]
+            let first_frame_projection = if capture_request.is_some() {
+                match capture_preferences.as_ref() {
+                    Some(preferences) => preferences.original_store().clone(),
+                    None => {
+                        protocol.close_request_bindings();
+                        return Err(cleanup_agent_host(
+                            data_plane,
+                            assembly,
+                            agent_host,
+                            DesktopLocalRuntimeError::Application,
+                        )
+                        .await);
+                    }
+                }
+            } else {
+                DesktopUiPreferenceStore::new(
                     app_data_root.as_path().join(DESKTOP_UI_PREFERENCES_FILE),
-                )),
-            )
+                )
+            };
+            #[cfg(not(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            )))]
+            let first_frame_projection = DesktopUiPreferenceStore::new(
+                app_data_root.as_path().join(DESKTOP_UI_PREFERENCES_FILE),
+            );
+            Arc::new(protocol.with_first_frame_projection(first_frame_projection))
         }
         Err(_) => {
             return Err(cleanup_agent_host(
@@ -1834,6 +2463,65 @@ pub(crate) async fn prepare_desktop_local_runtime(
     let application = Arc::clone(&assembly.application);
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     let artifact_administration_for_tests = Arc::clone(&artifact_administration);
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    let capture_armed = if let Some(request) = capture_request {
+        let capture = match (
+            capture_control.take(),
+            capture_vault.take(),
+            capture_artifact_store.take(),
+            capture_audit_key.take(),
+            capture_installation.take(),
+            capture_screen_seal.take(),
+            capture_preferences.take(),
+            capture_resources.take(),
+        ) {
+            (
+                Some(control),
+                Some(vault),
+                Some(store),
+                Some(audit_key),
+                Some(installation),
+                Some(screen),
+                Some(preferences),
+                Some(resources),
+            ) => capture::ArmedNormalCapture::from_original_startup(
+                request,
+                control,
+                vault,
+                store,
+                openbot_infra::repo::audit::AuditEventRepo::new(data_plane.pool().clone()),
+                audit_key,
+                capture::NormalCaptureMaterials::from_original_installation(
+                    installation,
+                    screen,
+                    preferences,
+                ),
+                resources,
+            ),
+            _ => {
+                Err(openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::MaterialMissing)
+            }
+        };
+        match capture {
+            Ok(capture) => Some(capture),
+            Err(_) => {
+                protocol.close_request_bindings();
+                return Err(cleanup_agent_host(
+                    data_plane,
+                    assembly,
+                    agent_host,
+                    DesktopLocalRuntimeError::Application,
+                )
+                .await);
+            }
+        }
+    } else {
+        None
+    };
     let owner: Box<dyn RuntimeShutdownOwner> = Box::new(DesktopLocalBackgroundOwner {
         lifecycle: Arc::clone(&lifecycle),
         transport,
@@ -1842,6 +2530,12 @@ pub(crate) async fn prepare_desktop_local_runtime(
         data_plane: Some(data_plane),
         _remember_preference_repository: remember_preference_repository,
         read_lifecycle: artifact_administration.read_authority().read_lifecycle(),
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        capture_armed,
     });
     Ok(PreparedDesktopLocalRuntime {
         auth,

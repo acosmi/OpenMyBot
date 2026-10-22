@@ -38,7 +38,7 @@ struct Record {
     phase: MasterJournalPhase,
 }
 
-pub(super) struct MasterInitializationJournal {
+pub(crate) struct MasterInitializationJournal {
     path: PathBuf,
     file: File,
     bytes: Vec<u8>,
@@ -140,6 +140,131 @@ impl MasterInitializationJournal {
     ) -> Result<(), JournalError> {
         validate_record(owner, &self.record)?;
         ensure_current(owner, &self.path, &self.file, &self.bytes)
+    }
+
+    /// Check the exact original file after the normal database owner has closed.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(super) fn revalidate_retained(&self) -> Result<(), JournalError> {
+        if self.record.phase != MasterJournalPhase::CanaryConfirmed
+            || !matches_file(&self.path, &self.file, &self.bytes, 1)
+        {
+            return Err(JournalError::ReconciliationRequired);
+        }
+        Ok(())
+    }
+
+    /// Runtime validation of the same confirmed journal; no reopen or duplicate.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(super) fn revalidate_retained_before(
+        &self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+        clock.require_effect()?;
+        if self.record.phase != MasterJournalPhase::CanaryConfirmed
+            || self.bytes.is_empty() || self.bytes.len() > MAX_BYTES
+        {
+            return Err(Fault::SourceChanged);
+        }
+        clock.require_effect()?;
+        let observed_named = fs::symlink_metadata(&self.path);
+        clock.require_effect()?;
+        let before = observed_named.map_err(|_| Fault::IoFailure)?;
+        clock.require_effect()?;
+        let observed_held = self.file.metadata();
+        clock.require_effect()?;
+        let held = observed_held.map_err(|_| Fault::IoFailure)?;
+        let identity = |m: &fs::Metadata| {
+            (m.dev(), m.ino(), m.uid(), m.mode(), m.nlink(), m.len(),
+                m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec())
+        };
+        if !shape(&before, self.bytes.len()) || !shape(&held, self.bytes.len())
+            || !same(&before, &held) || nlink(&held) != Some(1)
+            || held.uid() != rustix::process::geteuid().as_raw()
+            || held.mode() & 0o7777 != 0o600
+            || identity(&before) != identity(&held)
+        {
+            return Err(Fault::SourceChanged);
+        }
+        // A fixed bounded buffer replaces the startup matcher's unclocked temporary Vec.
+        let mut value = [0_u8; MAX_BYTES];
+        let mut offset = 0;
+        while offset < self.bytes.len() {
+            clock.require_effect()?;
+            let observed = self.file.read_at(&mut value[offset..self.bytes.len()], offset as u64);
+            clock.require_effect()?;
+            match observed {
+                Ok(0) => return Err(Fault::SourceChanged),
+                Ok(n) => offset = offset.checked_add(n).ok_or(Fault::BoundsOverflow)?,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(Fault::IoFailure),
+            }
+        }
+        let mut tail = [0_u8; 1];
+        loop {
+            clock.require_effect()?;
+            let observed = self.file.read_at(&mut tail, self.bytes.len() as u64);
+            clock.require_effect()?;
+            match observed {
+                Ok(0) => break,
+                Ok(_) => return Err(Fault::SourceChanged),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(Fault::IoFailure),
+            }
+        }
+        if value[..self.bytes.len()] != self.bytes[..] {
+            return Err(Fault::SourceChanged);
+        }
+        clock.require_effect()?;
+        let observed_named = fs::symlink_metadata(&self.path);
+        clock.require_effect()?;
+        let after = observed_named.map_err(|_| Fault::IoFailure)?;
+        clock.require_effect()?;
+        let observed_held = self.file.metadata();
+        clock.require_effect()?;
+        let held_after = observed_held.map_err(|_| Fault::IoFailure)?;
+        if !shape(&after, self.bytes.len()) || !shape(&held_after, self.bytes.len())
+            || !same(&after, &held_after) || nlink(&held_after) != Some(1)
+            || identity(&after) != identity(&held_after)
+            || identity(&held) != identity(&held_after)
+        {
+            return Err(Fault::SourceChanged);
+        }
+        clock.require_effect()
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(super) fn retained_material(&self) -> Result<(File, Vec<u8>), JournalError> {
+        self.revalidate_retained()?;
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|_| JournalError::Unavailable)?;
+        self.revalidate_retained()?;
+        Ok((file, self.bytes.clone()))
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(super) fn into_retained_material(self) -> (File, Vec<u8>) {
+        // The unique parent validates immediately before this pure, infallible ownership move.
+        (self.file, self.bytes)
     }
 
     pub(super) fn revalidate_absent(

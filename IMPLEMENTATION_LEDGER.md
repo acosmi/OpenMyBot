@@ -2243,3 +2243,14 @@ V7-IMPL-044 / PR #223: The native PostgreSQL maintenance toolchain completed its
 The affected Desktop libtest was compiled again and both declaration lists were checked on c1111646 (117 total, 6 ignored). Five other native test units, covering eight scenarios including streamed-WAL restore and restart, retain their original successful executions and independently reviewed source applicability. Sixteen ordinary directed tests and trusted-consumer verification likewise retain their separately qualified original evidence. These are distinct evidence roles, not six fresh native executions on the final candidate.
 
 This delivery is limited to the maintenance toolchain prerequisite. Complete application capture, sealed backup and restore activation remain unfinished. Earlier failures, administrative unknown outcomes and the two-file strict legacy scope hold remain recorded; source authentication does not establish platform signing or production release acceptance. Full CI and manual Actions were not run.
+
+
+V7-IMPL-045 — Draft capture candidate; not delivered.
+
+Adds the normal-exit capture pipeline, bounded material collection and an independent authenticated, encrypted PostgreSQL carrier. The implementation retains original worker handles, stage acknowledgements, key and data readbacks, and checked filesystem and secret accounting.
+
+Current directed tests passed: 18 Desktop resource/control tests, 13 carrier tests and 30 archive regression tests. Independent execution review of all three suites is recorded separately. The archive tests reuse the current Infra test executable without another build. These results do not establish normal application capture or recovery.
+
+Remaining work includes password-copy bounds for subscription lifetimes, the full SQL shared-buffer allocation bound, typed-canary zeroization and normal capture/replay/restore acceptance. This candidate remains Draft; merge and complete-backend acceptance are pending. Full CI and manual Actions were not run.
+
+Project websites: [wrokbot.com](https://wrokbot.com) (primary) and [grokbot.si](https://grokbot.si).

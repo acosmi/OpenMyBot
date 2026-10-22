@@ -19,7 +19,7 @@ use openbot_application::tenant::package::{
 };
 use openbot_contracts::engine::ENGINE_RELEASE_EPOCH;
 use openbot_domain::vault::SecretBytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::postgres_sidecar::{
@@ -51,6 +51,10 @@ pub const RELEASE_MANIFEST_FILE: &str = "wrok-bot-release.json";
 /// The sole installation-bound variable in the release's first-party brand template.
 pub const INSTANCE_BRAND_TEMPLATE: &str =
     "tenant:\n  id: ${WROK_BOT_INSTANCE_TENANT}\n  product_name: Wrok Bot\n";
+
+mod capture_request;
+use capture_request::CaptureField;
+pub(crate) use capture_request::{CaptureProfile, ReviewedNormalCaptureRequest};
 
 const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const TENANT_FILE_MAX_BYTES: u64 = 1024 * 1024;
@@ -129,16 +133,18 @@ struct ReleaseManifest {
     vault_key_store_service: String,
     provider: ProviderInput,
     agent_budgets: AgentBudgets,
+    #[serde(default)]
+    normal_capture: CaptureField,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ResourceTree {
     root: String,
     files: Vec<ResourceFile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ResourceFile {
     path: String,
@@ -162,7 +168,7 @@ struct ProviderInput {
     egress_allow_cidrs: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AgentBudgets {
     stall_timeout_ms: Option<u64>,
@@ -178,7 +184,10 @@ impl ReleaseManifest {
         let manifest: Self =
             serde_json::from_slice(bytes).map_err(|_| DesktopReleaseError::Manifest)?;
         if manifest.schema != "wrok-bot-desktop-release"
-            || manifest.schema_version != 1
+            || !matches!(
+                (&manifest.schema_version, &manifest.normal_capture),
+                (1, CaptureField::Missing) | (2, CaptureField::Null | CaptureField::Request(_))
+            )
             || manifest.product_name != PRODUCT_NAME
             || manifest.bundle_identifier != BUNDLE_IDENTIFIER
             || manifest.scheme != PROTOCOL_SCHEME
@@ -195,6 +204,9 @@ impl ReleaseManifest {
             || decode_digest(&manifest.postgres.manifest_sha256).is_none()
         {
             return Err(DesktopReleaseError::Manifest);
+        }
+        if let CaptureField::Request(request) = &manifest.normal_capture {
+            request.validate()?;
         }
         manifest.ui.inventory(static_asset_max_bytes)?;
         let tenant_inventory = manifest.tenant.inventory(|_| TENANT_FILE_MAX_BYTES)?;
@@ -284,6 +296,7 @@ pub struct VerifiedDesktopRelease {
     postgres: VerifiedPostgresBundle,
     application: DesktopLocalApplicationInput,
     tenant: VerifiedTenantTemplate,
+    capture: Option<ReviewedNormalCaptureRequest>,
 }
 
 impl core::fmt::Debug for VerifiedDesktopRelease {
@@ -311,6 +324,10 @@ impl VerifiedDesktopRelease {
         }
         let manifest = ReleaseManifest::parse(&bytes)?;
         let application = manifest.application_input()?;
+        let mut capture = match manifest.normal_capture {
+            CaptureField::Request(request) => Some(request.verify(root, expected.0)?),
+            CaptureField::Missing | CaptureField::Null => None,
+        };
         let ui_files = verify_tree(root, &manifest.ui, static_asset_max_bytes)?;
         let ui = VerifiedUiAssets::from_verified_release(ui_files)
             .map_err(|_| DesktopReleaseError::Resource)?;
@@ -325,11 +342,32 @@ impl VerifiedDesktopRelease {
         let postgres =
             VerifiedPostgresBundle::open(root.join(&manifest.postgres.root), expected_pg, &signer)
                 .map_err(|_| DesktopReleaseError::Postgres)?;
+        // Only these already verified release inputs are sealed. The original maintenance
+        // verify/FD/error order above is unchanged; nothing is published while DATA is absent.
+        if let Some(capture) = capture.as_mut() {
+            capture.bind_original_release_compatibility(
+                (
+                    manifest.schema_version,
+                    manifest.core_version,
+                    manifest.release_epoch,
+                    manifest.platform,
+                    manifest.arch,
+                ),
+                (manifest.ui, manifest.tenant),
+                (
+                    manifest.postgres.root,
+                    manifest.postgres.manifest_sha256,
+                    manifest.postgres.key_store_service,
+                ),
+                manifest.agent_budgets,
+            )?;
+        }
         Ok(Self {
             ui,
             postgres,
             application,
             tenant,
+            capture,
         })
     }
 
@@ -355,11 +393,12 @@ impl VerifiedDesktopRelease {
         )
         .map_err(|_| DesktopReleaseError::Application)?;
         let tenant = self.tenant;
-        Ok(DesktopLocalRuntimeConfig::new(
-            release,
-            self.application,
-            move |authority| tenant.bind(authority.auth_context().tenant().as_str()),
-        ))
+        Ok(
+            DesktopLocalRuntimeConfig::new(release, self.application, move |authority| {
+                tenant.bind(authority.auth_context().tenant().as_str())
+            })
+            .with_reviewed_normal_capture(self.capture),
+        )
     }
 }
 

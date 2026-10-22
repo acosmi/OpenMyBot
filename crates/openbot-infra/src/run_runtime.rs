@@ -148,8 +148,20 @@ fn invalid_cancel_acceptance_code(payload: &Value) -> &'static str {
 /// Production outbox relay 生命周期句柄。
 pub struct RunRelay {
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
     listener: Option<JoinHandle<()>>,
+    capture_stop_failure: Option<RunRelayStopFailure>,
+    capture_stop_requested: bool,
+    capture_stop_complete: bool,
+}
+
+/// A real original relay/listener join failure; no SQL or server text is exposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunRelayStopFailure {
+    /// The original task was cancelled.
+    Cancelled,
+    /// The original task panicked.
+    Panicked,
 }
 
 impl core::fmt::Debug for RunRelay {
@@ -167,8 +179,11 @@ impl RunRelay {
         let task = tokio::spawn(supervise_run_relay(runtime, consumer, stop_rx, wake));
         Self {
             stop,
-            task,
+            task: Some(task),
             listener: None,
+            capture_stop_failure: None,
+            capture_stop_requested: false,
+            capture_stop_complete: false,
         }
     }
 
@@ -194,18 +209,52 @@ impl RunRelay {
         )));
         Self {
             stop,
-            task,
+            task: Some(task),
             listener,
+            capture_stop_failure: None,
+            capture_stop_requested: false,
+            capture_stop_complete: false,
         }
     }
 
     /// 停止 claim 新工作并等待当前一次原子操作收口。
-    pub async fn stop(self) {
-        self.stop.send_replace(true);
-        let _ = self.task.await;
-        if let Some(listener) = self.listener {
-            let _ = listener.await;
+    pub async fn stop(mut self) {
+        let _ = self.stop_for_capture().await;
+    }
+
+    /// Borrow both original handles, so a cancelled caller cannot detach either task.
+    pub async fn stop_for_capture(&mut self) -> Result<(), RunRelayStopFailure> {
+        if self.capture_stop_complete {
+            return self.capture_stop_failure.map_or(Ok(()), Err);
         }
+        if !self.capture_stop_requested {
+            self.stop.send_replace(true);
+            self.capture_stop_requested = true;
+        }
+        if let Some(task) = self.task.as_mut() {
+            if let Err(error) = task.await {
+                self.capture_stop_failure
+                    .get_or_insert(if error.is_cancelled() {
+                        RunRelayStopFailure::Cancelled
+                    } else {
+                        RunRelayStopFailure::Panicked
+                    });
+            }
+            self.task = None;
+        }
+        if let Some(listener) = self.listener.as_mut() {
+            if let Err(error) = listener.await {
+                self.capture_stop_failure
+                    .get_or_insert(if error.is_cancelled() {
+                        RunRelayStopFailure::Cancelled
+                    } else {
+                        RunRelayStopFailure::Panicked
+                    });
+            }
+            self.listener = None;
+        }
+        self.capture_stop_complete = true;
+        self.capture_stop_failure.map_or(Ok(()), Err)
     }
 }
 

@@ -392,6 +392,22 @@ impl core::fmt::Debug for PostgresStartLock {
     }
 }
 
+enum StartControlInspection<'a> {
+    Ordinary,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    Reviewed(&'a crate::desktop_release::CaptureProfile),
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
+    _Lifetime(std::marker::PhantomData<&'a ()>),
+}
+
 impl PostgresStartLock {
     /// Acquire the persistent kernel guard, then atomically publish this start's evidence.
     ///
@@ -403,7 +419,13 @@ impl PostgresStartLock {
         instance_id: &str,
         bundle_digest: PostgresBundleDigest,
     ) -> Result<Self, PostgresSidecarError> {
-        Self::acquire_inner(app_data_root, instance_id, bundle_digest, None)
+        Self::acquire_inner(
+            app_data_root,
+            instance_id,
+            bundle_digest,
+            None,
+            StartControlInspection::Ordinary,
+        )
     }
 
     #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
@@ -413,7 +435,13 @@ impl PostgresStartLock {
         bundle_digest: PostgresBundleDigest,
         data_dir: &Path,
     ) -> Result<Self, PostgresSidecarError> {
-        Self::acquire_inner(app_data_root, instance_id, bundle_digest, Some(data_dir))
+        Self::acquire_inner(
+            app_data_root,
+            instance_id,
+            bundle_digest,
+            Some(data_dir),
+            StartControlInspection::Ordinary,
+        )
     }
 
     fn acquire_inner(
@@ -421,8 +449,26 @@ impl PostgresStartLock {
         instance_id: &str,
         bundle_digest: PostgresBundleDigest,
         data_dir: Option<&Path>,
+        control_inspection: StartControlInspection<'_>,
     ) -> Result<Self, PostgresSidecarError> {
         let kernel_guard = KernelStartLock::acquire(app_data_root, instance_id)?;
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        {
+            let app = crate::tauri_background::capture::open_app_data_read_only(app_data_root)
+                .map_err(|_| PostgresSidecarError::StartLockRecoveryRequired)?
+                .ok_or(PostgresSidecarError::StartLockRecoveryRequired)?;
+            let profile = match &control_inspection {
+                StartControlInspection::Ordinary => None,
+                StartControlInspection::Reviewed(profile) => Some(*profile),
+            };
+            crate::tauri_background::capture::control::inspect_startup_control(&app, profile)
+                .map_err(|_| PostgresSidecarError::StartLockRecoveryRequired)?;
+        }
+        let _ = control_inspection;
         let path = app_data_root.join(format!(".postgresql-17-{instance_id}.start-lock-v1"));
         let mut nonce = [0_u8; LOCK_NONCE_BYTES];
         getrandom::fill(&mut nonce).map_err(|error| {
@@ -978,7 +1024,7 @@ impl core::fmt::Debug for ReviewedPostgresKeyStoreService {
 
 /// Exact 256-bit random PostgreSQL password encoded as 64 lowercase hexadecimal bytes.
 #[cfg(feature = "postgres-key-store")]
-pub struct PostgresScramSecret(SecretBytes);
+pub struct PostgresScramSecret(Arc<SecretBytes>);
 
 #[cfg(feature = "postgres-key-store")]
 impl PostgresScramSecret {
@@ -1001,7 +1047,7 @@ impl PostgresScramSecret {
         {
             return Err(PostgresSecretStoreError::Corrupt);
         }
-        Ok(Self(stored.0))
+        Ok(Self(Arc::new(stored.0)))
     }
 
     /// Explicitly expose the password only to `initdb`/PostgreSQL process framing.
@@ -1156,7 +1202,7 @@ impl core::fmt::Debug for PostgresSidecarConnection<'_> {
 pub struct RunningPostgresSidecar {
     child: Option<Child>,
     lock: Option<PostgresStartLock>,
-    secret: PostgresScramSecret,
+    secret: Option<PostgresScramSecret>,
     bundle: VerifiedPostgresBundle,
     data_dir: PathBuf,
     port: u16,
@@ -1251,7 +1297,10 @@ impl RunningPostgresSidecar {
     pub const fn connection(&self) -> PostgresSidecarConnection<'_> {
         PostgresSidecarConnection {
             port: self.port,
-            secret: &self.secret,
+            secret: self
+                .secret
+                .as_ref()
+                .expect("running sidecar owns original SCRAM"),
         }
     }
 
@@ -1344,6 +1393,334 @@ impl RunningPostgresSidecar {
     }
 }
 
+/// Internal stopped-normal capsule. The original start-lock, secret and journal never leave it.
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) struct CaptureStoppedPostgres {
+    original: RunningPostgresSidecar,
+    normal_status: std::process::ExitStatus,
+    stop_status: std::process::ExitStatus,
+}
+
+/// The sole registered capture entry consumes the genuine post-stop consumer permit.
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+pub(crate) async fn start_capture_source(
+    permit: crate::tauri_background::capture::CaptureStartPermit,
+    operation: &crate::tauri_background::capture::CaptureOperation,
+) -> Result<crate::postgres_maintenance::capture::CaptureSourceOwner,
+            crate::tauri_background::capture::RetainedCaptureFailure> {
+    crate::postgres_maintenance::capture::CaptureSourceOwner::start_from_permit(permit, operation).await
+}
+
+/// An error retains every original handle; it is not a normal-closed capability.
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) struct RetainedSidecarCaptureFailure {
+    original: Option<RunningPostgresSidecar>,
+    helper: Option<Child>,
+    fault: openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
+    // Keep the original unwind payload resident without running its destructor here.
+    panic_payload: Option<Box<dyn std::any::Any + Send + 'static>>,
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl RetainedSidecarCaptureFailure {
+    pub(crate) fn fault(&self) -> openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault {
+        self.fault
+    }
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl RunningPostgresSidecar {
+    /// The caller stores this future's original task before awaiting it. No timeout drops it.
+    pub(crate) async fn stop_for_capture(
+        self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<CaptureStoppedPostgres, RetainedSidecarCaptureFailure> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        let mut retained = RetainedSidecarCaptureFailure {
+            original: Some(self),
+            helper: None,
+            fault: Fault::ClosingPending,
+            panic_payload: None,
+        };
+        // The original owners stay outside this borrowed future's unwind boundary.
+        // Poll failure is terminal for this one attempt; no replacement task or retry is made.
+        let result = {
+            let mut stop = std::pin::pin!(retained.stop_original(clock));
+            std::future::poll_fn(|context| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    std::future::Future::poll(stop.as_mut(), context)
+                })) {
+                    Ok(poll) => poll.map(Ok),
+                    Err(payload) => std::task::Poll::Ready(Err(payload)),
+                }
+            })
+            .await
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => {
+                retained.panic_payload = Some(payload);
+                Err(Fault::ClosingPending)
+            }
+        };
+        match result {
+            Ok((normal_status, stop_status)) => {
+                let Some(original) = retained.original.take() else {
+                    retained.fault = Fault::IntentMismatch;
+                    return Err(retained);
+                };
+                Ok(CaptureStoppedPostgres {
+                    original,
+                    normal_status,
+                    stop_status,
+                })
+            }
+            Err(fault) => {
+                retained.fault = fault;
+                Err(retained)
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl RetainedSidecarCaptureFailure {
+    async fn stop_original(
+        &mut self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<
+        (std::process::ExitStatus, std::process::ExitStatus),
+        openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
+    > {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        clock.require_effect()?;
+        let original = self.original.as_mut().ok_or(Fault::IntentMismatch)?;
+        original
+            .ensure_owner_current()
+            .map_err(|_| Fault::SourceChanged)?;
+        let lock = original.lock.as_ref().ok_or(Fault::SourceChanged)?;
+        clock.require_effect()?;
+        original
+            .startup_journal
+            .mark_stop(lock)
+            .map_err(|_| Fault::IoFailure)?;
+        clock.require_effect()?;
+        let mut command = original
+            .bundle
+            .checked_command(PostgresProgram::Control)
+            .map_err(|_| Fault::SourceChanged)?;
+        command
+            .arg("-D")
+            .arg(&original.data_dir)
+            .args(["-m", "fast", "-w", "-t", "5", "stop"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        // Store the actual helper before its first wait, rather than command.status().
+        clock.require_effect()?;
+        self.helper = Some(command.spawn().map_err(|_| Fault::IoFailure)?);
+        clock.require_closing()?;
+        let remaining = clock
+            .closing_remaining_ns()?
+            .min(u64::try_from(SHUTDOWN_DEADLINE.as_nanos()).map_err(|_| Fault::BoundsOverflow)?);
+        if remaining == 0 {
+            return Err(Fault::ClosingPending);
+        }
+        let stop_status = tokio::time::timeout(
+            Duration::from_nanos(remaining),
+            self.helper.as_mut().ok_or(Fault::IntentMismatch)?.wait(),
+        )
+        .await
+        .map_err(|_| Fault::ClosingPending)?
+        .map_err(|_| Fault::IoFailure)?;
+        clock.require_closing()?;
+        self.helper.take(); // only the actual helper's successful wait permits release
+        if !stop_status.success() {
+            return Err(Fault::SourceChanged);
+        }
+        let original = self.original.as_mut().ok_or(Fault::IntentMismatch)?;
+        let remaining = clock.closing_remaining_ns()?;
+        if remaining == 0 {
+            return Err(Fault::ClosingPending);
+        }
+        let normal_status = tokio::time::timeout(
+            Duration::from_nanos(remaining),
+            original.child.as_mut().ok_or(Fault::IntentMismatch)?.wait(),
+        )
+        .await
+        .map_err(|_| Fault::ClosingPending)?
+        .map_err(|_| Fault::IoFailure)?;
+        clock.require_closing()?;
+        original.child.take(); // the original Child::wait above, never PID absence
+        if !normal_status.success() {
+            return Err(Fault::SourceChanged);
+        }
+        let lock = original.lock.as_ref().ok_or(Fault::SourceChanged)?;
+        clock.require_effect()?;
+        original
+            .startup_journal
+            .confirm_exit(lock)
+            .map_err(|_| Fault::IoFailure)?;
+        clock.require_effect()?;
+        original
+            .startup_journal
+            .capture_exit_material(lock)
+            .map_err(|_| Fault::SourceChanged)?;
+        clock.require_effect()?;
+        // The original kernel/evidence lock is deliberately NOT removed or reacquired here.
+        Ok((normal_status, stop_status))
+    }
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl CaptureStoppedPostgres {
+    pub(crate) fn revalidate(
+        &self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        clock.require_effect()?;
+        if self.original.child.is_some()
+            || !self.normal_status.success()
+            || !self.stop_status.success()
+        {
+            return Err(Fault::SourceChanged);
+        }
+        let lock = self.original.lock.as_ref().ok_or(Fault::SourceChanged)?;
+        lock.ensure_current().map_err(|_| Fault::SourceChanged)?;
+        self.original
+            .startup_journal
+            .capture_exit_material(lock)
+            .map_err(|_| Fault::SourceChanged)?;
+        clock.require_effect()
+    }
+
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.original.data_dir
+    }
+    pub(crate) fn port(&self) -> u16 {
+        self.original.port
+    }
+
+    pub(crate) fn original_scram(&self) -> &[u8] {
+        self.original
+            .secret
+            .as_ref()
+            .expect("stopped capsule retains original SCRAM")
+            .expose()
+    }
+
+    /// Borrow the same original allocation; no password payload is copied or independently minted.
+    pub(crate) fn native_scram_allocation(
+        &self,
+    ) -> Result<Arc<SecretBytes>, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault>
+    {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        let original = self.original.secret.as_ref().ok_or(Fault::SecretInvalid)?;
+        if original.expose().len() != 64 {
+            return Err(Fault::SecretInvalid);
+        }
+        Ok(Arc::clone(&original.0))
+    }
+
+    /// Move the original SCRAM allocation exactly once after all source users have closed.
+    pub(crate) fn take_original_scram(
+        &mut self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<SecretBytes, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        self.revalidate(clock)?;
+        let PostgresScramSecret(secret) =
+            self.original.secret.take().ok_or(Fault::SecretInvalid)?;
+        match Arc::try_unwrap(secret) {
+            Ok(original) => Ok(original),
+            Err(original) => {
+                self.original.secret = Some(PostgresScramSecret(original));
+                Err(Fault::ClosingPending)
+            }
+        }
+    }
+
+    pub(crate) fn exit_journal_material(
+        &self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(File, Vec<u8>), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault>
+    {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        self.revalidate(clock)?;
+        self.original
+            .startup_journal
+            .capture_exit_material(self.original.lock.as_ref().ok_or(Fault::SourceChanged)?)
+            .map_err(|_| Fault::SourceChanged)
+    }
+
+    /// Unit-only comparison with this capsule's original journal-held directory.
+    pub(crate) fn capture_original_data_directory_matches(
+        &self, retained: &File,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        clock.require_effect()?;
+        let actual = self.original.startup_journal
+            .capture_original_data_directory_matches(retained, clock);
+        clock.require_effect()?;
+        actual
+    }
+
+    pub(crate) fn data_directory_file(&self) -> Result<File, PostgresSidecarError> {
+        self.original
+            .startup_journal
+            .capture_data_directory()
+            .map_err(map_startup_journal_error)
+    }
+
+    /// Release only after the later maintenance source has genuinely closed and publication ended.
+    pub(crate) fn release_after_capture(
+        mut self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), RetainedSidecarCaptureFailure> {
+        let check = self.revalidate(clock);
+        if let Err(fault) = check {
+            return Err(RetainedSidecarCaptureFailure {
+                original: Some(self.original),
+                helper: None,
+                fault,
+                panic_payload: None,
+            });
+        }
+        if let Some(lock) = self.original.lock.as_mut() {
+            lock.remove_after_confirmed_exit();
+        }
+        drop(self.original.lock.take());
+        Ok(())
+    }
+}
+
 #[cfg(feature = "postgres-supervisor")]
 impl Drop for RunningPostgresSidecar {
     fn drop(&mut self) {
@@ -1373,13 +1750,61 @@ impl PostgresSidecarSupervisor {
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
     ) -> Result<RunningPostgresSidecar, PostgresSidecarError> {
+        Self::start_inner(
+            bundle,
+            app_data_root,
+            instance_id,
+            data_dir,
+            store,
+            service,
+            StartControlInspection::Ordinary,
+        )
+        .await
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) async fn start_with_capture_profile<S: PostgresSecretStore + ?Sized>(
+        bundle: VerifiedPostgresBundle,
+        app_data_root: &Path,
+        instance_id: &str,
+        data_dir: &Path,
+        store: &S,
+        service: &ReviewedPostgresKeyStoreService,
+        profile: &crate::desktop_release::CaptureProfile,
+    ) -> Result<RunningPostgresSidecar, PostgresSidecarError> {
+        Self::start_inner(
+            bundle,
+            app_data_root,
+            instance_id,
+            data_dir,
+            store,
+            service,
+            StartControlInspection::Reviewed(profile),
+        )
+        .await
+    }
+
+    async fn start_inner<S: PostgresSecretStore + ?Sized>(
+        bundle: VerifiedPostgresBundle,
+        app_data_root: &Path,
+        instance_id: &str,
+        data_dir: &Path,
+        store: &S,
+        service: &ReviewedPostgresKeyStoreService,
+        control_inspection: StartControlInspection<'_>,
+    ) -> Result<RunningPostgresSidecar, PostgresSidecarError> {
         validate_supervisor_paths(app_data_root, instance_id, data_dir)?;
         #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
-        let mut lock = PostgresStartLock::acquire_with_data_dir(
+        let mut lock = PostgresStartLock::acquire_inner(
             app_data_root,
             instance_id,
             PostgresBundleDigest(bundle.manifest_sha256),
-            data_dir,
+            Some(data_dir),
+            control_inspection,
         )?;
         #[cfg(not(all(feature = "postgres-supervisor", target_os = "macos")))]
         let mut lock = PostgresStartLock::acquire(
@@ -1574,7 +1999,7 @@ impl PostgresSidecarSupervisor {
         Ok(RunningPostgresSidecar {
             child: Some(child),
             lock: Some(lock),
-            secret,
+            secret: Some(secret),
             bundle,
             data_dir: data_dir.to_owned(),
             port,
@@ -3066,7 +3491,7 @@ mod tests {
             );
             assert!(marker.exists());
             fs::remove_file(&marker).unwrap();
-            let secret = PostgresScramSecret(SecretBytes::new(vec![b'a'; 64]));
+            let secret = PostgresScramSecret(Arc::new(SecretBytes::new(vec![b'a'; 64])));
             let data = bundle_root.join("not-created-data");
             let result = match phase {
                 0 => verify_program_versions(&bundle).await,
@@ -3179,7 +3604,7 @@ mod tests {
         let running = RunningPostgresSidecar {
             child: Some(child),
             lock: Some(lock),
-            secret: PostgresScramSecret(SecretBytes::new(vec![b'a'; 64])),
+            secret: Some(PostgresScramSecret(Arc::new(SecretBytes::new(vec![b'a'; 64])))),
             bundle,
             data_dir,
             port: 0,
@@ -5327,7 +5752,7 @@ mod tests {
         let leaked = LeakedPostgres {
             identity,
             port: running.port,
-            password: running.secret.expose().to_vec(),
+            password: running.secret.as_ref().expect("running postgres SCRAM secret").expose().to_vec(),
         };
         if let Some(child) = running.child.take() {
             std::mem::forget(child);

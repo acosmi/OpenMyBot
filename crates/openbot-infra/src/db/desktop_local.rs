@@ -13,6 +13,13 @@ use openbot_domain::vault::SecretBytes;
 use tokio_postgres::{Client, Config};
 
 use super::InfraError;
+#[cfg(feature = "desktop-local-vault")]
+use super::pool::connect_config_retained;
+#[cfg(feature = "desktop-local-vault")]
+pub use super::pool::owner::{
+    DesktopCaptureDrivers, DesktopLocalDriverCustody, DesktopPoolJoinBounds,
+    OriginalDriverJoinFact, OriginalDriverJoinOutcome, OriginalDriverRetirement,
+};
 use super::pool::{DatabasePool, connect_config};
 
 const HOST: &str = "127.0.0.1";
@@ -20,7 +27,7 @@ const ADMIN_DATABASE: &str = "postgres";
 const APPLICATION_DATABASE: &str = "openbot";
 const APPLICATION_NAME: &str = "openbot-desktop-local";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const APPLICATION_POOL_SIZE: usize = 16;
+pub(super) const APPLICATION_POOL_SIZE: usize = 16;
 const SCRAM_SECRET_LEN: usize = 64;
 
 const DATABASE_FACTS_SQL: &str = "SELECT pg_get_userbyid(datdba)::text, pg_encoding_to_char(encoding)::text, \
@@ -46,6 +53,8 @@ pub struct DesktopLocalDatabase {
     pool: DatabasePool,
     origin: DesktopLocalDatabaseOrigin,
     owner: Arc<()>,
+    #[cfg(feature = "desktop-local-vault")]
+    retention: Option<DesktopLocalDriverCustody>,
 }
 
 /// Non-transferable proof that this attested owner created the fixed business database now.
@@ -62,6 +71,8 @@ pub struct UnattestedDesktopLocalAdmin {
     pool: DatabasePool,
     port: u16,
     password: SecretBytes,
+    #[cfg(feature = "desktop-local-vault")]
+    retention: Option<DesktopLocalDriverCustody>,
 }
 
 impl UnattestedDesktopLocalAdmin {
@@ -80,6 +91,8 @@ impl UnattestedDesktopLocalAdmin {
             pool: self.pool,
             port: self.port,
             password: self.password,
+            #[cfg(feature = "desktop-local-vault")]
+            retention: self.retention,
         }
     }
 }
@@ -95,6 +108,8 @@ pub struct AttestedDesktopLocalAdmin {
     pool: DatabasePool,
     port: u16,
     password: SecretBytes,
+    #[cfg(feature = "desktop-local-vault")]
+    retention: Option<DesktopLocalDriverCustody>,
 }
 
 impl AttestedDesktopLocalAdmin {
@@ -124,12 +139,38 @@ impl AttestedDesktopLocalAdmin {
         self.pool.close();
         let origin = origin?;
 
+        let configuration = local_config(
+            self.port,
+            self.password.expose(),
+            LocalDatabase::Application,
+        );
+        #[cfg(feature = "desktop-local-vault")]
+        let pool = match self.retention.as_ref() {
+            Some(custody) => {
+                connect_config_retained(
+                    configuration,
+                    APPLICATION_POOL_SIZE,
+                    CONNECT_TIMEOUT,
+                    "Desktop Local OpenBot 数据库",
+                    custody,
+                    true,
+                )
+                .await
+            }
+            None => {
+                connect_config(
+                    configuration,
+                    APPLICATION_POOL_SIZE,
+                    CONNECT_TIMEOUT,
+                    "Desktop Local OpenBot 数据库",
+                )
+                .await
+            }
+        }
+        .map_err(DesktopLocalDatabaseError::Connect)?;
+        #[cfg(not(feature = "desktop-local-vault"))]
         let pool = connect_config(
-            local_config(
-                self.port,
-                self.password.expose(),
-                LocalDatabase::Application,
-            ),
+            configuration,
             APPLICATION_POOL_SIZE,
             CONNECT_TIMEOUT,
             "Desktop Local OpenBot 数据库",
@@ -140,6 +181,8 @@ impl AttestedDesktopLocalAdmin {
             pool,
             origin,
             owner: Arc::new(()),
+            #[cfg(feature = "desktop-local-vault")]
+            retention: self.retention,
         })
     }
 }
@@ -254,6 +297,37 @@ pub async fn connect_for_attestation(
         pool: admin,
         port,
         password,
+        #[cfg(feature = "desktop-local-vault")]
+        retention: None,
+    })
+}
+
+/// Retain the actual administrative driver before its first connect poll. This is not a live
+/// attestation or capture capability; the existing attestation and business bootstrap still run.
+#[cfg(feature = "desktop-local-vault")]
+pub async fn connect_for_attestation_retained(
+    port: u16,
+    password: SecretBytes,
+    custody: &DesktopLocalDriverCustody,
+) -> Result<UnattestedDesktopLocalAdmin, DesktopLocalDatabaseError> {
+    if port == 0 || !valid_scram_secret(password.expose()) {
+        return Err(DesktopLocalDatabaseError::EndpointInvalid);
+    }
+    let pool = connect_config_retained(
+        local_config(port, password.expose(), LocalDatabase::Admin),
+        1,
+        CONNECT_TIMEOUT,
+        "Desktop Local PostgreSQL 管理库",
+        custody,
+        false,
+    )
+    .await
+    .map_err(DesktopLocalDatabaseError::Connect)?;
+    Ok(UnattestedDesktopLocalAdmin {
+        pool,
+        port,
+        password,
+        retention: Some(custody.shared()),
     })
 }
 

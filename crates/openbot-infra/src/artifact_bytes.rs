@@ -14,7 +14,11 @@ use std::sync::Arc;
 #[cfg(feature = "server-runtime")]
 use std::time::Instant;
 
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault;
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+use crate::backup::whole_pg_capture_stream::CaptureClockCheck;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant};
 
@@ -273,6 +277,147 @@ impl StoreDirectories {
 pub struct ArtifactByteStore {
     directories: Arc<StoreDirectories>,
     max_byte_length: u64,
+}
+
+/// Borrows the original three directory descriptors only inside the frozen snapshot worker.
+/// The caller reserves these fixed observation slots before this factory's first effect.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) struct ArtifactCaptureDirectoryBorrow<'a> {
+    directories: &'a StoreDirectories,
+    clock: &'a dyn CaptureClockCheck,
+    identities: [Identity; 3],
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl ArtifactByteStore {
+    pub(crate) fn capture_original_directories_before<'a>(
+        &'a self,
+        clock: &'a dyn CaptureClockCheck,
+    ) -> Result<ArtifactCaptureDirectoryBorrow<'a>, WholePgCarrierFault> {
+        // Compile-time qualification of the caller's elementary-field fee.
+        const {
+            let thin = (std::mem::size_of::<&()>(), std::mem::align_of::<&()>());
+            let clock = (std::mem::size_of::<&dyn CaptureClockCheck>(),
+                std::mem::align_of::<&dyn CaptureClockCheck>());
+            let word = (std::mem::size_of::<u64>(), std::mem::align_of::<u64>());
+            let a = if thin.1 > clock.1 { thin.1 } else { clock.1 };
+            let a = if a > word.1 { a } else { word.1 };
+            let thin = thin.0.checked_add(thin.1 - 1).expect("capture fee overflow");
+            let clock = clock.0.checked_add(clock.1 - 1).expect("capture fee overflow");
+            let words = word.0.checked_add(word.1 - 1).expect("capture fee overflow")
+                .checked_mul(6).expect("capture fee overflow");
+            let padding = (a - 1).checked_mul(5).expect("capture fee overflow");
+            let upper = thin.checked_add(clock).expect("capture fee overflow")
+                .checked_add(words).expect("capture fee overflow")
+                .checked_add(padding).expect("capture fee overflow");
+            assert!(std::mem::size_of::<ArtifactCaptureDirectoryBorrow<'static>>() <= upper);
+        }
+        // End these three observations before the second, named/held verification pass.
+        // No path open, descriptor duplicate, allocation or new owner is constructed here.
+        let identities = {
+            let root = capture_directory_metadata_before(&self.directories.root, clock)?;
+            let objects = capture_directory_metadata_before(&self.directories.objects, clock)?;
+            let staging = capture_directory_metadata_before(&self.directories.staging, clock)?;
+            for actual in [&root, &objects, &staging] {
+                check_directory(actual, self.directories.owner)
+                    .map_err(|_| WholePgCarrierFault::PathUnsafe)?;
+                if actual.dev() != root.dev() {
+                    return Err(WholePgCarrierFault::SourceChanged);
+                }
+            }
+            [Identity::of(&root), Identity::of(&objects), Identity::of(&staging)]
+        };
+        let original = ArtifactCaptureDirectoryBorrow {
+            directories: &self.directories,
+            clock,
+            identities,
+        };
+        original.verify_original_before()?;
+        Ok(original)
+    }
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl ArtifactCaptureDirectoryBorrow<'_> {
+    pub(crate) fn original_fds(&self) -> (&File, &File, &File) {
+        (&self.directories.root, &self.directories.objects, &self.directories.staging)
+    }
+
+    pub(crate) fn verify_original_before(&self) -> Result<(), WholePgCarrierFault> {
+        let root_before = capture_directory_metadata_before(&self.directories.root, self.clock)?;
+        check_directory(&root_before, self.directories.owner)
+            .map_err(|_| WholePgCarrierFault::PathUnsafe)?;
+        if Identity::of(&root_before) != self.identities[0] {
+            return Err(WholePgCarrierFault::SourceChanged);
+        }
+        for (name, held, expected) in [
+            ("objects", &self.directories.objects, self.identities[1]),
+            ("staging", &self.directories.staging, self.identities[2]),
+        ] {
+            let before = capture_directory_metadata_before(held, self.clock)?;
+            check_directory(&before, self.directories.owner)
+                .map_err(|_| WholePgCarrierFault::PathUnsafe)?;
+            if before.dev() != root_before.dev() || Identity::of(&before) != expected {
+                return Err(WholePgCarrierFault::SourceChanged);
+            }
+            self.clock.require_effect()?;
+            let observed = rustix::fs::statat(
+                &self.directories.root,
+                name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|error| match error {
+                rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => {
+                    WholePgCarrierFault::SourceChanged
+                }
+                _ => WholePgCarrierFault::IoFailure,
+            });
+            // Always observe E after an attempted syscall, including Err. The original
+            // syscall refusal remains the first fault if this postcheck also refuses.
+            let after_effect = self.clock.require_effect();
+            let named = observed?;
+            after_effect?;
+            if rustix::fs::FileType::from_raw_mode(named.st_mode) != rustix::fs::FileType::Directory
+                || named.st_uid != self.directories.owner
+                || u32::from(named.st_mode) & 0o7777 != 0o700
+            {
+                return Err(WholePgCarrierFault::PathUnsafe);
+            }
+            if named.st_dev as u64 != before.dev()
+                || named.st_ino != before.ino()
+                || u64::from(named.st_nlink) != before.nlink()
+                || u64::try_from(named.st_size).ok() != Some(before.len())
+            {
+                return Err(WholePgCarrierFault::SourceChanged);
+            }
+            let after = capture_directory_metadata_before(held, self.clock)?;
+            check_directory(&after, self.directories.owner)
+                .map_err(|_| WholePgCarrierFault::PathUnsafe)?;
+            if after.dev() != root_before.dev() || Identity::of(&after) != expected {
+                return Err(WholePgCarrierFault::SourceChanged);
+            }
+        }
+        let root_after = capture_directory_metadata_before(&self.directories.root, self.clock)?;
+        check_directory(&root_after, self.directories.owner)
+            .map_err(|_| WholePgCarrierFault::PathUnsafe)?;
+        if Identity::of(&root_after) != self.identities[0] {
+            return Err(WholePgCarrierFault::SourceChanged);
+        }
+        self.clock.require_effect()
+    }
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+fn capture_directory_metadata_before(
+    file: &File,
+    clock: &dyn CaptureClockCheck,
+) -> Result<Metadata, WholePgCarrierFault> {
+    clock.require_effect()?;
+    let observed = file.metadata().map_err(|_| WholePgCarrierFault::IoFailure);
+    let after_effect = clock.require_effect();
+    let metadata = observed?;
+    after_effect?;
+    Ok(metadata)
 }
 
 /// 私有 staging 中已经核长度/摘要并 fsync 的成果；不能发布为 available。

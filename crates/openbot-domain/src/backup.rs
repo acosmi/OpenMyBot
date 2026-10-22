@@ -28,6 +28,8 @@ pub mod plan;
 pub mod post_restore;
 pub mod recovery_chunks;
 pub mod recovery_wrap;
+/// Independent complete-PG capture format and bounded in-place AEAD; no source/restore authority.
+pub mod whole_pg_carrier;
 
 #[cfg(test)]
 mod tests;
@@ -58,4 +60,12 @@ pub use recovery_chunks::{
 pub use recovery_wrap::{
     BackupRecoveryBinding, BackupRecoveryEnvelope, open_backup_recovery_wrap,
     seal_backup_recovery_wrap,
+};
+
+pub use whole_pg_carrier::{
+    FrozenWholePgManifest, WholePgBarrierClaim, WholePgCarrierBounds, WholePgCarrierFault,
+    WholePgCoverageClaim, WholePgFrameParts, WholePgFrameSpec, WholePgManifestClaim,
+    WholePgMaterialClaim, WholePgMaterialKind, WholePgOpenCodec, WholePgPresence,
+    WholePgProvenanceClaim, WholePgSealCodec, WholePgSecretBounds, WholePgSecretClassBounds,
+    WholePgSecretClasses, WholePgSourceClaim, whole_pg_secret_matches,
 };

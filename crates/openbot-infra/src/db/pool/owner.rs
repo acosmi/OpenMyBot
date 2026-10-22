@@ -148,6 +148,8 @@ pub(super) struct OwnerSupervisor {
     registry: Mutex<Registry>,
     creations: AtomicUsize,
     fault: watch::Sender<Option<PoolError>>,
+    #[cfg(feature = "desktop-local-vault")]
+    retention: Option<retained::SupervisorRetention>,
 }
 
 impl OwnerSupervisor {
@@ -157,6 +159,19 @@ impl OwnerSupervisor {
             registry: Mutex::new(Registry::default()),
             creations: AtomicUsize::new(0),
             fault,
+            #[cfg(feature = "desktop-local-vault")]
+            retention: None,
+        })
+    }
+
+    #[cfg(feature = "desktop-local-vault")]
+    fn new_retained(retention: retained::SupervisorRetention, registry: Registry) -> Arc<Self> {
+        let (fault, _) = watch::channel(None);
+        Arc::new(Self {
+            registry: Mutex::new(registry),
+            creations: AtomicUsize::new(0),
+            fault,
+            retention: Some(retention),
         })
     }
 
@@ -196,6 +211,10 @@ impl OwnerSupervisor {
         if registry.pending.contains_key(&owner.sequence) {
             self.fail(PoolError::IdentityCollision);
             return Err(PoolError::IdentityCollision);
+        }
+        #[cfg(feature = "desktop-local-vault")]
+        if self.retention.is_some() && registry.pending.len() >= registry.pending.capacity() {
+            return Err(PoolError::CreationLimit);
         }
         registry.pending.insert(owner.sequence, owner);
         Ok(())
@@ -239,6 +258,14 @@ impl OwnerSupervisor {
     }
 
     fn can_return(&self, id: ObjectId, owner: &Arc<DriverOwner>) -> bool {
+        #[cfg(feature = "desktop-local-vault")]
+        if self
+            .retention
+            .as_ref()
+            .is_some_and(|retention| retention.ensure_running().is_err())
+        {
+            return false;
+        }
         if self.current_fault().is_some() || !owner.live() {
             return false;
         }
@@ -271,6 +298,10 @@ impl OwnerSupervisor {
                 .ok_or(PoolError::OwnershipUnavailable)?;
             if !Arc::ptr_eq(pending, &owner) || !owner.live() {
                 return Err(PoolError::OwnershipUnavailable);
+            }
+            #[cfg(feature = "desktop-local-vault")]
+            if self.retention.is_some() && registry.bound.len() >= registry.bound.capacity() {
+                return Err(PoolError::CreationLimit);
             }
             registry.bound.insert(id, Arc::clone(&owner));
             owner
@@ -312,7 +343,21 @@ impl OwnerSupervisor {
         if stock.is_closed() {
             return Err(PoolError::Closed);
         }
-        let trace = Arc::new(CheckoutTrace::new(self, session_permit));
+        #[cfg(feature = "desktop-local-vault")]
+        if let Some(retention) = self.retention.as_ref() {
+            retention.ensure_running()?;
+        }
+        #[cfg(feature = "desktop-local-vault")]
+        let metadata_ticket = match self.retention.as_ref() {
+            Some(retention) => Some(retention.reserve_checkout()?),
+            None => None,
+        };
+        let trace = Arc::new(CheckoutTrace::new(
+            self,
+            session_permit,
+            #[cfg(feature = "desktop-local-vault")]
+            metadata_ticket,
+        ));
         let mut cancellation = CheckoutCancellation {
             trace: Arc::clone(&trace),
             armed: true,
@@ -335,6 +380,17 @@ impl OwnerSupervisor {
             deadpool_postgres::PoolError::Closed => PoolError::Closed,
             _ => self.current_fault().unwrap_or(PoolError::Unavailable),
         })?;
+        #[cfg(feature = "desktop-local-vault")]
+        let _retained_gate = match self.retention.as_ref() {
+            Some(retention) => match retention.lock_running() {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    drop(Client::take(object));
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         // actual get → actual ID → registry bind → lease 移交连续完成；其间没有 await。
         let id = Client::id(&object);
         let owner = match self.bind(id, &trace).and_then(|owner| {
@@ -345,6 +401,8 @@ impl OwnerSupervisor {
             Ok(owner) => owner,
             Err(error) => {
                 self.fail(error);
+                #[cfg(feature = "desktop-local-vault")]
+                drop(_retained_gate);
                 let wrapper = Client::take(object);
                 drop(wrapper);
                 stock.close();
@@ -473,14 +531,33 @@ struct CheckoutTrace {
     supervisor: Weak<OwnerSupervisor>,
     created: Mutex<Vec<Arc<DriverOwner>>>,
     session_custody: Option<Arc<SessionPermitCustody>>,
+    // Last: refund only after the actual trace vector/session state is dropped.
+    #[cfg(feature = "desktop-local-vault")]
+    metadata_ticket: Option<retained::CheckoutMetadataTicket>,
 }
 
 impl CheckoutTrace {
-    fn new(supervisor: &Arc<OwnerSupervisor>, permit: Option<OwnedSemaphorePermit>) -> Self {
+    fn new(
+        supervisor: &Arc<OwnerSupervisor>,
+        permit: Option<OwnedSemaphorePermit>,
+        #[cfg(feature = "desktop-local-vault")] metadata_ticket: Option<
+            retained::CheckoutMetadataTicket,
+        >,
+    ) -> Self {
+        #[cfg(feature = "desktop-local-vault")]
+        let created = if metadata_ticket.is_some() {
+            Vec::with_capacity(1)
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "desktop-local-vault"))]
+        let created = Vec::new();
         Self {
             supervisor: Arc::downgrade(supervisor),
-            created: Mutex::new(Vec::new()),
+            created: Mutex::new(created),
             session_custody: permit.map(SessionPermitCustody::new),
+            #[cfg(feature = "desktop-local-vault")]
+            metadata_ticket,
         }
     }
 
@@ -502,6 +579,10 @@ impl CheckoutTrace {
             .created
             .lock()
             .map_err(|_| PoolError::OwnershipUnavailable)?;
+        #[cfg(feature = "desktop-local-vault")]
+        if self.metadata_ticket.is_some() && !created.is_empty() {
+            return Err(PoolError::OwnershipUnavailable);
+        }
         created.push(owner);
         if created.len() != 1 {
             return Err(PoolError::OwnershipUnavailable);
@@ -522,11 +603,26 @@ impl CheckoutTrace {
     }
 
     fn retire_created(&self) {
+        #[cfg(feature = "desktop-local-vault")]
+        if self.metadata_ticket.is_some() {
+            let owner = self
+                .created
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .first()
+                .map(Arc::clone);
+            if let Some(owner) = owner {
+                owner.request_retirement();
+            }
+            return;
+        }
         let created = self
             .created
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        for owner in created.iter() {
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        // Do not invert the creation gate -> trace lock order during cancellation.
+        for owner in created {
             owner.request_retirement();
         }
     }
@@ -552,6 +648,8 @@ struct DriverOwner {
     state: watch::Sender<ConnectionSnapshot>,
     abort: Mutex<Option<AbortHandle>>,
     session_custody: Mutex<Option<Arc<SessionPermitCustody>>>,
+    #[cfg(feature = "desktop-local-vault")]
+    retention: Option<retained::DriverRetention>,
 }
 
 impl DriverOwner {
@@ -563,7 +661,22 @@ impl DriverOwner {
             state,
             abort: Mutex::new(None),
             session_custody: Mutex::new(None),
+            #[cfg(feature = "desktop-local-vault")]
+            retention: None,
         })
+    }
+
+    #[cfg(feature = "desktop-local-vault")]
+    fn new_retained(
+        sequence: usize,
+        supervisor: &Arc<OwnerSupervisor>,
+        retention: retained::DriverRetention,
+    ) -> Arc<Self> {
+        let mut owner = Self::new(sequence, supervisor);
+        Arc::get_mut(&mut owner)
+            .expect("new original owner is exclusive")
+            .retention = Some(retention);
+        owner
     }
 
     fn attach_session_custody(&self, custody: &Arc<SessionPermitCustody>) -> Result<(), PoolError> {
@@ -596,15 +709,31 @@ impl DriverOwner {
 
     fn install_abort(&self, abort: AbortHandle) {
         let mut slot = self.abort.lock().unwrap_or_else(|error| error.into_inner());
-        if self.snapshot().retirement_requested {
-            abort.abort();
-        }
+        let requested = self.snapshot().retirement_requested;
         *slot = Some(abort);
+        drop(slot);
+        if requested {
+            #[cfg(feature = "desktop-local-vault")]
+            if let Some(retention) = self.retention.as_ref() {
+                retention.wake();
+                return;
+            }
+            self.abort_original();
+        }
     }
 
     fn request_retirement(&self) {
         self.state
             .send_modify(|state| state.retirement_requested = true);
+        #[cfg(feature = "desktop-local-vault")]
+        if let Some(retention) = self.retention.as_ref() {
+            retention.retirement_requested();
+            return;
+        }
+        self.abort_original();
+    }
+
+    fn abort_original(&self) {
         let slot = self.abort.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(abort) = slot.as_ref() {
             abort.abort();
@@ -624,6 +753,10 @@ impl DriverOwner {
     fn driving_started(&self) {
         self.state
             .send_modify(|state| state.connection_started = true);
+        #[cfg(feature = "desktop-local-vault")]
+        if let Some(retention) = self.retention.as_ref() {
+            retention.driving_started();
+        }
     }
 
     /// 调用者必须已经 drop 原资源；这里仅登记之后的事实，并从 held registry 移走它。
@@ -652,6 +785,10 @@ impl DriverOwner {
             custody.finish(self.sequence);
         }
         drop(held);
+        #[cfg(feature = "desktop-local-vault")]
+        if first && let Some(retention) = self.retention.as_ref() {
+            retention.after_drop(destruction);
+        }
         if first && let Some(supervisor) = self.supervisor.upgrade() {
             supervisor.finish(self.sequence, self.snapshot());
         }
@@ -688,6 +825,10 @@ impl Connect for SupervisedConnect {
                 return Box::pin(pending());
             }
         };
+        #[cfg(feature = "desktop-local-vault")]
+        if let Some(retention) = supervisor.retention.as_ref() {
+            return retention.connect(Arc::clone(&supervisor), pg_config, trace);
+        }
         let sequence = match supervisor.reserve_creation() {
             Ok(sequence) => sequence,
             Err(_) => return Box::pin(pending()),
@@ -805,6 +946,16 @@ impl Future for OriginalDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
+        #[cfg(feature = "desktop-local-vault")]
+        if this
+            .owner
+            .retention
+            .as_ref()
+            .is_some_and(|retention| retention.poll_retirement(&this.owner, cx))
+        {
+            this.destroy_original();
+            return Poll::Ready(());
+        }
         loop {
             match &mut this.resource {
                 OriginalResource::Connecting(connecting) => {
@@ -918,6 +1069,1098 @@ impl Drop for ClientLease {
         }
     }
 }
+
+// The armed Local graph retains original tasks independently of the stock lifecycle proxy.
+// This module does not authorize capture, construct a source, or interpret a transaction result.
+#[cfg(feature = "desktop-local-vault")]
+mod retained {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::task::Waker;
+    use tokio::task::{Id, JoinError, JoinSet};
+
+    pub struct DesktopPoolJoinBounds {
+        live: usize,
+        unjoined: usize,
+        pending: usize,
+        proxies: usize,
+        metadata: usize,
+    }
+    impl DesktopPoolJoinBounds {
+        // This configuration-only constructor becomes public only after the ABI registration.
+        /// Validate all five explicit positive retention limits without starting I/O.
+        pub fn checked(
+            live: u64,
+            unjoined: u64,
+            pending: u64,
+            proxies: u64,
+            metadata: u64,
+        ) -> Result<Self, PoolError> {
+            let convert = |n: u64| -> Result<usize, PoolError> {
+                if n == 0 {
+                    return Err(PoolError::CreationLimit);
+                }
+                usize::try_from(n).map_err(|_| PoolError::CreationLimit)
+            };
+            let value = Self {
+                live: convert(live)?,
+                unjoined: convert(unjoined)?,
+                pending: convert(pending)?,
+                proxies: convert(proxies)?,
+                metadata: convert(metadata)?,
+            };
+            if value.metadata < std::mem::size_of::<QueueEntry>() {
+                return Err(PoolError::CreationLimit);
+            }
+            Ok(value)
+        }
+    }
+
+    // One aggregate reservation is computed before any retained heap allocation. It remains
+    // charged for this custody lifetime, including empty-but-retained backing capacities.
+    #[derive(Clone, Copy)]
+    struct MetadataReservation {
+        prepaid: usize,
+        originals: usize,
+        queue: usize,
+        map_upper: usize,
+        queue_upper: usize,
+        retirement_upper: usize,
+        checkouts: usize,
+    }
+    fn metadata_add(values: &[usize]) -> Result<usize, PoolError> {
+        values.iter().try_fold(0usize, |total, value| {
+            total.checked_add(*value).ok_or(PoolError::CreationLimit)
+        })
+    }
+    fn metadata_mul(a: usize, b: usize) -> Result<usize, PoolError> {
+        a.checked_mul(b).ok_or(PoolError::CreationLimit)
+    }
+    fn capacity_ceiling(n: usize) -> Result<usize, PoolError> {
+        n.checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or(PoolError::CreationLimit)
+    }
+    fn table_charge<K, V>(upper: usize) -> Result<usize, PoolError> {
+        // The charged envelope includes spare hash buckets, control bytes and alignment.
+        metadata_add(&[
+            metadata_mul(
+                metadata_mul(upper, 2)?,
+                metadata_add(&[std::mem::size_of::<(K, V)>(), 1])?,
+            )?,
+            64,
+        ])
+    }
+    fn reserved_table<K: Eq + std::hash::Hash, V>(
+        logical: usize,
+        upper: usize,
+    ) -> Result<HashMap<K, V>, PoolError> {
+        let mut table = HashMap::new();
+        table
+            .try_reserve(logical)
+            .map_err(|_| PoolError::CreationLimit)?;
+        if table.capacity() > upper {
+            return Err(PoolError::CreationLimit);
+        }
+        Ok(table)
+    }
+    impl MetadataReservation {
+        fn checked(bounds: &DesktopPoolJoinBounds) -> Result<Self, PoolError> {
+            let originals = bounds.live.min(bounds.unjoined);
+            let queue = originals
+                .checked_add(bounds.proxies)
+                .ok_or(PoolError::CreationLimit)?;
+            let map_upper = capacity_ceiling(originals)?;
+            let queue_upper = capacity_ceiling(queue)?;
+            let retirement_upper = capacity_ceiling(originals)?;
+            let fixed_pool = crate::db::desktop_local::APPLICATION_POOL_SIZE
+                .checked_add(1)
+                .ok_or(PoolError::CreationLimit)?;
+            // Driver futures are separately sized. The locked Tokio task/JoinSet/channel/watch
+            // administration is conservatively prepaid at 8KiB per original and 1KiB per proxy;
+            // PG protocol buffers/password payloads remain in their separate actual budgets.
+            let original_charge = metadata_add(&[
+                std::mem::size_of::<DriverOwner>(),
+                std::mem::size_of::<OriginalDriver>(),
+                std::mem::size_of::<OriginalDriverJoinFact>(),
+                std::mem::size_of::<SessionPermitCustody>(),
+                std::mem::size_of::<DriverRetention>(),
+                8192,
+            ])?;
+            let proxy_charge = metadata_add(&[
+                std::mem::size_of::<ProxyFuture>(),
+                std::mem::size_of::<ProxyMetadata>(),
+                std::mem::size_of::<JoinHandle<()>>(),
+                1024,
+            ])?;
+            let checkout_charge = metadata_add(&[
+                std::mem::size_of::<CheckoutTrace>(),
+                std::mem::size_of::<SessionPermitCustody>(),
+                metadata_mul(std::mem::size_of::<Arc<DriverOwner>>(), 4)?,
+                1024,
+            ])?;
+            let prepaid = metadata_add(&[
+                std::mem::size_of::<CustodyCore>(),
+                std::mem::size_of::<RetirementGate>(),
+                std::mem::size_of::<Counters>(),
+                metadata_mul(2, std::mem::size_of::<OwnerSupervisor>())?,
+                metadata_mul(2, std::mem::size_of::<OriginalTasks>())?,
+                4096,
+                metadata_mul(originals, original_charge)?,
+                metadata_mul(
+                    queue
+                        .checked_add(fixed_pool)
+                        .ok_or(PoolError::CreationLimit)?,
+                    proxy_charge,
+                )?,
+                metadata_mul(bounds.pending, checkout_charge)?,
+                metadata_mul(2, table_charge::<usize, Arc<DriverOwner>>(map_upper)?)?,
+                metadata_mul(2, table_charge::<ObjectId, Arc<DriverOwner>>(map_upper)?)?,
+                metadata_mul(2, table_charge::<Id, Arc<DriverOwner>>(map_upper)?)?,
+                table_charge::<DriverKey, QueueEntry>(queue_upper)?,
+                metadata_mul(retirement_upper, std::mem::size_of::<Arc<DriverOwner>>())?,
+            ])?;
+            if prepaid > bounds.metadata {
+                return Err(PoolError::CreationLimit);
+            }
+            Ok(Self {
+                prepaid,
+                originals,
+                queue,
+                map_upper,
+                queue_upper,
+                retirement_upper,
+                checkouts: bounds.pending,
+            })
+        }
+        fn check(&self, bounds: &DesktopPoolJoinBounds) -> Result<(), PoolError> {
+            if self.prepaid != Self::checked(bounds)?.prepaid {
+                return Err(PoolError::CreationLimit);
+            }
+            Ok(())
+        }
+    }
+    pub(super) struct CheckoutMetadataTicket {
+        counts: Arc<Counters>,
+    }
+    impl Drop for CheckoutMetadataTicket {
+        fn drop(&mut self) {
+            Counters::decrement(&self.counts.checkouts, &self.counts.fault);
+        }
+    }
+    struct DriverMetadataTicket {
+        counts: Arc<Counters>,
+    }
+    impl Drop for DriverMetadataTicket {
+        fn drop(&mut self) {
+            Counters::decrement(&self.counts.owner_allocations, &self.counts.fault);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum RetainedPoolKind {
+        Admin,
+        Application,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    struct DriverKey {
+        pool: RetainedPoolKind,
+        sequence: usize,
+    }
+    #[derive(Clone, Copy)]
+    struct CopyDestructionFact {
+        pool: RetainedPoolKind,
+        sequence: usize,
+        kind: ConnectionDestruction,
+    }
+
+    // No I/O owner or strong task waker is reachable through the proxy's weak mailbox view.
+    struct RetirementWake {
+        waker: Mutex<Option<Waker>>,
+    }
+    impl RetirementWake {
+        fn register(&self, waker: &Waker) {
+            if let Ok(mut slot) = self.waker.lock() {
+                *slot = Some(waker.clone());
+            }
+        }
+        fn wake(&self) {
+            let waker = self
+                .waker
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().cloned());
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+        fn clear(&self) {
+            if let Ok(mut slot) = self.waker.lock() {
+                slot.take();
+            }
+        }
+    }
+    struct ProxyMetadata {
+        destroyed: AtomicBool,
+    }
+    struct QueueEntry {
+        requested: bool,
+        joined: bool,
+        proxy: Arc<ProxyMetadata>,
+        wake: Weak<RetirementWake>,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Running,
+        Frozen,
+    }
+    pub(super) struct GateState {
+        phase: Phase,
+        entries: HashMap<DriverKey, QueueEntry>,
+    }
+    struct Counters {
+        originals: AtomicUsize,
+        pending: AtomicUsize,
+        live_proxies: AtomicUsize,
+        joined: AtomicU64,
+        missing_destruction: AtomicU64,
+        owner_allocations: AtomicUsize,
+        checkouts: AtomicUsize,
+        fault: AtomicBool,
+    }
+    impl Counters {
+        fn new() -> Self {
+            Self {
+                originals: AtomicUsize::new(0),
+                pending: AtomicUsize::new(0),
+                live_proxies: AtomicUsize::new(0),
+                joined: AtomicU64::new(0),
+                missing_destruction: AtomicU64::new(0),
+                owner_allocations: AtomicUsize::new(0),
+                checkouts: AtomicUsize::new(0),
+                fault: AtomicBool::new(false),
+            }
+        }
+        fn increment(counter: &AtomicU64, fault: &AtomicBool) {
+            if counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+                .is_err()
+            {
+                fault.store(true, Ordering::Release);
+            }
+        }
+        fn decrement(counter: &AtomicUsize, fault: &AtomicBool) {
+            if counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_err()
+            {
+                fault.store(true, Ordering::Release);
+            }
+        }
+    }
+    struct RetirementGate {
+        state: Mutex<GateState>,
+        bounds: DesktopPoolJoinBounds,
+        metadata: MetadataReservation,
+        counts: Arc<Counters>,
+    }
+    struct QueueOnlyRetirement {
+        gate: Weak<RetirementGate>,
+        key: DriverKey,
+    }
+    impl QueueOnlyRetirement {
+        fn enqueue(&self) {
+            let Some(gate) = self.gate.upgrade() else {
+                return;
+            };
+            let wake = match gate.state.lock() {
+                Ok(mut state) => match state.entries.get_mut(&self.key) {
+                    Some(entry) => {
+                        entry.requested = true;
+                        entry.wake.clone()
+                    }
+                    None => {
+                        gate.counts.fault.store(true, Ordering::Release);
+                        return;
+                    }
+                },
+                Err(_) => {
+                    gate.counts.fault.store(true, Ordering::Release);
+                    return;
+                }
+            };
+            // Only schedule the existing owner. This path cannot issue an abort or any I/O.
+            if let Some(wake) = wake.upgrade() {
+                wake.wake();
+            }
+        }
+    }
+    struct ProxyDropAck {
+        metadata: Arc<ProxyMetadata>,
+        counts: Arc<Counters>,
+    }
+    impl ProxyDropAck {
+        fn released(self) {
+            if self.metadata.destroyed.swap(true, Ordering::AcqRel) {
+                self.counts.fault.store(true, Ordering::Release);
+            } else {
+                Counters::decrement(&self.counts.live_proxies, &self.counts.fault);
+            }
+        }
+    }
+    struct PassiveProxyView {
+        destruction: Option<oneshot::Receiver<CopyDestructionFact>>,
+        retirement: Option<QueueOnlyRetirement>,
+        drop_ack: Option<ProxyDropAck>,
+    }
+    struct ProxyFuture {
+        view: PassiveProxyView,
+        observed: Option<CopyDestructionFact>,
+    }
+    impl Future for ProxyFuture {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            let Some(receiver) = this.view.destruction.as_mut() else {
+                return Poll::Ready(());
+            };
+            match Pin::new(receiver).poll(cx) {
+                Poll::Ready(Ok(fact)) => {
+                    this.observed = Some(fact);
+                    Poll::Ready(())
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(()),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+    impl Drop for ProxyFuture {
+        fn drop(&mut self) {
+            let receiver = self.view.destruction.take();
+            let queue = self.view.retirement.take();
+            if self.observed.is_none()
+                && let Some(queue) = queue.as_ref()
+            {
+                queue.enqueue();
+            }
+            drop(receiver);
+            drop(queue);
+            // Last non-Copy state is now gone. The ticket itself has no automatic success Drop.
+            if let Some(ack) = self.view.drop_ack.take() {
+                ack.released();
+            }
+        }
+    }
+
+    pub(super) struct DriverRetention {
+        gate: Arc<RetirementGate>,
+        key: DriverKey,
+        wake: Arc<RetirementWake>,
+        pending: AtomicBool,
+        destruction: Mutex<Option<oneshot::Sender<CopyDestructionFact>>>,
+        // Last non-Copy field: actual owner-header custody, not cancellation, releases the slot.
+        metadata_ticket: DriverMetadataTicket,
+    }
+    impl DriverRetention {
+        fn queue(&self) {
+            QueueOnlyRetirement {
+                gate: Arc::downgrade(&self.gate),
+                key: self.key,
+            }
+            .enqueue();
+        }
+        fn leave_connecting(&self) {
+            if self.pending.swap(false, Ordering::AcqRel) {
+                Counters::decrement(&self.gate.counts.pending, &self.gate.counts.fault);
+            }
+        }
+        pub(super) fn after_drop(&self, kind: ConnectionDestruction) {
+            self.leave_connecting();
+            self.wake.clear();
+            let sender = self
+                .destruction
+                .lock()
+                .ok()
+                .and_then(|mut sender| sender.take());
+            if let Some(sender) = sender {
+                let _receiver = sender.send(CopyDestructionFact {
+                    pool: self.key.pool,
+                    sequence: self.key.sequence,
+                    kind,
+                });
+            }
+        }
+        pub(super) fn retirement_requested(&self) {
+            self.queue();
+        }
+        pub(super) fn driving_started(&self) {
+            self.leave_connecting();
+        }
+        pub(super) fn wake(&self) {
+            self.wake.wake();
+        }
+        pub(super) fn poll_retirement(&self, owner: &DriverOwner, cx: &Context<'_>) -> bool {
+            self.wake.register(cx.waker());
+            let Ok(state) = self.gate.state.lock() else {
+                self.gate.counts.fault.store(true, Ordering::Release);
+                return false;
+            };
+            if state.phase == Phase::Running
+                && state
+                    .entries
+                    .get(&self.key)
+                    .is_some_and(|entry| entry.requested)
+            {
+                // The actual original I/O owner performs its normal retirement under the gate.
+                owner.abort_original();
+                return true;
+            }
+            false
+        }
+    }
+
+    struct OriginalTasks {
+        set: JoinSet<()>,
+        owners: HashMap<Id, Arc<DriverOwner>>,
+    }
+    impl OriginalTasks {
+        fn new(metadata: &MetadataReservation) -> Result<Self, PoolError> {
+            Ok(Self {
+                set: JoinSet::new(),
+                owners: reserved_table(metadata.originals, metadata.map_upper)?,
+            })
+        }
+        fn record_join(
+            &mut self,
+            result: Result<(Id, ()), JoinError>,
+            kind: RetainedPoolKind,
+            state: &mut GateState,
+            counts: &Counters,
+        ) -> Result<OriginalDriverJoinFact, PoolError> {
+            let (id, outcome) = match result {
+                Ok((id, ())) => (id, OriginalDriverJoinOutcome::Returned),
+                Err(error) => {
+                    let outcome = if error.is_cancelled() {
+                        OriginalDriverJoinOutcome::Cancelled
+                    } else {
+                        OriginalDriverJoinOutcome::Panicked
+                    };
+                    (error.id(), outcome)
+                }
+            };
+            let owner = self
+                .owners
+                .remove(&id)
+                .ok_or(PoolError::OwnershipUnavailable)?;
+            let destruction = owner.snapshot().destruction;
+            if outcome == OriginalDriverJoinOutcome::Panicked {
+                counts.fault.store(true, Ordering::Release);
+            }
+            if destruction.is_none() {
+                Counters::increment(&counts.missing_destruction, &counts.fault);
+            }
+            Counters::increment(&counts.joined, &counts.fault);
+            Counters::decrement(&counts.originals, &counts.fault);
+            if let Some(entry) = state.entries.get_mut(&DriverKey {
+                pool: kind,
+                sequence: owner.sequence,
+            }) {
+                entry.joined = true;
+            } else {
+                counts.fault.store(true, Ordering::Release);
+            }
+            Ok(OriginalDriverJoinFact {
+                pool: kind,
+                sequence: owner.sequence,
+                id,
+                outcome,
+                destruction,
+            })
+        }
+    }
+
+    pub(super) struct SupervisorRetention {
+        gate: Arc<RetirementGate>,
+        kind: RetainedPoolKind,
+        tasks: Mutex<Option<OriginalTasks>>,
+    }
+    impl SupervisorRetention {
+        pub(super) fn reserve_checkout(&self) -> Result<CheckoutMetadataTicket, PoolError> {
+            let state = self
+                .gate
+                .state
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            self.gate.metadata.check(&self.gate.bounds)?;
+            if state.phase != Phase::Running || self.gate.counts.fault.load(Ordering::Acquire) {
+                return Err(PoolError::Closed);
+            }
+            if self.gate.counts.checkouts.load(Ordering::Acquire) >= self.gate.metadata.checkouts {
+                return Err(PoolError::CreationLimit);
+            }
+            self.gate.counts.checkouts.fetch_add(1, Ordering::AcqRel);
+            Ok(CheckoutMetadataTicket {
+                counts: Arc::clone(&self.gate.counts),
+            })
+        }
+        pub(super) fn lock_running(
+            &self,
+        ) -> Result<std::sync::MutexGuard<'_, GateState>, PoolError> {
+            let state = self
+                .gate
+                .state
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            if state.phase != Phase::Running {
+                return Err(PoolError::Closed);
+            }
+            if self.gate.counts.fault.load(Ordering::Acquire) {
+                return Err(PoolError::OwnershipUnavailable);
+            }
+            Ok(state)
+        }
+        pub(super) fn ensure_running(&self) -> Result<(), PoolError> {
+            let state = self
+                .gate
+                .state
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            if state.phase != Phase::Running {
+                return Err(PoolError::Closed);
+            }
+            if self.gate.counts.fault.load(Ordering::Acquire) {
+                return Err(PoolError::OwnershipUnavailable);
+            }
+            Ok(())
+        }
+        pub(super) fn connect(
+            &self,
+            supervisor: Arc<OwnerSupervisor>,
+            config: &PgConfig,
+            trace: Arc<CheckoutTrace>,
+        ) -> ConnectResultFuture<'static> {
+            let attempt = || -> Result<(PgClientReady, JoinHandle<()>), PoolError> {
+                let mut state = self
+                    .gate
+                    .state
+                    .lock()
+                    .map_err(|_| PoolError::OwnershipUnavailable)?;
+                if state.phase != Phase::Running {
+                    return Err(PoolError::Closed);
+                }
+                let mut stored = self
+                    .tasks
+                    .lock()
+                    .map_err(|_| PoolError::OwnershipUnavailable)?;
+                let tasks = stored.as_mut().ok_or(PoolError::Closed)?;
+                while let Some(result) = tasks.set.try_join_next_with_id() {
+                    tasks.record_join(result, self.kind, &mut state, &self.gate.counts)?;
+                }
+                state.entries.retain(|_, entry| {
+                    !(entry.joined && entry.proxy.destroyed.load(Ordering::Acquire))
+                });
+                let bounds = &self.gate.bounds;
+                let counts = &self.gate.counts;
+                self.gate.metadata.check(bounds)?;
+                // All original tables were pre-reserved and retain their backing charge.
+                if state.entries.len() >= self.gate.metadata.queue
+                    || state.entries.len() >= state.entries.capacity()
+                    || tasks.owners.len() >= self.gate.metadata.originals
+                    || tasks.owners.len() >= tasks.owners.capacity()
+                {
+                    return Err(PoolError::CreationLimit);
+                }
+                if counts.fault.load(Ordering::Acquire)
+                    || counts.originals.load(Ordering::Acquire) >= bounds.live
+                    || counts.originals.load(Ordering::Acquire) >= bounds.unjoined
+                    || counts.pending.load(Ordering::Acquire) >= bounds.pending
+                    || counts.live_proxies.load(Ordering::Acquire) >= bounds.proxies
+                    || counts.owner_allocations.load(Ordering::Acquire)
+                        >= self.gate.metadata.originals
+                {
+                    return Err(PoolError::CreationLimit);
+                }
+                let sequence = supervisor.reserve_creation()?;
+                let key = DriverKey {
+                    pool: self.kind,
+                    sequence,
+                };
+                let wake = Arc::new(RetirementWake {
+                    waker: Mutex::new(None),
+                });
+                let proxy = Arc::new(ProxyMetadata {
+                    destroyed: AtomicBool::new(false),
+                });
+                let (destruction, destroyed) = oneshot::channel();
+                let retention = DriverRetention {
+                    gate: Arc::clone(&self.gate),
+                    key,
+                    wake: Arc::clone(&wake),
+                    pending: AtomicBool::new(true),
+                    destruction: Mutex::new(Some(destruction)),
+                    metadata_ticket: DriverMetadataTicket {
+                        counts: Arc::clone(counts),
+                    },
+                };
+                counts.owner_allocations.fetch_add(1, Ordering::AcqRel);
+                counts.pending.fetch_add(1, Ordering::AcqRel);
+                let owner = DriverOwner::new_retained(sequence, &supervisor, retention);
+                let (ready, receiver) = oneshot::channel();
+                let configuration = config.clone();
+                let connecting_owner = Arc::clone(&owner);
+                let connecting: ConnectingFuture = Box::pin(async move {
+                    let original = configuration.connect(NoTls);
+                    let mut original = Box::pin(original);
+                    connecting_owner.connecting_started();
+                    let result = original.as_mut().await;
+                    drop(original);
+                    connecting_owner.connecting_destroyed();
+                    result
+                        .map(|(client, connection)| (client, Box::pin(connection) as DrivingFuture))
+                });
+                let driver = OriginalDriver {
+                    resource: OriginalResource::Connecting(connecting),
+                    ready: Some(ready),
+                    owner: Arc::clone(&owner),
+                };
+                if let Err(error) = supervisor
+                    .register(Arc::clone(&owner))
+                    .and_then(|()| trace.record(Arc::clone(&owner)))
+                {
+                    drop(stored);
+                    drop(state);
+                    drop(driver);
+                    return Err(error);
+                }
+                state.entries.insert(
+                    key,
+                    QueueEntry {
+                        requested: false,
+                        joined: false,
+                        proxy: Arc::clone(&proxy),
+                        wake: Arc::downgrade(&wake),
+                    },
+                );
+                counts.originals.fetch_add(1, Ordering::AcqRel);
+                let abort = tasks.set.spawn(driver);
+                let id = abort.id();
+                owner.install_abort(abort);
+                tasks.owners.insert(id, owner);
+                counts.live_proxies.fetch_add(1, Ordering::AcqRel);
+                let proxy = ProxyFuture {
+                    view: PassiveProxyView {
+                        destruction: Some(destroyed),
+                        retirement: Some(QueueOnlyRetirement {
+                            gate: Arc::downgrade(&self.gate),
+                            key,
+                        }),
+                        drop_ack: Some(ProxyDropAck {
+                            metadata: proxy,
+                            counts: Arc::clone(counts),
+                        }),
+                    },
+                    observed: None,
+                };
+                let handle = tokio::spawn(proxy);
+                Ok((receiver, handle))
+            };
+            match attempt() {
+                Ok((receiver, proxy)) => Box::pin(async move {
+                    let mut proxy = ProxyCreationCancellation { task: Some(proxy) };
+                    match receiver.await {
+                        Ok(Ok(client)) => {
+                            Ok((client, proxy.task.take().expect("single proxy transfer")))
+                        }
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => {
+                            supervisor.fail(PoolError::OwnershipUnavailable);
+                            pending().await
+                        }
+                    }
+                }),
+                Err(error) => {
+                    supervisor.fail(error);
+                    Box::pin(pending())
+                }
+            }
+        }
+    }
+    type PgClientReady = oneshot::Receiver<Result<PgClient, PgError>>;
+    struct ProxyCreationCancellation {
+        task: Option<JoinHandle<()>>,
+    }
+    impl Drop for ProxyCreationCancellation {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    struct CustodyCore {
+        gate: Arc<RetirementGate>,
+        admin: Arc<OwnerSupervisor>,
+        application: Arc<OwnerSupervisor>,
+        stocks: Mutex<[Option<Pool>; 2]>,
+        freeze_retirements: Mutex<Option<VecDeque<Arc<DriverOwner>>>>,
+    }
+    pub struct DesktopLocalDriverCustody {
+        core: Arc<CustodyCore>,
+    }
+    impl DesktopLocalDriverCustody {
+        pub fn prepare(bounds: DesktopPoolJoinBounds) -> Result<Self, PoolError> {
+            // Admission covers both fixed stocks. It never lowers their original capacities.
+            let fixed = crate::db::desktop_local::APPLICATION_POOL_SIZE
+                .checked_add(1)
+                .ok_or(PoolError::CreationLimit)?;
+            if bounds.live < fixed
+                || bounds.unjoined < fixed
+                || bounds.proxies < fixed
+                || bounds.pending < crate::db::desktop_local::APPLICATION_POOL_SIZE
+            {
+                return Err(PoolError::CreationLimit);
+            }
+            let metadata = MetadataReservation::checked(&bounds)?;
+            let counts = Arc::new(Counters::new());
+            let entries = reserved_table(metadata.queue, metadata.queue_upper)?;
+            let mut retirements = VecDeque::new();
+            retirements
+                .try_reserve_exact(metadata.originals)
+                .map_err(|_| PoolError::CreationLimit)?;
+            if retirements.capacity() > metadata.retirement_upper {
+                return Err(PoolError::CreationLimit);
+            }
+            let gate = Arc::new(RetirementGate {
+                state: Mutex::new(GateState {
+                    phase: Phase::Running,
+                    entries,
+                }),
+                bounds,
+                metadata,
+                counts,
+            });
+            let supervisor = |kind| -> Result<Arc<OwnerSupervisor>, PoolError> {
+                let registry = Registry {
+                    pending: reserved_table(metadata.originals, metadata.map_upper)?,
+                    bound: reserved_table(metadata.originals, metadata.map_upper)?,
+                    destroyed_connecting_futures: 0,
+                    destroyed_connections: 0,
+                    destroyed_before_start: 0,
+                };
+                Ok(OwnerSupervisor::new_retained(
+                    SupervisorRetention {
+                        gate: Arc::clone(&gate),
+                        kind,
+                        tasks: Mutex::new(Some(OriginalTasks::new(&metadata)?)),
+                    },
+                    registry,
+                ))
+            };
+            Ok(Self {
+                core: Arc::new(CustodyCore {
+                    admin: supervisor(RetainedPoolKind::Admin)?,
+                    application: supervisor(RetainedPoolKind::Application)?,
+                    gate,
+                    stocks: Mutex::new([None, None]),
+                    freeze_retirements: Mutex::new(Some(retirements)),
+                }),
+            })
+        }
+        pub(in crate::db) fn shared(&self) -> Self {
+            Self {
+                core: Arc::clone(&self.core),
+            }
+        }
+        pub(in crate::db) fn supervisor(&self, application: bool) -> Arc<OwnerSupervisor> {
+            Arc::clone(if application {
+                &self.core.application
+            } else {
+                &self.core.admin
+            })
+        }
+        pub(in crate::db) fn register_stock(
+            &self,
+            application: bool,
+            stock: Pool,
+        ) -> Result<(), PoolError> {
+            let state = self
+                .core
+                .gate
+                .state
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            if state.phase != Phase::Running {
+                return Err(PoolError::Closed);
+            }
+            let mut stocks = self
+                .core
+                .stocks
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            let slot = &mut stocks[usize::from(application)];
+            if slot.is_some() {
+                return Err(PoolError::IdentityCollision);
+            }
+            *slot = Some(stock);
+            Ok(())
+        }
+        pub fn freeze(&mut self) -> Result<DesktopCaptureDrivers, PoolError> {
+            let gate = &self.core.gate;
+            let mut state = gate
+                .state
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            if state.phase != Phase::Running {
+                return Err(PoolError::Closed);
+            }
+            if gate.counts.fault.load(Ordering::Acquire) {
+                return Err(PoolError::OwnershipUnavailable);
+            }
+            let admin_slot = self
+                .core
+                .admin
+                .retention
+                .as_ref()
+                .ok_or(PoolError::OwnershipUnavailable)?;
+            let app_slot = self
+                .core
+                .application
+                .retention
+                .as_ref()
+                .ok_or(PoolError::OwnershipUnavailable)?;
+            let mut admin = admin_slot
+                .tasks
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            let mut application = app_slot
+                .tasks
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            let stock_guard = self
+                .core
+                .stocks
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            if admin.is_none() || application.is_none() {
+                return Err(PoolError::OwnershipUnavailable);
+            }
+            // Startup may fail before one stock pool is ever published. Only an actually empty
+            // original set/map/mailbox establishes that uncreated slot; never manufacture a set.
+            for (index, kind, tasks) in [
+                (
+                    0,
+                    RetainedPoolKind::Admin,
+                    admin.as_ref().expect("checked original admin set"),
+                ),
+                (
+                    1,
+                    RetainedPoolKind::Application,
+                    application
+                        .as_ref()
+                        .expect("checked original application set"),
+                ),
+            ] {
+                if stock_guard[index].is_none()
+                    && (!tasks.set.is_empty()
+                        || !tasks.owners.is_empty()
+                        || state.entries.keys().any(|key| key.pool == kind))
+                {
+                    return Err(PoolError::OwnershipUnavailable);
+                }
+            }
+            gate.metadata.check(&gate.bounds)?;
+            let mut scratch = self
+                .core
+                .freeze_retirements
+                .lock()
+                .map_err(|_| PoolError::OwnershipUnavailable)?;
+            let owner_count = admin
+                .as_ref()
+                .expect("checked admin set")
+                .owners
+                .len()
+                .checked_add(application.as_ref().expect("checked app set").owners.len())
+                .ok_or(PoolError::CreationLimit)?;
+            let queue = scratch.as_mut().ok_or(PoolError::OwnershipUnavailable)?;
+            if !queue.is_empty()
+                || owner_count > gate.metadata.originals
+                || owner_count > queue.capacity()
+                || queue.capacity() > gate.metadata.retirement_upper
+            {
+                return Err(PoolError::CreationLimit);
+            }
+            for owner in admin
+                .as_ref()
+                .into_iter()
+                .chain(application.as_ref())
+                .flat_map(|tasks| tasks.owners.values())
+            {
+                queue.push_back(Arc::clone(owner)); // Pre-reserved; no allocation under the freeze gate.
+            }
+            let retirements = scratch.take().expect("checked original freeze staging");
+            drop(scratch);
+            state.phase = Phase::Frozen;
+            let drivers = DesktopCaptureDrivers {
+                admin: admin.take().expect("checked original admin set"),
+                application: application
+                    .take()
+                    .expect("checked original application set"),
+                retirements,
+                gate: Arc::clone(gate),
+                joined_before: gate.counts.joined.load(Ordering::Acquire),
+            };
+            let stocks: [Option<Pool>; 2] = std::array::from_fn(|index| stock_guard[index].clone());
+            drop(stock_guard);
+            drop(application);
+            drop(admin);
+            drop(state);
+            for stock in stocks.into_iter().flatten() {
+                stock.close();
+            }
+            Ok(drivers)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    /// Actual terminal result of one retained original task, independent of stock proxy joins.
+    pub enum OriginalDriverJoinOutcome {
+        /// The original task returned normally.
+        Returned,
+        /// The original task's real JoinError reports cancellation.
+        Cancelled,
+        /// The original task's real JoinError reports panic.
+        Panicked,
+    }
+    pub struct OriginalDriverJoinFact {
+        pool: RetainedPoolKind,
+        sequence: usize,
+        id: Id,
+        outcome: OriginalDriverJoinOutcome,
+        destruction: Option<ConnectionDestruction>,
+    }
+    impl OriginalDriverJoinFact {
+        /// Fixed retained pool identity.
+        pub fn pool_name(&self) -> &'static str {
+            match self.pool {
+                RetainedPoolKind::Admin => "admin",
+                RetainedPoolKind::Application => "application",
+            }
+        }
+        /// Original supervisor sequence, never a stock/proxy sequence.
+        pub fn sequence(&self) -> usize {
+            self.sequence
+        }
+        /// Tokio ID recovered from the actual original join.
+        pub fn task_id(&self) -> tokio::task::Id {
+            self.id
+        }
+        /// Actual original join outcome.
+        pub fn outcome(&self) -> OriginalDriverJoinOutcome {
+            self.outcome
+        }
+        /// Destruction observation recorded only after the original connection is dropped.
+        pub fn destruction(&self) -> Option<ConnectionDestruction> {
+            self.destruction
+        }
+    }
+
+    pub struct OriginalDriverRetirement {
+        owner: Arc<DriverOwner>,
+    }
+    impl OriginalDriverRetirement {
+        pub fn request(self) {
+            // Only the original closing owner calls this after its original C-clock check.
+            self.owner
+                .state
+                .send_modify(|snapshot| snapshot.retirement_requested = true);
+            self.owner.abort_original();
+        }
+    }
+    pub struct DesktopCaptureDrivers {
+        admin: OriginalTasks,
+        application: OriginalTasks,
+        retirements: VecDeque<Arc<DriverOwner>>,
+        gate: Arc<RetirementGate>,
+        joined_before: u64,
+    }
+    impl DesktopCaptureDrivers {
+        /// Number of actual original task joins completed before the freeze transfer.
+        pub fn joined_before_freeze(&self) -> u64 {
+            self.joined_before
+        }
+        /// Retained original tasks that still lack an actual join, including identity faults.
+        pub fn original_tasks_remaining(&self) -> usize {
+            if self.gate.counts.fault.load(Ordering::Acquire) {
+                return usize::MAX;
+            }
+            usize::try_from(self.gate.counts.originals.load(Ordering::Acquire))
+                .unwrap_or(usize::MAX)
+        }
+        /// Original joins whose actual Connection destruction fact is unavailable.
+        pub fn original_destructions_missing(&self) -> u64 {
+            if self.gate.counts.fault.load(Ordering::Acquire) {
+                return u64::MAX;
+            }
+            self.gate.counts.missing_destruction.load(Ordering::Acquire)
+        }
+        pub fn next_retirement(&mut self) -> Option<OriginalDriverRetirement> {
+            while let Some(owner) = self.retirements.pop_front() {
+                if owner.snapshot().destruction.is_none() {
+                    return Some(OriginalDriverRetirement { owner });
+                }
+            }
+            None
+        }
+        pub async fn join_next_original(&mut self) -> Option<OriginalDriverJoinFact> {
+            let result = match (self.admin.set.is_empty(), self.application.set.is_empty()) {
+                (true, true) => return None,
+                (false, true) => (
+                    RetainedPoolKind::Admin,
+                    self.admin.set.join_next_with_id().await,
+                ),
+                (true, false) => (
+                    RetainedPoolKind::Application,
+                    self.application.set.join_next_with_id().await,
+                ),
+                (false, false) => tokio::select! {
+                    result = self.admin.set.join_next_with_id() => (RetainedPoolKind::Admin, result),
+                    result = self.application.set.join_next_with_id() => (RetainedPoolKind::Application, result),
+                },
+            };
+            let Some(joined) = result.1 else {
+                return None;
+            };
+            let mut state = match self.gate.state.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    self.gate.counts.fault.store(true, Ordering::Release);
+                    return None;
+                }
+            };
+            let tasks = if result.0 == RetainedPoolKind::Admin {
+                &mut self.admin
+            } else {
+                &mut self.application
+            };
+            match tasks.record_join(joined, result.0, &mut state, &self.gate.counts) {
+                Ok(fact) => Some(fact),
+                Err(_) => {
+                    self.gate.counts.fault.store(true, Ordering::Release);
+                    None
+                }
+            }
+        }
+        pub fn live_proxy_future_count(&self) -> u64 {
+            u64::try_from(self.gate.counts.live_proxies.load(Ordering::Acquire)).unwrap_or(u64::MAX)
+        }
+    }
+}
+#[cfg(feature = "desktop-local-vault")]
+pub use retained::{
+    DesktopCaptureDrivers, DesktopLocalDriverCustody, DesktopPoolJoinBounds,
+    OriginalDriverJoinFact, OriginalDriverJoinOutcome, OriginalDriverRetirement,
+};
 
 #[cfg(test)]
 mod tests {

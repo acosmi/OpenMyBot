@@ -38,6 +38,14 @@ use openbot_contracts::telemetry::Transport;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+use openbot_domain::backup::{WholePgCarrierBounds, WholePgCarrierFault};
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+use crate::tauri_background::capture::{
+    CaptureResourceTotals, remaining_capture_resources, reserve_capture_resources,
+};
+
 use crate::broker::{DeliveryOutcome, EventBroker, WindowAlreadyOpen};
 use crate::budget::{COMMAND_QUEUE_CAPACITY, EventQueueBudget};
 use crate::cancel::{CancellationToken, SHUTDOWN_DEADLINE};
@@ -91,13 +99,434 @@ pub struct InProcessTransport {
     service: Arc<dyn ApplicationService>,
     broker: Arc<EventBroker>,
     commands: Semaphore,
-    pumps: Mutex<Vec<PumpHandle>>,
+    pumps: Mutex<PumpRegistry>,
+}
+
+#[derive(Default)]
+struct PumpRegistry {
+    legacy: Vec<PumpHandle>,
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    capture_requested: bool,
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    legacy_history: bool,
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    capture: Option<CapturePumpRegistry>,
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    capture_resources: Option<Arc<Mutex<CaptureResourceTotals>>>,
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    capture_fixed_metadata: u64,
 }
 
 struct PumpHandle {
     label: WindowLabel,
     cancellation: CancellationToken,
     task: JoinHandle<()>,
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureTransportFault {
+    Poisoned,
+    Cancelled,
+    Panicked,
+}
+
+// Each slot retains the actual result, including the original JoinError/panic payload.
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+enum CapturePumpOutcome {
+    Joined(Result<(), tokio::task::JoinError>),
+    PollPanicked { _payload: Box<dyn std::any::Any + Send + 'static> },
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+struct CapturePumpSlot {
+    original: PumpHandle,
+    actual: Option<CapturePumpOutcome>,
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+struct CapturePumpRegistry {
+    originals: Vec<CapturePumpSlot>,
+    slot_limit: usize,
+    label_limit: usize,
+    metadata_limit: u64,
+    // Includes fixed requested layouts, all actual admission fees and each complete replacement
+    // backing. Old backing is never refunded, covering old+new during a reallocation.
+    metadata_reserved: u64,
+    // Cumulative reservations are never refunded, including cancelled subscribe callers.
+    admissions: usize,
+    pending: usize,
+    closed: bool,
+    taken: bool,
+    fault: Option<CaptureTransportFault>,
+}
+
+/// Resident ownership of the original pumps, their actual results and the join cursor.
+/// The original caller stores this owner before awaiting; it is not a closure grant.
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+pub(crate) struct RetainedTransportClosing {
+    originals: Vec<CapturePumpSlot>,
+    cursor: usize,
+    fault: Option<CaptureTransportFault>,
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+struct CapturePumpAdmission<'a> {
+    transport: &'a InProcessTransport,
+    active: bool,
+    // Retained handle label, pump label and the original pump's EventScope label.
+    labels: Option<(WindowLabel, WindowLabel, WindowLabel)>,
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+fn fail_capture(registry: &mut PumpRegistry, fault: CaptureTransportFault) {
+    if let Some(capture) = registry.capture.as_mut() {
+        capture.closed = true;
+        capture.fault.get_or_insert(fault);
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+fn finish_capture_admission(registry: &mut PumpRegistry) {
+    if let Some(capture) = registry.capture.as_mut() {
+        if let Some(remaining) = capture.pending.checked_sub(1) {
+            capture.pending = remaining;
+        } else {
+            capture.closed = true;
+            capture.fault.get_or_insert(CaptureTransportFault::Poisoned);
+        }
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+impl Drop for CapturePumpAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut registry = match self.transport.pumps.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => {
+                let mut registry = poisoned.into_inner();
+                fail_capture(&mut registry, CaptureTransportFault::Poisoned);
+                registry
+            }
+        };
+        // Release only the pending-call count, never the cumulative original slot budget.
+        finish_capture_admission(&mut registry);
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+fn capture_label(label: &WindowLabel, limit: usize) -> Result<WindowLabel, OpenSessionError> {
+    if label.as_str().len() > limit {
+        return Err(OpenSessionError::ShuttingDown);
+    }
+    let mut value = String::new();
+    value.try_reserve_exact(label.as_str().len())
+        .map_err(|_| OpenSessionError::ShuttingDown)?;
+    if value.capacity() != label.as_str().len() {
+        return Err(OpenSessionError::ShuttingDown);
+    }
+    value.push_str(label.as_str());
+    Ok(WindowLabel::new(value))
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+impl InProcessTransport {
+    /// Bind the original pre-t0 owner's numeric DATA once, before use or arming.
+    /// The component gate always precedes the book gate; neither lock contains an await or I/O.
+    pub(crate) fn bind_original_capture_resources(
+        &self,
+        resources: Arc<Mutex<CaptureResourceTotals>>,
+    ) -> Result<(), WholePgCarrierFault> {
+        let mut registry = match self.pumps.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => {
+                poisoned.into_inner().capture_requested = true;
+                return Err(WholePgCarrierFault::ClosingPending);
+            }
+        };
+        if registry.capture_resources.is_some() || registry.capture_requested {
+            return Err(WholePgCarrierFault::IntentMismatch);
+        }
+        if registry.legacy_history || !registry.legacy.is_empty()
+            || self.shutdown_token().is_cancelled()
+        {
+            return Err(WholePgCarrierFault::ClosingPending);
+        }
+        let fixed = core::mem::size_of::<Mutex<PumpRegistry>>()
+            .checked_add(core::mem::size_of::<RetainedTransportClosing>())
+            .ok_or(WholePgCarrierFault::BoundsOverflow)?;
+        let fixed = u64::try_from(fixed).map_err(|_| WholePgCarrierFault::BoundsOverflow)?;
+        // This is requested Rust backing only. Unproved allocator/runtime/subscribe internals
+        // remain outside this component fact and cannot be treated as a whole-operation GO.
+        reserve_capture_resources(&resources, 0, fixed)?;
+        registry.capture_fixed_metadata = fixed;
+        registry.capture_resources = Some(resources);
+        Ok(())
+    }
+
+    /// Arm before the first subscription. The same book is retained; the profile is a ceiling,
+    /// not a separately spendable allowance. No maximum-size slot Vec is allocated here.
+    pub(crate) fn arm_capture_retention(
+        &self,
+        bounds: &WholePgCarrierBounds,
+    ) -> Result<(), WholePgCarrierFault> {
+        let mut registry = match self.pumps.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => {
+                // Even a rejected arm must never fall back to consuming legacy shutdown.
+                poisoned.into_inner().capture_requested = true;
+                return Err(WholePgCarrierFault::ClosingPending);
+            }
+        };
+        if registry.capture_requested {
+            return Err(WholePgCarrierFault::IntentMismatch);
+        }
+        registry.capture_requested = true;
+        if registry.legacy_history || !registry.legacy.is_empty()
+            || self.shutdown_token().is_cancelled()
+        {
+            return Err(WholePgCarrierFault::ClosingPending);
+        }
+        let bounds = (*bounds).check()?;
+        let resources = registry.capture_resources.as_ref().ok_or(WholePgCarrierFault::ProfileMissing)?;
+        remaining_capture_resources(resources)?;
+        let metadata_limit = bounds.max_metadata_bytes.min(bounds.max_total_allocation_bytes);
+        let label_limit = usize::try_from(bounds.max_path_bytes)
+            .map_err(|_| WholePgCarrierFault::BoundsOverflow)?;
+        let slot_limit = usize::try_from(bounds.max_open_files)
+            .map_err(|_| WholePgCarrierFault::BoundsOverflow)?;
+        let metadata_reserved = registry.capture_fixed_metadata;
+        if metadata_reserved > metadata_limit || slot_limit == 0 {
+            return Err(WholePgCarrierFault::CapacityExceeded);
+        }
+        registry.capture = Some(CapturePumpRegistry {
+            originals: Vec::new(), slot_limit, label_limit, metadata_limit, metadata_reserved,
+            admissions: 0, pending: 0, closed: false, taken: false, fault: None,
+        });
+        Ok(())
+    }
+
+    /// Cumulative known requested backing retained/reserved by this component; no new OS FD
+    /// is opened by the transport itself. This is not an opaque-runtime or global peak claim.
+    pub(crate) fn retained_resource_usage(&self) -> Result<(u64, u64), WholePgCarrierFault> {
+        let registry = self.pumps.lock().map_err(|_| WholePgCarrierFault::ClosingPending)?;
+        let capture = registry.capture.as_ref().ok_or(WholePgCarrierFault::ClosingPending)?;
+        if registry.capture_resources.is_none() || capture.metadata_reserved > capture.metadata_limit {
+            return Err(WholePgCarrierFault::IntentMismatch);
+        }
+        Ok((0, capture.metadata_reserved))
+    }
+
+    fn reserve_capture_session(
+        &self,
+        label: &WindowLabel,
+    ) -> Result<Option<CapturePumpAdmission<'_>>, OpenSessionError> {
+        let label_limit = {
+            let mut registry = match self.pumps.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => {
+                    let registry = poisoned.into_inner();
+                    if registry.capture_requested {
+                        return Err(OpenSessionError::ShuttingDown);
+                    }
+                    panic!("事件泵句柄锁不会中毒");
+                }
+            };
+            if !registry.capture_requested {
+                // Mark before subscribe awaits: even a later empty/reaped Vec is unknown history.
+                registry.legacy_history = true;
+                return Ok(None);
+            }
+            let PumpRegistry { capture_resources, capture, .. } = &mut *registry;
+            let resources = capture_resources.as_ref().ok_or(OpenSessionError::ShuttingDown)?;
+            let capture = capture.as_mut().ok_or(OpenSessionError::ShuttingDown)?;
+            if capture.closed || capture.taken || capture.fault.is_some()
+                || self.shutdown_token().is_cancelled()
+                || capture.admissions >= capture.slot_limit
+            {
+                return Err(OpenSessionError::ShuttingDown);
+            }
+            let label_bytes = label.as_str().len();
+            if label_bytes > capture.label_limit {
+                return Err(OpenSessionError::ShuttingDown);
+            }
+            let admissions = capture.admissions.checked_add(1).ok_or(OpenSessionError::ShuttingDown)?;
+            let pending = capture.pending.checked_add(1).ok_or(OpenSessionError::ShuttingDown)?;
+            let old_capacity = capture.originals.capacity();
+            let new_capacity = if admissions > old_capacity {
+                old_capacity.checked_mul(2)
+                    .map(|doubled| doubled.max(admissions).min(capture.slot_limit))
+                    .ok_or(OpenSessionError::ShuttingDown)?
+            } else {
+                old_capacity
+            };
+            let backing = if new_capacity > old_capacity {
+                new_capacity.checked_mul(core::mem::size_of::<CapturePumpSlot>())
+                    .ok_or(OpenSessionError::ShuttingDown)?
+            } else {
+                0
+            };
+            let additional = new_capacity.checked_sub(capture.originals.len())
+                .ok_or(OpenSessionError::ShuttingDown)?;
+            let admission_bytes = core::mem::size_of::<CapturePumpAdmission<'_>>()
+                .checked_add(label_bytes.checked_mul(3).ok_or(OpenSessionError::ShuttingDown)?)
+                .ok_or(OpenSessionError::ShuttingDown)?;
+            let delta = u64::try_from(backing.checked_add(admission_bytes)
+                .ok_or(OpenSessionError::ShuttingDown)?)
+                .map_err(|_| OpenSessionError::ShuttingDown)?;
+            let metadata = capture.metadata_reserved.checked_add(delta)
+                .ok_or(OpenSessionError::ShuttingDown)?;
+            if metadata > capture.metadata_limit {
+                return Err(OpenSessionError::ShuttingDown);
+            }
+            // Rust 1.98.0's pinned RawVec::grow_exact requests len+additional and records
+            // exactly that logical capacity. Prepay the COMPLETE new backing: the old charge
+            // is retained so old+new reallocation coexistence cannot spend unreserved bytes.
+            // This still does not prove opaque allocator or Tokio/subscribe internal peaks.
+            reserve_capture_resources(resources, 0, delta)
+                .map_err(|_| OpenSessionError::ShuttingDown)?;
+            capture.metadata_reserved = metadata;
+            capture.admissions = admissions;
+            if new_capacity > old_capacity {
+                if capture.originals.try_reserve_exact(additional).is_err()
+                    || capture.originals.capacity() != new_capacity
+                {
+                    // try_reserve_exact leaves existing elements unchanged on allocation Err.
+                    // Refuse without refund/reconstruction, and retain every original handle.
+                    capture.closed = true;
+                    capture.fault.get_or_insert(CaptureTransportFault::Cancelled);
+                    return Err(OpenSessionError::ShuttingDown);
+                }
+            }
+            capture.pending = pending;
+            capture.label_limit
+        };
+        let mut admission = CapturePumpAdmission { transport: self, active: true, labels: None };
+        // Fallible owned copies precede subscribe and are all bounded; RAII retains the reservation
+        // and releases only pending if allocation fails or the subscribe future is dropped.
+        admission.labels = Some((
+            capture_label(label, label_limit)?,
+            capture_label(label, label_limit)?,
+            capture_label(label, label_limit)?,
+        ));
+        Ok(Some(admission))
+    }
+
+    fn publish_capture_session(
+        &self,
+        mut admission: CapturePumpAdmission<'_>,
+        identity: WindowIdentity,
+        subscribed: Result<AppEventStream, AppError>,
+        subscriptions: ThreadSubscriptions,
+        queue_budget: Option<Arc<EventQueueBudget>>,
+    ) -> Result<DesktopSession, OpenSessionError> {
+        let mut registry = match self.pumps.lock() {
+            Ok(registry) => registry,
+            Err(_) => return Err(OpenSessionError::ShuttingDown),
+        };
+        let capture = registry.capture.as_mut().ok_or(OpenSessionError::ShuttingDown)?;
+        // This is the same mutex as begin_capture_closing, after the original subscribe await.
+        if capture.closed || capture.taken || capture.fault.is_some()
+            || self.shutdown_token().is_cancelled()
+            || capture.originals.len() >= capture.slot_limit
+            || capture.originals.len() >= capture.originals.capacity()
+        {
+            return Err(OpenSessionError::ShuttingDown);
+        }
+        let stream = subscribed?;
+        let (retained_label, pump_label, scope_label) = admission.labels.take()
+            .ok_or(OpenSessionError::ShuttingDown)?;
+        let session = match queue_budget {
+            Some(queue_budget) => self.broker.open_window_with_budget(
+                identity.clone(), subscriptions, queue_budget,
+            )?,
+            None => self.broker.open_window(identity.clone(), subscriptions)?,
+        };
+        let session_cancellation = CancellationToken::new();
+        let scope = EventScope::window(identity.tenant().clone(), scope_label);
+        let task = tokio::spawn(pump(
+            Arc::clone(&self.broker), self.shutdown_token().clone(), session_cancellation.clone(),
+            pump_label, scope, identity.auth_generation(), stream,
+        ));
+        // Capacity and all owned label buffers already exist: no await/reallocation/finished reap
+        // occurs between this exact original spawn and registration under the closing gate.
+        capture.originals.push(CapturePumpSlot {
+            original: PumpHandle { label: retained_label, cancellation: session_cancellation, task },
+            actual: None,
+        });
+        finish_capture_admission(&mut registry);
+        admission.active = false;
+        Ok(session)
+    }
+
+    /// Called only at the original caller's same-clock first-stop. No wait or new timer here.
+    pub(crate) fn begin_capture_closing(
+        &self,
+    ) -> Result<RetainedTransportClosing, CaptureTransportFault> {
+        let mut registry = self.pumps.lock().map_err(|_| CaptureTransportFault::Poisoned)?;
+        let capture = registry.capture.as_mut().ok_or(CaptureTransportFault::Cancelled)?;
+        if capture.taken {
+            return Err(CaptureTransportFault::Cancelled);
+        }
+        capture.closed = true;
+        self.shutdown_token().cancel();
+        // Keep the original Vec resident until the original cancel/route closure has returned.
+        // A panic here poisons the gate while leaving all originals in the transport.
+        self.broker.close_all();
+        capture.taken = true;
+        Ok(RetainedTransportClosing {
+            originals: core::mem::take(&mut capture.originals), cursor: 0, fault: capture.fault,
+        })
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+impl RetainedTransportClosing {
+    pub(crate) async fn join_originals(&mut self) -> Result<(), CaptureTransportFault> {
+        while self.cursor < self.originals.len() {
+            core::future::poll_fn(|cx| {
+                let slot = &mut self.originals[self.cursor];
+                if slot.actual.is_some() {
+                    return core::task::Poll::Ready(());
+                }
+                let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    core::future::Future::poll(core::pin::Pin::new(&mut slot.original.task), cx)
+                }));
+                match polled {
+                    Ok(core::task::Poll::Pending) => return core::task::Poll::Pending,
+                    Ok(core::task::Poll::Ready(actual)) => {
+                        slot.actual = Some(CapturePumpOutcome::Joined(actual));
+                    }
+                    Err(payload) => {
+                        slot.actual = Some(CapturePumpOutcome::PollPanicked { _payload: payload });
+                    }
+                }
+                // Cache the actual result in the resident slot before returning from this poll.
+                core::task::Poll::Ready(())
+            }).await;
+            let fault = match self.originals[self.cursor].actual.as_ref() {
+                Some(CapturePumpOutcome::Joined(Ok(()))) => None,
+                Some(CapturePumpOutcome::Joined(Err(error))) if error.is_cancelled() => {
+                    Some(CaptureTransportFault::Cancelled)
+                }
+                Some(CapturePumpOutcome::Joined(Err(error))) if error.is_panic() => {
+                    Some(CaptureTransportFault::Panicked)
+                }
+                Some(CapturePumpOutcome::PollPanicked { .. }) => Some(CaptureTransportFault::Panicked),
+                _ => Some(CaptureTransportFault::Poisoned),
+            };
+            if let Some(fault) = fault {
+                self.fault.get_or_insert(fault);
+            }
+            // No await between cached result, permanent failure and cursor advancement. A dropped
+            // waiter keeps the same original handle, and no consumed result is polled a second time.
+            self.cursor += 1;
+        }
+        self.fault.map_or(Ok(()), Err)
+    }
 }
 
 impl InProcessTransport {
@@ -117,7 +546,7 @@ impl InProcessTransport {
             service,
             broker: Arc::new(EventBroker::new(shutdown)),
             commands: Semaphore::new(COMMAND_QUEUE_CAPACITY),
-            pumps: Mutex::new(Vec::new()),
+            pumps: Mutex::new(PumpRegistry::default()),
         }
     }
 
@@ -266,8 +695,31 @@ impl InProcessTransport {
             return Err(OpenSessionError::ShuttingDown);
         }
 
+        #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+        let admission = self.reserve_capture_session(&label)?;
         let identity = WindowIdentity::bind(label, auth);
-        let stream = self.service.subscribe(auth.clone(), request).await?;
+        let subscribed = self.service.subscribe(auth.clone(), request).await;
+        #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+        if let Some(admission) = admission {
+            return self.publish_capture_session(admission, identity, subscribed, subscriptions, queue_budget);
+        }
+        let stream = subscribed?;
+        let mut pumps = match self.pumps.lock() {
+            Ok(pumps) => pumps,
+            Err(poisoned) => {
+                let _pumps = poisoned.into_inner();
+                #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+                if _pumps.capture_requested {
+                    return Err(OpenSessionError::ShuttingDown);
+                }
+                panic!("事件泵句柄锁不会中毒");
+            }
+        };
+        #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+        if pumps.capture_requested {
+            // An arm rejected for pre-existing legacy history also closes future admission.
+            return Err(OpenSessionError::ShuttingDown);
+        }
         let session = match queue_budget {
             Some(queue_budget) => self.broker.open_window_with_budget(
                 identity.clone(),
@@ -290,9 +742,8 @@ impl InProcessTransport {
             identity.auth_generation(),
             stream,
         ));
-        let mut pumps = self.pumps.lock().expect("事件泵句柄锁不会中毒");
-        pumps.retain(|pump| !pump.task.is_finished());
-        pumps.push(PumpHandle {
+        pumps.legacy.retain(|pump| !pump.task.is_finished());
+        pumps.legacy.push(PumpHandle {
             label: identity.label().clone(),
             cancellation: session_cancellation,
             task: handle,
@@ -307,16 +758,38 @@ impl InProcessTransport {
     /// then its upstream pump is cancelled. Returning `true` therefore proves that the route is no
     /// longer eligible for delivery; callers do not need to wait for another upstream event.
     pub fn close_session(&self, label: &WindowLabel) -> bool {
-        let cancellations = self
-            .pumps
-            .lock()
-            .expect("事件泵句柄锁不会中毒")
-            .iter()
+        let (mut pumps, poisoned) = match self.pumps.lock() {
+            Ok(pumps) => (pumps, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+        if pumps.capture_requested {
+            if poisoned {
+                fail_capture(&mut pumps, CaptureTransportFault::Poisoned);
+            }
+            let closed = self.broker
+                .close_window(label, crate::broker::DisconnectReason::SubscriptionClosed);
+            if let Some(capture) = pumps.capture.as_ref() {
+                for slot in &capture.originals {
+                    if &slot.original.label == label {
+                        slot.original.cancellation.cancel();
+                    }
+                }
+            }
+            // A rejected retrospective arm keeps any actual legacy originals too.
+            for original in &pumps.legacy {
+                if &original.label == label {
+                    original.cancellation.cancel();
+                }
+            }
+            return closed;
+        }
+        assert!(!poisoned, "事件泵句柄锁不会中毒");
+        let cancellations = pumps.legacy.iter()
             .filter(|pump| &pump.label == label)
-            .map(|pump| pump.cancellation.clone())
-            .collect::<Vec<_>>();
-        let closed = self
-            .broker
+            .map(|pump| pump.cancellation.clone()).collect::<Vec<_>>();
+        drop(pumps);
+        let closed = self.broker
             .close_window(label, crate::broker::DisconnectReason::SubscriptionClosed);
         for cancellation in cancellations {
             cancellation.cancel();
@@ -332,13 +805,42 @@ impl InProcessTransport {
     ///
     /// deadline 到了仍未停下的泵会被 `abort`：**deadline 是 deadline，不是建议**。
     /// 被 abort 的数量如实记进 [`ShutdownReport::pumps_aborted`]，不掩盖。
+    /// Capture-armed transports instead retain originals and return an unsuccessful legacy report;
+    /// their original caller must use `begin_capture_closing` and its resident owner.
     pub async fn shutdown(&self) -> ShutdownReport {
         let started = Instant::now();
-        self.shutdown_token().cancel();
-        let windows_closed = self.broker.close_all();
-
-        let mut handles: Vec<PumpHandle> =
-            core::mem::take(&mut *self.pumps.lock().expect("事件泵句柄锁不会中毒"));
+        let (mut handles, windows_closed) = {
+            let (mut pumps, poisoned) = match self.pumps.lock() {
+                Ok(pumps) => (pumps, false),
+                Err(poisoned) => (poisoned.into_inner(), true),
+            };
+            #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+            if pumps.capture_requested {
+                // This legacy entry cannot take an armed owner, abort it, or claim closure.
+                fail_capture(&mut pumps, if poisoned {
+                    CaptureTransportFault::Poisoned
+                } else {
+                    CaptureTransportFault::Cancelled
+                });
+                self.shutdown_token().cancel();
+                let windows_closed = self.broker.close_all();
+                let retained = pumps.capture.as_ref().map_or(0, |capture| capture.originals.len());
+                return ShutdownReport {
+                    windows_closed,
+                    pumps_total: pumps.legacy.len().saturating_add(retained),
+                    pumps_joined: 0,
+                    pumps_aborted: 0,
+                    elapsed: started.elapsed(),
+                    within_deadline: false,
+                };
+            }
+            assert!(!poisoned, "事件泵句柄锁不会中毒");
+            self.shutdown_token().cancel();
+            let windows_closed = self.broker.close_all();
+            #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+            { pumps.legacy_history = true; }
+            (core::mem::take(&mut pumps.legacy), windows_closed)
+        };
         let pumps_total = handles.len();
 
         let deadline = tokio::time::sleep(SHUTDOWN_DEADLINE);
@@ -1008,5 +1510,301 @@ mod tests {
         assert!(manifest.contains("tauri-host = ["));
         assert!(manifest.contains("serde_json = { workspace = true, optional = true }"));
         assert!(!manifest.contains("serde_json.workspace = true"));
+    }
+
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    mod capture_retention {
+        use super::*;
+        use tokio::sync::Notify;
+
+        fn bounds(slots: u64) -> WholePgCarrierBounds {
+            WholePgCarrierBounds {
+                max_material_files: 16, max_directories: 16, max_path_bytes: 64,
+                max_path_depth: 8, max_single_plain_bytes: 4096, max_material_plain_bytes: 65536,
+                max_manifest_bytes: 4096, max_header_bytes: 128, max_data_chunks: 32,
+                max_chunk_plain_bytes: 4096, max_wire_bytes: 131072,
+                max_metadata_bytes: 1048576, max_open_files: slots,
+                max_snapshot_bytes: 65536, max_spool_bytes: 131072,
+                max_retained_prior_bytes: 65536, max_journal_bytes: 4096,
+                max_total_allocation_bytes: 1048576, capacity_reserve_bytes: 4096,
+                free_floor_bytes: 4096, max_key_medium_allocation_bytes: 4096,
+                key_medium_reserve_bytes: 4096, key_medium_free_floor_bytes: 4096,
+            }
+        }
+
+        fn arm_with_original_resources(
+            transport: &InProcessTransport,
+            slots: u64,
+        ) -> Arc<Mutex<CaptureResourceTotals>> {
+            let bounds = bounds(slots);
+            let resources = crate::tauri_background::capture::original_capture_resources_for_test(&bounds).unwrap();
+            transport.bind_original_capture_resources(Arc::clone(&resources)).unwrap();
+            transport.arm_capture_retention(&bounds).unwrap();
+            resources
+        }
+
+        struct HeldSubscription {
+            started: Notify,
+            release: Notify,
+            calls: AtomicUsize,
+        }
+
+        impl HeldSubscription {
+            fn new() -> Self {
+                Self { started: Notify::new(), release: Notify::new(), calls: AtomicUsize::new(0) }
+            }
+        }
+
+        #[async_trait]
+        impl ApplicationService for HeldSubscription {
+            async fn execute(&self, _auth: AuthContext, _command: AppCommand) -> Result<AppReply, AppError> {
+                Ok(AppReply::Health(HealthReport { ok: true }))
+            }
+
+            async fn subscribe(&self, _auth: AuthContext, _request: SubscriptionRequest) -> Result<AppEventStream, AppError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(Box::pin(FiniteEventStream(VecDeque::new())))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_late_subscribe_cannot_publish_after_the_original_closing_gate() {
+            let service = Arc::new(HeldSubscription::new());
+            let transport = Arc::new(InProcessTransport::new(service.clone()));
+            arm_with_original_resources(&transport, 2);
+            let caller_transport = transport.clone();
+            let caller = tokio::spawn(async move {
+                caller_transport.open_session(
+                    WindowLabel::new("late"), &auth_for("actor-1"),
+                    SubscriptionRequest::Health, ThreadSubscriptions::none(),
+                ).await
+            });
+            service.started.notified().await;
+            let mut closing = transport.begin_capture_closing().unwrap();
+            assert!(closing.originals.is_empty());
+            service.release.notify_one();
+            assert!(matches!(caller.await.unwrap(), Err(OpenSessionError::ShuttingDown)));
+            assert_eq!(transport.broker().window_count(), 0);
+            assert_eq!(closing.join_originals().await, Ok(()));
+            assert_eq!(transport.pumps.lock().unwrap().capture.as_ref().unwrap().pending, 0);
+            // Caller completion is explicitly joined above; an empty pump Vec alone does not
+            // prove that the original subscribing caller/global writer has drained.
+        }
+
+        #[tokio::test]
+        async fn cancelled_subscribe_keeps_its_bounded_reservation_before_another_subscribe() {
+            let service = Arc::new(HeldSubscription::new());
+            let transport = InProcessTransport::new(service.clone());
+            arm_with_original_resources(&transport, 1);
+            let auth = auth_for("actor-1");
+            let mut first = Box::pin(transport.open_session(
+                WindowLabel::new("first"), &auth, SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ));
+            core::future::poll_fn(|cx| {
+                assert!(core::future::Future::poll(first.as_mut(), cx).is_pending());
+                Poll::Ready(())
+            }).await;
+            assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+            drop(first);
+            let second = transport.open_session(
+                WindowLabel::new("second"), &auth, SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await;
+            assert!(matches!(second, Err(OpenSessionError::ShuttingDown)));
+            assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+            {
+                let pumps = transport.pumps.lock().unwrap();
+                let capture = pumps.capture.as_ref().unwrap();
+                assert_eq!(capture.pending, 0);
+                assert_eq!(capture.admissions, 1);
+                assert!(capture.originals.is_empty());
+            }
+            let mut closing = transport.begin_capture_closing().unwrap();
+            assert_eq!(closing.join_originals().await, Ok(()));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn dropping_a_pending_join_waiter_preserves_the_original_and_consumed_result() {
+            let transport = InProcessTransport::new(Arc::new(FiniteSubscriptionService));
+            arm_with_original_resources(&transport, 1);
+            let _session = transport.open_session(
+                WindowLabel::new("main"), &auth_for("actor-1"),
+                SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await.unwrap();
+            let mut closing = transport.begin_capture_closing().unwrap();
+            // Tokio spawn does not synchronously poll the spawned pump; this test task has
+            // not yielded, so the first original join is genuinely pending on this runtime.
+            let mut waiter = Box::pin(closing.join_originals());
+            core::future::poll_fn(|cx| {
+                assert!(core::future::Future::poll(waiter.as_mut(), cx).is_pending());
+                Poll::Ready(())
+            }).await;
+            drop(waiter);
+            assert_eq!(closing.cursor, 0);
+            assert_eq!(closing.originals.len(), 1);
+            assert!(closing.originals[0].actual.is_none());
+            assert_eq!(closing.join_originals().await, Ok(()));
+            assert_eq!(closing.cursor, 1);
+            assert!(matches!(closing.originals[0].actual.as_ref(), Some(CapturePumpOutcome::Joined(Ok(())))));
+            // A second poll of a consumed JoinHandle would panic. The same actual result is used.
+            assert_eq!(closing.join_originals().await, Ok(()));
+        }
+
+        struct PanickingStream(Arc<Notify>);
+
+        impl futures_core::Stream for PanickingStream {
+            type Item = AppEvent;
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<AppEvent>> {
+                self.0.notify_one();
+                panic!("original-stream-panic-payload");
+            }
+        }
+
+        struct FirstPumpPanics {
+            panicked: Arc<Notify>,
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ApplicationService for FirstPumpPanics {
+            async fn execute(&self, _auth: AuthContext, _command: AppCommand) -> Result<AppReply, AppError> {
+                Ok(AppReply::Health(HealthReport { ok: true }))
+            }
+            async fn subscribe(&self, _auth: AuthContext, _request: SubscriptionRequest) -> Result<AppEventStream, AppError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Box::pin(PanickingStream(self.panicked.clone())))
+                } else {
+                    Ok(Box::pin(FiniteEventStream(VecDeque::new())))
+                }
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_finished_panicked_original_is_not_reaped_by_the_next_session() {
+            let panicked = Arc::new(Notify::new());
+            let service = Arc::new(FirstPumpPanics { panicked: panicked.clone(), calls: AtomicUsize::new(0) });
+            let transport = InProcessTransport::new(service);
+            arm_with_original_resources(&transport, 2);
+            let auth = auth_for("actor-1");
+            let _first = transport.open_session(
+                WindowLabel::new("first"), &auth, SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await.unwrap();
+            panicked.notified().await;
+            assert!(transport.pumps.lock().unwrap().capture.as_ref().unwrap().originals[0].original.task.is_finished());
+            let _second = transport.open_session(
+                WindowLabel::new("second"), &auth, SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await.unwrap();
+            let mut closing = transport.begin_capture_closing().unwrap();
+            assert_eq!(closing.originals.len(), 2);
+            assert_eq!(closing.join_originals().await, Err(CaptureTransportFault::Panicked));
+            let Some(CapturePumpOutcome::Joined(Err(error))) = closing.originals[0].actual.as_ref() else {
+                panic!("must retain the actual first JoinError");
+            };
+            assert!(error.is_panic());
+            assert_eq!(closing.cursor, 2);
+            assert_eq!(closing.join_originals().await, Err(CaptureTransportFault::Panicked));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn poisoned_gate_and_legacy_shutdown_keep_the_armed_original_resident() {
+            let transport = InProcessTransport::new(Arc::new(FiniteSubscriptionService));
+            arm_with_original_resources(&transport, 1);
+            let _session = transport.open_session(
+                WindowLabel::new("main"), &auth_for("actor-1"),
+                SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await.unwrap();
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _gate = transport.pumps.lock().unwrap();
+                panic!("original-pumps-gate-poison");
+            }));
+            assert!(panicked.is_err());
+            assert!(matches!(transport.begin_capture_closing(), Err(CaptureTransportFault::Poisoned)));
+            let report = transport.shutdown().await;
+            assert_eq!(report.pumps_total, 1);
+            assert_eq!(report.pumps_joined, 0);
+            assert_eq!(report.pumps_aborted, 0);
+            assert!(!report.within_deadline);
+            let retained = match transport.pumps.lock() {
+                Err(poisoned) => poisoned.into_inner(),
+                Ok(_) => panic!("the original gate must remain poisoned"),
+            };
+            assert_eq!(retained.capture.as_ref().unwrap().originals.len(), 1);
+            assert!(retained.capture.as_ref().unwrap().originals[0].actual.is_none());
+        }
+
+        #[tokio::test]
+        async fn retrospective_arm_failure_does_not_consume_legacy_originals() {
+            let transport = InProcessTransport::new(Arc::new(FiniteSubscriptionService));
+            let resources = crate::tauri_background::capture::original_capture_resources_for_test(&bounds(1)).unwrap();
+            transport.bind_original_capture_resources(resources).unwrap();
+            let _session = transport.open_session(
+                WindowLabel::new("legacy"), &auth_for("actor-1"),
+                SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await.unwrap();
+            assert!(matches!(transport.arm_capture_retention(&bounds(1)), Err(WholePgCarrierFault::ClosingPending)));
+            let report = transport.shutdown().await;
+            assert_eq!(report.pumps_total, 1);
+            assert_eq!(report.pumps_aborted, 0);
+            assert!(!report.within_deadline);
+            assert_eq!(transport.pumps.lock().unwrap().legacy.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn binding_and_arm_do_not_preallocate_the_full_slot_ceiling() {
+            let service = Arc::new(HeldSubscription::new());
+            let transport = InProcessTransport::new(service.clone());
+            let resources = arm_with_original_resources(&transport, 8);
+            let before = remaining_capture_resources(&resources).unwrap();
+            assert_eq!(transport.pumps.lock().unwrap().capture.as_ref().unwrap().originals.capacity(), 0);
+            let auth = auth_for("actor-1");
+            let mut subscribing = Box::pin(transport.open_session(
+                WindowLabel::new("one"), &auth, SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ));
+            core::future::poll_fn(|cx| {
+                assert!(core::future::Future::poll(subscribing.as_mut(), cx).is_pending());
+                Poll::Ready(())
+            }).await;
+            let after = remaining_capture_resources(&resources).unwrap();
+            assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+            assert!(after.1 < before.1);
+            assert_eq!(transport.pumps.lock().unwrap().capture.as_ref().unwrap().originals.capacity(), 1);
+            drop(subscribing);
+            assert_eq!(remaining_capture_resources(&resources), Ok(after));
+            assert_eq!(transport.pumps.lock().unwrap().capture.as_ref().unwrap().pending, 0);
+            let mut closing = transport.begin_capture_closing().unwrap();
+            assert_eq!(closing.join_originals().await, Ok(()));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn another_owner_spending_remaining_prevents_subscribe_and_keeps_the_original() {
+            let panicked = Arc::new(Notify::new());
+            let service = Arc::new(FirstPumpPanics { panicked: panicked.clone(), calls: AtomicUsize::new(0) });
+            let transport = InProcessTransport::new(service.clone());
+            let resources = arm_with_original_resources(&transport, 2);
+            let auth = auth_for("actor-1");
+            let _first = transport.open_session(
+                WindowLabel::new("first"), &auth, SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await.unwrap();
+            panicked.notified().await;
+            let (_, remaining_metadata) = remaining_capture_resources(&resources).unwrap();
+            reserve_capture_resources(&resources, 0, remaining_metadata).unwrap();
+            let component_before = transport.retained_resource_usage().unwrap();
+            let second = transport.open_session(
+                WindowLabel::new("second"), &auth, SubscriptionRequest::Health, ThreadSubscriptions::none(),
+            ).await;
+            assert!(matches!(second, Err(OpenSessionError::ShuttingDown)));
+            assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.retained_resource_usage().unwrap(), component_before);
+            assert_eq!(transport.pumps.lock().unwrap().capture.as_ref().unwrap().originals.len(), 1);
+            let mut closing = transport.begin_capture_closing().unwrap();
+            assert_eq!(closing.join_originals().await, Err(CaptureTransportFault::Panicked));
+            let Some(CapturePumpOutcome::Joined(Err(error))) = closing.originals[0].actual.as_ref() else {
+                panic!("the actual original JoinError must remain resident");
+            };
+            assert!(error.is_panic());
+            assert_eq!(closing.join_originals().await, Err(CaptureTransportFault::Panicked));
+        }
+
     }
 }

@@ -24,6 +24,8 @@
 pub mod approval_preference_schema;
 pub mod artifact_cleanup_schema;
 pub mod baseline;
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub mod capture_materials;
 pub mod compat;
 pub mod custom_model_catalog_schema;
 pub mod custom_model_v2_schema;

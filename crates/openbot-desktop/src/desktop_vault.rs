@@ -177,6 +177,155 @@ pub(crate) struct VaultReadyDesktopMaterial {
     material: DesktopApplicationKeyMaterial,
     proof: VerifiedDesktopVaultCanary,
     database_origin: DatabaseOrigin,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    retained_capture: Option<ArmedCaptureVault>,
+}
+
+/// The original master and its original confirmed journal, retained only for an armed request.
+/// This owner has no public constructor and never reads a second master from the OS store.
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) struct ArmedCaptureVault {
+    master: DesktopVaultMasterKey,
+    journal: MasterInitializationJournal,
+    dataset_id: String,
+    deployment_id: String,
+    tenant_id: String,
+    key_id: String,
+    key_version: i32,
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl ArmedCaptureVault {
+    pub(crate) fn revalidate(&self) -> Result<(), DesktopVaultKeyError> {
+        self.journal.revalidate_retained().map_err(map_journal)?;
+        if self.journal.dataset_id() != self.dataset_id
+            || self.journal.deployment_id() != self.deployment_id
+            || self.journal.tenant_id() != self.tenant_id
+            || self.journal.key_id() != self.key_id
+            || self.key_version != 1
+            || self.master.0.expose().len() != MASTER_KEY_BYTES
+        {
+            return Err(DesktopVaultKeyError::ReconciliationRequired);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn revalidate_before(
+        &self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        clock.require_effect()?;
+        self.journal.revalidate_retained_before(clock)?;
+        if self.journal.dataset_id() != self.dataset_id
+            || self.journal.deployment_id() != self.deployment_id
+            || self.journal.tenant_id() != self.tenant_id
+            || self.journal.key_id() != self.key_id || self.key_version != 1
+        {
+            return Err(Fault::SourceChanged);
+        }
+        if self.master.0.expose().len() != MASTER_KEY_BYTES {
+            return Err(Fault::SecretInvalid);
+        }
+        clock.require_effect()
+    }
+
+    pub(crate) fn verify_capture_canary_before(
+        &self,
+        row: &DesktopVaultCanaryRow,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        self.revalidate_before(clock)?;
+        if row.dataset_id() != self.dataset_id
+            || row.deployment_id() != self.deployment_id
+            || row.tenant_id() != self.tenant_id
+            || row.key_id() != self.key_id
+            || row.key_version() != self.key_version || row.canary_schema() != 1
+        {
+            return Err(Fault::SourceChanged);
+        }
+        clock.require_effect()?;
+        let observed_binding = DesktopVaultCanaryBinding::new(
+            self.dataset_id.clone(), self.deployment_id.clone(), self.tenant_id.clone(),
+            self.key_id.clone(), KeyVersion::new(1),
+        );
+        clock.require_effect()?;
+        let binding = observed_binding.map_err(|_| Fault::SecretInvalid)?;
+        let observed_envelope =
+            openbot_domain::vault::DesktopVaultCanaryEnvelope::parse(row.encrypted_canary());
+        clock.require_effect()?;
+        let envelope = observed_envelope.map_err(|_| Fault::SecretInvalid)?;
+        let observed_canary =
+            openbot_domain::vault::open_desktop_vault_canary(&self.master.0, &binding, &envelope);
+        clock.require_effect()?;
+        observed_canary.map_err(|_| Fault::SecretInvalid)?;
+        self.revalidate_before(clock)
+    }
+
+    pub(crate) fn journal_material(
+        &self,
+    ) -> Result<(std::fs::File, Vec<u8>), DesktopVaultKeyError> {
+        self.revalidate()?;
+        self.journal.retained_material().map_err(map_journal)
+    }
+
+    pub(crate) fn dataset_id(&self) -> &str {
+        &self.dataset_id
+    }
+    pub(crate) fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+    pub(crate) fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    pub(crate) fn key_id(&self) -> &str {
+        &self.key_id
+    }
+    pub(crate) fn key_version(&self) -> i32 {
+        self.key_version
+    }
+
+    /// Move the original secret, keeping the original journal owner separately resident.
+    pub(crate) fn into_original_master_before(
+        self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(SecretBytes, std::fs::File, Vec<u8>),
+                (Self, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault)> {
+        if let Err(error) = self.revalidate_before(clock) {
+            return Err((self, error));
+        }
+        let (file, bytes) = self.journal.into_retained_material();
+        Ok((self.master.0, file, bytes))
+    }
+}
+
+enum MasterRetention<'a> {
+    Ordinary,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    Armed(&'a crate::desktop_release::ReviewedNormalCaptureRequest),
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
+    _Lifetime(std::marker::PhantomData<&'a ()>),
 }
 
 impl VaultReadyDesktopMaterial {
@@ -189,6 +338,27 @@ impl VaultReadyDesktopMaterial {
     ) {
         (self.material, self.proof, self.database_origin)
     }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) fn into_capture_parts(
+        self,
+    ) -> (
+        DesktopApplicationKeyMaterial,
+        VerifiedDesktopVaultCanary,
+        DatabaseOrigin,
+        Option<ArmedCaptureVault>,
+    ) {
+        (
+            self.material,
+            self.proof,
+            self.database_origin,
+            self.retained_capture,
+        )
+    }
 }
 
 impl PreparedDesktopLocalDataPlane {
@@ -199,6 +369,55 @@ impl PreparedDesktopLocalDataPlane {
         service: &ReviewedDesktopVaultKeyStoreService,
         package: &openbot_application::tenant::package::LoadedTenantPackage,
     ) -> Result<VaultReadyDesktopMaterial, DesktopVaultKeyError> {
+        self.verify_application_key_material_inner(
+            store,
+            service,
+            package,
+            MasterRetention::Ordinary,
+        )
+        .await
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) async fn verify_application_key_material_for_capture<S: OsSecretStore + ?Sized>(
+        &self,
+        store: &S,
+        service: &ReviewedDesktopVaultKeyStoreService,
+        package: &openbot_application::tenant::package::LoadedTenantPackage,
+        request: &crate::desktop_release::ReviewedNormalCaptureRequest,
+    ) -> Result<VaultReadyDesktopMaterial, DesktopVaultKeyError> {
+        self.verify_application_key_material_inner(
+            store,
+            service,
+            package,
+            MasterRetention::Armed(request),
+        )
+        .await
+    }
+
+    async fn verify_application_key_material_inner<S: OsSecretStore + ?Sized>(
+        &self,
+        store: &S,
+        service: &ReviewedDesktopVaultKeyStoreService,
+        package: &openbot_application::tenant::package::LoadedTenantPackage,
+        retention: MasterRetention<'_>,
+    ) -> Result<VaultReadyDesktopMaterial, DesktopVaultKeyError> {
+        // Validate the full finite secret profile before the original master is acquired.
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        if let MasterRetention::Armed(request) = &retention {
+            request
+                .profile
+                .validate_master_retention()
+                .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        }
         self.ensure_owner_current()
             .map_err(|_| DesktopVaultKeyError::DataPlaneNotRunning)?;
         let mut journal = MasterInitializationJournal::load(self).map_err(map_journal)?;
@@ -294,16 +513,16 @@ impl PreparedDesktopLocalDataPlane {
             Some(MasterJournalPhase::WriteEntered) => unreachable!(),
         };
 
-        let journal = journal
+        let confirmed_journal = journal
             .as_mut()
             .ok_or(DesktopVaultKeyError::ReconciliationRequired)?;
-        journal.revalidate(self).map_err(map_journal)?;
-        let proof = match journal.phase() {
+        confirmed_journal.revalidate(self).map_err(map_journal)?;
+        let proof = match confirmed_journal.phase() {
             MasterJournalPhase::ReadbackConfirmed => {
                 if desktop_vault_canary::read(
                     self.pool(),
-                    journal.deployment_id(),
-                    journal.tenant_id(),
+                    confirmed_journal.deployment_id(),
+                    confirmed_journal.tenant_id(),
                 )
                 .await
                 .map_err(|_| DesktopVaultKeyError::ReconciliationRequired)?
@@ -311,32 +530,77 @@ impl PreparedDesktopLocalDataPlane {
                 {
                     return Err(DesktopVaultKeyError::ReconciliationRequired);
                 }
-                journal.enter_canary_write(self).map_err(map_journal)?;
+                confirmed_journal
+                    .enter_canary_write(self)
+                    .map_err(map_journal)?;
                 self.ensure_owner_current()
                     .map_err(|_| DesktopVaultKeyError::DataPlaneNotRunning)?;
-                let row = new_canary_row(&master, journal)?;
+                let row = new_canary_row(&master, confirmed_journal)?;
                 desktop_vault_canary::insert_once(self.pool(), &row)
                     .await
                     .map_err(|_| DesktopVaultKeyError::ReconciliationRequired)?;
-                let proof = verify_canary(self, journal, &master).await?;
-                journal.confirm_canary(self).map_err(map_journal)?;
+                let proof = verify_canary(self, confirmed_journal, &master).await?;
+                confirmed_journal
+                    .confirm_canary(self)
+                    .map_err(map_journal)?;
                 proof
             }
             MasterJournalPhase::CanaryWriteEntered => {
-                let proof = verify_canary(self, journal, &master).await?;
-                journal.confirm_canary(self).map_err(map_journal)?;
+                let proof = verify_canary(self, confirmed_journal, &master).await?;
+                confirmed_journal
+                    .confirm_canary(self)
+                    .map_err(map_journal)?;
                 proof
             }
-            MasterJournalPhase::CanaryConfirmed => verify_canary(self, journal, &master).await?,
+            MasterJournalPhase::CanaryConfirmed => {
+                verify_canary(self, confirmed_journal, &master).await?
+            }
             _ => return Err(DesktopVaultKeyError::ReconciliationRequired),
         };
-        journal.revalidate(self).map_err(map_journal)?;
+        confirmed_journal.revalidate(self).map_err(map_journal)?;
         let material =
-            derive_application_material(self.authority().auth_context().tenant().clone(), master)?;
+            derive_application_material(self.authority().auth_context().tenant().clone(), &master)?;
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        let retained_capture = match retention {
+            MasterRetention::Armed(_) => Some(ArmedCaptureVault {
+                dataset_id: proof.dataset_id().to_owned(),
+                deployment_id: proof.deployment_id().to_owned(),
+                tenant_id: proof.tenant_id().to_owned(),
+                key_id: proof.key_id().to_owned(),
+                key_version: proof.key_version(),
+                master,
+                journal: journal
+                    .take()
+                    .ok_or(DesktopVaultKeyError::ReconciliationRequired)?,
+            }),
+            MasterRetention::Ordinary => {
+                drop(master);
+                None
+            }
+        };
+        #[cfg(not(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        )))]
+        {
+            let _ = retention;
+            drop(master);
+        }
         Ok(VaultReadyDesktopMaterial {
             material,
             proof,
             database_origin,
+            #[cfg(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            ))]
+            retained_capture,
         })
     }
 }
@@ -513,7 +777,7 @@ fn decode_stored(stored: SecretBytes) -> Result<DesktopVaultMasterKey, DesktopVa
 
 fn derive_application_material(
     tenant: TenantId,
-    master: DesktopVaultMasterKey,
+    master: &DesktopVaultMasterKey,
 ) -> Result<DesktopApplicationKeyMaterial, DesktopVaultKeyError> {
     let credential_vault = CredentialRecordVault::single_key(
         tenant,
@@ -530,7 +794,6 @@ fn derive_application_material(
     let mcp_oauth_state_key =
         derive_application_key(&master.0, ApplicationKeyPurpose::McpOauthState)
             .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
-    drop(master);
     Ok(DesktopApplicationKeyMaterial {
         credential_vault,
         audit_key,
@@ -644,7 +907,8 @@ mod tests {
             DesktopVaultKeyDisposition::fresh(),
         )
         .unwrap();
-        let first_material = derive_application_material(TenantId::new("tenant-a"), first).unwrap();
+        let first_material =
+            derive_application_material(TenantId::new("tenant-a"), &first).unwrap();
         assert_eq!(store.writes.load(Ordering::Relaxed), 1);
         let secret_id = Uuid::from_u128(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef);
         let plaintext = SecretBytes::new(b"vault-canary".to_vec());
@@ -666,7 +930,7 @@ mod tests {
         )
         .unwrap();
         let second_material =
-            derive_application_material(TenantId::new("tenant-a"), second).unwrap();
+            derive_application_material(TenantId::new("tenant-a"), &second).unwrap();
         let opened = second_material
             .credential_vault()
             .open(
@@ -783,7 +1047,7 @@ mod tests {
             DesktopVaultKeyDisposition::fresh(),
         )
         .unwrap();
-        let first = derive_application_material(TenantId::new("tenant-keychain"), first).unwrap();
+        let first = derive_application_material(TenantId::new("tenant-keychain"), &first).unwrap();
         let id = Uuid::from_u128(0xfedc_ba09_8765_4321_fedc_ba09_8765_4321);
         let plaintext = SecretBytes::new(b"private-keychain-canary".to_vec());
         let sealed = first
@@ -803,7 +1067,8 @@ mod tests {
             DesktopVaultKeyDisposition::fresh(),
         )
         .unwrap();
-        let second = derive_application_material(TenantId::new("tenant-keychain"), second).unwrap();
+        let second =
+            derive_application_material(TenantId::new("tenant-keychain"), &second).unwrap();
         assert_eq!(
             second
                 .credential_vault()
@@ -848,7 +1113,7 @@ mod tests {
             DesktopVaultKeyDisposition::fresh(),
         )
         .unwrap();
-        let first = derive_application_material(TenantId::new("tenant-windows"), first).unwrap();
+        let first = derive_application_material(TenantId::new("tenant-windows"), &first).unwrap();
         let id = Uuid::from_u128(0xaaaa_bbbb_cccc_dddd_eeee_ffff_0000_1111);
         let plaintext = SecretBytes::new(b"windows-credential-canary".to_vec());
         let sealed = first
@@ -868,7 +1133,7 @@ mod tests {
             DesktopVaultKeyDisposition::fresh(),
         )
         .unwrap();
-        let second = derive_application_material(TenantId::new("tenant-windows"), second).unwrap();
+        let second = derive_application_material(TenantId::new("tenant-windows"), &second).unwrap();
         assert_eq!(
             second
                 .credential_vault()

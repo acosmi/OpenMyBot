@@ -345,6 +345,76 @@ impl StartupJournal {
         Ok(())
     }
 
+    /// Borrow only the original confirmed-exit journal; does not discover or stop a process.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(super) fn capture_exit_material(
+        &self,
+        owner: &PostgresStartLock,
+    ) -> Result<(File, Vec<u8>), StartupJournalError> {
+        self.revalidate(owner)?;
+        if self.record.phase != StartupJournalPhase::ExitConfirmed {
+            return Err(StartupJournalError::ReconciliationRequired);
+        }
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|_| StartupJournalError::Invalid)?;
+        self.revalidate(owner)?;
+        Ok((file, self.bytes.clone()))
+    }
+
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    pub(super) fn capture_original_data_directory_matches(
+        &self, retained: &File,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        use std::os::unix::fs::MetadataExt as _;
+        clock.require_effect()?;
+        let original = self.data_dir_file.metadata();
+        clock.require_effect()?;
+        let original = original.map_err(|_| Fault::IoFailure)?;
+        clock.require_effect()?;
+        let other = retained.metadata();
+        clock.require_effect()?;
+        let other = other.map_err(|_| Fault::IoFailure)?;
+        if !original.is_dir() || !other.is_dir()
+            || original.mode() & 0o777 != 0o700 || other.mode() & 0o777 != 0o700
+            || (original.dev(), original.ino(), original.uid())
+                != (self.data_dir_device, self.data_dir_inode, self.root_uid)
+            || (other.dev(), other.ino(), other.uid())
+                != (self.data_dir_device, self.data_dir_inode, self.root_uid) {
+            return Err(Fault::SourceChanged);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(super) fn capture_data_directory(&self) -> Result<File, StartupJournalError> {
+        let file = self
+            .data_dir_file
+            .try_clone()
+            .map_err(|_| StartupJournalError::Invalid)?;
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = file.metadata().map_err(|_| StartupJournalError::Invalid)?;
+        if metadata.dev() != self.data_dir_device
+            || metadata.ino() != self.data_dir_inode
+            || metadata.uid() != self.root_uid
+            || !metadata.is_dir()
+        {
+            return Err(StartupJournalError::Invalid);
+        }
+        Ok(file)
+    }
+
     /// Persist the observation of the same current child held by the Supervisor.
     pub(super) fn record_child(
         &mut self,

@@ -1318,3 +1318,277 @@ mod tests {
         assert!(!include_str!("desktop_local.rs").contains(&forbidden_env_read));
     }
 }
+
+/// Original installation descriptors retained by the armed startup owner.
+/// Borrowed descriptors and identity observations do not confer a capture source grant.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub struct RetainedInstallationCapture {
+    root: File,
+    marker: File,
+    root_identity: InstallationCaptureIdentity,
+    marker_identity: InstallationCaptureIdentity,
+    original_instance: Arc<str>,
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InstallationCaptureIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+    links: u64,
+    bytes: u64,
+    mtime: i64,
+    mtime_ns: i64,
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl InstallationCaptureIdentity {
+    fn observe_before(
+        file: &File,
+        clock: &dyn crate::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<Self, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        use std::os::unix::fs::MetadataExt as _;
+        clock.require_effect()?;
+        let observed = file.metadata();
+        clock.require_effect()?;
+        let meta = observed.map_err(|_| Fault::IoFailure)?;
+        Ok(Self {
+            device: meta.dev(), inode: meta.ino(), uid: meta.uid(), mode: meta.mode(),
+            links: meta.nlink(), bytes: meta.len(), mtime: meta.mtime(),
+            mtime_ns: meta.mtime_nsec(),
+        })
+    }
+
+    fn observe(file: &File) -> Result<Self, DesktopLocalAuthorityError> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file
+            .metadata()
+            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            uid: meta.uid(),
+            mode: meta.mode(),
+            links: meta.nlink(),
+            bytes: meta.len(),
+            mtime: meta.mtime(),
+            mtime_ns: meta.mtime_nsec(),
+        })
+    }
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl DesktopLocalInstallation {
+    /// Retain the original installation descriptors before the capture operation starts.
+    pub fn retain_capture_installation(
+        &self,
+    ) -> Result<RetainedInstallationCapture, DesktopLocalAuthorityError> {
+        use rustix::fs::{Mode, OFlags};
+        let parent = self
+            .sidecar_data_dir
+            .parent()
+            .ok_or(DesktopLocalAuthorityError::Corrupt)?;
+        let root = crate::artifact_store::open_trusted_host_root(parent)
+            .map_err(|_| DesktopLocalAuthorityError::InsecurePermissions)?;
+        let marker = File::from(
+            rustix::fs::openat(
+                &root,
+                FILE_NAME,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| DesktopLocalAuthorityError::Corrupt)?,
+        );
+        let root_identity = InstallationCaptureIdentity::observe(&root)?;
+        let marker_identity = InstallationCaptureIdentity::observe(&marker)?;
+        if root_identity.mode & 0o7777 != 0o700
+            || marker_identity.mode & 0o170000 != 0o100000
+            || marker_identity.mode & 0o7777 != 0o600
+            || marker_identity.links != 1
+            || marker_identity.uid != root_identity.uid
+            || marker_identity.bytes > FILE_MAX_BYTES
+        {
+            return Err(DesktopLocalAuthorityError::InsecurePermissions);
+        }
+        let mut retained = RetainedInstallationCapture {
+            root,
+            marker,
+            root_identity,
+            marker_identity,
+            original_instance: Arc::clone(&self.authority.instance_id),
+        };
+        retained.verify_original_startup()?;
+        Ok(retained)
+    }
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl RetainedInstallationCapture {
+    /// Borrow the startup-retained root without reopening or duplicating it.
+    pub fn original_root(&self) -> &File {
+        &self.root
+    }
+    /// Borrow the startup-retained marker without reopening or duplicating it.
+    pub fn original_marker(&self) -> &File {
+        &self.marker
+    }
+    // Only retain_capture_installation calls this pre-t0 verifier.
+    fn verify_original_startup(&mut self) -> Result<(), DesktopLocalAuthorityError> {
+        use std::os::unix::fs::FileExt;
+        // Root mtime/size may legitimately change as the same startup creates known children;
+        // its kernel identity/owner/mode cannot. Marker contents and every marker identity
+        // field are immutable, even when its original name has been replaced.
+        let root = InstallationCaptureIdentity::observe(&self.root)?;
+        if (root.device, root.inode, root.uid, root.mode)
+            != (
+                self.root_identity.device,
+                self.root_identity.inode,
+                self.root_identity.uid,
+                self.root_identity.mode,
+            )
+            || InstallationCaptureIdentity::observe(&self.marker)? != self.marker_identity
+        {
+            return Err(DesktopLocalAuthorityError::Corrupt);
+        }
+        let named =
+            rustix::fs::statat(&self.root, FILE_NAME, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| DesktopLocalAuthorityError::Corrupt)?;
+        if named.st_ino != self.marker_identity.inode
+            || named.st_dev as u64 != self.marker_identity.device
+        {
+            return Err(DesktopLocalAuthorityError::Corrupt);
+        }
+        let mut raw = [0_u8; FILE_MAX_BYTES as usize];
+        let length = usize::try_from(self.marker_identity.bytes)
+            .map_err(|_| DesktopLocalAuthorityError::Corrupt)?;
+        let mut offset = 0;
+        while offset < length {
+            let n = self
+                .marker
+                .read_at(&mut raw[offset..length], offset as u64)
+                .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+            if n == 0 {
+                return Err(DesktopLocalAuthorityError::Corrupt);
+            }
+            offset += n;
+        }
+        let mut extra = [0_u8; 1];
+        if self
+            .marker
+            .read_at(&mut extra, length as u64)
+            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?
+            != 0
+        {
+            return Err(DesktopLocalAuthorityError::Corrupt);
+        }
+        let parsed = parse(
+            std::str::from_utf8(&raw[..length]).map_err(|_| DesktopLocalAuthorityError::Corrupt)?,
+        )?;
+        if encode(parsed) != self.original_instance.as_ref()
+            || InstallationCaptureIdentity::observe(&self.marker)? != self.marker_identity
+        {
+            return Err(DesktopLocalAuthorityError::Corrupt);
+        }
+        Ok(())
+    }
+    /// Revalidate the original descriptors with the same operation's per-effect clock.
+    pub fn verify_original(
+        &mut self,
+        clock: &dyn crate::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        use std::os::unix::fs::FileExt as _;
+        clock.require_effect()?;
+        let root = InstallationCaptureIdentity::observe_before(&self.root, clock)?;
+        if (root.device, root.inode, root.uid, root.mode)
+            != (self.root_identity.device, self.root_identity.inode,
+                self.root_identity.uid, self.root_identity.mode)
+            || InstallationCaptureIdentity::observe_before(&self.marker, clock)?
+                != self.marker_identity
+        {
+            return Err(Fault::SourceChanged);
+        }
+        self.verify_marker_name_before(clock)?;
+        let length = usize::try_from(self.marker_identity.bytes)
+            .map_err(|_| Fault::BoundsOverflow)?;
+        if length == 0 || length > FILE_MAX_BYTES as usize {
+            return Err(Fault::SourceChanged);
+        }
+        let mut raw = [0_u8; FILE_MAX_BYTES as usize];
+        let mut offset = 0;
+        while offset < length {
+            clock.require_effect()?;
+            let observed = self.marker.read_at(&mut raw[offset..length], offset as u64);
+            // The original E postcheck runs before every result classification, including Err.
+            clock.require_effect()?;
+            match observed {
+                Ok(0) => return Err(Fault::SourceChanged),
+                Ok(n) => offset = offset.checked_add(n).ok_or(Fault::BoundsOverflow)?,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(Fault::IoFailure),
+            }
+        }
+        let mut extra = [0_u8; 1];
+        loop {
+            clock.require_effect()?;
+            let observed = self.marker.read_at(&mut extra, length as u64);
+            clock.require_effect()?;
+            match observed {
+                Ok(0) => break,
+                Ok(_) => return Err(Fault::SourceChanged),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(Fault::IoFailure),
+            }
+        }
+        let parsed = parse(std::str::from_utf8(&raw[..length])
+            .map_err(|_| Fault::SourceChanged)?)
+            .map_err(|_| Fault::SourceChanged)?;
+        if encode(parsed) != self.original_instance.as_ref()
+            || InstallationCaptureIdentity::observe_before(&self.marker, clock)?
+                != self.marker_identity
+        {
+            return Err(Fault::SourceChanged);
+        }
+        self.verify_marker_name_before(clock)?;
+        let root = InstallationCaptureIdentity::observe_before(&self.root, clock)?;
+        if (root.device, root.inode, root.uid, root.mode)
+            != (self.root_identity.device, self.root_identity.inode,
+                self.root_identity.uid, self.root_identity.mode)
+        {
+            return Err(Fault::SourceChanged);
+        }
+        clock.require_effect()
+    }
+
+    fn verify_marker_name_before(
+        &self,
+        clock: &dyn crate::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        clock.require_effect()?;
+        let observed = rustix::fs::statat(
+            &self.root, FILE_NAME, rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        );
+        clock.require_effect()?;
+        let named = observed.map_err(|_| Fault::IoFailure)?;
+        if named.st_ino != self.marker_identity.inode
+            || named.st_dev as u64 != self.marker_identity.device
+            || named.st_uid != self.marker_identity.uid
+            || u32::from(named.st_mode) != self.marker_identity.mode
+            || named.st_nlink as u64 != self.marker_identity.links
+            || u64::try_from(named.st_size).map_err(|_| Fault::SourceChanged)?
+                != self.marker_identity.bytes
+        {
+            return Err(Fault::SourceChanged);
+        }
+        Ok(())
+    }
+
+    /// Move both originals only after the unique caller's all-sources-closed barrier.
+    pub fn into_owned_parts(self) -> (File, File) {
+        (self.root, self.marker)
+    }
+}

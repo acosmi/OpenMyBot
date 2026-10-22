@@ -1900,140 +1900,164 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
         auth: &AuthContext,
         mut input: SaveRunMessageTextArtifact,
     ) -> Result<ArtifactRegistrationReceipt, ArtifactAdministrationError> {
-        let diagnostic = self
-            .save_producer_diagnostic
-            .get()
-            .and_then(|capture| capture.begin_original(&input.request_id));
-        // These statement-local wrappers observe the same original Result once. They create
-        // no future, resource owner, retry or new timeout, and return that Result unchanged.
-        macro_rules! save_result {
-            ($expression:expr) => {{
-                let original_result: Result<_, ArtifactAdministrationError> = $expression;
-                if let (Some(capture), Err(error)) = (&diagnostic, &original_result) {
-                    capture.record(SaveProducerDiagnosticEvent::Terminal(
-                        SaveProducerDiagnosticTerminal::Error(*error),
-                    ));
-                }
-                original_result
-            }};
-        }
-        macro_rules! save_stage {
-            ($stage:ident) => {
-                if let Some(capture) = &diagnostic {
-                    capture.record(SaveProducerDiagnosticEvent::Stage(
-                        SaveProducerDiagnosticStage::$stage,
-                    ));
-                }
-            };
-        }
-        save_stage!(ValidateInput);
-        input.request_id = save_result!(
-            canonical_artifact_uuid_v7(&input.request_id)
-                .ok_or(ArtifactAdministrationError::InvalidInput { field: "requestId" })
-        )?;
-        if !ThreadIdentity::is_plausible(&input.source_thread_id) {
-            return save_result!(Err(ArtifactAdministrationError::InvalidInput {
-                field: "sourceThreadId",
-            }));
-        }
-        for (field, id) in [
-            ("sourceRunId", input.source_run_id.as_str()),
-            ("sourceMessageId", input.source_message_id.as_str()),
-        ] {
-            if !is_valid_artifact_identity(id) {
-                return save_result!(Err(ArtifactAdministrationError::InvalidInput { field }));
+        let capture_operation = self
+            .store
+            .begin_capture_mutation()
+            .map_err(|_| unavailable())?;
+        let result = async {
+            let diagnostic = self
+                .save_producer_diagnostic
+                .get()
+                .and_then(|capture| capture.begin_original(&input.request_id));
+            // These statement-local wrappers observe the same original Result once. They create
+            // no future, resource owner, retry or new timeout, and return that Result unchanged.
+            macro_rules! save_result {
+                ($expression:expr) => {{
+                    let original_result: Result<_, ArtifactAdministrationError> = $expression;
+                    if let (Some(capture), Err(error)) = (&diagnostic, &original_result) {
+                        capture.record(SaveProducerDiagnosticEvent::Terminal(
+                            SaveProducerDiagnosticTerminal::Error(*error),
+                        ));
+                    }
+                    original_result
+                }};
             }
-        }
-        if !is_valid_artifact_sha256(&input.expected_sha256) {
-            return save_result!(Err(ArtifactAdministrationError::InvalidInput {
-                field: "expectedSha256",
-            }));
-        }
-        save_stage!(CheckNamespace);
-        save_result!(self.check_namespace(auth))?;
-        save_stage!(VerifyRegistrationSchema);
-        save_result!(verify_artifact_registration_schema(self.registry.pool()).await)?;
-        save_stage!(AvailableBytes);
-        let store = Arc::clone(&self.store);
-        let disk = save_result!(
-            save_result!(
+            macro_rules! save_stage {
+                ($stage:ident) => {
+                    if let Some(capture) = &diagnostic {
+                        capture.record(SaveProducerDiagnosticEvent::Stage(
+                            SaveProducerDiagnosticStage::$stage,
+                        ));
+                    }
+                };
+            }
+            save_stage!(ValidateInput);
+            input.request_id = save_result!(
+                canonical_artifact_uuid_v7(&input.request_id)
+                    .ok_or(ArtifactAdministrationError::InvalidInput { field: "requestId" })
+            )?;
+            if !ThreadIdentity::is_plausible(&input.source_thread_id) {
+                return save_result!(Err(ArtifactAdministrationError::InvalidInput {
+                    field: "sourceThreadId",
+                }));
+            }
+            for (field, id) in [
+                ("sourceRunId", input.source_run_id.as_str()),
+                ("sourceMessageId", input.source_message_id.as_str()),
+            ] {
+                if !is_valid_artifact_identity(id) {
+                    return save_result!(Err(ArtifactAdministrationError::InvalidInput { field }));
+                }
+            }
+            if !is_valid_artifact_sha256(&input.expected_sha256) {
+                return save_result!(Err(ArtifactAdministrationError::InvalidInput {
+                    field: "expectedSha256",
+                }));
+            }
+            save_stage!(CheckNamespace);
+            save_result!(self.check_namespace(auth))?;
+            save_stage!(VerifyRegistrationSchema);
+            save_result!(verify_artifact_registration_schema(self.registry.pool()).await)?;
+            save_stage!(AvailableBytes);
+            let store = Arc::clone(&self.store);
+            let worker_store = Arc::clone(&store);
+            let disk = save_result!(
+                save_result!(
+                    save_result!(
+                        tokio::time::timeout(
+                            WAIT,
+                            store.capture_blocking(move || worker_store.available_bytes()),
+                        )
+                        .await
+                        .map_err(|_| unavailable())
+                    )?
+                    .map_err(|_| unavailable())
+                )?
+                .map_err(|_| unavailable())
+            )?;
+            save_stage!(Admit);
+            let outcome = save_result!(save_result!(
+                tokio::time::timeout(PG_PHASE, self.admit(auth, &input, disk))
+                    .await
+                    .map_err(|_| ArtifactAdministrationError::CommitUnknown)
+            )?)?;
+            let mut admission = match outcome {
+                AdmissionOutcome::Observed(receipt) => {
+                    if let Some(capture) = &diagnostic {
+                        capture.record(SaveProducerDiagnosticEvent::Terminal(
+                            SaveProducerDiagnosticTerminal::Success,
+                        ));
+                    }
+                    return Ok(receipt);
+                }
+                AdmissionOutcome::Prepared(value) => value,
+            };
+            save_stage!(StartIo);
+            save_result!(save_result!(
+                tokio::time::timeout(PG_PHASE, self.start_io(auth, &input, &admission))
+                    .await
+                    .map_err(|_| ArtifactAdministrationError::CommitUnknown)
+            )?)?;
+            save_stage!(WriteWorker);
+            let store = Arc::clone(&self.store);
+            let id = admission.artifact_id;
+            let expected = save_result!(parse_digest(&input.expected_sha256))?;
+            let text = std::mem::take(&mut admission.source.text);
+            let worker_diagnostic = diagnostic.clone();
+            let worker_store = Arc::clone(&store);
+            let worker_capture_operation = capture_operation.delegated();
+            // Dropping/cancelling this waiter cannot cancel a worker; IO_STARTED and charge remain.
+            let observation = save_result!(
                 save_result!(
                     tokio::time::timeout(
-                        WAIT,
-                        tokio::task::spawn_blocking(move || store.available_bytes()),
+                        PG_PHASE,
+                        store.capture_blocking(move || {
+                            if let Some(capture) = &worker_diagnostic {
+                                capture.record(SaveProducerDiagnosticEvent::WorkerEntered);
+                            }
+                            let observation = worker_store.write_text_once_admitted(
+                                &worker_capture_operation,
+                                id,
+                                expected,
+                                text.as_bytes(),
+                            );
+                            worker_capture_operation.complete();
+                            if let Some(capture) = &worker_diagnostic {
+                                capture.record_worker_returned(&observation);
+                            }
+                            observation
+                        }),
                     )
                     .await
                     .map_err(|_| unavailable())
                 )?
                 .map_err(|_| unavailable())
-            )?
-            .map_err(|_| unavailable())
-        )?;
-        save_stage!(Admit);
-        let outcome = save_result!(save_result!(
-            tokio::time::timeout(PG_PHASE, self.admit(auth, &input, disk))
-                .await
-                .map_err(|_| ArtifactAdministrationError::CommitUnknown)
-        )?)?;
-        let mut admission = match outcome {
-            AdmissionOutcome::Observed(receipt) => {
-                if let Some(capture) = &diagnostic {
-                    capture.record(SaveProducerDiagnosticEvent::Terminal(
-                        SaveProducerDiagnosticTerminal::Success,
-                    ));
-                }
-                return Ok(receipt);
-            }
-            AdmissionOutcome::Prepared(value) => value,
-        };
-        save_stage!(StartIo);
-        save_result!(save_result!(
-            tokio::time::timeout(PG_PHASE, self.start_io(auth, &input, &admission))
-                .await
-                .map_err(|_| ArtifactAdministrationError::CommitUnknown)
-        )?)?;
-        save_stage!(WriteWorker);
-        let store = Arc::clone(&self.store);
-        let id = admission.artifact_id;
-        let expected = save_result!(parse_digest(&input.expected_sha256))?;
-        let text = std::mem::take(&mut admission.source.text);
-        let worker_diagnostic = diagnostic.clone();
-        // Dropping/cancelling this waiter cannot cancel a worker; IO_STARTED and charge remain.
-        let observation = save_result!(
-            save_result!(
+            )?;
+            save_stage!(Finalize);
+            let result = save_result!(save_result!(
                 tokio::time::timeout(
                     PG_PHASE,
-                    tokio::task::spawn_blocking(move || {
-                        if let Some(capture) = &worker_diagnostic {
-                            capture.record(SaveProducerDiagnosticEvent::WorkerEntered);
-                        }
-                        let observation = store.write_text_once(id, expected, text.as_bytes());
-                        if let Some(capture) = &worker_diagnostic {
-                            capture.record_worker_returned(&observation);
-                        }
-                        observation
-                    }),
+                    self.finalize(auth, &input, &admission, &observation, &diagnostic),
                 )
                 .await
-                .map_err(|_| unavailable())
-            )?
-            .map_err(|_| unavailable())
-        )?;
-        save_stage!(Finalize);
-        let result = save_result!(save_result!(
-            tokio::time::timeout(
-                PG_PHASE,
-                self.finalize(auth, &input, &admission, &observation, &diagnostic),
-            )
-            .await
-            .map_err(|_| ArtifactAdministrationError::CommitUnknown)
-        )?);
-        if result.is_ok()
-            && let Some(capture) = &diagnostic
-        {
-            capture.record(SaveProducerDiagnosticEvent::Terminal(
-                SaveProducerDiagnosticTerminal::Success,
-            ));
+                .map_err(|_| ArtifactAdministrationError::CommitUnknown)
+            )?);
+            if result.is_ok()
+                && let Some(capture) = &diagnostic
+            {
+                capture.record(SaveProducerDiagnosticEvent::Terminal(
+                    SaveProducerDiagnosticTerminal::Success,
+                ));
+            }
+            result
+        }
+        .await;
+        if !matches!(
+            &result,
+            Err(ArtifactAdministrationError::Unavailable
+                | ArtifactAdministrationError::CommitUnknown)
+        ) {
+            capture_operation.complete();
         }
         result
     }
