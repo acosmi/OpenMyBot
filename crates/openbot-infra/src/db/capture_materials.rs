@@ -36,15 +36,126 @@ pub struct CaptureSqlBudget {
     catalog: u64,
     queries: u64,
     metadata: u64,
-    sensitive: Option<SensitiveDecodeBound>,
+    sensitive: Option<std::sync::Arc<CaptureDecodeBudget>>,
 }
 
-// Same class is charged across all original normal/audit/maintenance producers. No refund
-// is made on timeout or merely because a query future was dropped.
+// One cold-start class is shared by the original wire, normal/audit SQL and maintenance
+// consumers. Clock binding never resets its cumulative charge.
+#[doc(hidden)]
+pub struct CaptureDecodeBudget {
+    state: std::sync::Mutex<SensitiveDecodeBound>,
+}
 struct SensitiveDecodeBound {
     max_count: u64,
     max_one_bytes: u64,
     charged_count: u64,
+    clock: Option<std::sync::Arc<dyn CaptureClockCheck>>,
+    poisoned: bool,
+}
+impl CaptureDecodeBudget {
+    pub fn checked(
+        max_count: u64,
+        max_one_bytes: u64,
+    ) -> Result<std::sync::Arc<Self>, CaptureSqlFailure> {
+        if max_count == 0 || max_one_bytes < 8 * 1024 {
+            return Err(CaptureSqlFailure::Bounds);
+        }
+        max_count.checked_mul(max_one_bytes).ok_or(CaptureSqlFailure::Bounds)?;
+        usize::try_from(max_one_bytes).map_err(|_| CaptureSqlFailure::Bounds)?;
+        Ok(std::sync::Arc::new(Self {
+            state: std::sync::Mutex::new(SensitiveDecodeBound {
+                max_count,
+                max_one_bytes,
+                charged_count: 0,
+                clock: None,
+                poisoned: false,
+            }),
+        }))
+    }
+
+    pub fn bind_original_clock(
+        &self,
+        clock: std::sync::Arc<dyn CaptureClockCheck>,
+    ) -> Result<(), CaptureSqlFailure> {
+        let mut state = self.state.lock().map_err(|_| CaptureSqlFailure::Bounds)?;
+        if state.poisoned || state.clock.is_some() {
+            state.poisoned = true;
+            return Err(CaptureSqlFailure::Bounds);
+        }
+        // Keep the actual clock resident even if its first effect observation fails.
+        // A failed bind must never leave later wire reads in the cold-start branch.
+        state.clock = Some(clock);
+        let checked = state.clock.as_ref().ok_or(CaptureSqlFailure::Bounds)?
+            .require_effect().map_err(|_| CaptureSqlFailure::Clock);
+        if checked.is_err() {
+            state.poisoned = true;
+        }
+        checked
+    }
+
+    pub fn reserve_allocations(
+        &self,
+        allocations: &[(u64, u64)],
+    ) -> Result<(), CaptureSqlFailure> {
+        let mut state = self.state.lock().map_err(|_| CaptureSqlFailure::Bounds)?;
+        if state.poisoned {
+            return Err(CaptureSqlFailure::Bounds);
+        }
+        let checked = (|| {
+            if let Some(clock) = state.clock.as_ref() {
+                clock.require_effect().map_err(|_| CaptureSqlFailure::Clock)?;
+            }
+            let mut copies = 0_u64;
+            for &(count, one_bytes) in allocations {
+                if one_bytes > state.max_one_bytes || (count != 0 && one_bytes == 0) {
+                    return Err(CaptureSqlFailure::Bounds);
+                }
+                count.checked_mul(one_bytes).ok_or(CaptureSqlFailure::Bounds)?;
+                copies = copies.checked_add(count).ok_or(CaptureSqlFailure::Bounds)?;
+            }
+            let next = state.charged_count.checked_add(copies)
+                .filter(|next| *next <= state.max_count)
+                .ok_or(CaptureSqlFailure::Bounds)?;
+            if let Some(clock) = state.clock.as_ref() {
+                clock.require_effect().map_err(|_| CaptureSqlFailure::Clock)?;
+            }
+            Ok(next)
+        })();
+        match checked {
+            Ok(next) => {
+                state.charged_count = next;
+                Ok(())
+            }
+            Err(failure) => {
+                state.poisoned = true;
+                Err(failure)
+            }
+        }
+    }
+
+    // A crate-private charging action, not a charged-count getter or a second writer.
+    // Immutable M is returned to the original socket adapter only after one full credit
+    // has been admitted by the same reserve_allocations transaction.
+    pub(crate) fn reserve_wire_credit(&self) -> Result<u64, CaptureSqlFailure> {
+        let one = self.state.lock().map_err(|_| CaptureSqlFailure::Bounds)?.max_one_bytes;
+        self.reserve_allocations(&[(1, one)])?;
+        Ok(one)
+    }
+
+    fn require_original_clock_binding(&self) -> Result<(), CaptureSqlFailure> {
+        let mut state = self.state.lock().map_err(|_| CaptureSqlFailure::Bounds)?;
+        if state.poisoned {
+            return Err(CaptureSqlFailure::Bounds);
+        }
+        let checked = match state.clock.as_ref() {
+            Some(clock) => clock.require_effect().map_err(|_| CaptureSqlFailure::Clock),
+            None => Err(CaptureSqlFailure::Bounds),
+        };
+        if checked.is_err() {
+            state.poisoned = true;
+        }
+        checked
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureSqlFailure {
@@ -103,45 +214,29 @@ impl CaptureSqlBudget {
         })
     }
 
-    // R474 exposes only the original operation-bound DATA admission.
+    // Adopt the original cold-start counter; no new allowance or counter reset.
     pub fn bind_sensitive_decode_bound(
         &mut self,
-        max_count: u64,
-        max_one_bytes: u64,
+        original: std::sync::Arc<CaptureDecodeBudget>,
     ) -> Result<(), CaptureSqlFailure> {
-        if self.sensitive.is_some() || max_count == 0 || max_one_bytes == 0 {
+        if self.sensitive.is_some() {
             return Err(CaptureSqlFailure::Bounds);
         }
-        max_count
-            .checked_mul(max_one_bytes)
-            .ok_or(CaptureSqlFailure::Bounds)?;
-        self.sensitive = Some(SensitiveDecodeBound {
-            max_count,
-            max_one_bytes,
-            charged_count: 0,
-        });
+        original.require_original_clock_binding()?;
+        self.sensitive = Some(original);
         Ok(())
     }
     fn reserve_sensitive_page(&mut self, rows: u64) -> Result<(), CaptureSqlFailure> {
-        let bound = self.sensitive.as_mut().ok_or(CaptureSqlFailure::Bounds)?;
+        let bound = self.sensitive.as_ref().ok_or(CaptureSqlFailure::Bounds)?;
         let one = self
             .limits
             .max_row_bytes
             .checked_add(32 * std::mem::size_of::<Option<String>>() as u64)
             .ok_or(CaptureSqlFailure::Bounds)?;
-        // One original per-operation six-slot allowance remains resident.
-        // This pre-query minimum also covers the locked receiver's 8 KiB allocation floor;
-        // it is not an upper bound on shared or previously grown wire backing.
+        // Preserve the original six-slot SQL admission and the SQL01 8 KiB minimum.
+        // Original wire credits use this same cold-start counter, never another profile.
         let copies = rows.checked_mul(6).ok_or(CaptureSqlFailure::Bounds)?;
-        let n = bound
-            .charged_count
-            .checked_add(copies)
-            .ok_or(CaptureSqlFailure::Bounds)?;
-        if one.max(8 * 1024) > bound.max_one_bytes || n > bound.max_count {
-            return Err(CaptureSqlFailure::Bounds);
-        }
-        bound.charged_count = n;
-        Ok(())
+        bound.reserve_allocations(&[(copies, one.max(8 * 1024))])
     }
 
     pub fn reserve_material_metadata(

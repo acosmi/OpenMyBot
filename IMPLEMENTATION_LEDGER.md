@@ -2261,3 +2261,10 @@ Project websites: [wrokbot.com](https://wrokbot.com) (primary) and [grokbot.si](
 The active PR224 candidate incorporates main be598bb18f23f7f37a2fef677afd2cd233c6f8da (PR225), retaining its AI employee / digital teammate positioning and the bilingual README badges and official links: wrokbot.com is primary; grokbot.si is the additional website.
 
 This integration changes the README files and this fact entry. Backend source is unchanged. The existing directed 18 Desktop, 13 Infra, and 30 Archive results remain attributed to their original C55 inputs; these 61 checks do not establish acceptance of later repair candidates, normal capture, recovery, or a complete release. No compilation or runtime validation was repeated for this documentation integration.
+
+
+### V7-IMPL-045: shared capture resources and owned secret buffers
+
+This repair candidate shares capture configuration, accounts for SQL wire backing before allocation, and wipes owned canary text when it is released. The pinned debug capture fixture now follows the normal application shutdown path.
+
+The 13-file repair has independent source review. Current-candidate builds, directed test execution, normal capture and request-replay acceptance are pending. Earlier test results retain their original inputs; restore acceptance remains a separate following task.

@@ -25,13 +25,38 @@ use crate::tauri_host::{DesktopTauriProtocol, TauriHostError, valid_scheme};
 pub struct VerifiedDesktopWindowAuthority {
     auth: AuthContext,
     fresh_for: Option<Duration>,
+    self_owned_capture_fixture: bool,
 }
 
 impl VerifiedDesktopWindowAuthority {
     /// Wrap an [`AuthContext`] that the host obtained from its verified session source.
     #[must_use]
     pub const fn from_verified_session(auth: AuthContext, fresh_for: Option<Duration>) -> Self {
-        Self { auth, fresh_for }
+        Self {
+            auth,
+            fresh_for,
+            self_owned_capture_fixture: false,
+        }
+    }
+
+    // The opaque witness can only originate in the fixed original fixture factory.
+    // This flag changes the WebKit datastore policy; it is not capture/Ready authority.
+    #[cfg(all(
+        target_os = "macos",
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        debug_assertions
+    ))]
+    pub(crate) fn from_self_owned_fixture(
+        auth: AuthContext,
+        fixture: &crate::tauri_background::SelfOwnedCaptureFixtureBinding,
+    ) -> Result<Self, DesktopWindowLifecycleError> {
+        fixture.require_window_witness().map_err(|_| DesktopWindowLifecycleError::RegistryUnavailable)?;
+        Ok(Self {
+            auth,
+            fresh_for: None,
+            self_owned_capture_fixture: true,
+        })
     }
 }
 
@@ -108,6 +133,7 @@ impl DesktopWindowLifecycle {
             .map_err(|_| DesktopWindowLifecycleError::InvalidStartUrl)?;
         let navigation_scheme = Arc::clone(&self.scheme);
 
+        let self_owned_capture_fixture = authority.self_owned_capture_fixture;
         self.protocol
             .bind_window(label.clone(), authority.auth, authority.fresh_for)?;
         let builder = WebviewWindowBuilder::new(
@@ -124,6 +150,11 @@ impl DesktopWindowLifecycle {
         let builder = builder
             .title_bar_style(tauri::TitleBarStyle::Overlay)
             .hidden_title(true);
+        let builder = if self_owned_capture_fixture {
+            builder.incognito(true)
+        } else {
+            builder
+        };
         let built = builder.build();
 
         let window = match built {

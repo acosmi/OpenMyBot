@@ -513,6 +513,16 @@ impl DesktopVaultCanaryRow {
     }
 }
 
+impl Drop for DesktopVaultCanaryRow {
+    fn drop(&mut self) {
+        drop(SecretBytes::new(std::mem::take(&mut self.dataset_id).into_bytes()));
+        drop(SecretBytes::new(std::mem::take(&mut self.deployment_id).into_bytes()));
+        drop(SecretBytes::new(std::mem::take(&mut self.tenant_id).into_bytes()));
+        drop(SecretBytes::new(std::mem::take(&mut self.key_id).into_bytes()));
+        drop(SecretBytes::new(std::mem::take(&mut self.encrypted_canary).into_bytes()));
+    }
+}
+
 impl core::fmt::Debug for DesktopVaultCanaryRow {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("DesktopVaultCanaryRow(<redacted>)")

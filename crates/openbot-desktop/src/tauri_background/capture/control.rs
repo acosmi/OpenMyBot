@@ -4310,7 +4310,7 @@ fn bounded_names(
     result.sort();
     Ok(result)
 }
-fn open_trusted_directory(path: &Path, private: bool) -> Result<File, Fault> {
+pub(in crate::tauri_background) fn open_trusted_directory(path: &Path, private: bool) -> Result<File, Fault> {
     if !path.is_absolute()
         || path
             .components()

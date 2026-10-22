@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use tokio_postgres::tls::NoTlsStream;
-use tokio_postgres::{Client, Connection, NoTls, Socket};
+use tokio_postgres::{Client, Connection, NoTls};
+use openbot_infra::db::pool::CapturePgIo;
 
 use super::{
     MaintenanceError,
@@ -78,7 +79,31 @@ use crate::tauri_background::capture::{
 };
 
 type Connecting =
-    JoinHandle<Result<(Client, Connection<Socket, NoTlsStream>), tokio_postgres::Error>>;
+    JoinHandle<Result<(Client, Connection<CapturePgIo, NoTlsStream>), tokio_postgres::Error>>;
+
+fn original_capture_connect(
+    original: Option<(tokio_postgres::Config, CapturePgIo)>,
+) -> impl std::future::Future<
+    Output = Result<(Client, Connection<CapturePgIo, NoTlsStream>), tokio_postgres::Error>
+> + Send {
+    async move {
+        let (config, io) = original.expect("only admitted original source inputs are polled");
+        config.connect_raw(io, NoTls).await
+    }
+}
+
+// Same actual unpolled factory, private DATA only. No socket/config/key is created.
+pub(crate) fn checked_original_source_connect_metadata_bytes(attempts: u64)
+    -> Result<u64, Fault>
+{
+    let original = original_capture_connect(None);
+    let raw = u64::try_from(std::alloc::Layout::for_value(&original).size())
+        .map_err(|_| Fault::BoundsOverflow)?;
+    let connection = u64::try_from(std::mem::size_of::<Connection<CapturePgIo, NoTlsStream>>())
+        .map_err(|_| Fault::BoundsOverflow)?;
+    raw.checked_add(connection).and_then(|n| n.checked_mul(attempts))
+        .ok_or(Fault::BoundsOverflow)
+}
 
 /// An ordinary file already opened and checked by the original closed producer.
 pub(crate) struct CaptureOwnedMaterialFile {
@@ -623,12 +648,20 @@ impl CaptureSourceOwner {
         let next = self.start_password_admissions.checked_add(1).ok_or(Fault::BoundsOverflow)?;
         let profile = self.operation.profile();
         let class = &profile.secrets.classes.pg_config_passwords;
-        let known = next.checked_mul(
+        let old_known = next.checked_mul(
             (std::mem::size_of::<SourceConnectFailure>() as u64)
                 .checked_add(std::mem::size_of::<tokio_postgres::Config>() as u64)
                 .and_then(|n| n.checked_add(self.socket_path.as_os_str().as_encoded_bytes().len() as u64))
                 .ok_or(Fault::BoundsOverflow)?,
         ).ok_or(Fault::BoundsOverflow)?;
+        let io_known = CapturePgIo::checked_metadata_bytes(next)
+            .map_err(|_| Fault::BoundsOverflow)?;
+        let raw_known = checked_original_source_connect_metadata_bytes(next)?;
+        // The old local formula already includes each original Config header once.
+        let config_headers = next.checked_mul(std::mem::size_of::<tokio_postgres::Config>() as u64)
+            .ok_or(Fault::BoundsOverflow)?;
+        let known = old_known.checked_add(io_known).and_then(|n| n.checked_add(raw_known))
+            .and_then(|n| n.checked_sub(config_headers)).ok_or(Fault::BoundsOverflow)?;
         if class.max_one_bytes < 64 || next > class.max_count
             || known > profile.drivers.max_owner_metadata_bytes
             || known > profile.carrier.max_metadata_bytes
@@ -639,6 +672,11 @@ impl CaptureSourceOwner {
         }
         self.connection_failures.try_reserve_exact(1).map_err(|_| Fault::CapacityExceeded)?;
         // No retry refunds. Opaque SASL/PG/error allocations remain a separate HOLD.
+        let new_known = CapturePgIo::checked_metadata_bytes(1)
+            .map_err(|_| Fault::BoundsOverflow)?
+            .checked_add(checked_original_source_connect_metadata_bytes(1)?)
+            .ok_or(Fault::BoundsOverflow)?;
+        self.operation.reserve_original_resources(0, new_known)?;
         self.start_password_admissions = next;
         self.reserve_start_fds(2)
     }
@@ -678,7 +716,11 @@ impl CaptureSourceOwner {
             let next_started = self.original_connect_tasks_started.checked_add(1)
                 .ok_or(Fault::BoundsOverflow)?;
             operation.require_effect()?;
-            self.connecting = Some(runtime.spawn(async move { config.connect(NoTls).await }));
+            let decode = self.permit.materials_mut()?.original_decode_budget();
+            let prepared = CapturePgIo::prepare(&config, decode);
+            operation.require_effect()?;
+            let original_io = prepared.map_err(|_| Fault::CapacityExceeded)?;
+            self.connecting = Some(runtime.spawn(original_capture_connect(Some((config, original_io)))));
             self.original_connect_tasks_started = next_started;
             operation.require_effect()?;
             loop {
@@ -2461,7 +2503,7 @@ enum SourceConnectFailure {
     Join(tokio::task::JoinError),
 }
 type SourceConnectResult = Result<
-    Result<(Client, Connection<Socket, NoTlsStream>), tokio_postgres::Error>,
+    Result<(Client, Connection<CapturePgIo, NoTlsStream>), tokio_postgres::Error>,
     tokio::task::JoinError,
 >;
 

@@ -374,6 +374,12 @@ impl VerifiedDesktopRelease {
     /// Reuse the existing authority → real PG/SCRAM → current PG actor → OS Vault → Agent → window
     /// assembly. The lazy real Keychain adapter is first touched by that background assembly.
     pub fn into_runtime_config(self) -> Result<DesktopLocalRuntimeConfig, DesktopReleaseError> {
+        let fixture = crate::tauri_background::bind_self_owned_capture_fixture(self.capture.as_ref())
+            .map_err(|_| DesktopReleaseError::Application)?;
+        let (fixture_binding, secret_store): (_, Arc<dyn OsSecretStore>) = match fixture {
+            Some((binding, store)) => (Some(binding), store),
+            None => (None, Arc::new(DeferredCurrentUserKeychain::default())),
+        };
         let pg_service = ReviewedPostgresKeyStoreService::from_reviewed_release(
             POSTGRES_KEY_STORE_SERVICE.to_owned(),
         )
@@ -389,16 +395,17 @@ impl VerifiedDesktopRelease {
             self.postgres,
             pg_service,
             vault_service,
-            Arc::new(DeferredCurrentUserKeychain::default()),
+            secret_store,
         )
         .map_err(|_| DesktopReleaseError::Application)?;
         let tenant = self.tenant;
-        Ok(
-            DesktopLocalRuntimeConfig::new(release, self.application, move |authority| {
-                tenant.bind(authority.auth_context().tenant().as_str())
-            })
-            .with_reviewed_normal_capture(self.capture),
-        )
+        let runtime = DesktopLocalRuntimeConfig::new(release, self.application, move |authority| {
+            tenant.bind(authority.auth_context().tenant().as_str())
+        }).with_reviewed_normal_capture(self.capture);
+        Ok(match fixture_binding {
+            Some(binding) => runtime.with_self_owned_capture_fixture(binding),
+            None => runtime,
+        })
     }
 }
 

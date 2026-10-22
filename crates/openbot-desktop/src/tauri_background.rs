@@ -57,6 +57,311 @@ use crate::{
 ))]
 pub(crate) mod capture;
 
+
+// This fixed fixture is a debug-only original launcher input, not a configurable source.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+const SELF_OWNED_CAPTURE_FIXTURE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01";
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+const SELF_OWNED_CAPTURE_OUTER: &str = "64428c91f9123a42a1220a6cfb0b78dd6f1082a928827b230fca66e1640b4dc1";
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+const SELF_OWNED_CAPTURE_RELEASE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/release";
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+const SELF_OWNED_CAPTURE_APP_DATA: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/app-data";
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+const SELF_OWNED_CAPTURE_OUTPUT: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/capture-output";
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+const SELF_OWNED_CAPTURE_KEY: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/independent-key-medium";
+
+// There is no public constructor, Clone, Deserialize, caller flag, path or secret injection.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) struct SelfOwnedCaptureFixtureBinding {
+    #[cfg(feature = "postgres-maintenance")]
+    store: Option<std::sync::Weak<SelfOwnedFixtureSecretStore>>,
+    #[cfg(feature = "postgres-maintenance")]
+    held_parent: Option<std::fs::File>,
+    #[cfg(feature = "postgres-maintenance")]
+    new_root: Option<std::fs::File>,
+    #[cfg(feature = "postgres-maintenance")]
+    original_root: Option<(u64, u64, u32, u32)>,
+    #[cfg(feature = "postgres-maintenance")]
+    original_verified: bool,
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+#[derive(Default)]
+struct SelfOwnedFixtureEntries {
+    instance: Option<[u8; 64]>,
+    master: Option<[u8; 33]>,
+    scram: Option<[u8; 64]>,
+    master_reads: u8,
+    scram_reads: u8,
+}
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+impl Drop for SelfOwnedFixtureEntries {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(bytes) = self.master.as_mut() { bytes.zeroize(); }
+        if let Some(bytes) = self.scram.as_mut() { bytes.zeroize(); }
+    }
+}
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+#[derive(Default)]
+struct SelfOwnedFixtureSecretStore {
+    entries: Mutex<SelfOwnedFixtureEntries>,
+    original_book: std::sync::OnceLock<Arc<Mutex<capture::CaptureResourceTotals>>>,
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+impl SelfOwnedFixtureSecretStore {
+    fn original_slot(
+        entries: &mut SelfOwnedFixtureEntries, service: &str, account: &str,
+    ) -> Result<bool, OsSecretStoreError> {
+        let (master, suffix) = match service {
+            "com.acosmi.wrokbot.vault" => (true, account.strip_prefix("desktop-vault-master-v1-")),
+            "com.acosmi.wrokbot.postgresql" => (false, account.strip_prefix("postgresql-17-")),
+            _ => return Err(OsSecretStoreError::AccessDenied),
+        };
+        let bytes = suffix.ok_or(OsSecretStoreError::AccessDenied)?.as_bytes();
+        if bytes.len() != 64 || !bytes.iter().all(|n| n.is_ascii_digit() || (b'a'..=b'f').contains(n)) {
+            return Err(OsSecretStoreError::AccessDenied);
+        }
+        let instance: [u8; 64] = bytes.try_into().map_err(|_| OsSecretStoreError::AccessDenied)?;
+        match entries.instance {
+            Some(original) if original != instance => return Err(OsSecretStoreError::AccessDenied),
+            None => entries.instance = Some(instance),
+            _ => {}
+        }
+        Ok(master)
+    }
+    fn require_original_book(&self) -> Result<(), OsSecretStoreError> {
+        if self.original_book.get().is_none() { return Err(OsSecretStoreError::AccessDenied); }
+        Ok(())
+    }
+}
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+impl OsSecretStore for SelfOwnedFixtureSecretStore {
+    fn read(&self, service: &str, account: &str)
+        -> Result<Option<openbot_domain::vault::SecretBytes>, OsSecretStoreError>
+    {
+        self.require_original_book()?;
+        let mut entries = self.entries.lock().map_err(|_| OsSecretStoreError::StoreUnavailable)?;
+        let master = Self::original_slot(&mut entries, service, account)?;
+        // The sole New initializer reads absence, writes once, then reads back once.
+        // This cannot become an unlimited allocator or a reusable OS-secret replacement.
+        let reads = if master { entries.master_reads } else { entries.scram_reads };
+        if reads >= 2 { return Err(OsSecretStoreError::AccessDenied); }
+        let bytes: Option<&[u8]> = if master { entries.master.as_ref().map(|n| n.as_slice()) }
+            else { entries.scram.as_ref().map(|n| n.as_slice()) };
+        if (reads == 0) != bytes.is_none() { return Err(OsSecretStoreError::AccessDenied); }
+        // Payload/class and these two exact read-result/header slots were admitted before Arc::new
+        // and adopted once by the same original book before any initializer can call read/write.
+        let result = bytes.map(|n| openbot_domain::vault::SecretBytes::new(n.to_vec()));
+        // This fixed New fixture permits only its one real readback. Wipe the RAM
+        // slot before the original consumer can allocate its decoded master copy;
+        // never call the linear move of that consumer's SCRAM source a wipe.
+        if result.is_some() {
+            use zeroize::Zeroize;
+            if master {
+                if let Some(bytes) = entries.master.as_mut() { bytes.zeroize(); }
+                entries.master = None;
+            } else {
+                if let Some(bytes) = entries.scram.as_mut() { bytes.zeroize(); }
+                entries.scram = None;
+            }
+        }
+        if master { entries.master_reads += 1; } else { entries.scram_reads += 1; }
+        Ok(result)
+    }
+    fn write(&self, service: &str, account: &str, secret: &[u8]) -> Result<(), OsSecretStoreError> {
+        self.require_original_book()?;
+        let mut entries = self.entries.lock().map_err(|_| OsSecretStoreError::StoreUnavailable)?;
+        if Self::original_slot(&mut entries, service, account)? {
+            if entries.master.is_some() || entries.master_reads != 1 || secret.len() != 33 || secret[0] != 1 {
+                return Err(OsSecretStoreError::AccessDenied);
+            }
+            entries.master = Some([0; 33]);
+            entries.master.as_mut().ok_or(OsSecretStoreError::AccessDenied)?.copy_from_slice(secret);
+        } else {
+            if entries.scram.is_some() || entries.scram_reads != 1 || secret.len() != 64
+                || !secret.iter().all(|n| n.is_ascii_digit() || (b'a'..=b'f').contains(n)) {
+                return Err(OsSecretStoreError::AccessDenied);
+            }
+            entries.scram = Some([0; 64]);
+            entries.scram.as_mut().ok_or(OsSecretStoreError::AccessDenied)?.copy_from_slice(secret);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+pub(crate) fn checked_self_owned_fixture_metadata_bytes() -> Result<u64, DesktopLocalRuntimeError> {
+    use std::mem::size_of;
+    use openbot_domain::vault::SecretBytes;
+    let arc = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+        .align_to(2).map_err(|_| DesktopLocalRuntimeError::Configuration)?
+        .extend(std::alloc::Layout::new::<SelfOwnedFixtureSecretStore>())
+        .map_err(|_| DesktopLocalRuntimeError::Configuration)?.0.pad_to_align().size();
+    // 97 resident secret bytes belong to original master_source / scram_source, not metadata.
+    let arc_metadata = arc.checked_sub(97).ok_or(DesktopLocalRuntimeError::Configuration)?;
+    let mut total = 0usize;
+    for n in [
+        arc_metadata, size_of::<SelfOwnedFixtureSecretStore>(),
+        size_of::<SelfOwnedFixtureEntries>(), size_of::<SelfOwnedCaptureFixtureBinding>(),
+        size_of::<Option<SelfOwnedCaptureFixtureBinding>>(),
+        size_of::<Arc<dyn OsSecretStore>>(), size_of::<Arc<SelfOwnedFixtureSecretStore>>(),
+        size_of::<std::sync::Weak<SelfOwnedFixtureSecretStore>>() * 2,
+        size_of::<Option<Arc<SelfOwnedFixtureSecretStore>>>(),
+        size_of::<Arc<Mutex<capture::CaptureResourceTotals>>>() * 2,
+        size_of::<std::sync::MutexGuard<'static, SelfOwnedFixtureEntries>>() * 4,
+        size_of::<std::sync::LockResult<std::sync::MutexGuard<'static, SelfOwnedFixtureEntries>>>() * 4,
+        size_of::<Result<Option<SecretBytes>, OsSecretStoreError>>() * 2,
+        size_of::<SecretBytes>() * 2, size_of::<Result<(), OsSecretStoreError>>() * 2,
+        size_of::<std::fs::Metadata>() * 5, size_of::<std::io::Result<std::fs::Metadata>>() * 5,
+        size_of::<std::fs::File>() * 2, size_of::<Result<std::fs::File, std::io::Error>>() * 2,
+        size_of::<Option<(u64, u64, u32, u32)>>(), size_of::<[u8; 64]>(),
+        size_of::<Option<&[u8]>>(), size_of::<Option<[u8; 33]>>(), size_of::<Option<[u8; 64]>>(),
+        size_of::<Result<bool, OsSecretStoreError>>(), size_of::<Result<(), DesktopLocalRuntimeError>>() * 4,
+        size_of::<rustix::fs::Stat>(), size_of::<Result<rustix::fs::Stat, rustix::io::Errno>>(),
+    ] { total = total.checked_add(n).ok_or(DesktopLocalRuntimeError::Configuration)?; }
+    // Fixed app-data PathBuf backing plus original trusted-directory getpath request; the
+    // existing path parser's allocator internals retain their original unproven boundary.
+    // rustix1.1.4 getpath uses locked macOS libc PATH_MAX=1024, then shrink
+    // and CString NUL growth; count both old/new requests before linear into_vec.
+    total = total.checked_add(SELF_OWNED_CAPTURE_APP_DATA.len())
+        .and_then(|n| n.checked_add(1024))
+        .and_then(|n| n.checked_add(SELF_OWNED_CAPTURE_FIXTURE.len().checked_mul(2)?))
+        .and_then(|n| n.checked_add(1))
+        .ok_or(DesktopLocalRuntimeError::Configuration)?;
+    u64::try_from(total).map_err(|_| DesktopLocalRuntimeError::Configuration)
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) fn bind_self_owned_capture_fixture(
+    request: Option<&crate::desktop_release::ReviewedNormalCaptureRequest>,
+) -> Result<Option<(SelfOwnedCaptureFixtureBinding, Arc<dyn OsSecretStore>)>, DesktopLocalRuntimeError> {
+    if option_env!("WROK_BOT_DESKTOP_RELEASE_SHA256") != Some(SELF_OWNED_CAPTURE_OUTER) {
+        return Ok(None);
+    }
+    #[cfg(not(all(feature = "postgres-maintenance", debug_assertions)))]
+    { let _ = request; return Err(DesktopLocalRuntimeError::Configuration); }
+    #[cfg(all(feature = "postgres-maintenance", debug_assertions))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let request = request.ok_or(DesktopLocalRuntimeError::Configuration)?;
+        let expected = [0x64,0x42,0x8c,0x91,0xf9,0x12,0x3a,0x42,0xa1,0x22,0x0a,0x6c,0xfb,0x0b,0x78,0xdd,0x6f,0x10,0x82,0xa9,0x28,0x82,0x7b,0x23,0x0f,0xca,0x66,0xe1,0x64,0x0b,0x4d,0xc1];
+        let known = checked_self_owned_fixture_metadata_bytes()?;
+        request.profile.validate_self_owned_fixture_retention(known)
+            .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        let fixed = std::path::Path::new(SELF_OWNED_CAPTURE_FIXTURE);
+        let release = std::path::Path::new(SELF_OWNED_CAPTURE_RELEASE);
+        let held = request.release_root.metadata().map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        let named = std::fs::symlink_metadata(release).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        let parent = std::fs::symlink_metadata(fixed).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        if request.release_digest != expected
+            || request.request_id != "8011979d2cf41c0ffeaf064a0b6c3dd9fda46d14694ac0fd38e2a19aec827760"
+            || request.release_path != release
+            || !held.is_dir() || !named.is_dir() || named.file_type().is_symlink()
+            || (held.dev(), held.ino(), held.uid(), held.mode() & 0o7777) != (16777230,109784555,501,0o700)
+            || (named.dev(), named.ino(), named.uid(), named.mode()) != (held.dev(),held.ino(),held.uid(),held.mode())
+            || !parent.is_dir() || parent.file_type().is_symlink()
+            || (parent.dev(),parent.ino(),parent.uid(),parent.mode() & 0o7777) != (16777230,109784554,501,0o700)
+        { return Err(DesktopLocalRuntimeError::Configuration); }
+        for (destination, leaf, inode) in [(&request.output, "capture-output", 109784556u64), (&request.key_medium, "independent-key-medium",109784557u64)] {
+            let fixed_destination = if leaf == "capture-output" { SELF_OWNED_CAPTURE_OUTPUT } else { SELF_OWNED_CAPTURE_KEY };
+            if destination.absolute_path != std::path::Path::new(fixed_destination)
+                || (destination.device,destination.inode,destination.uid) != (16777230,inode,501) {
+                return Err(DesktopLocalRuntimeError::Configuration);
+            }
+            let m = std::fs::symlink_metadata(&destination.absolute_path).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+            if !m.is_dir() || m.file_type().is_symlink() || (m.dev(),m.ino(),m.uid(),m.mode() & 0o7777) != (16777230,inode,501,0o700) {
+                return Err(DesktopLocalRuntimeError::Configuration);
+            }
+        }
+        match std::fs::symlink_metadata(SELF_OWNED_CAPTURE_APP_DATA) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(DesktopLocalRuntimeError::Configuration),
+        }
+        request.original_compatibility_metadata_bytes().map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        let store = Arc::new(SelfOwnedFixtureSecretStore::default());
+        let binding = SelfOwnedCaptureFixtureBinding { store: Some(Arc::downgrade(&store)), held_parent: None, new_root: None, original_root: None, original_verified: false };
+        Ok(Some((binding, store)))
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl SelfOwnedCaptureFixtureBinding {
+    fn app_data_root(&self) -> Result<CurrentOsUserAppDataRoot, DesktopLocalRuntimeError> {
+        CurrentOsUserAppDataRoot::from_current_os_user_app_data(
+            std::path::Path::new(SELF_OWNED_CAPTURE_APP_DATA).to_path_buf(),
+        ).map_err(|_| DesktopLocalRuntimeError::Configuration)
+    }
+    #[cfg(feature = "postgres-maintenance")]
+    fn prepare_new_root_before_startup(&mut self, book: &Arc<Mutex<capture::CaptureResourceTotals>>)
+        -> Result<(), DesktopLocalRuntimeError>
+    {
+        use std::os::unix::fs::MetadataExt;
+        use rustix::fs::{OFlags, Mode};
+        if self.held_parent.is_some() || self.new_root.is_some() { return Err(DesktopLocalRuntimeError::Configuration); }
+        capture::reserve_capture_resources(book, 2, checked_self_owned_fixture_metadata_bytes()?)
+            .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        self.held_parent = Some(capture::control::open_trusted_directory(std::path::Path::new(SELF_OWNED_CAPTURE_FIXTURE), true)
+            .map_err(|_| DesktopLocalRuntimeError::Configuration)?);
+        let parent = self.held_parent.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?;
+        let m = parent.metadata().map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        if (m.dev(),m.ino(),m.uid(),m.mode() & 0o7777) != (16777230,109784554,501,0o700) {
+            return Err(DesktopLocalRuntimeError::Configuration);
+        }
+        // mkdirat has no EEXIST adoption. The original New initializer follows only this root.
+        rustix::fs::mkdirat(parent, "app-data", Mode::RWXU).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        self.new_root = Some(std::fs::File::from(rustix::fs::openat(parent,"app-data",OFlags::RDONLY|OFlags::DIRECTORY|OFlags::NOFOLLOW|OFlags::CLOEXEC,Mode::empty())
+            .map_err(|_| DesktopLocalRuntimeError::Configuration)?));
+        let root = self.new_root.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?;
+        let m = root.metadata().map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        if !m.is_dir() || m.uid()!=501 || m.mode() & 0o7777 != 0o700 { return Err(DesktopLocalRuntimeError::Configuration); }
+        self.original_root=Some((m.dev(),m.ino(),m.uid(),m.mode() & 0o7777));
+        rustix::fs::fsync(parent).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        let store = self.store.as_ref().and_then(std::sync::Weak::upgrade).ok_or(DesktopLocalRuntimeError::Configuration)?;
+        store.original_book.set(Arc::clone(book)).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        drop(store);
+        Ok(())
+    }
+    #[cfg(feature = "postgres-maintenance")]
+    fn verify_original_root(&mut self, installation: &openbot_infra::auth::single_user::desktop_local::RetainedInstallationCapture)
+        -> Result<(), DesktopLocalRuntimeError>
+    {
+        use std::os::unix::fs::MetadataExt;
+        let expected=self.original_root.ok_or(DesktopLocalRuntimeError::Configuration)?;
+        let m=installation.original_root().metadata().map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        let named=rustix::fs::statat(self.held_parent.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?, "app-data", rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+        if !m.is_dir() || (m.dev(),m.ino(),m.uid(),m.mode() & 0o7777)!=expected
+            || (named.st_dev as u64,named.st_ino,named.st_uid,u32::from(named.st_mode) & 0o7777)!=expected {
+            return Err(DesktopLocalRuntimeError::Configuration);
+        }
+        self.original_verified=true;
+        Ok(())
+    }
+    #[cfg(feature = "postgres-maintenance")]
+    fn require_original_store_dropped(&self) -> Result<(), DesktopLocalRuntimeError> {
+        if !self.original_verified || self.store.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?.upgrade().is_some() {
+            return Err(DesktopLocalRuntimeError::Configuration);
+        }
+        Ok(())
+    }
+    #[cfg(feature = "postgres-maintenance")]
+    pub(crate) fn require_window_witness(&self) -> Result<(), DesktopLocalRuntimeError> {
+        self.require_original_store_dropped()
+    }
+    #[cfg(feature = "postgres-maintenance")]
+    fn retire_before_window_ready(mut self) -> Result<(), DesktopLocalRuntimeError> {
+        self.require_original_store_dropped()?;
+        drop(self.store.take()); // the last Weak allocation header is gone before mark_ready
+        drop(self.new_root.take());
+        drop(self.held_parent.take());
+        Ok(())
+    }
+}
+
 type PackageFactory = Box<
     dyn FnOnce(&DesktopLocalAuthority) -> Result<LoadedTenantPackage, TenantPackageError>
         + Send
@@ -375,6 +680,8 @@ pub struct DesktopLocalRuntimeConfig {
     release: DesktopLocalReleaseInput,
     application: DesktopLocalApplicationInput,
     package_factory: PackageFactory,
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    self_owned_capture_fixture: Option<SelfOwnedCaptureFixtureBinding>,
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",
@@ -400,6 +707,8 @@ impl DesktopLocalRuntimeConfig {
             release,
             application,
             package_factory: Box::new(package_factory),
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            self_owned_capture_fixture: None,
             #[cfg(all(
                 feature = "desktop-launcher",
                 feature = "postgres-maintenance",
@@ -419,6 +728,14 @@ impl DesktopLocalRuntimeConfig {
         request: Option<crate::desktop_release::ReviewedNormalCaptureRequest>,
     ) -> Self {
         self.capture_request = request;
+        self
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl DesktopLocalRuntimeConfig {
+    pub(crate) fn with_self_owned_capture_fixture(mut self, binding: SelfOwnedCaptureFixtureBinding) -> Self {
+        self.self_owned_capture_fixture = Some(binding);
         self
     }
 }
@@ -1168,6 +1485,8 @@ pub(crate) struct PreparedDesktopLocalRuntime {
     protocol: Arc<DesktopTauriProtocol>,
     lifecycle: Arc<DesktopWindowLifecycle>,
     owner: Box<dyn RuntimeShutdownOwner>,
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    self_owned_capture_fixture: Option<SelfOwnedCaptureFixtureBinding>,
     #[cfg(target_os = "macos")]
     confirmation: crate::local_confirmation_native::PreparedMacLocalConfirmation,
     #[cfg(test)]
@@ -1285,7 +1604,14 @@ pub fn register_desktop_local_runtime(
         .manage(Arc::clone(&runtime_state))
         .setup(move |app| {
             let app_handle = app.handle().clone();
-            let app_data_root = match resolve_current_user_app_data_root(app) {
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            let selected_app_data = match config.self_owned_capture_fixture.as_ref() {
+                Some(binding) => binding.app_data_root(),
+                None => resolve_current_user_app_data_root(app),
+            };
+            #[cfg(not(all(feature = "desktop-launcher", target_os = "macos")))]
+            let selected_app_data = resolve_current_user_app_data_root(app);
+            let app_data_root = match selected_app_data {
                 Ok(root) => root,
                 Err(_) => {
                     setup_state.fail_startup();
@@ -1323,6 +1649,8 @@ pub fn register_desktop_local_runtime(
                 let confirmation = prepared.confirmation;
                 #[cfg(target_os = "macos")]
                 let confirmation_protocol = Arc::clone(&prepared.protocol);
+                #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+                let mut self_owned_capture_fixture = prepared.self_owned_capture_fixture;
                 let mut owner = Some(prepared.owner);
                 if setup_state
                     .install_owner(&mut owner, Arc::clone(&lifecycle))
@@ -1357,17 +1685,40 @@ pub fn register_desktop_local_runtime(
                         request_shutdown(Arc::clone(&window_state), window_handle, 1);
                         return;
                     }
-                    let window = lifecycle.create_verified_window(
-                        &window_handle,
-                        window_label,
-                        VerifiedDesktopWindowAuthority::from_verified_session(auth, None),
-                    );
+                    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos", debug_assertions))]
+                    let self_owned_exit = self_owned_capture_fixture.is_some();
+                    #[cfg(not(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos", debug_assertions)))]
+                    let self_owned_exit = false;
+                    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos", debug_assertions))]
+                    let authority = match self_owned_capture_fixture.as_ref() {
+                        Some(binding) => match VerifiedDesktopWindowAuthority::from_self_owned_fixture(auth, binding) {
+                            Ok(authority) => authority,
+                            Err(_) => { request_shutdown(Arc::clone(&window_state), window_handle, 1); return; }
+                        },
+                        None => VerifiedDesktopWindowAuthority::from_verified_session(auth, None),
+                    };
+                    #[cfg(not(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos", debug_assertions)))]
+                    let authority = VerifiedDesktopWindowAuthority::from_verified_session(auth, None);
+                    let window = lifecycle.create_verified_window(&window_handle, window_label, authority);
                     if window.is_err() {
                         request_shutdown(Arc::clone(&window_state), window_handle, 1);
                         return;
                     }
-                    let exit_requested = window_state.mark_ready().unwrap_or(true);
-                    if exit_requested || lifecycle.active_window_count() == 0 {
+                    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+                    if let Some(binding) = self_owned_capture_fixture.take() {
+                        if binding.retire_before_window_ready().is_err() {
+                            request_shutdown(Arc::clone(&window_state), window_handle, 1);
+                            return;
+                        }
+                    }
+                    let ready = window_state.mark_ready();
+                    let exit_requested = if self_owned_exit {
+                        match ready {
+                            Ok(exit_requested) => exit_requested,
+                            Err(_) => { request_shutdown(Arc::clone(&window_state), window_handle, 1); return; }
+                        }
+                    } else { ready.unwrap_or(true) };
+                    if self_owned_exit || exit_requested || lifecycle.active_window_count() == 0 {
                         request_shutdown(Arc::clone(&window_state), window_handle, 0);
                     }
                 });
@@ -1595,6 +1946,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
         release,
         application,
         package_factory,
+        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+        mut self_owned_capture_fixture,
         #[cfg(all(
             feature = "desktop-launcher",
             feature = "postgres-maintenance",
@@ -1636,6 +1989,10 @@ pub(crate) async fn prepare_desktop_local_runtime(
         None => None,
     };
     #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    if let Some(binding) = self_owned_capture_fixture.as_mut() {
+        binding.prepare_new_root_before_startup(capture_resources.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?)?;
+    }
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
     let mut capture_control_footprint = None;
     #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
     if let Some(app) = capture::open_app_data_read_only(app_data_root.as_path())
@@ -1674,7 +2031,11 @@ pub(crate) async fn prepare_desktop_local_runtime(
         feature = "postgres-maintenance",
         target_os = "macos"
     ))]
-    let mut capture_control = match capture_request.as_ref() {
+    let mut capture_control = {
+        if let Some(binding) = self_owned_capture_fixture.as_mut() {
+            binding.verify_original_root(capture_installation.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?)?;
+        }
+        match capture_request.as_ref() {
         Some(request) => {
             request
                 .profile
@@ -1694,12 +2055,27 @@ pub(crate) async fn prepare_desktop_local_runtime(
             )
         }
         None => None,
-    };
+    }};
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",
         target_os = "macos"
     ))]
+    let mut capture_decode = match capture_request.as_ref() {
+        Some(request) => {
+            let (known, _) = request.profile.checked_original_decode_structure_bytes()
+                .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+            capture::reserve_capture_resources(
+                capture_resources.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?, 0, known,
+            ).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
+            let class = &request.profile.secrets.classes.decode_crypto_temporary;
+            Some(openbot_infra::db::capture_materials::CaptureDecodeBudget::checked(
+                class.max_count, class.max_one_bytes,
+            ).map_err(|_| DesktopLocalRuntimeError::Configuration)?)
+        }
+        None => None,
+    };
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
     let capture_custody = match capture_request.as_ref() {
         Some(request) => {
             use openbot_infra::db::desktop_local::{
@@ -1715,7 +2091,10 @@ pub(crate) async fn prepare_desktop_local_runtime(
             )
             .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
             Some(
-                DesktopLocalDriverCustody::prepare(bounds)
+                DesktopLocalDriverCustody::prepare(
+                    bounds,
+                    Arc::clone(capture_decode.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?),
+                )
                     .map_err(|_| DesktopLocalRuntimeError::Configuration)?,
             )
         }
@@ -1811,6 +2190,15 @@ pub(crate) async fn prepare_desktop_local_runtime(
             });
         }
     };
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    if let Some(binding) = self_owned_capture_fixture.as_ref() {
+        drop(secret_store);
+        if binding.require_original_store_dropped().is_err() {
+            return Err(if prepared_data_plane.shutdown().await.is_ok() {
+                DesktopLocalRuntimeError::Configuration
+            } else { DesktopLocalRuntimeError::FailureCleanup });
+        }
+    }
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",
@@ -2478,6 +2866,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
             capture_screen_seal.take(),
             capture_preferences.take(),
             capture_resources.take(),
+            capture_decode.take(),
         ) {
             (
                 Some(control),
@@ -2488,6 +2877,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 Some(screen),
                 Some(preferences),
                 Some(resources),
+                Some(decode),
             ) => capture::ArmedNormalCapture::from_original_startup(
                 request,
                 control,
@@ -2499,6 +2889,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                     installation,
                     screen,
                     preferences,
+                    decode,
                 ),
                 resources,
             ),
@@ -2542,6 +2933,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
         protocol,
         lifecycle,
         owner,
+        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+        self_owned_capture_fixture,
         #[cfg(target_os = "macos")]
         confirmation,
         #[cfg(test)]

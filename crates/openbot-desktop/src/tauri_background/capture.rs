@@ -1217,6 +1217,11 @@ async fn prepare_original_capture_source_permit(
         }
     };
     custody.operation = Some(Arc::clone(&operation));
+    if armed.materials.original_decode_budget()
+        .bind_original_clock(operation.clock_view()).is_err()
+    {
+        return Err(custody.pending(Fault::IntentMismatch));
+    }
     if let Err(fault) = operation.require_normal_closing() {
         return Err(custody.pending(fault));
     }

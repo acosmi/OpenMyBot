@@ -129,7 +129,7 @@ fn close_replay_observation(
 
 #[derive(Clone)]
 struct RuntimeLease {
-    database: ThreadListenerDatabase,
+    database: std::sync::Arc<tokio_postgres::Config>,
     owner_id: String,
     duration: Duration,
 }
@@ -170,10 +170,11 @@ impl PostgresThreadDirectory {
                 field: "thread_lease_config",
             });
         }
+        let database: ThreadListenerDatabase = database.into();
         Ok(Self {
             pool,
             runtime: Some(RuntimeLease {
-                database: database.into(),
+                database: std::sync::Arc::new(database.config()),
                 owner_id,
                 duration,
             }),
@@ -1295,11 +1296,10 @@ struct ActiveThreadListener {
 }
 
 async fn listen_thread_once(
-    database: &ThreadListenerDatabase,
+    database: &tokio_postgres::Config,
     mut stop: watch::Receiver<bool>,
 ) -> Result<ActiveThreadListener, ThreadDirectoryError> {
     let (client, mut connection) = database
-        .config()
         .connect(NoTls)
         .await
         .map_err(|error| unavailable("建立 thread event LISTEN 连接失败", error))?;
@@ -1335,7 +1335,7 @@ async fn listen_thread_once(
 
 async fn supervise_thread_stream(
     pool: crate::db::pool::DatabasePool,
-    database: ThreadListenerDatabase,
+    database: std::sync::Arc<tokio_postgres::Config>,
     request: ThreadEventSubscription,
     sender: mpsc::Sender<AppEvent>,
     mut stop: watch::Receiver<bool>,
@@ -1552,11 +1552,10 @@ async fn emit_stream_error(sender: &mpsc::Sender<AppEvent>, error: ThreadDirecto
 }
 
 async fn listen_channel_once(
-    database: &ThreadListenerDatabase,
+    database: &tokio_postgres::Config,
     mut stop: watch::Receiver<bool>,
 ) -> Result<ActiveThreadListener, ThreadDirectoryError> {
     let (client, mut connection) = database
-        .config()
         .connect(NoTls)
         .await
         .map_err(|error| unavailable("建立 channel activity LISTEN 连接失败", error))?;

@@ -1070,6 +1070,408 @@ impl Drop for ClientLease {
     }
 }
 
+#[cfg(feature = "desktop-local-vault")]
+mod capture_io {
+    use super::*;
+    use crate::db::capture_materials::{CaptureDecodeBudget, CaptureSqlFailure};
+    use std::io;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Clone, Copy)]
+    enum Endpoint {
+        Tcp(SocketAddr),
+        #[cfg(unix)]
+        Unix { bytes: [u8; 104], len: usize },
+    }
+    #[derive(Clone, Copy)]
+    struct TcpOptions {
+        keepalive: bool,
+        idle: Duration,
+        interval: Option<Duration>,
+        retries: Option<u32>,
+    }
+    impl TcpOptions {
+        fn from_original(config: &PgConfig) -> Self {
+            Self {
+                keepalive: config.get_keepalives(),
+                idle: config.get_keepalives_idle(),
+                interval: config.get_keepalives_interval(),
+                retries: config.get_keepalives_retries(),
+            }
+        }
+    }
+    enum OriginalSocket {
+        Tcp(tokio::net::TcpStream),
+        #[cfg(unix)]
+        Unix(tokio::net::UnixStream),
+    }
+    type SocketFuture = Pin<Box<dyn Future<Output = io::Result<OriginalSocket>> + Send>>;
+    enum SocketState {
+        Connecting(SocketFuture),
+        Connected(OriginalSocket),
+        Failed,
+    }
+    fn endpoint(config: &PgConfig) -> Result<Endpoint, CaptureSqlFailure> {
+        if config.get_ports().len() != 1
+            || !config.get_hostaddrs().is_empty()
+            || config.get_ssl_mode() == tokio_postgres::config::SslMode::Require
+            || config.get_channel_binding() == tokio_postgres::config::ChannelBinding::Require
+            || config.get_target_session_attrs()
+                != tokio_postgres::config::TargetSessionAttrs::Any
+        {
+            return Err(CaptureSqlFailure::Bounds);
+        }
+        let port = config.get_ports()[0];
+        match config.get_hosts() {
+            [tokio_postgres::config::Host::Tcp(host)] if host == "127.0.0.1" => {
+                Ok(Endpoint::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))))
+            }
+            #[cfg(unix)]
+            [tokio_postgres::config::Host::Unix(root)] => {
+                use std::os::unix::ffi::OsStrExt;
+                let root = root.as_os_str().as_bytes();
+                if root.is_empty() || root.contains(&0) {
+                    return Err(CaptureSqlFailure::Bounds);
+                }
+                let mut bytes = [0u8; 104];
+                let mut digits = [0u8; 5];
+                let mut n = port;
+                let mut first = 5usize;
+                loop {
+                    first -= 1;
+                    digits[first] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    if n == 0 { break; }
+                }
+                let slash = usize::from(!root.ends_with(b"/"));
+                let len = root.len().checked_add(slash)
+                    .and_then(|n| n.checked_add(b".s.PGSQL.".len()))
+                    .and_then(|n| n.checked_add(5 - first))
+                    .filter(|len| *len < bytes.len()).ok_or(CaptureSqlFailure::Bounds)?;
+                bytes[..root.len()].copy_from_slice(root);
+                let mut at = root.len();
+                if slash != 0 { bytes[at] = b'/'; at += 1; }
+                bytes[at..at + 9].copy_from_slice(b".s.PGSQL.");
+                at += 9;
+                bytes[at..len].copy_from_slice(&digits[first..]);
+                Ok(Endpoint::Unix { bytes, len })
+            }
+            _ => Err(CaptureSqlFailure::Bounds),
+        }
+    }
+
+    // All endpoint/option inputs are copied nonsecret DATA. This is the one actual
+    // lazy factory used both for the connection and its unpolled Layout calculation.
+    fn original_socket(
+        endpoint: Endpoint, timeout: Option<Duration>, options: TcpOptions,
+    ) -> impl Future<Output = io::Result<OriginalSocket>> + Send {
+        async move {
+            async fn connect(endpoint: Endpoint, options: TcpOptions) -> io::Result<OriginalSocket> {
+                match endpoint {
+                    Endpoint::Tcp(address) => {
+                        let stream = tokio::net::TcpStream::connect(address).await?;
+                        preserve_captured_tcp_options(&stream, &options)?;
+                        Ok(OriginalSocket::Tcp(stream))
+                    }
+                    #[cfg(unix)]
+                    Endpoint::Unix { bytes, len } => {
+                        use std::os::unix::ffi::OsStrExt;
+                        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..len]));
+                        Ok(OriginalSocket::Unix(tokio::net::UnixStream::connect(path).await?))
+                    }
+                }
+            }
+            match timeout {
+                Some(duration) => tokio::time::timeout(duration, connect(endpoint, options))
+                    .await.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+                None => connect(endpoint, options).await,
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)] // Only this locked-platform FFI helper; crate/workspace deny stays.
+    fn preserve_captured_tcp_options(
+        original: &tokio::net::TcpStream, options: &TcpOptions,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::raw::{c_int, c_void};
+        unsafe extern "C" {
+            fn setsockopt(fd: c_int, level: c_int, name: c_int,
+                value: *const c_void, length: u32) -> c_int;
+        }
+        fn set(fd: c_int, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
+            // SAFETY: fd is borrowed from the live original TcpStream for this synchronous
+            // call and is never closed/replaced here. value points to an aligned live c_int;
+            // setsockopt only reads exactly size_of::<c_int>() bytes during this call. The
+            // macOS ABI uses u32 socklen_t; no pointer or reference escapes to C. level/name
+            // are the locked Darwin SOL_SOCKET/TCP constants below; errno is read immediately.
+            // The declaration is scoped to this audited helper and no other unsafe is allowed.
+            let result = unsafe {
+                setsockopt(fd, level, name, (&value as *const c_int).cast(),
+                    std::mem::size_of::<c_int>() as u32)
+            };
+            if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        }
+        // tokio-postgres 0.7.18 connect_socket and socket2 0.6.5 perform this exact
+        // NODELAY / KEEPALIVE sequence. TCP_USER_TIMEOUT is ignored on macOS upstream.
+        original.set_nodelay(true)?;
+        if options.keepalive {
+            let fd = original.as_raw_fd();
+            set(fd, 0xffff, 0x0008, 1)?;
+            let secs = |d: Duration| d.as_secs().min(i32::MAX as u64) as i32;
+            set(fd, 6, 0x10, secs(options.idle))?;
+            if let Some(interval) = options.interval { set(fd, 6, 0x101, secs(interval))?; }
+            if let Some(retries) = options.retries { set(fd, 6, 0x102, retries as i32)?; }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn preserve_captured_tcp_options(
+        _original: &tokio::net::TcpStream, _options: &TcpOptions,
+    ) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    fn poll_connect(state: &mut SocketState, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let SocketState::Connecting(future) = state {
+            match future.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(socket)) => *state = SocketState::Connected(socket),
+                Poll::Ready(Err(error)) => { *state = SocketState::Failed; return Poll::Ready(Err(error)); }
+            }
+        }
+        match state {
+            SocketState::Connected(_) => Poll::Ready(Ok(())),
+            _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
+        }
+    }
+    fn read_socket(
+        state: &mut SocketState, cx: &mut Context<'_>, dst: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match state {
+            SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_read(cx, dst),
+            #[cfg(unix)]
+            SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_read(cx, dst),
+            _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
+        }
+    }
+
+    /// Original bounded socket DATA; it grants neither a source nor a capture operation.
+    #[doc(hidden)]
+    pub struct CapturePgIo {
+        socket: SocketState,
+        decode: Arc<CaptureDecodeBudget>,
+        header: [u8; 5],
+        header_read: usize,
+        header_sent: usize,
+        body_remaining: usize,
+        max_frame: usize,
+        credit: bool,
+        failed: bool,
+    }
+    impl Unpin for CapturePgIo {}
+    impl CapturePgIo {
+        pub fn prepare(config: &PgConfig, decode: Arc<CaptureDecodeBudget>)
+            -> Result<Self, CaptureSqlFailure>
+        {
+            if !cfg!(target_os = "macos") { return Err(CaptureSqlFailure::Bounds); }
+            let endpoint = endpoint(config)?;
+            let options = TcpOptions::from_original(config);
+            // This initial charge precedes both the lazy future Box and Framed::new.
+            let m = decode.reserve_wire_credit()?;
+            let frame = m.checked_div(4).and_then(|n| n.checked_sub(1))
+                .filter(|n| *n >= 5).ok_or(CaptureSqlFailure::Bounds)?;
+            let max_frame = usize::try_from(frame).map_err(|_| CaptureSqlFailure::Bounds)?;
+            let original = original_socket(endpoint, config.get_connect_timeout().copied(), options);
+            Ok(Self {
+                socket: SocketState::Connecting(Box::pin(original)),
+                decode, header: [0; 5], header_read: 0, header_sent: 0,
+                body_remaining: 0, max_frame, credit: false, failed: false,
+            })
+        }
+
+        // New pure DATA bridge, pending the Root-approved R475 supplement.
+        // The same actual lazy factory is instantiated but never polled or boxed.
+        pub fn checked_metadata_bytes(originals: u64) -> Result<u64, CaptureSqlFailure> {
+            let original = original_socket(
+                Endpoint::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
+                None, TcpOptions { keepalive: false, idle: Duration::ZERO,
+                    interval: None, retries: None },
+            );
+            let layout = std::alloc::Layout::for_value(&original);
+            let unit = std::mem::size_of::<Self>().checked_add(layout.size())
+                .ok_or(CaptureSqlFailure::Bounds)?;
+            u64::try_from(unit).map_err(|_| CaptureSqlFailure::Bounds)?
+                .checked_mul(originals).ok_or(CaptureSqlFailure::Bounds)
+        }
+        fn guard(&mut self) -> io::Result<()> {
+            if self.failed { return Err(io::Error::from(io::ErrorKind::InvalidData)); }
+            self.decode.reserve_allocations(&[]).map_err(|failure| {
+                self.failed = true;
+                io::Error::from(if failure == CaptureSqlFailure::Clock {
+                    io::ErrorKind::TimedOut
+                } else { io::ErrorKind::InvalidData })
+            })
+        }
+        fn ensure_credit(&mut self) -> io::Result<()> {
+            if !self.credit {
+                self.decode.reserve_wire_credit().map_err(|failure| {
+                    self.failed = true;
+                    io::Error::from(if failure == CaptureSqlFailure::Clock {
+                        io::ErrorKind::TimedOut
+                    } else { io::ErrorKind::InvalidData })
+                })?;
+                self.credit = true;
+            }
+            Ok(())
+        }
+    }
+    impl AsyncRead for CapturePgIo {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, dst: &mut ReadBuf<'_>)
+            -> Poll<io::Result<()>>
+        {
+            let this = self.get_mut();
+            if dst.remaining() == 0 { return Poll::Ready(Ok(())); }
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            let connecting = poll_connect(&mut this.socket, cx);
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            match connecting {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+            if this.header_sent == 5 && this.body_remaining == 0 {
+                this.header_read = 0;
+                this.header_sent = 0;
+            }
+            while this.header_read < 5 {
+                let (result, n) = {
+                    let mut header = ReadBuf::new(&mut this.header[this.header_read..]);
+                    let result = read_socket(&mut this.socket, cx, &mut header);
+                    (result, header.filled().len())
+                };
+                this.header_read += n;
+                if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+                match result {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) if n == 0 => {
+                        return Poll::Ready(if this.header_read == 0 { Ok(()) }
+                            else { Err(io::Error::from(io::ErrorKind::UnexpectedEof)) });
+                    }
+                    Poll::Ready(Ok(())) => {}
+                }
+            }
+            if this.header_sent == 0 {
+                let length = i32::from_be_bytes(this.header[1..5].try_into().expect("fixed header"));
+                let total = usize::try_from(length).ok().and_then(|n| n.checked_add(1));
+                match total {
+                    Some(total) if length >= 4 && total <= this.max_frame => {
+                        this.body_remaining = total - 5;
+                    }
+                    _ => {
+                        this.failed = true;
+                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::InvalidData)));
+                    }
+                }
+            }
+            if let Err(error) = this.ensure_credit() { return Poll::Ready(Err(error)); }
+            if this.header_sent < 5 {
+                let n = (5 - this.header_sent).min(dst.remaining());
+                dst.put_slice(&this.header[this.header_sent..this.header_sent + n]);
+                this.header_sent += n;
+                this.credit = false;
+                if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+                return Poll::Ready(Ok(()));
+            }
+            let len = this.body_remaining.min(dst.remaining());
+            let (result, n) = {
+                let mut body = ReadBuf::new(dst.initialize_unfilled_to(len));
+                let result = read_socket(&mut this.socket, cx, &mut body);
+                (result, body.filled().len())
+            };
+            this.body_remaining -= n;
+            if n != 0 { this.credit = false; }
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            match result {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) if n == 0 => {
+                    this.failed = true;
+                    Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)))
+                }
+                Poll::Ready(Ok(())) => { dst.advance(n); Poll::Ready(Ok(())) }
+            }
+        }
+    }
+    impl AsyncWrite for CapturePgIo {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, src: &[u8])
+            -> Poll<io::Result<usize>>
+        {
+            let this = self.get_mut();
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            let connecting = poll_connect(&mut this.socket, cx);
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            match connecting {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+            let result = match &mut this.socket {
+                SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_write(cx, src),
+                #[cfg(unix)]
+                SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_write(cx, src),
+                _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
+            };
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            result
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            let connecting = poll_connect(&mut this.socket, cx);
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            match connecting {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+            let result = match &mut this.socket {
+                SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_flush(cx),
+                #[cfg(unix)]
+                SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_flush(cx),
+                _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
+            };
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            result
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            let connecting = poll_connect(&mut this.socket, cx);
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            match connecting {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+            let result = match &mut this.socket {
+                SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_shutdown(cx),
+                #[cfg(unix)]
+                SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_shutdown(cx),
+                _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
+            };
+            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            result
+        }
+    }
+}
+#[cfg(feature = "desktop-local-vault")]
+pub use capture_io::CapturePgIo;
+
 // The armed Local graph retains original tasks independently of the stock lifecycle proxy.
 // This module does not authorize capture, construct a source, or interpret a transaction result.
 #[cfg(feature = "desktop-local-vault")]
@@ -1187,6 +1589,12 @@ mod retained {
                 std::mem::size_of::<SessionPermitCustody>(),
                 std::mem::size_of::<DriverRetention>(),
                 8192,
+                std::mem::size_of_val(&retained_original_connect(None)),
+                usize::try_from(CapturePgIo::checked_metadata_bytes(1)
+                    .map_err(|_| PoolError::CreationLimit)?)
+                    .map_err(|_| PoolError::CreationLimit)?,
+                std::mem::size_of::<tokio_postgres::Connection<
+                    CapturePgIo, tokio_postgres::tls::NoTlsStream>>(),
             ])?;
             let proxy_charge = metadata_add(&[
                 std::mem::size_of::<ProxyFuture>(),
@@ -1364,6 +1772,7 @@ mod retained {
         bounds: DesktopPoolJoinBounds,
         metadata: MetadataReservation,
         counts: Arc<Counters>,
+        original_decode: Arc<crate::db::capture_materials::CaptureDecodeBudget>,
     }
     struct QueueOnlyRetirement {
         gate: Weak<RetirementGate>,
@@ -1708,17 +2117,12 @@ mod retained {
                 let owner = DriverOwner::new_retained(sequence, &supervisor, retention);
                 let (ready, receiver) = oneshot::channel();
                 let configuration = config.clone();
-                let connecting_owner = Arc::clone(&owner);
-                let connecting: ConnectingFuture = Box::pin(async move {
-                    let original = configuration.connect(NoTls);
-                    let mut original = Box::pin(original);
-                    connecting_owner.connecting_started();
-                    let result = original.as_mut().await;
-                    drop(original);
-                    connecting_owner.connecting_destroyed();
-                    result
-                        .map(|(client, connection)| (client, Box::pin(connection) as DrivingFuture))
-                });
+                let original_io = CapturePgIo::prepare(
+                    &configuration, Arc::clone(&self.gate.original_decode),
+                ).map_err(|_| PoolError::CreationLimit)?;
+                let connecting: ConnectingFuture = Box::pin(retained_original_connect(
+                    Some((configuration, original_io, Arc::clone(&owner))),
+                ));
                 let driver = OriginalDriver {
                     resource: OriginalResource::Connecting(connecting),
                     ready: Some(ready),
@@ -1786,6 +2190,25 @@ mod retained {
             }
         }
     }
+    // The real factory is also instantiated with None for Layout only, never polled.
+    // The original raw connect future is scoped inline so it is actually dropped before
+    // connecting_destroyed; no additional erased inner Box needs a guessed size.
+    fn retained_original_connect(
+        original: Option<(PgConfig, CapturePgIo, Arc<DriverOwner>)>,
+    ) -> impl Future<Output = Result<(PgClient, DrivingFuture), PgError>> + Send {
+        async move {
+            let (configuration, original_io, connecting_owner) =
+                original.expect("only admitted original inputs are polled");
+            let result = {
+                let original = configuration.connect_raw(original_io, NoTls);
+                tokio::pin!(original);
+                connecting_owner.connecting_started();
+                original.as_mut().await
+            };
+            connecting_owner.connecting_destroyed();
+            result.map(|(client, connection)| (client, Box::pin(connection) as DrivingFuture))
+        }
+    }
     type PgClientReady = oneshot::Receiver<Result<PgClient, PgError>>;
     struct ProxyCreationCancellation {
         task: Option<JoinHandle<()>>,
@@ -1809,7 +2232,10 @@ mod retained {
         core: Arc<CustodyCore>,
     }
     impl DesktopLocalDriverCustody {
-        pub fn prepare(bounds: DesktopPoolJoinBounds) -> Result<Self, PoolError> {
+        pub fn prepare(
+            bounds: DesktopPoolJoinBounds,
+            original_decode: Arc<crate::db::capture_materials::CaptureDecodeBudget>,
+        ) -> Result<Self, PoolError> {
             // Admission covers both fixed stocks. It never lowers their original capacities.
             let fixed = crate::db::desktop_local::APPLICATION_POOL_SIZE
                 .checked_add(1)
@@ -1839,6 +2265,7 @@ mod retained {
                 bounds,
                 metadata,
                 counts,
+                original_decode,
             });
             let supervisor = |kind| -> Result<Arc<OwnerSupervisor>, PoolError> {
                 let registry = Registry {

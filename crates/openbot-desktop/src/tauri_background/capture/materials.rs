@@ -82,6 +82,7 @@ pub(crate) fn capture_screen_sessions_from_startup() -> Result<
 /// In-flight states deliberately have no restart path: cancellation cannot refund SQL or
 /// submit another Periodic checkpoint while the original driver result is uncertain.
 pub(crate) struct NormalCaptureMaterials {
+    original_decode: Arc<openbot_infra::db::capture_materials::CaptureDecodeBudget>,
     installation: RetainedInstallationCapture,
     screen: CaptureScreenAssemblySeal,
     preferences: crate::preferences::RetainedPreferenceCapture,
@@ -233,12 +234,20 @@ impl FileIdentity {
     }
 }
 impl NormalCaptureMaterials {
+    pub(crate) fn original_decode_budget(
+        &self,
+    ) -> Arc<openbot_infra::db::capture_materials::CaptureDecodeBudget> {
+        Arc::clone(&self.original_decode)
+    }
+
     pub(crate) fn from_original_installation(
         installation: RetainedInstallationCapture,
         screen: CaptureScreenAssemblySeal,
         preferences: crate::preferences::RetainedPreferenceCapture,
+        original_decode: Arc<openbot_infra::db::capture_materials::CaptureDecodeBudget>,
     ) -> Self {
         Self {
+            original_decode,
             installation,
             screen,
             preferences,
@@ -347,12 +356,11 @@ pub(crate) async fn prepare_intent_source(
         )
         .map_err(sql_fault)?,
     );
-    let decode = &op.profile().secrets.classes.decode_crypto_temporary;
     state
         .budget
         .as_mut()
         .ok_or(Fault::MaterialMissing)?
-        .bind_sensitive_decode_bound(decode.max_count, decode.max_one_bytes)
+        .bind_sensitive_decode_bound(Arc::clone(&state.original_decode))
         .map_err(sql_fault)?;
     state.phase = ReadPhase::IdentityReading;
     let identity = normal
@@ -540,6 +548,7 @@ fn reserve_original_canary_decode(
             .ok_or(Fault::BoundsOverflow)?;
     }
     if count > class.max_count { return Err(Fault::CapacityExceeded); }
+    state.original_decode.reserve_allocations(&allocations).map_err(sql_fault)?;
     let fixed = (std::mem::size_of::<Option<
         openbot_infra::db::desktop_vault_canary::DesktopVaultCanaryRow>>() as u64)
         .checked_add(std::mem::size_of::<openbot_domain::vault::DesktopVaultCanaryBinding>() as u64)

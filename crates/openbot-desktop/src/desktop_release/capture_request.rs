@@ -316,6 +316,85 @@ impl CaptureProfile {
             .ok_or(DesktopReleaseError::Manifest)?;
         self.validate_master_retention()
     }
+    // Returns (cold same-book admission, complete non-Config secret-structure increment).
+    // Original pool metadata is prepaid once as one bounded slice, not once per pool.
+    #[cfg(all(feature = "postgres-maintenance", target_os = "macos"))]
+    pub(crate) fn checked_original_decode_structure_bytes(
+        &self,
+    ) -> Result<(u64, u64), DesktopReleaseError> {
+        use openbot_infra::db::capture_materials::CaptureDecodeBudget;
+        let arc = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .align_to(2).map_err(|_| DesktopReleaseError::Manifest)?
+            .extend(std::alloc::Layout::new::<CaptureDecodeBudget>())
+            .map_err(|_| DesktopReleaseError::Manifest)?.0.pad_to_align();
+        let arc = u64::try_from(arc.size()).map_err(|_| DesktopReleaseError::Manifest)?;
+        // bytes1.12.1 Shared is Vec<u8>, usize, AtomicUsize. Bound every possible
+        // Rust field-order padding and final alignment, without claiming repr(C).
+        let fields = [
+            (core::mem::size_of::<Vec<u8>>(), core::mem::align_of::<Vec<u8>>()),
+            (core::mem::size_of::<usize>(), core::mem::align_of::<usize>()),
+            (core::mem::size_of::<std::sync::atomic::AtomicUsize>(),
+                core::mem::align_of::<std::sync::atomic::AtomicUsize>()),
+        ];
+        let mut shared = 0usize;
+        let mut align = 1usize;
+        for (size, a) in fields {
+            shared = shared.checked_add(size).and_then(|n| n.checked_add(a - 1))
+                .ok_or(DesktopReleaseError::Manifest)?;
+            align = align.max(a);
+        }
+        shared = shared.checked_add(align - 1).ok_or(DesktopReleaseError::Manifest)?;
+        let heads = u64::try_from(shared).map_err(|_| DesktopReleaseError::Manifest)?
+            .checked_mul(self.secrets.classes.decode_crypto_temporary.max_count)
+            .ok_or(DesktopReleaseError::Manifest)?;
+        let cold = arc.checked_add(heads)
+            .and_then(|n| n.checked_add(self.drivers.max_owner_metadata_bytes))
+            .ok_or(DesktopReleaseError::Manifest)?;
+        let attempts = self.secrets.classes.pg_config_passwords.max_count;
+        let source = openbot_infra::db::pool::CapturePgIo::checked_metadata_bytes(attempts)
+            .map_err(|_| DesktopReleaseError::Manifest)?
+            .checked_add(crate::postgres_maintenance::capture::
+                checked_original_source_connect_metadata_bytes(attempts)
+                .map_err(|_| DesktopReleaseError::Manifest)?)
+            .ok_or(DesktopReleaseError::Manifest)?;
+        // A already pays original Config headers. The concrete future fees contain
+        // those same headers, so remove only this proven overlap from the increment.
+        let originals = self.drivers.max_live_original_tasks
+            .min(self.drivers.max_unjoined_original_tasks);
+        let overlap = originals.checked_add(attempts)
+            .and_then(|n| n.checked_mul(core::mem::size_of::<tokio_postgres::Config>() as u64))
+            .ok_or(DesktopReleaseError::Manifest)?;
+        let increment = cold.checked_add(source).and_then(|n| n.checked_sub(overlap))
+            .ok_or(DesktopReleaseError::Manifest)?;
+        Ok((cold, increment))
+    }
+
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    pub(crate) fn validate_self_owned_fixture_retention(&self, fixture_metadata: u64) -> Result<(), DesktopReleaseError> {
+        self.validate_master_retention()?;
+        let k = &self.secrets.classes;
+        if k.master_source.max_count < 4 || k.master_source.max_one_bytes < 64
+            || k.scram_source.max_count < 4 || k.scram_source.max_one_bytes < 64 {
+            return Err(DesktopReleaseError::Manifest);
+        }
+        let n = self.drivers.max_live_original_tasks.checked_add(3)
+            .ok_or(DesktopReleaseError::Manifest)?
+            .max(self.drivers.max_live_original_tasks.min(self.drivers.max_pending_connects).min(17)
+                .checked_add(7).ok_or(DesktopReleaseError::Manifest)?);
+        let config = u64::try_from(core::mem::size_of::<tokio_postgres::Config>())
+            .map_err(|_| DesktopReleaseError::Manifest)?;
+        let arc = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .align_to(2).map_err(|_| DesktopReleaseError::Manifest)?
+            .extend(std::alloc::Layout::new::<tokio_postgres::Config>())
+            .map_err(|_| DesktopReleaseError::Manifest)?.0.pad_to_align();
+        let required = n.checked_sub(1).and_then(|n| n.checked_mul(config))
+            .and_then(|n| n.checked_add(u64::try_from(arc.size()).ok()?))
+            .and_then(|n| n.checked_add(u64::try_from(core::mem::size_of::<SecretClassBounds>()).ok()?))
+            .and_then(|n| n.checked_add(self.checked_original_decode_structure_bytes().ok()?.1))
+            .and_then(|n| n.checked_add(fixture_metadata)).ok_or(DesktopReleaseError::Manifest)?;
+        if required > self.secrets.max_secret_structure_bytes { return Err(DesktopReleaseError::Manifest); }
+        Ok(())
+    }
     pub(crate) fn validate_master_retention(&self) -> Result<(), DesktopReleaseError> {
         let s = &self.secrets;
         positive(&[
@@ -367,13 +446,26 @@ impl CaptureProfile {
         // and the five original bootstrap adapters/capture audit owner are live at peak.
         require(&k.application_derived, 26, 32)?;
         require(&k.scram_source, 1, 64)?;
-        // Original config per connecting driver, fixed two Managers, and LISTEN configuration.
+        // Preserve the original driver floor. The original Desktop stocks are admin1/app16.
+        // ThreadDirectory clones and listeners share one immutable Config; only its
+        // constructor temporarily overlaps the old input and the new shared Config.
+        // Startup has at most seven fixed/relay copies; stable four plus relay/source
+        // temporaries is at most six. These are original-owner phase bounds, not D+7.
         let passwords = self
             .drivers
             .max_live_original_tasks
             .checked_add(3)
             .ok_or(DesktopReleaseError::Manifest)?;
-        require(&k.pg_config_passwords, passwords, 64)?;
+        let connecting_passwords = self
+            .drivers
+            .max_live_original_tasks
+            .min(self.drivers.max_pending_connects)
+            .min(17);
+        let startup_passwords = connecting_passwords
+            .checked_add(7)
+            .ok_or(DesktopReleaseError::Manifest)?;
+        let required_passwords = passwords.max(startup_passwords);
+        require(&k.pg_config_passwords, required_passwords, 64)?;
         require(
             &k.native_secret_frames,
             self.native.max_native_secret_copies,
@@ -383,13 +475,41 @@ impl CaptureProfile {
         require(&k.stream_key, 1, 32)?;
         require(&k.key_medium_readback, 1, 32)?;
         require(&k.decode_crypto_temporary, 1, 64)?;
+        // One shared Config is inside ArcInner; the other actual Config headers are
+        // counted once each. Password backing remains in pg_config_passwords above.
+        let config_bytes = u64::try_from(core::mem::size_of::<tokio_postgres::Config>())
+            .map_err(|_| DesktopReleaseError::Manifest)?;
+        // Locked Rust 1.98 ArcInner is repr(C, align(2)): two AtomicUsize then T.
+        let arc_layout = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .align_to(2)
+            .map_err(|_| DesktopReleaseError::Manifest)?
+            .extend(std::alloc::Layout::new::<tokio_postgres::Config>())
+            .map_err(|_| DesktopReleaseError::Manifest)?
+            .0
+            .pad_to_align();
+        let arc_bytes = u64::try_from(arc_layout.size())
+            .map_err(|_| DesktopReleaseError::Manifest)?;
+        let config_structures = required_passwords
+            .checked_sub(1)
+            .ok_or(DesktopReleaseError::Manifest)?
+            .checked_mul(config_bytes)
+            .ok_or(DesktopReleaseError::Manifest)?
+            .checked_add(arc_bytes)
+            .ok_or(DesktopReleaseError::Manifest)?;
+        #[cfg(all(feature = "postgres-maintenance", target_os = "macos"))]
+        let (_, decode_structure) = self.checked_original_decode_structure_bytes()?;
+        #[cfg(not(all(feature = "postgres-maintenance", target_os = "macos")))]
+        let decode_structure: u64 = return Err(DesktopReleaseError::Manifest);
+        let required_secret_structure = u64::try_from(core::mem::size_of::<SecretClassBounds>())
+            .map_err(|_| DesktopReleaseError::Manifest)?
+            .checked_add(config_structures)
+            .and_then(|n| n.checked_add(decode_structure))
+            .ok_or(DesktopReleaseError::Manifest)?;
         if s.max_source_secret_count < 2
             || s.max_one_source_secret_bytes < 64
             || s.max_total_source_secret_bytes < 96
             || peak > s.max_secret_memory_bytes
-            || s.max_secret_structure_bytes
-                < u64::try_from(std::mem::size_of::<SecretClassBounds>())
-                    .map_err(|_| DesktopReleaseError::Manifest)?
+            || s.max_secret_structure_bytes < required_secret_structure
         {
             return Err(DesktopReleaseError::Manifest);
         }
