@@ -62,7 +62,7 @@ pub(crate) mod capture;
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 const SELF_OWNED_CAPTURE_FIXTURE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const SELF_OWNED_CAPTURE_OUTER: &str = "64428c91f9123a42a1220a6cfb0b78dd6f1082a928827b230fca66e1640b4dc1";
+const SELF_OWNED_CAPTURE_OUTER: &str = "77ea40dfc06352b5161317beae22a325cfb2b0ef827575d37d5bfef8895ceae2";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 const SELF_OWNED_CAPTURE_RELEASE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/release";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
@@ -248,7 +248,7 @@ pub(crate) fn bind_self_owned_capture_fixture(
     {
         use std::os::unix::fs::MetadataExt;
         let request = request.ok_or(DesktopLocalRuntimeError::Configuration)?;
-        let expected = [0x64,0x42,0x8c,0x91,0xf9,0x12,0x3a,0x42,0xa1,0x22,0x0a,0x6c,0xfb,0x0b,0x78,0xdd,0x6f,0x10,0x82,0xa9,0x28,0x82,0x7b,0x23,0x0f,0xca,0x66,0xe1,0x64,0x0b,0x4d,0xc1];
+        let expected = [0x77,0xea,0x40,0xdf,0xc0,0x63,0x52,0xb5,0x16,0x13,0x17,0xbe,0xae,0x22,0xa3,0x25,0xcf,0xb2,0xb0,0xef,0x82,0x75,0x75,0xd3,0x7d,0x5b,0xfe,0xf8,0x89,0x5c,0xea,0xe2];
         let known = checked_self_owned_fixture_metadata_bytes()?;
         request.profile.validate_self_owned_fixture_retention(known)
             .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
