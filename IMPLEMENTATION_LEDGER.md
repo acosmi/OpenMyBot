@@ -2303,3 +2303,8 @@ Documented the two existing Server recovery-gate attachment methods without chan
 ### V7-IMPL-046 — Server startup error conversion repair
 
 The Server library compiled at fd90bad; its binary check stopped at one startup error conversion. Both existing recovery read-gate installation calls now map failure through the existing fixed, redacted startup error and still refuse startup. Independent source review passed. A new exact-candidate Server binary check remains pending; runtime acceptance and delivery remain open.
+
+
+### V7-IMPL-046 — Recovery admission for requested input metadata
+
+Requested input metadata now holds the existing recovery admission across its Host control observation and checks it again before publishing metadata. The original binding, deadline, control witness, closure checks and error mapping remain in use. Independent review accepted the exact source change. Candidate compilation and complete runtime acceptance remain pending; the preceding candidate check did not start because resource admission was not met.
