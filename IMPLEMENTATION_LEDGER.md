@@ -2268,3 +2268,8 @@ The complete restore and current-binding reconfirmation task is accumulated on t
 ### V7-IMPL-046: service startup input validation
 
 Service startup input validation: the original owner-held configuration loader now requires explicit nonzero PG system/database identity for PG17, accepts only fresh_init or legacy_adoption with the selected private intentFile, and decodes exactly the four ordinary-intent fields. The request must match the selected mode and the original held configuration file identity, length and complete SHA-256; original descriptor, ownership, full-byte readback and finite metadata admission checks remain. This is source input validation only: no PostgreSQL connection, startup writer, Current publication or restore execution/acceptance is claimed.
+
+
+### V7-IMPL-046: closed site records and held-head validation
+
+External control input validation now uses explicit closed local-physical and server-database site data, checks the corresponding host/plan/reference identities, and keeps recovery target payloads local-physical only. The original held-head recheck performs one prepaid canonical typed validation, retains its complete result in the same owner and reuses that result only while the original FD, named identity, full bytes and digest continue to match. Runtime enrollment reads the common epoch without substituting a local physical identity for a server database. Original full journal-reference and publication evidence checks remain. This source change grants no database/key proof, Current authority, runtime closure, restore execution or complete acceptance.

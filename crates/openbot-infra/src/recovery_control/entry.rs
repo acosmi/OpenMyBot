@@ -743,6 +743,7 @@ pub(super) struct ControlFiles {
     scratch: Vec<u8>,
     first_fault: Option<RecoveryControlFault>,
     pub(super) activation_source: Option<Arc<OwnedRecord>>,
+    activation_observation: Option<Result<super::activation::ActivationObservation, RecoveryControlError>>,
     pub(super) pending_admission: Option<File>,
     pub(super) pending_runtime: Option<File>,
     pub(super) pending_owner: Option<File>,
@@ -1244,6 +1245,23 @@ impl ControlFiles {
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?);
         self.verify_original_record(&source, deadline)?;
         self.named_matches(Directory::Root, "activation-v1", source.identity, deadline)?;
+        if self.activation_observation.is_none() {
+            self.prepay(super::activation::read_metadata_reservation(&source.bytes)?, 0)?;
+            before(deadline)?;
+            // The original FD/bytes already belong to this ControlFiles. Keep
+            // the complete typed observation or parse error here before the
+            // original postclock check; a late result is never discarded.
+            self.activation_observation = Some(super::activation::observe(&source.bytes, &self.limits));
+            self.post(deadline)?;
+        }
+        match &self.activation_observation {
+            Some(Ok(observation)) if observation.digest == expected
+                && matches!(observation.record.phase, super::ActivationPhase::OrdinaryActive | super::ActivationPhase::RestoreCurrent) => (),
+            Some(Err(error)) => return Err(RecoveryControlError::new(error.fault())),
+            _ => return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)),
+        }
+        // This DATA validation adds no PublishedActivation, PG/key proof or
+        // Current grant. The inherited held-byte digest check still follows.
         let mut hash = Sha256::new();
         hash.update(b"wrokbot.restore.activation.v1\0"); hash.update(&source.bytes);
         let digest: [u8; 32] = hash.finalize().into();
@@ -1547,7 +1565,7 @@ pub(super) fn open_control(config: RecoveryControlConfig) -> Result<Arc<Mutex<Co
         operation_work: None, runtime_work: None,
         root_path: config.root, root_component, app_component: config.app_component, uid: config.uid, limits: config.limits,
         budget, raw: RawIo { file: None, metadata: None, named: None, unit: None, count: None, small: [0; 8], directory: None, entry: None },
-        scratch: Vec::new(), first_fault: None, activation_source: None, pending_admission: None,
+        scratch: Vec::new(), first_fault: None, activation_source: None, activation_observation: None, pending_admission: None,
         pending_runtime: None, pending_owner: None, pending_request: None,
         pending_host: None, service_source: config.service_source,
         runtime_record: None,

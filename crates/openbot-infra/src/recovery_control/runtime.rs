@@ -73,7 +73,7 @@ fn enrollment<'a>(
         boot_identity: &original.enrollment.boot_identity, pid: original.enrollment.pid,
         process_start: &original.enrollment.process_start,
         activation_digest: original.published.digest(),
-        authorization_epoch: &original.published.binding().authorization_epoch,
+        authorization_epoch: original.published.binding().authorization_epoch(),
         business_install_binding: original.published.binding(),
         root_and_lock_identities: RootAndLockIdentities { control_root: root, admission_lock: admission, runtime_lock: runtime },
         resource_model: original.enrollment.resource_model,

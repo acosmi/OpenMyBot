@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 
 use super::activation::{
     ActivationBinding, ActivationPhase, CandidatePlan, HostBinding, JournalReference,
-    PlannedInstallation,
+    PlannedInstallation, ServiceConfigReference, ExpectedServerDatabase,
 };
 use super::{
     RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, RequiredNullable,
@@ -83,8 +83,44 @@ struct FreshIntent {
     original_clock_relation: OwnerClockRecord,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "siteKind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
+enum SiteSelection {
+    LocalPhysical { trusted_parent: RecoveryFileIdentity, entry_component: String },
+    ServerDatabase { service_config: ServiceConfigReference, expected_server_database: ExpectedServerDatabase },
+}
+impl SiteSelection {
+    fn validate_host(&self, host: &HostBinding, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
+        host.validate(l)?;
+        match (self, host) {
+            (Self::LocalPhysical { trusted_parent, entry_component }, HostBinding::LocalPhysical { app_data_parent, .. }) => {
+                trusted_parent.validate()?; super::component(entry_component, l)?;
+                if trusted_parent != app_data_parent { return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)); }
+            }
+            (Self::ServerDatabase { service_config, expected_server_database },
+                HostBinding::ServerDatabase { service_config: actual_config, server_database, .. }) => {
+                service_config.validate()?; expected_server_database.validate()?;
+                if service_config != actual_config || !expected_server_database.matches(server_database) {
+                    return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid));
+                }
+            }
+            _ => return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)),
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SiteSelection { trusted_parent: RecoveryFileIdentity, entry_component: String }
+struct BusinessAndInstallation {
+    deployment_id: String, tenant_id: String, dataset_id: String,
+    source_installation_id: String, target_installation_id: String,
+}
+impl BusinessAndInstallation {
+    fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
+        for value in [&self.deployment_id, &self.tenant_id, &self.dataset_id,
+            &self.source_installation_id, &self.target_installation_id] { id(value, l.max_id_bytes)?; }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LegacyIntent {
@@ -92,7 +128,7 @@ struct LegacyIntent {
     original_startup_intent: String,
     owned_intent_file_identity: RecoveryFileIdentity,
     original_site_selection: SiteSelection,
-    expected_original_business_and_installation: Business,
+    expected_original_business_and_installation: BusinessAndInstallation,
     ordinary_startup_bounds: OrdinaryBounds,
     initializing_descriptor_digest: String,
     original_clock_relation: OwnerClockRecord,
@@ -294,6 +330,7 @@ impl Record {
             (Kind::OperationIntent, Data::Operation(d)) if self.sequence == 1 => match d {
                 OperationIntent::Restore(v) => {
                     v.profile.clone().checked(l)?;
+                    v.candidate_plan.validate(l)?;
                     v.input_identities.carrier.file.validate()?;
                     v.input_identities.key_medium.file.validate()?;
                     if v.input_identities.carrier.length == 0 || v.input_identities.key_medium.length != 104 {
@@ -306,7 +343,7 @@ impl Record {
                 OperationIntent::FreshInit(v) => {
                     hex(&v.original_startup_intent, 32, true)?;
                     hex(&v.initializing_descriptor_digest, 64, false)?;
-                    v.planned_installation.trusted_parent.validate()?;
+                    v.host_binding.validate_plan(&v.planned_installation, l)?;
                     v.original_clock_relation.validate(l)?;
                     if v.ordinary_startup_bounds.effect_ns == 0 || v.ordinary_startup_bounds.convergence_ns == 0 {
                         return Err(RecoveryControlError::new(RecoveryControlFault::ProfileInvalid));
@@ -316,7 +353,11 @@ impl Record {
                     hex(&v.original_startup_intent, 32, true)?;
                     hex(&v.initializing_descriptor_digest, 64, false)?;
                     v.owned_intent_file_identity.validate()?;
-                    v.original_site_selection.trusted_parent.validate()?;
+                    v.original_site_selection.validate_host(&v.host_binding, l)?;
+                    if v.owned_intent_file_identity.uid != v.host_binding.owner_uid()? {
+                        return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid));
+                    }
+                    v.expected_original_business_and_installation.validate(l)?;
                     v.original_clock_relation.validate(l)?;
                     if v.ordinary_startup_bounds.effect_ns == 0 || v.ordinary_startup_bounds.convergence_ns == 0 {
                         return Err(RecoveryControlError::new(RecoveryControlFault::ProfileInvalid));

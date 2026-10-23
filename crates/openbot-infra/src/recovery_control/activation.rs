@@ -35,49 +35,146 @@ pub(super) struct KeyReference {
 }
 
 /// Public binding DATA in a descriptor; this is not a usable installation or
-/// authorization source, and deserializing it creates no owner.
+/// authorization source. The transparent wrapper keeps variant fields private.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ActivationBinding { site: ActivationSiteBinding }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "siteKind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
+enum ActivationSiteBinding {
+    LocalPhysical {
+        dataset_id: String, deployment_id: String, tenant_id: String,
+        source_installation_id: String, target_installation_id: String,
+        generation_id: String, generation_root: RecoveryFileIdentity,
+        pg_system_id: u64, database_oid: u32, pg_major: u32,
+        native_version: u32, migration_digest: String, authorization_epoch: String,
+        key_refs: Vec<KeyReference>,
+    },
+    ServerDatabase {
+        dataset_id: String, deployment_id: String, tenant_id: String,
+        source_installation_id: String, target_installation_id: String,
+        service_config: ServiceConfigReference, server_database: ServerDatabaseSite,
+        native_version: u32, migration_digest: String, authorization_epoch: String,
+        key_refs: Vec<KeyReference>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ActivationBinding {
-    pub(super) dataset_id: String,
-    pub(super) deployment_id: String,
-    pub(super) tenant_id: String,
-    pub(super) source_installation_id: String,
-    pub(super) target_installation_id: String,
-    pub(super) generation_id: String,
-    pub(super) generation_root: RecoveryFileIdentity,
+pub(super) struct ServiceConfigReference {
+    pub(super) file: RecoveryFileIdentity,
+    pub(super) length: u64,
+    pub(super) digest: String,
+}
+impl ServiceConfigReference {
+    pub(super) fn validate(&self) -> Result<(), RecoveryControlError> {
+        self.file.validate()?;
+        hex(&self.digest, 64, false)?;
+        if self.length == 0 { return Err(invalid()); }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ExpectedServerDatabase {
     pub(super) pg_system_id: u64,
     pub(super) database_oid: u32,
     pub(super) pg_major: u32,
-    pub(super) native_version: u32,
-    pub(super) migration_digest: String,
-    pub(super) authorization_epoch: String,
-    pub(super) key_refs: Vec<KeyReference>,
+}
+impl ExpectedServerDatabase {
+    pub(super) fn validate(&self) -> Result<(), RecoveryControlError> {
+        if self.pg_system_id == 0 || self.database_oid == 0 || self.pg_major != 17 {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub(super) fn matches(&self, site: &ServerDatabaseSite) -> bool {
+        self.pg_system_id == site.pg_system_id && self.database_oid == site.database_oid
+            && self.pg_major == site.pg_major
+    }
 }
 
+// This is journal/descriptor DATA, not proof of authentication or a usable PG
+// connection. Its actual producer and Current consumer remain separate gates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ServerDatabaseSite {
+    pub(super) pg_system_id: u64,
+    pub(super) database_oid: u32,
+    pub(super) pg_major: u32,
+    authenticated_principal: String,
+    database_owner: String,
+}
+impl ServerDatabaseSite {
+    fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
+        ExpectedServerDatabase { pg_system_id: self.pg_system_id,
+            database_oid: self.database_oid, pg_major: self.pg_major }.validate()?;
+        id(&self.authenticated_principal, l.max_id_bytes)?;
+        id(&self.database_owner, l.max_id_bytes)
+    }
+}
+
+struct CommonBinding<'a> {
+    ids: [&'a str; 5],
+    native_version: u32,
+    migration_digest: &'a str,
+    authorization_epoch: &'a str,
+    key_refs: &'a [KeyReference],
+}
+fn invalid() -> RecoveryControlError { RecoveryControlError::new(RecoveryControlFault::ControlInvalid) }
+
 impl ActivationBinding {
+    fn common(&self) -> CommonBinding<'_> {
+        match &self.site {
+            ActivationSiteBinding::LocalPhysical { dataset_id, deployment_id, tenant_id,
+                source_installation_id, target_installation_id, native_version,
+                migration_digest, authorization_epoch, key_refs, .. }
+            | ActivationSiteBinding::ServerDatabase { dataset_id, deployment_id, tenant_id,
+                source_installation_id, target_installation_id, native_version,
+                migration_digest, authorization_epoch, key_refs, .. } => CommonBinding {
+                    ids: [dataset_id, deployment_id, tenant_id, source_installation_id, target_installation_id],
+                    native_version: *native_version, migration_digest, authorization_epoch, key_refs,
+                },
+        }
+    }
+
+    pub(super) fn authorization_epoch(&self) -> &str { self.common().authorization_epoch }
+    fn native_version(&self) -> u32 { self.common().native_version }
+    fn is_local(&self) -> bool { matches!(self.site, ActivationSiteBinding::LocalPhysical { .. }) }
+
     pub(super) fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
-        for s in [&self.dataset_id, &self.deployment_id, &self.tenant_id,
-            &self.source_installation_id, &self.target_installation_id] {
-            id(s, l.max_id_bytes)?;
-        }
-        hex(&self.generation_id, 32, true)?;
-        self.generation_root.validate()?;
-        hex(&self.migration_digest, 64, false)?;
-        hex(&self.authorization_epoch, 64, true)?;
-        if self.pg_system_id == 0 || self.database_oid == 0 || self.pg_major != 17
-            || !matches!(self.native_version, 52 | 53) || self.key_refs.len() != 2
-            || self.key_refs[0].kind != KeyKind::HistoricalMaster
-            || self.key_refs[1].kind != KeyKind::PostgresScram
-        {
-            return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid));
-        }
-        for key in &self.key_refs {
-            for s in [&key.reviewed_service, &key.account, &key.key_id,
-                &key.target_installation_id] { id(s, l.max_id_bytes)?; }
+        let common = self.common();
+        for value in common.ids { id(value, l.max_id_bytes)?; }
+        hex(common.migration_digest, 64, false)?;
+        hex(common.authorization_epoch, 64, true)?;
+        if !matches!(common.native_version, 52 | 53) || common.key_refs.len() != 2
+            || common.key_refs[0].kind != KeyKind::HistoricalMaster
+            || common.key_refs[1].kind != KeyKind::PostgresScram
+        { return Err(invalid()); }
+        for key in common.key_refs {
+            for value in [&key.reviewed_service, &key.account, &key.key_id, &key.target_installation_id] {
+                id(value, l.max_id_bytes)?;
+            }
             hex(&key.operation_id, 32, true)?;
-            if key.key_version == 0 || key.target_installation_id != self.target_installation_id {
-                return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid));
+            if key.key_version == 0 || key.target_installation_id != common.ids[4] { return Err(invalid()); }
+        }
+        match &self.site {
+            ActivationSiteBinding::LocalPhysical { generation_id, generation_root,
+                pg_system_id, database_oid, pg_major, .. } => {
+                hex(generation_id, 32, true)?;
+                generation_root.validate()?;
+                ExpectedServerDatabase { pg_system_id: *pg_system_id,
+                    database_oid: *database_oid, pg_major: *pg_major }.validate()?;
+            }
+            ActivationSiteBinding::ServerDatabase { service_config, server_database, .. } => {
+                service_config.validate()?;
+                server_database.validate(l)?;
+                if common.key_refs[0].reviewed_service != "server.KEY_ENCRYPTION_KEY"
+                    || common.key_refs[1].reviewed_service != "server.DATABASE_URL"
+                    || common.key_refs.iter().any(|key| key.account != "configured-current")
+                { return Err(invalid()); }
             }
         }
         Ok(())
@@ -109,27 +206,105 @@ pub(super) enum ActualOsOwner {
     ConfiguredService { uid: u32, service: String },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct HostBinding {
-    pub(super) actual_os_owner: ActualOsOwner,
-    pub(super) app_data_parent: RecoveryFileIdentity,
-    pub(super) control_root: RecoveryFileIdentity,
-    pub(super) reviewed_release_digest: String,
+#[serde(tag = "siteKind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub(super) enum HostBinding {
+    LocalPhysical {
+        actual_os_owner: ActualOsOwner,
+        app_data_parent: RecoveryFileIdentity,
+        control_root: RecoveryFileIdentity,
+        reviewed_release_digest: String,
+    },
+    ServerDatabase {
+        actual_os_owner: ActualOsOwner,
+        service_config: ServiceConfigReference,
+        control_root: RecoveryFileIdentity,
+        server_database: ServerDatabaseSite,
+    },
 }
+impl HostBinding {
+    pub(super) fn owner_uid(&self) -> Result<u32, RecoveryControlError> {
+        match self {
+            Self::LocalPhysical { actual_os_owner: ActualOsOwner::LocalUid { uid }, .. }
+            | Self::ServerDatabase { actual_os_owner: ActualOsOwner::ConfiguredService { uid, .. }, .. } => Ok(*uid),
+            _ => Err(invalid()),
+        }
+    }
+    pub(super) fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
+        let uid = self.owner_uid()?;
+        match self {
+            Self::LocalPhysical { app_data_parent, control_root, reviewed_release_digest, .. } => {
+                app_data_parent.validate()?; control_root.validate()?;
+                hex(reviewed_release_digest, 64, false)?;
+                if control_root.uid != uid { return Err(invalid()); }
+            }
+            Self::ServerDatabase { actual_os_owner: ActualOsOwner::ConfiguredService { service, .. },
+                service_config, control_root, server_database } => {
+                id(service, l.max_id_bytes)?; service_config.validate()?;
+                control_root.validate()?; server_database.validate(l)?;
+                if control_root.uid != uid || service_config.file.uid != uid { return Err(invalid()); }
+            }
+            _ => return Err(invalid()),
+        }
+        Ok(())
+    }
+    pub(super) fn validate_plan(&self, plan: &PlannedInstallation, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
+        self.validate(l)?; plan.validate(l)?;
+        match (self, plan) {
+            (Self::LocalPhysical { app_data_parent, .. }, PlannedInstallation::LocalPhysical { trusted_parent, .. })
+                if app_data_parent == trusted_parent => Ok(()),
+            (Self::ServerDatabase { service_config, server_database, .. },
+                PlannedInstallation::ServerDatabase { service_config: planned_config, server_database: planned_site, .. })
+                if service_config == planned_config && server_database == planned_site => Ok(()),
+            _ => Err(invalid()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct PlannedInstallation {
-    pub(super) trusted_parent: RecoveryFileIdentity,
-    pub(super) entry_component: String,
-    pub(super) installation_id: String,
+#[serde(tag = "siteKind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
+pub(super) enum PlannedInstallation {
+    LocalPhysical {
+        trusted_parent: RecoveryFileIdentity,
+        entry_component: String,
+        installation_id: String,
+    },
+    ServerDatabase {
+        service_config: ServiceConfigReference,
+        server_database: ServerDatabaseSite,
+        installation_id: String,
+    },
 }
+impl PlannedInstallation {
+    fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
+        match self {
+            Self::LocalPhysical { trusted_parent, entry_component, installation_id } => {
+                trusted_parent.validate()?; component(entry_component, l)?;
+                id(installation_id, l.max_id_bytes)
+            }
+            Self::ServerDatabase { service_config, server_database, installation_id } => {
+                service_config.validate()?; server_database.validate(l)?;
+                id(installation_id, l.max_id_bytes)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum LocalPhysicalSiteKind { #[serde(rename = "local_physical")] LocalPhysical }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct CandidatePlan {
+    site_kind: LocalPhysicalSiteKind,
     pub(super) trusted_parent: RecoveryFileIdentity,
     pub(super) entry_component: String,
     pub(super) installation_id: String,
     pub(super) generation_id: String,
+}
+impl CandidatePlan {
+    pub(super) fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
+        self.trusted_parent.validate()?; component(&self.entry_component, l)?;
+        id(&self.installation_id, l.max_id_bytes)?; hex(&self.generation_id, 32, true)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -246,12 +421,7 @@ impl ActivationRecord {
                 hex(&d.intent_id, 32, true)?;
                 hex(&d.initial_epoch, 64, true)?;
                 hex(&d.limits_digest, 64, false)?;
-                d.host_binding.app_data_parent.validate()?;
-                d.host_binding.control_root.validate()?;
-                hex(&d.host_binding.reviewed_release_digest, 64, false)?;
-                d.planned_installation.trusted_parent.validate()?;
-                component(&d.planned_installation.entry_component, l)?;
-                id(&d.planned_installation.installation_id, l.max_id_bytes)?;
+                d.host_binding.validate_plan(&d.planned_installation, l)?;
                 d.init_journal_prefix.validate()?;
             }
             (ActivationPhase::OrdinaryActive, ActivationPayload::Active(d)) => {
@@ -260,29 +430,65 @@ impl ActivationRecord {
             (ActivationPhase::RestorePending, ActivationPayload::Pending(d)) => {
                 hex(&d.operation_id, 32, true)?; hex(&d.epoch, 64, true)?;
                 hex(&d.profile_digest, 64, false)?; hex(&d.input_plan_digest, 64, false)?;
-                d.candidate_plan.trusted_parent.validate()?;
-                component(&d.candidate_plan.entry_component, l)?;
-                id(&d.candidate_plan.installation_id, l.max_id_bytes)?;
-                hex(&d.candidate_plan.generation_id, 32, true)?;
-                if let RequiredNullable::Value(binding) = &d.prior_binding { binding.validate(l)?; }
+                d.candidate_plan.validate(l)?;
+                if let RequiredNullable::Value(binding) = &d.prior_binding {
+                    binding.validate(l)?;
+                    if !binding.is_local() { return Err(invalid()); }
+                }
                 d.owner_clock.validate(l)?; d.journal_prefix.validate()?;
             }
             (ActivationPhase::SwitchedPending, ActivationPayload::Switched(d)) => {
                 hex(&d.operation_id, 32, true)?; hex(&d.epoch, 64, true)?;
                 hex(&d.profile_digest, 64, false)?;
                 d.binding.validate(l)?; evidence(&d.closure_evidence)?; d.publish_intent.validate()?;
-                if d.binding.native_version != 53 { return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)); }
+                if !d.binding.is_local() || d.binding.native_version() != 53 { return Err(invalid()); }
             }
             (ActivationPhase::RestoreCurrent, ActivationPayload::Current(d)) => {
                 hex(&d.operation_id, 32, true)?; hex(&d.epoch, 64, true)?;
                 hex(&d.profile_digest, 64, false)?; d.binding.validate(l)?;
-                if d.binding.native_version != 53 { return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)); }
+                if !d.binding.is_local() || d.binding.native_version() != 53 { return Err(invalid()); }
                 evidence(&d.closure_evidence)?; d.switch_readback.validate()?; d.publish_intent.validate()?;
             }
             _ => return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)),
         }
         Ok(())
     }
+}
+
+// Allocation admission only, not a second JSON validator. Outside-string
+// punctuation bounds map/sequence nodes, including malformed unknown fields;
+// encoded string bytes bound decoded strings. The pinned serde1.0.229 Content
+// envelope is bounded by two Vec headers per node. Four simultaneous Content
+// layers cover payload/nullable/site/owner; typed Vec leaves are separate.
+// The factor2 covers Vec growth, while16*wire prepays decoded string copies,
+// escape/key scratch, canonical output and retained diagnostic text. Charge
+// once for the same immutable held input, before entering serde or allocating.
+pub(super) fn read_metadata_reservation(raw: &[u8]) -> Result<u64, RecoveryControlError> {
+    let mut nodes = 1u64;
+    let (mut quoted, mut escaped) = (false, false);
+    for byte in raw {
+        if quoted {
+            if escaped { escaped = false; }
+            else if *byte == b'\\' { escaped = true; }
+            else if *byte == b'"' { quoted = false; }
+        } else if *byte == b'"' { quoted = true; }
+        else if matches!(*byte, b'{' | b'[' | b',' | b':') {
+            nodes = nodes.checked_add(1).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        }
+    }
+    let content = std::mem::size_of::<Vec<u8>>().checked_mul(2)
+        .and_then(|n| n.checked_mul(4)).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+    let leaf = std::mem::size_of::<KeyReference>().max(std::mem::size_of::<JournalReference>());
+    let node = content.checked_add(leaf).and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+    let fixed = std::mem::size_of::<ActivationObservation>().checked_mul(2)
+        .and_then(|n| n.checked_add(std::mem::size_of::<CommonBinding<'_>>()))
+        .and_then(|n| n.checked_add(1024))
+        .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+    nodes.checked_mul(u64::try_from(node).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?)
+        .and_then(|n| u64::try_from(raw.len()).ok().and_then(|wire| wire.checked_mul(16)).and_then(|wire| n.checked_add(wire)))
+        .and_then(|n| u64::try_from(fixed).ok().and_then(|fixed| n.checked_add(fixed)))
+        .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))
 }
 
 pub(super) fn observe(
