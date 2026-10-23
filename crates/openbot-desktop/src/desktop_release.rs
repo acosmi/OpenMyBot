@@ -341,7 +341,21 @@ impl VerifiedDesktopRelease {
             .map_err(|_| DesktopReleaseError::Postgres)?;
         let postgres =
             VerifiedPostgresBundle::open(root.join(&manifest.postgres.root), expected_pg, &signer)
-                .map_err(|_| DesktopReleaseError::Postgres)?;
+                .map_err(|_error| {
+                    #[cfg(debug_assertions)]
+                    if capture.is_some() {
+                        use crate::postgres_sidecar::PostgresSidecarError;
+                        let code = match &_error {
+                            PostgresSidecarError::Io(_) => "postgres_sidecar_io",
+                            PostgresSidecarError::ManifestDigest => "postgres_sidecar_manifest_digest",
+                            PostgresSidecarError::BundleShape => "postgres_sidecar_bundle_shape",
+                            PostgresSidecarError::FileDigest => "postgres_sidecar_file_digest",
+                            _ => "wrok_bot_release_postgres_invalid",
+                        };
+                        eprintln!("{code}");
+                    }
+                    DesktopReleaseError::Postgres
+                })?;
         // Only these already verified release inputs are sealed. The original maintenance
         // verify/FD/error order above is unchanged; nothing is published while DATA is absent.
         if let Some(capture) = capture.as_mut() {
