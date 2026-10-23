@@ -60,17 +60,17 @@ pub(crate) mod capture;
 
 // This fixed fixture is a debug-only original launcher input, not a configurable source.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const SELF_OWNED_CAPTURE_FIXTURE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01";
+const SELF_OWNED_CAPTURE_FIXTURE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-02";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const SELF_OWNED_CAPTURE_OUTER: &str = "77ea40dfc06352b5161317beae22a325cfb2b0ef827575d37d5bfef8895ceae2";
+const SELF_OWNED_CAPTURE_OUTER: &str = "f9ee6d061d6202b15edd9de72a1560212ccc70e1438625a2559025b21edaaaf6";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const SELF_OWNED_CAPTURE_RELEASE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/release";
+const SELF_OWNED_CAPTURE_RELEASE: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-02/release";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const SELF_OWNED_CAPTURE_APP_DATA: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/app-data";
+const SELF_OWNED_CAPTURE_APP_DATA: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-02/app-data";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const SELF_OWNED_CAPTURE_OUTPUT: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/capture-output";
+const SELF_OWNED_CAPTURE_OUTPUT: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-02/capture-output";
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const SELF_OWNED_CAPTURE_KEY: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-01/independent-key-medium";
+const SELF_OWNED_CAPTURE_KEY: &str = "/Users/wrok/Desktop/wrokbot/.local-private/v7-implementation/qa/task044-maintenance-v2-registration-20261019-01/SelfOwned-normal-fixture-02/independent-key-medium";
 
 // There is no public constructor, Clone, Deserialize, caller flag, path or secret injection.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
@@ -239,6 +239,14 @@ pub(crate) fn checked_self_owned_fixture_metadata_bytes() -> Result<u64, Desktop
 pub(crate) fn bind_self_owned_capture_fixture(
     request: Option<&crate::desktop_release::ReviewedNormalCaptureRequest>,
 ) -> Result<Option<(SelfOwnedCaptureFixtureBinding, Arc<dyn OsSecretStore>)>, DesktopLocalRuntimeError> {
+    // Retired fixed fixture pins must fail before any current-user secret-store fallback.
+    if option_env!("WROK_BOT_DESKTOP_RELEASE_SHA256")
+        == Some("64428c91f9123a42a1220a6cfb0b78dd6f1082a928827b230fca66e1640b4dc1")
+        || option_env!("WROK_BOT_DESKTOP_RELEASE_SHA256")
+            == Some("77ea40dfc06352b5161317beae22a325cfb2b0ef827575d37d5bfef8895ceae2")
+    {
+        return Err(DesktopLocalRuntimeError::Configuration);
+    }
     if option_env!("WROK_BOT_DESKTOP_RELEASE_SHA256") != Some(SELF_OWNED_CAPTURE_OUTER) {
         return Ok(None);
     }
@@ -248,7 +256,7 @@ pub(crate) fn bind_self_owned_capture_fixture(
     {
         use std::os::unix::fs::MetadataExt;
         let request = request.ok_or(DesktopLocalRuntimeError::Configuration)?;
-        let expected = [0x77,0xea,0x40,0xdf,0xc0,0x63,0x52,0xb5,0x16,0x13,0x17,0xbe,0xae,0x22,0xa3,0x25,0xcf,0xb2,0xb0,0xef,0x82,0x75,0x75,0xd3,0x7d,0x5b,0xfe,0xf8,0x89,0x5c,0xea,0xe2];
+        let expected = [0xf9,0xee,0x6d,0x06,0x1d,0x62,0x02,0xb1,0x5e,0xdd,0x9d,0xe7,0x2a,0x15,0x60,0x21,0x2c,0xcc,0x70,0xe1,0x43,0x86,0x25,0xa2,0x55,0x90,0x25,0xb2,0x1e,0xda,0xaa,0xf6];
         let known = checked_self_owned_fixture_metadata_bytes()?;
         request.profile.validate_self_owned_fixture_retention(known)
             .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
@@ -258,22 +266,22 @@ pub(crate) fn bind_self_owned_capture_fixture(
         let named = std::fs::symlink_metadata(release).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
         let parent = std::fs::symlink_metadata(fixed).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
         if request.release_digest != expected
-            || request.request_id != "8011979d2cf41c0ffeaf064a0b6c3dd9fda46d14694ac0fd38e2a19aec827760"
+            || request.request_id != "ba037759c50383b4cdd3769d0159fbe2daebee1d15629682f8c20b1d90fb28d7"
             || request.release_path != release
             || !held.is_dir() || !named.is_dir() || named.file_type().is_symlink()
-            || (held.dev(), held.ino(), held.uid(), held.mode() & 0o7777) != (16777230,109784555,501,0o700)
+            || (held.dev(), held.ino(), held.uid(), held.mode() & 0o7777) != (16777232,111166603,501,0o700)
             || (named.dev(), named.ino(), named.uid(), named.mode()) != (held.dev(),held.ino(),held.uid(),held.mode())
             || !parent.is_dir() || parent.file_type().is_symlink()
-            || (parent.dev(),parent.ino(),parent.uid(),parent.mode() & 0o7777) != (16777230,109784554,501,0o700)
+            || (parent.dev(),parent.ino(),parent.uid(),parent.mode() & 0o7777) != (16777232,111166602,501,0o700)
         { return Err(DesktopLocalRuntimeError::Configuration); }
-        for (destination, leaf, inode) in [(&request.output, "capture-output", 109784556u64), (&request.key_medium, "independent-key-medium",109784557u64)] {
+        for (destination, leaf, inode) in [(&request.output, "capture-output", 111166604u64), (&request.key_medium, "independent-key-medium",111166605u64)] {
             let fixed_destination = if leaf == "capture-output" { SELF_OWNED_CAPTURE_OUTPUT } else { SELF_OWNED_CAPTURE_KEY };
             if destination.absolute_path != std::path::Path::new(fixed_destination)
-                || (destination.device,destination.inode,destination.uid) != (16777230,inode,501) {
+                || (destination.device,destination.inode,destination.uid) != (16777232,inode,501) {
                 return Err(DesktopLocalRuntimeError::Configuration);
             }
             let m = std::fs::symlink_metadata(&destination.absolute_path).map_err(|_| DesktopLocalRuntimeError::Configuration)?;
-            if !m.is_dir() || m.file_type().is_symlink() || (m.dev(),m.ino(),m.uid(),m.mode() & 0o7777) != (16777230,inode,501,0o700) {
+            if !m.is_dir() || m.file_type().is_symlink() || (m.dev(),m.ino(),m.uid(),m.mode() & 0o7777) != (16777232,inode,501,0o700) {
                 return Err(DesktopLocalRuntimeError::Configuration);
             }
         }
@@ -308,7 +316,7 @@ impl SelfOwnedCaptureFixtureBinding {
             .map_err(|_| DesktopLocalRuntimeError::Configuration)?);
         let parent = self.held_parent.as_ref().ok_or(DesktopLocalRuntimeError::Configuration)?;
         let m = parent.metadata().map_err(|_| DesktopLocalRuntimeError::Configuration)?;
-        if (m.dev(),m.ino(),m.uid(),m.mode() & 0o7777) != (16777230,109784554,501,0o700) {
+        if (m.dev(),m.ino(),m.uid(),m.mode() & 0o7777) != (16777232,111166602,501,0o700) {
             return Err(DesktopLocalRuntimeError::Configuration);
         }
         // mkdirat has no EEXIST adoption. The original New initializer follows only this root.
