@@ -19,7 +19,8 @@ use rustix::fs::FlockOperation;
 use serde::Serialize;
 
 use super::activation::{ActivationBinding, PublishedActivation};
-use super::entry::{self, ControlFiles, OwnedRecord, VerifiedOrdinaryStartupIntent};
+use super::entry::{self, ControlFiles, ControlOwner, OwnedRecord, VerifiedOrdinaryStartupIntent};
+use std::ops::Deref;
 use super::journal::ProcessStart;
 use super::{RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, id};
 
@@ -83,10 +84,10 @@ fn enrollment<'a>(
 
 /// The actual SH and the original enrollment FD have a single strong owner.
 /// A read gate only holds Weak. There is intentionally no Clone or Drop close.
-pub struct RecoveryRuntimeOwner { state: Arc<Mutex<RuntimeState>>, handle_alive: Arc<AtomicBool> }
+pub struct RecoveryRuntimeOwner { state: RuntimeOwnerBook, handle_alive: Arc<AtomicBool> }
 
 pub(super) struct RuntimeState {
-    control: Arc<Mutex<ControlFiles>>,
+    control: ControlOwner,
     runtime_lock: File,
     runtime_directory: File,
     enrollment_file: OwnedRecord,
@@ -96,9 +97,45 @@ pub(super) struct RuntimeState {
     handle_alive: Arc<AtomicBool>,
 }
 
+pub(super) type RuntimeOwnerBook = Arc<Mutex<Option<RuntimeState>>>;
+
+/// The same original state is checked out for IO, without a bookkeeping
+/// guard. All actual SH/enrollment/control/live-observer owners stay resident.
+struct RuntimeAccess { owner: RuntimeOwnerBook, state: Option<RuntimeState> }
+impl Deref for RuntimeAccess {
+    type Target = RuntimeState;
+    fn deref(&self) -> &RuntimeState { self.state.as_ref().expect("original runtime access") }
+}
+impl Drop for RuntimeAccess {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else { return; };
+        let mut book = match self.owner.lock() {
+            Ok(book) => book,
+            Err(poisoned) => {
+                state.handle_alive.store(false, Ordering::SeqCst);
+                poisoned.into_inner()
+            }
+        };
+        // lock_runtime is the sole taker and this is the sole put-back path.
+        // Poison preserves original resources and does not produce a close.
+        *book = Some(state);
+    }
+}
+fn lock_runtime(owner: &RuntimeOwnerBook) -> Result<RuntimeAccess, RecoveryControlError> {
+    let mut access = RuntimeAccess { owner: Arc::clone(owner), state: None };
+    let mut book = owner.lock().map_err(|poisoned| {
+        let book = poisoned.into_inner();
+        if let Some(state) = book.as_ref() { state.handle_alive.store(false, Ordering::SeqCst); }
+        RecoveryControlError::new(RecoveryControlFault::OwnerLost)
+    })?;
+    access.state = Some(book.take().ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::OwnerBusy))?);
+    drop(book);
+    Ok(access)
+}
+
 /// Clone only the original owner's weak observation, never its runtime lease.
 #[derive(Clone)]
-pub struct RecoveryReadGate { state: Weak<Mutex<RuntimeState>> }
+pub struct RecoveryReadGate { state: Weak<Mutex<Option<RuntimeState>>> }
 
 impl RecoveryRuntimeOwner {
     #[must_use]
@@ -150,6 +187,7 @@ fn enqueue_enrollment(
         .and_then(|n| n.checked_add(4 * std::mem::size_of::<Result<(), serde_json::Error>>()))
         .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
     files.prepay(fixed as u64, 0)?;
+    files.verify_pending_enrollment_before(deadline)?;
     let cap = usize::try_from(files.limits.max_runtime_record_bytes)
         .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
     let mut count = Count { used: 0, cap };
@@ -176,7 +214,7 @@ fn enqueue_enrollment(
 }
 
 pub(super) fn enter_runtime(
-    control: &Arc<Mutex<ControlFiles>>, intent: VerifiedOrdinaryStartupIntent, deadline: Instant,
+    control: &ControlOwner, intent: VerifiedOrdinaryStartupIntent, deadline: Instant,
 ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
     let mut registration_effect_may_have_started = false;
     let result = (|| {
@@ -187,7 +225,9 @@ pub(super) fn enter_runtime(
             return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
         }
         let known = std::mem::size_of::<RuntimeState>()
-            .checked_add(std::mem::size_of::<Mutex<RuntimeState>>())
+            .checked_add(std::mem::size_of::<Mutex<Option<RuntimeState>>>())
+            .and_then(|n| n.checked_add(std::mem::size_of::<RuntimeAccess>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Result<RuntimeAccess, RecoveryControlError>>()))
             .and_then(|n| n.checked_add(2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()))
             .and_then(|n| n.checked_add(2 * std::mem::align_of::<RuntimeState>()))
             .and_then(|n| n.checked_add(std::mem::size_of::<[u8; 64]>() + std::mem::size_of::<[u8; 32]>() ))
@@ -204,6 +244,7 @@ pub(super) fn enter_runtime(
         before(deadline)?;
         hex(&intent.runtime_nonce, 32, true)?;
         id(&intent.enrollment.boot_identity, files.limits.max_id_bytes)?;
+        files.verify_enrollment_before(&intent.enrollment, deadline)?;
         if intent.enrollment.pid != std::process::id() || intent.enrollment.process_start.nanos >= 1_000_000_000
             || intent.enrollment.original_owner_set.is_empty()
             || u64::try_from(intent.enrollment.original_owner_set.len()).map_or(true, |n| n > files.limits.max_runtime_resource_facts)
@@ -256,10 +297,10 @@ pub(super) fn enter_runtime(
         let enrollment_file = files.runtime_record.take().expect("actual durable enrollment remains resident");
         let original = files.pending_startup.take().expect("original startup seal remains resident");
         let handle_alive = Arc::new(AtomicBool::new(true));
-        let owner = RecoveryRuntimeOwner { handle_alive: Arc::clone(&handle_alive), state: Arc::new(Mutex::new(RuntimeState {
+        let owner = RecoveryRuntimeOwner { handle_alive: Arc::clone(&handle_alive), state: Arc::new(Mutex::new(Some(RuntimeState {
             control: Arc::clone(control), runtime_lock, runtime_directory, enrollment_file, original, root, runtime_identity,
             handle_alive,
-        })) };
+        }))) };
         // Intentional same-owner failure retention, not a global registry or
         // another runtime. Only the original true close adapter may retire it.
         files.retained_runtime = Some(Arc::clone(&owner.state));
@@ -268,7 +309,7 @@ pub(super) fn enter_runtime(
         Ok(owner)
     })();
     result.map_err(|error: RecoveryControlError| {
-        if let Ok(mut files) = control.lock() {
+        if let Ok(mut files) = entry::lock(control) {
             if !registration_effect_may_have_started && files.retained_runtime.is_none()
                 && error.fault() == RecoveryControlFault::OwnerBusy
             {
@@ -283,12 +324,12 @@ pub(super) fn enter_runtime(
 fn unavailable(_: RecoveryControlError) -> HostRequestBindingError { HostRequestBindingError::Unavailable }
 
 struct Admission<'a> {
-    runtime: Weak<Mutex<RuntimeState>>,
+    runtime: Weak<Mutex<Option<RuntimeState>>>,
     original_binding: &'a VerifiedHostRequestBinding,
     original_auth: &'a AuthContext,
     deadline: Instant,
-    original_lock: Option<Mutex<File>>,
-    control: Arc<Mutex<ControlFiles>>,
+    original_lock: Option<File>,
+    control: ControlOwner,
     header_reservation: u64,
     retire_known: bool,
 }
@@ -299,7 +340,7 @@ impl Drop for Admission<'_> {
         // a Native/PG/task owner. It produces no close/Current receipt.
         drop(self.original_lock.take());
         if self.retire_known {
-            if let Ok(mut files) = self.control.lock() { files.retire_ordinary_lease(self.header_reservation); }
+            entry::retire_ordinary_lease(&self.control, self.header_reservation);
         }
     }
 }
@@ -317,23 +358,23 @@ impl RecoveryAdmissionWitness for Admission<'_> {
             return Err(HostRequestBindingError::NotCurrent);
         }
         let runtime = self.runtime.upgrade().ok_or(HostRequestBindingError::NotCurrent)?;
-        let state = runtime.lock().map_err(|_| HostRequestBindingError::Unavailable)?;
+        let state = lock_runtime(&runtime).map_err(unavailable)?;
         if !state.handle_alive.load(Ordering::SeqCst) { return Err(HostRequestBindingError::NotCurrent); }
         let mut files = entry::lock(&state.control).map_err(unavailable)?;
+        files.verify_enrollment_before(&state.original.enrollment, deadline).map_err(unavailable)?;
         before(deadline).map_err(unavailable)?;
         if files.root_identity(deadline).map_err(unavailable)? != state.root {
             return Err(HostRequestBindingError::NotCurrent);
         }
         files.verify_head_digest(state.original.published.digest(), deadline).map_err(unavailable)?;
-        let admission = self.original_lock.as_ref().ok_or(HostRequestBindingError::NotCurrent)?
-            .lock().map_err(|_| HostRequestBindingError::Unavailable)?;
-        files.verify_held_lock(&admission, "admission.lock", deadline).map_err(unavailable)?;
+        let admission = self.original_lock.as_ref().ok_or(HostRequestBindingError::NotCurrent)?;
+        files.verify_held_lock(admission, "admission.lock", deadline).map_err(unavailable)?;
         if files.verify_held_lock(&state.runtime_lock, "runtime.lock", deadline).map_err(unavailable)? != state.runtime_identity {
             return Err(HostRequestBindingError::NotCurrent);
         }
         files.verify_runtime_enrollment(&state.runtime_directory, &state.original.runtime_nonce, &state.enrollment_file, deadline).map_err(unavailable)?;
         if !state.handle_alive.load(Ordering::SeqCst) { return Err(HostRequestBindingError::NotCurrent); }
-        before(deadline).map_err(unavailable)
+        files.post(deadline).map_err(unavailable)
     }
 }
 
@@ -346,11 +387,11 @@ impl RecoveryReadGate {
             .and_then(|n| n.checked_add(std::mem::size_of::<(Admission<'_>, Result<(), RecoveryControlError>)>()))
             .and_then(|n| n.checked_add(std::mem::size_of::<Result<File, RecoveryControlError>>()))
             .and_then(|n| n.checked_add(std::mem::size_of::<Option<File>>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<Mutex<File>>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<File>()))
             .ok_or(HostRequestBindingError::Unavailable)? as u64;
         let (lease, acquired) = {
             let runtime = self.state.upgrade().ok_or(HostRequestBindingError::NotCurrent)?;
-            let state = runtime.lock().map_err(|_| HostRequestBindingError::Unavailable)?;
+            let state = lock_runtime(&runtime).map_err(unavailable)?;
             if !state.handle_alive.load(Ordering::SeqCst) { return Err(HostRequestBindingError::NotCurrent); }
             let mut files = entry::lock(&state.control).map_err(unavailable)?;
             files.prepay(reservation, 0).map_err(unavailable)?;
@@ -358,14 +399,14 @@ impl RecoveryReadGate {
                 original_lock: None, control: Arc::clone(&state.control), header_reservation: reservation, retire_known: false };
             let acquired = match files.acquire("admission.lock", b"WBRCADM1", FlockOperation::NonBlockingLockShared, deadline) {
                 Ok(file) => {
-                    lease.original_lock = Some(Mutex::new(file));
+                    lease.original_lock = Some(file);
                     lease.retire_known = true;
                     Ok(())
                 }
                 Err(error) => {
                     if error.fault() == RecoveryControlFault::OwnerBusy {
                         if let Some(file) = files.take_known_busy_admission() {
-                            lease.original_lock = Some(Mutex::new(file));
+                            lease.original_lock = Some(file);
                             lease.retire_known = true;
                         } else {
                             files.latch(RecoveryControlFault::OwnerLost);

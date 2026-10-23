@@ -9,7 +9,8 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
@@ -740,6 +741,12 @@ pub(super) struct ControlFiles {
     pub(super) limits: TrustedHostRecoveryLimits,
     budget: ControlBudget,
     raw: RawIo,
+    // Same native object and raw observations survive deadline/error paths.
+    original_process: Option<Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError>>,
+    original_process_evidence: Option<[u8; 32]>,
+    raw_process_evidence: Option<Result<[u8; 32], wrok_bot_macos_process::ProcessObservationError>>,
+    raw_process_clock: Option<Result<u64, RecoveryControlError>>,
+    process_monotonic_ns: u64,
     scratch: Vec<u8>,
     first_fault: Option<RecoveryControlFault>,
     pub(super) activation_source: Option<Arc<OwnedRecord>>,
@@ -754,13 +761,88 @@ pub(super) struct ControlFiles {
     pub(super) pending_startup: Option<VerifiedOrdinaryStartupIntent>,
     pub(super) runtime_input: Vec<u8>,
     pub(super) raw_encoding: Option<Result<(), serde_json::Error>>,
-    pub(super) retained_runtime: Option<Arc<Mutex<super::runtime::RuntimeState>>>,
+    pub(super) retained_runtime: Option<super::runtime::RuntimeOwnerBook>,
 }
 
-pub(super) fn lock(
-    owner: &Arc<Mutex<ControlFiles>>,
-) -> Result<MutexGuard<'_, ControlFiles>, RecoveryControlError> {
-    owner.lock().map_err(|_| RecoveryControlError::with_owner(RecoveryControlFault::OwnerLost, owner))
+pub(super) struct ControlBook {
+    files: Option<ControlFiles>,
+    retired_metadata: u64,
+    retired_files: u64,
+    fault: Option<RecoveryControlFault>,
+}
+pub(super) type ControlOwner = Arc<Mutex<ControlBook>>;
+
+/// Custody of the same original value, with no book guard across IO. None
+/// means Busy; it cannot initialize a second owner or replace the original.
+pub(super) struct ControlAccess { owner: ControlOwner, files: Option<ControlFiles> }
+impl Deref for ControlAccess {
+    type Target = ControlFiles;
+    fn deref(&self) -> &ControlFiles { self.files.as_ref().expect("original control access") }
+}
+impl DerefMut for ControlAccess {
+    fn deref_mut(&mut self) -> &mut ControlFiles { self.files.as_mut().expect("original control access") }
+}
+impl Drop for ControlAccess {
+    fn drop(&mut self) {
+        let Some(mut files) = self.files.take() else { return; };
+        let mut book = match self.owner.lock() {
+            Ok(book) => book,
+            Err(poisoned) => {
+                let mut book = poisoned.into_inner();
+                book.fault.get_or_insert(RecoveryControlFault::OwnerLost);
+                book
+            }
+        };
+        // The original File has already dropped before each recorded known
+        // retirement. Apply both aggregates exactly once to the same budget.
+        let metadata = std::mem::take(&mut book.retired_metadata);
+        let count = std::mem::take(&mut book.retired_files);
+        files.retire_known_ordinary_leases(metadata, count);
+        if let Some(fault) = book.fault { files.latch(fault); }
+        // lock is the sole original-value taker; this is its sole put-back.
+        book.files = Some(files);
+    }
+}
+
+pub(super) fn lock(owner: &ControlOwner) -> Result<ControlAccess, RecoveryControlError> {
+    let mut access = ControlAccess { owner: Arc::clone(owner), files: None };
+    let mut book = owner.lock().map_err(|poisoned| {
+        let mut book = poisoned.into_inner();
+        book.fault.get_or_insert(RecoveryControlFault::OwnerLost);
+        if let Some(files) = book.files.as_mut() { files.latch(RecoveryControlFault::OwnerLost); }
+        RecoveryControlError::with_owner(RecoveryControlFault::OwnerLost, owner)
+    })?;
+    if let Some(fault) = book.fault { return Err(RecoveryControlError::with_owner(fault, owner)); }
+    access.files = Some(book.files.take().ok_or_else(|| RecoveryControlError::with_owner(RecoveryControlFault::OwnerBusy, owner))?);
+    drop(book);
+    Ok(access)
+}
+
+/// Only a known ordinary admission's actual File Drop calls this. A concurrent
+/// original IO owner receives checked fixed aggregates at put-back; no spin,
+/// queue allocation, new quota, runtime-close fact or unknown FD retirement.
+pub(super) fn retire_ordinary_lease(owner: &ControlOwner, metadata: u64) {
+    let mut book = match owner.lock() {
+        Ok(book) => book,
+        Err(poisoned) => {
+            let mut book = poisoned.into_inner();
+            book.fault.get_or_insert(RecoveryControlFault::OwnerLost);
+            book
+        }
+    };
+    let fault = book.fault;
+    if let Some(files) = book.files.as_mut() {
+        files.retire_known_ordinary_leases(metadata, 1);
+        if let Some(fault) = fault { files.latch(fault); }
+    } else {
+        match (book.retired_metadata.checked_add(metadata), book.retired_files.checked_add(1)) {
+            (Some(bytes), Some(count)) => {
+                book.retired_metadata = bytes;
+                book.retired_files = count;
+            }
+            _ => { book.fault.get_or_insert(RecoveryControlFault::OwnerLost); }
+        }
+    }
 }
 
 fn static_io_fee() -> u64 {
@@ -770,7 +852,15 @@ fn static_io_fee() -> u64 {
         + 2 * std::mem::size_of::<io::Result<Metadata>>()
         + 2 * std::mem::size_of::<rustix::io::Result<rustix::fs::Stat>>()
         + 2 * std::mem::size_of::<io::Result<usize>>()
-        + 2 * std::mem::size_of::<io::Result<()>>()) as u64
+        + 2 * std::mem::size_of::<io::Result<()>>()
+        + 2 * std::mem::size_of::<Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError>>()
+        + 2 * std::mem::size_of::<Result<[u8; 32], wrok_bot_macos_process::ProcessObservationError>>()
+        + 2 * std::mem::size_of::<Result<u64, RecoveryControlError>>()
+        + 2 * std::mem::size_of::<[u8; 32]>()
+        + 2 * std::mem::size_of::<bool>()
+        + 2 * std::mem::size_of::<(Option<u64>, Option<u64>)>()
+        + 2 * std::mem::size_of::<(u64, u64)>()
+        + 2 * std::mem::size_of::<(u32, u64, u32, [u8; 32])>()) as u64
 }
 
 pub(super) fn identity(meta: &Metadata) -> RecoveryFileIdentity {
@@ -778,13 +868,82 @@ pub(super) fn identity(meta: &Metadata) -> RecoveryFileIdentity {
 }
 
 impl ControlFiles {
-    pub(super) fn post(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
-        // This is the original caller's admission/use-case deadline, not a
-        // persisted recovery clock. A failed short ordinary read must not
-        // permanently poison all later original requests. Setup/registration
-        // owners explicitly latch their own failure after retaining results;
-        // a restore session separately owns its one OperationClock E/C.
+    fn process_clock_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        self.raw_process_clock = Some(super::clock::monotonic_ns());
+        let observed = self.raw_process_clock.as_ref().and_then(|value| value.as_ref().ok()).copied();
+        match observed {
+            Some(value) if value >= self.process_monotonic_ns => self.process_monotonic_ns = value,
+            _ => {
+                self.latch(RecoveryControlFault::OwnerLost);
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+            }
+        }
         before(deadline)
+    }
+
+    fn initialize_original_process(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        if self.original_process.is_some() {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+        }
+        before(deadline)?;
+        self.process_clock_before(deadline)?;
+        self.original_process = Some(super::clock::capture_original_process());
+        if !matches!(self.original_process, Some(Ok(_))) { self.latch(RecoveryControlFault::OwnerLost); }
+        // Actual capture result is resident before native/portable time.
+        self.process_clock_before(deadline)?;
+        self.post(deadline)
+    }
+
+    pub(super) fn post(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        // A process observation neither starts nor restarts operation E/C.
+        // Ordinary expiry alone is not permanent owner loss. Actual native
+        // process/boot/clock drift is; raw IO and results remain resident.
+        if let Some(fault) = self.first_fault { return Err(RecoveryControlError::new(fault)); }
+        before(deadline)?;
+        self.process_clock_before(deadline)?;
+        let original = match self.original_process.as_ref() {
+            Some(Ok(original)) => original,
+            _ => {
+                self.latch(RecoveryControlFault::OwnerLost);
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+            }
+        };
+        self.raw_process_evidence = Some(super::clock::original_process_evidence(original));
+        // Remember known drift even if the following deadline check is late.
+        let invalid = match self.raw_process_evidence.as_ref() {
+            Some(Ok(observed)) => super::clock::verify_process_evidence(observed, None).is_err()
+                || self.original_process_evidence.is_some_and(|expected| expected != *observed),
+            _ => true,
+        };
+        if invalid { self.latch(RecoveryControlFault::OwnerLost); }
+        // Evidence/error is retained before either time check can fail.
+        self.process_clock_before(deadline)?;
+        if invalid { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)); }
+        let observed = self.raw_process_evidence.as_ref().and_then(|value| value.as_ref().ok()).copied()
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::OwnerLost))?;
+        self.original_process_evidence.get_or_insert(observed);
+        before(deadline)
+    }
+
+    fn check_enrollment(&self, original: &super::runtime::OriginalRuntimeEnrollment) -> Result<(), RecoveryControlError> {
+        let evidence = self.original_process_evidence.as_ref()
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::OwnerLost))?;
+        super::clock::verify_process_evidence(evidence,
+            Some((&original.boot_identity, original.pid, &original.process_start)))
+    }
+
+    pub(super) fn verify_enrollment_before(
+        &mut self, original: &super::runtime::OriginalRuntimeEnrollment, deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.post(deadline)?;
+        self.check_enrollment(original)
+    }
+
+    pub(super) fn verify_pending_enrollment_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        self.post(deadline)?;
+        let original = &self.pending_startup.as_ref()
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?.enrollment;
+        self.check_enrollment(original)
     }
 
     pub(super) fn latch(&mut self, fault: RecoveryControlFault) {
@@ -803,8 +962,8 @@ impl ControlFiles {
         self.prepay(0, files)
     }
 
-    pub(super) fn retire_ordinary_lease(&mut self, metadata: u64) {
-        if let Err(error) = self.budget.retire_ordinary_lease(metadata) { self.latch(error.fault()); }
+    fn retire_known_ordinary_leases(&mut self, metadata: u64, files: u64) {
+        if let Err(error) = self.budget.retire_ordinary_leases(metadata, files) { self.latch(error.fault()); }
     }
 
     pub(super) fn directory(&self, dir: Directory) -> Result<&File, RecoveryControlError> {
@@ -1530,12 +1689,14 @@ impl ControlFiles {
     }
 }
 
-pub(super) fn open_control(config: RecoveryControlConfig) -> Result<Arc<Mutex<ControlFiles>>, RecoveryControlError> {
+pub(super) fn open_control(config: RecoveryControlConfig) -> Result<ControlOwner, RecoveryControlError> {
     if !config.root.is_absolute() {
         return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
     }
     let fixed = std::mem::size_of::<ControlFiles>()
-        .checked_add(std::mem::size_of::<Mutex<ControlFiles>>())
+        .checked_add(std::mem::size_of::<Mutex<ControlBook>>())
+        .and_then(|n| n.checked_add(std::mem::size_of::<ControlAccess>()))
+        .and_then(|n| n.checked_add(std::mem::size_of::<Result<ControlAccess, RecoveryControlError>>()))
         .and_then(|n| n.checked_add(2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()))
         .and_then(|n| n.checked_add(2 * std::mem::align_of::<ControlFiles>()))
         .and_then(|n| n.checked_add(config.root.capacity()))
@@ -1560,19 +1721,22 @@ pub(super) fn open_control(config: RecoveryControlConfig) -> Result<Arc<Mutex<Co
     }
     let root_component = root_name.to_owned();
     component(&root_component, &config.limits)?;
-    let shared = Arc::new(Mutex::new(ControlFiles {
+    let shared = Arc::new(Mutex::new(ControlBook { files: Some(ControlFiles {
         root: None, parent: None, ancestors: Vec::new(), operations: None, runtimes: None,
         operation_work: None, runtime_work: None,
         root_path: config.root, root_component, app_component: config.app_component, uid: config.uid, limits: config.limits,
         budget, raw: RawIo { file: None, metadata: None, named: None, unit: None, count: None, small: [0; 8], directory: None, entry: None },
+        original_process: None, original_process_evidence: None, raw_process_evidence: None,
+        raw_process_clock: None, process_monotonic_ns: 0,
         scratch: Vec::new(), first_fault: None, activation_source: None, activation_observation: None, pending_admission: None,
         pending_runtime: None, pending_owner: None, pending_request: None,
         pending_host: None, service_source: config.service_source,
         runtime_record: None,
         pending_startup: None, runtime_input: Vec::new(), raw_encoding: None, retained_runtime: None,
-    }));
+    }), retired_metadata: 0, retired_files: 0, fault: None }));
     let result = (|| {
         let mut state = lock(&shared)?;
+        state.initialize_original_process(deadline)?;
         if let Some(source) = &mut state.service_source {
             source.recheck_original(deadline)?;
         }
@@ -1709,7 +1873,7 @@ pub(super) fn open_control(config: RecoveryControlConfig) -> Result<Arc<Mutex<Co
 /// Request reading uses the real held original request. The later Local and
 /// Server producers supply the private seals; no public construction fallback.
 pub(super) fn verify_intent(
-    owner: &Arc<Mutex<ControlFiles>>, request: OwnedRecoveryRequestFile,
+    owner: &ControlOwner, request: OwnedRecoveryRequestFile,
     host: VerifiedRecoveryHost, deadline: Instant,
 ) -> Result<VerifiedRecoveryHostIntent, RecoveryControlError> {
     let result = (|| {
@@ -1812,7 +1976,7 @@ pub(super) fn verify_intent(
         Ok(VerifiedRecoveryHostIntent { host, request, request_bytes: std::mem::take(&mut state.scratch), original_deadline: deadline })
     })();
     result.map_err(|e: RecoveryControlError| {
-        if let Ok(mut state) = owner.lock() { state.latch(e.fault()); }
+        if let Ok(mut state) = lock(owner) { state.latch(e.fault()); }
         e.retain(owner)
     })
 }

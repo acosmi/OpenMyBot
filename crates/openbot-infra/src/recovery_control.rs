@@ -4,7 +4,7 @@
 //! restore grant. Consumer and original resource adapters are separate hunks.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ pub enum RecoveryControlFault {
 /// Error retaining the same original control owner, never a success receipt.
 pub struct RecoveryControlError {
     fault: RecoveryControlFault,
-    retained: Option<Arc<Mutex<entry::ControlFiles>>>,
+    retained: Option<entry::ControlOwner>,
     original_json_error: Option<serde_json::Error>,
 }
 
@@ -51,11 +51,11 @@ impl RecoveryControlError {
         Self { fault, retained: None, original_json_error: None }
     }
 
-    fn with_owner(fault: RecoveryControlFault, owner: &Arc<Mutex<entry::ControlFiles>>) -> Self {
+    fn with_owner(fault: RecoveryControlFault, owner: &entry::ControlOwner) -> Self {
         Self { fault, retained: Some(Arc::clone(owner)), original_json_error: None }
     }
 
-    fn retain(mut self, owner: &Arc<Mutex<entry::ControlFiles>>) -> Self {
+    fn retain(mut self, owner: &entry::ControlOwner) -> Self {
         self.retained = Some(Arc::clone(owner));
         self
     }
@@ -320,9 +320,9 @@ impl ControlBudget {
         }
     }
 
-    fn retire_ordinary_lease(&mut self, metadata: u64) -> Result<(), RecoveryControlError> {
+    fn retire_ordinary_leases(&mut self, metadata: u64, files: u64) -> Result<(), RecoveryControlError> {
         let m = self.metadata.checked_sub(metadata);
-        let f = self.files.checked_sub(1);
+        let f = self.files.checked_sub(files);
         match (m, f) {
             (Some(m), Some(f)) => { self.metadata = m; self.files = f; Ok(()) }
             _ => Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)),
@@ -332,7 +332,7 @@ impl ControlBudget {
 
 /// One original external-control resource owner. It has no Clone/Serde API.
 pub struct RecoveryControl {
-    shared: Arc<Mutex<entry::ControlFiles>>,
+    shared: entry::ControlOwner,
 }
 
 impl RecoveryControl {

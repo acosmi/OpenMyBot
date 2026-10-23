@@ -2273,3 +2273,8 @@ Service startup input validation: the original owner-held configuration loader n
 ### V7-IMPL-046: closed site records and held-head validation
 
 External control input validation now uses explicit closed local-physical and server-database site data, checks the corresponding host/plan/reference identities, and keeps recovery target payloads local-physical only. The original held-head recheck performs one prepaid canonical typed validation, retains its complete result in the same owner and reuses that result only while the original FD, named identity, full bytes and digest continue to match. Runtime enrollment reads the common epoch without substituting a local physical identity for a server database. Original full journal-reference and publication evidence checks remain. This source change grants no database/key proof, Current authority, runtime closure, restore execution or complete acceptance.
+
+
+### 2026-10-23 — V7-IMPL-046: Native process identity and original resource custody
+
+The existing recovery-control library now keeps one native self-process identity through setup, enrollment and final admission checks, with fixed birth/boot decoding and monotonic readback. Original control/runtime state leaves short bookkeeping locks for filesystem/native observations; known ordinary admission retirements conserve both metadata and FD counts across concurrent custody. The exact source batch passed independent finite source review with no P1/P2 findings. The earlier Infra library check remains bound to3a9c8e1 and its53 retained warnings; compilation of these new postimages, real host assembly and full restore acceptance remain pending.
