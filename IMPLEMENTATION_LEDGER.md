@@ -2278,3 +2278,8 @@ External control input validation now uses explicit closed local-physical and se
 ### 2026-10-23 — V7-IMPL-046: Native process identity and original resource custody
 
 The existing recovery-control library now keeps one native self-process identity through setup, enrollment and final admission checks, with fixed birth/boot decoding and monotonic readback. Original control/runtime state leaves short bookkeeping locks for filesystem/native observations; known ordinary admission retirements conserve both metadata and FD counts across concurrent custody. The exact source batch passed independent finite source review with no P1/P2 findings. The earlier Infra library check remains bound to3a9c8e1 and its53 retained warnings; compilation of these new postimages, real host assembly and full restore acceptance remain pending.
+
+
+### V7-IMPL-046: isolated restore-process source adapter
+
+Added a private deny-default PostgreSQL restore-process policy and connected its command to the original native Child, three pipes and wait path. The adapter retains original spawn and post-check results, rechecks the resident child birth before one bounded stop request, and preserves the original maintenance callers. Independent source and actual-postimage reviews passed for the exact two-file change. Compilation and native isolation scenarios for these new postimages remain pending; session/resource binding, loader inventory, credential-slot integration and complete restore acceptance remain open. The earlier Infra library check remains bound to fe897f8e and its 52 retained warnings.
