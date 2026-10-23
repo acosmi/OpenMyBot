@@ -1838,7 +1838,8 @@ pub(super) async fn observe_existing_server_before(
         let journal = files.read_record(Directory::OperationWork, "journal-v1", cap, deadline)?;
         files.publication_journal = Some(Arc::new(journal));
         let journal = Arc::clone(files.publication_journal.as_ref().ok_or_else(service_invalid)?);
-        files.prepay(super::journal::read_metadata_reservation(&journal.bytes, &files.limits)?, 0)?;
+        let journal_fee = super::journal::read_metadata_reservation(&journal.bytes, &files.limits)?;
+        files.prepay(journal_fee, 0)?;
         files.publication_chain = Some(super::journal::observe_chain(&journal.bytes, &files.limits));
         files.post(deadline)?;
         let chain = files.publication_chain.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
@@ -1931,7 +1932,8 @@ pub(super) async fn observe_existing_server_before(
         {
             let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
             let client = packet.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            packet.layout = Some(crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client).await);
+            packet.layout = Some(crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client).await
+                .map_err(crate::db::desktop_vault_canary::DesktopVaultCanaryError::from));
         }
         files.post(deadline)?;
         if !matches!(files.existing_server.as_ref().ok_or_else(service_invalid)?.layout, Some(Ok(ref layout)) if layout.native_version() == 53) {

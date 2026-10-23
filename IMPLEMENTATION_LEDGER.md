@@ -2288,3 +2288,8 @@ Added a private deny-default PostgreSQL restore-process policy and connected its
 ### V7-IMPL-046: existing ordinary Server startup and admission
 
 Server ordinary startup source now holds the original recovery read locks before database probing, binds the held head to its complete publication journal, checks actual configured PostgreSQL/key/canary/schema observations, retains the same runtime ownership through enrollment, and installs matching recovery admission on session and single-user guards. This batch supports native53 ServerDatabase OrdinaryActive; Fresh, legacy production and RestoreCurrent admission remain closed pending the remaining implementation. Source review only: this change has no new build, database, runtime or full-recovery acceptance credit.
+
+
+### 2026-10-23 - V7-IMPL-046 Server runtime authorization keys and compiler repairs
+
+Server startup now derives five authorization keys from the same verified runtime epoch and existing configured parents, supplying matching keys to session issuers/resolvers, OIDC/SSO/MCP state factories and remote assertions. The same owner rechecks its head, pool scope, enrollment and locks before handing off bounded secret buffers once. This batch also fixes the two compiler root causes reported by the preceding targeted Server check, preserving the original canary queries and metadata charge. Audit, master/wrapping keys, stored ciphertext and SCRAM parents retain their prior behavior. Source review only; the previous Desktop pass and Server failure remain tied to their original candidate. New compilation and runtime/recovery acceptance are still pending.

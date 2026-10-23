@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use super::activation::{ActivationBinding, PublishedActivation};
 use super::entry::{self, ControlFiles, ControlOwner, OwnedRecord, VerifiedOrdinaryStartupIntent};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use super::journal::ProcessStart;
 use super::{RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, id};
 
@@ -95,6 +95,8 @@ pub(super) struct RuntimeState {
     root: RecoveryFileIdentity,
     runtime_identity: RecoveryFileIdentity,
     handle_alive: Arc<AtomicBool>,
+    #[cfg(feature = "server-runtime")]
+    authorization_derivation: Option<AuthorizationDerivation>,
 }
 
 pub(super) type RuntimeOwnerBook = Arc<Mutex<Option<RuntimeState>>>;
@@ -105,6 +107,9 @@ struct RuntimeAccess { owner: RuntimeOwnerBook, state: Option<RuntimeState> }
 impl Deref for RuntimeAccess {
     type Target = RuntimeState;
     fn deref(&self) -> &RuntimeState { self.state.as_ref().expect("original runtime access") }
+}
+impl DerefMut for RuntimeAccess {
+    fn deref_mut(&mut self) -> &mut RuntimeState { self.state.as_mut().expect("original runtime access") }
 }
 impl Drop for RuntimeAccess {
     fn drop(&mut self) {
@@ -140,6 +145,191 @@ pub struct RecoveryReadGate { state: Weak<Mutex<Option<RuntimeState>>> }
 impl RecoveryRuntimeOwner {
     #[must_use]
     pub fn read_gate(&self) -> RecoveryReadGate { RecoveryReadGate { state: Arc::downgrade(&self.state) } }
+}
+
+
+/// Startup-only, domain-separated keys from one original verified runtime.
+/// Fields are private; there is no constructor, Clone, Serde or epoch override.
+#[cfg(feature = "server-runtime")]
+pub struct ServerRuntimeAuthorizationKeys {
+    keys: [Option<openbot_domain::vault::SecretBytes>; 5],
+}
+#[cfg(feature = "server-runtime")]
+impl ServerRuntimeAuthorizationKeys {
+    fn login_key(&self, index: usize) -> Result<&[u8], RecoveryControlError> {
+        self.keys[index].as_ref().map(openbot_domain::vault::SecretBytes::expose)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::InitializationRequired))
+    }
+    /// Borrow the same session key for the original issuer and resolver.
+    pub fn session_key(&self) -> Result<&[u8], RecoveryControlError> { self.login_key(0) }
+    /// Borrow only the original OIDC attempt-store key.
+    pub fn oidc_state_key(&self) -> Result<&[u8], RecoveryControlError> { self.login_key(1) }
+    /// Borrow the original shared SSO route/SAML/dynamic-OIDC state key.
+    pub fn sso_state_key(&self) -> Result<&[u8], RecoveryControlError> { self.login_key(2) }
+    /// Borrow the MCP state key; this never replaces its persistent parent.
+    #[must_use]
+    pub fn mcp_state_key(&self) -> &[u8] {
+        self.keys[3].as_ref().expect("successful original MCP derivation").expose()
+    }
+    /// Borrow the key for the unchanged remote assertion signer and verifier.
+    #[must_use]
+    pub fn run_assertion_key(&self) -> &[u8] {
+        self.keys[4].as_ref().expect("successful original assertion derivation").expose()
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+struct AuthorizationDerivation {
+    keys: [Option<openbot_domain::vault::SecretBytes>; 5],
+    raw_expand: [Option<Result<(), hkdf::InvalidLength>>; 5],
+    raw_allocation: [Option<Result<(), std::collections::TryReserveError>>; 5],
+    scratch: zeroize::Zeroizing<[u8; 32]>,
+    backing: zeroize::Zeroizing<Vec<u8>>,
+    admission: Option<File>,
+    handed_off: bool,
+}
+#[cfg(feature = "server-runtime")]
+impl AuthorizationDerivation {
+    fn empty() -> Self {
+        Self { keys: std::array::from_fn(|_| None), raw_expand: std::array::from_fn(|_| None),
+            raw_allocation: std::array::from_fn(|_| None), scratch: zeroize::Zeroizing::new([0; 32]),
+            backing: zeroize::Zeroizing::new(Vec::new()), admission: None, handed_off: false }
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+fn verify_key_owner_before(
+    state: &RuntimeState, files: &mut ControlFiles, deadline: Instant,
+) -> Result<(), RecoveryControlError> {
+    if !state.handle_alive.load(Ordering::SeqCst) {
+        return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+    }
+    files.verify_enrollment_before(&state.original.enrollment, deadline)?;
+    if files.root_identity(deadline)? != state.root {
+        return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid));
+    }
+    files.verify_head_digest(state.original.published.digest(), deadline)?;
+    if files.verify_held_lock(&state.runtime_lock, "runtime.lock", deadline)? != state.runtime_identity {
+        return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+    }
+    files.verify_runtime_enrollment(&state.runtime_directory, &state.original.runtime_nonce,
+        &state.enrollment_file, deadline)?;
+    if let Some(admission) = state.authorization_derivation.as_ref().and_then(|p| p.admission.as_ref()) {
+        files.verify_held_lock(admission, "admission.lock", deadline)?;
+    }
+    if !state.handle_alive.load(Ordering::SeqCst) {
+        return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+    }
+    files.post(deadline)
+}
+
+#[cfg(feature = "server-runtime")]
+impl RecoveryRuntimeOwner {
+    /// Derive the five closed authorization purposes once, from this live
+    /// owner's actual held head and original parents. No copied epoch grants
+    /// this operation. Absence of configured login keeps all login keys absent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_server_authorization_keys_before(
+        &mut self,
+        pool: &crate::db::pool::DatabasePool,
+        deployment: &str,
+        tenant: &str,
+        session_parent: Option<&[u8]>,
+        mcp_state_parent: &openbot_domain::vault::SecretBytes,
+        run_assertion_parent: &[u8],
+        deadline: Instant,
+    ) -> Result<ServerRuntimeAuthorizationKeys, RecoveryControlError> {
+        use zeroize::Zeroize as _;
+        let mut state = lock_runtime(&self.state)?;
+        let control = Arc::clone(&state.control);
+        let result = (|| {
+            let mut files = entry::lock(&control)?;
+            if state.authorization_derivation.is_some() {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+            }
+            if !files.existing_scope(pool, deployment, tenant) || mcp_state_parent.is_empty()
+                || run_assertion_parent.is_empty() || session_parent.is_some_and(<[u8]>::is_empty) {
+                return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
+            }
+            let deployment_len = u16::try_from(deployment.len())
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?.to_be_bytes();
+            let tenant_len = u16::try_from(tenant.len())
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?.to_be_bytes();
+            let key_count = if session_parent.is_some() { 5usize } else { 2usize };
+            // RuntimeState already prepaid its resident Option/packet layout.
+            // Charge only the additional return/match/crypto locals and the
+            // actual Vec capacity ceiling (64 per 32-byte returned key).
+            let known = key_count.checked_mul(64)
+                .and_then(|n| n.checked_add(2 * std::mem::size_of::<ServerRuntimeAuthorizationKeys>()))
+                .and_then(|n| n.checked_add(2 * std::mem::size_of::<Result<ServerRuntimeAuthorizationKeys, RecoveryControlError>>()))
+                .and_then(|n| n.checked_add(2 * std::mem::size_of::<hkdf::Hkdf<sha2::Sha256>>()))
+                .and_then(|n| n.checked_add(std::mem::size_of::<[u8; 32]>() + std::mem::size_of::<[&[u8]; 8]>() + 8))
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            files.prepay(u64::try_from(known)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?, 0)?;
+            verify_key_owner_before(&state, &mut files, deadline)?;
+            state.authorization_derivation = Some(AuthorizationDerivation::empty());
+            let admission = files.acquire("admission.lock", b"WBRCADM1",
+                FlockOperation::NonBlockingLockShared, deadline)?;
+            state.authorization_derivation.as_mut().expect("resident original key packet").admission = Some(admission);
+            verify_key_owner_before(&state, &mut files, deadline)?;
+            let epoch_text = state.original.published.binding().authorization_epoch().as_bytes();
+            let mut epoch = [0u8; 32];
+            if epoch_text.len() != 64 {
+                return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid));
+            }
+            let nibble = |byte| -> Result<u8, RecoveryControlError> {
+                match byte { b'0'..=b'9' => Ok(byte - b'0'), b'a'..=b'f' => Ok(byte - b'a' + 10),
+                    _ => Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)) }
+            };
+            for (index, pair) in epoch_text.chunks_exact(2).enumerate() {
+                epoch[index] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+            }
+            const PURPOSES: [&[u8]; 5] = [b"session", b"oidc-state", b"sso-state", b"mcp-state", b"run-assertion"];
+            let version = 1u16.to_be_bytes();
+            for (index, purpose) in PURPOSES.iter().enumerate() {
+                let parent = match index { 0..=2 => match session_parent { Some(key) => key, None => continue },
+                    3 => mcp_state_parent.expose(), 4 => run_assertion_parent, _ => unreachable!() };
+                let purpose_len = u16::try_from(purpose.len())
+                    .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?.to_be_bytes();
+                let packet = state.authorization_derivation.as_mut().expect("resident original key packet");
+                let kdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(&epoch), parent);
+                packet.raw_expand[index] = Some(kdf.expand_multi_info(&[
+                    b"wrokbot.restore.authorization.v1", &version, &purpose_len, purpose,
+                    &deployment_len, deployment.as_bytes(), &tenant_len, tenant.as_bytes(),
+                ], &mut packet.scratch[..]));
+                files.post(deadline)?;
+                if !matches!(packet.raw_expand[index], Some(Ok(()))) {
+                    return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
+                }
+                packet.raw_allocation[index] = Some(packet.backing.try_reserve_exact(32));
+                files.post(deadline)?;
+                if !matches!(packet.raw_allocation[index], Some(Ok(())))
+                    || packet.backing.capacity() < 32 || packet.backing.capacity() > 64 {
+                    return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+                }
+                packet.backing.extend_from_slice(&packet.scratch[..]);
+                packet.keys[index] = Some(openbot_domain::vault::SecretBytes::new(std::mem::take(&mut *packet.backing)));
+                packet.scratch.zeroize();
+                files.post(deadline)?;
+            }
+            verify_key_owner_before(&state, &mut files, deadline)?;
+            let packet = state.authorization_derivation.as_mut().expect("resident original key packet");
+            if packet.handed_off || packet.keys[3].is_none() || packet.keys[4].is_none()
+                || (session_parent.is_some() && packet.keys[..3].iter().any(Option::is_none)) {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+            }
+            // This is a known short admission File release, never a runtime
+            // close fact. None on error stays with the original packet/owner.
+            drop(packet.admission.take());
+            entry::retire_ordinary_lease(&control, 0);
+            files.post(deadline)?;
+            let packet = state.authorization_derivation.as_mut().expect("resident original key packet");
+            packet.handed_off = true;
+            Ok(ServerRuntimeAuthorizationKeys { keys: std::array::from_fn(|i| packet.keys[i].take()) })
+        })();
+        result.map_err(|error: RecoveryControlError| error.retain(&control))
+    }
 }
 
 impl Drop for RecoveryRuntimeOwner {
@@ -308,6 +498,8 @@ pub(super) fn enter_runtime(
         let owner = RecoveryRuntimeOwner { handle_alive: Arc::clone(&handle_alive), state: Arc::new(Mutex::new(Some(RuntimeState {
             control: Arc::clone(control), runtime_lock, runtime_directory, enrollment_file, original, root, runtime_identity,
             handle_alive,
+            #[cfg(feature = "server-runtime")]
+            authorization_derivation: None,
         }))) };
         // Intentional same-owner failure retention, not a global registry or
         // another runtime. Only the original true close adapter may retire it.

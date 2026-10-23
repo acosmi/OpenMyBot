@@ -21,6 +21,8 @@ pub use entry::{
     VerifiedRecoveryHostIntent, VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
 };
 pub use runtime::{RecoveryReadGate, RecoveryRuntimeOwner};
+#[cfg(feature = "server-runtime")]
+pub use runtime::ServerRuntimeAuthorizationKeys;
 
 /// Redacted closed failure class; original IO stays with its original owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

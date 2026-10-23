@@ -631,7 +631,7 @@ pub async fn verify_pre_upgrade_layout(
 /// retains the complete result and supplies its unchanged admission deadline.
 pub(crate) async fn verify_pre_upgrade_layout_on(
     client: &tokio_postgres::Client,
-) -> Result<ValidatedDesktopVaultLayout, DesktopVaultCanaryError> {
+) -> Result<ValidatedDesktopVaultLayout, InfraError> {
     let ledger = native::validate_known_prefix(&client, native::NATIVE_0032_VERSION).await?;
     verify_internal_shape(client).await?;
     let expected = registered_public_schema(ledger.latest_version())?;

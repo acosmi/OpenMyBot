@@ -194,7 +194,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut recovery_control = openbot_infra::recovery_control::RecoveryControl::open(
         openbot_infra::recovery_control::RecoveryControlConfig::server(host, limits)?,
     )?;
-    let (pool, recovery_runtime_owner) = recovery_control.open_existing_server_before(
+    let (pool, mut recovery_runtime_owner) = recovery_control.open_existing_server_before(
         &database, recovery_master_encoding, deployment.as_str(), tenant.as_str(), startup_deadline,
     ).await?;
     let recovery_read_gate = recovery_runtime_owner.read_gate();
@@ -231,13 +231,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let application_master = SecretBytes::new(raw_master.as_bytes().to_vec());
     let audit_key =
         derive_application_key(&application_master, ApplicationKeyPurpose::AuditCheckpoint)?;
-    let mcp_oauth_state_key =
+    let mcp_state_parent =
         derive_application_key(&application_master, ApplicationKeyPurpose::McpOauthState)?;
     drop(application_master);
-    let remote_assertions = Arc::new(RemoteRunAssertionSigner::new(
-        raw_master.as_bytes().to_vec(),
-    )?);
-
     let has_dynamic_provider = database_has_dynamic_provider(&pool).await?;
     let public_url = server.public_url.as_ref().map(|url| url.as_str());
     let auth_config = auth_config_with_dynamic_provider(
@@ -246,6 +242,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         default_session_lifetime(),
         has_dynamic_provider,
     )?;
+    let server_authorization_keys = recovery_runtime_owner.derive_server_authorization_keys_before(
+        &pool, deployment.as_str(), tenant.as_str(),
+        auth_config.as_ref().map(|config| config.session_secret.expose().as_bytes()),
+        &mcp_state_parent, raw_master.as_bytes(), startup_deadline,
+    )?;
+    // Only these five short-lived purposes use the same external epoch.
+    // Audit, wrapping/master, stored ciphertext and SCRAM parents stay original.
+    drop(mcp_state_parent);
+    let remote_assertions = Arc::new(RemoteRunAssertionSigner::new(
+        server_authorization_keys.run_assertion_key().to_vec(),
+    )?);
     let has_provider = auth_config.is_some();
     let single_user = single_user_enabled(&env, has_provider)?;
     // An existing database can contain dynamic SSO even when the process environment does not.
@@ -284,6 +291,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &config,
             &pool,
             &tenant,
+            server_authorization_keys.session_key()?,
+            server_authorization_keys.oidc_state_key()?,
+            server_authorization_keys.sso_state_key()?,
             audit_key.expose(),
             key_encryption.into_wrapping_key(),
             server.public_transport().cookie_secure(),
@@ -291,7 +301,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
         let resolver = PostgresSessionAuthResolver::new(
             pool.clone(),
-            config.session_secret.expose().as_bytes(),
+            server_authorization_keys.session_key()?,
             config.session_lifetime,
             deployment.clone(),
             tenant.clone(),
@@ -502,7 +512,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         credential_vault: model_credential_vault.clone(),
         audit_key: SecretBytes::new(audit_key.expose().to_vec()),
         remote_assertions: remote_assertions.clone(),
-        mcp_oauth_state_key: SecretBytes::new(mcp_oauth_state_key.expose().to_vec()),
+        mcp_oauth_state_key: SecretBytes::new(server_authorization_keys.mcp_state_key().to_vec()),
         policy_store: policy_store.clone(),
         ui_preferences: Arc::new(PostgresUiPreferenceAdministration::new(
             pool.clone(),
@@ -1113,6 +1123,9 @@ async fn build_oidc_login(
     config: &AuthConfig,
     pool: &openbot_infra::db::pool::DatabasePool,
     tenant: &TenantId,
+    session_key: &[u8],
+    oidc_state_key: &[u8],
+    sso_state_key: &[u8],
     audit_key: &[u8],
     wrapping_key: WrappingKey,
     secure_cookie: bool,
@@ -1142,13 +1155,13 @@ async fn build_oidc_login(
     }
     let attempts = PostgresLoginAttemptStore::new(
         pool.clone(),
-        config.session_secret.expose().as_bytes(),
+        oidc_state_key,
         tenant,
         4096,
     )?;
     let sessions = PostgresOidcSessionIssuer::new(
         pool.clone(),
-        config.session_secret.expose().as_bytes(),
+        session_key,
         config.session_lifetime,
         config.admin_floor.clone(),
         audit_key,
@@ -1163,8 +1176,8 @@ async fn build_oidc_login(
     let dynamic_sso = DynamicSsoService::new(
         pool.clone(),
         tenant,
-        config.session_secret.expose().as_bytes(),
-        config.session_secret.expose().as_bytes(),
+        sso_state_key,
+        session_key,
         audit_key,
         wrapping_key,
         KeyVersion::new(1),
