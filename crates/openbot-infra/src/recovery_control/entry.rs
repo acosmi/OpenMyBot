@@ -30,7 +30,7 @@ pub struct VerifiedServiceRecoveryHost {
     original_config: ServiceOwnedInput,
     configuration: ServerRecoveryHostConfigV1,
     control_selection: ServiceControlSelection,
-    original_legacy_input: Option<ServiceOwnedInput>,
+    original_ordinary_input: Option<ServiceOrdinaryInput>,
 }
 
 // Bootstrap bounds the file before any value in that file can be used as a
@@ -46,7 +46,8 @@ struct ServerRecoveryHostConfigV1 {
     ordinary_startup_bounds: ServiceOrdinaryStartupBounds,
     expected_service_owner: ExpectedServiceOwner,
     expected_installation_binding: ServiceInstallationExpectation,
-    optional_startup_intent: super::RequiredNullable<PositiveServiceLegacySelection>,
+    expected_server_database: ServiceServerDatabaseExpectation,
+    optional_startup_intent: super::RequiredNullable<PositiveServiceOrdinarySelection>,
 }
 
 #[derive(Deserialize)]
@@ -67,17 +68,93 @@ struct ServiceInstallationExpectation {
     target_installation_id: String,
 }
 
-#[derive(Clone, Copy, Deserialize)]
-enum ServiceLegacyPurpose {
-    #[serde(rename = "adopt_ordinary_legacy")]
-    AdoptOrdinaryLegacy,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServiceServerDatabaseExpectation {
+    pg_system_id: u64,
+    database_oid: u32,
+    pg_major: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceOrdinaryMode { FreshInit, LegacyAdoption }
+
+// Both closed variants have precisely mode and intentFile. Neither variant
+// carries a profile, actor, release pin, root or database credentials.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PositiveServiceOrdinarySelection {
+    mode: ServiceOrdinaryMode,
+    intent_file: PathBuf,
+}
+
+// Decode fixed DATA directly into stack-owned arrays. Escaped JSON strings
+// are accepted through visit_str; no request-id/digest String is retained.
+struct ServiceIntentHex<const N: usize>([u8; N]);
+impl<const N: usize> ServiceIntentHex<N> {
+    fn validate(&self) -> Result<(), RecoveryControlError> {
+        let value = std::str::from_utf8(&self.0).map_err(|_| service_invalid())?;
+        hex(value, N, N == 32)
+    }
+}
+impl<'de, const N: usize> Deserialize<'de> for ServiceIntentHex<N> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HexVisitor<const N: usize>;
+        impl<const N: usize> serde::de::Visitor<'_> for HexVisitor<N> {
+            type Value = ServiceIntentHex<N>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "exactly {N} lowercase hexadecimal characters")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                hex(value, N, N == 32).map_err(|_| E::custom("invalid service intent reference"))?;
+                let mut bytes = [0; N];
+                bytes.copy_from_slice(value.as_bytes());
+                Ok(ServiceIntentHex(bytes))
+            }
+        }
+        deserializer.deserialize_str(HexVisitor::<N>)
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PositiveServiceLegacySelection {
-    purpose: ServiceLegacyPurpose,
-    request_file: PathBuf,
+struct ServiceConfigReference {
+    file: RecoveryFileIdentity,
+    length: u64,
+    digest: ServiceIntentHex<64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServerOrdinaryIntentV1 {
+    format_version: u32,
+    request_id: ServiceIntentHex<32>,
+    mode: ServiceOrdinaryMode,
+    service_config: ServiceConfigReference,
+}
+
+struct ServiceOrdinaryInput {
+    input: ServiceOwnedInput,
+    intent: ServerOrdinaryIntentV1,
+}
+impl ServiceOrdinaryInput {
+    fn validate(&self, config: &ServiceOwnedInput, mode: ServiceOrdinaryMode) -> Result<(), RecoveryControlError> {
+        self.intent.request_id.validate()?;
+        self.intent.service_config.file.validate()?;
+        self.intent.service_config.digest.validate()?;
+        if self.intent.format_version != 1 || self.intent.mode != mode
+            || self.intent.service_config.file != config.stamp.identity
+            || self.intent.service_config.length != config.stamp.length
+        { return Err(service_invalid()); }
+        let actual = Sha256::digest(&config.bytes);
+        let digits = b"0123456789abcdef";
+        if actual.iter().enumerate().any(|(index, byte)| {
+            self.intent.service_config.digest.0[2 * index] != digits[usize::from(byte >> 4)]
+                || self.intent.service_config.digest.0[2 * index + 1] != digits[usize::from(byte & 15)]
+        }) { return Err(service_invalid()); }
+        Ok(())
+    }
 }
 
 struct ServiceAncestor {
@@ -403,7 +480,7 @@ fn service_configuration_backing(configuration: &ServerRecoveryHostConfigV1) -> 
         bytes = bytes.checked_add(capacity as u64).ok_or_else(service_invalid)?;
     }
     if let super::RequiredNullable::Value(selection) = &configuration.optional_startup_intent {
-        bytes = bytes.checked_add(selection.request_file.capacity() as u64).ok_or_else(service_invalid)?;
+        bytes = bytes.checked_add(selection.intent_file.capacity() as u64).ok_or_else(service_invalid)?;
     }
     Ok(bytes)
 }
@@ -442,9 +519,9 @@ impl VerifiedServiceRecoveryHost {
             .ok_or_else(service_invalid)?;
         let mut files = self.original_config.files()?.checked_add(self.control_selection.parent.ancestors.len() as u64)
             .and_then(|n| n.checked_add(u64::from(self.control_selection.existing.is_some()))).ok_or_else(service_invalid)?;
-        if let Some(intent) = &self.original_legacy_input {
-            bytes = bytes.checked_add(intent.retained_bytes()?).ok_or_else(service_invalid)?;
-            files = files.checked_add(intent.files()?).ok_or_else(service_invalid)?;
+        if let Some(intent) = &self.original_ordinary_input {
+            bytes = bytes.checked_add(intent.input.retained_bytes()?).ok_or_else(service_invalid)?;
+            files = files.checked_add(intent.input.files()?).ok_or_else(service_invalid)?;
         }
         Ok((bytes, files))
     }
@@ -467,7 +544,14 @@ impl VerifiedServiceRecoveryHost {
                 || rustix::fs::FileType::from_raw_mode(named.st_mode) != rustix::fs::FileType::Directory
             { return Err(service_invalid()); }
         }
-        if let Some(intent) = &mut self.original_legacy_input { intent.recheck(self.uid, Some(deadline))?; }
+        match (&self.configuration.optional_startup_intent, &mut self.original_ordinary_input) {
+            (super::RequiredNullable::Value(selection), Some(intent)) => {
+                intent.input.recheck(self.uid, Some(deadline))?;
+                intent.validate(&self.original_config, selection.mode)?;
+            }
+            (super::RequiredNullable::Null(()), None) => (),
+            _ => return Err(service_invalid()),
+        }
         before(deadline)
     }
 }
@@ -487,7 +571,11 @@ pub fn load_service_recovery_host_from_config(
     let configuration: ServerRecoveryHostConfigV1 = serde_json::from_slice(&original_config.bytes)
         .map_err(RecoveryControlError::from_json)?;
     let limits = configuration.host_limits.clone().checked()?;
-    if configuration.version != 1 || configuration.expected_service_owner.uid != uid { return Err(service_invalid()); }
+    let expected_pg = &configuration.expected_server_database;
+    if configuration.version != 1 || configuration.expected_service_owner.uid != uid
+        || expected_pg.pg_system_id == 0 || expected_pg.database_oid == 0 || expected_pg.pg_major != 17
+    { return Err(service_invalid()); }
+    // This tuple is an explicit expected selection, never actual PG evidence.
     super::id(&configuration.expected_service_owner.service, limits.max_id_bytes)?;
     let ids = &configuration.expected_installation_binding;
     for id in [&ids.deployment_id, &ids.tenant_id, &ids.dataset_id, &ids.source_installation_id, &ids.target_installation_id] {
@@ -525,35 +613,48 @@ pub fn load_service_recovery_host_from_config(
     control_selection.excludes(&original_config)?;
     let mut verified = VerifiedServiceRecoveryHost {
         root: configuration.control_root.clone(), uid, original_config, configuration,
-        control_selection, original_legacy_input: None,
+        control_selection, original_ordinary_input: None,
     };
     if verified.root.capacity() > root_path_bytes.checked_mul(2).ok_or_else(service_invalid)? {
         return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
     }
     if let super::RequiredNullable::Value(selection) = &verified.configuration.optional_startup_intent {
-        match selection.purpose { ServiceLegacyPurpose::AdoptOrdinaryLegacy => () }
-        service_absolute(&selection.request_file)?;
+        service_absolute(&selection.intent_file)?;
         let (base_bytes, base_files) = verified.retained_usage()?;
-        let depth = selection.request_file.parent().ok_or_else(service_invalid)?.components().count();
-        let path_bytes = selection.request_file.as_os_str().as_bytes().len();
+        let depth = selection.intent_file.parent().ok_or_else(service_invalid)?.components().count();
+        let path_bytes = selection.intent_file.as_os_str().as_bytes().len();
         let extra_metadata = path_bytes.checked_mul(2)
             .and_then(|n| depth.checked_mul(2).and_then(|depth| depth.checked_mul(std::mem::size_of::<ServiceAncestor>()))
                 .and_then(|nodes| n.checked_add(nodes)))
             .and_then(|n| n.checked_add(2 * std::mem::size_of::<ServiceOwnedInput>()))
+            .and_then(|n| n.checked_add(2 * std::mem::size_of::<ServerOrdinaryIntentV1>()))
+            .and_then(|n| n.checked_add(1024))
             .ok_or_else(service_invalid)?;
         let metadata_before_bytes = base_bytes.checked_add(std::mem::size_of::<VerifiedServiceRecoveryHost>() as u64)
             .and_then(|n| n.checked_add(extra_metadata as u64)).ok_or_else(service_invalid)?;
         let available = limits.max_metadata_bytes.checked_sub(metadata_before_bytes).ok_or_else(service_invalid)?;
-        let maximum_wire = available.checked_sub(2).ok_or_else(service_invalid)? / 2;
+        // Prepay the held byte Vec (at most 2 * (wire + 1)), pinned serde
+        // escape/key scratch and any retained parse error before decode. The
+        // fixed arrays above do not allocate. The extra 1024 bytes cover the
+        // bounded decoder/field-label structure, not an effect/capacity default.
+        let maximum_wire = available.checked_sub(2).ok_or_else(service_invalid)? / 8;
         let planned_files = base_files.checked_add(depth as u64).and_then(|n| n.checked_add(1)).ok_or_else(service_invalid)?;
-        if maximum_wire == 0 || planned_files > limits.max_open_files { return Err(service_invalid()); }
+        if maximum_wire == 0 || depth as u64 > limits.max_path_depth
+            || planned_files > limits.max_open_files { return Err(service_invalid()); }
         // Prepay the original intent's real path/FD/buffer and typed return
         // slots before opening or allocating it. No second complete quota.
-        let input = ServiceOwnedInput::open(&selection.request_file, uid,
+        let input = ServiceOwnedInput::open(&selection.intent_file, uid,
             limits.max_request_bytes.min(maximum_wire), Some(deadline))?;
         if input.stamp.identity == verified.original_config.stamp.identity { return Err(service_invalid()); }
         verified.control_selection.excludes(&input)?;
-        verified.original_legacy_input = Some(input);
+        let intent = serde_json::from_slice::<ServerOrdinaryIntentV1>(&input.bytes)
+            .map_err(RecoveryControlError::from_json)?;
+        before(deadline)?;
+        let ordinary = ServiceOrdinaryInput { input, intent };
+        ordinary.validate(&verified.original_config, selection.mode)?;
+        // Holding the original file is custody only. No request consumption,
+        // operation/epoch, head, writer lock, SQL or initialization occurs here.
+        verified.original_ordinary_input = Some(ordinary);
     }
     let (bytes, files) = verified.retained_usage()?;
     let bytes = bytes.checked_add(std::mem::size_of::<VerifiedServiceRecoveryHost>() as u64).ok_or_else(service_invalid)?;

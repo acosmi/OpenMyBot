@@ -2263,3 +2263,8 @@ The complete restore and current-binding reconfirmation task is accumulated on t
 
 
 2026-10-23T12:21:27.867966+00:00 V7-IMPL-046 / PR226 source update: Server launch now preserves the required recovery configuration key in the original environment snapshot for the existing trusted-file loader. Infra declares its dependency on the already present macOS process observer, with the matching lockfile edge. The exact three-file candidate received independent source review and the applied bytes match it. Build, SQL, PostgreSQL, runtime recovery, native platform and task delivery acceptance remain pending; this source update accumulates in the same complete restore PR.
+
+
+### V7-IMPL-046: service startup input validation
+
+Service startup input validation: the original owner-held configuration loader now requires explicit nonzero PG system/database identity for PG17, accepts only fresh_init or legacy_adoption with the selected private intentFile, and decodes exactly the four ordinary-intent fields. The request must match the selected mode and the original held configuration file identity, length and complete SHA-256; original descriptor, ownership, full-byte readback and finite metadata admission checks remain. This is source input validation only: no PostgreSQL connection, startup writer, Current publication or restore execution/acceptance is claimed.
