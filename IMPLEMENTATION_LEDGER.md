@@ -2293,3 +2293,8 @@ Server ordinary startup source now holds the original recovery read locks before
 ### 2026-10-23 - V7-IMPL-046 Server runtime authorization keys and compiler repairs
 
 Server startup now derives five authorization keys from the same verified runtime epoch and existing configured parents, supplying matching keys to session issuers/resolvers, OIDC/SSO/MCP state factories and remote assertions. The same owner rechecks its head, pool scope, enrollment and locks before handing off bounded secret buffers once. This batch also fixes the two compiler root causes reported by the preceding targeted Server check, preserving the original canary queries and metadata charge. Audit, master/wrapping keys, stored ciphertext and SCRAM parents retain their prior behavior. Source review only; the previous Desktop pass and Server failure remain tied to their original candidate. New compilation and runtime/recovery acceptance are still pending.
+
+
+### 2026-10-23 - V7-IMPL-046 Server recovery gate API documentation
+
+Documented the two existing Server recovery-gate attachment methods without changing signatures, guards, behavior or the missing-documentation lint. The preceding targeted check emitted the updated Infra library and stopped at these two missing method comments; that original failure remains recorded. A new complete Server check and runtime/recovery acceptance are pending.

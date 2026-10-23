@@ -1926,6 +1926,8 @@ impl ServerSessionCurrentGuard {
 }
 
 impl PostgresSessionAuthResolver {
+    /// Attach the original runtime's weak recovery gate once to this live issuer.
+    /// Reject a different pool or namespace, a retired issuer or a repeated attachment.
     pub fn install_recovery_read_gate(&self, gate: openbot_infra::recovery_control::RecoveryReadGate) -> Result<(), HostRequestBindingError> {
         if !self.binding_owner.issuer.observation().is_current()
             || !gate.matches_server_scope(&self.pool, self.deployment.as_str(), self.tenant.as_str())
@@ -3054,6 +3056,8 @@ impl core::fmt::Debug for SingleUserAuthResolver {
 }
 
 impl SingleUserAuthResolver {
+    /// Attach the original runtime's weak recovery gate once to this verified principal.
+    /// Require a live issuer, the same actual pool and namespace, and no earlier attachment.
     pub fn install_recovery_read_gate(&self, pool: &openbot_infra::db::pool::DatabasePool, gate: openbot_infra::recovery_control::RecoveryReadGate) -> Result<(), HostRequestBindingError> {
         let owner = self.binding_owner.as_ref().ok_or(HostRequestBindingError::Unavailable)?;
         if !owner.issuer.observation().is_current()
