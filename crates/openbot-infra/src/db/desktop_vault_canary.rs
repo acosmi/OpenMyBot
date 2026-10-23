@@ -665,7 +665,9 @@ pub async fn verify_pre_upgrade_layout(
             super::thread_origin_schema::verify_legacy0050(&client).await?;
         } else if ledger.latest_version()==native::NATIVE_0051_VERSION {
             super::thread_origin_schema::verify_legacy0051(&client).await?;
-        } else if ledger.latest_version()>=native::NATIVE_0052_VERSION {
+        } else if ledger.latest_version()==native::NATIVE_0052_VERSION {
+            super::thread_origin_schema::verify_legacy0052(&client).await?;
+        } else if ledger.latest_version()==native::NATIVE_0053_VERSION {
             super::thread_origin_schema::verify(&client).await?;
         }
         Ok(ValidatedDesktopVaultLayout {
@@ -719,6 +721,8 @@ fn registered_public_schema(native_version: i32) -> Result<SchemaFacts, InfraErr
         native::NATIVE_0050_VERSION => PUBLIC_0050,
         native::NATIVE_0051_VERSION => PUBLIC_0051,
         native::NATIVE_0052_VERSION => PUBLIC_0052,
+        //0053 adds only internal restore facts; its actual additive catalog is checked separately.
+        native::NATIVE_0053_VERSION => PUBLIC_0052,
         _ => {
             return Err(InfraError::repository_invariant(
                 "desktop_vault_native_schema_unregistered",
