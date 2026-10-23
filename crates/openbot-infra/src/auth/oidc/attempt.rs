@@ -30,7 +30,9 @@
 use std::collections::HashMap;
 
 use openidconnect::{CsrfToken, Nonce, PkceCodeChallenge, PkceCodeVerifier};
+use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 
 use super::error::OidcError;
 use super::provider::ProviderId;
@@ -108,6 +110,28 @@ impl S256Pkce {
     }
 }
 
+// Configuration incarnation DATA only; never a fresh or Current authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ProviderIncarnationBinding {
+    Configured {},
+    Dynamic {
+        #[serde(rename = "providerInternalId")]
+        provider_internal_id: Uuid,
+    },
+}
+
+impl ProviderIncarnationBinding {
+    pub(crate) fn valid(&self) -> bool {
+        match self {
+            Self::Configured {} => true,
+            Self::Dynamic {
+                provider_internal_id,
+            } => !provider_internal_id.is_nil(),
+        }
+    }
+}
+
 /// 一次在飞的登录尝试。
 ///
 /// 不实现 `Clone`（[`S256Pkce`] 不 `Clone`，这条约束就顺着结构传上来了），也不实现
@@ -115,6 +139,7 @@ impl S256Pkce {
 #[derive(Debug)]
 pub struct LoginAttempt {
     provider: ProviderId,
+    incarnation: ProviderIncarnationBinding,
     state: CsrfToken,
     nonce: Nonce,
     pkce: S256Pkce,
@@ -128,6 +153,7 @@ pub struct LoginAttempt {
 pub(crate) struct LoginAttemptStorageRecord {
     pub(crate) state: String,
     pub(crate) provider: String,
+    pub(crate) incarnation: ProviderIncarnationBinding,
     pub(crate) nonce: String,
     pub(crate) pkce_verifier: String,
     pub(crate) pkce_method: &'static str,
@@ -141,24 +167,31 @@ pub(crate) struct LoginAttemptStorageRecord {
 /// callback 至多发起一次 token exchange。
 pub struct CallbackLoginAttempt {
     provider: ProviderId,
+    incarnation: ProviderIncarnationBinding,
     nonce: Nonce,
     verifier: PkceCodeVerifier,
     redirect_uri: CanonicalRedirectUri,
 }
 
 impl CallbackLoginAttempt {
-    pub(crate) fn restore(
+    pub(crate) fn restore_bound(
         provider: ProviderId,
         nonce: Nonce,
         verifier: PkceCodeVerifier,
         redirect_uri: CanonicalRedirectUri,
+        incarnation: ProviderIncarnationBinding,
     ) -> Self {
         Self {
             provider,
+            incarnation,
             nonce,
             verifier,
             redirect_uri,
         }
+    }
+
+    pub(crate) const fn incarnation(&self) -> ProviderIncarnationBinding {
+        self.incarnation
     }
 
     #[must_use]
@@ -202,8 +235,25 @@ impl LoginAttempt {
         now: OffsetDateTime,
         ttl: Duration,
     ) -> Self {
+        Self::begin_bound(
+            provider,
+            redirect_uri,
+            now,
+            ttl,
+            ProviderIncarnationBinding::Configured {},
+        )
+    }
+
+    pub(crate) fn begin_bound(
+        provider: ProviderId,
+        redirect_uri: CanonicalRedirectUri,
+        now: OffsetDateTime,
+        ttl: Duration,
+        incarnation: ProviderIncarnationBinding,
+    ) -> Self {
         Self {
             provider,
+            incarnation,
             state: CsrfToken::new_random(),
             nonce: Nonce::new_random(),
             pkce: S256Pkce::generate(),
@@ -271,6 +321,7 @@ impl LoginAttempt {
         LoginAttemptStorageRecord {
             state: self.state.into_secret(),
             provider: self.provider.as_str().to_owned(),
+            incarnation: self.incarnation,
             nonce: self.nonce.secret().clone(),
             pkce_verifier: self.pkce.into_verifier().into_secret(),
             pkce_method: PKCE_METHOD_S256,
