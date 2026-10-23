@@ -52,6 +52,8 @@ impl From<SsoVaultError> for DynamicSsoStoreError {
 }
 
 pub(crate) struct LoadedDynamicProvider {
+    // Actual locked row incarnation, not a digest, epoch or use grant.
+    pub internal_id: Uuid,
     pub provider_id: ProviderId,
     pub issuer: String,
     pub domains: BTreeSet<EmailDomain>,
@@ -63,6 +65,7 @@ impl core::fmt::Debug for LoadedDynamicProvider {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("LoadedDynamicProvider")
+            .field("internal_id", &self.internal_id)
             .field("provider_id", &self.provider_id)
             .field("issuer", &self.issuer)
             .field("domains", &self.domains)
@@ -280,7 +283,7 @@ impl DynamicSsoStore {
             .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT provider_id,issuer,domain,user_id,organization_id,oidc_config,saml_config \
+                "SELECT id,provider_id,issuer,domain,user_id,organization_id,oidc_config,saml_config \
                  FROM public.sso_providers WHERE provider_id=$1 FOR UPDATE",
                 &[&provider.as_str()],
             )
@@ -381,21 +384,34 @@ impl DynamicSsoStore {
             SsoSecretColumn::Saml => (None, Some(encrypted)),
         };
         if update {
+            let prior_id: String = get(
+                existing.as_ref().ok_or(DynamicSsoStoreError::ProviderUnknown)?,
+                "id",
+            )?;
+            let replacement_id = Uuid::now_v7().to_string();
+            if replacement_id == prior_id {
+                return Err(DynamicSsoStoreError::DependencyUnavailable);
+            }
             revoke_linked_accounts(&transaction, plan.provider_id()).await?;
-            transaction
-                .execute(
-                    "UPDATE public.sso_providers SET issuer=$2,domain=$3,oidc_config=$4,saml_config=$5 \
-                     WHERE provider_id=$1",
+            let updated = transaction
+                .query_one(
+                    "UPDATE public.sso_providers SET issuer=$2,domain=$3,oidc_config=$4,saml_config=$5,id=$6 \
+                     WHERE provider_id=$1 AND id=$7 RETURNING id",
                     &[
                         &plan.provider_id().as_str(),
                         &issuer,
                         &domain,
                         &oidc_config,
                         &saml_config,
+                        &replacement_id,
+                        &prior_id,
                     ],
                 )
                 .await
                 .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
+            if get::<String>(&updated, "id")? != replacement_id {
+                return Err(DynamicSsoStoreError::Corrupt);
+            }
         } else {
             let id = Uuid::now_v7().to_string();
             transaction
@@ -501,6 +517,12 @@ impl DynamicSsoStore {
         transaction: &Transaction<'_>,
         row: &Row,
     ) -> Result<LoadedDynamicProvider, DynamicSsoStoreError> {
+        let internal_raw: String = get(row, "id")?;
+        let internal_id = Uuid::parse_str(&internal_raw)
+            .map_err(|_| DynamicSsoStoreError::Corrupt)?;
+        if internal_id.is_nil() || internal_id.to_string() != internal_raw {
+            return Err(DynamicSsoStoreError::Corrupt);
+        }
         let provider_raw: String = get(row, "provider_id")?;
         let provider_id = self.stored_provider_id(&provider_raw)?;
         assert_deployment_owned_row(row)?;
@@ -573,6 +595,7 @@ impl DynamicSsoStore {
             }
         }
         Ok(LoadedDynamicProvider {
+            internal_id,
             provider_id,
             issuer: issuer_raw,
             domains,
