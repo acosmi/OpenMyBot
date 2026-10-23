@@ -2298,3 +2298,8 @@ Server startup now derives five authorization keys from the same verified runtim
 ### 2026-10-23 - V7-IMPL-046 Server recovery gate API documentation
 
 Documented the two existing Server recovery-gate attachment methods without changing signatures, guards, behavior or the missing-documentation lint. The preceding targeted check emitted the updated Infra library and stopped at these two missing method comments; that original failure remains recorded. A new complete Server check and runtime/recovery acceptance are pending.
+
+
+### V7-IMPL-046 — Server startup error conversion repair
+
+The Server library compiled at fd90bad; its binary check stopped at one startup error conversion. Both existing recovery read-gate installation calls now map failure through the existing fixed, redacted startup error and still refuse startup. Independent source review passed. A new exact-candidate Server binary check remains pending; runtime acceptance and delivery remain open.

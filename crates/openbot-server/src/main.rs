@@ -306,7 +306,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             deployment.clone(),
             tenant.clone(),
         )?;
-        resolver.install_recovery_read_gate(recovery_read_gate.clone())?;
+        resolver.install_recovery_read_gate(recovery_read_gate.clone())
+            .map_err(|_| startup_error("recovery_host_gate_unavailable"))?;
         let sensitive =
             SensitiveWriteSecurity::new(config.session_lifetime, config.trusted_origins.clone());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -331,7 +332,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let principal =
             load_single_user_principal(&pool, deployment.clone(), tenant.clone()).await?;
         let resolver = SingleUserAuthResolver::from_verified_principal(principal, lifetime);
-        resolver.install_recovery_read_gate(&pool, recovery_read_gate.clone())?;
+        resolver.install_recovery_read_gate(&pool, recovery_read_gate.clone())
+            .map_err(|_| startup_error("recovery_host_gate_unavailable"))?;
         remember_single_user_resolver = Some(resolver.clone());
         (
             Arc::new(resolver),
