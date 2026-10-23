@@ -193,6 +193,8 @@ pub mod remote_agui;
 #[cfg(feature = "server-runtime")]
 pub mod remote_interrupt;
 pub mod repo;
+#[cfg(unix)]
+pub mod recovery_control;
 #[cfg(feature = "server-runtime")]
 pub mod routing;
 pub mod run_cost_budget;
