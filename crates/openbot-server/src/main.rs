@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     telemetry::init(LogFormat::Json)?;
     let env = openbot_server::config::launch::prepare_environment(env_map_from_process(), local)?;
-    let server = ServerConfig::from_env_map(&env)?;
+    let mut server = ServerConfig::from_env_map(&env)?;
     if let Some(warning) = server.public_transport().startup_warning() {
         tracing::warn!(code = server.public_transport().as_str(), "{warning}");
     }
@@ -172,8 +172,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let database_url = openbot_server::config::env::optional(&env, "DATABASE_URL")
         .ok_or_else(|| startup_error("database_url_missing"))?;
     let database: DatabaseConfig = database_url.parse()?;
-    let pool = pool::connect(&database).await?;
-    openbot_server::database::initialize(&pool).await?;
+    let key_policy = match server.deployment_environment {
+        DeploymentEnvironment::Production => ExampleKeyPolicy::Reject,
+        DeploymentEnvironment::Development => ExampleKeyPolicy::Allow,
+    };
+    // Apply the original canonical / strength / example policy once and retain
+    // that same original wrapping key. The existing Infra production base64
+    // dependency decodes this exact canonical encoding after the publication
+    // gate; Server has no new production dependency or raw material accessor.
+    let key_encryption = KeyEncryptionKey::from_env_map(&env, key_policy)?;
+    let recovery_master_encoding = SecretBytes::new(
+        openbot_server::config::env::optional(&env, "KEY_ENCRYPTION_KEY")
+            .ok_or_else(|| startup_error("key_encryption_key_missing"))?.as_bytes().to_vec(),
+    );
+    let deployment = deployment_id_for_startup(server.deployment_id.as_deref(), &tenant_package.package.tenant_id);
+    let tenant = TenantId::new(&tenant_package.package.tenant_id);
+    let host = server.recovery_host.take().ok_or_else(|| startup_error("recovery_host_missing"))?;
+    let limits = host.host_limits().clone();
+    let startup_deadline = std::time::Instant::now().checked_add(Duration::from_nanos(limits.admission_ns))
+        .ok_or_else(|| startup_error("recovery_startup_bounds_invalid"))?;
+    let mut recovery_control = openbot_infra::recovery_control::RecoveryControl::open(
+        openbot_infra::recovery_control::RecoveryControlConfig::server(host, limits)?,
+    )?;
+    let (pool, recovery_runtime_owner) = recovery_control.open_existing_server_before(
+        &database, recovery_master_encoding, deployment.as_str(), tenant.as_str(), startup_deadline,
+    ).await?;
+    let recovery_read_gate = recovery_runtime_owner.read_gate();
 
     let policy_store = PolicyStore::postgres(
         pool.clone(),
@@ -199,11 +223,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
-    let key_policy = match server.deployment_environment {
-        DeploymentEnvironment::Production => ExampleKeyPolicy::Reject,
-        DeploymentEnvironment::Development => ExampleKeyPolicy::Allow,
-    };
-    let key_encryption = KeyEncryptionKey::from_env_map(&env, key_policy)?;
     if let Some(code) = key_encryption.advisory_code() {
         tracing::warn!(code, "KEY_ENCRYPTION_KEY 建议轮换到 AES-256");
     }
@@ -244,11 +263,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let deployment = deployment_id_for_startup(
-        server.deployment_id.as_deref(),
-        &tenant_package.package.tenant_id,
-    );
-    let tenant = TenantId::new(&tenant_package.package.tenant_id);
     let model_credential_vault = CredentialRecordVault::single_key(
         tenant.clone(),
         KeyVersion::new(1),
@@ -282,6 +296,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             deployment.clone(),
             tenant.clone(),
         )?;
+        resolver.install_recovery_read_gate(recovery_read_gate.clone())?;
         let sensitive =
             SensitiveWriteSecurity::new(config.session_lifetime, config.trusted_origins.clone());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -306,6 +321,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let principal =
             load_single_user_principal(&pool, deployment.clone(), tenant.clone()).await?;
         let resolver = SingleUserAuthResolver::from_verified_principal(principal, lifetime);
+        resolver.install_recovery_read_gate(&pool, recovery_read_gate.clone())?;
         remember_single_user_resolver = Some(resolver.clone());
         (
             Arc::new(resolver),

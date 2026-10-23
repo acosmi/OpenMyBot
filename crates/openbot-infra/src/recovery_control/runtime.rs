@@ -219,8 +219,9 @@ pub(super) fn enter_runtime(
     let mut registration_effect_may_have_started = false;
     let result = (|| {
         let mut files = entry::lock(control)?;
+        let existing_read_locks = files.holds_existing_read_locks();
         if files.retained_runtime.is_some() || files.pending_startup.is_some()
-            || files.pending_admission.is_some() || files.pending_runtime.is_some()
+            || (!existing_read_locks && (files.pending_admission.is_some() || files.pending_runtime.is_some()))
         {
             return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
         }
@@ -242,7 +243,7 @@ pub(super) fn enter_runtime(
         files.prepay(known as u64, 0)?;
         let deadline = deadline.min(intent.original_deadline);
         before(deadline)?;
-        hex(&intent.runtime_nonce, 32, true)?;
+        if !intent.runtime_nonce.is_empty() { hex(&intent.runtime_nonce, 32, true)?; }
         id(&intent.enrollment.boot_identity, files.limits.max_id_bytes)?;
         files.verify_enrollment_before(&intent.enrollment, deadline)?;
         if intent.enrollment.pid != std::process::id() || intent.enrollment.process_start.nanos >= 1_000_000_000
@@ -258,17 +259,24 @@ pub(super) fn enter_runtime(
             }
         }
         files.pending_startup = Some(intent);
-        let admission = files.acquire("admission.lock", b"WBRCADM1", FlockOperation::NonBlockingLockShared, deadline)?;
-        files.pending_admission = Some(admission);
+        if !existing_read_locks {
+            let admission = files.acquire("admission.lock", b"WBRCADM1", FlockOperation::NonBlockingLockShared, deadline)?;
+            files.pending_admission = Some(admission);
+        }
         let admission_identity = files.held_lock_identity(true, deadline)?;
-        let runtime = match files.acquire("runtime.lock", b"WBRCRUN1", FlockOperation::NonBlockingLockShared, deadline) {
-            Ok(file) => file,
-            Err(error) => { files.pending_admission = None; return Err(error); }
-        };
-        files.pending_runtime = Some(runtime);
+        if !existing_read_locks {
+            let runtime = match files.acquire("runtime.lock", b"WBRCRUN1", FlockOperation::NonBlockingLockShared, deadline) {
+                Ok(file) => file,
+                Err(error) => { files.pending_admission = None; return Err(error); }
+            };
+            files.pending_runtime = Some(runtime);
+        }
         // This is the original short registration writer, not a new lock or
         // restore session. Never wait for it while holding either SH.
         files.pending_owner = Some(files.acquire("owner.lock", b"WBRCOWN1", FlockOperation::NonBlockingLockExclusive, deadline)?);
+        if files.pending_startup.as_ref().is_some_and(|original| original.runtime_nonce.is_empty()) {
+            files.fill_runtime_nonce(deadline)?;
+        }
         files.verify_registration_capacity(deadline)?;
         let root = files.root_identity(deadline)?;
         let original = files.pending_startup.as_ref().ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?;
@@ -379,6 +387,16 @@ impl RecoveryAdmissionWitness for Admission<'_> {
 }
 
 impl RecoveryReadGate {
+    /// Same actual retained Pool and namespace, before installing an original
+    /// host guard. No gate constructor, new runtime or second owner is exposed.
+    pub fn matches_server_scope(&self, pool: &crate::db::pool::DatabasePool, deployment: &str, tenant: &str) -> bool {
+        let Some(runtime) = self.state.upgrade() else { return false; };
+        let Ok(state) = lock_runtime(&runtime) else { return false; };
+        if !state.handle_alive.load(Ordering::SeqCst) { return false; }
+        let Ok(files) = entry::lock(&state.control) else { return false; };
+        files.existing_scope(pool, deployment, tenant)
+    }
+
     pub async fn borrow_before<'a>(&'a self, binding: &'a VerifiedHostRequestBinding, auth: &'a AuthContext, deadline: Instant) -> Result<RecoveryAdmissionLease<'a>, HostRequestBindingError> {
         binding.verify_current_before(auth, deadline).await?;
         let reservation = std::mem::size_of::<Admission<'_>>().checked_mul(2)

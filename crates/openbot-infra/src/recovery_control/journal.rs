@@ -495,7 +495,52 @@ pub(super) fn observe_chain(
     Ok(JournalObservation { records, digests })
 }
 
+/// Admission for this immutable full frame stream, before serde/Vec growth.
+/// Reuses the existing closed JSON accounting for each actual body, not the
+/// binary digest bytes. The old full JournalReference shape is unchanged.
+pub(super) fn read_metadata_reservation(raw: &[u8], limits: &TrustedHostRecoveryLimits) -> Result<u64, RecoveryControlError> {
+    let invalid = || RecoveryControlError::new(RecoveryControlFault::CapacityExceeded);
+    let mut total = std::mem::size_of::<JournalObservation>() as u64;
+    let mut offset = 0usize;
+    let mut records = 0u64;
+    while offset < raw.len() {
+        let header = offset.checked_add(12).filter(|end| *end <= raw.len()).ok_or_else(invalid)?;
+        if raw.get(offset..offset + 8) != Some(MAGIC.as_slice()) { return Err(invalid()); }
+        let size = u32::from_be_bytes(raw[offset + 8..header].try_into().map_err(|_| invalid())?) as usize;
+        let body = header.checked_add(size).ok_or_else(invalid)?;
+        let end = body.checked_add(32).filter(|end| *end <= raw.len()).ok_or_else(invalid)?;
+        records = records.checked_add(1).filter(|n| *n <= limits.max_journal_records).ok_or_else(invalid)?;
+        if size == 0 || size as u64 > limits.max_journal_frame_bytes { return Err(invalid()); }
+        let body_fee = super::activation::read_metadata_reservation(&raw[header..body])?
+            .checked_mul(2).ok_or_else(invalid)?;
+        let fixed = 2 * (std::mem::size_of::<Record>() + std::mem::size_of::<[u8; 32]>());
+        total = total.checked_add(body_fee).and_then(|n| n.checked_add(fixed as u64)).ok_or_else(invalid)?;
+        offset = end;
+    }
+    Ok(total)
+}
+
 impl JournalObservation {
+    /// Check the original ordinary operation and actual full-digest evidence
+    /// references. Unknown / other-context evidence remains closed.
+    pub(super) fn verify_ordinary_evidence(&self, observation: &super::activation::ActivationObservation) -> Result<(), RecoveryControlError> {
+        let invalid = || RecoveryControlError::new(RecoveryControlFault::ClosureUnproven);
+        let (binding, evidence) = observation.ordinary_active()?;
+        let first = self.records.first().ok_or_else(invalid)?;
+        if first.epoch != binding.authorization_epoch()
+            || !matches!(first.data, Data::Operation(OperationIntent::FreshInit(_) | OperationIntent::LegacyAdoption(_)))
+        { return Err(invalid()); }
+        for reference in evidence {
+            reference.validate()?;
+            let index = usize::try_from(reference.sequence - 1).map_err(|_| invalid())?;
+            if reference.context_id != first.operation_id
+                || self.digests.get(index).map(digest_hex).as_ref() != Some(&reference.digest)
+                || !matches!(self.records.get(index), Some(Record { data: Data::StageObserved(stage), .. }) if stage.typed_disposition.confirms_effect())
+            { return Err(invalid()); }
+        }
+        Ok(())
+    }
+
     pub(super) fn publication_for(
         &self, control_id: &str, descriptor_digest: &str,
         reference: &JournalReference, actual_file: RecoveryFileIdentity,

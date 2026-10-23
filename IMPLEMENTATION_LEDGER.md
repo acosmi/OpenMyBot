@@ -2283,3 +2283,8 @@ The existing recovery-control library now keeps one native self-process identity
 ### V7-IMPL-046: isolated restore-process source adapter
 
 Added a private deny-default PostgreSQL restore-process policy and connected its command to the original native Child, three pipes and wait path. The adapter retains original spawn and post-check results, rechecks the resident child birth before one bounded stop request, and preserves the original maintenance callers. Independent source and actual-postimage reviews passed for the exact two-file change. Compilation and native isolation scenarios for these new postimages remain pending; session/resource binding, loader inventory, credential-slot integration and complete restore acceptance remain open. The earlier Infra library check remains bound to fe897f8e and its 52 retained warnings.
+
+
+### V7-IMPL-046: existing ordinary Server startup and admission
+
+Server ordinary startup source now holds the original recovery read locks before database probing, binds the held head to its complete publication journal, checks actual configured PostgreSQL/key/canary/schema observations, retains the same runtime ownership through enrollment, and installs matching recovery admission on session and single-user guards. This batch supports native53 ServerDatabase OrdinaryActive; Fresh, legacy production and RestoreCurrent admission remain closed pending the remaining implementation. Source review only: this change has no new build, database, runtime or full-recovery acceptance credit.

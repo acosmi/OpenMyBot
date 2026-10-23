@@ -225,7 +225,7 @@ pub struct ServerConfig {
     /// Original owner-held recovery configuration. It is linear and redacted;
     /// this source seal alone is not a startup, database or Current grant.
     #[cfg(unix)]
-    pub recovery_host: openbot_infra::recovery_control::VerifiedServiceRecoveryHost,
+    pub recovery_host: Option<openbot_infra::recovery_control::VerifiedServiceRecoveryHost>,
     /// 监听端口。缺省 [`DEFAULT_PORT`]。
     pub port: u16,
     /// 部署形态。见 [`DeploymentEnvironment`]。
@@ -411,7 +411,7 @@ impl ServerConfig {
 
         Ok(Self {
             #[cfg(unix)]
-            recovery_host,
+            recovery_host: Some(recovery_host),
             port,
             deployment_environment,
             deployment_id: env::optional(env_map, "DEPLOYMENT_ID").map(str::to_owned),

@@ -104,8 +104,8 @@ pub(super) struct ServerDatabaseSite {
     pub(super) pg_system_id: u64,
     pub(super) database_oid: u32,
     pub(super) pg_major: u32,
-    authenticated_principal: String,
-    database_owner: String,
+    pub(super) authenticated_principal: String,
+    pub(super) database_owner: String,
 }
 impl ServerDatabaseSite {
     fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
@@ -125,6 +125,20 @@ struct CommonBinding<'a> {
 }
 fn invalid() -> RecoveryControlError { RecoveryControlError::new(RecoveryControlFault::ControlInvalid) }
 
+pub(super) struct OrdinaryServerBinding<'a> {
+    pub(super) dataset_id: &'a str,
+    pub(super) deployment_id: &'a str,
+    pub(super) tenant_id: &'a str,
+    pub(super) source_installation_id: &'a str,
+    pub(super) target_installation_id: &'a str,
+    pub(super) service_config: &'a ServiceConfigReference,
+    pub(super) server_database: &'a ServerDatabaseSite,
+    pub(super) native_version: u32,
+    pub(super) migration_digest: &'a str,
+    pub(super) master: &'a KeyReference,
+    pub(super) postgres: &'a KeyReference,
+}
+
 impl ActivationBinding {
     fn common(&self) -> CommonBinding<'_> {
         match &self.site {
@@ -141,7 +155,21 @@ impl ActivationBinding {
     }
 
     pub(super) fn authorization_epoch(&self) -> &str { self.common().authorization_epoch }
-    fn native_version(&self) -> u32 { self.common().native_version }
+    pub(super) fn native_version(&self) -> u32 { self.common().native_version }
+
+    /// Borrow the closed Server DATA. This is not a constructor or PG proof.
+    pub(super) fn ordinary_server(&self) -> Result<OrdinaryServerBinding<'_>, RecoveryControlError> {
+        match &self.site {
+            ActivationSiteBinding::ServerDatabase { dataset_id, deployment_id, tenant_id,
+                source_installation_id, target_installation_id, service_config,
+                server_database, native_version, migration_digest, key_refs, .. } => Ok(OrdinaryServerBinding {
+                    dataset_id, deployment_id, tenant_id, source_installation_id, target_installation_id,
+                    service_config, server_database, native_version: *native_version, migration_digest,
+                    master: &key_refs[0], postgres: &key_refs[1],
+                }),
+            _ => Err(invalid()),
+        }
+    }
     fn is_local(&self) -> bool { matches!(self.site, ActivationSiteBinding::LocalPhysical { .. }) }
 
     pub(super) fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
@@ -394,7 +422,7 @@ pub(super) struct ActivationObservation {
 /// Produced only after the original complete journal and actual file identity
 /// establish its matching PublishIntent/PublishObserved pair.
 pub(super) struct PublishedActivation {
-    observation: ActivationObservation,
+    observation: std::sync::Arc<ActivationObservation>,
     _publication: super::journal::VerifiedPublication,
 }
 
@@ -515,7 +543,7 @@ pub(super) fn observe(
 
 impl PublishedActivation {
     pub(super) fn bind(
-        observation: ActivationObservation,
+        observation: std::sync::Arc<ActivationObservation>,
         publication: super::journal::VerifiedPublication,
     ) -> Result<Self, RecoveryControlError> {
         publication.matches(&observation.record.control_id, &observation.digest)?;
@@ -538,6 +566,16 @@ impl PublishedActivation {
 }
 
 impl ActivationObservation {
+    pub(super) fn ordinary_active(&self) -> Result<(&ActivationBinding, &[JournalReference]), RecoveryControlError> {
+        match (&self.record.phase, &self.record.data) {
+            (ActivationPhase::OrdinaryActive, ActivationPayload::Active(data)) =>
+                Ok((&data.binding, &data.initialization_evidence)),
+            // RestoreCurrent still requires the separately registered subject /
+            // credential reconfirmation producer. It is never normal admission.
+            _ => Err(RecoveryControlError::new(RecoveryControlFault::InitializationRequired)),
+        }
+    }
+
     pub(super) fn publication_reference(&self) -> Result<&JournalReference, RecoveryControlError> {
         match &self.record.data {
             ActivationPayload::Active(d) => Ok(&d.publish_intent),

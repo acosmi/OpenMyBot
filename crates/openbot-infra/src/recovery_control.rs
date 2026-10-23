@@ -47,7 +47,7 @@ pub struct RecoveryControlError {
 }
 
 impl RecoveryControlError {
-    fn new(fault: RecoveryControlFault) -> Self {
+    pub(crate) fn new(fault: RecoveryControlFault) -> Self {
         Self { fault, retained: None, original_json_error: None }
     }
 
@@ -350,6 +350,25 @@ impl RecoveryControl {
         deadline: Instant,
     ) -> Result<VerifiedRecoveryHostIntent, RecoveryControlError> {
         entry::verify_intent(&self.shared, request, host, deadline)
+    }
+
+    /// Existing ordinary Server startup only. It retains original SH before
+    /// connecting and performs no initialization DDL, adoption or restoration.
+    /// Missing/Pending/RestoreCurrent stays closed before any pool probe.
+    pub async fn open_existing_server_before(
+        &mut self,
+        database: &crate::db::pool::DatabaseConfig,
+        configured_master_encoding: openbot_domain::vault::SecretBytes,
+        deployment: &str,
+        tenant: &str,
+        deadline: Instant,
+    ) -> Result<(crate::db::pool::DatabasePool, RecoveryRuntimeOwner), RecoveryControlError> {
+        let intent = entry::observe_existing_server_before(
+            &self.shared, database, configured_master_encoding, deployment, tenant, deadline,
+        ).await?;
+        let runtime = runtime::enter_runtime(&self.shared, intent, deadline)?;
+        let files = entry::lock(&self.shared)?;
+        files.existing_server_pool().map(|pool| (pool.clone(), runtime))
     }
 
     /// Retain the original runtime lock only after a truly published head and
