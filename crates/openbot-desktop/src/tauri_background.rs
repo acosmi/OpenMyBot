@@ -1953,7 +1953,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
-        capture_request,
+        mut capture_request,
     } = config;
     let DesktopLocalReleaseInput {
         ui,
@@ -1995,16 +1995,32 @@ pub(crate) async fn prepare_desktop_local_runtime(
     #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
     let mut capture_control_footprint = None;
     #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    let mut closed_history_profile = None;
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
     if let Some(app) = capture::open_app_data_read_only(app_data_root.as_path())
         .map_err(|_| DesktopLocalRuntimeError::Authority)?
     {
         let observed = capture::control::inspect_startup_control_for_capture(
             &app,
             capture_request.as_ref().map(|request| &request.profile),
+            capture_request.as_ref().map(|request| request.request_id.as_str()),
             capture_resources.as_ref(),
         )
         .map_err(|_| DesktopLocalRuntimeError::Authority)?;
-        if capture_resources.is_some() { capture_control_footprint = Some(observed); }
+        let completed_request = match capture_request.as_ref() {
+            Some(request) => observed.completed_request(&request.request_id),
+            None => false,
+        };
+        if completed_request {
+            // Full original Closed history consumes this reviewed request. Do
+            // not arm or retain capture-only secrets again on ordinary startup.
+            if let Some(request) = capture_request.take() {
+                closed_history_profile = Some(request.profile);
+            }
+            capture_resources = None;
+        } else if capture_resources.is_some() {
+            capture_control_footprint = Some(observed);
+        }
     }
 
     let authority_store = DesktopLocalAuthorityStore::new(app_data_root.clone());
@@ -2106,7 +2122,12 @@ pub(crate) async fn prepare_desktop_local_runtime(
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
-        if let Some(request) = capture_request.as_ref() {
+        let profile = match capture_request.as_ref() {
+            Some(request) => Some(&request.profile),
+            None => closed_history_profile.as_ref(),
+        };
+        #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+        if let Some(profile) = profile {
             return PostgresSidecarSupervisor::start_with_capture_profile(
                 postgres_bundle,
                 app_data_root.as_path(),
@@ -2114,7 +2135,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 installation.sidecar_data_dir(),
                 secret_store.as_ref(),
                 &postgres_key_store_service,
-                &request.profile,
+                profile,
             )
             .await;
         }
@@ -2129,6 +2150,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
         .await
     };
     let sidecar = start.await.map_err(map_sidecar_error)?;
+    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    drop(closed_history_profile);
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",

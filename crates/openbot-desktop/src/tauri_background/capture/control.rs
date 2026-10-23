@@ -443,6 +443,7 @@ impl History {
 // Main needs the DATA return type; no fields or source handles are public.
 pub(in crate::tauri_background) struct OriginalControlHistoryFootprint {
     observation: OriginalControlHistoryObservation,
+    completed_request: Option<[u8; 64]>,
 }
 enum OriginalControlHistoryObservation {
     Unobserved,
@@ -451,7 +452,13 @@ enum OriginalControlHistoryObservation {
 }
 impl OriginalControlHistoryFootprint {
     pub(in crate::tauri_background) fn unobserved() -> Self {
-        Self { observation: OriginalControlHistoryObservation::Unobserved }
+        Self { observation: OriginalControlHistoryObservation::Unobserved, completed_request: None }
+    }
+    pub(in crate::tauri_background) fn completed_request(&self, reviewed_request_id: &str) -> bool {
+        match &self.completed_request {
+            Some(id) => id.as_slice() == reviewed_request_id.as_bytes(),
+            None => false,
+        }
     }
 }
 
@@ -462,6 +469,24 @@ pub(super) fn original_control_data_fixed_bytes() -> Result<usize, Fault> {
         (std::mem::size_of::<OriginalControlHistoryFootprint>(), std::mem::align_of::<OriginalControlHistoryFootprint>(), 3usize),
         (std::mem::size_of::<Result<OriginalControlHistoryFootprint, Fault>>(), std::mem::align_of::<Result<OriginalControlHistoryFootprint, Fault>>(), 2),
         (std::mem::size_of::<Option<OriginalControlHistoryFootprint>>(), std::mem::align_of::<Option<OriginalControlHistoryFootprint>>(), 1),
+        // At most three original scans; lookup DATA is published only after full success.
+        (std::mem::size_of::<Option<(&str, &mut bool)>>(), std::mem::align_of::<Option<(&str, &mut bool)>>(), 6),
+        (std::mem::size_of::<Option<&(&str, &mut bool)>>(), std::mem::align_of::<Option<&(&str, &mut bool)>>(), 2),
+        (std::mem::size_of::<Option<&str>>(), std::mem::align_of::<Option<&str>>(), 4),
+        (std::mem::size_of::<Result<&str, Fault>>(), std::mem::align_of::<Result<&str, Fault>>(), 2),
+        (std::mem::size_of::<&str>(), std::mem::align_of::<&str>(), 6),
+        (std::mem::size_of::<&[u8]>(), std::mem::align_of::<&[u8]>(), 4),
+        (std::mem::size_of::<bool>(), std::mem::align_of::<bool>(), 8),
+        (std::mem::size_of::<[u8; 64]>(), std::mem::align_of::<[u8; 64]>(), 2),
+        (std::mem::size_of::<Option<[u8; 64]>>(), std::mem::align_of::<Option<[u8; 64]>>(), 2),
+        // Already-Closed startup moves only finite profile DATA into the original
+        // sidecar's read-only classification await; no request/book is retained.
+        (std::mem::size_of::<Option<CaptureProfile>>(), std::mem::align_of::<Option<CaptureProfile>>(), 2),
+        (std::mem::size_of::<CaptureProfile>(), std::mem::align_of::<CaptureProfile>(), 1),
+        (std::mem::size_of::<Option<ReviewedNormalCaptureRequest>>(), std::mem::align_of::<Option<ReviewedNormalCaptureRequest>>(), 1),
+        (std::mem::size_of::<ReviewedNormalCaptureRequest>(), std::mem::align_of::<ReviewedNormalCaptureRequest>(), 1),
+        (std::mem::size_of::<Option<&CaptureProfile>>(), std::mem::align_of::<Option<&CaptureProfile>>(), 2),
+        (std::mem::size_of::<&CaptureProfile>(), std::mem::align_of::<&CaptureProfile>(), 2),
         (std::mem::size_of::<super::OriginalControlStorageFacts>(), std::mem::align_of::<super::OriginalControlStorageFacts>(), 2),
         (std::mem::size_of::<Result<super::OriginalControlStorageFacts, Fault>>(), std::mem::align_of::<Result<super::OriginalControlStorageFacts, Fault>>(), 1),
         // Six borrowed parameters plus their bounded reborrow/caller temporaries.
@@ -1264,7 +1289,7 @@ impl CaptureControlOwner {
             &resources, &reviewed.profile.carrier_bounds()?, maximum,
         )?;
         let history = match &control {
-            Some(fd) => scan_closed_history(fd, &limits, 7, Some(&mut storage))?,
+            Some(fd) => scan_closed_history(fd, &limits, 7, Some(&mut storage), None)?,
             // This is the second actual NOENT on the original held parent, not caller DATA.
             None => History::default(),
         };
@@ -2281,7 +2306,7 @@ impl JournalWork {
                 history_named_identity(HistoryFd::Original(app), CONTROL,
                     RecordIdentity::of(&before), true, &mut io)?;
                 let actual = scan_closed_history_observed(HistoryFd::Original(root), &limits,
-                    7, None, &mut io)?;
+                    7, None, &mut io, None)?;
                 if actual != expected { return Err(Fault::SourceChanged); }
                 let after = io.metadata(HistoryFd::Original(root))?;
                 if RecordIdentity::of(&before) != RecordIdentity::of(&after)
@@ -2530,13 +2555,14 @@ pub(crate) fn inspect_startup_control(
         None => Ok(()),
         Some(root) => {
             let limits = Limits::from_profile(profile.ok_or(Fault::ClosingPending)?)?;
-            scan_closed_history(&root, &limits, 1, None).map(|_| ())
+            scan_closed_history(&root, &limits, 1, None, None).map(|_| ())
         }
     }
 }
 pub(in crate::tauri_background) fn inspect_startup_control_for_capture(
     app: &File,
     profile: Option<&CaptureProfile>,
+    reviewed_request_id: Option<&str>,
     resources: Option<&Arc<std::sync::Mutex<super::CaptureResourceTotals>>>,
 ) -> Result<OriginalControlHistoryFootprint, Fault> {
     // The noncapture branch keeps the original classification and IO behavior.
@@ -2545,17 +2571,21 @@ pub(in crate::tauri_background) fn inspect_startup_control_for_capture(
         return Ok(OriginalControlHistoryFootprint::unobserved());
     }
     let profile = profile.ok_or(Fault::ClosingPending)?;
+    let reviewed_request_id = reviewed_request_id.ok_or(Fault::IntentMismatch)?;
+    if !digest_text(reviewed_request_id) { return Err(Fault::IntentMismatch); }
     super::original_capture_resource_identity(
         resources.expect("checked original book exists"), &profile.carrier_bounds()?,
     )?;
     let limits = Limits::from_profile(profile)?;
     let app_before = app.metadata().map_err(io_fault)?;
     private_directory(app)?;
+    let mut completed = false;
     let observation = match optional_directory(app, CONTROL)? {
         None => OriginalControlHistoryObservation::Absent { app: Identity::of(&app_before) },
         Some(root) => {
             let before = root.metadata().map_err(io_fault)?;
-            let history = scan_closed_history(&root, &limits, 1, None)?;
+            let history = scan_closed_history(&root, &limits, 1, None,
+                Some((reviewed_request_id, &mut completed)))?;
             let after = root.metadata().map_err(io_fault)?;
             if RecordIdentity::of(&before) != RecordIdentity::of(&after)
                 || before.blocks() != after.blocks()
@@ -2575,7 +2605,12 @@ pub(in crate::tauri_background) fn inspect_startup_control_for_capture(
     {
         return Err(Fault::ClosingPending);
     }
-    Ok(OriginalControlHistoryFootprint { observation })
+    let completed_request = if completed {
+        let mut id = [0u8; 64];
+        id.copy_from_slice(reviewed_request_id.as_bytes());
+        Some(id)
+    } else { None };
+    Ok(OriginalControlHistoryFootprint { observation, completed_request })
 }
 
 // These are bounded result/scratch DATA inside the one original JournalWork.
@@ -3288,7 +3323,8 @@ fn history_read_record_core(parent: HistoryFd<'_>, name: &str, limit: u64, expec
 }
 
 fn scan_closed_history(root: &File, l: &Limits, caller_files: u64,
-    objects: Option<&mut super::OriginalControlStorageFacts>) -> Result<History, Fault> {
+    objects: Option<&mut super::OriginalControlStorageFacts>,
+    reviewed_request: Option<(&str, &mut bool)>) -> Result<History, Fault> {
     // Ordinary/pre-t0 ABI retains the same sole grammar. Only the original
     // first-t0 worker supplies the resident fields and original clock/book.
     let mut files = Vec::new();
@@ -3300,10 +3336,15 @@ fn scan_closed_history(root: &File, l: &Limits, caller_files: u64,
     let mut io = HistoryIo { fs_admission: None, fs_observations: None,  clock: None, original_objects: None, maximum_files: 2, files: &mut files,
         directory: &mut directory, frames: &mut frames, matched: &mut matched,
         raw: &mut raw, bytes: &mut bytes };
-    scan_closed_history_observed(HistoryFd::Original(root), l, caller_files, objects, &mut io)
+    scan_closed_history_observed(HistoryFd::Original(root), l, caller_files, objects, &mut io, reviewed_request)
 }
 fn scan_closed_history_observed(root: HistoryFd<'_>, l: &Limits, caller_files: u64,
-    mut objects: Option<&mut super::OriginalControlStorageFacts>, io: &mut HistoryIo<'_>) -> Result<History, Fault> {
+    mut objects: Option<&mut super::OriginalControlStorageFacts>, io: &mut HistoryIo<'_>,
+    reviewed_request: Option<(&str, &mut bool)>) -> Result<History, Fault> {
+    if let Some((id, _)) = reviewed_request.as_ref() {
+        if !digest_text(id) { return Err(Fault::IntentMismatch); }
+    }
+    let mut completed_request = false;
     history_private_directory(root, io)?;
     let mut h = History::default();
     let root_names = history_names(root, l, &mut h, io)?;
@@ -3495,6 +3536,9 @@ fn scan_closed_history_observed(root: HistoryFd<'_>, l: &Limits, caller_files: u
             io.observe(&after, 0)?;
         }
         io.retire(op)?;
+        if let Some((id, _)) = reviewed_request.as_ref() {
+            completed_request |= request.request_id == *id;
+        }
     }
     if let Some((identities, blocks)) = shared_roots {
         for (i, directory) in [root, reqs, ops].into_iter().enumerate() {
@@ -3522,6 +3566,9 @@ fn scan_closed_history_observed(root: HistoryFd<'_>, l: &Limits, caller_files: u
     }
     io.retire(ops)?;
     io.retire(reqs)?;
+    // A matching tombstone alone is insufficient: later operations and all
+    // final held/named identities above must also have completed successfully.
+    if let Some((_, observed)) = reviewed_request { *observed = completed_request; }
     Ok(h)
 }
 // Closed startup classification only. These borrowed counters never mint a source owner.
@@ -5516,8 +5563,13 @@ mod tests {
     fn control_orphan_request_tombstone_is_pending_and_not_consumed() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        let profile: CaptureProfile =
+        let mut profile: CaptureProfile =
             serde_json::from_str(ORDINARY_STARTUP_HISTORY_PROFILE_JSON).unwrap();
+        // Explicit finite test inputs also admit the complete historical intent.
+        profile.native.max_control_bytes = 16384;
+        profile.secrets.max_secret_structure_bytes = 64 * 1024 * 1024;
+        profile.secrets.max_secret_memory_bytes = 128 * 1024 * 1024;
+        profile.validate().unwrap();
         Limits::from_profile(&profile).unwrap();
 
         let mut random = [0u8; 16];
@@ -5537,7 +5589,7 @@ mod tests {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
-        let request = RequestRecord {
+        let mut request = RequestRecord {
             schema: "wrokbot-capture-request".into(),
             version: 1,
             request_id: "a".repeat(64),
@@ -5597,6 +5649,90 @@ mod tests {
             ],
             before
         );
+
+        // Complete this same ordinary on-disk history. It is a grammar/arm
+        // classification case, not a substitute for the real capture pipeline.
+        let operation = operations.join("00000000000040008000000000000001");
+        std::fs::create_dir(&operation).unwrap();
+        std::fs::set_permissions(&operation, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let operation_file = File::open(&operation).unwrap();
+        let write = |path: &Path, body: &[u8]| {
+            let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true)
+                .mode(0o600).open(path).unwrap();
+            file.write_all(body).unwrap();
+            file.sync_all().unwrap();
+        };
+        let audit_path = operation.join(ORDINARY_AUDIT_LEAF);
+        let audit = b"{}\n";
+        write(&audit_path, audit);
+        let audit_metadata = std::fs::metadata(&audit_path).unwrap();
+        let parent_metadata = operation_file.metadata().unwrap();
+        let identity = Identity::of(&parent_metadata);
+        let source = ControlSourceIdentity {
+            instance_id: "instance".into(), dataset_id: "dataset".into(),
+            deployment_id: "deployment".into(), tenant_id: "tenant".into(),
+            system_identifier: "1".into(), database_oid: 1, key_id: "key".into(),
+            key_version: 1, source_device: identity.device, source_inode: identity.inode,
+            source_uid: identity.uid, canary_material_id: "canary".into(),
+            schema_material_id: "schema".into(), migration_material_id: "migration".into(),
+            compatibility_material_id: "compatibility".into(),
+        };
+        let intent = IntentView {
+            schema: "wrokbot-capture-control", version: 1, sequence: 0, stage: "intent",
+            request_id: &request.request_id, operation_id: request.operation_id.clone(),
+            bundle_id: request.bundle_id.clone(), owner_instance: request.owner_instance.clone(),
+            owner_pid: request.owner_pid, t0: 1, e: 3, c: 4, profile: &profile,
+            release_sha256: request.release_sha256.clone(), maintenance_sha256: request.maintenance_sha256.clone(),
+            source_identity: &source,
+            control: Destination { path: control.clone(), identity },
+            output: Destination { path: root.join("output"), identity },
+            key_medium: Destination { path: root.join("key"), identity },
+            temporary_basename: ".capture.partial".into(), final_basename: "capture.wbpg".into(),
+            key_basename: "capture.key".into(),
+        };
+        let intent_bytes = encode(&intent, profile.native.max_control_bytes).unwrap();
+        request.profile_sha256 = hex(&hash_encoded(&profile, profile.native.max_control_bytes).unwrap());
+        request.source_identity_sha256 = hex(&hash_encoded(&source, profile.native.max_control_bytes).unwrap());
+        request.intent_sha256 = hex(&Sha256::digest(&intent_bytes));
+        let request_bytes = encode(&request, profile.native.max_control_bytes).unwrap();
+        write(&tombstone_path, &request_bytes);
+        write(&operation.join("00000000-intent.json"), &intent_bytes);
+        let stages = [ControlStage::NormalClosed, ControlStage::ConsumerConfirmed,
+            ControlStage::SourceStarted, ControlStage::MaterialsFrozen, ControlStage::SourceClosed,
+            ControlStage::KeyMediumVerified, ControlStage::TemporaryVerified,
+            ControlStage::PublishedVerified, ControlStage::Closed];
+        for stage in stages {
+            let record = StageRecord {
+                schema: "wrokbot-capture-control".into(), version: 1, sequence: stage.ordinal(), stage,
+                request_id: request.request_id.clone(), operation_id: request.operation_id.clone(),
+                bundle_id: request.bundle_id.clone(), intent_sha256: request.intent_sha256.clone(),
+                observed_monotonic_ns: 2, outcome: ControlOutcome::Actual, fault: None,
+                issued_effects: 1, original_tasks: 1, joined_original_tasks: 1, live_proxy_futures: 0,
+                parent_device: Some(parent_metadata.dev()), parent_inode: Some(parent_metadata.ino()),
+                entry_device: Some(audit_metadata.dev()), entry_inode: Some(audit_metadata.ino()),
+                output_bytes: Some(audit.len() as u64), output_sha256: Some(hex(&Sha256::digest(audit))),
+            };
+            write(&operation.join(format!("{:08}-{}.json", stage.ordinal(), stage.text())),
+                &encode(&record, profile.native.max_control_bytes).unwrap());
+        }
+        operation_file.sync_all().unwrap();
+        File::open(&operations).unwrap().sync_all().unwrap();
+        let resources = super::super::prepare_original_capture_resources(&profile.carrier_bounds().unwrap()).unwrap();
+        let observed = inspect_startup_control_for_capture(&app, Some(&profile),
+            Some(&request.request_id), Some(&resources)).unwrap();
+        assert!(observed.completed_request(&request.request_id));
+        let other_request = "b".repeat(64);
+        assert!(!observed.completed_request(&other_request));
+        let other = inspect_startup_control_for_capture(&app, Some(&profile),
+            Some(&other_request), Some(&resources)).unwrap();
+        assert!(!other.completed_request(&other_request));
+        assert_eq!(std::fs::read(&tombstone_path).unwrap(), request_bytes);
+        // Even the matching tombstone cannot publish completed DATA if Closed is missing.
+        std::fs::remove_file(operation.join("00000009-closed.json")).unwrap();
+        assert!(matches!(inspect_startup_control_for_capture(&app, Some(&profile),
+            Some(&request.request_id), Some(&resources)), Err(Fault::ClosingPending)));
+        assert_eq!(std::fs::read(&tombstone_path).unwrap(), request_bytes);
+        drop(operation_file);
 
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
