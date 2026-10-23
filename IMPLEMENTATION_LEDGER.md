@@ -2271,3 +2271,8 @@ The 13-file repair has independent source review. Current-candidate builds, dire
 
 
 UTC 2026-10-23 — Normal capture request replay preflight repair (PR #224). The original Closed-history scanner now authenticates every operation and final held/named identity before matching the exact reviewed request. A completed request continues the existing unarmed startup before capture secret retention or arm. Its original finite profile is moved only into the existing read-only sidecar history check and retired on success or error; request, capture book and capture authority remain absent. Orphan, incomplete and uncertain histories keep their existing refusal. The original 18-selector scope includes owned-FD match, mismatch and missing-Closed cases inside an existing selector. Independent source review closed the focused startup defect. Compilation, current runtime checks and real normal capture remain pending; prior failures and evidence retain their original inputs.
+
+
+### 2026-10-22 — V7-IMPL-045 / PR #224 targeted validation input repair
+
+The current Desktop library compiled and listed all 18 selected tests. Its runtime result was 17 passed and one ProfileInvalid before the unknown-layout assertion. Only the test fixture's two explicit secret-memory ceilings are adjusted to admit the retained structure quote; production validation and all assertions remain unchanged. The same candidate's Infra library compiled, listed 13 selected carrier tests, and passed all 13 with the original process waits completed. The prior Desktop failure remains recorded; the repaired candidate still requires its own Desktop rerun and the normal capture/closing acceptance. Archive regressions and whole-task delivery remain pending.

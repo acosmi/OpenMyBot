@@ -5414,8 +5414,8 @@ mod tests {
     "maxSourceSecretCount": 2,
     "maxOneSourceSecretBytes": 4096,
     "maxTotalSourceSecretBytes": 8192,
-    "maxSecretStructureBytes": 2097152,
-    "maxSecretMemoryBytes": 16777216,
+    "maxSecretStructureBytes": 67108864,
+    "maxSecretMemoryBytes": 134217728,
     "classes": {
       "masterSource": {
         "maxCount": 1,
