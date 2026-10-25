@@ -18,6 +18,7 @@
     "deny.toml",
     "examples",
     "fixtures",
+    "openmybot",
     "provenance",
     "rust-toolchain.toml",
     "rustfmt.toml",
@@ -83,6 +84,10 @@
     "fixtures/agui/schema-0.0.57/README.md",
     "fixtures/db/README.md",
     "fixtures/provider/README.md",
+    "openmybot/README.md",
+    "openmybot/README.zh-CN.md",
+    "openmybot/compat/README.md",
+    "openmybot/hosts/README.md",
     "supply-chain/README.md",
     "tools/electron-v43.3.0.SHASUMS256.txt"
   ],
@@ -97,7 +102,10 @@
   "push_urls": [
     "https://github.com/acosmi/wrokbot.git",
     "https://github.com/acosmi/wrokbot",
-    "git@github.com:acosmi/wrokbot.git"
+    "git@github.com:acosmi/wrokbot.git",
+    "https://github.com/acosmi/OpenMyBot.git",
+    "https://github.com/acosmi/OpenMyBot",
+    "git@github.com:acosmi/OpenMyBot.git"
   ],
   "file_size_limits": {
     "crates/openbot-ui/assets/brand/wrok-bot-logo-1024.gif": 31457280,
