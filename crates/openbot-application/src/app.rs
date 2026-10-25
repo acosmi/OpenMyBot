@@ -86,6 +86,16 @@ use crate::use_cases::{
     update_memory_control,
 };
 
+fn refuse_unbound_delegation(auth: &AuthContext) -> Result<(), AppError> {
+    if auth.delegation().is_some() {
+        return Err(AppError::PolicyRefused {
+            rule: "delegated_authority_refused".into(),
+            decision: None,
+        });
+    }
+    Ok(())
+}
+
 /// [`ApplicationService`] 的生产实现。
 ///
 /// 它对具体数据源一无所知：`R` 是任何满足 [`ChannelReader`] 的类型。`openbot-server` 与
@@ -1298,7 +1308,10 @@ where
         )
     )]
     async fn execute(&self, auth: AuthContext, command: AppCommand) -> Result<AppReply, AppError> {
-        let result = self.dispatch(&auth, command).await;
+        let result = match refuse_unbound_delegation(&auth) {
+            Ok(()) => self.dispatch(&auth, command).await,
+            Err(error) => Err(error),
+        };
         if let Err(error) = &result {
             // 只记**稳定码**，不记 `Display`：`AppError` 的 Display 会带上 policy rule id
             // 与 lease holder 这类上下文，那些属于受控诊断，不该由一条恒开的 span 字段
@@ -1324,6 +1337,7 @@ where
         auth: AuthContext,
         request: SubscriptionRequest,
     ) -> Result<AppEventStream, AppError> {
+        refuse_unbound_delegation(&auth)?;
         // 穷举 match，理由同 `dispatch`。
         match request {
             SubscriptionRequest::Health => Ok(health_stream(self.heartbeat_period)),
@@ -1342,6 +1356,10 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "delegated_authority_tests.rs"]
+mod delegated_authority_tests;
 
 #[cfg(test)]
 mod tests {
