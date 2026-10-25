@@ -128,19 +128,18 @@ impl Fixture {
                 Err(rustix::io::Errno::SRCH)
             );
         }
-        if let Ok(text) = fs::read_to_string(self.root.join("pg/data/postmaster.pid")) {
-            if let Some(pid) = text
+        if let Ok(text) = fs::read_to_string(self.root.join("pg/data/postmaster.pid"))
+            && let Some(pid) = text
                 .lines()
                 .next()
                 .and_then(|s| s.parse::<i32>().ok())
                 .and_then(Pid::from_raw)
-            {
-                assert_eq!(
-                    rustix::process::test_kill_process(pid),
-                    Err(rustix::io::Errno::SRCH),
-                    "own PostgreSQL remains alive"
-                );
-            }
+        {
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "own PostgreSQL remains alive"
+            );
         }
     }
 }
