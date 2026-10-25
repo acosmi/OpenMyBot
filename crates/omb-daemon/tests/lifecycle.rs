@@ -145,6 +145,10 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("failed owned fixture retained: {}", self.root.display());
+            return;
+        }
         // Keep a failed fixture when a process remains, so evidence/data cannot be erased underneath it.
         let running = fs::read_to_string(self.root.join("pg/data/postmaster.pid"))
             .ok()

@@ -719,22 +719,30 @@ pub(crate) async fn stop_stale(root: &Path, config: &Config) -> Result<(), Daemo
     {
         return Err(DaemonError::PostmasterPidForeign);
     }
-    rustix::process::kill_process(pid, Signal::INT)
-        .map_err(|_| DaemonError::StalePostgresRunning)?;
+    match rustix::process::kill_process(pid, Signal::INT) {
+        Ok(()) => (),
+        Err(rustix::io::Errno::SRCH) => return Ok(()),
+        Err(_) => return Err(DaemonError::StalePostgresRunning),
+    }
     let deadline = Instant::now() + STOP;
     while Instant::now() < deadline {
-        if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
-            return Ok(());
+        match rustix::process::test_kill_process(pid) {
+            Ok(()) => (),
+            Err(rustix::io::Errno::SRCH) if Instant::now() < deadline => return Ok(()),
+            Err(_) => return Err(DaemonError::StalePostgresRunning),
         }
-        // PID identity changed: never signal the replacement.
-        if process_identity(raw, &executable, &argument_data, port)
-            .await
-            .as_ref()
-            != Some(&first)
-        {
-            return Err(DaemonError::StalePostgresRunning);
+        // The identified process can exit while ps/lsof are observing it. Missing identity
+        // is not evidence of a live replacement: confirm disappearance with a fresh kill0.
+        match process_identity_until(raw, &executable, &argument_data, port, deadline).await {
+            Some(identity) if identity != first => return Err(DaemonError::StalePostgresRunning),
+            Some(_) => (),
+            None => match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH) if Instant::now() < deadline => return Ok(()),
+                Ok(()) => (),
+                Err(_) => return Err(DaemonError::StalePostgresRunning),
+            },
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep_until(deadline.min(Instant::now() + Duration::from_millis(50))).await;
     }
     Err(DaemonError::StalePostgresRunning)
 }
