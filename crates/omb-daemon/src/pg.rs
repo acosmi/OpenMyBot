@@ -18,13 +18,37 @@ use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
     task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, sleep_until, timeout, timeout_at},
 };
 
 const READY: Duration = Duration::from_secs(30);
 const STOP: Duration = Duration::from_secs(30);
 
+fn ready_result<T>(deadline: Instant, result: Result<T, DaemonError>) -> Result<T, DaemonError> {
+    if Instant::now() >= deadline {
+        Err(DaemonError::PgStartFailed)
+    } else {
+        result
+    }
+}
+
 pub(crate) async fn tool(binary: &Path, args: &[OsString]) -> Result<Vec<u8>, DaemonError> {
+    tool_until(binary, args, Instant::now() + READY)
+        .await
+        .map_err(|error| {
+            if error == DaemonError::PgStartFailed {
+                DaemonError::PgBinariesRejected
+            } else {
+                error
+            }
+        })
+}
+async fn tool_until(
+    binary: &Path,
+    args: &[OsString],
+    deadline: Instant,
+) -> Result<Vec<u8>, DaemonError> {
+    ready_result(deadline, Ok(()))?;
     let mut command = StdCommand::new(binary);
     command
         .args(args)
@@ -38,49 +62,71 @@ pub(crate) async fn tool(binary: &Path, args: &[OsString]) -> Result<Vec<u8>, Da
     if binary == Path::new("/bin/ps") {
         command.env("TZ", "UTC");
     }
-    let mut child = Command::from(command)
+    ready_result(deadline, Ok(()))?;
+    let child = Command::from(command)
         .kill_on_drop(true)
         .spawn()
         .map_err(|_| DaemonError::PgBinariesRejected)?;
+    run_tool_child(child, deadline).await
+}
+async fn run_tool_child(mut child: Child, deadline: Instant) -> Result<Vec<u8>, DaemonError> {
     let group = child
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
         .and_then(Pid::from_raw);
-    let pipe = child.stdout.take().ok_or(DaemonError::InternalError)?;
-    let reader = tokio::spawn(async move {
+    let pipe = child.stdout.take();
+    let mut reader = tokio::spawn(async move {
         let mut output = Vec::new();
+        let pipe = pipe.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
         pipe.take(8193)
             .read_to_end(&mut output)
             .await
             .map(|_| output)
     });
-    let result = match timeout(READY, child.wait()).await {
+    let waited = timeout_at(deadline, child.wait()).await;
+    let result = match waited {
         Ok(Ok(status)) if status.success() => Ok(()),
-        _ => {
+        Ok(Ok(_)) => Err(DaemonError::PgBinariesRejected),
+        timed_out => {
+            // Keep the owned child and reader outside timeout cancellation. Cleanup has a
+            // separate stop budget; it can never turn an expired readiness probe into success.
             if let Some(group) = group {
                 let _ = rustix::process::kill_process_group(group, Signal::KILL);
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            Err(DaemonError::PgBinariesRejected)
-        }
-    };
-    let mut reader = reader;
-    let output = match timeout(Duration::from_secs(5), &mut reader).await {
-        Ok(Ok(Ok(output))) => output,
-        _ => {
-            // The original child is already reaped here. Do not signal a group number that
-            // could have been reused; close and join our pipe reader instead.
+            let _ = child.start_kill();
+            let reaped = timeout(STOP, child.wait()).await;
             reader.abort();
             let _ = reader.await;
-            return Err(DaemonError::PgBinariesRejected);
+            if !matches!(reaped, Ok(Ok(_))) {
+                return Err(DaemonError::ShutdownFailed);
+            }
+            return Err(if timed_out.is_err() {
+                DaemonError::PgStartFailed
+            } else {
+                DaemonError::PgBinariesRejected
+            });
+        }
+    };
+    let output = match timeout_at(
+        deadline.min(Instant::now() + Duration::from_secs(5)),
+        &mut reader,
+    )
+    .await
+    {
+        Ok(Ok(Ok(output))) => output,
+        Ok(_) => return ready_result(deadline, Err(DaemonError::PgBinariesRejected)),
+        Err(_) => {
+            // The child is already reaped. Never signal a potentially reused group number.
+            reader.abort();
+            let _ = reader.await;
+            return ready_result(deadline, Err(DaemonError::PgBinariesRejected));
         }
     };
     result?;
     if output.len() > 8192 {
         return Err(DaemonError::PgBinariesRejected);
     }
-    Ok(output)
+    ready_result(deadline, Ok(output))
 }
 
 pub(crate) async fn verify_binaries(bin: &Path) -> Result<(), DaemonError> {
@@ -118,14 +164,25 @@ struct Connection {
     driver: JoinHandle<Result<(), tokio_postgres::Error>>,
 }
 impl Connection {
-    async fn close(mut self) -> Result<(), DaemonError> {
+    async fn close(self) -> Result<(), DaemonError> {
+        self.close_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .map_err(|_| DaemonError::ShutdownFailed)
+    }
+    async fn close_until(mut self, deadline: Instant) -> Result<(), DaemonError> {
         self.client.take();
-        match timeout(Duration::from_secs(5), &mut self.driver).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            _ => {
+        match timeout_at(
+            deadline.min(Instant::now() + Duration::from_secs(5)),
+            &mut self.driver,
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => ready_result(deadline, Ok(())),
+            Ok(_) => ready_result(deadline, Err(DaemonError::ShutdownFailed)),
+            Err(_) => {
                 self.driver.abort();
                 let _ = self.driver.await;
-                Err(DaemonError::ShutdownFailed)
+                ready_result(deadline, Err(DaemonError::ShutdownFailed))
             }
         }
     }
@@ -235,11 +292,17 @@ impl Postgres {
                     return Err(DaemonError::PgStartFailed);
                 }
                 if instance.pid_file_matches() {
-                    match instance.verify_connection().await {
-                        Ok(version) => {
-                            instance.version = version;
-                            return Ok(instance);
-                        }
+                    match instance.verify_connection(deadline).await {
+                        Ok(version) => match ready_result(deadline, Ok(version)) {
+                            Ok(version) => {
+                                instance.version = version;
+                                return Ok(instance);
+                            }
+                            Err(error) => {
+                                instance.stop().await?;
+                                return Err(error);
+                            }
+                        },
                         Err(DaemonError::PgVersionRejected) => {
                             instance.stop().await?;
                             return Err(DaemonError::PgVersionRejected);
@@ -247,7 +310,7 @@ impl Postgres {
                         Err(_) => (),
                     }
                 }
-                sleep(Duration::from_millis(50)).await;
+                sleep_until(deadline.min(Instant::now() + Duration::from_millis(50))).await;
             }
             // The exited child was reaped; another attempt never connects without a matching new pid file.
         }
@@ -268,7 +331,8 @@ impl Postgres {
             && lines[3].parse::<u16>().ok() == Some(self.port)
             && lines[7].trim() == "ready"
     }
-    async fn connection_identity_gate(&mut self) -> Result<(), DaemonError> {
+    async fn connection_identity_gate(&mut self, deadline: Instant) -> Result<(), DaemonError> {
+        ready_result(deadline, Ok(()))?;
         if !self.pid_file_matches()
             || self
                 .child
@@ -295,11 +359,12 @@ impl Postgres {
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|s| *s > 0)
             .ok_or(DaemonError::PgStartFailed)?;
-        let identity = process_identity(
+        let identity = process_identity_until(
             self.pid,
             &self.binary,
             &self.root.join("pg/data"),
             self.port,
+            deadline,
         )
         .await
         .ok_or(DaemonError::PgStartFailed)?;
@@ -313,10 +378,14 @@ impl Postgres {
         {
             return Err(DaemonError::PgStartFailed);
         }
-        Ok(())
+        ready_result(deadline, Ok(()))
     }
-    async fn connect(&mut self, database: &str) -> Result<Connection, DaemonError> {
-        self.connection_identity_gate().await?;
+    async fn connect(
+        &mut self,
+        database: &str,
+        deadline: Instant,
+    ) -> Result<Connection, DaemonError> {
+        self.connection_identity_gate(deadline).await?;
         let mut config = tokio_postgres::Config::new();
         config
             .host("127.0.0.1")
@@ -326,23 +395,27 @@ impl Postgres {
             .dbname(database)
             .application_name("openmybot")
             .connect_timeout(Duration::from_secs(1));
-        let (client, connection) = timeout(
-            Duration::from_secs(2),
+        ready_result(deadline, Ok(()))?;
+        let (client, connection) = timeout_at(
+            deadline.min(Instant::now() + Duration::from_secs(2)),
             config.connect(tokio_postgres::NoTls),
         )
         .await
         .map_err(|_| DaemonError::PgStartFailed)?
         .map_err(|_| DaemonError::PgStartFailed)?;
+        // No driver task exists yet; a late connection result drops both socket owners here.
+        ready_result(deadline, Ok(()))?;
         Ok(Connection {
             client: Some(client),
             driver: tokio::spawn(connection),
         })
     }
-    async fn verify_connection(&mut self) -> Result<u32, DaemonError> {
-        let connection = self.connect("postgres").await?;
+    async fn verify_connection(&mut self, deadline: Instant) -> Result<u32, DaemonError> {
+        let connection = self.connect("postgres", deadline).await?;
         let result=async {
             let client=connection.client.as_ref().ok_or(DaemonError::PgStartFailed)?;
-            let row=timeout(Duration::from_secs(2),client.query_one("SELECT current_setting('server_version_num'),current_setting('data_directory'),extract(epoch from pg_postmaster_start_time())::bigint",&[])).await.map_err(|_|DaemonError::PgStartFailed)?.map_err(|_|DaemonError::PgStartFailed)?;
+            ready_result(deadline,Ok(()))?;
+            let row=timeout_at(deadline.min(Instant::now()+Duration::from_secs(2)),client.query_one("SELECT current_setting('server_version_num'),current_setting('data_directory'),extract(epoch from pg_postmaster_start_time())::bigint",&[])).await.map_err(|_|DaemonError::PgStartFailed)?.map_err(|_|DaemonError::PgStartFailed)?;
             let version:String=row.try_get(0).map_err(|_|DaemonError::PgStartFailed)?;
             let version:u32=version.parse().map_err(|_|DaemonError::PgVersionRejected)?;
             if !(170000..180000).contains(&version) {return Err(DaemonError::PgVersionRejected);}
@@ -354,11 +427,13 @@ impl Postgres {
                 || fs::canonicalize(directory).ok()!=fs::canonicalize(self.root.join("pg/data")).ok() || (start-recorded).abs()>1 {return Err(DaemonError::PgStartFailed);}
             Ok(version)
         }.await;
-        connection.close().await?;
-        result
+        // The query future can time out, but the Connection owner is still here. Join its
+        // driver or abort+await it before deciding whether readiness is still timely.
+        connection.close_until(deadline).await?;
+        ready_result(deadline, result)
     }
     pub(crate) async fn create_database(&mut self) -> Result<(), DaemonError> {
-        let connection = self.connect("postgres").await?;
+        let connection = self.connect("postgres", Instant::now() + READY).await?;
         let result = async {
             timeout(
                 Duration::from_secs(10),
@@ -435,7 +510,17 @@ async fn process_identity(
     data: &Path,
     port: u16,
 ) -> Option<ProcessIdentity> {
-    let started = tool(
+    process_identity_until(pid, expected, data, port, Instant::now() + READY).await
+}
+async fn process_identity_until(
+    pid: u32,
+    expected: &Path,
+    data: &Path,
+    port: u16,
+    deadline: Instant,
+) -> Option<ProcessIdentity> {
+    ready_result(deadline, Ok(())).ok()?;
+    let started = tool_until(
         Path::new("/bin/ps"),
         &[
             "-p".into(),
@@ -443,6 +528,7 @@ async fn process_identity(
             "-o".into(),
             "lstart=".into(),
         ],
+        deadline,
     )
     .await
     .ok()?;
@@ -451,7 +537,7 @@ async fn process_identity(
         chrono::DateTime::parse_from_str(&format!("{started} +0000"), "%a %b %e %H:%M:%S %Y %z")
             .ok()?
             .timestamp();
-    let arguments = tool(
+    let arguments = tool_until(
         Path::new("/bin/ps"),
         &[
             "-ww".into(),
@@ -460,6 +546,7 @@ async fn process_identity(
             "-o".into(),
             "args=".into(),
         ],
+        deadline,
     )
     .await
     .ok()?;
@@ -478,7 +565,7 @@ async fn process_identity(
     let executable = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
     #[cfg(target_os = "macos")]
     let executable = {
-        let bytes = tool(
+        let bytes = tool_until(
             Path::new("/usr/sbin/lsof"),
             &[
                 "-a".into(),
@@ -488,6 +575,7 @@ async fn process_identity(
                 "txt".into(),
                 "-Fn".into(),
             ],
+            deadline,
         )
         .await
         .ok()?;
@@ -501,6 +589,7 @@ async fn process_identity(
     if actual.dev() != desired.dev() || actual.ino() != desired.ino() {
         return None;
     }
+    ready_result(deadline, Ok(())).ok()?;
     Some(ProcessIdentity {
         started,
         arguments,
@@ -580,6 +669,76 @@ pub(crate) async fn stop_stale(root: &Path, config: &Config) -> Result<(), Daemo
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn ready_deadline_bounds_identity_probe_and_rejects_late_success() {
+        // This is the exact child/pipe owner used by ps/lsof identity probes. Earlier probe
+        // time is already spent; the next helper cannot receive a fresh thirty seconds.
+        let deadline = Instant::now() + Duration::from_millis(150);
+        sleep(Duration::from_millis(100)).await;
+        let mut command = StdCommand::new("/bin/sleep");
+        command
+            .arg("60")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = Command::from(command).kill_on_drop(true).spawn().unwrap();
+        let pid = Pid::from_raw(child.id().unwrap() as i32).unwrap();
+        let result = run_tool_child(child, deadline).await;
+        assert_eq!(result, Err(DaemonError::PgStartFailed));
+        assert!(Instant::now() >= deadline);
+        assert!(Instant::now().duration_since(deadline) < Duration::from_secs(2));
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        assert_eq!(
+            rustix::process::test_kill_process_group(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        // No new identity tool may start after exhaustion, even when it would succeed at once.
+        assert_eq!(
+            tool_until(Path::new("/bin/true"), &[], deadline).await,
+            Err(DaemonError::PgStartFailed)
+        );
+        assert_eq!(
+            ready_result(deadline, Ok(170011_u32)),
+            Err(DaemonError::PgStartFailed)
+        );
+
+        // An established connection driver is retained outside query timeout cancellation.
+        // A private pending driver models that timeout without any database or listener.
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(Arc::clone(&destroyed));
+        let driver = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<Result<(), tokio_postgres::Error>>().await
+        });
+        let connection = Connection {
+            client: None,
+            driver,
+        };
+        assert_eq!(
+            connection.close_until(deadline).await,
+            Err(DaemonError::PgStartFailed)
+        );
+        assert!(
+            destroyed.load(Ordering::SeqCst),
+            "driver cancellation must be joined before return"
+        );
+        assert!(ready_result(Instant::now() + READY, Ok(170011_u32)).is_ok());
+    }
+    #[tokio::test]
     async fn unowned_listener_is_not_contacted_before_identity_gate() {
         // Test-only TCP placeholder: the production daemon has no bind entry.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -616,7 +775,7 @@ mod tests {
         for contents in [short, ready] {
             config::write_private(&path, contents.as_bytes(), false).unwrap();
             assert!(matches!(
-                instance.verify_connection().await,
+                instance.verify_connection(Instant::now() + READY).await,
                 Err(DaemonError::PgStartFailed)
             ));
             match listener.accept() {
@@ -633,7 +792,7 @@ mod tests {
         instance.spawned_at =
             fs::metadata(&path).unwrap().modified().unwrap() + Duration::from_secs(1);
         assert!(matches!(
-            instance.verify_connection().await,
+            instance.verify_connection(Instant::now() + READY).await,
             Err(DaemonError::PgStartFailed)
         ));
         assert_eq!(
