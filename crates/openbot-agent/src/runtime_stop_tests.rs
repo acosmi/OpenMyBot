@@ -22,6 +22,7 @@ enum Plan {
     Pending,
     Release(StopOutcome),
     Late(Duration),
+    PendingThenLate(tokio::time::Instant),
 }
 #[derive(Clone, Copy)]
 enum Stream {
@@ -67,6 +68,8 @@ struct Control {
     stream_started: AtomicBool,
     stop_calls: AtomicUsize,
     stop_polls: AtomicUsize,
+    late_pending: AtomicBool,
+    late_ready: StdMutex<Option<(tokio::time::Instant, tokio::time::Instant)>>,
     entered: Notify,
     context_entered: Notify,
     start_entered: Notify,
@@ -92,6 +95,8 @@ impl Control {
             stream_started: AtomicBool::new(false),
             stop_calls: AtomicUsize::new(0),
             stop_polls: AtomicUsize::new(0),
+            late_pending: AtomicBool::new(false),
+            late_ready: StdMutex::new(None),
             entered: Notify::new(),
             context_entered: Notify::new(),
             start_entered: Notify::new(),
@@ -176,7 +181,7 @@ impl ProviderSession for Session {
         let release = control.release.notified();
         tokio::pin!(release);
         poll_fn(|cx| {
-            control.stop_polls.fetch_add(1, AtomicOrdering::SeqCst);
+            let poll = control.stop_polls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             match plan {
                 Plan::Ready(result) => Poll::Ready(result),
                 Plan::Pending => Poll::Pending,
@@ -184,6 +189,19 @@ impl ProviderSession for Session {
                 Plan::Late(delay) => {
                     std::thread::sleep(delay);
                     Poll::Ready(Ok(StopOutcome::Confirmed { at: AT }))
+                }
+                Plan::PendingThenLate(ready_at) => {
+                    if poll == 1 {
+                        control.late_pending.store(true, AtomicOrdering::SeqCst);
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        let started = tokio::time::Instant::now();
+                        std::thread::sleep(ready_at.saturating_duration_since(started));
+                        let returned = tokio::time::Instant::now();
+                        *control.late_ready.lock().unwrap() = Some((started, returned));
+                        Poll::Ready(Ok(StopOutcome::Confirmed { at: AT }))
+                    }
                 }
             }
         })
@@ -698,6 +716,7 @@ async fn stop_helper_zero_budget_polls_once_and_only_preserves_default_unsupport
     .await;
     assert_eq!(result.outcome, StopOutcome::Unsupported);
     assert_eq!(default.calls(), 0);
+    assert!(!default.events().contains(&Seen::Renew));
     for plan in [
         Plan::Pending,
         Plan::Ready(Err(ProviderPortError::Unavailable)),
@@ -727,24 +746,18 @@ async fn stop_helper_rejects_late_ready_confirmation_without_budget_reset() {
     .await;
     assert_eq!(result.outcome, StopOutcome::Unknown);
     ordered(&c, Seen::StopDrop, Seen::SessionDrop);
-    let c = Arc::new(Control::new(
-        "late-release",
-        Plan::Release(StopOutcome::Confirmed { at: AT }),
-    ));
-    let release = async {
-        c.stopping.notified().await;
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        c.release.notify_one();
-    };
-    let (result, ()) = tokio::join!(
-        helper(
-            c.clone(),
-            Some(tokio::time::Instant::now() + Duration::from_millis(10)),
-            Duration::from_secs(1)
-        ),
-        release
-    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    let ready_at = deadline + Duration::from_millis(20);
+    let c = Arc::new(Control::new("late-repoll", Plan::PendingThenLate(ready_at)));
+    let result = helper(c.clone(), Some(deadline), Duration::from_secs(1)).await;
     assert_eq!(result.outcome, StopOutcome::Unknown);
+    assert!(c.late_pending.load(AtomicOrdering::SeqCst));
+    assert_eq!(c.stop_polls.load(AtomicOrdering::SeqCst), 2);
+    let (started, returned) = c.late_ready.lock().unwrap().expect("second poll returned");
+    assert!(started < deadline);
+    assert!(returned >= ready_at);
+    assert!(returned > deadline);
+    assert_eq!(c.calls(), 1);
     ordered(&c, Seen::StopDrop, Seen::SessionDrop);
 }
 #[tokio::test]
