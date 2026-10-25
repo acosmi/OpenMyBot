@@ -4567,6 +4567,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "omb-cli"
+version = "0.0.0"
+dependencies = [
+ "omb-daemon",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "omb-daemon"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "getrandom 0.4.3",
+ "openbot-application",
+ "openbot-computer",
+ "openbot-contracts",
+ "openbot-domain",
+ "openbot-infra",
+ "openbot-server",
+ "rustix",
+ "semver",
+ "serde",
+ "serde_json",
+ "subtle",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-postgres",
+ "toml 0.9.8",
+ "url",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
