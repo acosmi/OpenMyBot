@@ -18,7 +18,7 @@ use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
     task::JoinHandle,
-    time::{Instant, sleep, sleep_until, timeout, timeout_at},
+    time::{Instant, sleep_until, timeout, timeout_at},
 };
 
 const READY: Duration = Duration::from_secs(30);
@@ -750,6 +750,7 @@ pub(crate) async fn stop_stale(root: &Path, config: &Config) -> Result<(), Daemo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::sleep;
     #[tokio::test]
     async fn ready_deadline_bounds_identity_probe_and_rejects_late_success() {
         // This is the exact child/pipe owner used by ps/lsof identity probes. Earlier probe
