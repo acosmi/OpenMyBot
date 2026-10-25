@@ -24,6 +24,14 @@ use tokio::{
 const READY: Duration = Duration::from_secs(30);
 const STOP: Duration = Duration::from_secs(30);
 
+fn map_store_error(error: omb_store::StoreError) -> DaemonError {
+    match error {
+        omb_store::StoreError::MigrationDrift => DaemonError::OmbMigrationDrift,
+        omb_store::StoreError::SchemaNewer => DaemonError::OmbSchemaNewer,
+        omb_store::StoreError::MigrationFailed => DaemonError::OmbMigrationFailed,
+        omb_store::StoreError::ControlTokenFailed => DaemonError::ControlTokenFailed,
+    }
+}
 fn ready_result<T>(deadline: Instant, result: Result<T, DaemonError>) -> Result<T, DaemonError> {
     if Instant::now() >= deadline {
         Err(DaemonError::PgStartFailed)
@@ -431,6 +439,72 @@ impl Postgres {
         // driver or abort+await it before deciding whether readiness is still timely.
         connection.close_until(deadline).await?;
         ready_result(deadline, result)
+    }
+    pub(crate) async fn migrate_store(&mut self) -> Result<(), DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connection = self
+            .connect("openmybot", deadline)
+            .await
+            .map_err(|_| DaemonError::OmbMigrationFailed)?;
+        let result = match connection.client.as_mut() {
+            Some(client) => omb_store::migrate(client, deadline)
+                .await
+                .map(|_| ())
+                .map_err(map_store_error),
+            None => Err(DaemonError::OmbMigrationFailed),
+        };
+        let closed = connection.close_until(deadline).await;
+        result?;
+        if closed.is_err() {
+            return Err(DaemonError::OmbMigrationFailed);
+        }
+        if Instant::now() >= deadline {
+            return Err(DaemonError::OmbMigrationFailed);
+        }
+        result
+    }
+    pub(crate) async fn start_control_token(
+        &mut self,
+        input: omb_store::ControlTokenStart<'_>,
+    ) -> Result<(), DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connection = self
+            .connect("openmybot", deadline)
+            .await
+            .map_err(|_| DaemonError::ControlTokenFailed)?;
+        let result = match connection.client.as_mut() {
+            Some(client) => omb_store::start_control_token(client, input, deadline)
+                .await
+                .map(|_| ())
+                .map_err(map_store_error),
+            None => Err(DaemonError::ControlTokenFailed),
+        };
+        let closed = connection.close_until(deadline).await;
+        if closed.is_err() || Instant::now() >= deadline {
+            return Err(DaemonError::ControlTokenFailed);
+        }
+        result
+    }
+    pub(crate) async fn stop_control_token(
+        &mut self,
+        token_id: uuid::Uuid,
+    ) -> Result<(), DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connection = self
+            .connect("openmybot", deadline)
+            .await
+            .map_err(|_| DaemonError::ControlTokenFailed)?;
+        let result = match connection.client.as_mut() {
+            Some(client) => omb_store::stop_control_token(client, token_id, deadline)
+                .await
+                .map_err(map_store_error),
+            None => Err(DaemonError::ControlTokenFailed),
+        };
+        let closed = connection.close_until(deadline).await;
+        if closed.is_err() || Instant::now() >= deadline {
+            return Err(DaemonError::ControlTokenFailed);
+        }
+        result
     }
     pub(crate) async fn create_database(&mut self) -> Result<(), DaemonError> {
         let connection = self.connect("postgres", Instant::now() + READY).await?;

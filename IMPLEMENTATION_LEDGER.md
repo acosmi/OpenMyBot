@@ -2246,3 +2246,6 @@ This delivery is limited to the maintenance toolchain prerequisite. Complete app
 
 2026-10-25T14:21:25Z REPO-POLICY-20261024 PR227 merged as 8194ae6b4398ed1c5b43c53a7965f86ac9dc3074 from head 84cccb4b64aac75be15bf85b2151ebaf7283f1b1; publication-policy tests9passed/0failed, exact scope and merge graph verified; normal hooks and admin merge accepted.
 2026-10-25T14:57:06Z OMB-001 started on branch omb/omb-001-daemon-skeleton from origin/main 8194ae6b4398ed1c5b43c53a7965f86ac9dc3074; implementation and verification pending.
+
+2026-10-25T16:40:50Z OMB-001 PR228 merged as 4ca9758f710c00d41446b4405a2769e6db021423 from head 94ad681de77c3910ddf634c5d277545c3ba2f80e; both crate strict clippy exit0, 30 exact tests and 30 affected-target tests passed, startup/restart/shutdown races repeated10, normal CLI and isolated PostgreSQL17.11 lifecycle passed; whole-workspace fmt exit1 is an unchanged baseline failure, new-crate fmt exit0; independent review GO/P1=0 and exact merge parents/tree verified.
+2026-10-25T16:51:22.553027+00:00 OMB-002 started on branch omb/omb-002-store-migrations from origin/main 4ca9758f710c00d41446b4405a2769e6db021423; schema migration and directed verification pending.

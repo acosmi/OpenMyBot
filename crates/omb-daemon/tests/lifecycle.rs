@@ -237,7 +237,12 @@ async fn child_entry() -> bool {
     };
     std::process::exit(code)
 }
-async fn query_own(fixture: &Fixture, query: &str) -> Vec<tokio_postgres::Row> {
+async fn connect_own(
+    fixture: &Fixture,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
     let pid = fs::read_to_string(fixture.root.join("pg/data/postmaster.pid")).unwrap();
     let port: u16 = pid.lines().nth(3).unwrap().parse().unwrap();
     let password = fs::read_to_string(fixture.root.join("pg/password")).unwrap();
@@ -247,13 +252,36 @@ async fn query_own(fixture: &Fixture, query: &str) -> Vec<tokio_postgres::Row> {
         .port(port)
         .user("openmybot")
         .password(password)
-        .dbname("openmybot");
-    let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
-    let driver = tokio::spawn(connection);
-    let result = client.query(query, &[]).await;
+        .dbname("openmybot")
+        .connect_timeout(Duration::from_secs(1));
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(2),
+        config.connect(tokio_postgres::NoTls),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (client, tokio::spawn(connection))
+}
+async fn close_own(
+    client: tokio_postgres::Client,
+    mut driver: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
     drop(client);
-    driver.await.unwrap().unwrap();
-    result.unwrap()
+    match tokio::time::timeout(Duration::from_secs(5), &mut driver).await {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => {
+            driver.abort();
+            let _ = driver.await;
+            panic!("own test driver close timeout; cancelled and joined");
+        }
+    }
+}
+async fn query_own(fixture: &Fixture, query: &str) -> Vec<tokio_postgres::Row> {
+    let (client, driver) = connect_own(fixture).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), client.query(query, &[])).await;
+    close_own(client, driver).await;
+    result.unwrap().unwrap()
 }
 fn assert_private(path: &Path, mode: u32) {
     let meta = fs::symlink_metadata(path).unwrap();
@@ -371,7 +399,7 @@ async fn daemon_assembles_existing_engine_and_serves_status() {
     assert_eq!(rows[0].get::<_, String>(0), "170011");
     assert_eq!(rows[0].get::<_, String>(1), "America/Los_Angeles");
     assert_eq!(rows[0].get::<_, String>(2), "16kB");
-    assert_eq!(rows[0].get::<_, i64>(3), 0);
+    assert_eq!(rows[0].get::<_, i64>(3), 1);
     #[cfg(target_os = "macos")]
     {
         for protocol in ["tcp-listeners", "udp-bindings"] {
@@ -574,4 +602,335 @@ async fn startup_failure_releases_owned_pg_and_lock() {
         .open(fixture.root.join("run/daemon.lock"))
         .unwrap();
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+}
+
+async fn wait_for_token(fixture: &Fixture) {
+    let limit = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !fixture.root.join("run/control.token").exists() {
+        assert!(
+            tokio::time::Instant::now() < limit,
+            "own token publication deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+async fn inspect_stopped(fixture: &Fixture, query: &str) -> Vec<tokio_postgres::Row> {
+    let password = fs::read_to_string(fixture.root.join("pg/password")).unwrap();
+    let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+    for _ in 0..16 {
+        let mut bytes = [0; 2];
+        getrandom::fill(&mut bytes).unwrap();
+        let port = 49152 + u16::from_le_bytes(bytes) % 16384;
+        let out = fixture.root.join(format!("inspect-{port}.out"));
+        let err = fixture.root.join(format!("inspect-{port}.err"));
+        private_file(&out, b"");
+        private_file(&err, b"");
+        let child = Command::new(fixture.pg_bin.join("postgres"))
+            .arg("-D")
+            .arg(fixture.root.join("pg/data"))
+            .args([
+                "-c",
+                "listen_addresses=127.0.0.1",
+                "-c",
+                &format!("port={port}"),
+                "-c",
+                "unix_socket_directories=",
+            ])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(fs::OpenOptions::new().append(true).open(&out).unwrap())
+            .stderr(fs::OpenOptions::new().append(true).open(&err).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut owner = OwnedDaemon {
+            child: Some(child),
+            out,
+            err,
+        };
+        let pid = owner.pid();
+        let mut ready = false;
+        while tokio::time::Instant::now() < limit {
+            if owner.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                break;
+            }
+            let record =
+                fs::read_to_string(fixture.root.join("pg/data/postmaster.pid")).unwrap_or_default();
+            let lines: Vec<_> = record.lines().collect();
+            if lines.len() >= 8
+                && lines[0].parse::<u32>().ok() == Some(pid)
+                && lines[3].parse::<u16>().ok() == Some(port)
+                && lines[7].trim() == "ready"
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !ready {
+            if owner.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+                owner.signal(Signal::INT);
+            }
+            let _ = owner.wait().await;
+            continue;
+        }
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(port)
+            .user("openmybot")
+            .password(&password)
+            .dbname("openmybot")
+            .connect_timeout(Duration::from_secs(1));
+        let connected = tokio::time::timeout(
+            Duration::from_secs(2),
+            config.connect(tokio_postgres::NoTls),
+        )
+        .await;
+        let result = match connected {
+            Ok(Ok((client, connection))) => {
+                let driver = tokio::spawn(connection);
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    if query.starts_with("CREATE ") {
+                        client.batch_execute(query).await.map(|()| Vec::new())
+                    } else {
+                        client.query(query, &[]).await
+                    }
+                })
+                .await;
+                close_own(client, driver).await;
+                result
+                    .map_err(|_| "inspection query timeout")
+                    .and_then(|r| r.map_err(|_| "inspection query failed"))
+            }
+            _ => Err("inspection connection failed"),
+        };
+        owner.stop(Signal::INT).await;
+        return result.expect("own inspection result after child reaped");
+    }
+    panic!("own inspection PostgreSQL unavailable")
+}
+fn assert_runtime_released(fixture: &Fixture) {
+    fixture.no_pg();
+    assert!(!fixture.root.join("run/control.sock").exists());
+    assert!(!fixture.root.join("run/control.token").exists());
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.root.join("run/daemon.lock"))
+        .unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_runs_store_migrations_before_control_token_publication() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process =
+        fixture.spawn("daemon_runs_store_migrations_before_control_token_publication");
+    wait_for_token(&fixture).await;
+    let rows=query_own(&fixture,"SELECT (SELECT count(*)::bigint FROM openmybot.omb_migrations),(SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='openmybot')").await;
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, i64>(1), 6);
+    fixture.ready().await;
+    let token = fs::read(fixture.root.join("run/control.token")).unwrap();
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(&token).to_vec();
+    let rows=query_own(&fixture,"SELECT token_sha256,engine_pin,daemon_pid FROM openmybot.control_tokens WHERE revoked_at IS NULL").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, Vec<u8>>(0), digest);
+    assert_eq!(rows[0].get::<_, String>(1), env!("OMB_ENGINE_PIN"));
+    assert_eq!(rows[0].get::<_, i32>(2), process.pid() as i32);
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+#[tokio::test]
+#[ignore = "own PG17.11; ten fresh clusters; serial"]
+async fn daemon_restart_rotates_digest_and_records_restart_reason() {
+    if child_entry().await {
+        return;
+    }
+    for _ in 0..10 {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut first = fixture.spawn("daemon_restart_rotates_digest_and_records_restart_reason");
+        fixture.ready().await;
+        let old = fs::read(fixture.root.join("run/control.token")).unwrap();
+        let old_id = query_own(
+            &fixture,
+            "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+        )
+        .await[0]
+            .get::<_, uuid::Uuid>(0);
+        first.signal(Signal::KILL);
+        assert_eq!(first.wait().await, -1);
+        let mut second = fixture.spawn("daemon_restart_rotates_digest_and_records_restart_reason");
+        fixture.ready().await;
+        let next = fs::read(fixture.root.join("run/control.token")).unwrap();
+        assert_ne!(old, next);
+        let rows=query_own(&fixture,&format!("SELECT revoke_reason,revoked_at IS NOT NULL FROM openmybot.control_tokens WHERE token_id='{old_id}'")).await;
+        assert_eq!(rows[0].get::<_, String>(0), "daemon_restart");
+        assert!(rows[0].get::<_, bool>(1));
+        assert_eq!(
+            query_own(
+                &fixture,
+                "SELECT count(*)::bigint FROM openmybot.control_tokens WHERE revoked_at IS NULL"
+            )
+            .await[0]
+                .get::<_, i64>(0),
+            1
+        );
+        second.stop(Signal::TERM).await;
+        assert_runtime_released(&fixture);
+    }
+}
+#[tokio::test]
+#[ignore = "own PG17.11; ten repetitions for each signal; serial"]
+async fn daemon_stop_records_revocation_before_owned_pg_shutdown() {
+    if child_entry().await {
+        return;
+    }
+    for signal in [Signal::INT, Signal::TERM] {
+        for _ in 0..10 {
+            let fixture = Fixture::new();
+            fixture.initialize().await;
+            let mut process =
+                fixture.spawn("daemon_stop_records_revocation_before_owned_pg_shutdown");
+            fixture.ready().await;
+            let id = query_own(
+                &fixture,
+                "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+            )
+            .await[0]
+                .get::<_, uuid::Uuid>(0);
+            process.stop(signal).await;
+            assert_runtime_released(&fixture);
+            let rows=inspect_stopped(&fixture,&format!("SELECT revoke_reason,revoked_at IS NOT NULL FROM openmybot.control_tokens WHERE token_id='{id}'")).await;
+            assert_eq!(rows[0].get::<_, String>(0), "daemon_stop");
+            assert!(rows[0].get::<_, bool>(1));
+        }
+    }
+    for signal in [Signal::INT, Signal::TERM] {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut process = fixture.spawn("daemon_stop_records_revocation_before_owned_pg_shutdown");
+        fixture.ready().await;
+        let id = query_own(
+            &fixture,
+            "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+        )
+        .await[0]
+            .get::<_, uuid::Uuid>(0);
+        let (client, driver) = connect_own(&fixture).await;
+        let injected=tokio::time::timeout(Duration::from_secs(10),client.batch_execute("CREATE FUNCTION openmybot.fixture_stop_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.revoke_reason='daemon_stop' THEN RAISE EXCEPTION 'owned fixture stop failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_stop_failure BEFORE UPDATE ON openmybot.control_tokens FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_stop_failure()")).await;
+        close_own(client, driver).await;
+        injected.unwrap().unwrap();
+        process.signal(signal);
+        assert_eq!(process.wait().await, 5);
+        assert!(process.output().contains("control_token_failed"));
+        assert_runtime_released(&fixture);
+        let rows=inspect_stopped(&fixture,&format!("SELECT revoked_at IS NULL AND revoke_reason IS NULL FROM openmybot.control_tokens WHERE token_id='{id}'")).await;
+        assert!(rows[0].get::<_, bool>(0));
+    }
+}
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn migration_refusal_cleans_owned_pg_runtime_files_and_lock() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut first = fixture.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    fixture.ready().await;
+    first.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+    inspect_stopped(&fixture,"UPDATE openmybot.omb_migrations SET sha256=decode(repeat('00',32),'hex') RETURNING version").await;
+    let mut second = fixture.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    assert_eq!(second.wait().await, 4);
+    assert!(second.output().contains("omb_migration_drift"));
+    assert_runtime_released(&fixture);
+    let delayed = Fixture::new();
+    delayed.initialize().await;
+    let mut seed = delayed.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    delayed.ready().await;
+    seed.stop(Signal::TERM).await;
+    assert_runtime_released(&delayed);
+    inspect_stopped(&delayed,"CREATE FUNCTION openmybot.fixture_migration_delay() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF current_query() LIKE '%CREATE SCHEMA IF NOT EXISTS openmybot%' THEN PERFORM pg_sleep(35); END IF; END $$; CREATE EVENT TRIGGER fixture_migration_delay ON ddl_command_start EXECUTE FUNCTION openmybot.fixture_migration_delay(); SELECT true").await;
+    let mut failing = delayed.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    assert_eq!(failing.wait().await, 5);
+    assert!(failing.output().contains("omb_migration_failed"));
+    assert_runtime_released(&delayed);
+}
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn assembly_failure_after_token_insert_records_controlled_stop() {
+    if child_entry().await {
+        return;
+    }
+    for _ in 0..10 {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut setup =
+            fixture.spawn("assembly_failure_after_token_insert_records_controlled_stop");
+        fixture.ready().await;
+        setup.stop(Signal::TERM).await;
+        assert_runtime_released(&fixture);
+        // Test-only trigger establishes an observed barrier before insertion: the daemon holds
+        // marker and waits for the parent's gate lock. No timing assumption or product knob.
+        inspect_stopped(&fixture,"CREATE FUNCTION openmybot.fixture_insert_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(77881234); WHILE NOT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=77881235 AND granted AND pid<>pg_backend_pid()) LOOP PERFORM pg_sleep(0.01); END LOOP; PERFORM pg_advisory_xact_lock(77881235); RETURN NEW; END $$; CREATE TRIGGER fixture_gate BEFORE INSERT ON openmybot.control_tokens FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_insert_gate(); SELECT true").await;
+        let mut process =
+            fixture.spawn("assembly_failure_after_token_insert_records_controlled_stop");
+        let daemon_pid = process.pid();
+        wait_for_token(&fixture).await;
+        let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let row=query_own(&fixture,"SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=77881234 AND granted)").await;
+            if row[0].get::<_, bool>(0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "insert marker deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (client, driver) = connect_own(&fixture).await;
+        client
+            .query_one("SELECT pg_advisory_lock(77881235)", &[])
+            .await
+            .unwrap();
+        loop {
+            let row=query_own(&fixture,"SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=77881235 AND NOT granted)").await;
+            if row[0].get::<_, bool>(0) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < limit, "insert gate deadline");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(fixture.root.join("keys/vault-kek.key"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        client
+            .query_one("SELECT pg_advisory_unlock(77881235)", &[])
+            .await
+            .unwrap();
+        close_own(client, driver).await;
+        assert_eq!(process.wait().await, 5);
+        assert!(process.output().contains("engine_assembly_failed"));
+        assert_runtime_released(&fixture);
+        let rows=inspect_stopped(&fixture,&format!("SELECT token_id,revoke_reason,revoked_at IS NOT NULL FROM openmybot.control_tokens WHERE daemon_pid={daemon_pid}")).await;
+        assert_eq!(rows.len(), 1);
+        let _: uuid::Uuid = rows[0].get(0);
+        assert_eq!(rows[0].get::<_, String>(1), "daemon_stop");
+        assert!(rows[0].get::<_, bool>(2));
+    }
 }

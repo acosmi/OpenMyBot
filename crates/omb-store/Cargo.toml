@@ -1,0 +1,37 @@
+[package]
+name = "omb-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+testkit = []
+
+[dependencies]
+tokio-postgres.workspace = true
+tokio = { workspace = true, features = ["process"] }
+sha2.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+time.workspace = true
+getrandom.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+
+[[test]]
+name = "migrations"
+required-features = ["testkit"]
+
+[[test]]
+name = "schema"
+required-features = ["testkit"]
+
+[[test]]
+name = "control_tokens"
+required-features = ["testkit"]

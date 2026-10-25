@@ -37,7 +37,11 @@ pub(crate) struct Prepared {
     package: LoadedTenantPackage,
     principal: VerifiedSingleUserPrincipal,
 }
-pub(crate) async fn prepare(root: &Path, id: &str, pg: &Postgres) -> Result<Prepared, DaemonError> {
+pub(crate) async fn prepare(
+    root: &Path,
+    id: &str,
+    pg: &mut Postgres,
+) -> Result<Prepared, DaemonError> {
     let database = pg.database_config();
     let pool = pool::connect(&database)
         .await
@@ -56,6 +60,7 @@ pub(crate) async fn prepare(root: &Path, id: &str, pg: &Postgres) -> Result<Prep
     let principal = load_single_user_principal(&pool, deployment.clone(), tenant.clone())
         .await
         .map_err(|_| DaemonError::EngineInitializationFailed)?;
+    pg.migrate_store().await?;
     let package = tenant::write_and_load(root, id)?;
     let audience = TenantPackageAudienceContext::single_user(ActorId::new(SINGLE_USER_ACTOR_ID))
         .map_err(|_| DaemonError::TenantPackageFailed)?;

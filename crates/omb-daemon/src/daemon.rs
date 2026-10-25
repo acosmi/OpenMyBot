@@ -23,10 +23,16 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     config::remove_runtime(root, "run/control.token")?;
     let mut postgres = Postgres::start(root, &config).await?;
     let mut engine = None;
+    let mut token_id = None;
+    use sha2::Digest as _;
     let result=async {
-        let prepared=engine::prepare(root,&config.deployment_id,&postgres).await?;
+        let prepared=engine::prepare(root,&config.deployment_id,&mut postgres).await?;
         let token=config::hex_random(config::TOKEN_BYTES).map_err(|_|DaemonError::ControlTokenFailed)?;
         config::write_private(&root.join("run/control.token"),token.as_bytes(),true).map_err(|_|DaemonError::ControlTokenFailed)?;
+        let current_token_id=uuid::Uuid::now_v7();
+        token_id=Some(current_token_id);
+        let token_sha256:[u8;32]=sha2::Sha256::digest(token.as_bytes()).into();
+        postgres.start_control_token(omb_store::ControlTokenStart{token_id:current_token_id,token_sha256,daemon_pid:i32::try_from(std::process::id()).map_err(|_|DaemonError::ControlTokenFailed)?,engine_pin:ENGINE_PIN,omb_version:env!("CARGO_PKG_VERSION")}).await?;
         engine=Some(engine::assemble(root,prepared).await?);
         let path=root.join("run/control.sock");
         let listener=UnixListener::bind(&path).map_err(|_|DaemonError::ControlSocketFailed)?;
@@ -64,11 +70,16 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     if let Some(engine) = engine {
         engine.shutdown().await;
     }
+    let revoked = match token_id {
+        Some(id) => postgres.stop_control_token(id).await,
+        None => Ok(()),
+    };
     let stopped = postgres.stop().await;
     let socket = config::remove_runtime(root, "run/control.sock");
     let token = config::remove_runtime(root, "run/control.token");
     stopped?;
     socket?;
     token?;
-    result
+    result?;
+    revoked
 }

@@ -4579,6 +4579,7 @@ dependencies = [
 name = "omb-daemon"
 version = "0.0.0"
 dependencies = [
+ "omb-store",
  "chrono",
  "getrandom 0.4.3",
  "openbot-application",
@@ -4591,12 +4592,29 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
  "toml 0.9.8",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "omb-store"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "rustix",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]
