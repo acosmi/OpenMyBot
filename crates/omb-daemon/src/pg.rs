@@ -453,7 +453,7 @@ impl Postgres {
     }
     async fn force_reap(&mut self, pid: Pid) -> Result<(), DaemonError> {
         let _ = rustix::process::kill_process_group(pid, Signal::KILL);
-        let killed = self.child.kill().await;
+        let killed = self.child.start_kill();
         let waited = timeout(STOP, self.child.wait()).await;
         match (killed, waited) {
             (_, Ok(Ok(_))) => Ok(()),
