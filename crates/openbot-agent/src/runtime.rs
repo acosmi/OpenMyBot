@@ -1,9 +1,10 @@
 //! Built-in Agent dispatch consumer/host；pure decisions remain in `openbot-domain::agent`。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::{Future, pending};
+use std::future::{Future, pending, poll_fn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -11,10 +12,11 @@ use openbot_application::{
     AgentAudit, AgentAuditKind, AgentContextError, AgentContextSource, DurableTextRun,
     NoRemoteInterruptCoordinator, ProviderAdapter, ProviderEvent, ProviderFailure,
     ProviderPortError, ProviderRateCard, ProviderRemoteInterruptBatch, ProviderRemoteResume,
-    ProviderRoute, RemoteInterruptCoordinator, RemoteInterruptError, RunCancellationDisposition,
-    RunCostCap, RunDispatchConsumer, RunDispatchDecision, RunExecutionLease, RunFailureCode,
-    RunRuntime, RunRuntimeError, RunTerminal, RunTokenUsageReceipt, RunToolExchange,
-    ToolCancellationHandle, ToolCancellationReason, tool_execution_cancellation,
+    ProviderRoute, ProviderSession, RemoteInterruptCoordinator, RemoteInterruptError,
+    RunCancellationDisposition, RunCostCap, RunDispatchConsumer, RunDispatchDecision,
+    RunExecutionLease, RunFailureCode, RunRuntime, RunRuntimeError, RunTerminal,
+    RunTokenUsageReceipt, RunToolExchange, StopOutcome, ToolCancellationHandle,
+    ToolCancellationReason, tool_execution_cancellation,
 };
 use openbot_contracts::components::is_component_human_decision_name;
 use openbot_domain::agent::{
@@ -44,6 +46,7 @@ pub const DEFAULT_AGENT_TOOL_CONCURRENCY: usize = 8;
 pub const MAX_AGENT_TOOL_CONCURRENCY: usize = 256;
 /// Bounded grace for a protocol-aware tool to transmit cancellation and stop its child.
 const TOOL_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
+const PROVIDER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Built-in runtime configuration。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -813,30 +816,50 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
             tokio::select! {
                 changed = activation.cancel.changed() => {
                     if changed.is_err() || *activation.cancel.borrow() {
+                        let stopped = request_provider_stop(session.as_mut(), deadline, &mut renew,
+                            inner.runtime.as_ref(), lease, false).await;
                         drop(session);
+                        if stopped.lease_lost {
+                            drive_terminal_event(&mut state, &mut journal, AgentEvent::LeaseLost).await;
+                        } else if stopped.outcome == StopOutcome::Unknown {
+                            commit_provider_stop_unknown(&mut state, &mut journal, inner.audit.as_ref(),
+                                lease, None).await;
+                        } else {
+                            cancel_and_commit(
+                                &mut state,
+                                &mut journal,
+                                inner.audit.as_ref(),
+                                lease,
+                                CancellationSource::User,
+                            ).await;
+                        }
+                        return;
+                    }
+                }
+                () = wait_optional(deadline) => {
+                    let stopped = request_provider_stop(session.as_mut(), deadline, &mut renew,
+                        inner.runtime.as_ref(), lease, false).await;
+                    drop(session);
+                    if stopped.lease_lost {
+                        drive_terminal_event(&mut state, &mut journal, AgentEvent::LeaseLost).await;
+                    } else if stopped.outcome == StopOutcome::Unknown {
+                        commit_provider_stop_unknown(&mut state, &mut journal, inner.audit.as_ref(),
+                            lease, Some(AgentAuditKind::RunDeadlineExceeded)).await;
+                    } else {
                         cancel_and_commit(
                             &mut state,
                             &mut journal,
                             inner.audit.as_ref(),
                             lease,
-                            CancellationSource::User,
+                            CancellationSource::Deadline,
                         ).await;
-                        return;
                     }
-                }
-                () = wait_optional(deadline) => {
-                    drop(session);
-                    cancel_and_commit(
-                        &mut state,
-                        &mut journal,
-                        inner.audit.as_ref(),
-                        lease,
-                        CancellationSource::Deadline,
-                    ).await;
                     return;
                 }
                 _ = renew.tick() => {
                     if inner.runtime.renew_lease(lease).await.is_err() {
+                        request_provider_stop(session.as_mut(), deadline, &mut renew,
+                            inner.runtime.as_ref(), lease, true).await;
                         drop(session);
                         drive_terminal_event(&mut state, &mut journal, AgentEvent::LeaseLost).await;
                         return;
@@ -895,6 +918,30 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
                             return;
                         }
                         break SamplingOutcome::Interrupted(batch);
+                    }
+                    Ok(Some(ProviderEvent::Failed(ProviderFailure::StreamStalled))) => {
+                        let stopped = request_provider_stop(session.as_mut(), deadline, &mut renew,
+                            inner.runtime.as_ref(), lease, false).await;
+                        drop(session);
+                        if stopped.lease_lost {
+                            drive_terminal_event(&mut state, &mut journal, AgentEvent::LeaseLost).await;
+                        } else if stopped.outcome == StopOutcome::Unknown {
+                            commit_provider_stop_unknown(&mut state, &mut journal, inner.audit.as_ref(),
+                                lease, Some(AgentAuditKind::StreamStalled)).await;
+                        } else {
+                            let sampling = ProviderSamplingContext {
+                                max_output_tokens, usage_seen: &mut usage_seen,
+                                current_text_seen: &mut current_text_seen,
+                                runtime: inner.runtime.as_ref(), lease, sampling_index,
+                                max_run_output_tokens: run_output_ceiling.flatten(),
+                                rate_card: run_rate_card.as_ref().and_then(Option::as_ref),
+                                cost_cap: run_cost_cap.as_ref().and_then(Option::as_ref),
+                                audit: inner.audit.as_ref(),
+                            };
+                            handle_provider_event(&mut state, &mut journal,
+                                ProviderEvent::Failed(ProviderFailure::StreamStalled), sampling).await;
+                        }
+                        return;
                     }
                     Ok(Some(event)) => {
                         let sampling = ProviderSamplingContext {
@@ -1821,6 +1868,103 @@ async fn reject_cost_budget_before_provider(
     }
 }
 
+struct ProviderStopObservation {
+    outcome: StopOutcome,
+    lease_lost: bool,
+}
+
+fn stop_result(
+    result: Result<StopOutcome, ProviderPortError>,
+    deadline: tokio::time::Instant,
+    first_poll: bool,
+) -> StopOutcome {
+    match result {
+        Ok(StopOutcome::Unsupported) if first_poll => StopOutcome::Unsupported,
+        Ok(outcome) if tokio::time::Instant::now() < deadline => {
+            if let StopOutcome::Confirmed { at } = outcome {
+                tracing::debug!(stop_confirmed_at = ?at, "provider stop confirmed");
+            }
+            outcome
+        }
+        _ => StopOutcome::Unknown,
+    }
+}
+
+async fn request_provider_stop(
+    session: &mut dyn ProviderSession,
+    run_deadline: Option<tokio::time::Instant>,
+    renew: &mut tokio::time::Interval,
+    runtime: &dyn RunRuntime,
+    lease: &RunExecutionLease,
+    mut lease_lost: bool,
+) -> ProviderStopObservation {
+    let cap = tokio::time::Instant::now() + PROVIDER_STOP_TIMEOUT;
+    let deadline = run_deadline.map_or(cap, |run| run.min(cap));
+    let mut stop = session.request_stop();
+    // Poll once even at an expired deadline: the default Unsupported has no wait or I/O.
+    // A blocking adapter poll cannot be preempted; late confirmation still earns no proof.
+    let first = poll_fn(|cx| Poll::Ready(stop.as_mut().poll(cx))).await;
+    if let Poll::Ready(result) = first {
+        return ProviderStopObservation {
+            outcome: stop_result(result, deadline, true),
+            lease_lost,
+        };
+    }
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return ProviderStopObservation {
+                outcome: StopOutcome::Unknown,
+                lease_lost,
+            };
+        }
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                return ProviderStopObservation { outcome: StopOutcome::Unknown, lease_lost };
+            }
+            result = &mut stop => {
+                return ProviderStopObservation { outcome: stop_result(result, deadline, false), lease_lost };
+            }
+            _ = renew.tick(), if !lease_lost => {
+                match tokio::time::timeout_at(deadline, runtime.renew_lease(lease)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => lease_lost = true,
+                    Err(_) => return ProviderStopObservation { outcome: StopOutcome::Unknown, lease_lost },
+                }
+            }
+        }
+    }
+}
+
+async fn commit_provider_stop_unknown(
+    state: &mut AgentState,
+    journal: &mut DurableTextRun,
+    audit: &dyn AgentAudit,
+    lease: &RunExecutionLease,
+    audit_kind: Option<AgentAuditKind>,
+) {
+    if let Some(kind) = audit_kind {
+        match kind {
+            AgentAuditKind::RunDeadlineExceeded => {
+                metrics::counter!("openbot_agent_run_deadline_total").increment(1)
+            }
+            AgentAuditKind::StreamStalled => {
+                metrics::counter!("openbot_agent_stream_stalled_total").increment(1)
+            }
+            _ => {}
+        }
+        if audit.record(lease, kind).await.is_err() {
+            tracing::warn!("provider stop remains unknown after lifecycle audit failure");
+        }
+    }
+    drive_terminal_event(
+        state,
+        journal,
+        AgentEvent::ProviderFailed(AgentFailure::ProviderStopUnknown),
+    )
+    .await;
+}
+
 async fn cancel_and_commit(
     state: &mut AgentState,
     journal: &mut DurableTextRun,
@@ -1934,6 +2078,7 @@ const fn failure_code(failure: AgentFailure) -> RunFailureCode {
         AgentFailure::ProviderRateLimited => RunFailureCode::ProviderRateLimited,
         AgentFailure::ProviderUnavailable => RunFailureCode::ProviderUnavailable,
         AgentFailure::ProviderCommitUnknown => RunFailureCode::ProviderCommitUnknown,
+        AgentFailure::ProviderStopUnknown => RunFailureCode::ProviderStopUnknown,
         AgentFailure::ProviderInvalidResponse => RunFailureCode::ProviderInvalidResponse,
         AgentFailure::ProviderStreamStalled => RunFailureCode::ProviderStreamStalled,
         AgentFailure::ProviderGenerationFailed => RunFailureCode::ProviderGenerationFailed,
@@ -1976,6 +2121,10 @@ fn bind_custom_model(
     }
     true
 }
+
+#[cfg(test)]
+#[path = "runtime_stop_tests.rs"]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {

@@ -195,6 +195,8 @@ pub enum AgentFailure {
     ProviderUnavailable,
     /// Provider request may have been sent but no response headers became knowable。
     ProviderCommitUnknown,
+    /// Provider 停止请求的结果未获确认。
+    ProviderStopUnknown,
     /// Provider schema/sequence invalid。
     ProviderInvalidResponse,
     /// Real read gap exceeded watchdog。
@@ -599,11 +601,16 @@ fn begin_terminal(state: &mut AgentState, terminal: AgentTerminal) -> Vec<AgentE
 const fn failure_terminal(failure: AgentFailure) -> AgentTerminal {
     match failure {
         AgentFailure::ProviderCommitUnknown
+        | AgentFailure::ProviderStopUnknown
         | AgentFailure::RuntimeLeaseLost
         | AgentFailure::JournalCommitUnknown => AgentTerminal::ReconciliationRequired(failure),
         _ => AgentTerminal::Failed(failure),
     }
 }
+
+#[cfg(test)]
+#[path = "agent_stop_tests.rs"]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {

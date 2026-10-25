@@ -197,7 +197,7 @@ pub use provider::{
     RemoteAguiRoute, RemoteAguiTransport, RemoteAguiTransportError, RemoteInterruptCoordinator,
     RemoteInterruptError, RemoteInterruptPending, RemoteInterruptPendingInput,
     RemoteInterruptResolutionReceipt, RunModelBinding, RunModelCredentialPolicy,
-    RunModelDatasetInitialOrigin, RunModelDatasetSnapshot, RunModelV2Snapshot,
+    RunModelDatasetInitialOrigin, RunModelDatasetSnapshot, RunModelV2Snapshot, StopOutcome,
 };
 pub use run_cost_budget::{
     NoRunCostBudgetAdministration, RunCostBudgetAdministration, RunCostBudgetAdministrationError,
