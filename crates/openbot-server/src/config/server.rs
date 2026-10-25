@@ -220,8 +220,12 @@ impl std::fmt::Debug for ConfiguredServerJournalInstallationId {
 }
 
 /// Server 启动配置。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ServerConfig {
+    /// Original owner-held recovery configuration. It is linear and redacted;
+    /// this source seal alone is not a startup, database or Current grant.
+    #[cfg(unix)]
+    pub recovery_host: Option<openbot_infra::recovery_control::VerifiedServiceRecoveryHost>,
     /// 监听端口。缺省 [`DEFAULT_PORT`]。
     pub port: u16,
     /// 部署形态。见 [`DeploymentEnvironment`]。
@@ -280,7 +284,9 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// 从一张环境映射解析。**纯函数**：不读进程环境（理由见 [`crate::config::env`]）。
+    /// 从唯一环境快照解析，不读取进程环境。既有字段仍按原纯解析器处理；
+    /// 必需的 `WROK_BOT_RECOVERY_CONFIG` 另外经 Infra 原受信文件 producer
+    /// 真实核验 owner、FD 和闭键内容，不把一个路径当作宿主授权。
     ///
     /// # 顺序是契约的一部分
     ///
@@ -358,11 +364,54 @@ impl ServerConfig {
             })
             .map(|value| env::strip_trailing_slashes(&value).to_owned());
 
+        #[cfg(unix)]
+        let recovery_host = match env::optional(env_map, "WROK_BOT_RECOVERY_CONFIG") {
+            None => {
+                problems.push(ConfigProblem::Malformed {
+                    variable: "WROK_BOT_RECOVERY_CONFIG",
+                    expectation: Expectation::NonEmptySecret,
+                });
+                None
+            }
+            Some(path) => match openbot_infra::recovery_control::load_service_recovery_host_from_config(
+                std::path::Path::new(path),
+            ) {
+                Ok(host) => Some(host),
+                Err(_) => {
+                    // Preserve the existing closed, value-free transport
+                    // vocabulary. The original expectation label is coarse:
+                    // this is a private configuration object, not a policy.
+                    problems.push(ConfigProblem::Malformed {
+                        variable: "WROK_BOT_RECOVERY_CONFIG",
+                        expectation: Expectation::ActionPolicyObject,
+                    });
+                    None
+                }
+            },
+        };
+        // The registered real producer is Unix. Unsupported hosts cannot
+        // return a usable ServerConfig or fall back to an ungated startup.
+        #[cfg(not(unix))]
+        problems.push(ConfigProblem::Malformed {
+            variable: "WROK_BOT_RECOVERY_CONFIG",
+            expectation: Expectation::ActionPolicyObject,
+        });
+
         if let Some(error) = ConfigError::new(problems) {
             return Err(error);
         }
 
+        #[cfg(unix)]
+        let recovery_host = recovery_host.ok_or_else(|| {
+            ConfigError::new(vec![ConfigProblem::Malformed {
+                variable: "WROK_BOT_RECOVERY_CONFIG",
+                expectation: Expectation::ActionPolicyObject,
+            }]).expect("a fixed nonempty problem list")
+        })?;
+
         Ok(Self {
+            #[cfg(unix)]
+            recovery_host: Some(recovery_host),
             port,
             deployment_environment,
             deployment_id: env::optional(env_map, "DEPLOYMENT_ID").map(str::to_owned),

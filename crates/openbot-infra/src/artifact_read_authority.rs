@@ -211,6 +211,10 @@ impl PostgresArtifactReadAuthority {
             return Err(ArtifactReadCurrentError::Unavailable.into());
         }
         let original = auth.request_binding().ok_or_else(host_unavailable)?;
+        let recovery_admission = original
+            .borrow_recovery_admission_before(auth, deadline)
+            .await
+            .map_err(ArtifactReadCurrentError::Host)?;
         let target = Arc::new(RequestedRunInputMetadataTarget {
             id: artifact_id.to_owned(),
             auth: auth.clone(),
@@ -231,9 +235,16 @@ impl PostgresArtifactReadAuthority {
             target: Arc::downgrade(&target),
         };
         // A filled inner result is never a substitute for complete outer Host/control success.
-        let witness = original
+        recovery_admission
+            .verify_current_before(original, auth, deadline)
+            .map_err(ArtifactReadCurrentError::Host)?;
+        let witness_result = original
             .verify_artifact_read_control_current_before(auth, target.as_ref(), deadline)
-            .await?;
+            .await;
+        recovery_admission
+            .verify_current_before(original, auth, deadline)
+            .map_err(ArtifactReadCurrentError::Host)?;
+        let witness = witness_result?;
         original.verify_artifact_read_control_tail(auth, witness.as_ref(), deadline)?;
         remaining(deadline)?;
         if target.closure_unproven.load(Ordering::SeqCst) {
@@ -250,6 +261,9 @@ impl PostgresArtifactReadAuthority {
         if target.closure_unproven.load(Ordering::SeqCst) {
             return Err(ArtifactReadCurrentError::Unavailable.into());
         }
+        recovery_admission
+            .verify_current_before(original, auth, deadline)
+            .map_err(ArtifactReadCurrentError::Host)?;
         result.map_err(Into::into)
     }
 

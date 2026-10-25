@@ -4756,6 +4756,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots",
+ "wrok-bot-macos-process",
  "zeroize",
 ]
 

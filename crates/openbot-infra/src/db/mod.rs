@@ -35,6 +35,7 @@ pub mod initialization;
 pub mod native;
 pub(crate) mod occupancy;
 pub mod pool;
+pub(crate) mod restore_reconfirmation_schema;
 pub mod schema_facts;
 pub mod tables;
 pub mod thread_history_admission_schema;

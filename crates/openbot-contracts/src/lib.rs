@@ -99,6 +99,7 @@ pub mod policy;
 pub mod reconciliation;
 pub mod remote_interrupt;
 pub mod request_binding;
+pub mod recovery;
 pub mod revision;
 pub mod runtime_capabilities;
 pub mod sandboxed;
@@ -126,6 +127,10 @@ pub use request_binding::{
     HostRequestBindingIdentity, HostRequestBindingKind, MAX_SERVER_SESSION_EPOCH_LOOKUP_BYTES,
     RequestBindingAttachError, RequestBindingIssuer, RequestBindingOwnerLease,
     RequestBindingOwnerObservation, ServerSessionBindingIdentity, VerifiedHostRequestBinding,
+};
+pub use recovery::{
+    RecoveryAdmissionLease, RecoveryAdmissionPurpose, RecoveryAdmissionWitness,
+    RecoveryHostReadPort,
 };
 pub use request_binding::{
     CustomModelCatalogHostObservation, CustomModelCatalogHostObservationParts,

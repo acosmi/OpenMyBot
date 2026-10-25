@@ -30,6 +30,138 @@ use super::clock::{self, OperationClock};
 use super::limits::{self, CapacityObservation, MaintenanceProfile, MaterialCounters};
 use super::protocol::{self, StatusRecord, StatusTrail};
 
+#[cfg(feature = "postgres-supervisor")]
+#[path = "restore_isolation.rs"]
+mod restore_isolation;
+
+#[cfg(feature = "postgres-supervisor")]
+use restore_isolation::{IsolationFailure, RestoreIsolationPolicy};
+
+// No child exists on these failures. Legacy maintenance callers retain their
+// original closed mapping; the restore owner additionally keeps native spawn IO.
+struct NativeSpawnFailure {
+    fault: MaintenanceError,
+    original_io: Option<std::io::Error>,
+}
+impl From<MaintenanceError> for NativeSpawnFailure {
+    fn from(fault: MaintenanceError) -> Self { Self { fault, original_io: None } }
+}
+impl From<std::io::Error> for NativeSpawnFailure {
+    fn from(error: std::io::Error) -> Self {
+        Self { fault: MaintenanceError::IoFailure, original_io: Some(error) }
+    }
+}
+#[cfg(feature = "postgres-supervisor")]
+enum RestoreProgramFailure {
+    Isolation(IsolationFailure),
+    Bundle(MaintenanceError),
+    OriginalSpawn(NativeSpawnFailure),
+    Identity(wrok_bot_macos_process::ProcessObservationError),
+    ClosingGate(MaintenanceError),
+    OriginalStopUnknown,
+}
+
+#[cfg(feature = "postgres-supervisor")]
+enum RestoreStopState {
+    Entered,
+    Returned(Result<(), std::io::Error>),
+}
+#[cfg(feature = "postgres-supervisor")]
+struct RestoreProgramOwner {
+    original: ProgramOwner,
+    identity: Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError>,
+    generation: [u64; 3],
+    stop: Option<RestoreStopState>,
+    post_directories: Result<(), IsolationFailure>,
+    post_software: Result<(), MaintenanceError>,
+}
+
+// The full restore session/candidate/config producer is a separately registered
+// dependency. This adapter mints no authority and never starts a replacement clock.
+#[cfg(feature = "postgres-supervisor")]
+fn spawn_restore_program(
+    policy: &RestoreIsolationPolicy<'_>,
+    bundle: &VerifiedMaintenanceBundle,
+    authenticated_config_args: &[OsString],
+    clock: &OperationClock,
+    secret: Arc<SecretBytes>,
+    limits: (u64, u64, bool),
+) -> Result<RestoreProgramOwner, RestoreProgramFailure> {
+    let generation = policy.generation_identity().map_err(RestoreProgramFailure::Isolation)?;
+    let command = policy.checked_postgres_command(bundle, authenticated_config_args)?;
+    policy.revalidate().map_err(RestoreProgramFailure::Isolation)?;
+    // This real sandbox-exec Command enters the original spawn body; no second
+    // Child/pipe abstraction, optional sandbox or unisolated fallback is used.
+    let original = spawn_program_retaining_io(command, "restore_postgres", clock, secret, false, limits, false)
+        .map_err(RestoreProgramFailure::OriginalSpawn)?;
+    // No fallible return drops a spawned Child. Capture failure remains resident
+    // with that owner and cannot authorize another native request.
+    let identity = wrok_bot_macos_process::ProcessIdentity::capture(original.pid);
+    let post_software = bundle.checked_command(Program::Postgres).map(|_| ());
+    let post_directories = policy.revalidate();
+    // Post-check failure stays WITH the original Child and raw identity outcome.
+    // The only remaining operations are original-resource stop/wait; no grant is
+    // returned and no failure path silently drops or restarts this process.
+    Ok(RestoreProgramOwner { original, identity, generation, stop: None,
+        post_directories, post_software })
+}
+
+#[cfg(feature = "postgres-supervisor")]
+fn request_restore_stop(
+    owner: &mut RestoreProgramOwner,
+    clock: &OperationClock,
+) -> Result<(), RestoreProgramFailure> {
+    if owner.stop.is_some() { return Err(RestoreProgramFailure::OriginalStopUnknown); }
+    // This is the still-resident, unreaped original Child, not a saved PID or
+    // reconstructed journal observer. No new pg_ctl process is created.
+    if owner.original.role != "restore_postgres"
+        || owner.original.child.id() != Some(owner.original.pid) {
+        return Err(RestoreProgramFailure::Identity(
+            wrok_bot_macos_process::ProcessObservationError::ObservationChanged));
+    }
+    owner.identity.as_ref().map_err(|error| RestoreProgramFailure::Identity(*error))?
+        .revalidate().map_err(RestoreProgramFailure::Identity)?;
+    let pid = i32::try_from(owner.original.pid).ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or(RestoreProgramFailure::Identity(
+            wrok_bot_macos_process::ProcessObservationError::InvalidPid))?;
+    clock.permit_closing_request().map_err(RestoreProgramFailure::ClosingGate)?;
+    owner.stop = Some(RestoreStopState::Entered);
+    let result = rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+        .map_err(std::io::Error::from);
+    let requested = result.is_ok();
+    owner.stop = Some(RestoreStopState::Returned(result));
+    // A successful signal request is not child exit, pipe join or a close receipt.
+    // An error/unknown retains the original result and never retries this request.
+    if requested { Ok(()) } else { Err(RestoreProgramFailure::OriginalStopUnknown) }
+}
+
+#[cfg(feature = "postgres-supervisor")]
+struct RestoreProgramResult {
+    tool: Result<ToolResult, MaintenanceError>,
+    identity: Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError>,
+    generation: [u64; 3],
+    stop: Option<RestoreStopState>,
+    post_directories: Result<(), IsolationFailure>,
+    post_software: Result<(), MaintenanceError>,
+}
+#[cfg(feature = "postgres-supervisor")]
+async fn wait_restore_program(
+    owner: RestoreProgramOwner,
+    capacity: &mut CapacityMonitor<'_>,
+    closing: bool,
+) -> RestoreProgramResult {
+    // Capturing a birth or requesting TERM never substitutes for this original
+    // wait and all original pipe joins. Both raw stop and identity outcomes stay.
+    let RestoreProgramOwner { original, identity, generation, stop,
+        post_directories, post_software } = owner;
+    // Only request_restore_stop may issue this restore owner's one TERM. The
+    // original wait's optional deadline TERM is disabled, so Unknown cannot send
+    // another native request. It still waits the same Child and joins all pipes.
+    RestoreProgramResult { tool: wait_program(original, capacity, closing, false).await,
+        identity, generation, stop, post_directories, post_software }
+}
+
 const ROLE: &str = "wrokbot_maintenance_fixture";
 const PORT: u16 = 5432;
 
@@ -1920,6 +2052,18 @@ fn command_secret_absent(command: &tokio::process::Command, secret: &[u8]) -> bo
             .any(|(k, v)| contains(k.as_bytes()) || v.is_some_and(|v| contains(v.as_bytes())))
 }
 fn spawn_program(
+    command: tokio::process::Command,
+    role: &'static str,
+    clock: &OperationClock,
+    secret: Arc<SecretBytes>,
+    write_secret: bool,
+    limits: (u64, u64, bool),
+    closing: bool,
+) -> Result<ProgramOwner, MaintenanceError> {
+    spawn_program_retaining_io(command, role, clock, secret, write_secret, limits, closing)
+        .map_err(|failure| failure.fault)
+}
+fn spawn_program_retaining_io(
     mut command: tokio::process::Command,
     role: &'static str,
     clock: &OperationClock,
@@ -1927,7 +2071,7 @@ fn spawn_program(
     write_secret: bool,
     (out_limit, err_limit, preview): (u64, u64, bool),
     closing: bool,
-) -> Result<ProgramOwner, MaintenanceError> {
+) -> Result<ProgramOwner, NativeSpawnFailure> {
     let started = if closing {
         clock.permit_closing_request()?;
         clock.observed()?
@@ -1937,7 +2081,7 @@ fn spawn_program(
     let effect_deadline = clock.effect();
     let args_env_clean = command_secret_absent(&command, secret.expose());
     if !args_env_clean {
-        return Err(MaintenanceError::SecretInvalid);
+        return Err(MaintenanceError::SecretInvalid.into());
     }
     let input = if write_secret {
         Some(Arc::clone(&secret))

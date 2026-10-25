@@ -72,6 +72,9 @@ impl std::error::Error for LaunchError {}
 /// 本机模式仅填充未配置项，仍需要真实 PG 与持久 Vault key，仍执行原安全校验。
 pub fn prepare_environment(mut input: EnvMap, local: bool) -> Result<EnvMap, LaunchError> {
     for name in input.keys().filter(|name| name.starts_with("WROK_BOT_")) {
+        if name == "WROK_BOT_RECOVERY_CONFIG" {
+            continue;
+        }
         let Some((_, legacy)) = VARIABLES.iter().find(|(brand, _)| *brand == name) else {
             return Err(LaunchError::UnknownVariable);
         };

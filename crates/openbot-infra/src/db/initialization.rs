@@ -9,6 +9,41 @@ use crate::db::pool::DatabasePool as Pool;
 use super::compat::{DataMigrationVerdict, check_migration_boundary_on};
 use super::{InfraError, fresh, native};
 
+/// Actual readonly startup resources and full results. This is neither a Fresh
+/// proof nor a constructor from a Pool/DatabaseOrigin. The original control
+/// owner keeps this packet before any postcheck and throughout runtime.
+pub(crate) struct OwnedExistingServerDatabase {
+    pub(crate) master: openbot_domain::vault::SecretBytes,
+    pub(crate) pool: Option<Result<Pool, InfraError>>,
+    pub(crate) client: Option<Result<super::pool::PooledClient, super::pool::PoolError>>,
+    pub(crate) identity: Option<Result<tokio_postgres::Row, tokio_postgres::Error>>,
+    pub(crate) canary: Option<Result<tokio_postgres::Row, tokio_postgres::Error>>,
+    pub(crate) known_restore: Option<Result<tokio_postgres::Row, tokio_postgres::Error>>,
+    pub(crate) native: Option<Result<(), InfraError>>,
+    pub(crate) writer_schema: Option<Result<(), InfraError>>,
+    pub(crate) layout: Option<Result<super::desktop_vault_canary::ValidatedDesktopVaultLayout, super::desktop_vault_canary::DesktopVaultCanaryError>>,
+    pub(crate) crypto: Option<Result<(), openbot_domain::vault::VaultError>>,
+}
+
+impl OwnedExistingServerDatabase {
+    pub(crate) fn new(master: openbot_domain::vault::SecretBytes) -> Self {
+        Self { master, pool: None, client: None, identity: None, canary: None,
+            known_restore: None, native: None, writer_schema: None, layout: None, crypto: None }
+    }
+
+    pub(crate) fn pool(&self) -> Result<&Pool, crate::recovery_control::RecoveryControlError> {
+        self.pool.as_ref().and_then(|value| value.as_ref().ok()).ok_or_else(||
+            crate::recovery_control::RecoveryControlError::new(crate::recovery_control::RecoveryControlFault::ClosureUnproven))
+    }
+}
+
+pub(crate) const EXISTING_SERVER_IDENTITY_SQL: &str = "SELECT pcs.system_identifier::text AS system_identifier, d.oid AS database_oid, pg_catalog.current_setting('server_version_num')::integer / 10000 AS pg_major, session_user::text AS authenticated_principal, current_user::text AS current_principal, pg_catalog.pg_get_userbyid(d.datdba)::text AS database_owner FROM pg_catalog.pg_control_system() pcs JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database()";
+
+// Bounds are enforced by PG before the row can allocate a large ciphertext or
+// caller-selected text. NULL is rejection, never an empty/missing canary.
+pub(crate) const EXISTING_SERVER_CANARY_SQL: &str = "SELECT CASE WHEN pg_catalog.octet_length(dataset_id)<=$3 THEN dataset_id ELSE NULL END AS dataset_id, CASE WHEN pg_catalog.octet_length(deployment_id)<=$3 THEN deployment_id ELSE NULL END AS deployment_id, CASE WHEN pg_catalog.octet_length(tenant_id)<=$3 THEN tenant_id ELSE NULL END AS tenant_id, CASE WHEN pg_catalog.octet_length(key_id)<=64 THEN key_id ELSE NULL END AS key_id, key_version, canary_schema, CASE WHEN pg_catalog.octet_length(encrypted_canary)<=4096 THEN encrypted_canary ELSE NULL END AS encrypted_canary FROM openbot_internal.desktop_vault_canaries WHERE deployment_id=$1 AND tenant_id=$2 AND key_version=1";
+
+
 /// The database origin recognized during this startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatabaseOrigin {

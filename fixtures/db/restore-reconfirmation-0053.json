@@ -1,0 +1,203 @@
+{
+  "format": "restore-reconfirmation-oracle-v1",
+  "nativeVersion": 53,
+  "migrationSha256": "865c13ccbae7e53f642df010221c29e648c775c3aa26e1014e130e53778c8988",
+  "schema": {
+    "functions": [
+      ["restore53_guard_insert", "6800894e870698cd10cd40bf064b7ad961c4514ff30997f997b5d1f71cd4929c"],
+      ["restore53_reject_mutation", "e476b418fdfb229e240b764c852e0d9c6d58d90a7b5c8855a33fb10a2f5148a5"]
+    ],
+    "tables": [
+      {
+        "name": "restore_pg_batches",
+        "columns": [
+          ["operation_id", "uuid", true, null, null],
+          ["epoch", "bytea", true, null, null],
+          ["batch_seq", "bigint", true, null, null],
+          ["action", "text", true, "pg_catalog.default", null],
+          ["affected_count", "bigint", true, null, null],
+          ["remaining_count", "bigint", true, null, null],
+          ["xact_id", "xid8", true, null, "pg_current_xact_id()"],
+          ["recorded_at", "timestamp with time zone", true, null, "clock_timestamp()"]
+        ],
+        "constraints": [
+          ["restore_pg_batches_action_check", "c", "CHECK ((action = ANY (ARRAY['auth_generation'::text, 'sessions_retired'::text, 'approvals_cancelled'::text, 'human_decisions_cancelled'::text, 'leases_expired'::text, 'capabilities_aborted'::text, 'oauth_states_retired'::text, 'callback_registrations_retired'::text, 'remote_interrupts_expired'::text, 'subject_requirements'::text, 'credential_requirements'::text])))"],
+          ["restore_pg_batches_counts_check", "c", "CHECK (((affected_count >= 0) AND (remaining_count >= 0)))"],
+          ["restore_pg_batches_epoch_check", "c", "CHECK (((octet_length(epoch) = 32) AND (epoch <> decode(repeat('00'::text, 32), 'hex'::text))))"],
+          ["restore_pg_batches_operation_fkey", "f", "FOREIGN KEY (operation_id, epoch) REFERENCES openbot_internal.restore_pg_operations(operation_id, epoch) ON UPDATE RESTRICT ON DELETE RESTRICT"],
+          ["restore_pg_batches_pkey", "p", "PRIMARY KEY (operation_id, batch_seq)"],
+          ["restore_pg_batches_sequence_check", "c", "CHECK ((batch_seq >= 1))"],
+          ["restore_pg_batches_time_check", "c", "CHECK (isfinite(recorded_at))"],
+          ["restore_pg_batches_uuid_check", "c", "CHECK ((operation_id <> '00000000-0000-0000-0000-000000000000'::uuid))"],
+          ["restore_pg_batches_xact_action_key", "u", "UNIQUE (operation_id, xact_id, action)"]
+        ],
+        "indexes": [
+          "CREATE UNIQUE INDEX restore_pg_batches_pkey ON openbot_internal.restore_pg_batches USING btree (operation_id, batch_seq)",
+          "CREATE UNIQUE INDEX restore_pg_batches_xact_action_key ON openbot_internal.restore_pg_batches USING btree (operation_id, xact_id, action)"
+        ],
+        "triggers": [
+          ["restore_pg_batches_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
+          ["restore_pg_batches_insert", 7, "openbot_internal", "restore53_guard_insert"],
+          ["restore_pg_batches_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+        ]
+      },
+      {
+        "name": "restore_pg_operations",
+        "columns": [
+          ["operation_id", "uuid", true, null, null],
+          ["epoch", "bytea", true, null, null],
+          ["candidate_generation", "uuid", true, null, null],
+          ["source_bundle_id", "uuid", true, null, null],
+          ["deployment_id", "text", true, "pg_catalog.C", null],
+          ["tenant_id", "text", true, "pg_catalog.C", null],
+          ["dataset_id", "text", true, "pg_catalog.C", null],
+          ["source_installation_id", "text", true, "pg_catalog.C", null],
+          ["target_installation_id", "text", true, "pg_catalog.C", null],
+          ["candidate_database_oid", "oid", true, null, null],
+          ["pg_system_identifier", "text", true, "pg_catalog.default", null],
+          ["profile_binding", "bytea", true, null, null],
+          ["max_batches", "bigint", true, null, null],
+          ["max_requirements", "bigint", true, null, null],
+          ["xact_id", "xid8", true, null, "pg_current_xact_id()"],
+          ["recorded_at", "timestamp with time zone", true, null, "clock_timestamp()"]
+        ],
+        "constraints": [
+          ["restore_pg_operations_binding_check", "c", "CHECK ((octet_length(profile_binding) = 32))"],
+          ["restore_pg_operations_candidate_epoch_key", "u", "UNIQUE (candidate_generation, epoch)"],
+          ["restore_pg_operations_caps_check", "c", "CHECK (((max_batches > 0) AND (max_requirements > 0)))"],
+          ["restore_pg_operations_epoch_check", "c", "CHECK (((octet_length(epoch) = 32) AND (epoch <> decode(repeat('00'::text, 32), 'hex'::text))))"],
+          ["restore_pg_operations_epoch_key", "u", "UNIQUE (epoch)"],
+          ["restore_pg_operations_identity_check", "c", "CHECK ((((octet_length(deployment_id) >= 1) AND (octet_length(deployment_id) <= 512)) AND (deployment_id !~ '[\u0001-\u001f\u007f-\u009f]'::text) AND ((octet_length(tenant_id) >= 1) AND (octet_length(tenant_id) <= 512)) AND (tenant_id !~ '[\u0001-\u001f\u007f-\u009f]'::text) AND ((octet_length(dataset_id) >= 1) AND (octet_length(dataset_id) <= 512)) AND (dataset_id !~ '[\u0001-\u001f\u007f-\u009f]'::text) AND ((octet_length(source_installation_id) >= 1) AND (octet_length(source_installation_id) <= 512)) AND (source_installation_id !~ '[\u0001-\u001f\u007f-\u009f]'::text) AND ((octet_length(target_installation_id) >= 1) AND (octet_length(target_installation_id) <= 512)) AND (target_installation_id !~ '[\u0001-\u001f\u007f-\u009f]'::text)))"],
+          ["restore_pg_operations_operation_epoch_key", "u", "UNIQUE (operation_id, epoch)"],
+          ["restore_pg_operations_pg_identity_check", "c", "CHECK (((candidate_database_oid <> '0'::oid) AND ((octet_length(pg_system_identifier) >= 1) AND (octet_length(pg_system_identifier) <= 20)) AND (pg_system_identifier ~ '^[0-9]+$'::text) AND (pg_system_identifier !~ '^0+$'::text)))"],
+          ["restore_pg_operations_pkey", "p", "PRIMARY KEY (operation_id)"],
+          ["restore_pg_operations_time_check", "c", "CHECK (isfinite(recorded_at))"],
+          ["restore_pg_operations_uuid_check", "c", "CHECK (((operation_id <> '00000000-0000-0000-0000-000000000000'::uuid) AND (candidate_generation <> '00000000-0000-0000-0000-000000000000'::uuid) AND (source_bundle_id <> '00000000-0000-0000-0000-000000000000'::uuid)))"]
+        ],
+        "indexes": [
+          "CREATE UNIQUE INDEX restore_pg_operations_candidate_epoch_key ON openbot_internal.restore_pg_operations USING btree (candidate_generation, epoch)",
+          "CREATE UNIQUE INDEX restore_pg_operations_epoch_key ON openbot_internal.restore_pg_operations USING btree (epoch)",
+          "CREATE UNIQUE INDEX restore_pg_operations_operation_epoch_key ON openbot_internal.restore_pg_operations USING btree (operation_id, epoch)",
+          "CREATE UNIQUE INDEX restore_pg_operations_pkey ON openbot_internal.restore_pg_operations USING btree (operation_id)"
+        ],
+        "triggers": [
+          ["restore_pg_operations_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
+          ["restore_pg_operations_insert", 7, "openbot_internal", "restore53_guard_insert"],
+          ["restore_pg_operations_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+        ]
+      },
+      {
+        "name": "restore_pg_seals",
+        "columns": [
+          ["operation_id", "uuid", true, null, null],
+          ["epoch", "bytea", true, null, null],
+          ["batches", "bigint", true, null, null],
+          ["subject_requirements", "bigint", true, null, null],
+          ["credential_requirements", "bigint", true, null, null],
+          ["xact_id", "xid8", true, null, "pg_current_xact_id()"],
+          ["recorded_at", "timestamp with time zone", true, null, "clock_timestamp()"]
+        ],
+        "constraints": [
+          ["restore_pg_seals_counts_check", "c", "CHECK (((batches >= 0) AND (subject_requirements >= 0) AND (credential_requirements >= 0)))"],
+          ["restore_pg_seals_epoch_check", "c", "CHECK (((octet_length(epoch) = 32) AND (epoch <> decode(repeat('00'::text, 32), 'hex'::text))))"],
+          ["restore_pg_seals_operation_fkey", "f", "FOREIGN KEY (operation_id, epoch) REFERENCES openbot_internal.restore_pg_operations(operation_id, epoch) ON UPDATE RESTRICT ON DELETE RESTRICT"],
+          ["restore_pg_seals_pkey", "p", "PRIMARY KEY (operation_id)"],
+          ["restore_pg_seals_time_check", "c", "CHECK (isfinite(recorded_at))"],
+          ["restore_pg_seals_uuid_check", "c", "CHECK ((operation_id <> '00000000-0000-0000-0000-000000000000'::uuid))"]
+        ],
+        "indexes": [
+          "CREATE UNIQUE INDEX restore_pg_seals_pkey ON openbot_internal.restore_pg_seals USING btree (operation_id)"
+        ],
+        "triggers": [
+          ["restore_pg_seals_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
+          ["restore_pg_seals_insert", 7, "openbot_internal", "restore53_guard_insert"],
+          ["restore_pg_seals_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+        ]
+      },
+      {
+        "name": "restore_reconfirm_receipts",
+        "columns": [
+          ["operation_id", "uuid", true, null, null],
+          ["epoch", "bytea", true, null, null],
+          ["requirement_id", "uuid", true, null, null],
+          ["confirmation_id", "uuid", true, null, null],
+          ["proof_ref", "uuid", true, null, null],
+          ["confirmed_by", "text", true, "pg_catalog.C", null],
+          ["proof_kind", "text", true, "pg_catalog.default", null],
+          ["xact_id", "xid8", true, null, "pg_current_xact_id()"],
+          ["recorded_at", "timestamp with time zone", true, null, "clock_timestamp()"]
+        ],
+        "constraints": [
+          ["restore_reconfirm_receipts_confirmation_key", "u", "UNIQUE (operation_id, confirmation_id)"],
+          ["restore_reconfirm_receipts_epoch_check", "c", "CHECK (((octet_length(epoch) = 32) AND (epoch <> decode(repeat('00'::text, 32), 'hex'::text))))"],
+          ["restore_reconfirm_receipts_identity_check", "c", "CHECK ((((octet_length(confirmed_by) >= 1) AND (octet_length(confirmed_by) <= 512)) AND (confirmed_by !~ '[\u0001-\u001f\u007f-\u009f]'::text)))"],
+          ["restore_reconfirm_receipts_operation_fkey", "f", "FOREIGN KEY (operation_id, epoch) REFERENCES openbot_internal.restore_pg_operations(operation_id, epoch) ON UPDATE RESTRICT ON DELETE RESTRICT"],
+          ["restore_reconfirm_receipts_pkey", "p", "PRIMARY KEY (requirement_id)"],
+          ["restore_reconfirm_receipts_proof_check", "c", "CHECK ((proof_kind = ANY (ARRAY['fresh_actor'::text, 'fresh_local_os'::text, 'fresh_service_operator'::text])))"],
+          ["restore_reconfirm_receipts_proof_key", "u", "UNIQUE (operation_id, proof_ref)"],
+          ["restore_reconfirm_receipts_requirement_fkey", "f", "FOREIGN KEY (operation_id, epoch, requirement_id) REFERENCES openbot_internal.restore_reconfirm_requirements(operation_id, epoch, requirement_id) ON UPDATE RESTRICT ON DELETE RESTRICT"],
+          ["restore_reconfirm_receipts_time_check", "c", "CHECK (isfinite(recorded_at))"],
+          ["restore_reconfirm_receipts_uuid_check", "c", "CHECK (((operation_id <> '00000000-0000-0000-0000-000000000000'::uuid) AND (requirement_id <> '00000000-0000-0000-0000-000000000000'::uuid) AND (confirmation_id <> '00000000-0000-0000-0000-000000000000'::uuid) AND (proof_ref <> '00000000-0000-0000-0000-000000000000'::uuid)))"]
+        ],
+        "indexes": [
+          "CREATE UNIQUE INDEX restore_reconfirm_receipts_confirmation_key ON openbot_internal.restore_reconfirm_receipts USING btree (operation_id, confirmation_id)",
+          "CREATE UNIQUE INDEX restore_reconfirm_receipts_pkey ON openbot_internal.restore_reconfirm_receipts USING btree (requirement_id)",
+          "CREATE UNIQUE INDEX restore_reconfirm_receipts_proof_key ON openbot_internal.restore_reconfirm_receipts USING btree (operation_id, proof_ref)"
+        ],
+        "triggers": [
+          ["restore_reconfirm_receipts_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
+          ["restore_reconfirm_receipts_insert", 7, "openbot_internal", "restore53_guard_insert"],
+          ["restore_reconfirm_receipts_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+        ]
+      },
+      {
+        "name": "restore_reconfirm_requirements",
+        "columns": [
+          ["operation_id", "uuid", true, null, null],
+          ["epoch", "bytea", true, null, null],
+          ["requirement_id", "uuid", true, null, null],
+          ["requirement_seq", "bigint", true, null, null],
+          ["source_kind", "text", true, "pg_catalog.default", null],
+          ["source_ref", "text", true, "pg_catalog.C", null],
+          ["binding_generation", "bigint", true, null, null],
+          ["source_created_at", "timestamp with time zone", false, null, null],
+          ["source_revision", "bigint", false, null, null],
+          ["public_binding", "bytea", true, null, null],
+          ["owner_kind", "text", true, "pg_catalog.default", null],
+          ["owner_id", "text", true, "pg_catalog.C", null],
+          ["owner_created_at", "timestamp with time zone", false, null, null],
+          ["xact_id", "xid8", true, null, "pg_current_xact_id()"],
+          ["recorded_at", "timestamp with time zone", true, null, "clock_timestamp()"]
+        ],
+        "constraints": [
+          ["restore_reconfirm_requirements_binding_check", "c", "CHECK ((octet_length(public_binding) = 32))"],
+          ["restore_reconfirm_requirements_epoch_check", "c", "CHECK (((octet_length(epoch) = 32) AND (epoch <> decode(repeat('00'::text, 32), 'hex'::text))))"],
+          ["restore_reconfirm_requirements_generation_key", "u", "UNIQUE (operation_id, source_kind, source_ref, binding_generation)"],
+          ["restore_reconfirm_requirements_identity_check", "c", "CHECK ((((octet_length(source_ref) >= 1) AND (octet_length(source_ref) <= 512)) AND (source_ref !~ '[\u0001-\u001f\u007f-\u009f]'::text) AND ((octet_length(owner_id) >= 1) AND (octet_length(owner_id) <= 512)) AND (owner_id !~ '[\u0001-\u001f\u007f-\u009f]'::text)))"],
+          ["restore_reconfirm_requirements_kind_check", "c", "CHECK ((source_kind = ANY (ARRAY['subject'::text, 'credential'::text, 'model_secret'::text, 'sdk_secret'::text, 'sso_provider'::text, 'config_slot'::text])))"],
+          ["restore_reconfirm_requirements_operation_fkey", "f", "FOREIGN KEY (operation_id, epoch) REFERENCES openbot_internal.restore_pg_operations(operation_id, epoch) ON UPDATE RESTRICT ON DELETE RESTRICT"],
+          ["restore_reconfirm_requirements_operation_id_key", "u", "UNIQUE (operation_id, epoch, requirement_id)"],
+          ["restore_reconfirm_requirements_owner_check", "c", "CHECK ((owner_kind = ANY (ARRAY['actor'::text, 'installation'::text, 'service'::text])))"],
+          ["restore_reconfirm_requirements_pkey", "p", "PRIMARY KEY (requirement_id)"],
+          ["restore_reconfirm_requirements_sequence_check", "c", "CHECK (((requirement_seq >= 1) AND (binding_generation >= 0)))"],
+          ["restore_reconfirm_requirements_sequence_key", "u", "UNIQUE (operation_id, requirement_seq)"],
+          ["restore_reconfirm_requirements_source_check", "c", "CHECK ((((source_created_at IS NULL) OR isfinite(source_created_at)) AND ((source_revision IS NULL) OR (source_revision >= 0)) AND ((owner_created_at IS NULL) OR isfinite(owner_created_at))))"],
+          ["restore_reconfirm_requirements_time_check", "c", "CHECK (isfinite(recorded_at))"],
+          ["restore_reconfirm_requirements_uuid_check", "c", "CHECK (((operation_id <> '00000000-0000-0000-0000-000000000000'::uuid) AND (requirement_id <> '00000000-0000-0000-0000-000000000000'::uuid)))"]
+        ],
+        "indexes": [
+          "CREATE UNIQUE INDEX restore_reconfirm_requirements_generation_key ON openbot_internal.restore_reconfirm_requirements USING btree (operation_id, source_kind, source_ref, binding_generation)",
+          "CREATE UNIQUE INDEX restore_reconfirm_requirements_operation_id_key ON openbot_internal.restore_reconfirm_requirements USING btree (operation_id, epoch, requirement_id)",
+          "CREATE UNIQUE INDEX restore_reconfirm_requirements_pkey ON openbot_internal.restore_reconfirm_requirements USING btree (requirement_id)",
+          "CREATE UNIQUE INDEX restore_reconfirm_requirements_sequence_key ON openbot_internal.restore_reconfirm_requirements USING btree (operation_id, requirement_seq)",
+          "CREATE INDEX restore_reconfirm_requirements_source_idx ON openbot_internal.restore_reconfirm_requirements USING btree (operation_id, source_kind, source_ref, binding_generation DESC)"
+        ],
+        "triggers": [
+          ["restore_reconfirm_requirements_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
+          ["restore_reconfirm_requirements_insert", 7, "openbot_internal", "restore53_guard_insert"],
+          ["restore_reconfirm_requirements_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+        ]
+      }
+    ]
+  }
+}

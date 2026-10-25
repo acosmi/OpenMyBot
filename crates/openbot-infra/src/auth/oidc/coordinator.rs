@@ -15,8 +15,9 @@ use openidconnect::{AuthorizationCode, ClientSecret};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
 use url::Url;
+use uuid::Uuid;
 
-use super::attempt::CallbackLoginAttempt;
+use super::attempt::{CallbackLoginAttempt, ProviderIncarnationBinding};
 use super::attempt_postgres::{PostgresAttemptError, PostgresLoginAttemptStore};
 use super::authorize::{DEFAULT_SCOPES, authorization_url};
 use super::claims::{
@@ -26,7 +27,7 @@ use super::claims::{
 use super::discovery::{FetchBudget, discover_with_expected_issuer};
 use super::error::OidcError;
 use super::jwks::{JwksCache, JwksRefreshPolicy};
-use super::provider::{OidcProviderConfig, ProviderId, ProviderKind};
+use super::provider::{OidcProviderConfig, ProviderId, ProviderKind, ProviderOrigin};
 use super::ratelimit::RateLimitPolicy;
 use super::ratelimit_postgres::{
     OidcRateLimitBucket, PostgresOidcRateLimiter, PostgresRateLimitError,
@@ -110,6 +111,7 @@ impl OidcLoginError {
 /// 一家已完成 discovery 预验证的运行时 provider。
 pub struct OidcProviderRuntime {
     config: OidcProviderConfig,
+    incarnation: ProviderIncarnationBinding,
     client_secret: Option<SecretBytes>,
     metadata: CoreProviderMetadata,
     jwks: Mutex<JwksCache>,
@@ -125,9 +127,88 @@ impl OidcProviderRuntime {
         dialer: &SafeDialer,
         budget: FetchBudget,
     ) -> Result<Self, OidcError> {
-        if group_mapping
-            .as_ref()
-            .is_some_and(|mapping| mapping.provider().as_str() != config.id().as_str())
+        if config.origin() != ProviderOrigin::EnvironmentConfigured {
+            return Err(OidcError::ProviderUnknown);
+        }
+        Self::discover_with_binding(
+            config,
+            client_secret,
+            group_mapping,
+            ProviderIncarnationBinding::Configured {},
+            dialer,
+            budget,
+        )
+        .await
+    }
+
+    /// The row incarnation is configuration DATA, not a Current provider admission.
+    pub(crate) async fn discover_bound(
+        config: OidcProviderConfig,
+        client_secret: Option<SecretBytes>,
+        group_mapping: Option<IdpGroupMapping>,
+        provider_internal_id: Uuid,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<Self, OidcError> {
+        if config.origin() != ProviderOrigin::DynamicallyRegistered || provider_internal_id.is_nil() {
+            return Err(OidcError::ProviderUnknown);
+        }
+        Self::discover_with_binding(
+            config,
+            client_secret,
+            group_mapping,
+            ProviderIncarnationBinding::Dynamic {
+                provider_internal_id,
+            },
+            dialer,
+            budget,
+        )
+        .await
+    }
+
+    /// Registration has no stored row incarnation yet; validate metadata without minting a runtime.
+    pub(crate) async fn validate_registration(
+        config: &OidcProviderConfig,
+        group_mapping: Option<IdpGroupMapping>,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<(), OidcError> {
+        if config.origin() != ProviderOrigin::DynamicallyRegistered {
+            return Err(OidcError::ProviderUnknown);
+        }
+        Self::discover_metadata(config, group_mapping.as_ref(), dialer, budget)
+            .await
+            .map(|_| ())
+    }
+
+    async fn discover_with_binding(
+        config: OidcProviderConfig,
+        client_secret: Option<SecretBytes>,
+        group_mapping: Option<IdpGroupMapping>,
+        incarnation: ProviderIncarnationBinding,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<Self, OidcError> {
+        let metadata =
+            Self::discover_metadata(&config, group_mapping.as_ref(), dialer, budget).await?;
+        let jwks = JwksCache::from_metadata(&metadata);
+        Ok(Self {
+            config,
+            incarnation,
+            client_secret,
+            metadata,
+            jwks: Mutex::new(jwks),
+            group_mapping,
+        })
+    }
+
+    async fn discover_metadata(
+        config: &OidcProviderConfig,
+        group_mapping: Option<&IdpGroupMapping>,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<CoreProviderMetadata, OidcError> {
+        if group_mapping.is_some_and(|mapping| mapping.provider().as_str() != config.id().as_str())
         {
             return Err(OidcError::GroupMappingMismatch);
         }
@@ -139,14 +220,7 @@ impl OidcProviderRuntime {
         )
         .await?;
         validate_metadata_endpoints(&metadata, budget)?;
-        let jwks = JwksCache::from_metadata(&metadata);
-        Ok(Self {
-            config,
-            client_secret,
-            metadata,
-            jwks: Mutex::new(jwks),
-            group_mapping,
-        })
+        Ok(metadata)
     }
 
     #[must_use]
@@ -234,11 +308,12 @@ impl OidcLoginCoordinator {
             .providers
             .get(provider_id)
             .ok_or(OidcError::ProviderUnknown)?;
-        let attempt = super::attempt::LoginAttempt::begin(
+        let attempt = super::attempt::LoginAttempt::begin_bound(
             provider_id.clone(),
             runtime.config.redirect_uri().clone(),
             now,
             self.attempt_ttl,
+            runtime.incarnation,
         );
         let url = authorization_url(&runtime.metadata, &runtime.config, &attempt, DEFAULT_SCOPES)?;
         self.attempts.insert(attempt, now).await?;
@@ -310,6 +385,9 @@ impl OidcLoginCoordinator {
         peer_ip: &str,
         user_agent: Option<&str>,
     ) -> Result<IssuedSession, OidcLoginError> {
+        if attempt.provider() != runtime.config.id() || attempt.incarnation() != runtime.incarnation {
+            return Err(PostgresAttemptError::ProviderMismatch.into());
+        }
         attempt
             .redirect_uri()
             .assert_exact_match(received_redirect_uri)?;

@@ -9,6 +9,7 @@ use openbot_domain::vault::{KeyVersion, SecretBytes, WrappingKey};
 use openidconnect::ClientId;
 use time::{Duration, OffsetDateTime};
 use url::Url;
+use uuid::Uuid;
 
 use super::config::{
     DecodedSecretConfig, RegisterIdentityProviderInput, RegisteredIdentityProvider,
@@ -16,8 +17,9 @@ use super::config::{
 };
 use super::ephemeral::{PostgresSamlAttemptStore, PostgresSsoRouteTicketStore, SsoEphemeralError};
 use super::saml::{SamlError, SamlRuntime, SamlStart};
-use super::store::{DynamicSsoStore, DynamicSsoStoreError};
+use super::store::{DynamicSsoStore, DynamicSsoStoreError, LoadedDynamicProvider};
 use super::vault::SsoConfigVault;
+use crate::auth::oidc::attempt::ProviderIncarnationBinding;
 use crate::auth::oidc::coordinator::{DEFAULT_IDP_TIMEOUT, DEFAULT_METADATA_MAX_BYTES};
 use crate::auth::oidc::redirect::HTTPS_OR_HTTP;
 use crate::auth::oidc::{
@@ -137,6 +139,12 @@ impl core::fmt::Debug for SsoRouteReceipt {
             .field("expires_at", &self.expires_at)
             .finish()
     }
+}
+
+// The loaded row incarnation is DATA only; it does not replace Current/GuardedRC admission.
+struct LoadedSamlRuntime {
+    runtime: SamlRuntime,
+    internal_id: Uuid,
 }
 
 #[derive(Clone)]
@@ -355,7 +363,9 @@ impl DynamicSsoService {
                         .store
                         .load(&provider)
                         .await?
-                        .map(|loaded| (provider, protocol_of(&loaded.config))),
+                        .map(|loaded| {
+                            (provider, protocol_of(&loaded.config), loaded.internal_id)
+                        }),
                     None => None,
                 }
             } else {
@@ -369,7 +379,7 @@ impl DynamicSsoService {
             .issue(
                 routed
                     .as_ref()
-                    .map(|(provider, protocol)| (provider, *protocol)),
+                    .map(|(provider, protocol, internal_id)| (provider, *protocol, *internal_id)),
                 now,
             )
             .await?;
@@ -393,7 +403,7 @@ impl DynamicSsoService {
         match routed.protocol {
             SsoProtocol::Oidc => {
                 let runtime = self
-                    .load_oidc_runtime(&routed.provider_id)
+                    .load_oidc_runtime_bound(&routed.provider_id, routed.internal_id)
                     .await?
                     .ok_or(DynamicSsoError::ProviderUnknown)?;
                 let coordinator = self.oidc_coordinator([runtime])?;
@@ -408,12 +418,22 @@ impl DynamicSsoService {
                     .load_saml_runtime(&routed.provider_id, now)
                     .await?
                     .ok_or(DynamicSsoError::ProviderUnknown)?;
+                if runtime.internal_id != routed.internal_id {
+                    return Err(SsoEphemeralError::Mismatch.into());
+                }
                 let request_id = SamlRuntime::fresh_request_id();
                 let relay_state = self
                     .saml_attempts
-                    .issue(&routed.provider_id, &request_id, runtime.acs_url(), now)
+                    .issue(
+                        &routed.provider_id,
+                        runtime.internal_id,
+                        &request_id,
+                        runtime.runtime.acs_url(),
+                        now,
+                    )
                     .await?;
                 runtime
+                    .runtime
                     .begin(request_id, relay_state, now)
                     .map(DynamicSsoStart::Saml)
                     .map_err(Into::into)
@@ -435,8 +455,14 @@ impl DynamicSsoService {
         let attempt = coordinator
             .begin_callback(provider, state, now, peer_ip)
             .await?;
+        let ProviderIncarnationBinding::Dynamic {
+            provider_internal_id,
+        } = attempt.incarnation()
+        else {
+            return Err(SsoEphemeralError::Mismatch.into());
+        };
         let runtime = self
-            .load_oidc_runtime(provider)
+            .load_oidc_runtime_bound(provider, provider_internal_id)
             .await?
             .ok_or(DynamicSsoError::ProviderUnknown)?;
         let callback = dynamic_oidc_callback(&self.public_url, provider)?;
@@ -487,7 +513,10 @@ impl DynamicSsoService {
             .load_saml_runtime(provider, now)
             .await?
             .ok_or(DynamicSsoError::ProviderUnknown)?;
-        let verified = runtime.verify_response(
+        if runtime.internal_id != attempt.internal_id {
+            return Err(SsoEphemeralError::Mismatch.into());
+        }
+        let verified = runtime.runtime.verify_response(
             encoded_response,
             &attempt.request_id,
             &attempt.acs_url,
@@ -523,6 +552,7 @@ impl DynamicSsoService {
         self.load_saml_runtime(provider, now)
             .await?
             .ok_or(DynamicSsoError::ProviderUnknown)?
+            .runtime
             .metadata_xml()
             .map_err(Into::into)
     }
@@ -551,11 +581,9 @@ impl DynamicSsoService {
                     domains.clone(),
                     Some(actor.as_str().to_owned()),
                 );
-                // 显式副本：runtime 必须在回调期持有，源配置随后 seal/drop；两份都 zeroize。
-                let secret = SecretBytes::new(config.client_secret.expose().to_vec());
-                OidcProviderRuntime::discover(
-                    public,
-                    Some(secret),
+                // Registration has no committed row incarnation and returns no login runtime.
+                OidcProviderRuntime::validate_registration(
+                    &public,
                     config.mapping(provider_id)?,
                     &self.dialer,
                     FetchBudget::new(DEFAULT_METADATA_MAX_BYTES, DEFAULT_IDP_TIMEOUT),
@@ -589,6 +617,31 @@ impl DynamicSsoService {
         let Some(loaded) = self.store.load(provider).await? else {
             return Ok(None);
         };
+        self.discover_loaded_oidc(loaded).await.map(Some)
+    }
+
+    async fn load_oidc_runtime_bound(
+        &self,
+        provider: &ProviderId,
+        expected_incarnation: Uuid,
+    ) -> Result<Option<OidcProviderRuntime>, DynamicSsoError> {
+        if expected_incarnation.is_nil() {
+            return Err(SsoEphemeralError::Mismatch.into());
+        }
+        let Some(loaded) = self.store.load(provider).await? else {
+            return Ok(None);
+        };
+        // This DATA comparison precedes discovery; the same-transaction Current gate is separate.
+        if loaded.internal_id != expected_incarnation {
+            return Err(SsoEphemeralError::Mismatch.into());
+        }
+        self.discover_loaded_oidc(loaded).await.map(Some)
+    }
+
+    async fn discover_loaded_oidc(
+        &self,
+        loaded: LoadedDynamicProvider,
+    ) -> Result<OidcProviderRuntime, DynamicSsoError> {
         let DecodedSecretConfig::Oidc(config) = loaded.config else {
             return Err(DynamicSsoError::ProtocolMismatch);
         };
@@ -603,15 +656,15 @@ impl DynamicSsoService {
             loaded.domains,
             loaded.registered_by,
         );
-        OidcProviderRuntime::discover(
+        OidcProviderRuntime::discover_bound(
             public,
             Some(config.client_secret),
             mapping,
+            loaded.internal_id,
             &self.dialer,
             FetchBudget::new(DEFAULT_METADATA_MAX_BYTES, DEFAULT_IDP_TIMEOUT),
         )
         .await
-        .map(Some)
         .map_err(OidcLoginError::from)
         .map_err(Into::into)
     }
@@ -620,13 +673,14 @@ impl DynamicSsoService {
         &self,
         provider: &ProviderId,
         now: OffsetDateTime,
-    ) -> Result<Option<SamlRuntime>, DynamicSsoError> {
+    ) -> Result<Option<LoadedSamlRuntime>, DynamicSsoError> {
         let Some(loaded) = self.store.load(provider).await? else {
             return Ok(None);
         };
         let DecodedSecretConfig::Saml(config) = loaded.config else {
             return Err(DynamicSsoError::ProtocolMismatch);
         };
+        let internal_id = loaded.internal_id;
         SamlRuntime::build(
             loaded.provider_id,
             loaded.issuer.as_str(),
@@ -635,7 +689,12 @@ impl DynamicSsoService {
             &self.public_url,
             now,
         )
-        .map(Some)
+        .map(|runtime| {
+            Some(LoadedSamlRuntime {
+                runtime,
+                internal_id,
+            })
+        })
         .map_err(|_| DynamicSsoStoreError::Corrupt.into())
     }
 

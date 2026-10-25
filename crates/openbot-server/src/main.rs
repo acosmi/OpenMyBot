@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     telemetry::init(LogFormat::Json)?;
     let env = openbot_server::config::launch::prepare_environment(env_map_from_process(), local)?;
-    let server = ServerConfig::from_env_map(&env)?;
+    let mut server = ServerConfig::from_env_map(&env)?;
     if let Some(warning) = server.public_transport().startup_warning() {
         tracing::warn!(code = server.public_transport().as_str(), "{warning}");
     }
@@ -172,8 +172,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let database_url = openbot_server::config::env::optional(&env, "DATABASE_URL")
         .ok_or_else(|| startup_error("database_url_missing"))?;
     let database: DatabaseConfig = database_url.parse()?;
-    let pool = pool::connect(&database).await?;
-    openbot_server::database::initialize(&pool).await?;
+    let key_policy = match server.deployment_environment {
+        DeploymentEnvironment::Production => ExampleKeyPolicy::Reject,
+        DeploymentEnvironment::Development => ExampleKeyPolicy::Allow,
+    };
+    // Apply the original canonical / strength / example policy once and retain
+    // that same original wrapping key. The existing Infra production base64
+    // dependency decodes this exact canonical encoding after the publication
+    // gate; Server has no new production dependency or raw material accessor.
+    let key_encryption = KeyEncryptionKey::from_env_map(&env, key_policy)?;
+    let recovery_master_encoding = SecretBytes::new(
+        openbot_server::config::env::optional(&env, "KEY_ENCRYPTION_KEY")
+            .ok_or_else(|| startup_error("key_encryption_key_missing"))?.as_bytes().to_vec(),
+    );
+    let deployment = deployment_id_for_startup(server.deployment_id.as_deref(), &tenant_package.package.tenant_id);
+    let tenant = TenantId::new(&tenant_package.package.tenant_id);
+    let host = server.recovery_host.take().ok_or_else(|| startup_error("recovery_host_missing"))?;
+    let limits = host.host_limits().clone();
+    let startup_deadline = std::time::Instant::now().checked_add(Duration::from_nanos(limits.admission_ns))
+        .ok_or_else(|| startup_error("recovery_startup_bounds_invalid"))?;
+    let mut recovery_control = openbot_infra::recovery_control::RecoveryControl::open(
+        openbot_infra::recovery_control::RecoveryControlConfig::server(host, limits)?,
+    )?;
+    let (pool, mut recovery_runtime_owner) = recovery_control.open_existing_server_before(
+        &database, recovery_master_encoding, deployment.as_str(), tenant.as_str(), startup_deadline,
+    ).await?;
+    let recovery_read_gate = recovery_runtime_owner.read_gate();
 
     let policy_store = PolicyStore::postgres(
         pool.clone(),
@@ -199,11 +223,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
-    let key_policy = match server.deployment_environment {
-        DeploymentEnvironment::Production => ExampleKeyPolicy::Reject,
-        DeploymentEnvironment::Development => ExampleKeyPolicy::Allow,
-    };
-    let key_encryption = KeyEncryptionKey::from_env_map(&env, key_policy)?;
     if let Some(code) = key_encryption.advisory_code() {
         tracing::warn!(code, "KEY_ENCRYPTION_KEY 建议轮换到 AES-256");
     }
@@ -212,13 +231,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let application_master = SecretBytes::new(raw_master.as_bytes().to_vec());
     let audit_key =
         derive_application_key(&application_master, ApplicationKeyPurpose::AuditCheckpoint)?;
-    let mcp_oauth_state_key =
+    let mcp_state_parent =
         derive_application_key(&application_master, ApplicationKeyPurpose::McpOauthState)?;
     drop(application_master);
-    let remote_assertions = Arc::new(RemoteRunAssertionSigner::new(
-        raw_master.as_bytes().to_vec(),
-    )?);
-
     let has_dynamic_provider = database_has_dynamic_provider(&pool).await?;
     let public_url = server.public_url.as_ref().map(|url| url.as_str());
     let auth_config = auth_config_with_dynamic_provider(
@@ -227,6 +242,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         default_session_lifetime(),
         has_dynamic_provider,
     )?;
+    let server_authorization_keys = recovery_runtime_owner.derive_server_authorization_keys_before(
+        &pool, deployment.as_str(), tenant.as_str(),
+        auth_config.as_ref().map(|config| config.session_secret.expose().as_bytes()),
+        &mcp_state_parent, raw_master.as_bytes(), startup_deadline,
+    )?;
+    // Only these five short-lived purposes use the same external epoch.
+    // Audit, wrapping/master, stored ciphertext and SCRAM parents stay original.
+    drop(mcp_state_parent);
+    let remote_assertions = Arc::new(RemoteRunAssertionSigner::new(
+        server_authorization_keys.run_assertion_key().to_vec(),
+    )?);
     let has_provider = auth_config.is_some();
     let single_user = single_user_enabled(&env, has_provider)?;
     // An existing database can contain dynamic SSO even when the process environment does not.
@@ -244,11 +270,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let deployment = deployment_id_for_startup(
-        server.deployment_id.as_deref(),
-        &tenant_package.package.tenant_id,
-    );
-    let tenant = TenantId::new(&tenant_package.package.tenant_id);
     let model_credential_vault = CredentialRecordVault::single_key(
         tenant.clone(),
         KeyVersion::new(1),
@@ -270,6 +291,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &config,
             &pool,
             &tenant,
+            server_authorization_keys.session_key()?,
+            server_authorization_keys.oidc_state_key()?,
+            server_authorization_keys.sso_state_key()?,
             audit_key.expose(),
             key_encryption.into_wrapping_key(),
             server.public_transport().cookie_secure(),
@@ -277,11 +301,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
         let resolver = PostgresSessionAuthResolver::new(
             pool.clone(),
-            config.session_secret.expose().as_bytes(),
+            server_authorization_keys.session_key()?,
             config.session_lifetime,
             deployment.clone(),
             tenant.clone(),
         )?;
+        resolver.install_recovery_read_gate(recovery_read_gate.clone())
+            .map_err(|_| startup_error("recovery_host_gate_unavailable"))?;
         let sensitive =
             SensitiveWriteSecurity::new(config.session_lifetime, config.trusted_origins.clone());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -306,6 +332,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let principal =
             load_single_user_principal(&pool, deployment.clone(), tenant.clone()).await?;
         let resolver = SingleUserAuthResolver::from_verified_principal(principal, lifetime);
+        resolver.install_recovery_read_gate(&pool, recovery_read_gate.clone())
+            .map_err(|_| startup_error("recovery_host_gate_unavailable"))?;
         remember_single_user_resolver = Some(resolver.clone());
         (
             Arc::new(resolver),
@@ -486,7 +514,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         credential_vault: model_credential_vault.clone(),
         audit_key: SecretBytes::new(audit_key.expose().to_vec()),
         remote_assertions: remote_assertions.clone(),
-        mcp_oauth_state_key: SecretBytes::new(mcp_oauth_state_key.expose().to_vec()),
+        mcp_oauth_state_key: SecretBytes::new(server_authorization_keys.mcp_state_key().to_vec()),
         policy_store: policy_store.clone(),
         ui_preferences: Arc::new(PostgresUiPreferenceAdministration::new(
             pool.clone(),
@@ -1097,6 +1125,9 @@ async fn build_oidc_login(
     config: &AuthConfig,
     pool: &openbot_infra::db::pool::DatabasePool,
     tenant: &TenantId,
+    session_key: &[u8],
+    oidc_state_key: &[u8],
+    sso_state_key: &[u8],
     audit_key: &[u8],
     wrapping_key: WrappingKey,
     secure_cookie: bool,
@@ -1126,13 +1157,13 @@ async fn build_oidc_login(
     }
     let attempts = PostgresLoginAttemptStore::new(
         pool.clone(),
-        config.session_secret.expose().as_bytes(),
+        oidc_state_key,
         tenant,
         4096,
     )?;
     let sessions = PostgresOidcSessionIssuer::new(
         pool.clone(),
-        config.session_secret.expose().as_bytes(),
+        session_key,
         config.session_lifetime,
         config.admin_floor.clone(),
         audit_key,
@@ -1147,8 +1178,8 @@ async fn build_oidc_login(
     let dynamic_sso = DynamicSsoService::new(
         pool.clone(),
         tenant,
-        config.session_secret.expose().as_bytes(),
-        config.session_secret.expose().as_bytes(),
+        sso_state_key,
+        session_key,
         audit_key,
         wrapping_key,
         KeyVersion::new(1),

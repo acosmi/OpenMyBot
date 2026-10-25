@@ -2243,3 +2243,68 @@ V7-IMPL-044 / PR #223: The native PostgreSQL maintenance toolchain completed its
 The affected Desktop libtest was compiled again and both declaration lists were checked on c1111646 (117 total, 6 ignored). Five other native test units, covering eight scenarios including streamed-WAL restore and restart, retain their original successful executions and independently reviewed source applicability. Sixteen ordinary directed tests and trusted-consumer verification likewise retain their separately qualified original evidence. These are distinct evidence roles, not six fresh native executions on the final candidate.
 
 This delivery is limited to the maintenance toolchain prerequisite. Complete application capture, sealed backup and restore activation remain unfinished. Earlier failures, administrative unknown outcomes and the two-file strict legacy scope hold remain recorded; source authentication does not establish platform signing or production release acceptance. Full CI and manual Actions were not run.
+
+
+### 2026-10-22 — V7-IMPL-046 / whole-PG restore draft source accumulation
+
+The complete restore and current-binding reconfirmation task is accumulated on this one draft branch. Fourteen initial source paths now provide bounded external control records and runtime admission ownership, the reconfirmation migration and catalog fixture, and a real owner-private service-configuration loader. Independent source review accepted these batches after fixing retained-runtime replacement, known Busy reservation retirement, and subject-birth binding. This is source-level progress: compilation, migration execution, startup and full restore acceptance have not run. The remaining restore execution, active-schema routing, launcher configuration registration and Current consumers are still required here, with the capture prerequisite and latest-main integration before full acceptance and merge.
+
+
+2026-10-23T04:15:01.463056+00:00 V7-IMPL-046: registered native0053 in the real migration list and wired exact current53/41-row validation through the complete existing schema checks plus the additive reconfirmation observer. Explicit legacy52/40-row preflight remains separate and cannot qualify Current; unknown targets reject before lock or DDL. Canary current/legacy routing preserves the public0052 schema and observes the new internal catalog. Four actual source changes passed independent source review with the prior14 sources and42 old SQL/fixture inputs preserved. No current compilation, SQL application, restore runtime, Fresh/Current authority or full-task acceptance is claimed. This accumulates in the same complete restore PR.
+
+
+2026-10-23T04:57:31.195900+00:00 V7-IMPL-046: added the registered normal-admission and restore-reconfirmation ports to the original HostRequestBinding guard. Unsupported hosts fail with Unavailable. Verified bindings preserve the original attachment, Auth, owner and absolute deadline checks before and after delegation, including errors, then check the returned lease purpose and its actual held witness before returning that same lease. Independent source review passed with60 protected inputs and all original guard/binding methods preserved. Concrete host installation, final consumer wiring and runtime/Current acceptance remain pending in this same complete restore PR.
+
+
+2026-10-23T05:54:58.653584+00:00 V7-IMPL-046 source continuation: the dynamic SSO store now carries the actual locked provider-row ID before secret decoding. Semantic configuration updates rotate that ID in the original transaction after linked-account revocation and verify the returned ID; pure rewrapping preserves it. Independent review accepted the exact source and unchanged surrounding transaction behavior. This remains part of the full restore task in its existing PR. Bound callback and Current admission integration, compilation, PostgreSQL execution and complete restore acceptance remain pending; no runtime or delivery credit is claimed here.
+
+
+2026-10-23T07:20:53.060514+00:00 V7-IMPL-046 source continuation: real dynamic-provider configuration IDs now follow SSO routing, login-attempt storage, committed consumption and the OIDC/SAML runtime checks. Stored records require the explicit versioned binding; legacy or invalid records are rejected after the existing committed burn. Static configuration and dynamic registration remain distinct, and registration preflight performs metadata validation without creating a login runtime. Independent review accepted all five exact source images and their original transaction and protocol boundaries. This remains in the existing full restore PR. Current admission before Vault opening, retained transaction guards through send/session, compilation and PostgreSQL/full restore acceptance are still pending; no runtime or delivery credit is claimed.
+
+
+2026-10-23T12:21:27.867966+00:00 V7-IMPL-046 / PR226 source update: Server launch now preserves the required recovery configuration key in the original environment snapshot for the existing trusted-file loader. Infra declares its dependency on the already present macOS process observer, with the matching lockfile edge. The exact three-file candidate received independent source review and the applied bytes match it. Build, SQL, PostgreSQL, runtime recovery, native platform and task delivery acceptance remain pending; this source update accumulates in the same complete restore PR.
+
+
+### V7-IMPL-046: service startup input validation
+
+Service startup input validation: the original owner-held configuration loader now requires explicit nonzero PG system/database identity for PG17, accepts only fresh_init or legacy_adoption with the selected private intentFile, and decodes exactly the four ordinary-intent fields. The request must match the selected mode and the original held configuration file identity, length and complete SHA-256; original descriptor, ownership, full-byte readback and finite metadata admission checks remain. This is source input validation only: no PostgreSQL connection, startup writer, Current publication or restore execution/acceptance is claimed.
+
+
+### V7-IMPL-046: closed site records and held-head validation
+
+External control input validation now uses explicit closed local-physical and server-database site data, checks the corresponding host/plan/reference identities, and keeps recovery target payloads local-physical only. The original held-head recheck performs one prepaid canonical typed validation, retains its complete result in the same owner and reuses that result only while the original FD, named identity, full bytes and digest continue to match. Runtime enrollment reads the common epoch without substituting a local physical identity for a server database. Original full journal-reference and publication evidence checks remain. This source change grants no database/key proof, Current authority, runtime closure, restore execution or complete acceptance.
+
+
+### 2026-10-23 — V7-IMPL-046: Native process identity and original resource custody
+
+The existing recovery-control library now keeps one native self-process identity through setup, enrollment and final admission checks, with fixed birth/boot decoding and monotonic readback. Original control/runtime state leaves short bookkeeping locks for filesystem/native observations; known ordinary admission retirements conserve both metadata and FD counts across concurrent custody. The exact source batch passed independent finite source review with no P1/P2 findings. The earlier Infra library check remains bound to3a9c8e1 and its53 retained warnings; compilation of these new postimages, real host assembly and full restore acceptance remain pending.
+
+
+### V7-IMPL-046: isolated restore-process source adapter
+
+Added a private deny-default PostgreSQL restore-process policy and connected its command to the original native Child, three pipes and wait path. The adapter retains original spawn and post-check results, rechecks the resident child birth before one bounded stop request, and preserves the original maintenance callers. Independent source and actual-postimage reviews passed for the exact two-file change. Compilation and native isolation scenarios for these new postimages remain pending; session/resource binding, loader inventory, credential-slot integration and complete restore acceptance remain open. The earlier Infra library check remains bound to fe897f8e and its 52 retained warnings.
+
+
+### V7-IMPL-046: existing ordinary Server startup and admission
+
+Server ordinary startup source now holds the original recovery read locks before database probing, binds the held head to its complete publication journal, checks actual configured PostgreSQL/key/canary/schema observations, retains the same runtime ownership through enrollment, and installs matching recovery admission on session and single-user guards. This batch supports native53 ServerDatabase OrdinaryActive; Fresh, legacy production and RestoreCurrent admission remain closed pending the remaining implementation. Source review only: this change has no new build, database, runtime or full-recovery acceptance credit.
+
+
+### 2026-10-23 - V7-IMPL-046 Server runtime authorization keys and compiler repairs
+
+Server startup now derives five authorization keys from the same verified runtime epoch and existing configured parents, supplying matching keys to session issuers/resolvers, OIDC/SSO/MCP state factories and remote assertions. The same owner rechecks its head, pool scope, enrollment and locks before handing off bounded secret buffers once. This batch also fixes the two compiler root causes reported by the preceding targeted Server check, preserving the original canary queries and metadata charge. Audit, master/wrapping keys, stored ciphertext and SCRAM parents retain their prior behavior. Source review only; the previous Desktop pass and Server failure remain tied to their original candidate. New compilation and runtime/recovery acceptance are still pending.
+
+
+### 2026-10-23 - V7-IMPL-046 Server recovery gate API documentation
+
+Documented the two existing Server recovery-gate attachment methods without changing signatures, guards, behavior or the missing-documentation lint. The preceding targeted check emitted the updated Infra library and stopped at these two missing method comments; that original failure remains recorded. A new complete Server check and runtime/recovery acceptance are pending.
+
+
+### V7-IMPL-046 — Server startup error conversion repair
+
+The Server library compiled at fd90bad; its binary check stopped at one startup error conversion. Both existing recovery read-gate installation calls now map failure through the existing fixed, redacted startup error and still refuse startup. Independent source review passed. A new exact-candidate Server binary check remains pending; runtime acceptance and delivery remain open.
+
+
+### V7-IMPL-046 — Recovery admission for requested input metadata
+
+Requested input metadata now holds the existing recovery admission across its Host control observation and checks it again before publishing metadata. The original binding, deadline, control witness, closure checks and error mapping remain in use. Independent review accepted the exact source change. Candidate compilation and complete runtime acceptance remain pending; the preceding candidate check did not start because resource admission was not met.
