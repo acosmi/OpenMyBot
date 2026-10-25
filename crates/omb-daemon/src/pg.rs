@@ -18,12 +18,20 @@ use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
     task::JoinHandle,
-    time::{Instant, sleep, sleep_until, timeout, timeout_at},
+    time::{Instant, sleep_until, timeout, timeout_at},
 };
 
 const READY: Duration = Duration::from_secs(30);
 const STOP: Duration = Duration::from_secs(30);
 
+fn map_store_error(error: omb_store::StoreError) -> DaemonError {
+    match error {
+        omb_store::StoreError::MigrationDrift => DaemonError::OmbMigrationDrift,
+        omb_store::StoreError::SchemaNewer => DaemonError::OmbSchemaNewer,
+        omb_store::StoreError::MigrationFailed => DaemonError::OmbMigrationFailed,
+        omb_store::StoreError::ControlTokenFailed => DaemonError::ControlTokenFailed,
+    }
+}
 fn ready_result<T>(deadline: Instant, result: Result<T, DaemonError>) -> Result<T, DaemonError> {
     if Instant::now() >= deadline {
         Err(DaemonError::PgStartFailed)
@@ -432,6 +440,72 @@ impl Postgres {
         connection.close_until(deadline).await?;
         ready_result(deadline, result)
     }
+    pub(crate) async fn migrate_store(&mut self) -> Result<(), DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connection = self
+            .connect("openmybot", deadline)
+            .await
+            .map_err(|_| DaemonError::OmbMigrationFailed)?;
+        let result = match connection.client.as_mut() {
+            Some(client) => omb_store::migrate(client, deadline)
+                .await
+                .map(|_| ())
+                .map_err(map_store_error),
+            None => Err(DaemonError::OmbMigrationFailed),
+        };
+        let closed = connection.close_until(deadline).await;
+        result?;
+        if closed.is_err() {
+            return Err(DaemonError::OmbMigrationFailed);
+        }
+        if Instant::now() >= deadline {
+            return Err(DaemonError::OmbMigrationFailed);
+        }
+        result
+    }
+    pub(crate) async fn start_control_token(
+        &mut self,
+        input: omb_store::ControlTokenStart<'_>,
+    ) -> Result<(), DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connection = self
+            .connect("openmybot", deadline)
+            .await
+            .map_err(|_| DaemonError::ControlTokenFailed)?;
+        let result = match connection.client.as_mut() {
+            Some(client) => omb_store::start_control_token(client, input, deadline)
+                .await
+                .map(|_| ())
+                .map_err(map_store_error),
+            None => Err(DaemonError::ControlTokenFailed),
+        };
+        let closed = connection.close_until(deadline).await;
+        if closed.is_err() || Instant::now() >= deadline {
+            return Err(DaemonError::ControlTokenFailed);
+        }
+        result
+    }
+    pub(crate) async fn stop_control_token(
+        &mut self,
+        token_id: uuid::Uuid,
+    ) -> Result<(), DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connection = self
+            .connect("openmybot", deadline)
+            .await
+            .map_err(|_| DaemonError::ControlTokenFailed)?;
+        let result = match connection.client.as_mut() {
+            Some(client) => omb_store::stop_control_token(client, token_id, deadline)
+                .await
+                .map_err(map_store_error),
+            None => Err(DaemonError::ControlTokenFailed),
+        };
+        let closed = connection.close_until(deadline).await;
+        if closed.is_err() || Instant::now() >= deadline {
+            return Err(DaemonError::ControlTokenFailed);
+        }
+        result
+    }
     pub(crate) async fn create_database(&mut self) -> Result<(), DaemonError> {
         let connection = self.connect("postgres", Instant::now() + READY).await?;
         let result = async {
@@ -645,22 +719,30 @@ pub(crate) async fn stop_stale(root: &Path, config: &Config) -> Result<(), Daemo
     {
         return Err(DaemonError::PostmasterPidForeign);
     }
-    rustix::process::kill_process(pid, Signal::INT)
-        .map_err(|_| DaemonError::StalePostgresRunning)?;
+    match rustix::process::kill_process(pid, Signal::INT) {
+        Ok(()) => (),
+        Err(rustix::io::Errno::SRCH) => return Ok(()),
+        Err(_) => return Err(DaemonError::StalePostgresRunning),
+    }
     let deadline = Instant::now() + STOP;
     while Instant::now() < deadline {
-        if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
-            return Ok(());
+        match rustix::process::test_kill_process(pid) {
+            Ok(()) => (),
+            Err(rustix::io::Errno::SRCH) if Instant::now() < deadline => return Ok(()),
+            Err(_) => return Err(DaemonError::StalePostgresRunning),
         }
-        // PID identity changed: never signal the replacement.
-        if process_identity(raw, &executable, &argument_data, port)
-            .await
-            .as_ref()
-            != Some(&first)
-        {
-            return Err(DaemonError::StalePostgresRunning);
+        // The identified process can exit while ps/lsof are observing it. Missing identity
+        // is not evidence of a live replacement: confirm disappearance with a fresh kill0.
+        match process_identity_until(raw, &executable, &argument_data, port, deadline).await {
+            Some(identity) if identity != first => return Err(DaemonError::StalePostgresRunning),
+            Some(_) => (),
+            None => match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH) if Instant::now() < deadline => return Ok(()),
+                Ok(()) => (),
+                Err(_) => return Err(DaemonError::StalePostgresRunning),
+            },
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep_until(deadline.min(Instant::now() + Duration::from_millis(50))).await;
     }
     Err(DaemonError::StalePostgresRunning)
 }
@@ -668,6 +750,7 @@ pub(crate) async fn stop_stale(root: &Path, config: &Config) -> Result<(), Daemo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::sleep;
     #[tokio::test]
     async fn ready_deadline_bounds_identity_probe_and_rejects_late_success() {
         // This is the exact child/pipe owner used by ps/lsof identity probes. Earlier probe

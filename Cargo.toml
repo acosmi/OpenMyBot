@@ -16,6 +16,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/omb-store",
     "crates/omb-daemon",
     "crates/omb-cli",
     "crates/openbot-contracts",

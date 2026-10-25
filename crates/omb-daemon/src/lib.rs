@@ -88,4 +88,7 @@ errors! {
     ControlSocketFailed => ("control_socket_failed", Internal),
     ShutdownFailed => ("shutdown_failed", Internal),
     InternalError => ("internal_error", Internal),
+    OmbMigrationDrift => ("omb_migration_drift", Rejected),
+    OmbSchemaNewer => ("omb_schema_newer", Rejected),
+    OmbMigrationFailed => ("omb_migration_failed", Internal),
 }
