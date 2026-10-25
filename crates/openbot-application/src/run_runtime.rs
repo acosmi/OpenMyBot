@@ -64,6 +64,8 @@ pub enum RunFailureCode {
     ProviderUnavailable,
     /// Provider request may have left the process before acknowledgement。
     ProviderCommitUnknown,
+    /// Provider 停止请求的结果未获确认。
+    ProviderStopUnknown,
     /// Provider SSE/schema/sequence invalid。
     ProviderInvalidResponse,
     /// Provider real body read gap exceeded watchdog。
@@ -105,6 +107,7 @@ impl RunFailureCode {
             Self::ProviderRateLimited => "provider_rate_limited",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderCommitUnknown => "provider_commit_unknown",
+            Self::ProviderStopUnknown => "provider_stop_unknown",
             Self::ProviderInvalidResponse => "provider_invalid_response",
             Self::ProviderStreamStalled => "agent_stream_stalled",
             Self::ProviderGenerationFailed => "provider_generation_failed",
