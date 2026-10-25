@@ -1,0 +1,799 @@
+use crate::{
+    DaemonError,
+    config::{self, Config, HBA},
+};
+use rustix::process::{Pid, Signal};
+use std::{
+    ffi::OsString,
+    fs,
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        process::CommandExt,
+    },
+    path::{Path, PathBuf},
+    process::{Command as StdCommand, Stdio},
+    time::{Duration, SystemTime},
+};
+use tokio::{
+    io::AsyncReadExt,
+    process::{Child, Command},
+    task::JoinHandle,
+    time::{Instant, sleep, timeout},
+};
+
+const READY: Duration = Duration::from_secs(30);
+const STOP: Duration = Duration::from_secs(30);
+
+pub(crate) async fn tool(binary: &Path, args: &[OsString]) -> Result<Vec<u8>, DaemonError> {
+    let mut command = StdCommand::new(binary);
+    command
+        .args(args)
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    if binary == Path::new("/bin/ps") {
+        command.env("TZ", "UTC");
+    }
+    let mut child = Command::from(command)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| DaemonError::PgBinariesRejected)?;
+    let group = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(Pid::from_raw);
+    let pipe = child.stdout.take().ok_or(DaemonError::InternalError)?;
+    let reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        pipe.take(8193)
+            .read_to_end(&mut output)
+            .await
+            .map(|_| output)
+    });
+    let result = match timeout(READY, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        _ => {
+            if let Some(group) = group {
+                let _ = rustix::process::kill_process_group(group, Signal::KILL);
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(DaemonError::PgBinariesRejected)
+        }
+    };
+    let mut reader = reader;
+    let output = match timeout(Duration::from_secs(5), &mut reader).await {
+        Ok(Ok(Ok(output))) => output,
+        _ => {
+            // The original child is already reaped here. Do not signal a group number that
+            // could have been reused; close and join our pipe reader instead.
+            reader.abort();
+            let _ = reader.await;
+            return Err(DaemonError::PgBinariesRejected);
+        }
+    };
+    result?;
+    if output.len() > 8192 {
+        return Err(DaemonError::PgBinariesRejected);
+    }
+    Ok(output)
+}
+
+pub(crate) async fn verify_binaries(bin: &Path) -> Result<(), DaemonError> {
+    if !bin.is_absolute() {
+        return Err(DaemonError::PgBinariesRejected);
+    }
+    for name in ["postgres", "initdb"] {
+        let meta = fs::metadata(bin.join(name)).map_err(|_| DaemonError::PgBinariesRejected)?;
+        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+            return Err(DaemonError::PgBinariesRejected);
+        }
+    }
+    let bytes = tool(&bin.join("postgres"), &["--version".into()]).await?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| DaemonError::PgBinariesRejected)?;
+    if !text
+        .strip_prefix("postgres (PostgreSQL) ")
+        .is_some_and(|v| v.trim().split('.').next() == Some("17"))
+    {
+        return Err(DaemonError::PgBinariesRejected);
+    }
+    Ok(())
+}
+pub(crate) fn verify_hba(root: &Path) -> Result<(), DaemonError> {
+    if config::read_private(&root.join("pg/data/pg_hba.conf"), 4096)
+        .map_err(|_| DaemonError::PgHbaRejected)?
+        != HBA
+    {
+        return Err(DaemonError::PgHbaRejected);
+    }
+    Ok(())
+}
+
+struct Connection {
+    client: Option<tokio_postgres::Client>,
+    driver: JoinHandle<Result<(), tokio_postgres::Error>>,
+}
+impl Connection {
+    async fn close(mut self) -> Result<(), DaemonError> {
+        self.client.take();
+        match timeout(Duration::from_secs(5), &mut self.driver).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            _ => {
+                self.driver.abort();
+                let _ = self.driver.await;
+                Err(DaemonError::ShutdownFailed)
+            }
+        }
+    }
+}
+
+pub(crate) struct Postgres {
+    child: Child,
+    port: u16,
+    root: PathBuf,
+    password: String,
+    pub(crate) version: u32,
+    pid: u32,
+    binary: PathBuf,
+    spawned_at: SystemTime,
+}
+impl Postgres {
+    pub(crate) fn is_alive(&mut self) -> Result<bool, DaemonError> {
+        self.child
+            .try_wait()
+            .map(|s| s.is_none())
+            .map_err(|_| DaemonError::PgStartFailed)
+    }
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+    pub(crate) fn database_config(&self) -> openbot_infra::db::pool::DatabaseConfig {
+        openbot_infra::db::pool::DatabaseConfig::new(
+            "127.0.0.1",
+            self.port,
+            "openmybot",
+            "openmybot",
+        )
+        .with_password(self.password.clone())
+        .with_application_name("openmybot")
+    }
+    pub(crate) async fn start(root: &Path, config: &Config) -> Result<Self, DaemonError> {
+        verify_binaries(&config.pg_bin_dir).await?;
+        verify_hba(root)?;
+        let password = String::from_utf8(config::read_private(&root.join("pg/password"), 64)?)
+            .map_err(|_| DaemonError::DataDirPermissionsInvalid)?;
+        let deadline = Instant::now() + READY;
+        for _ in 0..16 {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let mut random = [0; 2];
+            getrandom::fill(&mut random).map_err(|_| DaemonError::PgStartFailed)?;
+            let port = 49152 + (u16::from_le_bytes(random) % 16384);
+            let log_path = root.join("logs/postgres.log");
+            if !log_path.exists() {
+                config::write_private(&log_path, b"", true)?;
+            }
+            config::check(&log_path, false)?;
+            let log = fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(&log_path)
+                .map_err(|_| DaemonError::PgStartFailed)?;
+            let mut command = StdCommand::new(config.pg_bin_dir.join("postgres"));
+            command
+                .arg("-D")
+                .arg(root.join("pg/data"))
+                .args([
+                    "-c",
+                    "listen_addresses=127.0.0.1",
+                    "-c",
+                    &format!("port={port}"),
+                    "-c",
+                    "unix_socket_directories=",
+                ])
+                .env_clear()
+                .env("LANG", "C")
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(
+                    log.try_clone().map_err(|_| DaemonError::PgStartFailed)?,
+                ))
+                .stderr(Stdio::from(log))
+                .process_group(0);
+            let spawned_at = SystemTime::now();
+            let child = Command::from(command)
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| DaemonError::PgStartFailed)?;
+            let pid = child.id().ok_or(DaemonError::PgStartFailed)?;
+            let mut instance = Self {
+                child,
+                port,
+                root: root.to_owned(),
+                password: password.clone(),
+                version: 0,
+                pid,
+                binary: config.pg_bin_dir.join("postgres"),
+                spawned_at,
+            };
+            loop {
+                match instance.child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => (),
+                    Err(_) => {
+                        instance.stop().await?;
+                        return Err(DaemonError::PgStartFailed);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    instance.stop().await?;
+                    return Err(DaemonError::PgStartFailed);
+                }
+                if instance.pid_file_matches() {
+                    match instance.verify_connection().await {
+                        Ok(version) => {
+                            instance.version = version;
+                            return Ok(instance);
+                        }
+                        Err(DaemonError::PgVersionRejected) => {
+                            instance.stop().await?;
+                            return Err(DaemonError::PgVersionRejected);
+                        }
+                        Err(_) => (),
+                    }
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            // The exited child was reaped; another attempt never connects without a matching new pid file.
+        }
+        Err(DaemonError::PgStartFailed)
+    }
+    fn pid_file_matches(&self) -> bool {
+        let Ok(bytes) = config::read_private(&self.root.join("pg/data/postmaster.pid"), 8192)
+        else {
+            return false;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        let lines: Vec<_> = text.lines().collect();
+        lines.len() >= 8
+            && lines[0].parse::<u32>().ok() == Some(self.pid)
+            && fs::canonicalize(lines[1]).ok() == fs::canonicalize(self.root.join("pg/data")).ok()
+            && lines[3].parse::<u16>().ok() == Some(self.port)
+            && lines[7].trim() == "ready"
+    }
+    async fn connection_identity_gate(&mut self) -> Result<(), DaemonError> {
+        if !self.pid_file_matches()
+            || self
+                .child
+                .try_wait()
+                .map_err(|_| DaemonError::PgStartFailed)?
+                .is_some()
+        {
+            return Err(DaemonError::PgStartFailed);
+        }
+        let path = self.root.join("pg/data/postmaster.pid");
+        let bytes = config::read_private(&path, 8192).map_err(|_| DaemonError::PgStartFailed)?;
+        // A ready record left by a dead postmaster cannot authenticate a PID/port reused by
+        // this new child. Keep that record for PG's own orphan checks, and require a new write.
+        let modified = fs::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .map_err(|_| DaemonError::PgStartFailed)?;
+        if modified < self.spawned_at {
+            return Err(DaemonError::PgStartFailed);
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| DaemonError::PgStartFailed)?;
+        let recorded = text
+            .lines()
+            .nth(2)
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|s| *s > 0)
+            .ok_or(DaemonError::PgStartFailed)?;
+        let identity = process_identity(
+            self.pid,
+            &self.binary,
+            &self.root.join("pg/data"),
+            self.port,
+        )
+        .await
+        .ok_or(DaemonError::PgStartFailed)?;
+        if !identity_start_matches(&identity, recorded)
+            || self
+                .child
+                .try_wait()
+                .map_err(|_| DaemonError::PgStartFailed)?
+                .is_some()
+            || config::read_private(&path, 8192).ok().as_ref() != Some(&bytes)
+        {
+            return Err(DaemonError::PgStartFailed);
+        }
+        Ok(())
+    }
+    async fn connect(&mut self, database: &str) -> Result<Connection, DaemonError> {
+        self.connection_identity_gate().await?;
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(self.port)
+            .user("openmybot")
+            .password(&self.password)
+            .dbname(database)
+            .application_name("openmybot")
+            .connect_timeout(Duration::from_secs(1));
+        let (client, connection) = timeout(
+            Duration::from_secs(2),
+            config.connect(tokio_postgres::NoTls),
+        )
+        .await
+        .map_err(|_| DaemonError::PgStartFailed)?
+        .map_err(|_| DaemonError::PgStartFailed)?;
+        Ok(Connection {
+            client: Some(client),
+            driver: tokio::spawn(connection),
+        })
+    }
+    async fn verify_connection(&mut self) -> Result<u32, DaemonError> {
+        let connection = self.connect("postgres").await?;
+        let result=async {
+            let client=connection.client.as_ref().ok_or(DaemonError::PgStartFailed)?;
+            let row=timeout(Duration::from_secs(2),client.query_one("SELECT current_setting('server_version_num'),current_setting('data_directory'),extract(epoch from pg_postmaster_start_time())::bigint",&[])).await.map_err(|_|DaemonError::PgStartFailed)?.map_err(|_|DaemonError::PgStartFailed)?;
+            let version:String=row.try_get(0).map_err(|_|DaemonError::PgStartFailed)?;
+            let version:u32=version.parse().map_err(|_|DaemonError::PgVersionRejected)?;
+            if !(170000..180000).contains(&version) {return Err(DaemonError::PgVersionRejected);}
+            let directory:String=row.try_get(1).map_err(|_|DaemonError::PgStartFailed)?;
+            let start:i64=row.try_get(2).map_err(|_|DaemonError::PgStartFailed)?;
+            let pid_text=String::from_utf8(config::read_private(&self.root.join("pg/data/postmaster.pid"),8192)?).map_err(|_|DaemonError::PgStartFailed)?;
+            let recorded=pid_text.lines().nth(2).and_then(|s|s.parse::<i64>().ok()).ok_or(DaemonError::PgStartFailed)?;
+            if !self.pid_file_matches() || self.child.try_wait().map_err(|_|DaemonError::PgStartFailed)?.is_some()
+                || fs::canonicalize(directory).ok()!=fs::canonicalize(self.root.join("pg/data")).ok() || (start-recorded).abs()>1 {return Err(DaemonError::PgStartFailed);}
+            Ok(version)
+        }.await;
+        connection.close().await?;
+        result
+    }
+    pub(crate) async fn create_database(&mut self) -> Result<(), DaemonError> {
+        let connection = self.connect("postgres").await?;
+        let result = async {
+            timeout(
+                Duration::from_secs(10),
+                connection
+                    .client
+                    .as_ref()
+                    .ok_or(DaemonError::InitFailed)?
+                    .batch_execute("CREATE DATABASE openmybot"),
+            )
+            .await
+            .map_err(|_| DaemonError::InitFailed)?
+            .map_err(|_| DaemonError::InitFailed)
+        }
+        .await;
+        connection.close().await?;
+        result
+    }
+    async fn force_reap(&mut self, pid: Pid) -> Result<(), DaemonError> {
+        let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+        let killed = self.child.kill().await;
+        let waited = timeout(STOP, self.child.wait()).await;
+        match (killed, waited) {
+            (_, Ok(Ok(_))) => Ok(()),
+            _ => Err(DaemonError::ShutdownFailed),
+        }
+    }
+    pub(crate) async fn stop(&mut self) -> Result<(), DaemonError> {
+        let pid = Pid::from_raw(i32::try_from(self.pid).map_err(|_| DaemonError::ShutdownFailed)?)
+            .ok_or(DaemonError::ShutdownFailed)?;
+        match self.child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => (),
+            Err(_) => {
+                self.force_reap(pid).await?;
+                return Err(DaemonError::ShutdownFailed);
+            }
+        }
+        for signal in [Signal::INT, Signal::QUIT] {
+            match rustix::process::kill_process(pid, signal) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => (),
+                Err(_) => {
+                    self.force_reap(pid).await?;
+                    return Err(DaemonError::ShutdownFailed);
+                }
+            }
+            match timeout(STOP, self.child.wait()).await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(_)) => {
+                    self.force_reap(pid).await?;
+                    return Err(DaemonError::ShutdownFailed);
+                }
+                Err(_) => (),
+            }
+        }
+        // A forced kill still counts as a failed graceful shutdown; the owned child is reaped.
+        self.force_reap(pid).await?;
+        Err(DaemonError::ShutdownFailed)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct ProcessIdentity {
+    started: i64,
+    arguments: String,
+    device: u64,
+    inode: u64,
+}
+fn identity_start_matches(identity: &ProcessIdentity, recorded: i64) -> bool {
+    recorded > 0 && identity.started.abs_diff(recorded) <= 1
+}
+async fn process_identity(
+    pid: u32,
+    expected: &Path,
+    data: &Path,
+    port: u16,
+) -> Option<ProcessIdentity> {
+    let started = tool(
+        Path::new("/bin/ps"),
+        &[
+            "-p".into(),
+            pid.to_string().into(),
+            "-o".into(),
+            "lstart=".into(),
+        ],
+    )
+    .await
+    .ok()?;
+    let started = std::str::from_utf8(&started).ok()?.trim();
+    let started =
+        chrono::DateTime::parse_from_str(&format!("{started} +0000"), "%a %b %e %H:%M:%S %Y %z")
+            .ok()?
+            .timestamp();
+    let arguments = tool(
+        Path::new("/bin/ps"),
+        &[
+            "-ww".into(),
+            "-p".into(),
+            pid.to_string().into(),
+            "-o".into(),
+            "args=".into(),
+        ],
+    )
+    .await
+    .ok()?;
+    let arguments = std::str::from_utf8(&arguments).ok()?.trim_end().to_owned();
+    // Compare the entire command we created, including the complete data path and fixed flags.
+    // No whitespace tokenization: paths such as Application Support stay one exact expected value.
+    let expected_arguments = format!(
+        "{} -D {} -c listen_addresses=127.0.0.1 -c port={port} -c unix_socket_directories=",
+        expected.to_str()?,
+        data.to_str()?
+    );
+    if arguments != expected_arguments {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let executable = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    #[cfg(target_os = "macos")]
+    let executable = {
+        let bytes = tool(
+            Path::new("/usr/sbin/lsof"),
+            &[
+                "-a".into(),
+                "-p".into(),
+                pid.to_string().into(),
+                "-d".into(),
+                "txt".into(),
+                "-Fn".into(),
+            ],
+        )
+        .await
+        .ok()?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        PathBuf::from(text.lines().find_map(|line| line.strip_prefix('n'))?)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return None;
+    let actual = fs::metadata(executable).ok()?;
+    let desired = fs::metadata(expected).ok()?;
+    if actual.dev() != desired.dev() || actual.ino() != desired.ino() {
+        return None;
+    }
+    Some(ProcessIdentity {
+        started,
+        arguments,
+        device: actual.dev(),
+        inode: actual.ino(),
+    })
+}
+pub(crate) async fn stop_stale(root: &Path, config: &Config) -> Result<(), DaemonError> {
+    let path = root.join("pg/data/postmaster.pid");
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(DaemonError::PostmasterPidForeign),
+        Ok(_) => (),
+    }
+    let bytes = config::read_private(&path, 8192).map_err(|_| DaemonError::PostmasterPidForeign)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| DaemonError::PostmasterPidForeign)?;
+    let lines: Vec<_> = text.lines().collect();
+    let pid = lines
+        .first()
+        .and_then(|s| s.parse::<i32>().ok())
+        .and_then(Pid::from_raw)
+        .ok_or(DaemonError::PostmasterPidForeign)?;
+    if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+        return Ok(());
+    }
+    let data =
+        fs::canonicalize(root.join("pg/data")).map_err(|_| DaemonError::PostmasterPidForeign)?;
+    if lines.get(1).and_then(|p| fs::canonicalize(p).ok()).as_ref() != Some(&data) {
+        return Err(DaemonError::PostmasterPidForeign);
+    }
+    let recorded_start = lines
+        .get(2)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|t| *t > 0)
+        .ok_or(DaemonError::PostmasterPidForeign)?;
+    let port = lines
+        .get(3)
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .ok_or(DaemonError::PostmasterPidForeign)?;
+    let raw = pid.as_raw_pid() as u32;
+    let executable = config.pg_bin_dir.join("postgres");
+    let argument_data = root.join("pg/data");
+    let first = process_identity(raw, &executable, &argument_data, port)
+        .await
+        .ok_or(DaemonError::PostmasterPidForeign)?;
+    if !identity_start_matches(&first, recorded_start)
+        || process_identity(raw, &executable, &argument_data, port)
+            .await
+            .as_ref()
+            != Some(&first)
+        || config::read_private(&path, 8192).ok().as_ref() != Some(&bytes)
+    {
+        return Err(DaemonError::PostmasterPidForeign);
+    }
+    rustix::process::kill_process(pid, Signal::INT)
+        .map_err(|_| DaemonError::StalePostgresRunning)?;
+    let deadline = Instant::now() + STOP;
+    while Instant::now() < deadline {
+        if rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH) {
+            return Ok(());
+        }
+        // PID identity changed: never signal the replacement.
+        if process_identity(raw, &executable, &argument_data, port)
+            .await
+            .as_ref()
+            != Some(&first)
+        {
+            return Err(DaemonError::StalePostgresRunning);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    Err(DaemonError::StalePostgresRunning)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn unowned_listener_is_not_contacted_before_identity_gate() {
+        // Test-only TCP placeholder: the production daemon has no bind entry.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = config::test_dir();
+        config::make_dir(&root.join("pg")).unwrap();
+        config::make_dir(&root.join("pg/data")).unwrap();
+        let spawned_at = SystemTime::now();
+        let child = Command::new("/bin/sleep")
+            .env_clear()
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let mut instance = Postgres {
+            child,
+            port,
+            root: root.clone(),
+            password: "test-only-sentinel".into(),
+            version: 0,
+            pid,
+            binary: PathBuf::from("/bin/sleep"),
+            spawned_at,
+        };
+        let path = root.join("pg/data/postmaster.pid");
+        let data = fs::canonicalize(root.join("pg/data")).unwrap();
+        let current = chrono::Utc::now().timestamp();
+        let short = format!("{pid}\n{}\n{current}\n{port}\n", data.display());
+        let ready = format!("{short}\n127.0.0.1\n0 0\nready   \n");
+        config::write_private(&path, short.as_bytes(), true).unwrap();
+        let mut accepts = 0_u32;
+        for contents in [short, ready] {
+            config::write_private(&path, contents.as_bytes(), false).unwrap();
+            assert!(matches!(
+                instance.verify_connection().await,
+                Err(DaemonError::PgStartFailed)
+            ));
+            match listener.accept() {
+                Ok((_stream, _)) => accepts += 1,
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+            }
+            assert_eq!(
+                accepts, 0,
+                "a rejected identity must not contact or authenticate to the placeholder"
+            );
+        }
+        // An old ready file carrying the newly reused PID/port cannot pass the spawn-time boundary.
+        assert!(instance.pid_file_matches());
+        instance.spawned_at =
+            fs::metadata(&path).unwrap().modified().unwrap() + Duration::from_secs(1);
+        assert!(matches!(
+            instance.verify_connection().await,
+            Err(DaemonError::PgStartFailed)
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(accepts, 0); // With no accepted connection, authentication and SQL counts are also zero.
+        instance.child.kill().await.unwrap();
+        instance.child.wait().await.unwrap();
+        // Preserve stale PG records for PostgreSQL's own orphan/shared-memory interlock.
+        assert!(path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires explicit own PG17.11 binaries; run serially"]
+    async fn identity_rejects_prefix_cluster_and_stale_start() {
+        let outer = config::test_dir();
+        let root = outer.join("Space Dir");
+        config::make_dir(&root).unwrap();
+        let pg_bin = std::env::var_os("OMB_TEST_PG_BIN_DIR")
+            .map(PathBuf::from)
+            .expect("explicit own PG17.11 test binary directory required");
+        crate::init(crate::InitOptions {
+            data_dir: root.clone(),
+            pg_bin_dir: pg_bin,
+        })
+        .await
+        .unwrap();
+        let config = config::load(&root).unwrap();
+        let mut postgres = Postgres::start(&root, &config).await.unwrap();
+        let result: Result<(), &'static str> = async {
+            let data = root.join("pg/data");
+            let binary = config.pg_bin_dir.join("postgres");
+            let observed = process_identity(postgres.pid, &binary, &data, postgres.port)
+                .await
+                .ok_or("owned PostgreSQL identity unavailable")?;
+            let text = String::from_utf8(
+                config::read_private(&data.join("postmaster.pid"), 8192)
+                    .map_err(|_| "own pid file unavailable")?,
+            )
+            .map_err(|_| "own pid file UTF-8")?;
+            let recorded = text
+                .lines()
+                .nth(2)
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or("own recorded start")?;
+            if !identity_start_matches(&observed, recorded)
+                || identity_start_matches(&observed, recorded - 3600)
+                || identity_start_matches(&observed, recorded + 3600)
+            {
+                return Err("actual start freshness was not enforced");
+            }
+            let prefix_neighbor = PathBuf::from(format!("{}-other", data.display()));
+            if process_identity(postgres.pid, &binary, &prefix_neighbor, postgres.port)
+                .await
+                .is_some()
+                || process_identity(postgres.pid, &binary, &data, postgres.port.wrapping_add(1))
+                    .await
+                    .is_some()
+            {
+                return Err("prefix cluster or other port accepted");
+            }
+            let foreign_root = outer.join("Space Dir-other");
+            for path in [
+                &foreign_root,
+                &foreign_root.join("pg"),
+                &foreign_root.join("pg/data"),
+            ] {
+                config::make_dir(path).map_err(|_| "foreign observation fixture")?;
+            }
+            let foreign_data = fs::canonicalize(foreign_root.join("pg/data"))
+                .map_err(|_| "foreign observation path")?;
+            let foreign_record = format!(
+                "{}\n{}\n{recorded}\n{}\n\n127.0.0.1\n0 0\nready   \n",
+                postgres.pid,
+                foreign_data.display(),
+                postgres.port
+            );
+            config::write_private(
+                &foreign_root.join("pg/data/postmaster.pid"),
+                foreign_record.as_bytes(),
+                true,
+            )
+            .map_err(|_| "foreign observation record")?;
+            if stop_stale(&foreign_root, &config).await != Err(DaemonError::PostmasterPidForeign) {
+                return Err("same-binary other-cluster process was not refused");
+            }
+            if postgres.version != 170011
+                || !postgres.is_alive().map_err(|_| "owned child state")?
+            {
+                return Err("owned PG17.11 not alive");
+            }
+            Ok(())
+        }
+        .await;
+        let stopped = postgres.stop().await;
+        fs::remove_dir_all(outer).unwrap();
+        stopped.unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_version_and_changed_hba() {
+        let root = config::test_dir();
+        config::make_dir(&root.join("pg")).unwrap();
+        config::make_dir(&root.join("pg/data")).unwrap();
+        config::write_private(
+            &root.join("pg/data/pg_hba.conf"),
+            b"host all all 0.0.0.0/0 trust",
+            true,
+        )
+        .unwrap();
+        assert_eq!(verify_hba(&root), Err(DaemonError::PgHbaRejected));
+        assert_eq!(
+            verify_binaries(&root).await,
+            Err(DaemonError::PgBinariesRejected)
+        );
+        // Known disposable scripts are controlled test inputs; no unknown installation is executed.
+        config::write_private(
+            &root.join("postgres"),
+            b"#!/bin/sh\nprintf 'postgres (PostgreSQL) 16.11\\n'\n",
+            true,
+        )
+        .unwrap();
+        config::write_private(&root.join("initdb"), b"#!/bin/sh\nexit 99\n", true).unwrap();
+        for name in ["postgres", "initdb"] {
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(
+            verify_binaries(&root).await,
+            Err(DaemonError::PgBinariesRejected)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn foreign_postmaster_identity_is_never_signalled() {
+        let root = config::test_dir();
+        config::make_dir(&root.join("pg")).unwrap();
+        config::make_dir(&root.join("pg/data")).unwrap();
+        let mut child = Command::new("/bin/sleep")
+            .env_clear()
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let data = fs::canonicalize(root.join("pg/data")).unwrap();
+        let text = format!("{}\n{}\n0\n5432\n", child.id().unwrap(), data.display());
+        config::write_private(&root.join("pg/data/postmaster.pid"), text.as_bytes(), true).unwrap();
+        let cfg = Config {
+            deployment_id: String::new(),
+            pg_bin_dir: PathBuf::from("/unavailable-pg"),
+            hosts: Default::default(),
+        };
+        assert_eq!(
+            stop_stale(&root, &cfg).await,
+            Err(DaemonError::PostmasterPidForeign)
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}

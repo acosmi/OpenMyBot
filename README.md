@@ -10,6 +10,8 @@
 
 Wrok Bot is an AI employee / digital teammate platform built with Rust, designed to provide AI coworkers who can get work done independently. The platform includes a desktop host, server, web interface, and a mobile client under development. The project is currently in development and validation, with macOS as the first release platform.
 
+Wrok Bot and [OpenMyBot](openmybot/README.md) are two products assembled from the same OpenBot engine in this workspace. Wrok Bot provides the desktop and server product surface; OpenMyBot currently provides a local foreground daemon with initialization and authenticated status commands. Its channel, host-driver and MCP integrations remain under development.
+
 ## Current progress
 
 Status as of October 16, 2026, based on the current v7 baseline and the published main line. Passing individual checks does not mean the installer or the complete product has passed release validation.
