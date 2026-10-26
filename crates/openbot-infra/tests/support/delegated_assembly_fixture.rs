@@ -113,6 +113,23 @@ impl Fixture {
         let client = pool.get().await.map_err(text)?;
         client.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('other-owner','other-owner@example.test',0) ON CONFLICT DO NOTHING;INSERT INTO public.agents(id,name,type,configuration) VALUES('delegated-bot','Delegated Bot','built_in','{\"providerSource\":\"extension:fake_host\",\"systemPrompt\":\"Standing instruction\"}') ON CONFLICT DO NOTHING;INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility,deleted_at) VALUES('delegated-bot','dev-local-user','Bot','Fixture role','seed','public',NULL) ON CONFLICT DO NOTHING;").await.map_err(text)?;
         drop(client);
+        Self::assemble_existing(config, options, pool).await
+    }
+    pub async fn reopen(config: &pool::DatabaseConfig) -> Result<Self, String> {
+        Self::reopen_with_options(config, Options::default()).await
+    }
+    pub async fn reopen_with_options(
+        config: &pool::DatabaseConfig,
+        options: Options,
+    ) -> Result<Self, String> {
+        let pool = pool::connect(config).await.map_err(text)?;
+        Self::assemble_existing(config, options, pool).await
+    }
+    async fn assemble_existing(
+        config: &pool::DatabaseConfig,
+        options: Options,
+        pool: pool::DatabasePool,
+    ) -> Result<Self, String> {
         let deployment = DeploymentId::new("delegated-deployment");
         let tenant = TenantId::new("delegated-tenant");
         let policy = PolicyStore::postgres(pool.clone(), None);

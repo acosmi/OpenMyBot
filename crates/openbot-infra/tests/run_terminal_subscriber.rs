@@ -18,7 +18,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -33,6 +33,12 @@ impl Gate {
     fn release(&self) {
         *self.open.lock().unwrap() = true;
         self.ready.notify_all();
+    }
+}
+struct GateReleaseGuard(Arc<Gate>);
+impl Drop for GateReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 impl RunTerminalSubscriber for Gate {
@@ -227,7 +233,7 @@ async fn terminal_replay_and_unknown_commit_never_duplicate_notice() {
             close(f).await;
             result?;
             let proxy = CommitAckProxy::start(&config).await?;
-            let unknown = Fixture::new(&proxy.config).await?;
+            let unknown = Fixture::reopen(&proxy.config).await?;
             begin(&unknown, "lost-terminal-ack").await?;
             let l = lease(&unknown, "lost-terminal-ack").await?;
             proxy.drop_next_commit_ack();
@@ -292,20 +298,87 @@ async fn slow_and_panicking_subscriber_cannot_delay_terminal_or_readers() {
                 },
             )
             .await?;
+            let gate_release = GateReleaseGuard(gate.clone());
             let result: Result<(), String> = async {
                 finish(&f, "panic").await?;
                 wait_calls(&gate.calls, 1).await?;
                 finish(&f, "blocked").await?;
                 wait_calls(&gate.calls, 2).await?;
                 // Overflow the real bounded worker queue while its consumer is gated.
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    for n in 0..140 {
-                        finish(&f, &format!("queue-{n}")).await?;
+                let mut remaining = Duration::from_secs(30);
+                let mut terminal_elapsed = Duration::ZERO;
+                let mut completed = 0;
+                for n in 0..140 {
+                    let diagnostic = |phase: &str, elapsed: Duration, left: Duration, done| {
+                        format!(
+                            "phase={phase} index={n} completed={done} terminal_elapsed_ms={} remaining_ms={}",
+                            elapsed.as_millis(),
+                            left.as_millis()
+                        )
+                    };
+                    let id = format!("queue-{n}");
+                    begin(&f, &id).await.map_err(|error| {
+                        format!("{} cause={error}", diagnostic("begin", terminal_elapsed, remaining, completed))
+                    })?;
+                    let l = lease(&f, &id).await.map_err(|error| {
+                        format!("{} cause={error}", diagnostic("claim_ack", terminal_elapsed, remaining, completed))
+                    })?;
+                    if remaining.is_zero() {
+                        return Err(diagnostic(
+                            "finish_budget_exhausted",
+                            terminal_elapsed,
+                            remaining,
+                            completed,
+                        ));
                     }
-                    Ok::<_, String>(())
-                })
-                .await
-                .map_err(text)??;
+                    let allotted = remaining;
+                    let started = Instant::now();
+                    let terminal = tokio::time::timeout(
+                        remaining,
+                        f.assembly.run_runtime.finish_run(
+                            &l,
+                            l.next_event_sequence(),
+                            RunTerminal::Completed,
+                        ),
+                    )
+                    .await;
+                    let spent = started.elapsed();
+                    terminal_elapsed += spent;
+                    remaining = remaining.saturating_sub(spent);
+                    let receipt = terminal.map_err(|error| {
+                        format!("{} cause={error}", diagnostic("finish_timeout", terminal_elapsed, remaining, completed))
+                    })?
+                    .map_err(|error| {
+                        format!("{} cause={error}", diagnostic("finish_error", terminal_elapsed, remaining, completed))
+                    })?;
+                    if spent > allotted {
+                        return Err(diagnostic(
+                            "finish_budget_exceeded",
+                            terminal_elapsed,
+                            remaining,
+                            completed,
+                        ));
+                    }
+                    if receipt.replayed {
+                        return Err(diagnostic(
+                            "finish_replayed",
+                            terminal_elapsed,
+                            remaining,
+                            completed,
+                        ));
+                    }
+                    completed += 1;
+                }
+                assert_eq!(completed, 140);
+                for n in 0..140 {
+                    let id = format!("queue-{n}");
+                    if status(&f, &id).await.map_err(|error| {
+                        format!("phase=durable_read index={n} completed={completed} terminal_elapsed_ms={} remaining_ms={} cause={error}", terminal_elapsed.as_millis(), remaining.as_millis())
+                    })? != ("completed".into(), 1) {
+                        return Err(format!("phase=durable_check index={n} completed={completed} terminal_elapsed_ms={} remaining_ms={}", terminal_elapsed.as_millis(), remaining.as_millis()));
+                    }
+                }
+                assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
                 assert_eq!(status(&f, "queue-139").await?, ("completed".into(), 1));
                 let reply = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -328,6 +401,7 @@ async fn slow_and_panicking_subscriber_cannot_delay_terminal_or_readers() {
             f.assembly.shutdown().await;
             assert!(gate.calls.load(Ordering::SeqCst) <= 130);
             f.pool.close();
+            drop(gate_release);
             result
         },
     )
@@ -355,7 +429,7 @@ async fn subscriber_shutdown_and_restart_do_not_replay_or_leak() {
                 weak_subscriber.upgrade().is_none(),
                 "terminal worker must release subscriber"
             );
-            let restarted = Fixture::new(&config).await?;
+            let restarted = Fixture::reopen(&config).await?;
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(restarted.notices.0.lock().unwrap().is_empty());
             finish(&restarted, "new-terminal").await?;
@@ -366,7 +440,7 @@ async fn subscriber_shutdown_and_restart_do_not_replay_or_leak() {
             );
             restarted.assembly.shutdown().await;
             restarted.pool.close();
-            let none = Fixture::with_options(
+            let none = Fixture::reopen_with_options(
                 &config,
                 Options {
                     subscribe: false,
@@ -380,7 +454,7 @@ async fn subscriber_shutdown_and_restart_do_not_replay_or_leak() {
             close(none).await;
             assert!(weak_none.upgrade().is_none());
             let gate = Arc::new(Gate::default());
-            let gated = Fixture::with_options(
+            let gated = Fixture::reopen_with_options(
                 &config,
                 Options {
                     subscriber: Some(gate.clone()),
@@ -388,12 +462,14 @@ async fn subscriber_shutdown_and_restart_do_not_replay_or_leak() {
                 },
             )
             .await?;
+            let gate_release = GateReleaseGuard(gate.clone());
             finish(&gated, "gated-stop").await?;
             wait_calls(&gate.calls, 1).await?;
             gate.release();
             tokio::time::timeout(Duration::from_secs(2), close(gated))
                 .await
                 .map_err(text)?;
+            drop(gate_release);
             assert_eq!(Arc::strong_count(&gate), 1);
             Ok(())
         },

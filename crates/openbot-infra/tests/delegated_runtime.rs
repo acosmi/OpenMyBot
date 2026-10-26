@@ -887,7 +887,7 @@ async fn restart_remints_from_persisted_record_and_never_extends_deadline() {
         let deadline:Value=c.query_one("SELECT content->'delegationSnapshot'->'absoluteDeadline' FROM public.messages WHERE message_id='restart:input'",&[]).await.map_err(text)?.get(0);
         c.execute("UPDATE public.thread_leases SET acquired_at=clock_timestamp()-interval '10 seconds',expires_at=clock_timestamp()-interval '1 second',updated_at=clock_timestamp() WHERE thread_id=$1",&[&r.thread_id.as_str()]).await.map_err(text)?;drop(c);
         close(f).await;
-        let restarted=Fixture::new(&config).await?;restarted.grant("Frozen owner template",Some(Duration::from_secs(90)));
+        let restarted=Fixture::reopen(&config).await?;restarted.grant("Frozen owner template",Some(Duration::from_secs(90)));
         let result:Result<(),String>=async{
             let l=claim(&restarted,"restart").await?;assert!(l.fencing().get()>1);
             assert_eq!(l.absolute_deadline(),deadline.as_u64().and_then(|n|SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(n))));
