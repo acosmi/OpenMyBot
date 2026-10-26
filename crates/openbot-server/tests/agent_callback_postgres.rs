@@ -704,6 +704,9 @@ async fn production_callback_http_reaches_governed_real_rmcp_with_durable_sequen
                 | ProviderRoute::CustomModel(_) => {
                     return Err("remote Agent selected a local provider route".to_owned());
                 }
+                ProviderRoute::Extension(_) => {
+                    return Err("remote Agent selected an unexpected extension route".to_owned());
+                }
             };
             let policy = PolicyStore::postgres(pool.clone(), None);
             policy.load().await.map_err(|error| error.to_string())?;
