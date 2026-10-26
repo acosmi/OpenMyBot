@@ -464,6 +464,13 @@ pub fn reduce(
         (AgentPhase::Preparing, AgentEvent::ContextFailed(failure)) => {
             begin_terminal(&mut next, failure_terminal(failure))
         }
+        (
+            AgentPhase::ExecutingTools,
+            AgentEvent::ContextFailed(AgentFailure::DelegationNotCurrent),
+        ) => begin_terminal(
+            &mut next,
+            failure_terminal(AgentFailure::DelegationNotCurrent),
+        ),
         (AgentPhase::Sampling, AgentEvent::ProviderTextDelta(delta)) if !delta.is_empty() => {
             vec![AgentEffect::PersistText(delta)]
         }

@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 use std::sync::{Mutex as StdMutex, atomic::AtomicUsize};
 struct Journal {
     terminal: StdMutex<Option<RunTerminal>>,
+    terminal_writes: AtomicUsize,
+    exchanges: AtomicUsize,
     done: tokio::sync::Notify,
 }
 fn receipt(n: u64) -> RunWriteReceipt {
@@ -58,6 +60,7 @@ impl RunRuntime for Journal {
         n: u64,
         _: &RunToolExchange,
     ) -> Result<RunWriteReceipt, RunRuntimeError> {
+        self.exchanges.fetch_add(1, Ordering::SeqCst);
         Ok(receipt(n))
     }
     async fn record_provider_usage(
@@ -81,6 +84,7 @@ impl RunRuntime for Journal {
         n: u64,
         t: RunTerminal,
     ) -> Result<RunWriteReceipt, RunRuntimeError> {
+        self.terminal_writes.fetch_add(1, Ordering::SeqCst);
         let mut slot = self.terminal.lock().unwrap();
         assert!(slot.is_none());
         *slot = Some(t);
@@ -119,6 +123,7 @@ impl AgentContextSource for Context {
 }
 struct Provider {
     starts: AtomicUsize,
+    tool_names: Vec<String>,
 }
 struct Session(VecDeque<ProviderEvent>);
 #[async_trait]
@@ -134,48 +139,75 @@ impl ProviderAdapter for Provider {
         _: ProviderRequest,
     ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(Session(
-            vec![
-                ProviderEvent::ToolCallCompleted {
-                    index: 0,
-                    call_id: "provider-call".into(),
-                    name: "remember".into(),
-                    arguments: serde_json::json!({}),
-                },
-                ProviderEvent::Usage(ProviderUsage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    total_tokens: 2,
-                }),
-                ProviderEvent::Completed,
-            ]
-            .into(),
-        )))
+        let mut events = self
+            .tool_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ProviderEvent::ToolCallCompleted {
+                index: u32::try_from(index).unwrap(),
+                call_id: format!("provider-call-{index}"),
+                name: name.clone(),
+                arguments: serde_json::json!({"index": index}),
+            })
+            .collect::<Vec<_>>();
+        events.push(ProviderEvent::Usage(ProviderUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            total_tokens: 2,
+        }));
+        events.push(ProviderEvent::Completed);
+        Ok(Box::new(Session(events.into())))
     }
 }
 struct Tools {
-    mode: u8,
+    modes: Vec<u8>,
+    parallel: bool,
+    pair_barrier: Option<tokio::sync::Barrier>,
+    invocations: AtomicUsize,
+    human_invocations: AtomicUsize,
     effects: AtomicUsize,
 }
 #[async_trait]
 impl AgentToolInvoker for Tools {
+    fn scheduling(&self, _: &str) -> AgentToolScheduling {
+        if self.parallel {
+            AgentToolScheduling::parallel(Vec::new())
+        } else {
+            AgentToolScheduling::serial()
+        }
+    }
+
     async fn invoke(
         &self,
         _: &RunExecutionLease,
         _: &str,
-        _: &str,
-        _: serde_json::Value,
+        name: &str,
+        arguments: serde_json::Value,
     ) -> Result<AgentToolReply, AgentToolInvokeError> {
-        if self.mode == 1 {
+        let index = arguments["index"].as_u64().unwrap() as usize;
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        if is_component_human_decision_name(name) {
+            self.human_invocations.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(barrier) = &self.pair_barrier {
+            // Neither child can complete unless the entire wave actually starts concurrently.
+            barrier.wait().await;
+        }
+        if self.modes[index] == 1 {
             return Err(AgentToolInvokeError::DelegationNotCurrent);
         }
         self.effects.fetch_add(1, Ordering::SeqCst);
-        if self.mode == 2 {
+        if self.modes[index] == 2 {
             return Err(AgentToolInvokeError::ReconciliationRequired);
         }
-        AgentToolReply::new(ToolCallId::new("effect-call"), "stored".into(), None)
+        AgentToolReply::new(
+            ToolCallId::new(format!("effect-call-{index}")),
+            "stored".into(),
+            None,
+        )
     }
 }
+
 fn lease() -> RunExecutionLease {
     RunExecutionLease::new(
         RunId::new("delegation-unit-run"),
@@ -187,9 +219,21 @@ fn lease() -> RunExecutionLease {
     )
     .unwrap()
 }
-async fn run(mode: u8, expired: bool) -> (RunTerminal, usize, usize, usize) {
+struct Observation {
+    terminal: RunTerminal,
+    starts: usize,
+    effects: usize,
+    loads: usize,
+    invocations: usize,
+    human_invocations: usize,
+    terminal_writes: usize,
+    exchanges: usize,
+}
+async fn run_case(calls: &[(&str, u8)], parallel: bool, expired: bool) -> Observation {
     let journal = Arc::new(Journal {
         terminal: StdMutex::new(None),
+        terminal_writes: AtomicUsize::new(0),
+        exchanges: AtomicUsize::new(0),
         done: tokio::sync::Notify::new(),
     });
     let context = Arc::new(Context {
@@ -197,9 +241,14 @@ async fn run(mode: u8, expired: bool) -> (RunTerminal, usize, usize, usize) {
     });
     let provider = Arc::new(Provider {
         starts: AtomicUsize::new(0),
+        tool_names: calls.iter().map(|(name, _)| (*name).to_owned()).collect(),
     });
     let tools = Arc::new(Tools {
-        mode,
+        modes: calls.iter().map(|(_, mode)| *mode).collect(),
+        parallel,
+        pair_barrier: (parallel && calls.len() > 1).then(|| tokio::sync::Barrier::new(calls.len())),
+        invocations: AtomicUsize::new(0),
+        human_invocations: AtomicUsize::new(0),
         effects: AtomicUsize::new(0),
     });
     let agent = BuiltInAgentRuntime::start(
@@ -211,7 +260,7 @@ async fn run(mode: u8, expired: bool) -> (RunTerminal, usize, usize, usize) {
         BuiltInAgentConfig {
             queue_capacity: 2,
             max_concurrency: 1,
-            max_tool_concurrency: 1,
+            max_tool_concurrency: calls.len().max(1),
             lease_renew_interval: Duration::from_millis(20),
             run_deadline: Some(Duration::from_secs(5)),
         },
@@ -234,11 +283,24 @@ async fn run(mode: u8, expired: bool) -> (RunTerminal, usize, usize, usize) {
         .unwrap();
     agent.stop().await;
     let terminal = journal.terminal.lock().unwrap().unwrap();
-    (
+    Observation {
         terminal,
-        provider.starts.load(Ordering::SeqCst),
-        tools.effects.load(Ordering::SeqCst),
-        context.loads.load(Ordering::SeqCst),
+        starts: provider.starts.load(Ordering::SeqCst),
+        effects: tools.effects.load(Ordering::SeqCst),
+        loads: context.loads.load(Ordering::SeqCst),
+        invocations: tools.invocations.load(Ordering::SeqCst),
+        human_invocations: tools.human_invocations.load(Ordering::SeqCst),
+        terminal_writes: journal.terminal_writes.load(Ordering::SeqCst),
+        exchanges: journal.exchanges.load(Ordering::SeqCst),
+    }
+}
+async fn run(mode: u8, expired: bool) -> (RunTerminal, usize, usize, usize) {
+    let observed = run_case(&[("remember", mode)], false, expired).await;
+    (
+        observed.terminal,
+        observed.starts,
+        observed.effects,
+        observed.loads,
     )
 }
 #[tokio::test]
@@ -254,24 +316,115 @@ async fn delegation_refusal_before_resampling_stops_provider() {
 }
 #[tokio::test]
 async fn delegation_refusal_before_effect_is_failed() {
-    let (terminal, starts, effects, _) = run(1, false).await;
+    for (calls, parallel) in [
+        (vec![("remember", 1)], false),
+        (vec![("showCard", 1), ("showQuote", 1)], true),
+        // The actual serial invocation takes HumanRequired -> HumanReleased before the refusal.
+        (vec![("askApproval", 1)], false),
+    ] {
+        let observed = run_case(&calls, parallel, false).await;
+        assert_eq!(
+            observed.terminal,
+            RunTerminal::Failed(RunFailureCode::DelegationNotCurrent)
+        );
+        assert_eq!(observed.terminal_writes, 1);
+        assert_eq!(observed.starts, 1);
+        assert_eq!(observed.loads, 1, "refusal must stop resampling");
+        assert_eq!(observed.effects, 0);
+        assert_eq!(observed.invocations, calls.len());
+        assert_eq!(observed.exchanges, 0);
+        assert_eq!(
+            observed.human_invocations,
+            usize::from(calls[0].0 == "askApproval")
+        );
+    }
+
+    let positive = run_case(&[("showCard", 0), ("showQuote", 0)], true, false).await;
+    assert_eq!(positive.effects, 2);
+    assert_eq!(positive.invocations, 2);
+    assert_eq!(positive.exchanges, 2);
+    assert_eq!(positive.loads, 2, "a committed wave can resample");
+    assert_eq!(positive.starts, 1);
+    assert_eq!(positive.terminal_writes, 1);
     assert_eq!(
-        terminal,
+        positive.terminal,
         RunTerminal::Failed(RunFailureCode::DelegationNotCurrent)
     );
-    assert_eq!(starts, 1);
-    assert_eq!(effects, 0);
+
+    // Document the exact accepted phase and keep other context failures closed in that phase.
+    let state = AgentState::queued(RunId::new("human-phase-check"));
+    let (state, _) = reduce(&state, AgentEvent::DispatchActivated).unwrap();
+    let (state, _) = reduce(&state, AgentEvent::ContextPrepared).unwrap();
+    let (state, _) = reduce(
+        &state,
+        AgentEvent::ProviderToolCalls(vec![AgentToolCall {
+            call_id: "human-call".into(),
+            name: "askApproval".into(),
+            arguments: serde_json::json!({}),
+        }]),
+    )
+    .unwrap();
+    let (state, _) = reduce(&state, AgentEvent::HumanRequired).unwrap();
+    let (state, _) = reduce(&state, AgentEvent::HumanReleased).unwrap();
+    assert_eq!(
+        state.phase(),
+        openbot_domain::agent::AgentPhase::ExecutingTools
+    );
+    assert!(
+        reduce(
+            &state,
+            AgentEvent::ContextFailed(AgentFailure::ToolLoopUnavailable)
+        )
+        .is_err()
+    );
+    let (_, effects) = reduce(
+        &state,
+        AgentEvent::ContextFailed(AgentFailure::DelegationNotCurrent),
+    )
+    .unwrap();
+    assert_eq!(
+        effects,
+        [AgentEffect::CommitTerminal(AgentTerminal::Failed(
+            AgentFailure::DelegationNotCurrent
+        ))]
+    );
 }
 #[tokio::test]
 async fn started_effect_unknown_is_not_overwritten_by_revocation() {
     for _ in 0..10 {
-        let (terminal, starts, effects, _) = run(2, false).await;
+        let observed = run_case(&[("remember", 2)], false, false).await;
         assert_eq!(
-            terminal,
+            observed.terminal,
             RunTerminal::ReconciliationRequired(RunFailureCode::JournalCommitUnknown)
         );
-        assert_eq!(starts, 1);
-        assert_eq!(effects, 1);
+        assert_eq!(observed.terminal_writes, 1);
+        assert_eq!(observed.starts, 1);
+        assert_eq!(observed.effects, 1);
+        assert_eq!(observed.loads, 1);
+        assert_eq!(observed.exchanges, 0);
+
+        for calls in [
+            vec![("showCard", 1), ("showQuote", 2)],
+            vec![("showCard", 2), ("showQuote", 1)],
+            // A successful child before the unknown child must not append a partial reply wave.
+            vec![("showCard", 0), ("showQuote", 1), ("showRecord", 2)],
+            vec![("showCard", 2), ("showQuote", 1), ("showRecord", 0)],
+        ] {
+            let observed = run_case(&calls, true, false).await;
+            assert_eq!(
+                observed.terminal,
+                RunTerminal::ReconciliationRequired(RunFailureCode::JournalCommitUnknown)
+            );
+            assert_eq!(observed.terminal_writes, 1, "no Failed before or after RR");
+            assert_eq!(observed.starts, 1);
+            assert_eq!(observed.loads, 1, "unknown must stop resampling");
+            assert_eq!(observed.invocations, calls.len(), "the full wave joined");
+            assert_eq!(
+                observed.effects,
+                calls.iter().filter(|(_, mode)| *mode != 1).count()
+            );
+            assert_eq!(observed.exchanges, 0, "RR precedes every reply append");
+        }
     }
 }
 #[tokio::test]

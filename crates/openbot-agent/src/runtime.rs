@@ -1170,6 +1170,14 @@ async fn execute_tool_wave(
     else {
         return false;
     };
+    // Every child has joined. Preserve an uncertain effect before any definite refusal or reply.
+    if outputs
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, Err(AgentToolInvokeError::ReconciliationRequired)))
+    {
+        drive_terminal_event(state, journal, AgentEvent::JournalCommitUnknown).await;
+        return false;
+    }
     for (call, outcome) in outputs {
         let reply = match outcome {
             Ok(reply) => reply,
