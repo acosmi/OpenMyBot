@@ -447,6 +447,44 @@ async fn run_proof_is_single_use_and_cross_command_replay_is_refused() {
 }
 #[tokio::test]
 async fn proof_capacity_expiry_and_terminal_cleanup_fail_closed() {
+    let (runtime, authority, store, r, lease) = fixture();
+    let future = SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
+    let invalid = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+    for (grant_expiry, record_expiry, accepted) in [
+        (None, None, true),
+        (
+            Some(future + Duration::from_nanos(999_999)),
+            Some(future),
+            true,
+        ),
+        (Some(future), Some(future + Duration::from_millis(1)), false),
+        (Some(future), None, false),
+        (None, Some(future), false),
+        // Conversion failure must not become None and match an absent grant expiry.
+        (None, Some(invalid), false),
+    ] {
+        *authority.grant.lock().unwrap() = Ok(DelegationGrant::new(
+            ActorId::new("owner"),
+            r.bot_id.clone(),
+            1,
+            AuthGeneration::new(2),
+            grant_expiry,
+            None,
+            "private-template".into(),
+        ));
+        store.record.lock().unwrap().expires_at = record_expiry;
+        let calls_before = store.calls.load(Ordering::SeqCst);
+        let result = runtime.check_sampling(&lease).await;
+        if accepted {
+            result.unwrap();
+            assert_eq!(store.calls.load(Ordering::SeqCst), calls_before + 2);
+        } else {
+            assert!(matches!(result, Err(AppError::PolicyRefused { rule, .. })
+                if rule == "delegation_not_current"));
+            assert_eq!(store.calls.load(Ordering::SeqCst), calls_before + 1);
+        }
+    }
+
     let (runtime, a, store, r, lease) = fixture();
     runtime.check_sampling(&lease).await.unwrap();
     for _ in 0..256 {

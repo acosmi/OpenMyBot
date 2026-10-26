@@ -445,15 +445,20 @@ impl DelegationRuntime {
         }
         let grant = self.verify(&record.source, record.revision).await?;
         validate_grant(&grant, record.revision, &record.bot_id)?;
+        let expiry_millis = |expires_at: Option<SystemTime>| {
+            expires_at
+                .map(|at| {
+                    at.duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                })
+                .transpose()
+                .map_err(|_| not_current())
+        };
+        let grant_expiry_millis = expiry_millis(grant.expires_at)?;
+        let record_expiry_millis = expiry_millis(record.expires_at)?;
         if grant.owner != record.actor_id
             || grant.granted_generation != record.granted_generation
-            || grant.expires_at.map(|at| {
-                at.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-            }) != record.expires_at.map(|at| {
-                at.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-            })
+            || grant_expiry_millis != record_expiry_millis
         {
             return Err(not_current());
         }
