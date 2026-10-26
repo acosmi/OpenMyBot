@@ -3,7 +3,8 @@
 //! A declared HTTPS URL controls cookie attributes; it does not prove how a request arrived.
 //! Business routes additionally require a verified loopback single-user connection or an explicit
 //! same-machine HTTPS proxy secret plus exact forwarded authority/protocol. Other configurations
-//! retain diagnostics but cannot authenticate users, issue sessions or perform actions.
+//! retain diagnostics but cannot authenticate users, issue sessions or perform actions. Single-user
+//! startup additionally rejects any configuration that cannot select the loopback single-user mode.
 
 use crate::config::address::{DeploymentAddress, Scheme};
 use crate::config::{ConfigProblem, EnvMap, Expectation, Secret};
@@ -27,6 +28,24 @@ pub(crate) enum TrustedTransportMode {
     TestOnlyUnchecked,
 }
 
+/// Single-user startup requires a loopback HTTP configuration without a proxy secret.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SingleUserRemoteTransportRefused;
+
+impl core::fmt::Display for SingleUserRemoteTransportRefused {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("single_user_remote_transport_refused")
+    }
+}
+
+impl core::fmt::Debug for SingleUserRemoteTransportRefused {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for SingleUserRemoteTransportRefused {}
+
 impl TrustedTransportPolicy {
     /// Disable business and authentication routes while retaining non-sensitive diagnostics.
     #[must_use]
@@ -41,6 +60,18 @@ impl TrustedTransportPolicy {
         secret: Option<Secret>,
         single_user: bool,
     ) -> Self {
+        if single_user {
+            return if secret.is_none()
+                && public_url
+                    .is_none_or(|address| address.scheme() == Scheme::Http && address.is_loopback())
+            {
+                Self {
+                    mode: TrustedTransportMode::LoopbackSingleUser,
+                }
+            } else {
+                Self::deny()
+            };
+        }
         if let (Some(address), Some(secret)) = (public_url, secret.as_ref()) {
             if valid_proxy_secret(secret.expose())
                 && let Some(authority) = proxy_authority(address)
@@ -53,15 +84,6 @@ impl TrustedTransportPolicy {
                 };
             }
             return Self::deny();
-        }
-        if single_user
-            && secret.is_none()
-            && public_url
-                .is_none_or(|address| address.scheme() == Scheme::Http && address.is_loopback())
-        {
-            return Self {
-                mode: TrustedTransportMode::LoopbackSingleUser,
-            };
         }
         Self::deny()
     }
@@ -211,6 +233,10 @@ impl PublicTransport {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "single_user_transport_tests.rs"]
+mod single_user_transport_tests;
 
 #[cfg(test)]
 mod tests {
