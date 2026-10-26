@@ -73,7 +73,7 @@ async fn physical_commit_ack_loss(
             return Err(text(error));
         }
     };
-    let result = async {
+    let result: Result<(), String> = async {
         let r = f.request("ack-loss-run").await?;
         let c = control.get().await.map_err(text)?;
         c.batch_execute(
