@@ -435,10 +435,10 @@ async fn callback_rechecks_after_authentication_before_actual_invoke() {
                                         )
                                         .await
                                         .map_err(text)?;
-                                    if let AppReply::PendingToolApprovals(page) = reply {
-                                        if let Some(p) = page.approvals.into_iter().next() {
-                                            return Ok::<_, String>(p);
-                                        }
+                                    if let AppReply::PendingToolApprovals(page) = reply
+                                        && let Some(p) = page.approvals.into_iter().next()
+                                    {
+                                        return Ok::<_, String>(p);
                                     }
                                     tokio::time::sleep(Duration::from_millis(5)).await;
                                 }
@@ -808,7 +808,7 @@ async fn legal_component_chain_refreshes_proof_for_each_command() {
                 let human=tokio::spawn(async move {app.execute(human_auth,human_command).await});
                 let pending=tokio::time::timeout(Duration::from_secs(5),async {loop {
                     let reply=f.assembly.application.execute(f.auth.clone(),AppCommand::ListPendingComponentHumanDecisions).await.map_err(text)?;
-                    if let AppReply::PendingComponentHumanDecisions(page)=reply {if let Some(p)=page.decisions.into_iter().next(){return Ok::<_,String>(p);}}
+                    if let AppReply::PendingComponentHumanDecisions(page)=reply && let Some(p)=page.decisions.into_iter().next(){return Ok::<_,String>(p);}
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }}).await.map_err(text)??;
                 f.assembly.application.execute(f.auth.clone(),AppCommand::ResolveComponentHumanDecision {decision_id:pending.decision_id,answer:ComponentHumanDecisionAnswer::Approval(ComponentApprovalAnswer {decision:ComponentApprovalDecision::Approved,note:None})}).await.map_err(text)?;
