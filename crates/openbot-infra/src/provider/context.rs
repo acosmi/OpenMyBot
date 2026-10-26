@@ -545,10 +545,10 @@ impl PostgresAgentContextSource {
                     Some(binding) => ProviderRoute::CustomModel(binding.clone()),
                     None => {
                         let route = provider_route(&configuration)?;
-                        if let ProviderRoute::Extension(key) = &route {
-                            if self.extensions.get(key).is_none() {
-                                return Err(AgentContextError::Unavailable);
-                            }
+                        if let ProviderRoute::Extension(key) = &route
+                            && self.extensions.get(key).is_none()
+                        {
+                            return Err(AgentContextError::Unavailable);
                         }
                         route
                     }

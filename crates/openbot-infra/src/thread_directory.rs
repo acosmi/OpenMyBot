@@ -1982,7 +1982,7 @@ async fn apply_begin_observed(
     let model_snapshot = crate::model_runtime::resolve(transaction, request).await?;
     artifact_refs::verify_current(
         transaction,
-        &schema,
+        schema,
         (&request.deployment, &request.tenant),
         &request.actor,
         request.auth_generation.get(),
@@ -2235,7 +2235,7 @@ async fn apply_begin_observed(
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
     if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
-        crate::channel_activity::record_from_message(&schema, message.id())
+        crate::channel_activity::record_from_message(schema, message.id())
             .await
             .map_err(writer_error)?;
     }

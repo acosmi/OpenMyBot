@@ -370,8 +370,8 @@ impl PostgresRunRuntime {
         {
             return Err(RunRuntimeError::StaleLease);
         }
-        if let Some(expected) = expected_record {
-            if actual.deployment != expected.deployment
+        if let Some(expected) = expected_record
+            && (actual.deployment != expected.deployment
                 || actual.tenant != expected.tenant
                 || actual.run_id != expected.run_id
                 || actual.thread_id != expected.thread_id
@@ -383,10 +383,9 @@ impl PostgresRunRuntime {
                 || actual.trigger_id != expected.trigger_id
                 || actual.granted_generation != expected.granted_generation
                 || actual.expires_at != expected.expires_at
-                || actual.absolute_deadline != expected.absolute_deadline
-            {
-                return Err(RunRuntimeError::StaleLease);
-            }
+                || actual.absolute_deadline != expected.absolute_deadline)
+        {
+            return Err(RunRuntimeError::StaleLease);
         }
 
         let row=tx.query_one("SELECT EXISTS(SELECT 1 FROM public.tool_calls c JOIN public.tool_attempts a ON a.tool_call_id=c.tool_call_id WHERE c.run_id=$1 AND (a.status IN ('executing','reconciliation_required') OR a.commit_state='unknown')) AS uncertain",&[&lease.run_id().as_str()]).await.map_err(|e|unavailable("delegated callback effects",e))?;
