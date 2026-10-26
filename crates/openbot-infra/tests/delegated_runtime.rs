@@ -386,7 +386,7 @@ async fn revoked_expired_generation_or_revision_changed_run_fails_before_work() 
                 if mode>=6 {let c=f.pool.get().await.map_err(text)?;c.execute(if mode==6 {"UPDATE public.messages SET content=jsonb_set(content,'{delegation,source,bindingId}','\"other-binding\"') WHERE run_id='revoked-run' AND message_id='revoked-run:input'"} else {"UPDATE public.users SET auth_generation=auth_generation+1 WHERE id='dev-local-user'"},&[]).await.map_err(text)?;}
             }
             let context=PostgresAgentContextSource::new(f.pool.clone(),f.auth.deployment().clone(),f.auth.tenant().clone(),Some(32)).map_err(text)?.with_extensions(f.assembly.provider_extensions.clone());
-            let agent=BuiltInAgentRuntime::start(f.assembly.run_runtime.clone(),Arc::new(context),Arc::new(ProviderRouter::new(Arc::new(Provider::default()),None).with_extensions(f.assembly.provider_extensions.clone())),Arc::new(NoAgentToolInvoker),Arc::new(NoAgentAudit),BuiltInAgentConfig::default()).map_err(text)?;
+            let agent=BuiltInAgentRuntime::start(f.assembly.run_runtime.clone(),Arc::new(context),Arc::new(ProviderRouter::new(Arc::new(Provider::default()),None).with_extensions(f.assembly.provider_extensions.clone())),Arc::new(NoAgentToolInvoker),Arc::new(NoAgentAudit),BuiltInAgentConfig::default()).map_err(|error| format!("{error:?}"))?;
             let relay=RunRelay::start(f.assembly.run_runtime.clone(),agent.consumer());
             let result:Result<(),String>=async{
                 tokio::time::timeout(Duration::from_secs(10),async{loop{if row(&f,"revoked-run").await?.0!="running" {return Ok::<_,String>(());}tokio::time::sleep(Duration::from_millis(10)).await;}}).await.map_err(text)??;
