@@ -85,7 +85,7 @@ async fn e07_fake_extension_delegated_run_terminal_and_local_read() {
         let resolver = local_resolver(&f).await?;
         let context = PostgresAgentContextSource::new(f.pool.clone(), f.auth.deployment().clone(), f.auth.tenant().clone(), Some(32)).map_err(text)?.with_extensions(f.assembly.provider_extensions.clone());
         let router = ProviderRouter::new(Arc::new(AnswerProvider::default()), None).with_extensions(f.assembly.provider_extensions.clone());
-        let agent = BuiltInAgentRuntime::start(f.assembly.run_runtime.clone(), Arc::new(context), Arc::new(router), Arc::new(NoAgentToolInvoker), Arc::new(NoAgentAudit), BuiltInAgentConfig::default()).map_err(text)?;
+        let agent = BuiltInAgentRuntime::start(f.assembly.run_runtime.clone(), Arc::new(context), Arc::new(router), Arc::new(NoAgentToolInvoker), Arc::new(NoAgentAudit), BuiltInAgentConfig::default()).map_err(|error| format!("{error:?}"))?;
         let relay = RunRelay::start(f.assembly.run_runtime.clone(), agent.consumer());
         let result: Result<(), String> = async {
             assert_eq!(resolver.local_context().map_err(text)?, f.auth);
