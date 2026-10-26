@@ -14,11 +14,12 @@ fn environment(pairs: &[(&str, &str)]) -> EnvMap {
 
 fn main_source() -> &'static str {
     // A source-level wiring audit, not an execution of the production startup or its PG prefix.
+    // Only a top-level test attribute ends this prefix; nested field attributes stay included.
     include_str!("main.rs")
         .split_once("async fn main()")
         .unwrap()
         .1
-        .split("#[cfg(test)]")
+        .split("\n#[cfg(test)]")
         .next()
         .unwrap()
 }
