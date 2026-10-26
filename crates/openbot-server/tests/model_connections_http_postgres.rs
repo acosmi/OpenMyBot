@@ -193,6 +193,9 @@ async fn assemble(
         stall_timeout: Some(std::time::Duration::from_secs(2)),
         oauth_public_url: None,
         app_url: None,
+        extra_provider_adapters: Vec::new(),
+        run_event_subscriber: None,
+        delegation_authority: None,
     })
     .await
     .map_err(|e| e.to_string())?;

@@ -1574,6 +1574,9 @@ pub(super) async fn run(config: pool::DatabaseConfig) -> Result<(), String> {
             remote_agent_probe:remote.clone(),managed_slot_available,
             channel_routing_provider:ChannelRoutingProviderInput{endpoint:Url::parse(&format!("{}/v1/chat/completions",view.origin())).map_err(|_|"owned_channel_endpoint")?,environment_api_key:None,egress_allow_cidrs:vec!["127.0.0.1/32".to_owned()],allow_http:false},
             stall_timeout:None,oauth_public_url:None,app_url:None,
+            extra_provider_adapters: Vec::new(),
+            run_event_subscriber: None,
+            delegation_authority: None,
         }).await.map_err(|_|"owned_production_assembly")?);
         let assembled=assembly.as_ref().ok_or("assembly_missing")?;
         let package_credentials=Arc::new(PostgresOpenAiCredentialSource::new(application_pool.clone(),vault.clone(),"unused-default-model-key".to_owned(),None).map_err(|_|"owned_default_source")?);

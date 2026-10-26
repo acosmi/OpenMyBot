@@ -187,6 +187,8 @@ impl AgentPhase {
 /// Stable terminal reason；vendor 原文不进入 domain。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFailure {
+    /// The current delegated authority check refused new sampling or effects.
+    DelegationNotCurrent,
     /// Provider authentication。
     ProviderAuthentication,
     /// Provider rate limit exhausted for this run。

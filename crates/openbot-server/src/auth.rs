@@ -3015,6 +3015,11 @@ impl core::fmt::Debug for SingleUserAuthResolver {
 }
 
 impl SingleUserAuthResolver {
+    /// Resolve the same verified local context without an HTTP request.
+    pub fn local_context(&self) -> Result<AuthContext, AppError> {
+        self.resolved().map(ResolvedAuth::into_context)
+    }
+
     #[allow(
         dead_code,
         reason = "The production callback URL destination remains disabled"
@@ -3679,3 +3684,7 @@ mod gateway_token_dispatch_tests;
 #[cfg(test)]
 #[path = "auth/thread_history_management_tests.rs"]
 mod thread_history_management_tests;
+
+#[cfg(test)]
+#[path = "auth/delegation_local_context_tests.rs"]
+mod delegation_local_context_tests;

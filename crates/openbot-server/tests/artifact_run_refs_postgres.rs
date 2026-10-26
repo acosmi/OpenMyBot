@@ -1195,6 +1195,9 @@ async fn artifact_refs_v2_custom_selection_follows_same_rules() {
                 endpoint: url::Url::parse("http://127.0.0.1:9/v1/chat/completions").map_err(text)?,
                 environment_api_key: None, egress_allow_cidrs: vec!["127.0.0.1/32".into()], allow_http: true,
             }, stall_timeout: Some(Duration::from_secs(2)), oauth_public_url: None, app_url: None,
+            extra_provider_adapters: Vec::new(),
+            run_event_subscriber: None,
+            delegation_authority: None,
         }).await.map_err(text)?;
         let result: Result = async {
             let binding = assembly.model_dataset_binding.clone();

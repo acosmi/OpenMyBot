@@ -54,6 +54,7 @@ pub struct PostgresAgentContextSource {
     pool: crate::db::pool::DatabasePool,
     deployment: DeploymentId,
     tenant: TenantId,
+    extensions: openbot_application::ProviderExtensions,
     max_output_tokens: Option<u32>,
     package_rate_card: Option<ProviderRateCard>,
     managed_rate_card: Option<ProviderRateCard>,
@@ -84,6 +85,7 @@ impl PostgresAgentContextSource {
             pool,
             deployment,
             tenant,
+            extensions: Default::default(),
             max_output_tokens,
             package_rate_card: None,
             managed_rate_card: None,
@@ -95,6 +97,13 @@ impl PostgresAgentContextSource {
             agent_credential_vault: None,
             model_dataset_binding: None,
         })
+    }
+
+    /// Use the immutable registration shared with this assembly's provider router.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: openbot_application::ProviderExtensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 
     /// Attach host-validated package and managed provider rate snapshots.
@@ -534,12 +543,22 @@ impl PostgresAgentContextSource {
                 tools.extend(granted_mcp.iter().map(|tool| tool.provider_definition()));
                 let route = match &selection {
                     Some(binding) => ProviderRoute::CustomModel(binding.clone()),
-                    None => provider_route(&configuration)?,
+                    None => {
+                        let route = provider_route(&configuration)?;
+                        if let ProviderRoute::Extension(key) = &route {
+                            if self.extensions.get(key).is_none() {
+                                return Err(AgentContextError::Unavailable);
+                            }
+                        }
+                        route
+                    }
                 };
                 let rate_card = match &route {
                     ProviderRoute::PackageOpenAi => self.package_rate_card.clone(),
                     ProviderRoute::Managed => self.managed_rate_card.clone(),
-                    ProviderRoute::RemoteAgUi(_) | ProviderRoute::CustomModel(_) => None,
+                    ProviderRoute::RemoteAgUi(_)
+                    | ProviderRoute::CustomModel(_)
+                    | ProviderRoute::Extension(_) => None,
                 };
                 (
                     route,
@@ -892,6 +911,10 @@ impl Drop for V2ContextProjectionConnection {
 #[async_trait]
 impl AgentContextSource for PostgresAgentContextSource {
     async fn load(&self, lease: &RunExecutionLease) -> Result<ProviderRequest, AgentContextError> {
+        lease
+            .check_delegated_sampling()
+            .await
+            .map_err(|_| AgentContextError::DelegationNotCurrent)?;
         if self.model_dataset_binding.is_some() {
             self.load_configured(lease).await
         } else {
@@ -1064,6 +1087,13 @@ fn provider_route(configuration: &Value) -> Result<ProviderRoute, AgentContextEr
         None | Some(Value::Null) => Ok(ProviderRoute::PackageOpenAi),
         Some(Value::String(value)) if value == "package" => Ok(ProviderRoute::PackageOpenAi),
         Some(Value::String(value)) if value == "managed" => Ok(ProviderRoute::Managed),
+        Some(Value::String(value)) if value.starts_with("extension:") => {
+            openbot_application::ProviderExtensionKey::new(&value[10..])
+                .map(ProviderRoute::Extension)
+                .map_err(|_| AgentContextError::Corrupt {
+                    field: "provider_source",
+                })
+        }
         _ => Err(AgentContextError::Corrupt {
             field: "provider_source",
         }),

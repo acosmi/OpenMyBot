@@ -517,6 +517,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stall_timeout: server.agent_budgets.stall_timeout,
         oauth_public_url: oauth_public_url.map(|url| url.as_str().to_owned()),
         app_url: server.app_url.clone(),
+        extra_provider_adapters: Vec::new(),
+        run_event_subscriber: None,
+        delegation_authority: None,
     })
     .await?;
     if application_assembly

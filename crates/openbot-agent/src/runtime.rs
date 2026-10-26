@@ -558,10 +558,17 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
     let mut renew = tokio::time::interval(inner.config.lease_renew_interval);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     renew.tick().await;
-    let deadline = inner
-        .config
-        .run_deadline
-        .map(|duration| tokio::time::Instant::now() + duration);
+    let deadline = match lease.absolute_deadline() {
+        Some(at) => Some(
+            tokio::time::Instant::now()
+                + at.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default(),
+        ),
+        None => inner
+            .config
+            .run_deadline
+            .map(|duration| tokio::time::Instant::now() + duration),
+    };
     loop {
         // The run-wide output ceiling is derived from at most nine provider invocations
         // (initial + eight continuations). Interrupt resumes consume the same continuation
@@ -1170,6 +1177,15 @@ async fn execute_tool_wave(
                 drive_terminal_event(state, journal, AgentEvent::JournalCommitUnknown).await;
                 return false;
             }
+            Err(AgentToolInvokeError::DelegationNotCurrent) => {
+                drive_terminal_event(
+                    state,
+                    journal,
+                    AgentEvent::ContextFailed(AgentFailure::DelegationNotCurrent),
+                )
+                .await;
+                return false;
+            }
             Err(AgentToolInvokeError::Unavailable) => {
                 drive_terminal_event(state, journal, AgentEvent::ToolRuntimeUnavailable).await;
                 return false;
@@ -1310,6 +1326,15 @@ async fn invoke_serial_tool(
         ControlledChild::Ready(Ok(reply)) => Some((call, reply)),
         ControlledChild::Ready(Err(AgentToolInvokeError::ReconciliationRequired)) => {
             drive_terminal_event(state, journal, AgentEvent::JournalCommitUnknown).await;
+            None
+        }
+        ControlledChild::Ready(Err(AgentToolInvokeError::DelegationNotCurrent)) => {
+            drive_terminal_event(
+                state,
+                journal,
+                AgentEvent::ContextFailed(AgentFailure::DelegationNotCurrent),
+            )
+            .await;
             None
         }
         ControlledChild::Ready(Err(AgentToolInvokeError::Unavailable)) => {
@@ -2053,6 +2078,7 @@ const fn provider_port_failure(error: ProviderPortError) -> AgentFailure {
 
 const fn context_failure(error: AgentContextError) -> AgentFailure {
     match error {
+        AgentContextError::DelegationNotCurrent => AgentFailure::DelegationNotCurrent,
         AgentContextError::Stale => AgentFailure::RuntimeLeaseLost,
         AgentContextError::ToolHistoryUnsupported => AgentFailure::ToolLoopUnavailable,
         AgentContextError::Unavailable
@@ -2074,6 +2100,7 @@ const fn run_terminal(terminal: AgentTerminal) -> RunTerminal {
 
 const fn failure_code(failure: AgentFailure) -> RunFailureCode {
     match failure {
+        AgentFailure::DelegationNotCurrent => RunFailureCode::DelegationNotCurrent,
         AgentFailure::ProviderAuthentication => RunFailureCode::ProviderAuthentication,
         AgentFailure::ProviderRateLimited => RunFailureCode::ProviderRateLimited,
         AgentFailure::ProviderUnavailable => RunFailureCode::ProviderUnavailable,
@@ -5074,3 +5101,7 @@ mod tests {
         assert!(!bind_custom_model(&mut bound, &request, &run));
     }
 }
+
+#[cfg(test)]
+#[path = "delegation_runtime_tests.rs"]
+mod delegation_runtime_tests;

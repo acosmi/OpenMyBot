@@ -174,6 +174,9 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
         stall_timeout: None,
         oauth_public_url: None,
         app_url: None,
+        extra_provider_adapters: Vec::new(),
+        run_event_subscriber: None,
+        delegation_authority: None,
     })
     .await
     .map_err(|_| DaemonError::EngineAssemblyFailed)?;

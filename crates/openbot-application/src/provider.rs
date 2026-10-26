@@ -19,6 +19,9 @@ use crate::RunExecutionLease;
 /// Loading a fresh authoritative actor context for an asynchronous Agent effect failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AgentAuthorizationError {
+    /// Delegated registration failed its current authority check.
+    #[error("delegation_not_current")]
+    DelegationNotCurrent,
     /// Database/ACL source unavailable.
     #[error("agent_authorization_unavailable")]
     Unavailable,
@@ -261,6 +264,8 @@ impl Eq for RemoteAguiAuthorization {}
 /// Provider routing loaded from authoritative Bot configuration or an explicit run snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderRoute {
+    /// Assembly-registered provider with no built-in fallback.
+    Extension(crate::ProviderExtensionKey),
     /// Package `model.yaml` 固定 OpenAI。
     PackageOpenAi,
     /// Managed slot 读取 deployment `BOT_PROVIDER/BOT_MODEL` config。
@@ -2197,6 +2202,9 @@ pub trait ProviderAdapter: Send + Sync {
 /// Authoritative thread/Bot context load failure。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AgentContextError {
+    /// Delegated authority is no longer current.
+    #[error("delegation_not_current")]
+    DelegationNotCurrent,
     /// PostgreSQL unavailable。
     #[error("agent_context_unavailable")]
     Unavailable,

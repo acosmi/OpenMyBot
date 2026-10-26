@@ -120,6 +120,9 @@ async fn shared_postgres_application_assembly_executes_real_command() {
                 stall_timeout: Some(std::time::Duration::from_secs(2)),
                 oauth_public_url: None,
                 app_url: None,
+                extra_provider_adapters: Vec::new(),
+                run_event_subscriber: None,
+                delegation_authority: None,
             })
             .await
             .map_err(|error| error.to_string())?;
