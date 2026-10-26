@@ -1,12 +1,25 @@
 use super::*;
 use openbot_application::{
-    ClaimedRunDispatch, NoAgentAudit, ProviderMessage, ProviderMessageRole, ProviderRequest,
+    AgentAuditError, ClaimedRunDispatch, ProviderMessage, ProviderMessageRole, ProviderRequest,
     ProviderUsage, RunSemanticChannel, RunTokenUsage, RunWriteReceipt,
 };
 use openbot_contracts::ids::{ActorId, BotId, RunId, ThreadId, ToolCallId};
 use openbot_domain::thread::FencingToken;
 use std::collections::VecDeque;
 use std::sync::{Mutex as StdMutex, atomic::AtomicUsize};
+#[derive(Default)]
+struct RecordingAudit(StdMutex<Vec<AgentAuditKind>>);
+#[async_trait]
+impl AgentAudit for RecordingAudit {
+    async fn record(
+        &self,
+        _: &RunExecutionLease,
+        kind: AgentAuditKind,
+    ) -> Result<(), AgentAuditError> {
+        self.0.lock().unwrap().push(kind);
+        Ok(())
+    }
+}
 struct Journal {
     terminal: StdMutex<Option<RunTerminal>>,
     terminal_writes: AtomicUsize,
@@ -228,6 +241,7 @@ struct Observation {
     human_invocations: usize,
     terminal_writes: usize,
     exchanges: usize,
+    audits: Vec<AgentAuditKind>,
 }
 async fn run_case(calls: &[(&str, u8)], parallel: bool, expired: bool) -> Observation {
     let journal = Arc::new(Journal {
@@ -251,12 +265,13 @@ async fn run_case(calls: &[(&str, u8)], parallel: bool, expired: bool) -> Observ
         human_invocations: AtomicUsize::new(0),
         effects: AtomicUsize::new(0),
     });
+    let audit = Arc::new(RecordingAudit::default());
     let agent = BuiltInAgentRuntime::start(
         journal.clone(),
         context.clone(),
         provider.clone(),
         tools.clone(),
-        Arc::new(NoAgentAudit),
+        audit.clone(),
         BuiltInAgentConfig {
             queue_capacity: 2,
             max_concurrency: 1,
@@ -283,6 +298,7 @@ async fn run_case(calls: &[(&str, u8)], parallel: bool, expired: bool) -> Observ
         .unwrap();
     agent.stop().await;
     let terminal = journal.terminal.lock().unwrap().unwrap();
+    let audits = audit.0.lock().unwrap().clone();
     Observation {
         terminal,
         starts: provider.starts.load(Ordering::SeqCst),
@@ -292,6 +308,7 @@ async fn run_case(calls: &[(&str, u8)], parallel: bool, expired: bool) -> Observ
         human_invocations: tools.human_invocations.load(Ordering::SeqCst),
         terminal_writes: journal.terminal_writes.load(Ordering::SeqCst),
         exchanges: journal.exchanges.load(Ordering::SeqCst),
+        audits,
     }
 }
 async fn run(mode: u8, expired: bool) -> (RunTerminal, usize, usize, usize) {
@@ -429,12 +446,18 @@ async fn started_effect_unknown_is_not_overwritten_by_revocation() {
 }
 #[tokio::test]
 async fn persisted_delegated_deadline_survives_dispatch_delay() {
-    let (terminal, starts, effects, _) = run(0, true).await;
+    let observed = run_case(&[("remember", 0)], false, true).await;
+    assert_eq!(observed.terminal, RunTerminal::Cancelled);
+    assert_eq!(observed.loads, 0);
+    assert_eq!(observed.starts, 0);
+    assert_eq!(observed.invocations, 0);
+    assert_eq!(observed.human_invocations, 0);
+    assert_eq!(observed.effects, 0);
+    assert_eq!(observed.exchanges, 0);
+    assert_eq!(observed.terminal_writes, 1);
     assert_eq!(
-        terminal,
-        RunTerminal::Failed(RunFailureCode::RunDeadlineExceeded)
+        observed.audits,
+        vec![AgentAuditKind::Invoked, AgentAuditKind::RunDeadlineExceeded]
     );
-    assert_eq!(starts, 0);
-    assert_eq!(effects, 0);
     assert!(lease().absolute_deadline().is_none());
 }

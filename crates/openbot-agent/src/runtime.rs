@@ -569,6 +569,19 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
             .run_deadline
             .map(|duration| tokio::time::Instant::now() + duration),
     };
+    if lease.absolute_deadline().is_some()
+        && deadline.is_some_and(|at| at <= tokio::time::Instant::now())
+    {
+        cancel_and_commit(
+            &mut state,
+            &mut journal,
+            inner.audit.as_ref(),
+            lease,
+            CancellationSource::Deadline,
+        )
+        .await;
+        return;
+    }
     loop {
         // The run-wide output ceiling is derived from at most nine provider invocations
         // (initial + eight continuations). Interrupt resumes consume the same continuation
