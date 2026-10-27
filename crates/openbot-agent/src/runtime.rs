@@ -3028,11 +3028,17 @@ mod tests {
                 .expect("parallel completion")
                 .push(order);
             self.active.fetch_sub(1, AtomicOrdering::SeqCst);
-            crate::AgentToolReply::new(
-                ToolCallId::new(format!("internal-{order}")),
-                format!("result-{order}"),
-                None,
-            )
+            match arguments.get("outcome").and_then(serde_json::Value::as_str) {
+                Some("unavailable") => Err(AgentToolInvokeError::Unavailable),
+                Some("reconciliation_required") => {
+                    Err(AgentToolInvokeError::ReconciliationRequired)
+                }
+                _ => crate::AgentToolReply::new(
+                    ToolCallId::new(format!("internal-{order}")),
+                    format!("result-{order}"),
+                    None,
+                ),
+            }
         }
     }
 
@@ -4225,6 +4231,92 @@ mod tests {
             ]
         );
         agent.stop().await;
+
+        let mut mixed_traces = Vec::new();
+        for first_outcome in ["ok", "unavailable"] {
+            let runtime = Arc::new(FakeRuntime::new());
+            let provider = Arc::new(SequencedProvider {
+                sessions: StdMutex::new(
+                    vec![vec![
+                        ProviderEvent::ToolCallCompleted {
+                            index: 0,
+                            call_id: "provider-0".to_owned(),
+                            name: "parallel".to_owned(),
+                            arguments: serde_json::json!({"order":0,"outcome":first_outcome}),
+                        },
+                        ProviderEvent::ToolCallCompleted {
+                            index: 1,
+                            call_id: "provider-1".to_owned(),
+                            name: "parallel".to_owned(),
+                            arguments: serde_json::json!({
+                                "order":1,
+                                "outcome":"reconciliation_required"
+                            }),
+                        },
+                        ProviderEvent::Usage(ProviderUsage {
+                            input_tokens: 2,
+                            output_tokens: 2,
+                            total_tokens: 4,
+                        }),
+                        ProviderEvent::Completed,
+                    ]]
+                    .into(),
+                ),
+                starts: AtomicUsize::new(0),
+            });
+            let tools = Arc::new(ParallelToolInvoker::new());
+            let agent = BuiltInAgentRuntime::start(
+                runtime.clone(),
+                Arc::new(FakeContext),
+                provider,
+                tools.clone(),
+                Arc::new(NoAgentAudit),
+                BuiltInAgentConfig {
+                    max_tool_concurrency: 2,
+                    ..test_config()
+                },
+            )
+            .unwrap();
+            let consumer = agent.consumer();
+            let lease = self::lease(&format!("run-parallel-{first_outcome}-then-reconciliation"));
+            assert!(!lease.delegation_required());
+            assert_eq!(
+                consumer.dispatch(lease.clone()).await,
+                RunDispatchDecision::Accepted
+            );
+            consumer.activate(&lease).await.unwrap();
+            let terminal =
+                tokio::time::timeout(Duration::from_secs(1), runtime.terminal.notified()).await;
+            agent.stop().await;
+            terminal.unwrap();
+
+            assert_eq!(tools.max_active.load(AtomicOrdering::SeqCst), 2);
+            let mut completed = tools.completed.lock().expect("parallel completion").clone();
+            completed.sort_unstable();
+            assert_eq!(completed, [0, 1]);
+            mixed_traces.push(runtime.calls());
+        }
+        assert_eq!(
+            mixed_traces,
+            [
+                vec![
+                    RuntimeCall::ToolExchange(
+                        1,
+                        "provider-0".to_owned(),
+                        "parallel".to_owned(),
+                        "result-0".to_owned(),
+                    ),
+                    RuntimeCall::Finish(
+                        2,
+                        RunTerminal::ReconciliationRequired(RunFailureCode::JournalCommitUnknown),
+                    ),
+                ],
+                vec![RuntimeCall::Finish(
+                    1,
+                    RunTerminal::Failed(RunFailureCode::ToolLoopUnavailable),
+                )],
+            ]
+        );
     }
 
     #[tokio::test]
