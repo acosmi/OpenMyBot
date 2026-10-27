@@ -286,8 +286,10 @@ async fn run_case(calls: &[(&str, u8)], parallel: bool, expired: bool) -> Observ
             .with_delegated_run_binding(None, std::time::SystemTime::now() - Duration::from_secs(1))
     } else {
         lease()
+            .with_delegated_run_binding(None, std::time::SystemTime::now() + Duration::from_secs(5))
     };
     let consumer = agent.consumer();
+    assert!(lease.delegation_required());
     assert_eq!(
         consumer.dispatch(lease.clone()).await,
         RunDispatchDecision::Accepted
