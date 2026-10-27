@@ -1183,10 +1183,11 @@ async fn execute_tool_wave(
     else {
         return false;
     };
-    // Every child has joined. Preserve an uncertain effect before any definite refusal or reply.
-    if outputs
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, Err(AgentToolInvokeError::ReconciliationRequired)))
+    // Every child has joined. Preserve delegated uncertain effects before definite refusals or replies.
+    if control.lease.delegation_required()
+        && outputs.iter().any(|(_, outcome)| {
+            matches!(outcome, Err(AgentToolInvokeError::ReconciliationRequired))
+        })
     {
         drive_terminal_event(state, journal, AgentEvent::JournalCommitUnknown).await;
         return false;
