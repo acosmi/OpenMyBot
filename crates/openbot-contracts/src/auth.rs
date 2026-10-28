@@ -337,7 +337,7 @@ impl VerifiedDelegation {
     pub const fn granted_generation(&self) -> AuthGeneration {
         self.granted_generation
     }
-    /// 记录的到期时刻；空值表示未记录到期限制。
+    /// 记录的到期时刻；`None` 表示用户明确选择“持续至撤销”，该授权不按时间到期（Run 绝对期限仍然适用）。
     #[must_use]
     pub const fn expires_at(&self) -> Option<SystemTime> {
         self.expires_at
