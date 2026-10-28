@@ -4567,6 +4567,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "omb-channels"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "omb-store",
+ "openbot-application",
+ "openbot-contracts",
+ "openbot-domain",
+ "openbot-infra",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "omb-cli"
 version = "0.0.0"
 dependencies = [
