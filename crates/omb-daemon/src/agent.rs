@@ -111,7 +111,7 @@ mod tests {
         auth::DelegationSource,
         command::{
             AppCommand, AppReply, CancelThreadRun, ThreadConversationSnapshot,
-            ThreadForegroundRunState, ThreadHistoryRole,
+            ThreadForegroundRunState, ThreadHistoryRole, ThreadRunCancellationState,
         },
         ids::{BotId, RunId, ThreadId},
         reconciliation::RunReconciliationStatus,
@@ -412,6 +412,43 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| m.role == ThreadHistoryRole::Assistant)
+        );
+        // The run is terminal and its outcome is known: a second cancellation finds it terminal and
+        // the reconciliation view, which serves only unknown outcomes, refuses it.
+        let local = fixture.engine().resolver.local_context().unwrap();
+        let AppReply::ThreadRunCancellation(second) = fixture
+            .engine()
+            .assembly
+            .application
+            .execute(
+                local.clone(),
+                AppCommand::CancelThreadRun(CancelThreadRun {
+                    thread_id: run.thread.clone(),
+                    run_id: run.run.clone(),
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("cancellation reply");
+        };
+        assert_eq!(second.state, ThreadRunCancellationState::AlreadyTerminal);
+        assert!(
+            fixture
+                .engine()
+                .assembly
+                .application
+                .execute(
+                    local,
+                    AppCommand::GetRunReconciliation {
+                        thread_id: run.thread.clone(),
+                        run_id: run.run.clone(),
+                        after: None,
+                        limit: None,
+                    },
+                )
+                .await
+                .is_err()
         );
         let row = session(&client, &run.run).await;
         assert_eq!(row["end_reason"], "stop_requested");

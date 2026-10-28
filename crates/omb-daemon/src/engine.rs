@@ -152,8 +152,7 @@ pub(crate) async fn assemble(
         .map_err(|_| DaemonError::EngineAssemblyFailed)?;
     let ui_audit_key = derive_application_key(&master, ApplicationKeyPurpose::AuditCheckpoint)
         .map_err(|_| DaemonError::EngineAssemblyFailed)?;
-    let agent_audit_key = derive_application_key(&master, ApplicationKeyPurpose::AuditCheckpoint)
-        .map_err(|_| DaemonError::EngineAssemblyFailed)?;
+    let agent_audit_key = SecretBytes::new(audit_key.expose().to_vec());
     let crabcode: Arc<dyn ProviderAdapter> = host.adapter();
     let ui_preferences = Arc::new(
         PostgresUiPreferenceAdministration::new(
