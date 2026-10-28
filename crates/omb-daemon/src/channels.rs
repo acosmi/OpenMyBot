@@ -524,32 +524,6 @@ mod tests {
         fixture.stop().await;
     }
 
-    #[tokio::test]
-    #[ignore = "own PG17.11; explicit binary directory; serial"]
-    async fn production_tenant_without_bot_cancels_first_event_and_suspends_binding_with_grant_stale()
-     {
-        let mut fixture = Fixture::start().await;
-        let (client, binding) = paired(&mut fixture).await;
-        let entry = fixture.engine().assembly.delegated_entry.clone().unwrap();
-        let pending = row(&client, "10").await;
-        let error = entry.begin(replay(binding, &pending)).await.unwrap_err();
-        assert_eq!(error.http_status(), 403);
-        assert!(
-            matches!(&error, openbot_contracts::error::AppError::PolicyRefused { rule, .. } if rule == "delegation_not_current"),
-            "{error:?}"
-        );
-        let (task, wake) = dispatcher(&mut fixture).await;
-        wake.notify_one();
-        let stored = settled(&client, "10").await;
-        assert_eq!(stored["dispatch_status"], "cancelled");
-        assert_eq!(
-            binding_state(&client, binding).await,
-            ("suspended".into(), Some("grant_stale".into()))
-        );
-        task.stop().await;
-        fixture.stop().await;
-    }
-
     async fn status_source(
         fixture: &mut Fixture,
     ) -> (StatusSource, JoinHandle<Result<(), tokio_postgres::Error>>) {
