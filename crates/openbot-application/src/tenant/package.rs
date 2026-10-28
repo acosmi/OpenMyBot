@@ -4,6 +4,7 @@
 //! 投影。GUI 第一真源规定 design token 只能来自 `wrokbot-ui/design/tokens.toml`，因此 runtime
 //! tenant CSS 不在输入类型里；历史 `skin.stylesheet` 只产生兼容状态，不读取、更不执行。
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::ProviderExtensionKey;
 use crate::provider::{ProviderBillingFamily, ProviderRateCard, ProviderRateCardInput};
 
 /// Tenant Package 唯一允许读取的五个文件；runtime `theme.css` 刻意不在其中。
@@ -326,21 +328,24 @@ pub enum TenantAgentConfiguration {
 }
 
 /// Built-in Agent 的权威 provider 选择层（v3 §7.3）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuiltInProviderSource {
     /// `model.yaml` 固定 OpenAI。
     Package,
     /// Deployment `BOT_PROVIDER/BOT_MODEL` managed slot。
     Managed,
+    /// Assembly-registered provider extension, declared as `providerSource: extension:<key>`.
+    Extension(ProviderExtensionKey),
 }
 
 impl BuiltInProviderSource {
-    /// PostgreSQL Agent configuration 的稳定字面量。
+    /// PostgreSQL Agent configuration 的稳定字面量；extension 原样为 `extension:<key>`。
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> Cow<'static, str> {
         match self {
-            Self::Package => "package",
-            Self::Managed => "managed",
+            Self::Package => Cow::Borrowed("package"),
+            Self::Managed => Cow::Borrowed("managed"),
+            Self::Extension(key) => Cow::Owned(format!("extension:{}", key.as_str())),
         }
     }
 }
@@ -484,7 +489,16 @@ pub fn validate_tenant_package(
         let configuration = match (agent_type, managed_in_process) {
             (TenantAgentType::BuiltIn, false) => TenantAgentConfiguration::BuiltIn {
                 system_prompt: required(raw.system_prompt, "agent.system_prompt")?,
-                provider_source: BuiltInProviderSource::Package,
+                provider_source: match raw.provider_source.as_deref() {
+                    None => BuiltInProviderSource::Package,
+                    Some(value) => value
+                        .strip_prefix("extension:")
+                        .and_then(|key| ProviderExtensionKey::new(key).ok())
+                        .map(BuiltInProviderSource::Extension)
+                        .ok_or(TenantPackageError::ShapeInvalid {
+                            field: "agent.providerSource",
+                        })?,
+                },
             },
             (TenantAgentType::RemoteAgUi, true) => {
                 agent_type = TenantAgentType::BuiltIn;
@@ -989,6 +1003,8 @@ struct RawAgent {
     system_prompt: Option<String>,
     #[serde(default)]
     endpoint: Option<String>,
+    #[serde(rename = "providerSource", default)]
+    provider_source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1293,6 +1309,72 @@ mod tests {
                 provider_source: BuiltInProviderSource::Managed,
             } if system_prompt.starts_with("You are Risk, Compliance.")
         ));
+    }
+
+    fn agents_with_provider_source(value: &str) -> TenantPackageFiles {
+        let mut files = valid_files();
+        files.agents = format!(
+            "agents:\n  - id: knowledge\n    name: Knowledge\n    title: Knowledge\n    role_description: Answer.\n    type: built-in\n    system_prompt: Answer.\n    providerSource: {value}\n"
+        );
+        files
+    }
+
+    #[test]
+    fn built_in_provider_source_parses_extension_key() {
+        let package =
+            validate_tenant_package(agents_with_provider_source("extension:crabcode")).unwrap();
+        assert_eq!(package.agents[0].agent_type, TenantAgentType::BuiltIn);
+        assert_eq!(
+            package.agents[0].configuration,
+            TenantAgentConfiguration::BuiltIn {
+                system_prompt: "Answer.".to_owned(),
+                provider_source: BuiltInProviderSource::Extension(
+                    ProviderExtensionKey::new("crabcode").unwrap()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn built_in_provider_source_rejects_malformed_extension_key() {
+        for value in [
+            "'extension:'".to_owned(),
+            "extension:Crab".to_owned(),
+            format!("extension:{}", "a".repeat(33)),
+        ] {
+            let error = validate_tenant_package(agents_with_provider_source(&value)).unwrap_err();
+            assert_eq!(
+                error,
+                TenantPackageError::ShapeInvalid {
+                    field: "agent.providerSource"
+                },
+                "{value}"
+            );
+            assert!(error.to_string().contains("providerSource"), "{value}");
+        }
+    }
+
+    #[test]
+    fn built_in_provider_source_extension_round_trips_as_text() {
+        let package =
+            validate_tenant_package(agents_with_provider_source("extension:crab_code-1")).unwrap();
+        let TenantAgentConfiguration::BuiltIn {
+            provider_source, ..
+        } = &package.agents[0].configuration
+        else {
+            panic!("built-in configuration");
+        };
+        let text = provider_source.as_str();
+        assert_eq!(text, "extension:crab_code-1");
+        assert_eq!(
+            validate_tenant_package(agents_with_provider_source(&text))
+                .unwrap()
+                .agents[0]
+                .configuration,
+            package.agents[0].configuration
+        );
+        assert_eq!(BuiltInProviderSource::Package.as_str(), "package");
+        assert_eq!(BuiltInProviderSource::Managed.as_str(), "managed");
     }
 
     fn environment(entries: &[(&str, &str)]) -> TenantPackageEnvironment {
