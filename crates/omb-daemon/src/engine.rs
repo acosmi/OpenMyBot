@@ -1,4 +1,4 @@
-use crate::{DaemonError, config, pg::Postgres, tenant};
+use crate::{DaemonError, config, delegation::OmbDelegationAuthority, pg::Postgres, tenant};
 use openbot_application::tenant::package::{
     LoadedTenantPackage, TenantPackageAudienceContext, synchronize_tenant_package,
 };
@@ -15,9 +15,12 @@ use openbot_infra::{
         ChannelRoutingProviderInput, PostgresApplicationAssembly, PostgresApplicationAssemblyInput,
         assemble_postgres_application,
     },
-    auth::single_user::{
-        SINGLE_USER_ACTOR_ID, VerifiedSingleUserPrincipal, initialize_single_user,
-        load_single_user_principal,
+    auth::{
+        config::default_session_lifetime,
+        single_user::{
+            SINGLE_USER_ACTOR_ID, VerifiedSingleUserPrincipal, initialize_single_user,
+            load_single_user_principal,
+        },
     },
     db::pool::{self, DatabaseConfig, DatabasePool},
     net::safe_http::{CidrAllowlist, EgressPolicy, SafeDialer, SafeHttpBudget, SchemePolicy},
@@ -27,6 +30,7 @@ use openbot_infra::{
     ui_preferences::PostgresUiPreferenceAdministration,
     vault::CredentialRecordVault,
 };
+use openbot_server::SingleUserAuthResolver;
 use std::{path::Path, sync::Arc, time::Duration};
 
 pub(crate) struct Prepared {
@@ -36,6 +40,7 @@ pub(crate) struct Prepared {
     tenant: TenantId,
     package: LoadedTenantPackage,
     principal: VerifiedSingleUserPrincipal,
+    authority: OmbDelegationAuthority,
 }
 pub(crate) async fn prepare(
     root: &Path,
@@ -71,6 +76,13 @@ pub(crate) async fn prepare(
     )
     .await
     .map_err(|_| DaemonError::TenantPackageFailed)?;
+    let authority = OmbDelegationAuthority::open(
+        pg,
+        deployment.clone(),
+        tenant.clone(),
+        ActorId::new(SINGLE_USER_ACTOR_ID),
+    )
+    .await?;
     Ok(Prepared {
         pool,
         database,
@@ -78,15 +90,19 @@ pub(crate) async fn prepare(
         tenant,
         package,
         principal,
+        authority,
     })
 }
-pub(crate) struct Engine {
-    assembly: PostgresApplicationAssembly,
-    _principal: VerifiedSingleUserPrincipal,
+/// The assembled engine, its delegation authority and the single-user owner resolver.
+pub struct Engine {
+    pub(crate) assembly: PostgresApplicationAssembly,
+    pub(crate) authority: Arc<OmbDelegationAuthority>,
+    pub(crate) resolver: SingleUserAuthResolver,
 }
 impl Engine {
     pub(crate) async fn shutdown(self) {
         self.assembly.shutdown().await;
+        self.authority.close().await;
     }
 }
 pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, DaemonError> {
@@ -97,7 +113,9 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
         tenant,
         package,
         principal,
+        authority,
     } = prepared;
+    let authority = Arc::new(authority);
     let master = SecretBytes::new(config::read_private(&root.join("keys/app-master.key"), 32)?);
     let audit_key = derive_application_key(&master, ApplicationKeyPurpose::AuditCheckpoint)
         .map_err(|_| DaemonError::EngineAssemblyFailed)?;
@@ -176,12 +194,16 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
         app_url: None,
         extra_provider_adapters: Vec::new(),
         run_event_subscriber: None,
-        delegation_authority: None,
+        delegation_authority: Some(authority.clone()),
     })
     .await
     .map_err(|_| DaemonError::EngineAssemblyFailed)?;
     Ok(Engine {
         assembly,
-        _principal: principal,
+        authority,
+        resolver: SingleUserAuthResolver::from_verified_principal(
+            principal,
+            default_session_lifetime(),
+        ),
     })
 }

@@ -4579,9 +4579,10 @@ dependencies = [
 name = "omb-daemon"
 version = "0.0.0"
 dependencies = [
- "omb-store",
+ "async-trait",
  "chrono",
  "getrandom 0.4.3",
+ "omb-store",
  "openbot-application",
  "openbot-computer",
  "openbot-contracts",
@@ -4610,6 +4611,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 2.0.20",
  "time",
  "tokio",

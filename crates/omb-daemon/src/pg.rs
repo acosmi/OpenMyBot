@@ -30,6 +30,11 @@ fn map_store_error(error: omb_store::StoreError) -> DaemonError {
         omb_store::StoreError::SchemaNewer => DaemonError::OmbSchemaNewer,
         omb_store::StoreError::MigrationFailed => DaemonError::OmbMigrationFailed,
         omb_store::StoreError::ControlTokenFailed => DaemonError::ControlTokenFailed,
+        omb_store::StoreError::ChannelAlreadyBound => DaemonError::ChannelAlreadyBound,
+        omb_store::StoreError::ReceiverNotActive => DaemonError::ReceiverNotActive,
+        omb_store::StoreError::BindingNotFound => DaemonError::BindingNotFound,
+        omb_store::StoreError::BindingStateInvalid => DaemonError::BindingStateInvalid,
+        omb_store::StoreError::BindingFailed => DaemonError::BindingFailed,
     }
 }
 fn ready_result<T>(deadline: Instant, result: Result<T, DaemonError>) -> Result<T, DaemonError> {
@@ -196,7 +201,15 @@ impl Connection {
     }
 }
 
-pub(crate) struct Postgres {
+/// A store connection owned by the delegation authority, plus the settings to reopen it.
+pub struct AuthorityConnection {
+    pub config: tokio_postgres::Config,
+    pub client: tokio_postgres::Client,
+    pub driver: JoinHandle<Result<(), tokio_postgres::Error>>,
+}
+
+/// The daemon's own PostgreSQL child process.
+pub struct Postgres {
     child: Child,
     port: u16,
     root: PathBuf,
@@ -388,12 +401,7 @@ impl Postgres {
         }
         ready_result(deadline, Ok(()))
     }
-    async fn connect(
-        &mut self,
-        database: &str,
-        deadline: Instant,
-    ) -> Result<Connection, DaemonError> {
-        self.connection_identity_gate(deadline).await?;
+    fn client_config(&self, database: &str) -> tokio_postgres::Config {
         let mut config = tokio_postgres::Config::new();
         config
             .host("127.0.0.1")
@@ -403,6 +411,15 @@ impl Postgres {
             .dbname(database)
             .application_name("openmybot")
             .connect_timeout(Duration::from_secs(1));
+        config
+    }
+    async fn connect(
+        &mut self,
+        database: &str,
+        deadline: Instant,
+    ) -> Result<Connection, DaemonError> {
+        self.connection_identity_gate(deadline).await?;
+        let config = self.client_config(database);
         ready_result(deadline, Ok(()))?;
         let (client, connection) = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(2)),
@@ -505,6 +522,82 @@ impl Postgres {
             return Err(DaemonError::ControlTokenFailed);
         }
         result
+    }
+    /// Opens the delegation authority's own connection through the identity-checked path.
+    pub async fn open_authority_connection(&mut self) -> Result<AuthorityConnection, DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        self.connection_identity_gate(deadline)
+            .await
+            .map_err(|_| DaemonError::BindingFailed)?;
+        let mut config = self.client_config("openmybot");
+        config
+            .application_name("openmybot-delegation")
+            .options("-c statement_timeout=2s");
+        let (client, connection) = timeout(
+            Duration::from_secs(2),
+            config.connect(tokio_postgres::NoTls),
+        )
+        .await
+        .map_err(|_| DaemonError::BindingFailed)?
+        .map_err(|_| DaemonError::BindingFailed)?;
+        Ok(AuthorityConnection {
+            config,
+            client,
+            driver: tokio::spawn(connection),
+        })
+    }
+    async fn binding_call<T>(
+        &mut self,
+        call: impl AsyncFnOnce(&mut tokio_postgres::Client, Instant) -> Result<T, omb_store::StoreError>,
+    ) -> Result<T, DaemonError> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut connection = self
+            .connect("openmybot", deadline)
+            .await
+            .map_err(|_| DaemonError::BindingFailed)?;
+        let result = match connection.client.as_mut() {
+            Some(client) => call(client, deadline).await.map_err(map_store_error),
+            None => Err(DaemonError::BindingFailed),
+        };
+        let closed = connection.close_until(deadline).await;
+        if closed.is_err() || Instant::now() >= deadline {
+            return Err(DaemonError::BindingFailed);
+        }
+        result
+    }
+    pub async fn pair_start(
+        &mut self,
+        input: omb_store::PairStart<'_>,
+    ) -> Result<omb_store::PairStarted, DaemonError> {
+        self.binding_call(async |client, deadline| {
+            omb_store::pair_start(client, input, deadline).await
+        })
+        .await
+    }
+    pub async fn revoke_binding(&mut self, binding_id: uuid::Uuid) -> Result<(), DaemonError> {
+        self.binding_call(async |client, deadline| {
+            omb_store::revoke_binding(client, binding_id, deadline).await
+        })
+        .await
+    }
+    pub async fn reconfirm_binding(
+        &mut self,
+        binding_id: uuid::Uuid,
+        granted_generation: u64,
+    ) -> Result<u64, DaemonError> {
+        self.binding_call(async |client, deadline| {
+            omb_store::reconfirm_binding(client, binding_id, granted_generation, deadline).await
+        })
+        .await
+    }
+    pub async fn activate_host(
+        &mut self,
+        input: omb_store::HostBinding<'_>,
+    ) -> Result<uuid::Uuid, DaemonError> {
+        self.binding_call(async |client, deadline| {
+            omb_store::activate_host(client, input, deadline).await
+        })
+        .await
     }
     pub(crate) async fn create_database(&mut self) -> Result<(), DaemonError> {
         let connection = self.connect("postgres", Instant::now() + READY).await?;
