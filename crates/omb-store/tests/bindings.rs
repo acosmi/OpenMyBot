@@ -60,8 +60,9 @@ async fn active_sender(client: &mut Client, receiver: Uuid) -> Uuid {
     .unwrap();
     let sender = IdentityKey::parse("telegram:1").unwrap();
     let chat = IdentityKey::parse("telegram:1").unwrap();
+    let tx = client.transaction().await.unwrap();
     let outcome = pair_attempt(
-        client,
+        &tx,
         PairAttempt {
             channel: Channel::Telegram,
             receiver_binding_id: receiver,
@@ -72,12 +73,15 @@ async fn active_sender(client: &mut Client, receiver: Uuid) -> Uuid {
                 event_key: "pair",
                 source_key: "1001",
                 fingerprint: [1; 32],
+                occurred_at: None,
+                event_type: None,
             },
         },
         deadline(),
     )
     .await
     .unwrap();
+    tx.commit().await.unwrap();
     assert_eq!(
         outcome,
         PairOutcome::Succeeded {

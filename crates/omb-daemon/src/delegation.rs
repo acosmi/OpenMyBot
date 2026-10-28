@@ -128,6 +128,10 @@ pub(crate) mod fixture {
         engine::{self, Engine},
         pg::Postgres,
     };
+    use openbot_application::tenant::package::{
+        TenantPackageAudienceContext, TenantPackageEnvironment, synchronize_tenant_package,
+    };
+    use openbot_contracts::ids::ActorId;
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -138,8 +142,18 @@ pub(crate) mod fixture {
         pub(crate) engine: Option<Engine>,
         pub(crate) deployment_id: String,
     }
+    /// Test-only copy of the tenant package's agents: the Bot without a provider source, which the
+    /// production package cannot declare yet.
+    const TEST_BOT: &str = "agents:\n  - id: omb-crabcode\n    name: OpenMyBot\n    title: OpenMyBot\n    role_description: OpenMyBot host bot\n    type: built-in\n    system_prompt: OpenMyBot\n";
     impl Fixture {
         pub(crate) async fn start() -> Self {
+            Self::launch(false).await
+        }
+        /// Like `start`, with the test tenant package that declares Bot `omb-crabcode`.
+        pub(crate) async fn start_with_bot() -> Self {
+            Self::launch(true).await
+        }
+        async fn launch(bot: bool) -> Self {
             let pg_bin = PathBuf::from(
                 std::env::var_os("OMB_TEST_PG_BIN_DIR")
                     .expect("explicit own PG17.11 test binary directory required"),
@@ -156,6 +170,27 @@ pub(crate) mod fixture {
             let prepared = engine::prepare(&root, &config.deployment_id, &mut pg)
                 .await
                 .unwrap();
+            if bot {
+                std::fs::write(root.join("tenant/agents.yaml"), TEST_BOT).unwrap();
+                let package = openbot_infra::tenant::load_tenant_package(
+                    &root.join("tenant"),
+                    &TenantPackageEnvironment::from_explicit([]),
+                )
+                .unwrap();
+                let pool = openbot_infra::db::pool::connect(&pg.database_config())
+                    .await
+                    .unwrap();
+                synchronize_tenant_package(
+                    &openbot_infra::tenant::PostgresTenantPackageSynchronizer::new(pool),
+                    &package,
+                    &TenantPackageAudienceContext::single_user(ActorId::new(
+                        openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID,
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
             let engine = engine::assemble(&root, prepared).await.unwrap();
             Self {
                 root,
@@ -248,8 +283,9 @@ mod tests {
         let receiver = fixture::receiver(client, "telegram").await;
         let started = pending(client, run_deadline).await;
         let key = IdentityKey::parse("telegram:42").unwrap();
+        let tx = client.transaction().await.unwrap();
         let outcome = omb_store::pair_attempt(
-            client,
+            &tx,
             PairAttempt {
                 channel: Channel::Telegram,
                 receiver_binding_id: receiver,
@@ -260,12 +296,15 @@ mod tests {
                     event_key: "1",
                     source_key: "1001",
                     fingerprint: [3; 32],
+                    occurred_at: None,
+                    event_type: None,
                 },
             },
             deadline(),
         )
         .await
         .unwrap();
+        tx.commit().await.unwrap();
         assert_eq!(
             outcome,
             PairOutcome::Succeeded {

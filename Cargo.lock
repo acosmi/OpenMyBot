@@ -4610,6 +4610,7 @@ dependencies = [
  "getrandom 0.4.3",
  "rustix",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "subtle",
  "thiserror 2.0.20",

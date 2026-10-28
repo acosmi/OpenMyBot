@@ -1,16 +1,21 @@
 //! Product-owned PostgreSQL migrations, control-token records, pairing and binding lifecycle.
 mod bindings;
 mod control_tokens;
+mod events;
 mod migration;
 mod pairing;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 pub use bindings::{
     AuthorityRow, GrantKind, HostBinding, IdentityKey, RunDeadline, activate_host, authority_row,
     reconfirm_binding, revoke_binding,
 };
 pub use control_tokens::{
-    ControlTokenRecord, ControlTokenStart, start_control_token, stop_control_token,
+    ControlTokenRecord, ControlTokenStart, HeartbeatTick, read_heartbeat, start_control_token,
+    stop_control_token, touch_heartbeat,
 };
+pub use events::*;
 pub use migration::{MigrationReport, migrate};
 pub use pairing::{
     AcceptedEvent, Channel, PairAttempt, PairCode, PairOutcome, PairStart, PairStarted,
@@ -24,6 +29,17 @@ pub const PAIR_FAIL_LIMIT: i64 = 5;
 /// Lock duration after the limit is reached; also the window the failures must fall within.
 pub const PAIR_LOCK: std::time::Duration = std::time::Duration::from_secs(3600);
 pub const RUN_DEADLINE_MAX: u32 = 86_400;
+/// UTF-8 bytes of an accepted message text.
+pub const MSG_TEXT_MAX: usize = 4096;
+/// Pending events per binding before new messages are refused.
+pub const DISPATCH_QUEUE_MAX: i64 = 20;
+pub const ACCEPT_TX_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+pub const EVENT_PAST_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+pub const EVENT_FUTURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How far back the status view lists ended interruption intervals.
+pub const GAP_DISPLAY: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// Internal deadline of the read functions, which take no deadline parameter.
+pub(crate) const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -45,6 +61,12 @@ pub enum StoreError {
     BindingStateInvalid,
     #[error("binding_failed")]
     BindingFailed,
+    #[error("event_failed")]
+    EventFailed,
+    #[error("dispatch_failed")]
+    DispatchFailed,
+    #[error("gap_failed")]
+    GapFailed,
 }
 
 pub(crate) fn timely<T>(
@@ -95,7 +117,7 @@ pub(crate) async fn finish<T>(
     timely(deadline, result, error)
 }
 pub(crate) async fn rows(
-    client: &tokio_postgres::Client,
+    client: &(impl tokio_postgres::GenericClient + Sync),
     sql: &str,
     parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)],
     deadline: tokio::time::Instant,
