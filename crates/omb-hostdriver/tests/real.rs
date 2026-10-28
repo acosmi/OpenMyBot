@@ -67,21 +67,67 @@ fn request(binding: Uuid, prompt: &str) -> ProviderRequest {
     }
 }
 
+/// The driver's refused arguments; the source of truth is the private list in `src/spawn.rs`.
+const FORBIDDEN: [&str; 7] = [
+    "--sdk-url",
+    "--dangerously-skip-permissions",
+    "--allowedTools",
+    "--allowed-tools",
+    "bypassPermissions",
+    "acceptEdits",
+    "remote-control",
+];
+
+/// Every whitespace-delimited token starting with `/` becomes `<path>`.
+fn paths_hidden(text: &str) -> String {
+    text.split_inclusive(char::is_whitespace)
+        .map(|piece| {
+            let token = piece.trim_end_matches(char::is_whitespace);
+            if token.starts_with('/') {
+                format!("<path>{}", &piece[token.len()..])
+            } else {
+                piece.to_owned()
+            }
+        })
+        .collect()
+}
+/// Child stderr carried in the report keeps no path.
+fn hide_stderr_paths(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                match item {
+                    Value::String(text) if key == "stderr_tail" => *text = paths_hidden(text),
+                    other => hide_stderr_paths(other),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(hide_stderr_paths),
+        _ => (),
+    }
+}
+
 /// The report, rewritten on every change.
 struct Report {
     path: PathBuf,
     sandbox: PathBuf,
     home: PathBuf,
+    /// A credential that must never appear in the text (the `bare` isolation's API key).
+    secret: Option<String>,
     fields: Map<String, Value>,
 }
 impl Report {
-    fn set(&mut self, key: &str, value: Value) {
+    fn set(&mut self, key: &str, mut value: Value) {
+        hide_stderr_paths(&mut value);
         self.fields.insert(key.to_owned(), value);
-        let text = relative(
+        let mut text = relative(
             &serde_json::to_string_pretty(&self.fields).unwrap(),
             &self.sandbox,
             &self.home,
         );
+        if let Some(secret) = self.secret.as_deref().filter(|secret| !secret.is_empty()) {
+            text = text.replace(secret, "<redacted>");
+        }
         assert!(
             !text.contains(self.home.to_str().unwrap())
                 && !text.contains(self.sandbox.to_str().unwrap()),
@@ -172,9 +218,32 @@ impl Recheck {
         policy: impl Fn(&str, &str) -> Decision,
         stop_after_start: bool,
     ) -> Turn {
+        self.turn_on(
+            &self.driver,
+            binding,
+            run,
+            thread,
+            prompt,
+            policy,
+            stop_after_start,
+        )
+        .await
+    }
+    /// Like `turn`, through the given driver.
+    #[allow(clippy::too_many_arguments)]
+    async fn turn_on(
+        &self,
+        driver: &HostDriver,
+        binding: Uuid,
+        run: &str,
+        thread: &str,
+        prompt: &str,
+        policy: impl Fn(&str, &str) -> Decision,
+        stop_after_start: bool,
+    ) -> Turn {
         let event = insert_event_for_run(&self.client, binding, run, thread, "dispatched").await;
         let turn = self
-            .drive(binding, run, prompt, policy, stop_after_start)
+            .drive(driver, binding, run, prompt, policy, stop_after_start)
             .await;
         let kind = match (&turn.stop, turn.terminal.as_deref()) {
             (Some(_), _) => "cancelled",
@@ -186,6 +255,7 @@ impl Recheck {
     }
     async fn drive(
         &self,
+        driver: &HostDriver,
         binding: Uuid,
         run: &str,
         prompt: &str,
@@ -193,7 +263,7 @@ impl Recheck {
         stop_after_start: bool,
     ) -> Turn {
         let mut turn = Turn::default();
-        let mut session = match self.driver.adapter().start(request(binding, prompt)).await {
+        let mut session = match driver.adapter().start(request(binding, prompt)).await {
             Ok(session) => session,
             Err(error) => {
                 turn.terminal = Some(format!("start_error:{error}"));
@@ -252,6 +322,7 @@ impl Recheck {
 }
 
 /// The minimal environment of the driver's children.
+#[derive(Clone, Copy)]
 struct ChildEnvironment<'a> {
     binary: &'a Path,
     home: &'a Path,
@@ -376,10 +447,22 @@ async fn real_crabcode_recheck() {
     assert!(
         sandbox.starts_with(&home) && sandbox != home && !sandbox.starts_with(home.join("Library"))
     );
+    let version_args: Vec<String> = std::env::var("OMB_REAL_RECHECK_EXTRA_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if let Some(token) = version_args
+        .iter()
+        .find(|arg| FORBIDDEN.contains(&arg.as_str()))
+    {
+        panic!("OMB_REAL_RECHECK_EXTRA_ARGS holds the refused argument {token}");
+    }
     let mut report = Report {
         path: report_path,
         sandbox: sandbox.clone(),
         home: home.clone(),
+        secret: None,
         fields: Map::new(),
     };
     report.set("isolation", json!(isolation));
@@ -402,12 +485,8 @@ async fn real_crabcode_recheck() {
             other => panic!("OMB_REAL_RECHECK_ISOLATION {other} is not home, config_dir or bare"),
         };
     // Per-version arguments the window entry carries (e.g. `--verbose` for 1.1.16).
-    extra_args.extend(
-        std::env::var("OMB_REAL_RECHECK_EXTRA_ARGS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned),
-    );
+    extra_args.extend(version_args);
+    report.secret = extra_env.get("ACOSMI_API_KEY").cloned();
     let report_env: BTreeMap<&String, String> = extra_env
         .iter()
         .map(|(key, value)| {
@@ -515,15 +594,44 @@ async fn real_crabcode_recheck() {
         other => panic!("OMB_REAL_RECHECK_WINDOW {other} is not inject or embedded"),
     };
     let probed = version.clone().unwrap_or_default();
-    let effective_args: Vec<String> = manifest["accepted"]
+    let entry = manifest["accepted"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["version"] == probed.as_str())
+        .find(|entry| entry["version"] == probed.as_str());
+    let effective_args: Vec<String> = entry
         .map(|entry| serde_json::from_value(entry["extra_args"].clone()).unwrap())
         .unwrap_or_default();
+    // The final entry's environment with the isolation keys inserted or overwritten.
+    let mut effective_env: BTreeMap<String, String> = entry
+        .map(|entry| serde_json::from_value(entry["extra_env"].clone()).unwrap())
+        .unwrap_or_default();
+    effective_env.extend(extra_env.clone());
     report.set("extra_args", json!(effective_args));
     let window = VersionWindow::parse(&manifest.to_string()).unwrap();
+    // G4 under the `home` isolation: user-level permissive settings come from a sandbox file
+    // passed with `--settings` (CrabCode's flag settings layer), never from the real home.
+    let g4_settings = sandbox.join("g4-settings.json");
+    let g4_args: Vec<String> = effective_args
+        .iter()
+        .cloned()
+        .chain([
+            "--settings".to_owned(),
+            g4_settings.to_str().unwrap().to_owned(),
+        ])
+        .collect();
+    let g4_window = {
+        let mut manifest = manifest.clone();
+        let entry = manifest["accepted"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["version"] == probed.as_str());
+        if let Some(entry) = entry {
+            entry["extra_args"] = json!(g4_args);
+        }
+        VersionWindow::parse(&manifest.to_string()).unwrap()
+    };
 
     let workspace = sandbox.join(format!("ws-{suffix}"));
     let permissive = sandbox.join(format!("ws-g4-{suffix}"));
@@ -545,17 +653,23 @@ async fn real_crabcode_recheck() {
     migrate(&mut session.client, deadline()).await.unwrap();
     let (store, _store_driver) = fixture.open().await;
     let (client, _client_driver) = fixture.open().await;
-    let driver = HostDriver::new(
-        HostDriverConfig {
-            binary: Some(binary.clone()),
-            home: home.clone(),
-            tmp_dir: tmp.clone(),
-            roots: WorkspaceRoots::parse(&home, &[workspace.clone(), permissive.clone()]).unwrap(),
-            window,
-            limits: Limits::default(),
-        },
-        Arc::new(store),
-    );
+    let store = Arc::new(store);
+    let driver_with = |window: VersionWindow| {
+        HostDriver::new(
+            HostDriverConfig {
+                binary: Some(binary.clone()),
+                home: home.clone(),
+                tmp_dir: tmp.clone(),
+                roots: WorkspaceRoots::parse(&home, &[workspace.clone(), permissive.clone()])
+                    .unwrap(),
+                window,
+                limits: Limits::default(),
+            },
+            Arc::clone(&store),
+        )
+    };
+    let driver = driver_with(window);
+    let g4_driver = driver_with(g4_window);
     let recheck = Recheck {
         _fixture: fixture,
         client,
@@ -632,7 +746,8 @@ async fn real_crabcode_recheck() {
     );
 
     // G4: workspace and user configuration both allow every tool; the host must still ask. The
-    // user-scope file is written only into the sandbox configuration directory.
+    // user-scope settings are a file in the sandbox configuration directory (`config_dir`) or a
+    // sandbox file passed with `--settings` (`home`); nothing under the real home is written.
     let (fourth, g4_ok, g4_observation) = if isolation == "config_dir" {
         let user_settings = UserSettings::write(&config_dir, &permissions);
         let fourth = recheck
@@ -649,6 +764,22 @@ async fn real_crabcode_recheck() {
             fourth,
             g4_asked && g4_absent,
             json!({"write_requested": g4_asked, "no_file_after_deny": g4_absent, "workspace_settings_permissive": true, "user_settings_permissive": true}),
+        )
+    } else if isolation == "home" {
+        std::fs::write(&g4_settings, &permissions).unwrap();
+        let fourth = recheck
+            .turn_on(&g4_driver, g4, "real-g4", "T-g4", "Use the Write tool to create g4.txt containing the word four. Then reply with the word DONE.", deny_all, false)
+            .await;
+        let g4_asked = recheck
+            .permissions("real-g4")
+            .await
+            .iter()
+            .any(|p| p["tool_name"] == "Write");
+        let g4_absent = !permissive.join("g4.txt").exists();
+        (
+            fourth,
+            g4_asked && g4_absent,
+            json!({"write_requested": g4_asked, "no_file_after_deny": g4_absent, "workspace_settings_permissive": true, "user_settings_permissive": "flagSettings via --settings", "extra_args": g4_args}),
         )
     } else {
         (
@@ -675,8 +806,15 @@ async fn real_crabcode_recheck() {
     let stop_in_grace = stopped
         .stop_elapsed
         .is_some_and(|elapsed| elapsed < CC_STOP_GRACE);
-    let (stdin_close_exit, stdin_close) =
-        stdin_close_probe(&child_env, &effective_args, &workspace).await;
+    let (stdin_close_exit, stdin_close) = stdin_close_probe(
+        &ChildEnvironment {
+            extra_env: &effective_env,
+            ..child_env
+        },
+        &effective_args,
+        &workspace,
+    )
+    .await;
     let g5 = stopped.stop.as_deref() == Some("confirmed")
         && group_empty
         && stop_row["end_reason"] == "stop_requested"
@@ -764,10 +902,10 @@ async fn real_crabcode_recheck() {
     );
     report.set(
         "uncovered",
-        json!(if isolation == "config_dir" {
-            Vec::<&str>::new()
+        json!(if isolation == "bare" {
+            vec!["G4 is not evaluated under the bare isolation"]
         } else {
-            vec!["G4 needs the config_dir isolation"]
+            Vec::<&str>::new()
         }),
     );
     println!(
@@ -780,6 +918,7 @@ async fn real_crabcode_recheck() {
         pass(g6)
     );
     recheck.driver.shutdown().await;
+    g4_driver.shutdown().await;
     let Recheck {
         _fixture: fixture,
         client,
