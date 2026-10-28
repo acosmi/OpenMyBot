@@ -16,7 +16,9 @@ use openbot_agent::{
 };
 use openbot_application::*;
 use openbot_contracts::auth::{AuthContextBuilder, AuthGeneration, VerifiedDelegation};
-use openbot_contracts::command::{AppCommand, AppReply, CancelThreadRun};
+use openbot_contracts::command::{
+    AppCommand, AppReply, BeginThreadRun, CancelThreadRun, ThreadRunAnchor,
+};
 use openbot_contracts::components::{
     ComponentApprovalAnswer, ComponentApprovalDecision, ComponentCatalogueRequest,
     ComponentDecisionRequest, ComponentHumanDecisionAnswer, ComponentHumanDecisionRequest,
@@ -348,7 +350,8 @@ async fn sampling_and_each_effect_remint_same_persisted_delegation() {
                     assert!(reply.error_code().is_none(), "{reply:?}");
                     l.check_delegated_sampling().await.map_err(text)?;
                 }
-                assert!(f.authority.calls.load(Ordering::SeqCst) >= before + 7);
+                // One authority verification for the context load, then one per effect and per sampling.
+                assert_eq!(f.authority.calls.load(Ordering::SeqCst), before + 5);
                 assert_eq!(row(&f, r.run_id.as_str()).await?.2, 2);
                 let c = f.pool.get().await.map_err(text)?;
                 assert_eq!(
@@ -827,7 +830,8 @@ async fn legal_component_chain_refreshes_proof_for_each_command() {
                         .await
                         .unwrap_err()
                 ));
-                assert!(f.authority.calls.load(Ordering::SeqCst) >= before + 8);
+                // One verification per admitted command; refused replays and denied commands never verify.
+                assert_eq!(f.authority.calls.load(Ordering::SeqCst), before + 5);
                 assert_eq!(row(&f, "chain").await?.2, 2);
                 Ok(())
             }
@@ -903,16 +907,23 @@ async fn restart_remints_from_persisted_record_and_never_extends_deadline() {
     }).await;
 }
 
-/// Samples until stopped and counts provider stop requests.
+/// Samples until stopped and counts provider stop requests; optionally streams one chunk first.
 #[derive(Default)]
 struct Sampling {
+    chunk: bool,
     starts: AtomicUsize,
     stops: Arc<AtomicUsize>,
 }
-struct SamplingSession(Arc<AtomicUsize>);
+struct SamplingSession(Arc<AtomicUsize>, bool);
 #[async_trait]
 impl ProviderSession for SamplingSession {
     async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderPortError> {
+        if std::mem::take(&mut self.1) {
+            return Ok(Some(ProviderEvent::TextDelta {
+                index: 0,
+                delta: "Synthetic streamed text".into(),
+            }));
+        }
         std::future::pending().await
     }
     async fn request_stop(&mut self) -> Result<StopOutcome, ProviderPortError> {
@@ -929,92 +940,149 @@ impl ProviderAdapter for Sampling {
         _: ProviderRequest,
     ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(SamplingSession(self.stops.clone())))
+        Ok(Box::new(SamplingSession(self.stops.clone(), self.chunk)))
     }
 }
 
-#[tokio::test]
-#[ignore = "requires explicitly injected fresh owned PostgreSQL 17.11"]
-async fn cancel_active_delegated_run_signals_local_child() {
-    with_temp_database(
-        &admin_config("delegated_cancel"),
-        "delegatedcancel",
-        |config| async move {
-            let p = Arc::new(Sampling::default());
-            let f = Fixture::with_options(
-                &config,
-                Options {
-                    extensions: vec![(
-                        ProviderExtensionKey::new("fake_host").map_err(text)?,
-                        p.clone(),
-                    )],
-                    ..Options::default()
-                },
-            )
-            .await?;
-            let r = begin(&f, "cancel-active").await?;
-            let context = PostgresAgentContextSource::new(
-                f.pool.clone(),
-                f.auth.deployment().clone(),
-                f.auth.tenant().clone(),
-                Some(32),
-            )
-            .map_err(text)?
-            .with_extensions(f.assembly.provider_extensions.clone());
-            let agent = BuiltInAgentRuntime::start(
-                f.assembly.run_runtime.clone(),
-                Arc::new(context),
-                Arc::new(
-                    ProviderRouter::new(Arc::new(Provider::default()), None)
-                        .with_extensions(f.assembly.provider_extensions.clone()),
-                ),
-                Arc::new(NoAgentToolInvoker),
-                Arc::new(NoAgentAudit),
-                BuiltInAgentConfig::default(),
-            )
-            .map_err(|error| format!("{error:?}"))?;
-            let relay = RunRelay::start(f.assembly.run_runtime.clone(), agent.consumer());
-            let result: Result<(), String> = async {
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while p.starts.load(Ordering::SeqCst) == 0 {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
+/// Cancel an active Run whose provider is still sampling; the local child must be signalled.
+async fn cancel_active_run(tag: &str, chunk: bool, delegated: bool) {
+    with_temp_database(&admin_config(tag), tag, |config| async move {
+        let p = Arc::new(Sampling {
+            chunk,
+            ..Sampling::default()
+        });
+        let f = Fixture::with_options(
+            &config,
+            Options {
+                extensions: vec![(
+                    ProviderExtensionKey::new("fake_host").map_err(text)?,
+                    p.clone(),
+                )],
+                ..Options::default()
+            },
+        )
+        .await?;
+        let r = if delegated {
+            begin(&f, "cancel-active").await?
+        } else {
+            let r = f.request("cancel-active").await?;
+            f.assembly
+                .application
+                .execute(
+                    f.auth.clone(),
+                    AppCommand::BeginThreadRun(BeginThreadRun {
+                        model_selection: None,
+                        thread_id: r.thread_id.clone(),
+                        run_id: r.run_id.clone(),
+                        bot_id: r.bot_id.clone(),
+                        anchor: ThreadRunAnchor::DirectBot,
+                        message: "Synthetic ordinary request".into(),
+                        selected_skill_slugs: Vec::new(),
+                        artifact_refs: Vec::new(),
+                    }),
+                )
                 .await
                 .map_err(text)?;
-                f.assembly
-                    .application
-                    .execute(
-                        f.auth.clone(),
-                        AppCommand::CancelThreadRun(CancelThreadRun {
-                            thread_id: r.thread_id.clone(),
-                            run_id: r.run_id.clone(),
-                        }),
-                    )
-                    .await
-                    .map_err(text)?;
+            r
+        };
+        let context = PostgresAgentContextSource::new(
+            f.pool.clone(),
+            f.auth.deployment().clone(),
+            f.auth.tenant().clone(),
+            Some(32),
+        )
+        .map_err(text)?
+        .with_extensions(f.assembly.provider_extensions.clone());
+        let agent = BuiltInAgentRuntime::start(
+            f.assembly.run_runtime.clone(),
+            Arc::new(context),
+            Arc::new(
+                ProviderRouter::new(Arc::new(Provider::default()), None)
+                    .with_extensions(f.assembly.provider_extensions.clone()),
+            ),
+            Arc::new(NoAgentToolInvoker),
+            Arc::new(NoAgentAudit),
+            BuiltInAgentConfig::default(),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let relay = RunRelay::start(f.assembly.run_runtime.clone(), agent.consumer());
+        let result: Result<(), String> = async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while p.starts.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(text)?;
+            if chunk {
+                // The durable chunk advances the Run's event cursor past the dispatched lease's.
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
-                        if row(&f, "cancel-active").await?.0 != "running" {
+                        let c = f.pool.get().await.map_err(text)?;
+                        let chunks: i64 = c
+                            .query_one(
+                                "SELECT count(*) FROM public.run_events \
+                                 WHERE run_id='cancel-active' AND event_type='semantic_chunk'",
+                                &[],
+                            )
+                            .await
+                            .map_err(text)?
+                            .get(0);
+                        if chunks > 0 {
                             return Ok::<_, String>(());
                         }
+                        drop(c);
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 })
                 .await
                 .map_err(text)??;
-                assert_eq!(row(&f, "cancel-active").await?.0, "cancelled");
-                // Only the signalled-child path stops the provider before the terminal is written;
-                // the unstarted path would write `cancelled` while the child kept sampling.
-                assert_eq!(p.stops.load(Ordering::SeqCst), 1);
-                Ok(())
             }
-            .await;
-            relay.stop().await;
-            agent.stop().await;
-            close(f).await;
-            result
-        },
-    )
+            f.assembly
+                .application
+                .execute(
+                    f.auth.clone(),
+                    AppCommand::CancelThreadRun(CancelThreadRun {
+                        thread_id: r.thread_id.clone(),
+                        run_id: r.run_id.clone(),
+                    }),
+                )
+                .await
+                .map_err(text)?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if row(&f, "cancel-active").await?.0 != "running" {
+                        return Ok::<_, String>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(text)??;
+            assert_eq!(row(&f, "cancel-active").await?.0, "cancelled");
+            // Only the signalled-child path stops the provider before the terminal is written;
+            // the unstarted path would write `cancelled` while the child kept sampling.
+            assert_eq!(p.stops.load(Ordering::SeqCst), 1);
+            Ok(())
+        }
+        .await;
+        relay.stop().await;
+        agent.stop().await;
+        close(f).await;
+        result
+    })
     .await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly injected fresh owned PostgreSQL 17.11"]
+async fn cancel_active_delegated_run_signals_local_child() {
+    cancel_active_run("delegatedcancel", false, true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly injected fresh owned PostgreSQL 17.11"]
+async fn cancel_after_streamed_chunk_still_signals_local_child() {
+    cancel_active_run("delegatedcancelchunk", true, true).await;
+    cancel_active_run("ordinarycancelchunk", true, false).await;
 }

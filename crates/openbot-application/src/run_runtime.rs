@@ -316,8 +316,9 @@ impl core::fmt::Debug for RunExecutionLease {
             .finish()
     }
 }
-// The attached delegation runtime is a process-local handle, not part of the lease identity:
-// a cancellation lease read back from the database must match the dispatched one.
+// Equality is lease identity. The attached delegation runtime is a process-local handle and
+// `next_event_sequence` is only the read-time cursor, so a cancellation lease read back after the
+// child appended events still matches the dispatched one; the fencing token keeps stale leases out.
 impl PartialEq for RunExecutionLease {
     fn eq(&self, other: &Self) -> bool {
         self.run_id == other.run_id
@@ -325,7 +326,6 @@ impl PartialEq for RunExecutionLease {
             && self.bot_id == other.bot_id
             && self.actor_id == other.actor_id
             && self.fencing == other.fencing
-            && self.next_event_sequence == other.next_event_sequence
             && self.delegation_required == other.delegation_required
             && self.absolute_deadline == other.absolute_deadline
     }

@@ -355,7 +355,7 @@ impl PostgresRunRuntime {
             .await?
             .ok_or(RunRuntimeError::StaleLease)?;
         validate_active_lease(&locked, &self.owner_id, lease, database_now(&tx).await?)?;
-        let row=tx.query_one("SELECT r.run_id,r.thread_id,r.bot_id,r.actor_id,r.fencing_token,r.created_at AS run_created_at,t.deployment_id,t.tenant_id,l.expires_at AS lease_expires_at,(m.content ? 'delegation') AS delegation_present,m.content->'delegation' AS delegation,m.content->'delegationSnapshot' AS delegation_snapshot FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id JOIN public.thread_leases l ON l.thread_id=r.thread_id JOIN public.messages m ON m.message_id=r.run_id||':input' AND m.run_id=r.run_id WHERE r.run_id=$1",&[&lease.run_id().as_str()]).await.map_err(|e|unavailable("confirmed callback provenance",e))?;
+        let row=tx.query_one("SELECT r.run_id,r.thread_id,r.bot_id,r.actor_id,r.fencing_token,t.deployment_id,t.tenant_id,l.expires_at AS lease_expires_at,m.content->'delegation' AS delegation,m.content->'delegationSnapshot' AS delegation_snapshot FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id JOIN public.thread_leases l ON l.thread_id=r.thread_id JOIN public.messages m ON m.message_id=r.run_id||':input' AND m.run_id=r.run_id WHERE r.run_id=$1",&[&lease.run_id().as_str()]).await.map_err(|e|unavailable("confirmed callback provenance",e))?;
         let actual = crate::delegation::decode_record(&row)
             .map_err(|_| RunRuntimeError::Corrupt {
                 field: "delegation_record",

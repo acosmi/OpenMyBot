@@ -11,10 +11,11 @@ use openbot_contracts::command::ThreadRunStarted;
 use openbot_contracts::error::AppError;
 use openbot_contracts::ids::{ActorId, BotId, DeploymentId, RunId, TenantId, ThreadId};
 use openbot_domain::thread::FencingToken;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 use tokio_postgres::{Row, Transaction};
 
 pub(crate) struct PostgresDelegatedRunStore {
@@ -165,83 +166,52 @@ impl DelegatedRunStore for PostgresDelegatedRunStore {
             .await
     }
 }
-pub(crate) const RECORD_SQL: &str = "SELECT r.run_id,r.thread_id,r.bot_id,r.actor_id,r.fencing_token,r.next_event_seq,r.created_at AS run_created_at, t.deployment_id,t.tenant_id,l.expires_at AS lease_expires_at,(m.content ? 'delegation') AS delegation_present,m.content->'delegation' AS delegation,m.content->'delegationSnapshot' AS delegation_snapshot FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id JOIN public.thread_leases l ON l.thread_id=r.thread_id JOIN public.messages m ON m.message_id=r.run_id||':input' AND m.run_id=r.run_id WHERE r.run_id=$1 AND t.deployment_id=$2 AND t.tenant_id=$3 AND r.status='running' AND t.status='active' AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads h WHERE h.deployment_id=t.deployment_id AND h.tenant_id=t.tenant_id AND h.thread_id=t.thread_id AND h.phase='closed') AND l.fencing_token=r.fencing_token AND l.expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM public.thread_memberships tm WHERE tm.thread_id=t.thread_id AND tm.user_id=r.actor_id)";
+pub(crate) const RECORD_SQL: &str = "SELECT r.run_id,r.thread_id,r.bot_id,r.actor_id,r.fencing_token,r.next_event_seq, t.deployment_id,t.tenant_id,l.expires_at AS lease_expires_at,m.content->'delegation' AS delegation,m.content->'delegationSnapshot' AS delegation_snapshot FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id JOIN public.thread_leases l ON l.thread_id=r.thread_id JOIN public.messages m ON m.message_id=r.run_id||':input' AND m.run_id=r.run_id WHERE r.run_id=$1 AND t.deployment_id=$2 AND t.tenant_id=$3 AND r.status='running' AND t.status='active' AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_heads h WHERE h.deployment_id=t.deployment_id AND h.tenant_id=t.tenant_id AND h.thread_id=t.thread_id AND h.phase='closed') AND l.fencing_token=r.fencing_token AND l.expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM public.thread_memberships tm WHERE tm.thread_id=t.thread_id AND tm.user_id=r.actor_id)";
+/// The engine-written `delegation` object; its shape was validated once at `begin`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredDelegation {
+    source: StoredSource,
+    revision: u64,
+    trigger_id: String,
+}
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum StoredSource {
+    ExternalBinding { binding_id: String },
+    AutomationDefinition { definition_id: String },
+}
+/// The engine-written `delegationSnapshot`; the absolute deadline is authoritative.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSnapshot {
+    grant_generation: u64,
+    expires_at: Option<u64>,
+    absolute_deadline: u64,
+}
 pub(crate) fn decode_record(row: &Row) -> Result<Option<DelegatedRunRecord>, AppError> {
-    let present: bool = row
-        .try_get("delegation_present")
-        .map_err(|_| not_current())?;
-    let delegation: Option<Value> = row.try_get("delegation").map_err(|_| not_current())?;
-    let snapshot: Option<Value> = row
-        .try_get("delegation_snapshot")
-        .map_err(|_| not_current())?;
-    if !present {
-        return if snapshot.is_some() {
-            Err(not_current())
-        } else {
-            Ok(None)
-        };
-    }
-    let d = delegation.as_ref().ok_or_else(not_current)?;
-    let snapshot = snapshot.as_ref().ok_or_else(not_current)?;
-    if d.as_object().is_none_or(|o| o.len() != 3)
-        || snapshot.as_object().is_none_or(|o| o.len() != 4)
-    {
-        return Err(not_current());
-    }
-    let number = |value: &Value, key: &str| {
-        value
-            .get(key)
-            .and_then(Value::as_u64)
-            .ok_or_else(not_current)
+    let Some(delegation) = row
+        .try_get::<_, Option<Value>>("delegation")
+        .map_err(|_| not_current())?
+    else {
+        return Ok(None);
     };
-    let string = |value: &Value, key: &str| {
-        value
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(not_current)
-    };
+    let delegation: StoredDelegation =
+        serde_json::from_value(delegation).map_err(|_| not_current())?;
+    let snapshot: StoredSnapshot = serde_json::from_value(
+        row.try_get("delegation_snapshot")
+            .map_err(|_| not_current())?,
+    )
+    .map_err(|_| not_current())?;
     let millis = |v: u64| {
         UNIX_EPOCH
             .checked_add(Duration::from_millis(v))
             .ok_or_else(not_current)
     };
-    let expiry = match snapshot.get("expiresAt") {
-        Some(Value::Null) => None,
-        Some(v) => Some(millis(v.as_u64().ok_or_else(not_current)?)?),
-        None => return Err(not_current()),
-    };
-    let source = parse_source(d.get("source").ok_or_else(not_current)?)?;
-    let deadline = millis(number(snapshot, "absoluteDeadline")?)?;
-    let budget = number(snapshot, "runDeadlineMillis")?;
-    if !(1000..=86400000).contains(&budget) {
-        return Err(not_current());
-    }
-    let created: time::OffsetDateTime = row.try_get("run_created_at").map_err(|_| not_current())?;
-    let created: SystemTime = created.into();
-    let expected = created
-        .checked_add(Duration::from_millis(budget))
-        .ok_or_else(not_current)?;
-    let expected_millis = expected
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| not_current())?
-        .as_millis();
-    let actual_millis = deadline
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| not_current())?
-        .as_millis();
-    if actual_millis < expected_millis || actual_millis > expected_millis + 1 {
-        return Err(not_current());
-    }
-    if !string(d, "triggerId")?
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
-        || string(d, "triggerId")?.is_empty()
-        || string(d, "triggerId")?.len() > 128
-    {
-        return Err(not_current());
-    }
-
     let lease: time::OffsetDateTime = row.try_get("lease_expires_at").map_err(|_| not_current())?;
     Ok(Some(DelegatedRunRecord {
         deployment: DeploymentId::new(
@@ -270,12 +240,19 @@ pub(crate) fn decode_record(row: &Row) -> Result<Option<DelegatedRunRecord>, App
         ),
         fencing: FencingToken::new(row.try_get("fencing_token").map_err(|_| not_current())?)
             .map_err(|_| not_current())?,
-        source,
-        revision: number(d, "revision")?,
-        trigger_id: string(d, "triggerId")?,
-        granted_generation: AuthGeneration::new(number(snapshot, "grantGeneration")?),
-        expires_at: expiry,
-        absolute_deadline: deadline,
+        source: match delegation.source {
+            StoredSource::ExternalBinding { binding_id } => {
+                DelegationSource::ExternalBinding { binding_id }
+            }
+            StoredSource::AutomationDefinition { definition_id } => {
+                DelegationSource::AutomationDefinition { definition_id }
+            }
+        },
+        revision: delegation.revision,
+        trigger_id: delegation.trigger_id,
+        granted_generation: AuthGeneration::new(snapshot.grant_generation),
+        expires_at: snapshot.expires_at.map(millis).transpose()?,
+        absolute_deadline: millis(snapshot.absolute_deadline)?,
         lease_expires_at: lease.into(),
     }))
 }
@@ -314,45 +291,6 @@ pub(crate) fn source_json(source: &DelegationSource) -> Value {
         DelegationSource::AutomationDefinition { definition_id } => {
             json!({"kind":"automation_definition","definitionId":definition_id})
         }
-    }
-}
-fn parse_source(source: &Value) -> Result<DelegationSource, AppError> {
-    let o = source.as_object().ok_or_else(not_current)?;
-    let id = match o.get("kind").and_then(Value::as_str) {
-        Some("external_binding") => o.get("bindingId"),
-        Some("automation_definition") => o.get("definitionId"),
-        _ => None,
-    }
-    .and_then(Value::as_str)
-    .ok_or_else(not_current)?;
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
-    {
-        return Err(not_current());
-    }
-
-    if o.len() != 2 {
-        return Err(not_current());
-    }
-    match o.get("kind").and_then(Value::as_str) {
-        Some("external_binding") => Ok(DelegationSource::ExternalBinding {
-            binding_id: o
-                .get("bindingId")
-                .and_then(Value::as_str)
-                .ok_or_else(not_current)?
-                .to_owned(),
-        }),
-        Some("automation_definition") => Ok(DelegationSource::AutomationDefinition {
-            definition_id: o
-                .get("definitionId")
-                .and_then(Value::as_str)
-                .ok_or_else(not_current)?
-                .to_owned(),
-        }),
-        _ => Err(not_current()),
     }
 }
 pub(crate) fn not_current() -> AppError {
