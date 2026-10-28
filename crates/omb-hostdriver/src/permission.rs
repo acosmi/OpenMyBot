@@ -47,8 +47,12 @@ pub(crate) fn readonly(tool_name: &str, input: &Value, workspace: &Path) -> bool
     std::fs::canonicalize(path).is_ok_and(|real| real.starts_with(workspace))
 }
 
-pub(crate) fn notice(tool_name: &str, permission_id: &str) -> String {
+/// The notice with the run's first 8 characters, the tool and the id; `{expires}` stays for the
+/// store.
+pub(crate) fn notice(run_id: &str, tool_name: &str, permission_id: &str) -> String {
+    let run: String = run_id.chars().take(8).collect();
     OMB_NOTICE_PERMISSION_V1
+        .replace("{run}", &run)
         .replace("{tool}", tool_name)
         .replace("{id}", permission_id)
 }
@@ -228,8 +232,12 @@ mod tests {
     #[test]
     fn notice_text_fills_tool_and_id_into_the_constant() {
         assert_eq!(
-            notice("Write", "hp0123456789"),
-            "CrabCode 请求使用工具 Write。在本机执行 openmybot approve hp0123456789 放行，或 openmybot deny hp0123456789 拒绝。"
+            notice("3b5a3661-5a30-58d9", "Write", "hp0123456789"),
+            "CrabCode run 3b5a3661 请求使用工具 Write，许可 hp0123456789，{expires} 到期。在本机执行 openmybot approve hp0123456789 放行，或 openmybot deny hp0123456789 拒绝；渠道回复不构成批准。"
         );
+        let text = notice("r1", "Bash", "hp0000000001");
+        assert!(text.starts_with("CrabCode run r1 请求使用工具 Bash，"));
+        assert!(text.contains("{expires}") && !text.contains("{run}") && !text.contains("{tool}"));
+        assert!(text.ends_with("渠道回复不构成批准。"));
     }
 }

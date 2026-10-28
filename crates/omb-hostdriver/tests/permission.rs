@@ -617,10 +617,19 @@ async fn sender_run_permission_row_carries_notice_delivery_row() {
     assert_eq!(delivery["chat_key"], "telegram:42");
     assert_eq!(delivery["channel_kind"], "telegram");
     assert_eq!(delivery["binding_id"], binding.to_string());
+    let expiry: String = env
+        .client()
+        .query_one(
+            "SELECT to_char(expires_at,'YYYY-MM-DD HH24:MI TZ') FROM openmybot.host_driver_sessions WHERE permission_id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(
         delivery["body"],
         format!(
-            "CrabCode 请求使用工具 Write。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝。"
+            "CrabCode run r1 请求使用工具 Write，许可 {id}，{expiry} 到期。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝；渠道回复不构成批准。"
         )
     );
     decide(env.client(), &id, Decision::Deny).await;

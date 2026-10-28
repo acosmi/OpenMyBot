@@ -308,6 +308,7 @@ impl ProviderAdapter for HostDriverAdapter {
             pending: Vec::new(),
             allowed: Vec::new(),
             result_seen: false,
+            write_stalled: false,
             slot: Some(slot),
         };
         {
@@ -363,6 +364,8 @@ struct Run {
     /// Inputs the owner allowed, in order; the source of the row's artifact paths.
     allowed: Vec<Value>,
     result_seen: bool,
+    /// A stdin write outlasted the stall budget.
+    write_stalled: bool,
     /// Released once the ladder has run, so a reaped child frees its place at once.
     slot: Option<Slot>,
 }
@@ -453,6 +456,9 @@ impl Run {
         let mut out = vec![0; READ_CHUNK];
         let mut err = vec![0; READ_CHUNK];
         loop {
+            if self.write_stalled {
+                return End::Reason(EndReason::Stalled);
+            }
             let stall = self.pending.is_empty().then(|| last_output + limits.stall);
             tokio::select! {
                 read = self.stdout.read(&mut out), if self.stdout_open => match read {
@@ -510,8 +516,9 @@ impl Run {
         self.output += bytes as u64;
         self.output > self.shared.config.limits.output_max
     }
+    /// PostgreSQL text holds no NUL, so NUL bytes never enter the tail.
     fn keep_tail(&mut self, bytes: &[u8]) {
-        self.tail.extend_from_slice(bytes);
+        self.tail.extend(bytes.iter().filter(|byte| **byte != 0));
         let excess = self.tail.len().saturating_sub(STDERR_TAIL_MAX);
         self.tail.drain(..excess);
     }
@@ -520,12 +527,26 @@ impl Run {
             let _ = self.events.send(Ok(event));
         }
     }
-    /// Writes one frame to the child; false when stdin is closed or the write failed.
+    /// Writes one frame to the child; false when stdin is closed or the write failed. A child that
+    /// does not read its stdin within the stall budget, or a driver shutdown during the write,
+    /// closes stdin; the main loop then ends the run as stalled or shut down.
     async fn write(&mut self, frame: &[u8]) -> bool {
-        match self.stdin.as_mut() {
-            Some(stdin) => stdin.write_all(frame).await.is_ok(),
-            None => false,
-        }
+        let Some(stdin) = self.stdin.as_mut() else {
+            return false;
+        };
+        let mut shutdown = self.shared.shutdown.subscribe();
+        let written = tokio::select! {
+            written = tokio::time::timeout(self.shared.config.limits.stall, stdin.write_all(frame)) => match written {
+                Ok(result) => return result.is_ok(),
+                Err(_) => {
+                    self.write_stalled = true;
+                    false
+                }
+            },
+            () = async { drop(shutdown.wait_for(|stopping| *stopping).await) } => false,
+        };
+        self.stdin = None;
+        written
     }
 
     async fn stdout_bytes(&mut self, bytes: &[u8]) -> Option<End> {
@@ -581,7 +602,14 @@ impl Run {
                 self.write(&protocol::refuse(&request_id, code)).await;
                 None
             }
-            Mapped::Success { events, summary } => {
+            Mapped::Success {
+                events,
+                mut summary,
+            } => {
+                // PostgreSQL text holds no NUL.
+                if let Some(text) = summary.as_mut() {
+                    text.retain(|c| c != '\0');
+                }
                 self.result_seen = true;
                 for event in events {
                     let _ = self.events.send(Ok(event));
@@ -627,7 +655,7 @@ impl Run {
         let summary = jcs::summary(&bytes);
         let readonly = permission::readonly(&tool_name, &input, &self.workspace);
         let notice = (self.target.kind == GrantKind::Sender && !readonly)
-            .then(|| permission::notice(&tool_name, &permission_id));
+            .then(|| permission::notice(&self.target.run_id, &tool_name, &permission_id));
         let row = PermissionNew {
             run_id: &self.target.run_id,
             binding_id: self.target.binding_id,

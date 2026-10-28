@@ -170,20 +170,6 @@ pub struct SessionEnd<'a> {
     /// Truncated to its last 2048 bytes on a UTF-8 boundary.
     pub stderr_tail: &'a str,
 }
-fn head(text: &str, max: usize) -> &str {
-    let mut end = text.len().min(max);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-fn tail(text: &str, max: usize) -> &str {
-    let mut start = text.len().saturating_sub(max);
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
-}
 /// Writes the end columns; only a successful result makes the session resumable.
 pub async fn end_session(
     client: &Client,
@@ -197,8 +183,19 @@ pub async fn end_session(
         None => (None, None),
     };
     let resumable = (end.reason == EndReason::ResultSuccess).then_some(true);
-    let summary = end.result_summary.map(|text| head(text, SUMMARY_MAX));
-    update(client, "UPDATE openmybot.host_driver_sessions SET ended_at=statement_timestamp(),end_reason=$2,exit_code=$3,exit_signal=$4,stop_outcome=$5,stop_confirmed_at=$6,result_summary=$7,artifact_paths=$8,stderr_tail=$9,resumable=$10 WHERE record_id=$1 AND record_kind='session' RETURNING record_id", &[&record, &end.reason.as_str(), &end.exit_code, &end.exit_signal, &outcome, &confirmed_at, &summary, &end.artifact_paths, &tail(end.stderr_tail, TAIL_MAX), &resumable], deadline).await
+    let summary = end.result_summary.map(|text| {
+        let mut end = text.len().min(SUMMARY_MAX);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    });
+    let mut start = end.stderr_tail.len().saturating_sub(TAIL_MAX);
+    while !end.stderr_tail.is_char_boundary(start) {
+        start += 1;
+    }
+    let stderr_tail = &end.stderr_tail[start..];
+    update(client, "UPDATE openmybot.host_driver_sessions SET ended_at=statement_timestamp(),end_reason=$2,exit_code=$3,exit_signal=$4,stop_outcome=$5,stop_confirmed_at=$6,result_summary=$7,artifact_paths=$8,stderr_tail=$9,resumable=$10 WHERE record_id=$1 AND record_kind='session' RETURNING record_id", &[&record, &end.reason.as_str(), &end.exit_code, &end.exit_signal, &outcome, &confirmed_at, &summary, &end.artifact_paths, &stderr_tail, &resumable], deadline).await
 }
 /// The resumed session failed to continue and is not offered again.
 pub async fn clear_resumable(
@@ -228,7 +225,7 @@ pub async fn insert_permission(
     input: PermissionNew<'_>,
     deadline: Instant,
 ) -> Result<OffsetDateTime, StoreError> {
-    let written = rows(client, "WITH p AS (INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,permission_id,native_request_id,tool_name,input_summary,input_sha256,requested_at,expires_at) VALUES ($1,'permission',$2,$3,$4,$5,$6,$7,$8,statement_timestamp(),statement_timestamp()+make_interval(secs=>$9)) RETURNING binding_id,expires_at), d AS (INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,created_at) SELECT $10,b.binding_id,b.channel_kind,b.chat_key,'permission_notice','perm:'||$4,$11,'pending',statement_timestamp() FROM p JOIN openmybot.channel_bindings b ON b.binding_id=p.binding_id WHERE $11::text IS NOT NULL ON CONFLICT (idempotency_key) DO NOTHING RETURNING delivery_id) SELECT expires_at FROM p", &[&Uuid::now_v7(), &input.run_id, &input.binding_id, &input.permission_id, &input.native_request_id, &input.tool_name, &input.input_summary, &input.input_sha256.as_slice(), &input.ttl.as_secs_f64(), &Uuid::now_v7(), &input.notice], deadline, ERROR).await?;
+    let written = rows(client, "WITH p AS (INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,permission_id,native_request_id,tool_name,input_summary,input_sha256,requested_at,expires_at) VALUES ($1,'permission',$2,$3,$4,$5,$6,$7,$8,statement_timestamp(),statement_timestamp()+make_interval(secs=>$9)) RETURNING binding_id,expires_at), d AS (INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,created_at) SELECT $10,b.binding_id,b.channel_kind,b.chat_key,'permission_notice','perm:'||$4,replace($11,'{expires}',to_char(p.expires_at,'YYYY-MM-DD HH24:MI TZ')),'pending',statement_timestamp() FROM p JOIN openmybot.channel_bindings b ON b.binding_id=p.binding_id WHERE $11::text IS NOT NULL ON CONFLICT (idempotency_key) DO NOTHING RETURNING delivery_id) SELECT expires_at FROM p", &[&Uuid::now_v7(), &input.run_id, &input.binding_id, &input.permission_id, &input.native_request_id, &input.tool_name, &input.input_summary, &input.input_sha256.as_slice(), &input.ttl.as_secs_f64(), &Uuid::now_v7(), &input.notice], deadline, ERROR).await?;
     written.first().ok_or(ERROR)?.try_get(0).map_err(|_| ERROR)
 }
 /// Writes a permission row already allowed by the read-only rule.

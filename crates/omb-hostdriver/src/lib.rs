@@ -36,7 +36,9 @@ pub const DELIVERY_ARTIFACTS_MAX: usize = 20;
 pub const CC_READONLY_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "LS"];
 /// How often a waiting permission request reads its row for the owner's decision.
 pub const PERMISSION_POLL: Duration = Duration::from_millis(250);
-pub const OMB_NOTICE_PERMISSION_V1: &str = "CrabCode 请求使用工具 {tool}。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝。";
+/// `{run}`, `{tool}` and `{id}` are filled by the driver; the store fills `{expires}` from the
+/// permission row it writes in the same statement.
+pub const OMB_NOTICE_PERMISSION_V1: &str = "CrabCode run {run} 请求使用工具 {tool}，许可 {id}，{expires} 到期。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝；渠道回复不构成批准。";
 
 /// Per-driver budgets; the default is the specification's constants.
 #[derive(Clone, Copy, Debug)]

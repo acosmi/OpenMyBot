@@ -650,9 +650,15 @@ async fn permission_native_request_is_unique_per_run() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn sender_permission_writes_notice_delivery_in_the_same_statement() {
     let env = Env::new().await;
-    insert_permission(
+    let expires = insert_permission(
         env.client(),
-        request("r1", env.sender, "hp0000000001", "q1", Some("notice one")),
+        request(
+            "r1",
+            env.sender,
+            "hp0000000001",
+            "q1",
+            Some("notice {expires} one"),
+        ),
         deadline(),
     )
     .await
@@ -668,9 +674,20 @@ async fn sender_permission_writes_notice_delivery_in_the_same_statement() {
     assert_eq!(delivery["channel_kind"], "telegram");
     assert_eq!(delivery["chat_key"], "telegram:42");
     assert_eq!(delivery["binding_id"], env.sender.to_string());
-    assert_eq!(delivery["body"], "notice one");
+    let expiry: String = env
+        .client()
+        .query_one(
+            "SELECT to_char($1::timestamptz,'YYYY-MM-DD HH24:MI TZ')",
+            &[&expires],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(delivery["body"], format!("notice {expiry} one"));
+    assert!(!delivery["body"].as_str().unwrap().contains("{expires}"));
     assert_eq!(delivery["status"], "pending");
-    // Replaying the same permission writes neither a row nor a second delivery.
+    // A repeated permission id fails on the permission row, so neither a second row nor a second
+    // delivery is written.
     assert_eq!(
         insert_permission(
             env.client(),
