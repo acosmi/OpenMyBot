@@ -57,3 +57,7 @@ required-features = ["testkit"]
 [[test]]
 name = "gaps"
 required-features = ["testkit"]
+
+[[test]]
+name = "host_sessions"
+required-features = ["testkit"]

@@ -37,7 +37,8 @@ fn map_store_error(error: omb_store::StoreError) -> DaemonError {
         omb_store::StoreError::BindingFailed => DaemonError::BindingFailed,
         omb_store::StoreError::EventFailed
         | omb_store::StoreError::DispatchFailed
-        | omb_store::StoreError::GapFailed => DaemonError::InternalError,
+        | omb_store::StoreError::GapFailed
+        | omb_store::StoreError::HostSessionFailed => DaemonError::InternalError,
     }
 }
 fn ready_result<T>(deadline: Instant, result: Result<T, DaemonError>) -> Result<T, DaemonError> {
