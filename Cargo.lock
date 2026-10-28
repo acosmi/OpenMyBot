@@ -4602,6 +4602,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "getrandom 0.4.3",
+ "omb-channels",
  "omb-store",
  "openbot-application",
  "openbot-computer",

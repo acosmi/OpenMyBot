@@ -98,6 +98,7 @@ pub struct Engine {
     pub(crate) assembly: PostgresApplicationAssembly,
     pub(crate) authority: Arc<OmbDelegationAuthority>,
     pub(crate) resolver: SingleUserAuthResolver,
+    pub(crate) vault: CredentialRecordVault,
 }
 impl Engine {
     pub(crate) async fn shutdown(self) {
@@ -130,6 +131,7 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
             .map_err(|_| DaemonError::EngineAssemblyFailed)?;
     let credential_vault =
         CredentialRecordVault::single_key(tenant.clone(), KeyVersion::new(1), wrapping);
+    let vault = credential_vault.clone();
     let policy_store = PolicyStore::postgres(pool.clone(), None);
     policy_store
         .load()
@@ -205,5 +207,6 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
             principal,
             default_session_lifetime(),
         ),
+        vault,
     })
 }

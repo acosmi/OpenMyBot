@@ -31,6 +31,7 @@ semver = "=1.0.28"
 chrono.workspace = true
 
 omb-store = { path = "../omb-store" }
+omb-channels = { path = "../omb-channels" }
 sha2.workspace = true
 uuid.workspace = true
 

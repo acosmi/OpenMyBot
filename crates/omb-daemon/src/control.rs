@@ -1,4 +1,4 @@
-use crate::{DaemonError, StatusOptions, StatusSnapshot, config};
+use crate::{DaemonError, StatusOptions, StatusSnapshot, channels::StatusSource, config};
 use serde::{
     Deserialize, Serialize,
     de::{self, MapAccess, SeqAccess, Visitor},
@@ -142,6 +142,8 @@ pub(crate) struct ControlState {
     token: String,
     snapshot: StatusSnapshot,
     failures: AtomicU64,
+    /// The daemon always supplies it; transport-only unit tests run without a database.
+    channels: Option<StatusSource>,
 }
 impl fmt::Debug for ControlState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -152,17 +154,26 @@ impl fmt::Debug for ControlState {
     }
 }
 impl ControlState {
-    pub(crate) fn new(token: String, snapshot: StatusSnapshot) -> Arc<Self> {
+    pub(crate) fn new(
+        token: String,
+        snapshot: StatusSnapshot,
+        channels: Option<StatusSource>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             token,
             snapshot,
             failures: AtomicU64::new(0),
+            channels,
         })
     }
-    fn snapshot(&self) -> StatusSnapshot {
+    /// The fixed overview plus the channel segment read from the store at request time.
+    async fn snapshot(&self) -> Result<StatusSnapshot, DaemonError> {
         let mut data = self.snapshot.clone();
         data.authentication_failures = self.failures.load(Ordering::Relaxed);
-        data
+        if let Some(channels) = &self.channels {
+            data.channels = channels.read().await?;
+        }
+        Ok(data)
     }
 }
 fn reject(state: &ControlState) {
@@ -229,11 +240,14 @@ async fn handle_with_uid(stream: &mut UnixStream, state: Arc<ControlState>, obse
             Ok(request) if !request.args.as_object().is_some_and(|a| a.is_empty()) => {
                 error_response(DaemonError::InvalidRequest)
             }
-            Ok(_) => Response {
-                r#type: "response".into(),
-                ok: true,
-                data: Some(state.snapshot()),
-                code: None,
+            Ok(_) => match state.snapshot().await {
+                Ok(data) => Response {
+                    r#type: "response".into(),
+                    ok: true,
+                    data: Some(data),
+                    code: None,
+                },
+                Err(error) => error_response(error),
             },
         },
     };
@@ -366,7 +380,9 @@ mod tests {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 engine_pin: ENGINE_PIN.into(),
                 authentication_failures: 0,
+                channels: Vec::new(),
             },
+            None,
         )
     }
     fn hello(token: &str, client: &str) -> Vec<u8> {
@@ -579,7 +595,7 @@ mod tests {
         let rendered = format!(
             "{:?} {} {:?}",
             shared,
-            serde_json::to_string(&shared.snapshot()).unwrap(),
+            serde_json::to_string(&shared.snapshot().await.unwrap()).unwrap(),
             DaemonError::InternalError
         );
         for secret in [
