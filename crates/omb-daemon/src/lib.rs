@@ -1,5 +1,6 @@
 //! Foreground local composition and authenticated Unix control transport.
 
+mod agent;
 mod channels;
 mod config;
 mod control;
@@ -131,4 +132,7 @@ errors! {
     BindingNotFound => ("binding_not_found", Rejected),
     BindingStateInvalid => ("binding_state_invalid", Rejected),
     BindingFailed => ("binding_failed", Internal),
+    HostBinaryInvalid => ("host_binary_invalid", Rejected),
+    WorkspaceRootInvalid => ("workspace_root_invalid", Rejected),
+    AgentRuntimeFailed => ("agent_runtime_failed", Internal),
 }

@@ -128,32 +128,51 @@ pub(crate) mod fixture {
         engine::{self, Engine},
         pg::Postgres,
     };
+    use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots};
     use openbot_application::tenant::package::{
         TenantPackageAudienceContext, TenantPackageEnvironment, synchronize_tenant_package,
     };
     use openbot_contracts::ids::ActorId;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use tokio::task::JoinHandle;
     use uuid::Uuid;
 
-    /// One own PG17.11 data directory with the assembled engine.
+    /// One own PG17.11 data directory with the assembled engine and its host driver.
     pub(crate) struct Fixture {
         pub(crate) root: PathBuf,
         pub(crate) pg: Postgres,
         pub(crate) engine: Option<Engine>,
+        pub(crate) host: Option<HostDriver>,
+        host_link: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
         pub(crate) deployment_id: String,
     }
-    /// Test-only copy of the tenant package's agents: the Bot without a provider source, which the
-    /// production package cannot declare yet.
+    /// Test-only copy of the tenant package's agents: the Bot routed to the package provider
+    /// instead of the `crabcode` extension.
     const TEST_BOT: &str = "agents:\n  - id: omb-crabcode\n    name: OpenMyBot\n    title: OpenMyBot\n    role_description: OpenMyBot host bot\n    type: built-in\n    system_prompt: OpenMyBot\n";
+    /// A driver without a binary: every start is refused.
+    fn idle_host(root: &Path) -> HostDriverConfig {
+        HostDriverConfig {
+            binary: None,
+            home: root.to_path_buf(),
+            tmp_dir: root.join("hosts/crabcode/tmp"),
+            roots: WorkspaceRoots::parse(root, &[]).unwrap(),
+            window: VersionWindow::embedded(),
+            limits: Limits::default(),
+        }
+    }
     impl Fixture {
         pub(crate) async fn start() -> Self {
-            Self::launch(false).await
+            Self::launch(false, idle_host).await
         }
         /// Like `start`, with the test tenant package that declares Bot `omb-crabcode`.
         pub(crate) async fn start_with_bot() -> Self {
-            Self::launch(true).await
+            Self::launch(true, idle_host).await
         }
-        async fn launch(bot: bool) -> Self {
+        /// Like `start`, with the host driver configured by `host` from the data directory.
+        pub(crate) async fn start_with_host(host: fn(&Path) -> HostDriverConfig) -> Self {
+            Self::launch(false, host).await
+        }
+        async fn launch(bot: bool, host: fn(&Path) -> HostDriverConfig) -> Self {
             let pg_bin = PathBuf::from(
                 std::env::var_os("OMB_TEST_PG_BIN_DIR")
                     .expect("explicit own PG17.11 test binary directory required"),
@@ -191,11 +210,15 @@ pub(crate) mod fixture {
                 .await
                 .unwrap();
             }
-            let engine = engine::assemble(&root, prepared).await.unwrap();
+            let resident = pg.open_resident_connection("omb-hostdriver").await.unwrap();
+            let driver = HostDriver::new(host(&root), std::sync::Arc::new(resident.client));
+            let engine = engine::assemble(&root, prepared, &driver).await.unwrap();
             Self {
                 root,
                 pg,
                 engine: Some(engine),
+                host: Some(driver),
+                host_link: Some(resident.driver),
                 deployment_id: config.deployment_id,
             }
         }
@@ -207,6 +230,13 @@ pub(crate) mod fixture {
             self.pg.open_authority_connection().await.unwrap().client
         }
         pub(crate) async fn stop(mut self) {
+            if let Some(host) = self.host.take() {
+                host.shutdown().await;
+            }
+            if let Some(link) = self.host_link.take() {
+                link.abort();
+                let _ = link.await;
+            }
             if let Some(engine) = self.engine.take() {
                 engine.shutdown().await;
             }
@@ -662,9 +692,15 @@ mod tests {
     async fn delegated_entry_is_some_after_assembly() {
         let fixture = Fixture::start().await;
         assert!(fixture.engine().assembly.delegated_entry.is_some());
-        assert!(fixture.engine().assembly.provider_extensions.is_empty());
-        // The engine's tenant package has no provider-source field for agents, so a Bot routed
-        // to the "crabcode" extension cannot be declared or synchronized from the package.
+        let extensions = &fixture.engine().assembly.provider_extensions;
+        assert_eq!(extensions.len(), 1);
+        assert!(
+            extensions
+                .get(&openbot_application::ProviderExtensionKey::new("crabcode").unwrap())
+                .is_some()
+        );
+        // Built-in Bots may route to an assembly-registered extension, so the package that
+        // declares the Bot on the "crabcode" extension loads and is synchronized at startup.
         let copy = crate::config::test_dir();
         for name in [
             "brand.yaml",
@@ -685,7 +721,7 @@ mod tests {
             format!("{bot}    providerSource: extension:crabcode\n"),
         )
         .unwrap();
-        assert!(openbot_infra::tenant::load_tenant_package(&copy, &environment).is_err());
+        assert!(openbot_infra::tenant::load_tenant_package(&copy, &environment).is_ok());
         std::fs::remove_dir_all(copy).unwrap();
         let auth = fixture.engine().resolver.local_context().unwrap();
         let AppReply::Agents(roster) = fixture
@@ -698,7 +734,7 @@ mod tests {
         else {
             panic!("roster reply");
         };
-        assert!(roster.iter().all(|agent| agent.id.as_str() != BOT_ID));
+        assert!(roster.iter().any(|agent| agent.id.as_str() == BOT_ID));
         fixture.stop().await;
     }
 
