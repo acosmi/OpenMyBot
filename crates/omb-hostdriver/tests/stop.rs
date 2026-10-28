@@ -403,7 +403,15 @@ async fn setsid_descendant_is_outside_confirmation() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn stop_denies_pending_permissions_with_run_stopped_first() {
     let env = Env::new().await;
-    let (_driver, mut session) = live(&env, "permission", quick()).await;
+    let binding = env.host().await;
+    env.event(binding, "r1", "TH").await;
+    // The fake holds its result after the answer, so it reads the interrupt that follows.
+    let driver = env.driver(
+        env.window("permission", &[("FAKE_CRABCODE_HOLD_MS", "500")]),
+        quick(),
+    );
+    let mut session = start(&driver, binding).await.unwrap();
+    started(&mut session).await;
     let rows = env.requested("r1", 1).await;
     let (outcome, _) = stopped(&env, &mut session).await;
     assert!(matches!(outcome, StopOutcome::Confirmed { .. }));

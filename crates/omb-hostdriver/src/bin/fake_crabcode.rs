@@ -3,7 +3,8 @@
 //! `FAKE_CRABCODE_SCENARIO` (behaviour), `FAKE_CRABCODE_VERSION` (version line),
 //! `FAKE_CRABCODE_REPORT` (JSON-lines observations: argv, environment, cwd, stdin, signals,
 //! descendants), `FAKE_CRABCODE_SESSION`, `FAKE_CRABCODE_TEXT`, `FAKE_CRABCODE_TOOL`,
-//! `FAKE_CRABCODE_INPUT`, `FAKE_CRABCODE_INPUT2`, `FAKE_CRABCODE_BYTES`, `FAKE_CRABCODE_DELAY_MS`.
+//! `FAKE_CRABCODE_INPUT`, `FAKE_CRABCODE_INPUT2`, `FAKE_CRABCODE_BYTES`, `FAKE_CRABCODE_DELAY_MS`,
+//! `FAKE_CRABCODE_HOLD_MS`.
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, Write},
@@ -261,6 +262,12 @@ async fn main() {
             let allowed = answers
                 .iter()
                 .all(|a| a["response"]["response"]["behavior"] == "allow");
+            tokio::time::sleep(Duration::from_millis(
+                var("FAKE_CRABCODE_HOLD_MS")
+                    .and_then(|ms| ms.parse().ok())
+                    .unwrap_or(0),
+            ))
+            .await;
             let reply = if allowed { "allowed" } else { "denied" };
             child.text(reply).await;
             child.success(reply).await;
