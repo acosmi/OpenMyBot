@@ -938,3 +938,79 @@ async fn assembly_failure_after_token_insert_records_controlled_stop() {
         assert!(rows[0].get::<_, bool>(2));
     }
 }
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_status_reports_channel_segment_over_control_socket() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture.spawn("daemon_status_reports_channel_segment_over_control_socket");
+    let snapshot = fixture.ready().await;
+    assert!(snapshot.channels.is_empty());
+    let rows = query_own(&fixture, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,status_reason,revision,created_at,activated_at,suspended_at) VALUES (gen_random_uuid(),'receiver','telegram','1001','test-envelope','suspended','credential_rejected',1,statement_timestamp(),statement_timestamp(),statement_timestamp()) RETURNING binding_id").await;
+    let receiver: uuid::Uuid = rows[0].get(0);
+    let snapshot = fixture.ready().await;
+    assert_eq!(snapshot.channels.len(), 1);
+    let channel = &snapshot.channels[0];
+    assert_eq!(channel.channel, "telegram");
+    assert_eq!(channel.binding_id, receiver.to_string());
+    assert_eq!(channel.status, "suspended");
+    assert_eq!(
+        channel.status_reason.as_deref(),
+        Some("credential_rejected")
+    );
+    assert_eq!(channel.pending_dispatch, 0);
+    assert!(channel.gaps.is_empty());
+    assert_eq!(channel.note, "telegram 长轮询");
+    assert_eq!(
+        (
+            channel.counters.platform_payload_unparseable,
+            channel.counters.event_conflict,
+            channel.counters.unsupported_update
+        ),
+        (0, 0, 0)
+    );
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_restart_records_daemon_down_gap() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut first = fixture.spawn("daemon_restart_records_daemon_down_gap");
+    fixture.ready().await;
+    let rows = query_own(&fixture, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,revision,created_at,activated_at) VALUES (gen_random_uuid(),'receiver','telegram','1001','test-envelope','active',1,statement_timestamp(),statement_timestamp()) RETURNING binding_id").await;
+    let receiver: uuid::Uuid = rows[0].get(0);
+    let old = query_own(
+        &fixture,
+        "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+    )
+    .await[0]
+        .get::<_, uuid::Uuid>(0);
+    first.signal(Signal::KILL);
+    assert_eq!(first.wait().await, -1);
+    let mut second = fixture.spawn("daemon_restart_records_daemon_down_gap");
+    let snapshot = fixture.ready().await;
+    let rows = query_own(&fixture, &format!("SELECT g.binding_id,g.gap_started_at=t.last_heartbeat_at,g.gap_ended_at>=n.created_at AND g.gap_ended_at<=statement_timestamp(),t.revoke_reason FROM openmybot.channel_events g CROSS JOIN openmybot.control_tokens t CROSS JOIN openmybot.control_tokens n WHERE g.gap_reason='daemon_down' AND t.token_id='{old}' AND n.revoked_at IS NULL")).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, uuid::Uuid>(0), receiver);
+    assert!(rows[0].get::<_, bool>(1));
+    assert!(rows[0].get::<_, bool>(2));
+    assert_eq!(rows[0].get::<_, String>(3), "daemon_restart");
+    let channel = &snapshot.channels[0];
+    assert_eq!(channel.binding_id, receiver.to_string());
+    assert!(
+        channel
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "daemon_down" && gap.ended_at.is_some())
+    );
+    second.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
