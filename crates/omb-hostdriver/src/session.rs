@@ -602,14 +602,7 @@ impl Run {
                 self.write(&protocol::refuse(&request_id, code)).await;
                 None
             }
-            Mapped::Success {
-                events,
-                mut summary,
-            } => {
-                // PostgreSQL text holds no NUL.
-                if let Some(text) = summary.as_mut() {
-                    text.retain(|c| c != '\0');
-                }
+            Mapped::Success { events, summary } => {
                 self.result_seen = true;
                 for event in events {
                     let _ = self.events.send(Ok(event));

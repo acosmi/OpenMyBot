@@ -103,9 +103,10 @@ impl Mapper {
                         total_tokens: input_tokens.saturating_add(output_tokens),
                     }));
                 }
+                // PostgreSQL text holds no NUL.
                 Mapped::Success {
                     events,
-                    summary: outcome.text,
+                    summary: outcome.text.map(|text| text.replace('\0', "")),
                 }
             }
             Frame::CanUseTool {
@@ -210,6 +211,12 @@ mod tests {
 
     #[test]
     fn result_success_without_text_uses_result_text_else_invalid_response() {
+        let (_, mapped) = run(&[
+            INIT,
+            &assistant(&["x"]),
+            r#"{"type":"result","subtype":"success","result":"a\u0000b"}"#,
+        ]);
+        assert!(matches!(&mapped[2], Mapped::Success { summary: Some(s), .. } if s == "ab"));
         let (_, mapped) = run(&[
             INIT,
             &assistant(&["  "]),

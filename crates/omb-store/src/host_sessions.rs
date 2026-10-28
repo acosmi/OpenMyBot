@@ -184,11 +184,11 @@ pub async fn end_session(
     };
     let resumable = (end.reason == EndReason::ResultSuccess).then_some(true);
     let summary = end.result_summary.map(|text| {
-        let mut end = text.len().min(SUMMARY_MAX);
-        while !text.is_char_boundary(end) {
-            end -= 1;
+        let mut cut = text.len().min(SUMMARY_MAX);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
         }
-        &text[..end]
+        &text[..cut]
     });
     let mut start = end.stderr_tail.len().saturating_sub(TAIL_MAX);
     while !end.stderr_tail.is_char_boundary(start) {

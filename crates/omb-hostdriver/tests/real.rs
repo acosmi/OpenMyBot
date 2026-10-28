@@ -81,6 +81,11 @@ impl Report {
             &self.sandbox,
             &self.home,
         );
+        assert!(
+            !text.contains(self.home.to_str().unwrap())
+                && !text.contains(self.sandbox.to_str().unwrap()),
+            "the report holds no absolute path"
+        );
         std::fs::write(&self.path, text).unwrap();
     }
 }
@@ -90,14 +95,17 @@ impl Report {
 struct UserSettings(PathBuf);
 impl UserSettings {
     fn write(dir: &Path, contents: &str) -> Self {
+        assert!(dir.is_dir(), "<sandbox>/crabcode-config does not exist");
         let path = dir.join("settings.json");
+        // An existing file is never touched: the guard exists only once this call created it.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .expect("settings.json must not already exist in the configuration directory");
+        let guard = Self(path);
         std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
-        Self(path)
+        guard
     }
 }
 impl Drop for UserSettings {
@@ -114,6 +122,18 @@ struct Turn {
     decisions: Vec<(String, String)>,
     stop: Option<String>,
     stop_elapsed: Option<Duration>,
+}
+
+/// G5 asks for the stop this long after `ResponseStarted`: assistant text and the result arrive
+/// back to back in stream-json, so a stop on the first text would usually land after the result.
+const STOP_DELAY: Duration = Duration::from_secs(2);
+
+/// Kills the probe's process group when dropped, also while unwinding.
+struct GroupKill(rustix::process::Pid);
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        let _ = rustix::process::kill_process_group(self.0, rustix::process::Signal::KILL);
+    }
 }
 
 struct Recheck {
@@ -139,8 +159,8 @@ impl Recheck {
             .collect()
     }
     /// Drives one run to its terminal, answering each waiting request through the testkit
-    /// decision interface with `policy(tool, input summary)`; `stop_after_text` asks for a stop
-    /// once the first text arrives. The run's channel event is marked terminal afterwards, so the
+    /// decision interface with `policy(tool, input summary)`; `stop_after_start` asks for a stop
+    /// `STOP_DELAY` after `ResponseStarted`. The run's channel event is marked terminal afterwards, so the
     /// binding's next run resolves to the next event.
     async fn turn(
         &self,
@@ -149,11 +169,11 @@ impl Recheck {
         thread: &str,
         prompt: &str,
         policy: impl Fn(&str, &str) -> Decision,
-        stop_after_text: bool,
+        stop_after_start: bool,
     ) -> Turn {
         let event = insert_event_for_run(&self.client, binding, run, thread, "dispatched").await;
         let turn = self
-            .drive(binding, run, prompt, policy, stop_after_text)
+            .drive(binding, run, prompt, policy, stop_after_start)
             .await;
         let kind = match (&turn.stop, turn.terminal.as_deref()) {
             (Some(_), _) => "cancelled",
@@ -169,7 +189,7 @@ impl Recheck {
         run: &str,
         prompt: &str,
         policy: impl Fn(&str, &str) -> Decision,
-        stop_after_text: bool,
+        stop_after_start: bool,
     ) -> Turn {
         let mut turn = Turn::default();
         let mut session = match self.driver.adapter().start(request(binding, prompt)).await {
@@ -186,14 +206,15 @@ impl Recheck {
                 event = session.next_event() => match event {
                     Ok(Some(event)) => {
                         let name = format!("{event:?}");
-                        turn.init |= matches!(event, ProviderEvent::ResponseStarted { .. });
-                        let text = matches!(event, ProviderEvent::TextDelta { .. });
+                        let started = matches!(event, ProviderEvent::ResponseStarted { .. });
+                        turn.init |= started;
                         let done = matches!(event, ProviderEvent::Completed | ProviderEvent::Failed(_));
                         if done {
                             turn.terminal = Some(name);
                             return turn;
                         }
-                        if stop_after_text && text {
+                        if stop_after_start && started {
+                            tokio::time::sleep(STOP_DELAY).await;
                             let asked = std::time::Instant::now();
                             let outcome = session.request_stop().await.unwrap();
                             turn.stop_elapsed = Some(asked.elapsed());
@@ -286,6 +307,7 @@ async fn stdin_close_probe(
     args.extend(extra_args.iter().cloned());
     let mut child = child_env.command(&args, cwd).spawn().unwrap();
     let pgid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+    let _kill = GroupKill(pgid);
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     for frame in [
@@ -295,7 +317,7 @@ async fn stdin_close_probe(
         stdin
             .write_all(format!("{frame}\n").as_bytes())
             .await
-            .unwrap();
+            .expect("probe stdin write; the guard kills the group while unwinding");
     }
     let result = tokio::time::timeout(Duration::from_secs(300), async {
         while let Ok(Some(line)) = lines.next_line().await {
@@ -318,14 +340,19 @@ async fn stdin_close_probe(
     let closed = std::time::Instant::now();
     let status = tokio::time::timeout(CC_STOP_GRACE, child.wait()).await;
     let elapsed = closed.elapsed();
+    let group_empty =
+        rustix::process::test_kill_process_group(pgid) == Err(rustix::io::Errno::SRCH);
     let observation = match &status {
         Ok(Ok(status)) => {
-            json!({"result_seen": result, "exit_code": status.code(), "exit_signal": status.signal(), "exit_after_ms": elapsed.as_millis() as u64})
+            json!({"result_seen": result, "exit_code": status.code(), "exit_signal": status.signal(), "exit_after_ms": elapsed.as_millis() as u64, "process_group_empty": group_empty})
         }
-        _ => json!({"result_seen": result, "exited_within_stop_grace": false}),
+        _ => {
+            json!({"result_seen": result, "exited_within_stop_grace": false, "process_group_empty": group_empty})
+        }
     };
+    // Tool or MCP subprocesses of the probe never outlive it.
+    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
     if status.is_err() {
-        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
         let _ = child.wait().await;
     }
     let exited_cleanly = result && matches!(&status, Ok(Ok(status)) if status.signal().is_none());
@@ -640,6 +667,8 @@ async fn real_crabcode_recheck() {
     report.set(
         "G5",
         json!({"result": pass(g5), "observation": {
+            "stop_trigger": "ResponseStarted",
+            "stop_delay_ms": STOP_DELAY.as_millis() as u64,
             "request_stop": stopped.stop,
             "request_stop_ms": stopped.stop_elapsed.map(|e| e.as_millis() as u64),
             "within_stop_grace": stop_in_grace,
