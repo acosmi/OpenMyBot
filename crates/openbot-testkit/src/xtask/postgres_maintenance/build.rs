@@ -365,14 +365,19 @@ impl OwnedBuildDirectory {
             )
             .open(path)?;
         let identity = Self::identity(&directory.metadata()?);
-        let owner = Self { path: path.to_path_buf(), directory, identity };
+        let owner = Self {
+            path: path.to_path_buf(),
+            directory,
+            identity,
+        };
         owner.verify()?;
         Ok(owner)
     }
     fn verify(&self) -> Result<()> {
         let held = self.directory.metadata()?;
         let named = fs::symlink_metadata(&self.path)?;
-        if !held.is_dir() || !named.is_dir()
+        if !held.is_dir()
+            || !named.is_dir()
             || Self::identity(&held) != self.identity
             || Self::identity(&named) != self.identity
         {
@@ -928,7 +933,8 @@ fn space(path: &Path, p: &Profile, remaining: u64) -> Result<()> {
     space_snapshot(&s, p, remaining)
 }
 fn space_snapshot(s: &rustix::fs::StatVfs, p: &Profile, remaining: u64) -> Result<()> {
-    let free = s.f_bavail
+    let free = s
+        .f_bavail
         .checked_mul(s.f_frsize)
         .context("maintenance_space_overflow")?;
     let need = remaining
@@ -1173,8 +1179,7 @@ fn command(
         impl std::fmt::Write for BoundedOwnedDisplay {
             fn write_str(&mut self, text: &str) -> std::fmt::Result {
                 let count = text.len().min(self.bytes.len() - self.len);
-                self.bytes[self.len..self.len + count]
-                    .copy_from_slice(&text.as_bytes()[..count]);
+                self.bytes[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
                 self.len += count;
                 if count < text.len() {
                     Err(std::fmt::Error)
@@ -1187,9 +1192,9 @@ fn command(
             bytes: [0; 2048],
             len: 0,
         };
-        let owned_format_complete = first_owned_error.as_ref().is_none_or(|error| {
-            std::fmt::write(&mut owned_text, format_args!("{error}")).is_ok()
-        });
+        let owned_format_complete = first_owned_error
+            .as_ref()
+            .is_none_or(|error| std::fmt::write(&mut owned_text, format_args!("{error}")).is_ok());
         // Pure diagnostic tails of already collected bytes; no collection cap is increased.
         bail!(
             "maintenance_build_command_failed: program={program:?}; status={status}; \
@@ -1382,7 +1387,8 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
             == (b.st_dev, b.st_ino, b.st_uid, b.st_gid, b.st_mode)
     }
     fn not_found(error: &anyhow::Error) -> bool {
-        error.downcast_ref::<std::io::Error>()
+        error
+            .downcast_ref::<std::io::Error>()
             .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
     }
     fn walk(
@@ -1403,9 +1409,13 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
             bail!("maintenance_build_tree_root");
         }
         if seen.insert((dm.st_dev as u64, dm.st_ino)) {
-            u.allocated = u.allocated
-                .checked_add(u64::try_from(dm.st_blocks)?
-                    .checked_mul(512).context("maintenance_allocated_overflow")?)
+            u.allocated = u
+                .allocated
+                .checked_add(
+                    u64::try_from(dm.st_blocks)?
+                        .checked_mul(512)
+                        .context("maintenance_allocated_overflow")?,
+                )
                 .context("maintenance_allocated_overflow")?;
         }
         // read_from opens an independent directory stream; never follows an entry path.
@@ -1418,7 +1428,10 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
             }
             b.check()?;
             // Charge every successfully enumerated name before any possible disappearance.
-            u.nodes = u.nodes.checked_add(1).context("maintenance_build_tree_count")?;
+            u.nodes = u
+                .nodes
+                .checked_add(1)
+                .context("maintenance_build_tree_count")?;
             if u.nodes > p.limits.max_build_files {
                 bail!("maintenance_build_tree_files");
             }
@@ -1433,7 +1446,8 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
             match FileType::from_raw_mode(m.st_mode) {
                 FileType::Directory => {
                     let child = match rustix::fs::openat(
-                        dir, name,
+                        dir,
+                        name,
                         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     ) {
@@ -1450,7 +1464,9 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
                         Err(rustix::io::Errno::NOENT) if live => {
                             // Only this enumerated child's confirmed disappearance can explain
                             // an inner NotFound; capacity/clock/permission/other errors survive.
-                            if let Err(error) = result && !not_found(&error) {
+                            if let Err(error) = result
+                                && !not_found(&error)
+                            {
                                 return Err(error);
                             }
                         }
@@ -1465,14 +1481,19 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
                 }
                 FileType::RegularFile | FileType::Symlink => {
                     if FileType::from_raw_mode(m.st_mode) == FileType::RegularFile {
-                        u.logical = u.logical
+                        u.logical = u
+                            .logical
                             .checked_add(u64::try_from(m.st_size)?)
                             .context("maintenance_build_tree_bytes")?;
                     }
                     if seen.insert((m.st_dev as u64, m.st_ino)) {
-                        u.allocated = u.allocated
-                            .checked_add(u64::try_from(m.st_blocks)?
-                                .checked_mul(512).context("maintenance_allocated_overflow")?)
+                        u.allocated = u
+                            .allocated
+                            .checked_add(
+                                u64::try_from(m.st_blocks)?
+                                    .checked_mul(512)
+                                    .context("maintenance_allocated_overflow")?,
+                            )
                             .context("maintenance_allocated_overflow")?;
                     }
                     if u.logical > max {
@@ -1495,11 +1516,15 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
     } else if root == output.path.as_path() {
         (output, &output.directory, false)
     } else if root == derived.path.join("install").as_path() {
-        install = fs::File::from(rustix::fs::openat(
-            &derived.directory, c"install",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ).map_err(std::io::Error::from)?);
+        install = fs::File::from(
+            rustix::fs::openat(
+                &derived.directory,
+                c"install",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?,
+        );
         (derived, &install, true)
     } else {
         bail!("maintenance_build_unknown_usage_root");
@@ -1512,9 +1537,8 @@ fn usage(root: &Path, p: &Profile, b: &Budget, bounds: (u64, bool)) -> Result<Us
     derived.verify()?;
     output.verify()?;
     if install_root {
-        let named = rustix::fs::statat(
-            &derived.directory, c"install", AtFlags::SYMLINK_NOFOLLOW,
-        ).map_err(std::io::Error::from)?;
+        let named = rustix::fs::statat(&derived.directory, c"install", AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)?;
         if !same(&initial, &named) {
             bail!("maintenance_build_root_identity");
         }
@@ -1532,13 +1556,22 @@ fn observe_owned(p: &Profile, b: &Budget, live: bool) -> Result<()> {
     derived.verify()?;
     output.verify()?;
     let all = usage(
-        &derived.path, p, b,
-        (p.limits.max_derived_bytes
-            .checked_add(p.limits.max_install_bytes).context("maintenance_peak_overflow")?, live),
+        &derived.path,
+        p,
+        b,
+        (
+            p.limits
+                .max_derived_bytes
+                .checked_add(p.limits.max_install_bytes)
+                .context("maintenance_peak_overflow")?,
+            live,
+        ),
     )?;
     let stage = derived.path.join("install");
     let install = match rustix::fs::statat(
-        &derived.directory, c"install", rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        &derived.directory,
+        c"install",
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
     ) {
         Ok(m) => {
             if rustix::fs::FileType::from_raw_mode(m.st_mode) != rustix::fs::FileType::Directory {
@@ -1550,7 +1583,9 @@ fn observe_owned(p: &Profile, b: &Budget, live: bool) -> Result<()> {
         Err(rustix::io::Errno::NOENT) => Usage::default(),
         Err(error) => return Err(std::io::Error::from(error).into()),
     };
-    let core_bytes = all.logical.checked_sub(install.logical)
+    let core_bytes = all
+        .logical
+        .checked_sub(install.logical)
         .context("maintenance_build_tree_accounting")?;
     if core_bytes > p.limits.max_derived_bytes {
         bail!("maintenance_build_tree_limit");
@@ -1567,7 +1602,10 @@ fn observe_owned(p: &Profile, b: &Budget, live: bool) -> Result<()> {
             out.allocated,
         )
     };
-    let derived_remaining = p.limits.max_derived_bytes.saturating_sub(core_allocated)
+    let derived_remaining = p
+        .limits
+        .max_derived_bytes
+        .saturating_sub(core_allocated)
         .checked_add(p.limits.max_install_bytes.saturating_sub(install_allocated))
         .context("maintenance_peak_overflow")?;
     let output_remaining = p.limits.max_bundle_bytes.saturating_sub(output_allocated);
@@ -1575,15 +1613,22 @@ fn observe_owned(p: &Profile, b: &Budget, live: bool) -> Result<()> {
     let ostat = rustix::fs::fstat(&output.directory).map_err(std::io::Error::from)?;
     if dstat.st_dev == ostat.st_dev {
         space_snapshot(
-            &rustix::fs::fstatvfs(&derived.directory).map_err(std::io::Error::from)?, p,
-            derived_remaining.checked_add(output_remaining).context("maintenance_peak_overflow")?,
+            &rustix::fs::fstatvfs(&derived.directory).map_err(std::io::Error::from)?,
+            p,
+            derived_remaining
+                .checked_add(output_remaining)
+                .context("maintenance_peak_overflow")?,
         )?;
     } else {
         space_snapshot(
-            &rustix::fs::fstatvfs(&derived.directory).map_err(std::io::Error::from)?, p, derived_remaining,
+            &rustix::fs::fstatvfs(&derived.directory).map_err(std::io::Error::from)?,
+            p,
+            derived_remaining,
         )?;
         space_snapshot(
-            &rustix::fs::fstatvfs(&output.directory).map_err(std::io::Error::from)?, p, output_remaining,
+            &rustix::fs::fstatvfs(&output.directory).map_err(std::io::Error::from)?,
+            p,
+            output_remaining,
         )?;
     }
     derived.verify()?;

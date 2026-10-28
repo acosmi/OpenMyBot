@@ -856,7 +856,9 @@ mod enrollment_bookend_tests {
     fn p05_body_pending_ready_error_eof_bookends() {
         // Pure per-poll lemma only; no real HTTP/body/Host/PG acceptance credit.
         let polls = Cell::new(0);
-        let refused: Poll<Result<Option<Result<&[u8], ()>>, &str>> = enrollment_poll_bookended(
+        type RefusedPoll<'body, 'error> =
+            Poll<Result<Option<Result<&'body [u8], ()>>, &'error str>>;
+        let refused: RefusedPoll<'_, '_> = enrollment_poll_bookended(
             || Err("before"),
             || {
                 polls.set(polls.get() + 1);

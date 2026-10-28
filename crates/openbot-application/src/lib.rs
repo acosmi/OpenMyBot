@@ -85,14 +85,17 @@ pub mod credential_admin;
 pub mod cursor;
 pub mod custom_model_catalog;
 mod custom_model_catalog_delivery;
+pub mod delegation;
 pub mod intelligence_import;
 pub mod mcp_connections;
 pub mod model_connections;
 pub mod ports;
 pub mod provider;
+pub mod provider_extensions;
 pub mod remote_interrupt;
 pub mod run_cost_budget;
 pub mod run_runtime;
+pub mod run_terminal;
 pub mod runtime_capabilities;
 pub mod sandboxed_components;
 pub mod screen_sessions;
@@ -120,6 +123,12 @@ pub use artifacts::{
     ArtifactAdministration, ArtifactAdministrationError, CurrentArtifactReadChunk,
     NoArtifactAdministration, RunInputArtifactMetadataObservation, get_artifact_metadata,
     get_source_run_artifact_ids, save_run_message_text_artifact,
+};
+pub use delegation::{
+    BeginDelegatedThreadRun, DelegatedBegin, DelegatedContextIssuer, DelegatedCurrentRequest,
+    DelegatedOwnerSnapshot, DelegatedRunEntry, DelegatedRunRecord, DelegatedRunStore,
+    DelegatedUntrustedMaterial, DelegationAuthority, DelegationAuthorityError, DelegationGrant,
+    DelegationRuntime,
 };
 pub mod artifact_read_lifecycle;
 pub mod artifact_read_protocol;
@@ -199,6 +208,9 @@ pub use provider::{
     RemoteInterruptResolutionReceipt, RunModelBinding, RunModelCredentialPolicy,
     RunModelDatasetInitialOrigin, RunModelDatasetSnapshot, RunModelV2Snapshot, StopOutcome,
 };
+pub use provider_extensions::{
+    ProviderExtensionKey, ProviderExtensionKeyError, ProviderExtensions, ProviderExtensionsError,
+};
 pub use run_cost_budget::{
     NoRunCostBudgetAdministration, RunCostBudgetAdministration, RunCostBudgetAdministrationError,
     RunCostCap, get_run_cost_budget, replace_run_cost_budget,
@@ -209,6 +221,10 @@ pub use run_runtime::{
     RunFailureCode, RunRuntime, RunRuntimeError, RunSemanticChannel, RunTerminal, RunTokenUsage,
     RunTokenUsageReceipt, RunToolExchange, RunWriteReceipt,
 };
+pub use run_terminal::{RunTerminalKind, RunTerminalNotice, RunTerminalSubscriber};
+
+#[cfg(test)]
+mod provider_extensions_tests;
 pub use sandboxed_components::{
     GrantedSandboxedComponent, GrantedSandboxedComponents, MAX_SANDBOXED_COMPONENT_DRAFT_BYTES,
     NoSandboxedComponentAdministration, SandboxedComponentAdministration,
@@ -251,3 +267,6 @@ pub use use_cases::{
     subscribe_channel_activity, subscribe_thread_events, test_agent_connection, update_agent,
     update_memory_control,
 };
+
+#[cfg(test)]
+mod delegation_tests;

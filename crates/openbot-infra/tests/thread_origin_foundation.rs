@@ -1246,6 +1246,9 @@ impl ModelFixture {
             stall_timeout: Some(Duration::from_secs(2)),
             oauth_public_url: None,
             app_url: None,
+            extra_provider_adapters: Vec::new(),
+            run_event_subscriber: None,
+            delegation_authority: None,
         })
         .await
         .unwrap();

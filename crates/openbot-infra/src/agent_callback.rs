@@ -287,6 +287,8 @@ pub struct PostgresRemoteCallbackAuthenticator {
     signer: Arc<RemoteRunAssertionSigner>,
     checkpoint_key: Arc<SecretBytes>,
     mcp_catalog: Option<Arc<PostgresMcpCatalog>>,
+    delegation: Option<Arc<openbot_application::DelegationRuntime>>,
+    run_runtime: Option<Arc<crate::run_runtime::PostgresRunRuntime>>,
 }
 
 impl PostgresRemoteCallbackAuthenticator {
@@ -312,6 +314,8 @@ impl PostgresRemoteCallbackAuthenticator {
             signer,
             checkpoint_key: Arc::new(SecretBytes::new(checkpoint_key)),
             mcp_catalog: None,
+            delegation: None,
+            run_runtime: None,
         })
     }
 
@@ -319,6 +323,16 @@ impl PostgresRemoteCallbackAuthenticator {
     #[must_use]
     pub fn with_mcp_catalog(mut self, catalog: Arc<PostgresMcpCatalog>) -> Self {
         self.mcp_catalog = Some(catalog);
+        self
+    }
+
+    pub(crate) fn with_delegation_runtime(
+        mut self,
+        delegation: Option<Arc<openbot_application::DelegationRuntime>>,
+        runtime: Arc<crate::run_runtime::PostgresRunRuntime>,
+    ) -> Self {
+        self.delegation = delegation;
+        self.run_runtime = Some(runtime);
         self
     }
 
@@ -494,7 +508,7 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
 
         let scope = transaction
             .query_opt(
-                "SELECT r.thread_id,coalesce(u.auth_generation,0) AS auth_generation, \
+                "SELECT r.thread_id,r.fencing_token,r.next_event_seq,(m.content ? 'delegation' OR m.content ? 'delegationSnapshot') AS delegation_present,m.content->'delegationSnapshot' AS delegation_snapshot,coalesce(u.auth_generation,0) AS auth_generation, \
                         EXISTS(SELECT 1 FROM public.revoked_access ra \
                                WHERE ra.email=lower(u.email)) AS revoked, \
                         ARRAY(SELECT DISTINCT ur.role::text FROM public.user_roles ur \
@@ -504,6 +518,7 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
                    JOIN public.thread_memberships tm ON tm.thread_id=t.thread_id \
                    JOIN public.thread_leases l ON l.thread_id=t.thread_id \
                    JOIN public.users u ON u.id=r.actor_id \
+                   LEFT JOIN public.messages m ON m.message_id=r.run_id||':input' AND m.run_id=r.run_id \
                   WHERE r.run_id=$1 AND r.bot_id=$2 AND r.actor_id=$3 \
                     AND r.status='running' AND t.status='active' \
                     AND t.deployment_id=$4 AND t.tenant_id=$5 AND tm.user_id=$3 \
@@ -527,6 +542,18 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
                 )
                 .await;
         };
+        let snapshot: Option<serde_json::Value> =
+            scope
+                .try_get("delegation_snapshot")
+                .map_err(|_| RemoteCallbackAuthError::Corrupt {
+                    field: "delegation_input",
+                })?;
+        let delegated: bool = scope
+            .try_get::<_, Option<bool>>("delegation_present")
+            .map_err(|_| RemoteCallbackAuthError::Corrupt {
+                field: "delegation_input",
+            })?
+            .unwrap_or(false);
         let revoked: bool = scope
             .try_get("revoked")
             .map_err(|_| RemoteCallbackAuthError::Corrupt { field: "revoked" })?;
@@ -548,9 +575,11 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
             .map(|value| Role::from_str(value))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| RemoteCallbackAuthError::Corrupt { field: "roles" })?;
-        let role =
-            resolve_effective_role(roles).map_err(|_| RemoteCallbackAuthError::Unauthenticated)?;
-        if revoked {
+        let role = resolve_effective_role(roles);
+        if role.is_err() && !delegated {
+            return Err(RemoteCallbackAuthError::Unauthenticated);
+        }
+        if revoked && !delegated {
             return self
                 .refuse(
                     transaction,
@@ -604,14 +633,82 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
             AuthGeneration::new(generation),
             self.single_user,
         )
-        .with_role(role)
+        .with_roles(role.ok())
         .build();
-        Ok(RemoteCallbackAuthorization::new(
+        let original = RemoteCallbackAuthorization::new(
             auth,
             assertion.scope().run.clone(),
-            ThreadId::new(thread_id),
+            ThreadId::new(thread_id.clone()),
             assertion.scope().bot.clone(),
-        ))
+        );
+        if delegated {
+            let fencing: i64 =
+                scope
+                    .try_get("fencing_token")
+                    .map_err(|_| RemoteCallbackAuthError::Corrupt {
+                        field: "fencing_token",
+                    })?;
+            let sequence: i64 =
+                scope
+                    .try_get("next_event_seq")
+                    .map_err(|_| RemoteCallbackAuthError::Corrupt {
+                        field: "next_event_seq",
+                    })?;
+            let deadline = snapshot
+                .as_ref()
+                .and_then(|v| v.get("absoluteDeadline"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| {
+                    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(v))
+                })
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let lease = openbot_application::RunExecutionLease::new(
+                assertion.scope().run.clone(),
+                ThreadId::new(thread_id),
+                assertion.scope().bot.clone(),
+                assertion.scope().actor.clone(),
+                openbot_domain::thread::FencingToken::new(fencing)
+                    .map_err(|_| RemoteCallbackAuthError::Unauthenticated)?,
+                u64::try_from(sequence).map_err(|_| RemoteCallbackAuthError::Unauthenticated)?,
+            )
+            .map_err(|_| RemoteCallbackAuthError::Unauthenticated)?
+            .with_delegated_run_binding(self.delegation.clone(), deadline);
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| RemoteCallbackAuthError::Unavailable)?;
+            let result = match &self.delegation {
+                Some(runtime) => runtime.remint_callback(&original, &lease).await,
+                None => Err(openbot_contracts::error::AppError::PolicyRefused {
+                    rule: "delegation_not_current".into(),
+                    decision: None,
+                }),
+            };
+            match result {
+                Ok(auth) => Ok(RemoteCallbackAuthorization::new(
+                    auth,
+                    original.run().clone(),
+                    original.thread().clone(),
+                    original.bot().clone(),
+                )),
+                Err(_) => match &self.run_runtime {
+                    Some(runtime) => match runtime
+                        .fail_confirmed_delegated_callback(&lease, None)
+                        .await
+                    {
+                        Ok(_) => Err(RemoteCallbackAuthError::Unauthenticated),
+                        Err(
+                            openbot_application::RunRuntimeError::StaleLease
+                            | openbot_application::RunRuntimeError::Conflict,
+                        ) => Err(RemoteCallbackAuthError::Unauthenticated),
+                        Err(_) => Err(RemoteCallbackAuthError::Unavailable),
+                    },
+                    None => Err(RemoteCallbackAuthError::Unavailable),
+                },
+            }
+        } else {
+            Ok(original)
+        }
     }
 }
 

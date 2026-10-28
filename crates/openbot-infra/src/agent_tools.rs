@@ -163,6 +163,13 @@ impl AgentAuthorizationSource for PostgresAgentAuthorizationSource {
         &self,
         lease: &openbot_application::RunExecutionLease,
     ) -> Result<AuthContext, AgentAuthorizationError> {
+        if lease.delegation_required() {
+            return lease
+                .remint_delegated_auth()
+                .await
+                .map_err(|_| AgentAuthorizationError::DelegationNotCurrent)?
+                .ok_or(AgentAuthorizationError::DelegationNotCurrent);
+        }
         let client = self
             .pool
             .get()

@@ -93,6 +93,10 @@ pub mod approval_preferences;
     any(target_os = "macos", target_os = "linux")
 ))]
 pub mod artifact_administration;
+#[cfg(feature = "server-runtime")]
+pub(crate) mod delegation;
+#[cfg(feature = "server-runtime")]
+pub(crate) mod run_terminal_delivery;
 #[cfg(all(
     feature = "server-runtime",
     any(target_os = "macos", target_os = "linux")

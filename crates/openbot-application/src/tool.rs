@@ -935,6 +935,17 @@ pub async fn invoke_tool<C: ToolControlPlane, J: ToolJournal>(
     auth: &AuthContext,
     invocation: ToolInvocation,
 ) -> Result<ToolResult, AppError> {
+    invoke_tool_guarded(control, journal, auth, invocation, None).await
+}
+
+/// Same pipeline; a delegated Run passes its effect guard.
+pub(crate) async fn invoke_tool_guarded<C: ToolControlPlane, J: ToolJournal>(
+    control: &C,
+    journal: &J,
+    auth: &AuthContext,
+    invocation: ToolInvocation,
+    guard: Option<&crate::delegation::DelegatedEffectGuard>,
+) -> Result<ToolResult, AppError> {
     let tool = ToolName::new(invocation.tool_name.clone())
         .map_err(|_| AppError::MalformedPayload { field: "toolName" })?;
     let arguments = ToolArguments::new(invocation.arguments.clone()).map_err(
@@ -1096,6 +1107,7 @@ pub async fn invoke_tool<C: ToolControlPlane, J: ToolJournal>(
         decision,
         arguments,
         execution_scope,
+        guard,
     )
     .await
 }
@@ -1115,7 +1127,11 @@ async fn execute_after_approval<C: ToolControlPlane, J: ToolJournal>(
     decision: ToolDecisionDraft,
     arguments: ToolArguments,
     scope: ToolExecutionScope,
+    guard: Option<&crate::delegation::DelegatedEffectGuard>,
 ) -> Result<ToolResult, AppError> {
+    if let Some(guard) = guard {
+        guard.recheck().await?;
+    }
     let written = journal.record_decision(&decision).await;
     let recorded = settled
         .record_decision(written.clone().map_err(|error| DecisionWriteFailed {

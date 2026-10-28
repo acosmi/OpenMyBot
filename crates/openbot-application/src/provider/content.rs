@@ -49,6 +49,7 @@ impl ProviderRequest {
                     })
             }
             ProviderRoute::CustomModel(binding) => contains_known_secret(binding.model()),
+            ProviderRoute::Extension(key) => contains_known_secret(key.as_str()),
             ProviderRoute::Managed | ProviderRoute::PackageOpenAi => false,
         };
         if messages || tools || route_content {

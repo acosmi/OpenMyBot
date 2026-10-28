@@ -68,7 +68,9 @@ use crate::screen_sessions::{
     NoScreenSessionAdministration, ScreenSessionAdministration, issue_screen_session,
 };
 use crate::service::{AppEventStream, ApplicationService, command_kind, subscription_kind};
-use crate::tool::{NoToolControlPlane, NoToolJournal, ToolControlPlane, ToolJournal, invoke_tool};
+use crate::tool::{
+    NoToolControlPlane, NoToolJournal, ToolControlPlane, ToolJournal, invoke_tool_guarded,
+};
 use crate::ui_preferences::{
     NoUiPreferenceAdministration, UiPreferenceAdministration, get_ui_preferences,
     update_ui_preferences,
@@ -141,6 +143,7 @@ pub struct OpenBotApplication<
     artifacts: std::sync::Arc<dyn ArtifactAdministration>,
     public_artifact_reads:
         std::sync::Arc<crate::artifact_read_protocol::PublicArtifactReadRegistry>,
+    delegation_runtime: Option<std::sync::Arc<crate::DelegationRuntime>>,
     runtime_capabilities:
         Option<std::sync::Arc<dyn crate::runtime_capabilities::RuntimeCapabilitiesCollector>>,
     heartbeat_period: Duration,
@@ -195,6 +198,7 @@ impl<R>
             public_artifact_reads: std::sync::Arc::new(
                 crate::artifact_read_protocol::PublicArtifactReadRegistry::new(),
             ),
+            delegation_runtime: None,
             runtime_capabilities: None,
             heartbeat_period: DEFAULT_HEARTBEAT_PERIOD,
         }
@@ -233,6 +237,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -269,6 +274,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -305,6 +311,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -345,6 +352,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -381,6 +389,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -417,6 +426,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -456,6 +466,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -615,6 +626,15 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
         self
     }
 
+    #[doc(hidden)]
+    pub fn with_delegation_runtime(
+        mut self,
+        runtime: std::sync::Arc<crate::DelegationRuntime>,
+    ) -> Self {
+        self.delegation_runtime = Some(runtime);
+        self
+    }
+
     /// Attach the real current host's non-Serde capability collector.
     #[must_use]
     pub fn with_runtime_capabilities(
@@ -655,6 +675,7 @@ where
         &self,
         auth: &AuthContext,
         command: AppCommand,
+        delegated_guard: Option<&crate::delegation::DelegatedEffectGuard>,
     ) -> Result<AppReply, AppError> {
         match command {
             AppCommand::ListCustomModelCatalog(input) => Ok(AppReply::CustomModelCatalog(
@@ -897,7 +918,14 @@ where
                 policy: Some(set_action_policy(&self.policies, auth, policy).await?),
             }),
             AppCommand::InvokeTool(invocation) => Ok(AppReply::Tool(
-                invoke_tool(&self.tool_control, &self.tool_journal, auth, invocation).await?,
+                invoke_tool_guarded(
+                    &self.tool_control,
+                    &self.tool_journal,
+                    auth,
+                    invocation,
+                    delegated_guard,
+                )
+                .await?,
             )),
             AppCommand::MintThreadId => Ok(AppReply::ThreadMinted(
                 mint_thread_id(&self.threads, auth).await?,
@@ -1308,9 +1336,19 @@ where
         )
     )]
     async fn execute(&self, auth: AuthContext, command: AppCommand) -> Result<AppReply, AppError> {
-        let result = match refuse_unbound_delegation(&auth) {
-            Ok(()) => self.dispatch(&auth, command).await,
-            Err(error) => Err(error),
+        let result = if auth.delegation().is_some() {
+            match &self.delegation_runtime {
+                Some(runtime) => match runtime.admit_command(&auth, &command).await {
+                    Ok(guard) => self.dispatch(&auth, command, Some(&guard)).await,
+                    Err(error) => Err(error),
+                },
+                None => Err(AppError::PolicyRefused {
+                    rule: "delegated_authority_refused".into(),
+                    decision: None,
+                }),
+            }
+        } else {
+            self.dispatch(&auth, command, None).await
         };
         if let Err(error) = &result {
             // 只记**稳定码**，不记 `Display`：`AppError` 的 Display 会带上 policy rule id

@@ -216,6 +216,8 @@ pub struct PostgresRunRuntime {
     owner_id: String,
     lease_duration: Duration,
     claim_duration: Duration,
+    delegation_runtime: Option<std::sync::Weak<openbot_application::DelegationRuntime>>,
+    terminal_delivery: Option<Arc<crate::run_terminal_delivery::TerminalDelivery>>,
 }
 
 impl core::fmt::Debug for PostgresRunRuntime {
@@ -250,7 +252,161 @@ impl PostgresRunRuntime {
             owner_id,
             lease_duration,
             claim_duration,
+            delegation_runtime: None,
+            terminal_delivery: None,
         })
+    }
+
+    pub(crate) fn with_delegation_runtime(
+        mut self,
+        runtime: std::sync::Weak<openbot_application::DelegationRuntime>,
+    ) -> Self {
+        self.delegation_runtime = Some(runtime);
+        self
+    }
+    pub(crate) fn with_terminal_subscriber(
+        mut self,
+        subscriber: Arc<dyn openbot_application::RunTerminalSubscriber>,
+    ) -> Self {
+        self.terminal_delivery = Some(Arc::new(
+            crate::run_terminal_delivery::TerminalDelivery::new(subscriber),
+        ));
+        self
+    }
+    pub(crate) async fn shutdown_terminal_delivery(&self) {
+        if let Some(delivery) = self.terminal_delivery.clone() {
+            let _ = tokio::task::spawn_blocking(move || delivery.close_and_join()).await;
+        }
+    }
+    fn bind_delegation(&self, lease: RunExecutionLease) -> RunExecutionLease {
+        match lease.absolute_deadline() {
+            Some(deadline) if lease.delegation_required() => lease.with_delegated_run_binding(
+                self.delegation_runtime
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade),
+                deadline,
+            ),
+            _ => lease,
+        }
+    }
+    async fn stage_terminal_notice(
+        client: &tokio_postgres::Client,
+        lease: &RunExecutionLease,
+        receipt: &RunWriteReceipt,
+    ) -> Result<Option<openbot_application::RunTerminalNotice>, RunRuntimeError> {
+        let row=client.query_opt("SELECT t.deployment_id,t.tenant_id,r.status FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id WHERE r.run_id=$1 AND r.thread_id=$2 AND r.fencing_token=$3 AND r.terminal_event_seq=$4",&[&lease.run_id().as_str(),&lease.thread_id().as_str(),&lease.fencing().get(),&(receipt.run_event_sequence as i64)]).await.map_err(|e|unavailable("stage terminal identity",e))?;
+        let Some(row) = row else { return Ok(None) };
+        let status: String = decode(&row, "status")?;
+        let terminal = match status.as_str() {
+            "completed" => openbot_application::RunTerminalKind::Succeeded,
+            "failed" => openbot_application::RunTerminalKind::Failed,
+            "cancelled" => openbot_application::RunTerminalKind::Cancelled,
+            "reconciliation_required" => {
+                openbot_application::RunTerminalKind::ReconciliationRequired
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(openbot_application::RunTerminalNotice {
+            deployment: openbot_contracts::ids::DeploymentId::new(decode::<String>(
+                &row,
+                "deployment_id",
+            )?),
+            tenant: openbot_contracts::ids::TenantId::new(decode::<String>(&row, "tenant_id")?),
+            thread_id: lease.thread_id().clone(),
+            run_id: lease.run_id().clone(),
+            terminal,
+        }))
+    }
+    async fn terminal_committed(
+        &self,
+        client: &tokio_postgres::Client,
+        lease: &RunExecutionLease,
+        receipt: &RunWriteReceipt,
+    ) {
+        if receipt.replayed {
+            return;
+        }
+        if let Some(runtime) = self
+            .delegation_runtime
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            runtime.retire_run(lease.run_id());
+        }
+        // The wake-up is read after commit and is lossy: a failed lookup never touches the terminal.
+        if let Some(delivery) = &self.terminal_delivery
+            && let Ok(Some(notice)) = Self::stage_terminal_notice(client, lease, receipt).await
+        {
+            delivery.enqueue(notice);
+        }
+    }
+    pub(crate) async fn fail_confirmed_delegated_callback(
+        &self,
+        lease: &RunExecutionLease,
+        expected_record: Option<&openbot_application::DelegatedRunRecord>,
+    ) -> Result<RunWriteReceipt, RunRuntimeError> {
+        let mut client = self.client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| unavailable("delegated callback terminal", e))?;
+        let schema = observe_writer_schema(&tx).await?;
+        let locked = lock_run(&tx, lease.run_id().as_str())
+            .await?
+            .ok_or(RunRuntimeError::StaleLease)?;
+        validate_active_lease(&locked, &self.owner_id, lease, database_now(&tx).await?)?;
+        let row=tx.query_one("SELECT r.run_id,r.thread_id,r.bot_id,r.actor_id,r.fencing_token,r.created_at AS run_created_at,t.deployment_id,t.tenant_id,l.expires_at AS lease_expires_at,(m.content ? 'delegation') AS delegation_present,m.content->'delegation' AS delegation,m.content->'delegationSnapshot' AS delegation_snapshot FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id JOIN public.thread_leases l ON l.thread_id=r.thread_id JOIN public.messages m ON m.message_id=r.run_id||':input' AND m.run_id=r.run_id WHERE r.run_id=$1",&[&lease.run_id().as_str()]).await.map_err(|e|unavailable("confirmed callback provenance",e))?;
+        let actual = crate::delegation::decode_record(&row)
+            .map_err(|_| RunRuntimeError::Corrupt {
+                field: "delegation_record",
+            })?
+            .ok_or(RunRuntimeError::StaleLease)?;
+        if actual.run_id != *lease.run_id()
+            || actual.thread_id != *lease.thread_id()
+            || actual.bot_id != *lease.bot_id()
+            || actual.actor_id != *lease.actor_id()
+            || actual.fencing != lease.fencing()
+        {
+            return Err(RunRuntimeError::StaleLease);
+        }
+        if let Some(expected) = expected_record
+            && (actual.deployment != expected.deployment
+                || actual.tenant != expected.tenant
+                || actual.run_id != expected.run_id
+                || actual.thread_id != expected.thread_id
+                || actual.bot_id != expected.bot_id
+                || actual.actor_id != expected.actor_id
+                || actual.fencing != expected.fencing
+                || actual.source != expected.source
+                || actual.revision != expected.revision
+                || actual.trigger_id != expected.trigger_id
+                || actual.granted_generation != expected.granted_generation
+                || actual.expires_at != expected.expires_at
+                || actual.absolute_deadline != expected.absolute_deadline)
+        {
+            return Err(RunRuntimeError::StaleLease);
+        }
+
+        let row=tx.query_one("SELECT EXISTS(SELECT 1 FROM public.tool_calls c JOIN public.tool_attempts a ON a.tool_call_id=c.tool_call_id WHERE c.run_id=$1 AND (a.status IN ('executing','reconciliation_required') OR a.commit_state='unknown')) AS uncertain",&[&lease.run_id().as_str()]).await.map_err(|e|unavailable("delegated callback effects",e))?;
+        let uncertain: bool = decode(&row, "uncertain")?;
+        let terminal = if uncertain {
+            RunTerminal::ReconciliationRequired(RunFailureCode::JournalCommitUnknown)
+        } else {
+            RunTerminal::Failed(RunFailureCode::DelegationNotCurrent)
+        };
+        let result = finish_run_in_transaction(
+            &tx,
+            &schema,
+            &self.owner_id,
+            lease,
+            sequence_u64(locked.next_event_seq, "next_event_sequence")?,
+            terminal,
+            LeaseCheck::Active,
+        )
+        .await;
+        let receipt = finish_transaction(tx, result).await?;
+        self.terminal_committed(&client, lease, &receipt).await;
+        Ok(receipt)
     }
 
     async fn client(&self) -> Result<crate::db::pool::PooledClient, RunRuntimeError> {
@@ -309,7 +465,10 @@ impl RunRuntime for PostgresRunRuntime {
             .map_err(|error| unavailable("开始 unstarted cancellation 事务", error))?;
         let result =
             finish_unstarted_cancellation_in_transaction(&transaction, &self.owner_id, claim).await;
-        finish_transaction(transaction, result).await
+        let receipt = finish_transaction(transaction, result).await?;
+        self.terminal_committed(&client, claim.lease(), &receipt)
+            .await;
+        Ok(receipt)
     }
 
     async fn claim_dispatch(&self) -> Result<Option<ClaimedRunDispatch>, RunRuntimeError> {
@@ -325,7 +484,16 @@ impl RunRuntime for PostgresRunRuntime {
             self.claim_duration,
         )
         .await;
-        finish_transaction(transaction, result).await
+        let claim = finish_transaction(transaction, result).await?;
+        claim
+            .map(|c| {
+                ClaimedRunDispatch::new(
+                    c.outbox_id().to_owned(),
+                    c.attempt(),
+                    self.bind_delegation(c.lease().clone()),
+                )
+            })
+            .transpose()
     }
 
     async fn acknowledge_dispatch(
@@ -338,7 +506,9 @@ impl RunRuntime for PostgresRunRuntime {
             .await
             .map_err(|error| unavailable("开始 dispatch ack 事务", error))?;
         let result = acknowledge_dispatch_in_transaction(&transaction, &self.owner_id, claim).await;
-        finish_transaction(transaction, result).await
+        finish_transaction(transaction, result)
+            .await
+            .map(|lease| self.bind_delegation(lease))
     }
 
     async fn retry_dispatch(&self, claim: &ClaimedRunDispatch) -> Result<(), RunRuntimeError> {
@@ -365,7 +535,10 @@ impl RunRuntime for PostgresRunRuntime {
             .map_err(|error| unavailable("开始 dispatch reject 事务", error))?;
         let result =
             reject_dispatch_in_transaction(&transaction, &self.owner_id, claim, code).await;
-        finish_transaction(transaction, result).await
+        let receipt = finish_transaction(transaction, result).await?;
+        self.terminal_committed(&client, claim.lease(), &receipt)
+            .await;
+        Ok(receipt)
     }
 
     async fn renew_lease(&self, lease: &RunExecutionLease) -> Result<(), RunRuntimeError> {
@@ -521,7 +694,9 @@ impl RunRuntime for PostgresRunRuntime {
             .await
         }
         .await;
-        finish_transaction(transaction, result).await
+        let receipt = finish_transaction(transaction, result).await?;
+        self.terminal_committed(&client, lease, &receipt).await;
+        Ok(receipt)
     }
 
     async fn recover_one_stale_run(&self) -> Result<Option<RunWriteReceipt>, RunRuntimeError> {
@@ -531,7 +706,13 @@ impl RunRuntime for PostgresRunRuntime {
             .await
             .map_err(|error| unavailable("开始 stale run recovery 事务", error))?;
         let result = recover_one_in_transaction(&transaction, &self.owner_id).await;
-        finish_transaction(transaction, result).await
+        let result = finish_transaction(transaction, result).await?;
+        if let Some((lease, receipt)) = result {
+            self.terminal_committed(&client, &lease, &receipt).await;
+            Ok(Some(receipt))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -2485,7 +2666,7 @@ async fn retire_remote_interrupts(
 async fn recover_one_in_transaction(
     transaction: &Transaction<'_>,
     owner: &str,
-) -> Result<Option<RunWriteReceipt>, RunRuntimeError> {
+) -> Result<Option<(RunExecutionLease, RunWriteReceipt)>, RunRuntimeError> {
     let now = database_now(transaction).await?;
     let row = transaction
         .query_opt(
@@ -2556,7 +2737,7 @@ async fn recover_one_in_transaction(
         LeaseCheck::Recovery,
     )
     .await
-    .map(Some)
+    .map(|receipt| Some((lease, receipt)))
 }
 
 struct LockedRun {
@@ -2572,6 +2753,8 @@ struct LockedRun {
     lease_owner: String,
     lease_fencing: i64,
     lease_expires_at: OffsetDateTime,
+    delegation_required: bool,
+    delegated_deadline: Option<std::time::SystemTime>,
 }
 
 async fn lock_run(
@@ -2583,10 +2766,11 @@ async fn lock_run(
             "SELECT r.run_id,r.thread_id,r.bot_id,r.actor_id,r.status,r.fencing_token, \
                     r.next_event_seq,t.next_event_seq AS thread_next_event_seq, \
                     t.next_message_seq AS thread_next_message_seq,l.owner_id AS lease_owner, \
-                    l.fencing_token AS lease_fencing,l.expires_at AS lease_expires_at \
+                    l.fencing_token AS lease_fencing,l.expires_at AS lease_expires_at,(m.content ? 'delegation' OR m.content ? 'delegationSnapshot') AS delegation_present,m.content->'delegationSnapshot' AS delegation_snapshot \
              FROM public.runs r \
              JOIN public.threads t ON t.thread_id=r.thread_id \
              JOIN public.thread_leases l ON l.thread_id=r.thread_id \
+             LEFT JOIN public.messages m ON m.message_id=r.run_id||':input' AND m.run_id=r.run_id \
              WHERE r.run_id=$1 FOR UPDATE OF r,t,l",
             &[&run_id],
         )
@@ -2596,6 +2780,31 @@ async fn lock_run(
 }
 
 fn decode_locked_run(row: &Row) -> Result<LockedRun, RunRuntimeError> {
+    let snapshot: Option<Value> =
+        row.try_get("delegation_snapshot")
+            .map_err(|_| RunRuntimeError::Corrupt {
+                field: "delegation_input",
+            })?;
+    let required: bool = row
+        .try_get::<_, Option<bool>>("delegation_present")
+        .map_err(|_| RunRuntimeError::Corrupt {
+            field: "delegation_input",
+        })?
+        .unwrap_or(false);
+    let deadline = if required {
+        Some(
+            snapshot
+                .as_ref()
+                .and_then(|v| v.get("absoluteDeadline"))
+                .and_then(Value::as_u64)
+                .and_then(|n| {
+                    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(n))
+                })
+                .unwrap_or(std::time::UNIX_EPOCH),
+        )
+    } else {
+        None
+    };
     Ok(LockedRun {
         run_id: decode(row, "run_id")?,
         thread_id: decode(row, "thread_id")?,
@@ -2609,11 +2818,13 @@ fn decode_locked_run(row: &Row) -> Result<LockedRun, RunRuntimeError> {
         lease_owner: decode(row, "lease_owner")?,
         lease_fencing: decode(row, "lease_fencing")?,
         lease_expires_at: decode(row, "lease_expires_at")?,
+        delegation_required: required,
+        delegated_deadline: deadline,
     })
 }
 
 fn lease_from_locked(locked: &LockedRun) -> Result<RunExecutionLease, RunRuntimeError> {
-    RunExecutionLease::new(
+    let lease = RunExecutionLease::new(
         RunId::new(&locked.run_id),
         ThreadId::new(&locked.thread_id),
         BotId::new(&locked.bot_id),
@@ -2622,7 +2833,15 @@ fn lease_from_locked(locked: &LockedRun) -> Result<RunExecutionLease, RunRuntime
             field: "fencing_token",
         })?,
         sequence_u64(locked.next_event_seq, "next_event_sequence")?,
-    )
+    )?;
+    Ok(if locked.delegation_required {
+        lease.with_delegated_run_binding(
+            None,
+            locked.delegated_deadline.unwrap_or(std::time::UNIX_EPOCH),
+        )
+    } else {
+        lease
+    })
 }
 
 fn validate_claim_binding(
