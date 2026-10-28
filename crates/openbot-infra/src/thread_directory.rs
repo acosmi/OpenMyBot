@@ -259,16 +259,6 @@ impl PostgresThreadDirectory {
             apply_begin_observed(&tx, runtime, &request, &[], &schema, Some(&delegated)).await;
         match result {
             Ok(BeginOutcome::Created(receipt)) => {
-                issuer.issue(
-                    crate::delegation::owner_snapshot(
-                        &tx,
-                        &delegated.deployment,
-                        &delegated.tenant,
-                        delegated.grant.owner(),
-                        delegated.grant.bot_id(),
-                    )
-                    .await?,
-                )?;
                 tx.commit().await.map_err(|_| {
                     openbot_contracts::error::AppError::ReconciliationRequired { accepted: true }
                 })?;

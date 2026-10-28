@@ -348,7 +348,8 @@ async fn sampling_and_each_effect_remint_same_persisted_delegation() {
                     assert!(reply.error_code().is_none(), "{reply:?}");
                     l.check_delegated_sampling().await.map_err(text)?;
                 }
-                assert!(f.authority.calls.load(Ordering::SeqCst) >= before + 7);
+                // One authority verification for the context load, then one per effect and per sampling.
+                assert_eq!(f.authority.calls.load(Ordering::SeqCst), before + 5);
                 assert_eq!(row(&f, r.run_id.as_str()).await?.2, 2);
                 let c = f.pool.get().await.map_err(text)?;
                 assert_eq!(
@@ -827,7 +828,8 @@ async fn legal_component_chain_refreshes_proof_for_each_command() {
                         .await
                         .unwrap_err()
                 ));
-                assert!(f.authority.calls.load(Ordering::SeqCst) >= before + 8);
+                // One verification per admitted command; refused replays and denied commands never verify.
+                assert_eq!(f.authority.calls.load(Ordering::SeqCst), before + 5);
                 assert_eq!(row(&f, "chain").await?.2, 2);
                 Ok(())
             }

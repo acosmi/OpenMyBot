@@ -1090,6 +1090,13 @@ pub(crate) async fn invoke_tool_guarded<C: ToolControlPlane, J: ToolJournal>(
         }
     };
 
+    // Admission verified the delegation once; only a human approval wait can separate that
+    // check from the effect, so verify again exactly when one was awaited.
+    if let Some(guard) = guard
+        && metadata.approval_class.requires_human_approval()
+    {
+        guard.recheck().await?;
+    }
     let mut decision = base_draft;
     decision.approval_id = settled.approval_id().map(str::to_owned);
 
@@ -1107,7 +1114,6 @@ pub(crate) async fn invoke_tool_guarded<C: ToolControlPlane, J: ToolJournal>(
         decision,
         arguments,
         execution_scope,
-        guard,
     )
     .await
 }
@@ -1127,11 +1133,7 @@ async fn execute_after_approval<C: ToolControlPlane, J: ToolJournal>(
     decision: ToolDecisionDraft,
     arguments: ToolArguments,
     scope: ToolExecutionScope,
-    guard: Option<&crate::delegation::DelegatedEffectGuard>,
 ) -> Result<ToolResult, AppError> {
-    if let Some(guard) = guard {
-        guard.recheck().await?;
-    }
     let written = journal.record_decision(&decision).await;
     let recorded = settled
         .record_decision(written.clone().map_err(|error| DecisionWriteFailed {

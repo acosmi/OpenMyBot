@@ -224,11 +224,9 @@ pub trait DelegatedRunStore: Send + Sync {
     ) -> Result<AuthContext, AppError>;
     async fn fail_confirmed_callback(
         &self,
-        _record: &DelegatedRunRecord,
-        _lease: &RunExecutionLease,
-    ) -> Result<crate::RunWriteReceipt, crate::RunRuntimeError> {
-        Err(crate::RunRuntimeError::Unavailable)
-    }
+        record: &DelegatedRunRecord,
+        lease: &RunExecutionLease,
+    ) -> Result<crate::RunWriteReceipt, crate::RunRuntimeError>;
 }
 struct Issuer {
     deployment: DeploymentId,
@@ -381,16 +379,6 @@ impl DelegationRuntime {
             proofs: Arc::new(Mutex::new(Vec::new())),
         }
     }
-    fn shared(&self) -> Arc<Self> {
-        Arc::new(Self {
-            deployment: self.deployment.clone(),
-            tenant: self.tenant.clone(),
-            single_user: self.single_user,
-            authority: self.authority.clone(),
-            store: self.store.clone(),
-            proofs: self.proofs.clone(),
-        })
-    }
     fn issuer(&self, source: DelegationSource, trigger: String, grant: DelegationGrant) -> Issuer {
         Issuer {
             deployment: self.deployment.clone(),
@@ -416,9 +404,13 @@ impl DelegationRuntime {
                 },
             })
     }
+    /// Bind the lease to its persisted delegation and re-mint the owner's context in one PG
+    /// transaction. With `verify` the authority is consulted first (before each sampling and each
+    /// effect); proof issuance passes `false` and relies on that single check before the effect.
     async fn current(
         &self,
         lease: &RunExecutionLease,
+        verify: bool,
     ) -> Result<(AuthContext, DelegatedRunRecord), AppError> {
         let record = self
             .store
@@ -437,25 +429,38 @@ impl DelegationRuntime {
         {
             return Err(not_current());
         }
-        let grant = self.verify(&record.source, record.revision).await?;
-        validate_grant(&grant, record.revision, &record.bot_id)?;
-        let expiry_millis = |expires_at: Option<SystemTime>| {
-            expires_at
-                .map(|at| {
-                    at.duration_since(std::time::UNIX_EPOCH)
-                        .map(|duration| duration.as_millis())
-                })
-                .transpose()
-                .map_err(|_| not_current())
+        let grant = if verify {
+            let grant = self.verify(&record.source, record.revision).await?;
+            validate_grant(&grant, record.revision, &record.bot_id)?;
+            let expiry_millis = |expires_at: Option<SystemTime>| {
+                expires_at
+                    .map(|at| {
+                        at.duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_millis())
+                    })
+                    .transpose()
+                    .map_err(|_| not_current())
+            };
+            let grant_expiry_millis = expiry_millis(grant.expires_at)?;
+            let record_expiry_millis = expiry_millis(record.expires_at)?;
+            if grant.owner != record.actor_id
+                || grant.granted_generation != record.granted_generation
+                || grant_expiry_millis != record_expiry_millis
+            {
+                return Err(not_current());
+            }
+            grant
+        } else {
+            DelegationGrant::new(
+                record.actor_id.clone(),
+                record.bot_id.clone(),
+                record.revision,
+                record.granted_generation,
+                record.expires_at,
+                None,
+                String::new(),
+            )
         };
-        let grant_expiry_millis = expiry_millis(grant.expires_at)?;
-        let record_expiry_millis = expiry_millis(record.expires_at)?;
-        if grant.owner != record.actor_id
-            || grant.granted_generation != record.granted_generation
-            || grant_expiry_millis != record_expiry_millis
-        {
-            return Err(not_current());
-        }
         let issuer = self.issuer(
             record.source.clone(),
             record.trigger_id.clone(),
@@ -476,7 +481,7 @@ impl DelegationRuntime {
     }
     #[doc(hidden)]
     pub async fn check_sampling(&self, lease: &RunExecutionLease) -> Result<(), AppError> {
-        self.current(lease).await.map(|_| ())
+        self.current(lease, true).await.map(|_| ())
     }
     #[doc(hidden)]
     pub async fn remint_lease(&self, lease: &RunExecutionLease) -> Result<AuthContext, AppError> {
@@ -487,7 +492,7 @@ impl DelegationRuntime {
         lease: &RunExecutionLease,
         origin: DelegationProofOrigin,
     ) -> Result<AuthContext, AppError> {
-        let (auth, record) = self.current(lease).await?;
+        let (auth, record) = self.current(lease, false).await?;
         let now = SystemTime::now();
         let mut duration = record
             .lease_expires_at
@@ -543,7 +548,7 @@ impl DelegationRuntime {
             .await
     }
     pub(crate) async fn admit_command(
-        &self,
+        self: &Arc<Self>,
         auth: &AuthContext,
         command: &AppCommand,
     ) -> Result<DelegatedEffectGuard, AppError> {
@@ -593,11 +598,12 @@ impl DelegationRuntime {
             return Err(refused());
         }
         let guard = DelegatedEffectGuard {
-            coordinator: self.shared(),
+            coordinator: Arc::clone(self),
             binding: proof.binding,
             origin: proof.origin,
             terminal: proof.terminal,
         };
+        // The one authority verification and owner re-mint before this command's effect.
         self.check_effect(&guard).await?;
         Ok(guard)
     }
@@ -613,7 +619,7 @@ impl DelegationRuntime {
         )
         .map_err(|_| not_current())?;
         let checked = async {
-            let (current_auth, current) = self.current(&lease).await?;
+            let (current_auth, current) = self.current(&lease, true).await?;
             if current_auth.roles() != &b.roles
                 || current.source != b.record.source
                 || current.revision != b.record.revision

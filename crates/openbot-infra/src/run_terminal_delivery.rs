@@ -2,6 +2,8 @@
 use openbot_application::{RunTerminalNotice, RunTerminalSubscriber};
 use std::sync::{Arc, Mutex, mpsc};
 
+/// Dropping it never blocks: the sender drops, the detached worker drains and exits on its own.
+/// Only the explicit `close_and_join` (from shutdown, off the async workers) waits for it.
 pub(crate) struct TerminalDelivery {
     sender: Mutex<Option<mpsc::SyncSender<RunTerminalNotice>>>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -35,10 +37,5 @@ impl TerminalDelivery {
         {
             let _ = worker.join();
         }
-    }
-}
-impl Drop for TerminalDelivery {
-    fn drop(&mut self) {
-        self.close_and_join();
     }
 }
