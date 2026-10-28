@@ -4625,6 +4625,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "omb-hostdriver"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "getrandom 0.4.3",
+ "omb-store",
+ "openbot-application",
+ "rustix",
+ "ryu",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
+]
+
+[[package]]
 name = "omb-store"
 version = "0.0.0"
 dependencies = [
