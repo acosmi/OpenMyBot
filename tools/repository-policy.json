@@ -87,6 +87,7 @@
     "openmybot/README.md",
     "openmybot/README.zh-CN.md",
     "openmybot/compat/README.md",
+    "openmybot/compat/crabcode/1.1.16.md",
     "openmybot/hosts/README.md",
     "supply-chain/README.md",
     "tools/electron-v43.3.0.SHASUMS256.txt"
