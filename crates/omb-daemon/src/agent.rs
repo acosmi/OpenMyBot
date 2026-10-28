@@ -110,8 +110,9 @@ mod tests {
     use openbot_contracts::{
         auth::DelegationSource,
         command::{
-            AppCommand, AppReply, CancelThreadRun, ThreadConversationSnapshot,
-            ThreadForegroundRunState, ThreadHistoryRole, ThreadRunCancellationState,
+            AppCommand, AppEvent, AppReply, CancelThreadRun, SubscriptionRequest,
+            ThreadConversationSnapshot, ThreadForegroundRunState, ThreadHistoryRole,
+            ThreadRunEventKind,
         },
         ids::{BotId, RunId, ThreadId},
         reconciliation::RunReconciliationStatus,
@@ -413,43 +414,37 @@ mod tests {
                 .iter()
                 .any(|m| m.role == ThreadHistoryRole::Assistant)
         );
-        // The run is terminal and its outcome is known: a second cancellation finds it terminal and
-        // the reconciliation view, which serves only unknown outcomes, refuses it.
+        // The thread's journal, replayed from its start, carries the run's terminal kind.
         let local = fixture.engine().resolver.local_context().unwrap();
-        let AppReply::ThreadRunCancellation(second) = fixture
+        let mut events = fixture
             .engine()
             .assembly
             .application
-            .execute(
-                local.clone(),
-                AppCommand::CancelThreadRun(CancelThreadRun {
+            .subscribe(
+                local,
+                SubscriptionRequest::ThreadEvents {
                     thread_id: run.thread.clone(),
-                    run_id: run.run.clone(),
-                }),
+                    after_event_sequence: None,
+                },
             )
             .await
-            .unwrap()
-        else {
-            panic!("cancellation reply");
-        };
-        assert_eq!(second.state, ThreadRunCancellationState::AlreadyTerminal);
-        assert!(
-            fixture
-                .engine()
-                .assembly
-                .application
-                .execute(
-                    local,
-                    AppCommand::GetRunReconciliation {
-                        thread_id: run.thread.clone(),
-                        run_id: run.run.clone(),
-                        after: None,
-                        limit: None,
-                    },
-                )
-                .await
-                .is_err()
-        );
+            .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match std::future::poll_fn(|cx| events.as_mut().poll_next(cx)).await {
+                    Some(AppEvent::ThreadRunEvent(event))
+                        if event.run_id == run.run && event.terminal =>
+                    {
+                        return Some(event.event_type);
+                    }
+                    Some(_) => (),
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminal, Some(ThreadRunEventKind::Cancelled));
         let row = session(&client, &run.run).await;
         assert_eq!(row["end_reason"], "stop_requested");
         assert_eq!(row["stop_outcome"], "confirmed");
