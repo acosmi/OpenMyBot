@@ -286,3 +286,32 @@ impl Drop for Fixture {
         }
     }
 }
+/// Receiver rows are created by a later task; tests insert an active one directly.
+#[allow(dead_code, reason = "used by the pairing and bindings targets only")]
+pub(crate) async fn insert_receiver(
+    client: &tokio_postgres::Client,
+    channel: &str,
+    source_key: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,created_at,activated_at,revision) VALUES ($1,'receiver',$2,$3,'test-envelope','active',statement_timestamp(),statement_timestamp(),1)",&[&id,&channel,&source_key]).await.unwrap();
+    id
+}
+/// Moves a pending row's expiry relative to the database clock.
+#[allow(dead_code, reason = "used by the pairing target only")]
+pub(crate) async fn set_pairing_expires_at(
+    client: &tokio_postgres::Client,
+    binding_id: uuid::Uuid,
+    seconds_from_now: f64,
+) {
+    assert_eq!(client.execute("UPDATE openmybot.channel_bindings SET pairing_expires_at=statement_timestamp()+make_interval(secs=>$2) WHERE binding_id=$1",&[&binding_id,&seconds_from_now]).await.unwrap(),1);
+}
+/// Moves one accepted event relative to the database clock.
+#[allow(dead_code, reason = "used by the pairing target only")]
+pub(crate) async fn set_accepted_at(
+    client: &tokio_postgres::Client,
+    event_key: &str,
+    seconds_from_now: f64,
+) {
+    assert_eq!(client.execute("UPDATE openmybot.channel_events SET accepted_at=statement_timestamp()+make_interval(secs=>$2) WHERE event_key=$1",&[&event_key,&seconds_from_now]).await.unwrap(),1);
+}

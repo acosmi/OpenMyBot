@@ -16,6 +16,7 @@ openbot-application = { path = "../openbot-application" }
 openbot-contracts = { path = "../openbot-contracts" }
 openbot-domain = { path = "../openbot-domain" }
 openbot-computer = { path = "../openbot-computer" }
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -32,3 +33,6 @@ chrono.workspace = true
 omb-store = { path = "../omb-store" }
 sha2.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+openbot-contracts = { path = "../openbot-contracts", features = ["testkit"] }

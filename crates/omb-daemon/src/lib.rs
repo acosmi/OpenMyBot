@@ -3,8 +3,10 @@
 mod config;
 mod control;
 mod daemon;
+mod delegation;
 mod engine;
 mod init;
+mod pairing;
 mod pg;
 mod tenant;
 
@@ -14,7 +16,10 @@ use std::path::PathBuf;
 pub use config::resolve_data_dir;
 pub use control::status;
 pub use daemon::daemon;
+pub use engine::Engine;
 pub use init::init;
+pub use pairing::{PairRequest, pair};
+pub use pg::Postgres;
 
 pub struct DataDirectoryInput {
     pub explicit: Option<PathBuf>,
@@ -91,4 +96,10 @@ errors! {
     OmbMigrationDrift => ("omb_migration_drift", Rejected),
     OmbSchemaNewer => ("omb_schema_newer", Rejected),
     OmbMigrationFailed => ("omb_migration_failed", Internal),
+    ChannelAlreadyBound => ("channel_already_bound", Rejected),
+    ReceiverNotActive => ("receiver_not_active", Rejected),
+    WorkspaceInvalid => ("workspace_invalid", Rejected),
+    BindingNotFound => ("binding_not_found", Rejected),
+    BindingStateInvalid => ("binding_state_invalid", Rejected),
+    BindingFailed => ("binding_failed", Internal),
 }

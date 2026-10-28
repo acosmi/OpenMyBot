@@ -23,6 +23,7 @@ time.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 
 [[test]]
 name = "migrations"
@@ -34,4 +35,12 @@ required-features = ["testkit"]
 
 [[test]]
 name = "control_tokens"
+required-features = ["testkit"]
+
+[[test]]
+name = "pairing"
+required-features = ["testkit"]
+
+[[test]]
+name = "bindings"
 required-features = ["testkit"]

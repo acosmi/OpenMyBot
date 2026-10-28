@@ -1,5 +1,8 @@
 use std::{path::PathBuf, process::Command};
 
+/// Written when no git metadata is available, for example in a source archive build.
+const PLACEHOLDER_PIN: &str = "0000000000000000000000000000000000000000";
+
 fn git(args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -13,7 +16,16 @@ fn git(args: &[&str]) -> String {
 }
 
 fn main() {
-    let head = git(&["rev-parse", "HEAD"]);
+    let head = match Command::new("git").args(["rev-parse", "HEAD"]).output() {
+        Ok(output) if output.status.success() => String::from_utf8(output.stdout)
+            .expect("git metadata UTF-8")
+            .trim()
+            .to_owned(),
+        _ => {
+            println!("cargo:rustc-env=OMB_ENGINE_PIN={PLACEHOLDER_PIN}");
+            return;
+        }
+    };
     assert!(
         head.len() == 40
             && head

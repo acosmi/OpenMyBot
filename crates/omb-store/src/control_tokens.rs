@@ -43,6 +43,10 @@ pub async fn start_control_token(
         let previous=rows(client,"SELECT pg_system_identifier,pg_timeline_id FROM openmybot.control_tokens ORDER BY created_at DESC,token_id DESC LIMIT 1",&[],deadline,error).await?;
         let restore_detected=match previous.first(){None=>false,Some(row)=>row.try_get::<_,String>(0).map_err(|_|error)?!=system || row.try_get::<_,i32>(1).map_err(|_|error)?!=timeline};
         rows(client,"UPDATE openmybot.control_tokens SET revoked_at=statement_timestamp(),revoke_reason='daemon_restart' WHERE revoked_at IS NULL RETURNING token_id",&[],deadline,error).await?;
+        if restore_detected {
+            // A restored cluster cannot prove its bindings are still current: stop them until reconfirmed.
+            command(client,"UPDATE openmybot.channel_bindings SET status='suspended',status_reason='restore_detected',suspended_at=statement_timestamp() WHERE status='active'; UPDATE openmybot.channel_bindings SET status='expired',status_reason='restore_detected',ended_at=statement_timestamp(),pairing_code_hash=NULL WHERE status='pending'; UPDATE openmybot.channel_events SET dispatch_status='expired' WHERE dispatch_status='pending'",deadline,error).await?;
+        }
         let hash=input.token_sha256.to_vec();
         rows(client,"INSERT INTO openmybot.control_tokens(token_id,token_sha256,daemon_pid,engine_pin,omb_version,pg_system_identifier,pg_timeline_id,restore_detected,created_at,last_heartbeat_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,statement_timestamp(),statement_timestamp()) RETURNING token_id",&[&input.token_id,&hash,&input.daemon_pid,&input.engine_pin,&input.omb_version,&system,&timeline,&restore_detected],deadline,error).await?;
         timely(deadline,Ok(ControlTokenRecord{token_id:input.token_id,restore_detected}),error)
