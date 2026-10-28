@@ -1,5 +1,6 @@
 //! Foreground local composition and authenticated Unix control transport.
 
+mod channels;
 mod config;
 mod control;
 mod daemon;
@@ -50,6 +51,34 @@ pub struct StatusSnapshot {
     pub daemon_version: String,
     pub engine_pin: String,
     pub authentication_failures: u64,
+    pub channels: Vec<ChannelStatus>,
+}
+/// One receiver in the status channel segment; times are RFC 3339 UTC.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelStatus {
+    pub channel: String,
+    pub binding_id: String,
+    pub status: String,
+    pub status_reason: Option<String>,
+    pub pending_dispatch: u64,
+    pub gaps: Vec<GapStatus>,
+    pub note: String,
+    pub counters: ChannelCounters,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GapStatus {
+    pub reason: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelCounters {
+    pub platform_payload_unparseable: u64,
+    pub event_conflict: u64,
+    pub unsupported_update: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorClass {

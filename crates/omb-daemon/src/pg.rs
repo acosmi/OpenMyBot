@@ -35,6 +35,9 @@ fn map_store_error(error: omb_store::StoreError) -> DaemonError {
         omb_store::StoreError::BindingNotFound => DaemonError::BindingNotFound,
         omb_store::StoreError::BindingStateInvalid => DaemonError::BindingStateInvalid,
         omb_store::StoreError::BindingFailed => DaemonError::BindingFailed,
+        omb_store::StoreError::EventFailed
+        | omb_store::StoreError::DispatchFailed
+        | omb_store::StoreError::GapFailed => DaemonError::InternalError,
     }
 }
 fn ready_result<T>(deadline: Instant, result: Result<T, DaemonError>) -> Result<T, DaemonError> {
@@ -525,26 +528,52 @@ impl Postgres {
     }
     /// Opens the delegation authority's own connection through the identity-checked path.
     pub async fn open_authority_connection(&mut self) -> Result<AuthorityConnection, DaemonError> {
+        self.open_resident_connection("openmybot-delegation")
+            .await
+            .map_err(|_| DaemonError::BindingFailed)
+    }
+    /// Opens a long-lived store connection for one daemon component, through the
+    /// identity-checked path, with the component's application name.
+    pub async fn open_resident_connection(
+        &mut self,
+        application_name: &str,
+    ) -> Result<AuthorityConnection, DaemonError> {
         let deadline = Instant::now() + Duration::from_secs(30);
         self.connection_identity_gate(deadline)
             .await
-            .map_err(|_| DaemonError::BindingFailed)?;
+            .map_err(|_| DaemonError::InternalError)?;
         let mut config = self.client_config("openmybot");
         config
-            .application_name("openmybot-delegation")
+            .application_name(application_name)
             .options("-c statement_timeout=2s");
         let (client, connection) = timeout(
             Duration::from_secs(2),
             config.connect(tokio_postgres::NoTls),
         )
         .await
-        .map_err(|_| DaemonError::BindingFailed)?
-        .map_err(|_| DaemonError::BindingFailed)?;
+        .map_err(|_| DaemonError::InternalError)?
+        .map_err(|_| DaemonError::InternalError)?;
         Ok(AuthorityConnection {
             config,
             client,
             driver: tokio::spawn(connection),
         })
+    }
+    pub async fn record_startup_gaps(
+        &mut self,
+        token_id: uuid::Uuid,
+    ) -> Result<omb_store::StartupGaps, DaemonError> {
+        self.binding_call(async |client, deadline| {
+            omb_store::record_startup_gaps(client, token_id, deadline).await
+        })
+        .await
+    }
+    pub async fn list_active_receivers(
+        &mut self,
+        channel: omb_store::Channel,
+    ) -> Result<Vec<omb_store::ReceiverRow>, DaemonError> {
+        self.binding_call(async |client, _| omb_store::list_active_receivers(client, channel).await)
+            .await
     }
     async fn binding_call<T>(
         &mut self,

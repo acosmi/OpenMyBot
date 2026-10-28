@@ -66,6 +66,50 @@ pub async fn stop_control_token(
     }.await;
     finish(client, deadline, result, error).await
 }
+/// One heartbeat advance: the stored value it replaced, the new value, and the
+/// `daemon_suspended` gap rows written because the interval exceeded the threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatTick {
+    pub previous: time::OffsetDateTime,
+    pub now: time::OffsetDateTime,
+    pub gaps_written: u64,
+}
+/// Advances `last_heartbeat_at` in one statement; an interval longer than `gap` records a
+/// `daemon_suspended` gap for every active receiver in the same statement.
+pub async fn touch_heartbeat(
+    client: &mut Client,
+    token_id: Uuid,
+    gap: std::time::Duration,
+    deadline: Instant,
+) -> Result<HeartbeatTick, StoreError> {
+    let error = StoreError::GapFailed;
+    let found = rows(client, "WITH t AS (UPDATE openmybot.control_tokens c SET last_heartbeat_at=statement_timestamp() FROM (SELECT token_id,last_heartbeat_at FROM openmybot.control_tokens WHERE token_id=$1 FOR UPDATE) old WHERE c.token_id=old.token_id RETURNING old.last_heartbeat_at previous,c.last_heartbeat_at now), g AS (INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,gap_started_at,gap_ended_at,gap_reason) SELECT r.id,'gap',r.channel_kind,r.source_key,'gap:'||r.id,statement_timestamp(),r.binding_id,'gap',t.previous,t.now,'daemon_suspended' FROM t CROSS JOIN (SELECT gen_random_uuid() id,binding_id,channel_kind,source_key FROM openmybot.channel_bindings WHERE binding_kind='receiver' AND status='active') r WHERE t.now-t.previous>make_interval(secs=>$2) RETURNING 1) SELECT previous,now,(SELECT count(*) FROM g) FROM t", &[&token_id, &gap.as_secs_f64()], deadline, error).await?;
+    let row = found.first().ok_or(error)?;
+    Ok(HeartbeatTick {
+        previous: row.try_get(0).map_err(|_| error)?,
+        now: row.try_get(1).map_err(|_| error)?,
+        gaps_written: u64::try_from(row.try_get::<_, i64>(2).map_err(|_| error)?)
+            .map_err(|_| error)?,
+    })
+}
+pub async fn read_heartbeat(
+    client: &Client,
+    token_id: Uuid,
+) -> Result<Option<time::OffsetDateTime>, StoreError> {
+    let error = StoreError::ControlTokenFailed;
+    let found = rows(
+        client,
+        "SELECT last_heartbeat_at FROM openmybot.control_tokens WHERE token_id=$1",
+        &[&token_id],
+        Instant::now() + crate::READ_BUDGET,
+        error,
+    )
+    .await?;
+    found
+        .first()
+        .map(|row| row.try_get(0).map_err(|_| error))
+        .transpose()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

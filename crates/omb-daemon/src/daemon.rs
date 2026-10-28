@@ -1,9 +1,13 @@
 use crate::{
-    DaemonError, DaemonOptions, StatusSnapshot, config,
+    DaemonError, DaemonOptions, StatusSnapshot,
+    channels::Channels,
+    config,
     control::{self, ControlState, ENGINE_PIN},
     engine,
     pg::{self, Postgres},
 };
+use omb_channels::{TelegramEndpoint, Timings};
+use openbot_infra::net::safe_http::{EgressPolicy, SafeDialer};
 use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 use tokio::{
     net::UnixListener,
@@ -24,6 +28,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     let mut postgres = Postgres::start(root, &config).await?;
     let mut engine = None;
     let mut token_id = None;
+    let mut channels = None;
     use sha2::Digest as _;
     let result=async {
         let prepared=engine::prepare(root,&config.deployment_id,&mut postgres).await?;
@@ -33,21 +38,23 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         token_id=Some(current_token_id);
         let token_sha256:[u8;32]=sha2::Sha256::digest(token.as_bytes()).into();
         postgres.start_control_token(omb_store::ControlTokenStart{token_id:current_token_id,token_sha256,daemon_pid:i32::try_from(std::process::id()).map_err(|_|DaemonError::ControlTokenFailed)?,engine_pin:ENGINE_PIN,omb_version:env!("CARGO_PKG_VERSION")}).await?;
-        engine=Some(engine::assemble(root,prepared).await?);
+        let assembled=engine.insert(engine::assemble(root,prepared).await?);
+        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()))).await?);
         let path=root.join("run/control.sock");
         let listener=UnixListener::bind(&path).map_err(|_|DaemonError::ControlSocketFailed)?;
         std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).map_err(|_|DaemonError::ControlSocketFailed)?;
         config::check(&path,false)?;
         let state=ControlState::new(token,StatusSnapshot{
             deployment_id:config.deployment_id,daemon_pid:std::process::id(),pg_pid:postgres.pid(),
-            pg_server_version_num:postgres.version,daemon_version:env!("CARGO_PKG_VERSION").into(),engine_pin:ENGINE_PIN.into(),authentication_failures:0,
-        });
+            pg_server_version_num:postgres.version,daemon_version:env!("CARGO_PKG_VERSION").into(),engine_pin:ENGINE_PIN.into(),authentication_failures:0,channels:Vec::new(),
+        },Some(started.status_source()));
         let mut connections=JoinSet::new();
         let mut health=tokio::time::interval(Duration::from_millis(200));
         let outcome=loop {
             tokio::select! {
                 _=interrupt.recv()=>break Ok(()),
                 _=terminate.recv()=>break Ok(()),
+                error=started.finished()=>break Err(error),
                 _=health.tick()=>{
                     match postgres.is_alive() {
                         Ok(true)=>(),
@@ -63,10 +70,14 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
                 },
             }
         };
+        if let Some(started)=channels.take() {started.stop().await;}
         drop(listener);
         connections.abort_all();while connections.join_next().await.is_some() {}
         outcome
     }.await;
+    if let Some(channels) = channels {
+        channels.stop().await;
+    }
     if let Some(engine) = engine {
         engine.shutdown().await;
     }

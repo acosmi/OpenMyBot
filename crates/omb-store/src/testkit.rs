@@ -16,7 +16,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
-pub(crate) fn deadline() -> Instant {
+pub fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(30)
 }
 fn random() -> String {
@@ -33,7 +33,7 @@ fn private(path: &std::path::Path, bytes: &[u8]) {
         .unwrap();
     file.write_all(bytes).unwrap();
 }
-pub(crate) struct ClientOwner(Option<tokio_postgres::Client>);
+pub struct ClientOwner(Option<tokio_postgres::Client>);
 impl std::ops::Deref for ClientOwner {
     type Target = tokio_postgres::Client;
     fn deref(&self) -> &Self::Target {
@@ -45,12 +45,12 @@ impl std::ops::DerefMut for ClientOwner {
         self.0.as_mut().unwrap()
     }
 }
-pub(crate) struct Session {
-    pub(crate) client: ClientOwner,
+pub struct Session {
+    pub client: ClientOwner,
     driver: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
 }
 impl Session {
-    pub(crate) async fn close(mut self) {
+    pub async fn close(mut self) {
         self.client.0.take();
         let mut driver = self.driver.take().unwrap();
         match timeout(Duration::from_secs(5), &mut driver).await {
@@ -74,14 +74,14 @@ impl Drop for Session {
         }
     }
 }
-pub(crate) struct Fixture {
+pub struct Fixture {
     root: PathBuf,
     child: Option<Child>,
     port: u16,
     password: String,
 }
 impl Fixture {
-    pub(crate) async fn new() -> Self {
+    pub async fn new() -> Self {
         let bin = PathBuf::from(
             std::env::var_os("OMB_TEST_PG_BIN_DIR")
                 .expect("explicit own PG17.11 binary directory required"),
@@ -200,7 +200,21 @@ impl Fixture {
         }
         panic!("own PostgreSQL port attempts exhausted")
     }
-    pub(crate) async fn connect(&mut self) -> Session {
+    /// A client and its driver task for components that own their connection.
+    #[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+    pub async fn open(
+        &mut self,
+    ) -> (
+        tokio_postgres::Client,
+        JoinHandle<Result<(), tokio_postgres::Error>>,
+    ) {
+        let mut session = self.connect().await;
+        (
+            session.client.0.take().unwrap(),
+            session.driver.take().unwrap(),
+        )
+    }
+    pub async fn connect(&mut self) -> Session {
         assert!(self.child.as_mut().unwrap().try_wait().unwrap().is_none());
         let mut config = tokio_postgres::Config::new();
         config
@@ -222,7 +236,7 @@ impl Fixture {
             driver: Some(tokio::spawn(connection)),
         }
     }
-    pub(crate) async fn stop(mut self) {
+    pub async fn stop(mut self) {
         if let Some(mut child) = self.child.take() {
             let pid = Pid::from_raw(child.id().unwrap() as i32).unwrap();
             let mut reaped = false;
@@ -288,7 +302,7 @@ impl Drop for Fixture {
 }
 /// Receiver rows are created by a later task; tests insert an active one directly.
 #[allow(dead_code, reason = "used by the pairing and bindings targets only")]
-pub(crate) async fn insert_receiver(
+pub async fn insert_receiver(
     client: &tokio_postgres::Client,
     channel: &str,
     source_key: &str,
@@ -299,7 +313,7 @@ pub(crate) async fn insert_receiver(
 }
 /// Moves a pending row's expiry relative to the database clock.
 #[allow(dead_code, reason = "used by the pairing target only")]
-pub(crate) async fn set_pairing_expires_at(
+pub async fn set_pairing_expires_at(
     client: &tokio_postgres::Client,
     binding_id: uuid::Uuid,
     seconds_from_now: f64,
@@ -308,10 +322,69 @@ pub(crate) async fn set_pairing_expires_at(
 }
 /// Moves one accepted event relative to the database clock.
 #[allow(dead_code, reason = "used by the pairing target only")]
-pub(crate) async fn set_accepted_at(
+pub async fn set_accepted_at(
     client: &tokio_postgres::Client,
     event_key: &str,
     seconds_from_now: f64,
 ) {
     assert_eq!(client.execute("UPDATE openmybot.channel_events SET accepted_at=statement_timestamp()+make_interval(secs=>$2) WHERE event_key=$1",&[&event_key,&seconds_from_now]).await.unwrap(),1);
+}
+/// An active receiver row with a caller-chosen id and credential envelope.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_receiver_with(
+    client: &tokio_postgres::Client,
+    binding_id: uuid::Uuid,
+    channel: &str,
+    source_key: &str,
+    envelope: &str,
+) {
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,created_at,activated_at,revision) VALUES ($1,'receiver',$2,$3,$4,'active',statement_timestamp(),statement_timestamp(),1)",&[&binding_id,&channel,&source_key,&envelope]).await.unwrap(),1);
+}
+/// Moves one timestamp column of an event or gap row relative to the database clock.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn shift_event(
+    client: &tokio_postgres::Client,
+    record_id: uuid::Uuid,
+    column: &str,
+    seconds_from_now: f64,
+) {
+    let sql = format!(
+        "UPDATE openmybot.channel_events SET {column}=statement_timestamp()+make_interval(secs=>$2) WHERE record_id=$1"
+    );
+    assert_eq!(
+        client
+            .execute(&sql, &[&record_id, &seconds_from_now])
+            .await
+            .unwrap(),
+        1
+    );
+}
+/// Writes the terminal columns that a later task's terminal subscriber owns.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn set_terminal(client: &tokio_postgres::Client, record_id: uuid::Uuid, kind: &str) {
+    assert_eq!(client.execute("UPDATE openmybot.channel_events SET terminal_kind=$2,terminal_at=statement_timestamp() WHERE record_id=$1",&[&record_id,&kind]).await.unwrap(),1);
+}
+/// One row as JSON, selected by its uuid key column.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn read_row(
+    client: &tokio_postgres::Client,
+    table: &str,
+    key: &str,
+    id: uuid::Uuid,
+) -> serde_json::Value {
+    let sql = format!("SELECT row_to_json(t) FROM openmybot.{table} t WHERE {key}=$1");
+    client.query_one(&sql, &[&id]).await.unwrap().get(0)
+}
+/// An active sender row on the receiver's source, revision 1, with the given identity and thread.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_sender(
+    client: &tokio_postgres::Client,
+    channel: &str,
+    source_key: &str,
+    sender_key: &str,
+    thread_id: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$2,$3,$4,$4,'/workspaces/project',$5,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&channel,&source_key,&sender_key,&thread_id]).await.unwrap(),1);
+    id
 }

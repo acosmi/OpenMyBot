@@ -110,6 +110,7 @@ pub async fn reconfirm_binding(
             return Err(refusal(client, binding_id, deadline).await);
         };
         let revision = u64::try_from(row.try_get::<_, i64>(0).map_err(|_| error)?).map_err(|_| error)?;
+        rows(client, "UPDATE openmybot.channel_events SET gap_ended_at=(SELECT reconfirmed_at FROM openmybot.channel_bindings WHERE binding_id=$1) WHERE binding_id=$1 AND record_kind='gap' AND gap_reason='receiver_suspended' AND gap_ended_at IS NULL RETURNING record_id", &[&binding_id], deadline, error).await?;
         timely(deadline, Ok(revision), error)
     }
     .await;

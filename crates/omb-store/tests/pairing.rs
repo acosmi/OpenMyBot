@@ -47,8 +47,9 @@ async fn attempt(
     };
     let sender = IdentityKey::parse(sender).unwrap();
     let chat = IdentityKey::parse(&format!("{}:chat", sender.as_str())).unwrap();
-    pair_attempt(
-        client,
+    let tx = client.transaction().await.unwrap();
+    let outcome = pair_attempt(
+        &tx,
         PairAttempt {
             channel,
             receiver_binding_id: receiver,
@@ -59,12 +60,16 @@ async fn attempt(
                 event_key,
                 source_key,
                 fingerprint: [7; 32],
+                occurred_at: None,
+                event_type: None,
             },
         },
         deadline(),
     )
     .await
-    .unwrap()
+    .unwrap();
+    tx.commit().await.unwrap();
+    outcome
 }
 async fn scalar<T: for<'a> tokio_postgres::types::FromSql<'a>>(client: &Client, sql: &str) -> T {
     client.query_one(sql, &[]).await.unwrap().get(0)
@@ -609,41 +614,6 @@ async fn pending_row_is_selected_by_arriving_channel() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn duplicate_event_key_changes_nothing() {
-    let (fixture, mut session, receiver) = setup().await;
-    let started = start(&mut session.client, Channel::Telegram).await.unwrap();
-    assert_eq!(
-        attempt(
-            &mut session.client,
-            Channel::Telegram,
-            receiver,
-            "telegram:1",
-            "WRONG000",
-            "same"
-        )
-        .await,
-        PairOutcome::Failed
-    );
-    let before = snapshot(&session.client).await;
-    assert_eq!(
-        attempt(
-            &mut session.client,
-            Channel::Telegram,
-            receiver,
-            "telegram:1",
-            &started.code.display(),
-            "same"
-        )
-        .await,
-        PairOutcome::Duplicate
-    );
-    assert_eq!(snapshot(&session.client).await, before);
-    session.close().await;
-    fixture.stop().await;
-}
-
-#[tokio::test]
-#[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn concurrent_pair_attempts_with_same_code_succeed_once() {
     let (mut fixture, mut session, receiver) = setup().await;
     let mut a = fixture.connect().await;
@@ -715,6 +685,115 @@ async fn concurrent_pair_attempts_with_same_code_succeed_once() {
     }
     for owned in [a, b, c, d] {
         owned.close().await;
+    }
+    session.close().await;
+    fixture.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn pair_attempt_changes_roll_back_with_the_callers_transaction() {
+    let (fixture, mut session, receiver) = setup().await;
+    let started = start(&mut session.client, Channel::Telegram).await.unwrap();
+    let before = snapshot(&session.client).await;
+    let sender = IdentityKey::parse("telegram:42").unwrap();
+    let code = started.code.display();
+    let tx = session.client.transaction().await.unwrap();
+    let outcome = pair_attempt(
+        &tx,
+        PairAttempt {
+            channel: Channel::Telegram,
+            receiver_binding_id: receiver,
+            sender_key: &sender,
+            chat_key: &sender,
+            code_text: &code,
+            event: AcceptedEvent {
+                event_key: "1",
+                source_key: "1001",
+                fingerprint: [7; 32],
+                occurred_at: None,
+                event_type: None,
+            },
+        },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        PairOutcome::Succeeded {
+            binding_id: started.binding_id
+        }
+    );
+    let inside: i64 = tx
+        .query_one("SELECT count(*) FROM openmybot.deliveries", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(inside, 1);
+    tx.rollback().await.unwrap();
+    assert_eq!(snapshot(&session.client).await, before);
+    assert_eq!(
+        attempt(
+            &mut session.client,
+            Channel::Telegram,
+            receiver,
+            "telegram:42",
+            &code,
+            "1"
+        )
+        .await,
+        PairOutcome::Succeeded {
+            binding_id: started.binding_id
+        }
+    );
+    session.close().await;
+    fixture.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn pair_attempt_writes_occurred_at_and_event_type_columns() {
+    let (fixture, mut session, receiver) = setup().await;
+    start(&mut session.client, Channel::Telegram).await.unwrap();
+    let sender = IdentityKey::parse("telegram:42").unwrap();
+    let occurred = time::OffsetDateTime::from_unix_timestamp(1_793_202_187).unwrap();
+    for (key, occurred_at, event_type) in [
+        ("1", Some(occurred), Some("telegram.message")),
+        ("2", None, None),
+    ] {
+        let tx = session.client.transaction().await.unwrap();
+        pair_attempt(
+            &tx,
+            PairAttempt {
+                channel: Channel::Telegram,
+                receiver_binding_id: receiver,
+                sender_key: &sender,
+                chat_key: &sender,
+                code_text: "WRONG000",
+                event: AcceptedEvent {
+                    event_key: key,
+                    source_key: "1001",
+                    fingerprint: [7; 32],
+                    occurred_at,
+                    event_type,
+                },
+            },
+            deadline(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let row = session
+            .client
+            .query_one(
+                "SELECT occurred_at,event_type FROM openmybot.channel_events WHERE event_key=$1",
+                &[&key],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, Option<time::OffsetDateTime>>(0), occurred_at);
+        assert_eq!(row.get::<_, Option<String>>(1).as_deref(), event_type);
     }
     session.close().await;
     fixture.stop().await;

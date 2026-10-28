@@ -16,7 +16,7 @@ pub enum Channel {
     Feishu,
 }
 impl Channel {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Telegram => "telegram",
             Self::Feishu => "feishu",
@@ -129,6 +129,8 @@ pub struct AcceptedEvent<'a> {
     pub event_key: &'a str,
     pub source_key: &'a str,
     pub fingerprint: [u8; 32],
+    pub occurred_at: Option<time::OffsetDateTime>,
+    pub event_type: Option<&'a str>,
 }
 pub struct PairAttempt<'a> {
     pub channel: Channel,
@@ -143,24 +145,19 @@ pub enum PairOutcome {
     Succeeded { binding_id: Uuid },
     Failed,
     Locked,
-    Duplicate,
 }
 
-/// Evaluates one `/pair` message and records its event in the same transaction.
+/// Evaluates one `/pair` message and records its event inside the caller's transaction; the
+/// caller has already ruled out a repeated event key and commits or rolls back.
 pub async fn pair_attempt(
-    client: &mut Client,
+    client: &tokio_postgres::Transaction<'_>,
     input: PairAttempt<'_>,
     deadline: Instant,
 ) -> Result<PairOutcome, StoreError> {
     let error = StoreError::BindingFailed;
     let channel = input.channel.as_str();
     let sender = input.sender_key.as_str();
-    let result = async {
-        command(client, "BEGIN", deadline, error).await?;
-        let seen = rows(client, "SELECT 1 FROM openmybot.channel_events WHERE channel_kind=$1 AND source_key=$2 AND event_key=$3", &[&channel, &input.event.source_key, &input.event.event_key], deadline, error).await?;
-        if !seen.is_empty() {
-            return Ok(PairOutcome::Duplicate);
-        }
+    async {
         let receiver = rows(client, "SELECT source_key FROM openmybot.channel_bindings WHERE binding_id=$1 AND binding_kind='receiver' AND channel_kind=$2 AND status='active'", &[&input.receiver_binding_id, &channel], deadline, error).await?;
         let source_key: String = receiver
             .first()
@@ -202,14 +199,13 @@ pub async fn pair_attempt(
         let disposition = match outcome {
             PairOutcome::Succeeded { .. } => "pairing_succeeded",
             PairOutcome::Locked => "pairing_locked",
-            PairOutcome::Failed | PairOutcome::Duplicate => "pairing_failed",
+            PairOutcome::Failed => "pairing_failed",
         };
         let fingerprint = input.event.fingerprint.to_vec();
-        rows(client, "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,fingerprint,sender_key,chat_key,binding_id,disposition,command) VALUES ($1,'event',$2,$3,$4,statement_timestamp(),$5,$6,$7,$8,$9,'pair') RETURNING record_id", &[&Uuid::now_v7(), &channel, &input.event.source_key, &input.event.event_key, &fingerprint, &sender, &input.chat_key.as_str(), &binding_id, &disposition], deadline, error).await?;
+        rows(client, "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,event_type,occurred_at,accepted_at,fingerprint,sender_key,chat_key,binding_id,disposition,command) VALUES ($1,'event',$2,$3,$4,$5,$6,statement_timestamp(),$7,$8,$9,$10,$11,'pair') RETURNING record_id", &[&Uuid::now_v7(), &channel, &input.event.source_key, &input.event.event_key, &input.event.event_type, &input.event.occurred_at, &fingerprint, &sender, &input.chat_key.as_str(), &binding_id, &disposition], deadline, error).await?;
         timely(deadline, Ok(outcome), error)
     }
-    .await;
-    finish(client, deadline, result, error).await
+    .await
 }
 
 #[cfg(test)]

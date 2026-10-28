@@ -19,6 +19,7 @@ members = [
     "crates/omb-store",
     "crates/omb-daemon",
     "crates/omb-cli",
+    "crates/omb-channels",
     "crates/openbot-contracts",
     "crates/openbot-domain",
     "crates/openbot-application",
