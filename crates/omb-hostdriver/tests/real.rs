@@ -5,7 +5,8 @@
 //! (`inject`, the default, or `embedded`), `OMB_REAL_RECHECK_REPORT` (inside the sandbox) and
 //! `OMB_TEST_PG_BIN_DIR`. `config_dir` points `CRABCODE_CONFIG_DIR` at
 //! `<sandbox>/crabcode-config`; `bare` adds `--bare` and passes `ACOSMI_API_KEY` from this
-//! process's environment. The report holds no absolute path and no credential; it is rewritten
+//! process's environment. `OMB_REAL_RECHECK_EXTRA_ARGS` (optional, whitespace-separated) adds
+//! per-version arguments to the window entry. The report holds no absolute path and no credential; it is rewritten
 //! after every step, so a failed gate still leaves it behind.
 use omb_hostdriver::{
     CC_STOP_GRACE, HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots,
@@ -384,22 +385,29 @@ async fn real_crabcode_recheck() {
     report.set("isolation", json!(isolation));
     report.set("window", json!(window_mode));
     let config_dir = sandbox.join("crabcode-config");
-    let (extra_args, extra_env): (Vec<String>, BTreeMap<String, String>) = match isolation.as_str()
-    {
-        "home" => (Vec::new(), BTreeMap::new()),
-        "config_dir" => (
-            Vec::new(),
-            BTreeMap::from([(
-                "CRABCODE_CONFIG_DIR".to_owned(),
-                config_dir.to_str().unwrap().to_owned(),
-            )]),
-        ),
-        "bare" => (
-            vec!["--bare".to_owned()],
-            BTreeMap::from([("ACOSMI_API_KEY".to_owned(), required("ACOSMI_API_KEY"))]),
-        ),
-        other => panic!("OMB_REAL_RECHECK_ISOLATION {other} is not home, config_dir or bare"),
-    };
+    let (mut extra_args, extra_env): (Vec<String>, BTreeMap<String, String>) =
+        match isolation.as_str() {
+            "home" => (Vec::new(), BTreeMap::new()),
+            "config_dir" => (
+                Vec::new(),
+                BTreeMap::from([(
+                    "CRABCODE_CONFIG_DIR".to_owned(),
+                    config_dir.to_str().unwrap().to_owned(),
+                )]),
+            ),
+            "bare" => (
+                vec!["--bare".to_owned()],
+                BTreeMap::from([("ACOSMI_API_KEY".to_owned(), required("ACOSMI_API_KEY"))]),
+            ),
+            other => panic!("OMB_REAL_RECHECK_ISOLATION {other} is not home, config_dir or bare"),
+        };
+    // Per-version arguments the window entry carries (e.g. `--verbose` for 1.1.16).
+    extra_args.extend(
+        std::env::var("OMB_REAL_RECHECK_EXTRA_ARGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned),
+    );
     let report_env: BTreeMap<&String, String> = extra_env
         .iter()
         .map(|(key, value)| {
@@ -411,7 +419,6 @@ async fn real_crabcode_recheck() {
             (key, shown)
         })
         .collect();
-    report.set("extra_args", json!(extra_args));
     report.set("extra_env", json!(report_env));
 
     let mut suffix = [0; 4];
@@ -474,8 +481,10 @@ async fn real_crabcode_recheck() {
             "record": format!("compat/crabcode/{}.md", version.clone().unwrap_or_default()),
         }]}),
         "embedded" => {
-            // The compiled-in manifest with this isolation's arguments and environment laid over
-            // the entry of the probed version; version, gates and record stay as committed.
+            // The compiled-in manifest with this run's arguments and the isolation environment
+            // laid over the entry of the probed version: the entry's arguments followed by any not
+            // already present, its environment with the isolation keys inserted or overwritten.
+            // Version, gates and record stay as committed.
             let mut manifest: Value = serde_json::from_str(include_str!(
                 "../../../openmybot/compat/crabcode/accepted.json"
             ))
@@ -505,6 +514,15 @@ async fn real_crabcode_recheck() {
         }
         other => panic!("OMB_REAL_RECHECK_WINDOW {other} is not inject or embedded"),
     };
+    let probed = version.clone().unwrap_or_default();
+    let effective_args: Vec<String> = manifest["accepted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["version"] == probed.as_str())
+        .map(|entry| serde_json::from_value(entry["extra_args"].clone()).unwrap())
+        .unwrap_or_default();
+    report.set("extra_args", json!(effective_args));
     let window = VersionWindow::parse(&manifest.to_string()).unwrap();
 
     let workspace = sandbox.join(format!("ws-{suffix}"));
@@ -586,7 +604,7 @@ async fn real_crabcode_recheck() {
     let g2 = first.init && first_row["native_session_id"].is_string();
     report.set(
         "G2",
-        json!({"result": pass(g2), "observation": {"system_init": first.init, "terminal": first.terminal}}),
+        json!({"result": pass(g2), "observation": {"system_init": first.init, "terminal": first.terminal, "exit_code": first_row["exit_code"], "exit_signal": first_row["exit_signal"], "stderr_tail": first_row["stderr_tail"]}}),
     );
 
     // Step 4–5: the write request allowed, and the run's terminal result.
@@ -658,7 +676,7 @@ async fn real_crabcode_recheck() {
         .stop_elapsed
         .is_some_and(|elapsed| elapsed < CC_STOP_GRACE);
     let (stdin_close_exit, stdin_close) =
-        stdin_close_probe(&child_env, &extra_args, &workspace).await;
+        stdin_close_probe(&child_env, &effective_args, &workspace).await;
     let g5 = stopped.stop.as_deref() == Some("confirmed")
         && group_empty
         && stop_row["end_reason"] == "stop_requested"
@@ -708,7 +726,7 @@ async fn real_crabcode_recheck() {
     report.set(
         "steps",
         json!([
-            {"step": "start", "init": first.init, "terminal": first.terminal},
+            {"step": "start", "init": first.init, "terminal": first.terminal, "exit_code": first_row["exit_code"], "exit_signal": first_row["exit_signal"], "stderr_tail": first_row["stderr_tail"]},
             {"step": "readonly_auto_allow", "read_via_can_use_tool": read_requested, "readonly_rule_rows": readonly_rows, "note": if read_requested { "observed through can_use_tool" } else { "CLI allowed internally, not through can_use_tool" }},
             {"step": "approval_required_tool_blocked", "write_requested": write_asked_first, "denied": denied_absent},
             {"step": "allow", "write_requested": write_asked_second, "file_written": allowed_present},
