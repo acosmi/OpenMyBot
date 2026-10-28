@@ -611,15 +611,44 @@ async fn real_crabcode_recheck() {
     let window = VersionWindow::parse(&manifest.to_string()).unwrap();
     // G4 under the `home` isolation: user-level permissive settings come from a sandbox file
     // passed with `--settings` (CrabCode's flag settings layer), never from the real home.
+    // `--settings` takes one value: when the entry already carries one, its object is merged with
+    // the permissive block and the value is replaced by the file; its `ask` list stays as is.
     let g4_settings = sandbox.join("g4-settings.json");
-    let g4_args: Vec<String> = effective_args
+    let g4_path = g4_settings.to_str().unwrap().to_owned();
+    let settings_at = effective_args
         .iter()
-        .cloned()
-        .chain([
-            "--settings".to_owned(),
-            g4_settings.to_str().unwrap().to_owned(),
-        ])
-        .collect();
+        .position(|arg| arg == "--settings")
+        .filter(|index| index + 1 < effective_args.len());
+    let (g4_args, g4_settings_body, settings_merged) = match settings_at {
+        Some(index) => {
+            let value = &effective_args[index + 1];
+            let mut merged: Value = if value.trim_start().starts_with('{') {
+                serde_json::from_str(value).unwrap()
+            } else {
+                serde_json::from_str(&std::fs::read_to_string(value).unwrap()).unwrap()
+            };
+            let mut allow = merged["permissions"]["ask"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            allow.extend(["Read", "Glob", "Grep"].map(|tool| json!(tool)));
+            merged["permissions"]["defaultMode"] = json!("acceptEdits");
+            merged["permissions"]["allow"] = Value::Array(allow);
+            let mut args = effective_args.clone();
+            args[index + 1] = g4_path.clone();
+            (args, merged.to_string(), true)
+        }
+        None => (
+            effective_args
+                .iter()
+                .cloned()
+                .chain(["--settings".to_owned(), g4_path.clone()])
+                .collect::<Vec<_>>(),
+            json!({"permissions": {"defaultMode": "acceptEdits", "allow": ["Read", "Write", "Edit", "Bash"]}})
+                .to_string(),
+            false,
+        ),
+    };
     let g4_window = {
         let mut manifest = manifest.clone();
         let entry = manifest["accepted"]
@@ -766,10 +795,13 @@ async fn real_crabcode_recheck() {
             json!({"write_requested": g4_asked, "no_file_after_deny": g4_absent, "workspace_settings_permissive": true, "user_settings_permissive": true}),
         )
     } else if isolation == "home" {
-        std::fs::write(&g4_settings, &permissions).unwrap();
+        std::fs::write(&g4_settings, &g4_settings_body).unwrap();
+        // Removed right after the G4 turn, also while unwinding.
+        let g4_file = UserSettings(g4_settings.clone());
         let fourth = recheck
             .turn_on(&g4_driver, g4, "real-g4", "T-g4", "Use the Write tool to create g4.txt containing the word four. Then reply with the word DONE.", deny_all, false)
             .await;
+        drop(g4_file);
         let g4_asked = recheck
             .permissions("real-g4")
             .await
@@ -779,7 +811,7 @@ async fn real_crabcode_recheck() {
         (
             fourth,
             g4_asked && g4_absent,
-            json!({"write_requested": g4_asked, "no_file_after_deny": g4_absent, "workspace_settings_permissive": true, "user_settings_permissive": "flagSettings via --settings", "extra_args": g4_args}),
+            json!({"write_requested": g4_asked, "no_file_after_deny": g4_absent, "workspace_settings_permissive": true, "user_settings_permissive": "flagSettings via --settings", "settings_merged": settings_merged, "extra_args": g4_args}),
         )
     } else {
         (
