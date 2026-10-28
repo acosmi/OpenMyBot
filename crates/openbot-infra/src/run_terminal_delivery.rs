@@ -11,9 +11,7 @@ impl TerminalDelivery {
         let (sender, receiver) = mpsc::sync_channel::<RunTerminalNotice>(128);
         let worker = std::thread::spawn(move || {
             while let Ok(notice) = receiver.recv() {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    subscriber.on_run_terminal(notice)
-                }));
+                subscriber.on_run_terminal(notice);
             }
         });
         Self {

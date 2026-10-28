@@ -346,7 +346,6 @@ pub async fn assemble_postgres_application(
             thread_directory.clone(),
             deployment.clone(),
             tenant.clone(),
-            single_user,
         ))
     });
     let delegation_runtime =

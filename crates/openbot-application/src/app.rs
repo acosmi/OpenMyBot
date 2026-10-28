@@ -68,7 +68,9 @@ use crate::screen_sessions::{
     NoScreenSessionAdministration, ScreenSessionAdministration, issue_screen_session,
 };
 use crate::service::{AppEventStream, ApplicationService, command_kind, subscription_kind};
-use crate::tool::{NoToolControlPlane, NoToolJournal, ToolControlPlane, ToolJournal, invoke_tool};
+use crate::tool::{
+    NoToolControlPlane, NoToolJournal, ToolControlPlane, ToolJournal, invoke_tool_guarded,
+};
 use crate::ui_preferences::{
     NoUiPreferenceAdministration, UiPreferenceAdministration, get_ui_preferences,
     update_ui_preferences,
@@ -915,21 +917,16 @@ where
             AppCommand::SetActionPolicy { policy } => Ok(AppReply::ActionPolicy {
                 policy: Some(set_action_policy(&self.policies, auth, policy).await?),
             }),
-            AppCommand::InvokeTool(invocation) => Ok(AppReply::Tool(match delegated_guard {
-                Some(guard) => {
-                    crate::tool::invoke_tool_with_delegation(
-                        &self.tool_control,
-                        &self.tool_journal,
-                        auth,
-                        invocation,
-                        guard,
-                    )
-                    .await?
-                }
-                None => {
-                    invoke_tool(&self.tool_control, &self.tool_journal, auth, invocation).await?
-                }
-            })),
+            AppCommand::InvokeTool(invocation) => Ok(AppReply::Tool(
+                invoke_tool_guarded(
+                    &self.tool_control,
+                    &self.tool_journal,
+                    auth,
+                    invocation,
+                    delegated_guard,
+                )
+                .await?,
+            )),
             AppCommand::MintThreadId => Ok(AppReply::ThreadMinted(
                 mint_thread_id(&self.threads, auth).await?,
             )),

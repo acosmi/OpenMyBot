@@ -316,6 +316,8 @@ impl core::fmt::Debug for RunExecutionLease {
             .finish()
     }
 }
+// The attached delegation runtime is a process-local handle, not part of the lease identity:
+// a cancellation lease read back from the database must match the dispatched one.
 impl PartialEq for RunExecutionLease {
     fn eq(&self, other: &Self) -> bool {
         self.run_id == other.run_id
@@ -326,11 +328,6 @@ impl PartialEq for RunExecutionLease {
             && self.next_event_sequence == other.next_event_sequence
             && self.delegation_required == other.delegation_required
             && self.absolute_deadline == other.absolute_deadline
-            && match (&self.delegation_runtime, &other.delegation_runtime) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            }
     }
 }
 impl Eq for RunExecutionLease {}

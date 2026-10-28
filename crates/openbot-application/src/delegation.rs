@@ -296,9 +296,6 @@ impl DelegatedRunEntry {
         request: BeginDelegatedThreadRun,
     ) -> Result<ThreadRunStarted, AppError> {
         validate_request(&request)?;
-        if !self.runtime.single_user {
-            return Err(not_current());
-        }
         let grant = self
             .runtime
             .verify(&request.source, request.revision)
@@ -423,9 +420,6 @@ impl DelegationRuntime {
         &self,
         lease: &RunExecutionLease,
     ) -> Result<(AuthContext, DelegatedRunRecord), AppError> {
-        if !self.single_user {
-            return Err(not_current());
-        }
         let record = self
             .store
             .load_run(&self.deployment, &self.tenant, lease.run_id())

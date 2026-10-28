@@ -290,15 +290,11 @@ impl PostgresRunRuntime {
         }
     }
     async fn stage_terminal_notice(
-        &self,
-        transaction: &tokio_postgres::Transaction<'_>,
+        client: &tokio_postgres::Client,
         lease: &RunExecutionLease,
         receipt: &RunWriteReceipt,
     ) -> Result<Option<openbot_application::RunTerminalNotice>, RunRuntimeError> {
-        if self.terminal_delivery.is_none() || receipt.replayed {
-            return Ok(None);
-        }
-        let row=transaction.query_opt("SELECT t.deployment_id,t.tenant_id,r.status FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id WHERE r.run_id=$1 AND r.thread_id=$2 AND r.fencing_token=$3 AND r.terminal_event_seq=$4",&[&lease.run_id().as_str(),&lease.thread_id().as_str(),&lease.fencing().get(),&(receipt.run_event_sequence as i64)]).await.map_err(|e|unavailable("stage terminal identity",e))?;
+        let row=client.query_opt("SELECT t.deployment_id,t.tenant_id,r.status FROM public.runs r JOIN public.threads t ON t.thread_id=r.thread_id WHERE r.run_id=$1 AND r.thread_id=$2 AND r.fencing_token=$3 AND r.terminal_event_seq=$4",&[&lease.run_id().as_str(),&lease.thread_id().as_str(),&lease.fencing().get(),&(receipt.run_event_sequence as i64)]).await.map_err(|e|unavailable("stage terminal identity",e))?;
         let Some(row) = row else { return Ok(None) };
         let status: String = decode(&row, "status")?;
         let terminal = match status.as_str() {
@@ -321,11 +317,11 @@ impl PostgresRunRuntime {
             terminal,
         }))
     }
-    fn terminal_committed(
+    async fn terminal_committed(
         &self,
+        client: &tokio_postgres::Client,
         lease: &RunExecutionLease,
         receipt: &RunWriteReceipt,
-        notice: Option<openbot_application::RunTerminalNotice>,
     ) {
         if receipt.replayed {
             return;
@@ -337,7 +333,10 @@ impl PostgresRunRuntime {
         {
             runtime.retire_run(lease.run_id());
         }
-        if let (Some(delivery), Some(notice)) = (&self.terminal_delivery, notice) {
+        // The wake-up is read after commit and is lossy: a failed lookup never touches the terminal.
+        if let Some(delivery) = &self.terminal_delivery
+            && let Ok(Some(notice)) = Self::stage_terminal_notice(client, lease, receipt).await
+        {
             delivery.enqueue(notice);
         }
     }
@@ -405,12 +404,8 @@ impl PostgresRunRuntime {
             LeaseCheck::Active,
         )
         .await;
-        let notice = match &result {
-            Ok(receipt) => self.stage_terminal_notice(&tx, lease, receipt).await?,
-            Err(_) => None,
-        };
         let receipt = finish_transaction(tx, result).await?;
-        self.terminal_committed(lease, &receipt, notice);
+        self.terminal_committed(&client, lease, &receipt).await;
         Ok(receipt)
     }
 
@@ -470,15 +465,9 @@ impl RunRuntime for PostgresRunRuntime {
             .map_err(|error| unavailable("开始 unstarted cancellation 事务", error))?;
         let result =
             finish_unstarted_cancellation_in_transaction(&transaction, &self.owner_id, claim).await;
-        let notice = match &result {
-            Ok(receipt) => {
-                self.stage_terminal_notice(&transaction, claim.lease(), receipt)
-                    .await?
-            }
-            Err(_) => None,
-        };
         let receipt = finish_transaction(transaction, result).await?;
-        self.terminal_committed(claim.lease(), &receipt, notice);
+        self.terminal_committed(&client, claim.lease(), &receipt)
+            .await;
         Ok(receipt)
     }
 
@@ -546,15 +535,9 @@ impl RunRuntime for PostgresRunRuntime {
             .map_err(|error| unavailable("开始 dispatch reject 事务", error))?;
         let result =
             reject_dispatch_in_transaction(&transaction, &self.owner_id, claim, code).await;
-        let notice = match &result {
-            Ok(receipt) => {
-                self.stage_terminal_notice(&transaction, claim.lease(), receipt)
-                    .await?
-            }
-            Err(_) => None,
-        };
         let receipt = finish_transaction(transaction, result).await?;
-        self.terminal_committed(claim.lease(), &receipt, notice);
+        self.terminal_committed(&client, claim.lease(), &receipt)
+            .await;
         Ok(receipt)
     }
 
@@ -711,15 +694,8 @@ impl RunRuntime for PostgresRunRuntime {
             .await
         }
         .await;
-        let notice = match &result {
-            Ok(receipt) => {
-                self.stage_terminal_notice(&transaction, lease, receipt)
-                    .await?
-            }
-            Err(_) => None,
-        };
         let receipt = finish_transaction(transaction, result).await?;
-        self.terminal_committed(lease, &receipt, notice);
+        self.terminal_committed(&client, lease, &receipt).await;
         Ok(receipt)
     }
 
@@ -730,16 +706,9 @@ impl RunRuntime for PostgresRunRuntime {
             .await
             .map_err(|error| unavailable("开始 stale run recovery 事务", error))?;
         let result = recover_one_in_transaction(&transaction, &self.owner_id).await;
-        let notice = match &result {
-            Ok(Some((lease, receipt))) => {
-                self.stage_terminal_notice(&transaction, lease, receipt)
-                    .await?
-            }
-            _ => None,
-        };
         let result = finish_transaction(transaction, result).await?;
         if let Some((lease, receipt)) = result {
-            self.terminal_committed(&lease, &receipt, notice);
+            self.terminal_committed(&client, &lease, &receipt).await;
             Ok(Some(receipt))
         } else {
             Ok(None)

@@ -16,7 +16,7 @@ use openbot_agent::{
 };
 use openbot_application::*;
 use openbot_contracts::auth::{AuthContextBuilder, AuthGeneration, VerifiedDelegation};
-use openbot_contracts::command::{AppCommand, AppReply};
+use openbot_contracts::command::{AppCommand, AppReply, CancelThreadRun};
 use openbot_contracts::components::{
     ComponentApprovalAnswer, ComponentApprovalDecision, ComponentCatalogueRequest,
     ComponentDecisionRequest, ComponentHumanDecisionAnswer, ComponentHumanDecisionRequest,
@@ -901,4 +901,120 @@ async fn restart_remints_from_persisted_record_and_never_extends_deadline() {
             assert!(restarted.notices.0.lock().unwrap().is_empty());Ok(())
         }.await;close(restarted).await;result
     }).await;
+}
+
+/// Samples until stopped and counts provider stop requests.
+#[derive(Default)]
+struct Sampling {
+    starts: AtomicUsize,
+    stops: Arc<AtomicUsize>,
+}
+struct SamplingSession(Arc<AtomicUsize>);
+#[async_trait]
+impl ProviderSession for SamplingSession {
+    async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderPortError> {
+        std::future::pending().await
+    }
+    async fn request_stop(&mut self) -> Result<StopOutcome, ProviderPortError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(StopOutcome::Confirmed {
+            at: SystemTime::now(),
+        })
+    }
+}
+#[async_trait]
+impl ProviderAdapter for Sampling {
+    async fn start(
+        &self,
+        _: ProviderRequest,
+    ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(SamplingSession(self.stops.clone())))
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly injected fresh owned PostgreSQL 17.11"]
+async fn cancel_active_delegated_run_signals_local_child() {
+    with_temp_database(
+        &admin_config("delegated_cancel"),
+        "delegatedcancel",
+        |config| async move {
+            let p = Arc::new(Sampling::default());
+            let f = Fixture::with_options(
+                &config,
+                Options {
+                    extensions: vec![(
+                        ProviderExtensionKey::new("fake_host").map_err(text)?,
+                        p.clone(),
+                    )],
+                    ..Options::default()
+                },
+            )
+            .await?;
+            let r = begin(&f, "cancel-active").await?;
+            let context = PostgresAgentContextSource::new(
+                f.pool.clone(),
+                f.auth.deployment().clone(),
+                f.auth.tenant().clone(),
+                Some(32),
+            )
+            .map_err(text)?
+            .with_extensions(f.assembly.provider_extensions.clone());
+            let agent = BuiltInAgentRuntime::start(
+                f.assembly.run_runtime.clone(),
+                Arc::new(context),
+                Arc::new(
+                    ProviderRouter::new(Arc::new(Provider::default()), None)
+                        .with_extensions(f.assembly.provider_extensions.clone()),
+                ),
+                Arc::new(NoAgentToolInvoker),
+                Arc::new(NoAgentAudit),
+                BuiltInAgentConfig::default(),
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            let relay = RunRelay::start(f.assembly.run_runtime.clone(), agent.consumer());
+            let result: Result<(), String> = async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while p.starts.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(text)?;
+                f.assembly
+                    .application
+                    .execute(
+                        f.auth.clone(),
+                        AppCommand::CancelThreadRun(CancelThreadRun {
+                            thread_id: r.thread_id.clone(),
+                            run_id: r.run_id.clone(),
+                        }),
+                    )
+                    .await
+                    .map_err(text)?;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if row(&f, "cancel-active").await?.0 != "running" {
+                            return Ok::<_, String>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(text)??;
+                assert_eq!(row(&f, "cancel-active").await?.0, "cancelled");
+                // Only the signalled-child path stops the provider before the terminal is written;
+                // the unstarted path would write `cancelled` while the child kept sampling.
+                assert_eq!(p.stops.load(Ordering::SeqCst), 1);
+                Ok(())
+            }
+            .await;
+            relay.stop().await;
+            agent.stop().await;
+            close(f).await;
+            result
+        },
+    )
+    .await;
 }

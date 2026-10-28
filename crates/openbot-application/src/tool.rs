@@ -935,20 +935,11 @@ pub async fn invoke_tool<C: ToolControlPlane, J: ToolJournal>(
     auth: &AuthContext,
     invocation: ToolInvocation,
 ) -> Result<ToolResult, AppError> {
-    invoke_tool_inner(control, journal, auth, invocation, None).await
+    invoke_tool_guarded(control, journal, auth, invocation, None).await
 }
 
-pub(crate) async fn invoke_tool_with_delegation<C: ToolControlPlane, J: ToolJournal>(
-    control: &C,
-    journal: &J,
-    auth: &AuthContext,
-    invocation: ToolInvocation,
-    guard: &crate::delegation::DelegatedEffectGuard,
-) -> Result<ToolResult, AppError> {
-    invoke_tool_inner(control, journal, auth, invocation, Some(guard)).await
-}
-
-async fn invoke_tool_inner<C: ToolControlPlane, J: ToolJournal>(
+/// Same pipeline; a delegated Run passes its effect guard.
+pub(crate) async fn invoke_tool_guarded<C: ToolControlPlane, J: ToolJournal>(
     control: &C,
     journal: &J,
     auth: &AuthContext,

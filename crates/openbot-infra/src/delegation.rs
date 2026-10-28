@@ -22,7 +22,6 @@ pub(crate) struct PostgresDelegatedRunStore {
     directory: PostgresThreadDirectory,
     deployment: DeploymentId,
     tenant: TenantId,
-    single_user: bool,
     callback_runtime: OnceLock<Weak<crate::run_runtime::PostgresRunRuntime>>,
 }
 impl PostgresDelegatedRunStore {
@@ -31,14 +30,12 @@ impl PostgresDelegatedRunStore {
         directory: PostgresThreadDirectory,
         deployment: DeploymentId,
         tenant: TenantId,
-        single_user: bool,
     ) -> Self {
         Self {
             pool,
             directory,
             deployment,
             tenant,
-            single_user,
             callback_runtime: OnceLock::new(),
         }
     }
@@ -58,11 +55,7 @@ impl DelegatedRunStore for PostgresDelegatedRunStore {
         request: DelegatedBegin,
         issuer: &dyn DelegatedContextIssuer,
     ) -> Result<ThreadRunStarted, AppError> {
-        if request.deployment != self.deployment
-            || request.tenant != self.tenant
-            || request.single_user != self.single_user
-            || !self.single_user
-        {
+        if request.deployment != self.deployment || request.tenant != self.tenant {
             return Err(not_current());
         }
         self.directory.begin_delegated(request, issuer).await

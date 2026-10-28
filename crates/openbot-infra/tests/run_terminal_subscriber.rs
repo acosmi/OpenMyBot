@@ -281,10 +281,10 @@ async fn terminal_replay_and_unknown_commit_never_duplicate_notice() {
 
 #[tokio::test]
 #[ignore = "requires explicitly injected fresh owned PostgreSQL 17.11"]
-async fn slow_and_panicking_subscriber_cannot_delay_terminal_or_readers() {
+async fn panicking_subscriber_only_ends_lossy_delivery() {
     with_temp_database(
-        &admin_config("terminal_slow"),
-        "terminalslow",
+        &admin_config("terminal_panic"),
+        "terminalpanic",
         |config| async move {
             let gate = Arc::new(Gate {
                 panic_first: true,
@@ -298,12 +298,44 @@ async fn slow_and_panicking_subscriber_cannot_delay_terminal_or_readers() {
                 },
             )
             .await?;
-            let gate_release = GateReleaseGuard(gate.clone());
             let result: Result<(), String> = async {
                 finish(&f, "panic").await?;
                 wait_calls(&gate.calls, 1).await?;
+                // The worker thread is gone; later terminals still commit and are not delivered.
+                finish(&f, "after-panic").await?;
+                assert_eq!(status(&f, "after-panic").await?, ("completed".into(), 1));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+                Ok(())
+            }
+            .await;
+            close(f).await;
+            result
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly injected fresh owned PostgreSQL 17.11"]
+async fn slow_subscriber_cannot_delay_terminal_or_readers() {
+    with_temp_database(
+        &admin_config("terminal_slow"),
+        "terminalslow",
+        |config| async move {
+            let gate = Arc::new(Gate::default());
+            let f = Fixture::with_options(
+                &config,
+                Options {
+                    subscriber: Some(gate.clone()),
+                    ..Options::default()
+                },
+            )
+            .await?;
+            let gate_release = GateReleaseGuard(gate.clone());
+            let result: Result<(), String> = async {
                 finish(&f, "blocked").await?;
-                wait_calls(&gate.calls, 2).await?;
+                wait_calls(&gate.calls, 1).await?;
                 // Overflow the real bounded worker queue while its consumer is gated.
                 let mut remaining = Duration::from_secs(30);
                 let mut terminal_elapsed = Duration::ZERO;
@@ -378,7 +410,7 @@ async fn slow_and_panicking_subscriber_cannot_delay_terminal_or_readers() {
                         return Err(format!("phase=durable_check index={n} completed={completed} terminal_elapsed_ms={} remaining_ms={}", terminal_elapsed.as_millis(), remaining.as_millis()));
                     }
                 }
-                assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(status(&f, "queue-139").await?, ("completed".into(), 1));
                 let reply = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -393,7 +425,7 @@ async fn slow_and_panicking_subscriber_cannot_delay_terminal_or_readers() {
                     reply,
                     openbot_contracts::command::AppReply::CurrentUser(_)
                 ));
-                assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
                 Ok(())
             }
             .await;
