@@ -727,7 +727,7 @@ mod tests {
     use openbot_contracts::{
         auth::DelegationSource,
         command::{AppEvent, SubscriptionRequest, ThreadRunEventKind},
-        ids::BotId,
+        ids::{BotId, thread::ThreadIdentity},
         reconciliation::RunReconciliationStatus,
     };
     use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
@@ -2006,7 +2006,8 @@ mod tests {
         assert_eq!(after["granted_generation"], before["granted_generation"]);
         let thread = after["thread_id"].as_str().unwrap();
         assert_ne!(thread, before["thread_id"].as_str().unwrap());
-        let AppReply::ThreadStatus(status) = execute(
+        // A minted thread without runs is not yet known, but the engine reads it; an unminted id is refused.
+        let AppReply::ThreadStatus(_) = execute(
             env.ops.application.as_ref(),
             &env.ops.resolver,
             AppCommand::GetThreadStatus {
@@ -2017,7 +2018,7 @@ mod tests {
         .unwrap() else {
             panic!("status reply");
         };
-        assert!(status.known);
+        assert!(ThreadIdentity::is_plausible(&ThreadId::new(thread)));
         assert_eq!(
             testkit::read_row(&env.client, "channel_events", "record_id", old).await,
             old_row
@@ -2638,7 +2639,12 @@ mod tests {
         let mut env = Env::start().await;
         let binding = suspended_receiver(&mut env, "1001:reconfirm-token").await;
         let before = env.rows().await;
-        env.verified(2002);
+        // A refused bot id ends the check before getWebhookInfo, so only getMe is scripted.
+        env.fake.script(
+            "getMe",
+            200,
+            br#"{"ok":true,"result":{"id":2002,"is_bot":true,"first_name":"Bot"}}"#.to_vec(),
+        );
         assert_eq!(
             env.call(
                 "bindings_reconfirm",

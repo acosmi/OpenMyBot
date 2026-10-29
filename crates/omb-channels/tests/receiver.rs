@@ -1065,7 +1065,15 @@ async fn cancel_request(env: &mut Env) -> Uuid {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn cancel_command_sends_the_binding_id_after_commit() {
     let mut env = Env::new().await;
-    insert_event_for_run(env.client(), env.sender, "r1", "thread-A", "dispatched").await;
+    let run = insert_event_for_run(env.client(), env.sender, "r1", "thread-A", "dispatched").await;
+    // The receiver resumes from the latest event key of its bot, so the run's event needs an update id.
+    env.client()
+        .execute(
+            "UPDATE openmybot.channel_events SET event_key='0' WHERE record_id=$1",
+            &[&run],
+        )
+        .await
+        .unwrap();
     env.fake.push_update(text(1, "/cancel"));
     let task = env.start().await;
     assert_eq!(cancel_request(&mut env).await, env.sender);
