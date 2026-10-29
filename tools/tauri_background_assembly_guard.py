@@ -216,11 +216,19 @@ def _origin(tokens: list[str], name: str, before: int) -> tuple[str, int | None]
     """Follow visible `let name = other;` aliases back to the `let` that introduced the value.
 
     Only bindings in the scope enclosing `before` count; a `let` inside an already closed block
-    (dead or not) is invisible there. The position, not the name, identifies the value.
+    (dead or not) is invisible there. A macro call group (`name! { … }`) is not a block: its
+    statements may expand into the enclosing scope, so its braces stay transparent. The position,
+    not the name, identifies the value.
     """
 
+    transparent = set()
+    for index in range(1, before):
+        if tokens[index] == "{" and tokens[index - 1] == "!":
+            transparent.update((index, _paired(tokens, index, "{", "}")))
     nested = 0
     for index in range(before - 1, -1, -1):
+        if index in transparent:
+            continue
         if tokens[index] == "}":
             nested += 1
             continue
@@ -850,8 +858,11 @@ def _check_owner_closing(tokens: list[str]) -> None:
         raise GuardError("non-database timeout result is not retained")
     timeout_result = run[let_at + 2]
     match_at = _unique(run, ("match", timeout_result, "{"), "non-database timeout match")
-    rebound_at = _origin(run, timeout_result, match_at)[1]
-    if rebound_at is not None and rebound_at > let_at:
+    if any(
+        run[index] == "let"
+        and run[index + 2 if run[index + 1] == "mut" else index + 1] == timeout_result
+        for index in range(let_at + 1, match_at)
+    ):
         raise GuardError("non-database timeout result is rebound before its projection")
     match_close = _paired(run, match_at + 2, "{", "}")
     observed_arms: dict[tuple[str, ...], str] = {}

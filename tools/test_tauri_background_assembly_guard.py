@@ -241,6 +241,20 @@ REVIEWED_MUTATIONS = {
             + "    let deadline = widened + Duration::from_secs(3600);\n",
         )
     ],
+    # Review v2: the timeout result name cannot be rebound at all, and macro call groups are
+    # transparent to the enclosing scope.
+    "M34 timeout result replaced through an alias": [
+        (OUTER_JOIN, "    let fake_result = Ok::<bool, ()>(true);\n" + OUTER_JOIN),
+        (PROJECTION, "    let non_database = fake_result;\n" + PROJECTION),
+    ],
+    "M35 database result shadowed inside a statement macro": [
+        (
+            "async fn run_owned_local_closing_job(",
+            "macro_rules! stmts { ($($t:tt)*) => { $($t)* }; }\n\n"
+            "async fn run_owned_local_closing_job(",
+        ),
+        (FINISH, "    stmts! { let database_ok = true; }\n" + FINISH),
+    ],
 }
 
 
