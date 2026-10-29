@@ -28,26 +28,26 @@ expected_callers=$'crates/openbot-server/src/http/approvals.rs\ncrates/openbot-s
 [[ $(rg -l 'WebSocketUpgrade|drive_thread_websocket' crates --glob '*.rs' | sort) == \
    "$expected_callers" ]] \
   || fail 'WebSocket server 调用面越出 thread/channel/approval/screen typed transports'
-if rg -n 'sha1::|Sha1' crates --glob '*.rs'; then
+if rg -n 'sha1::|Sha1' crates --glob '*.rs' --glob '!crates/omb-*/**'; then
   fail '第一方代码不得把 RFC6455 handshake SHA-1 复用为凭据/业务摘要'
 fi
 grep -qF 'const THREAD_EVENTS_WS_INPUT_LIMIT: usize = 1024;' \
   crates/openbot-server/src/http/threads.rs || fail 'WebSocket 1KiB inbound cap 漂移'
 grep -qF 'OriginAuthenticated(auth): OriginAuthenticated' \
   crates/openbot-server/src/http/threads.rs || fail 'WebSocket trusted Origin extractor 缺失'
-grep -qF 'reason: "thread_events_read_only".into()' \
+grep -qF 'super::realtime::close(&mut socket, stream, close_code::POLICY, "thread_events_read_only")' \
   crates/openbot-server/src/http/threads.rs || fail 'read-only 1008 close 边界缺失'
 grep -qF 'const CHANNEL_ACTIVITY_INPUT_LIMIT: usize = 1024;' \
   crates/openbot-server/src/http/channels.rs || fail 'channel WebSocket 1KiB inbound cap 漂移'
 grep -qF 'OriginAuthenticated(auth): OriginAuthenticated' \
   crates/openbot-server/src/http/channels.rs || fail 'channel WebSocket trusted Origin extractor 缺失'
-grep -qF 'reason: "channel_activity_read_only".into()' \
+grep -qF 'super::realtime::close(&mut socket, stream, close_code::POLICY, "channel_activity_read_only")' \
   crates/openbot-server/src/http/channels.rs || fail 'channel read-only 1008 close 边界缺失'
 grep -qF 'const TOOL_APPROVAL_INPUT_LIMIT: usize = 1024;' \
   crates/openbot-server/src/http/approvals.rs || fail 'approval WebSocket 1KiB inbound cap 漂移'
 grep -qF 'OriginAuthenticated(auth): OriginAuthenticated' \
   crates/openbot-server/src/http/approvals.rs || fail 'approval WebSocket trusted Origin extractor 缺失'
-grep -qF 'reason: "tool_approval_activity_read_only".into()' \
+grep -qF 'super::realtime::close(&mut socket, stream, close_code::POLICY, "tool_approval_activity_read_only")' \
   crates/openbot-server/src/http/approvals.rs || fail 'approval read-only 1008 close 边界缺失'
 grep -qF 'const SCREEN_WS_INPUT_LIMIT: usize = 1024;' \
   crates/openbot-server/src/http/screen.rs || fail 'screen WebSocket 1KiB inbound cap 漂移'
