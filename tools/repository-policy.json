@@ -88,6 +88,7 @@
     "openmybot/README.zh-CN.md",
     "openmybot/compat/README.md",
     "openmybot/compat/crabcode/1.1.16.md",
+    "openmybot/compat/feishu/long-connection.md",
     "openmybot/hosts/README.md",
     "openmybot/hosts/crabcode/skills/openmybot/SKILL.md",
     "supply-chain/README.md",
