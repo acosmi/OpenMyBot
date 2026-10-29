@@ -212,6 +212,21 @@ def _bound_name(tokens: list[str], at: int) -> str | None:
     return None
 
 
+def _origin(tokens: list[str], name: str, before: int) -> tuple[str, int | None]:
+    """Follow `let name = other;` aliases back to the binding that introduced the value."""
+
+    for index in range(before - 1, -1, -1):
+        cursor = index + 2 if tokens[index + 1:index + 2] == ["mut"] else index + 1
+        if tokens[index] != "let" or tokens[cursor:cursor + 1] != [name]:
+            continue
+        rhs = tokens[cursor + 1:cursor + 4]
+        if len(rhs) == 3 and rhs[0] == "=" and rhs[1].isidentifier() and rhs[2] == ";":
+            name = rhs[1]
+            continue
+        return name, index
+    return name, None
+
+
 def _conjunction(tokens: list[str]) -> list[str] | None:
     """Identifiers of a pure `a && b && …` expression, otherwise None."""
 
@@ -679,7 +694,15 @@ def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) 
         (index + 1 for index, token in enumerate(after_join) if token == ";"),
         default=0,
     )
-    if _strip_parentheses(after_join[final_start:]) != [transport_result, ".", "within_deadline"]:
+    transport_value = [transport_result, ".", "within_deadline"]
+    final = _strip_parentheses(after_join[final_start:])
+    if len(final) == 1:
+        origin, let_at = _origin(after_join, final[0], final_start)
+        if let_at is not None and _matches(
+            after_join, let_at, ("let", origin, "=", *transport_value, ";")
+        ):
+            final = transport_value
+    if final != transport_value:
         raise GuardError("the transport deadline result no longer gates non-database success")
 
 
@@ -754,7 +777,10 @@ def _check_owner_closing(tokens: list[str]) -> None:
     }
     if fields.get("owner") != ["owner"] or fields.get("deadline") != ["deadline"]:
         raise GuardError("owned closing job no longer carries the owner and shared deadline")
-    if authority_result not in (_conjunction(fields.get("startup_ok", [])) or []):
+    if authority_result not in {
+        _origin(start, term, literal_at)[0]
+        for term in _conjunction(fields.get("startup_ok", [])) or []
+    }:
         raise GuardError("authority revocation result no longer gates shutdown success")
 
     # Job: deadline-bounded non-database stage, then the independent database stage.
@@ -775,13 +801,23 @@ def _check_owner_closing(tokens: list[str]) -> None:
     )
     timeout_close = _paired(run, timeout_at + 5, "(", ")")
     timeout_arguments = _split_arguments(run[timeout_at + 6:timeout_close])
-    if len(timeout_arguments) != 2 or timeout_arguments[0] != [
-        "tokio", "::", "time", "::", "Instant", "::", "from_std", "(", "deadline", ")",
-    ]:
+    if (
+        len(timeout_arguments) != 2
+        or timeout_arguments[0][:8]
+        != ["tokio", "::", "time", "::", "Instant", "::", "from_std", "("]
+        or len(timeout_arguments[0]) != 10
+        or timeout_arguments[0][9] != ")"
+        or _origin(run, timeout_arguments[0][8], timeout_at) != ("deadline", None)
+    ):
         raise GuardError("non-database timeout no longer uses the shared closing deadline")
-    if len(timeout_arguments[1]) != 1 or timeout_arguments[1][0] not in blocks:
+    stage = (
+        _origin(run, timeout_arguments[1][0], timeout_at)[0]
+        if len(timeout_arguments[1]) == 1
+        else None
+    )
+    if stage not in blocks:
         raise GuardError("non-database stage no longer runs inside the reviewed timeout")
-    _check_non_database_stage(blocks[timeout_arguments[1][0]], aliases)
+    _check_non_database_stage(blocks[stage], aliases)
 
     joins = [
         index
@@ -813,26 +849,41 @@ def _check_owner_closing(tokens: list[str]) -> None:
         raise GuardError("non-database timeout success/failure projection drift")
     non_database_ok = _bound_name(run, match_at)
 
-    database_at = _unique(
-        run,
-        ("match", "owner", ".", "data_plane", ".", "take", "(", ")", "{"),
-        "database owner match",
-    )
+    plane = ("owner", ".", "data_plane", ".", "take", "(", ")")
+    database_matches = []
+    for index, token in enumerate(run):
+        if token != "match" or depths[index] != 0:
+            continue
+        scrutinee = _strip_parentheses(run[index + 1:run.index("{", index + 1)])
+        if len(scrutinee) == 1:
+            origin, let_at = _origin(run, scrutinee[0], index)
+            if let_at is None or not _matches(run, let_at, ("let", origin, "=", *plane, ";")):
+                continue
+        elif tuple(scrutinee) != plane:
+            continue
+        database_matches.append(index)
+    if len(database_matches) != 1:
+        raise GuardError("database stage must retain one top-level data-plane owner match")
+    database_at = database_matches[0]
     if database_at <= join_close:
         raise GuardError("database shutdown ran before the non-database stage completed")
     if depths[database_at] != 0:
         raise GuardError("database shutdown became conditional on a prior stage")
     if any(token in {"return", "break", "continue", "?", "panic"} for token in run[:database_at]):
         raise GuardError("an early exit can skip the independent database shutdown stage")
-    database_close = _paired(run, database_at + 8, "{", "}")
-    _check_database_arms(run[database_at + 9:database_close])
+    database_open = run.index("{", database_at + 1)
+    database_close = _paired(run, database_open, "{", "}")
+    _check_database_arms(run[database_open + 1:database_close])
     database_ok = _bound_name(run, database_at)
 
+    finish_at = _unique(run, ("completion", ".", "finish", "("), "shutdown completion")
     finish = _call_arguments(run, ("completion", ".", "finish", "("), "shutdown completion")
     terms = _conjunction(finish[0]) if len(finish) == 1 else None
-    if terms is None or not {"startup_ok", non_database_ok, database_ok} <= set(terms):
+    if terms is None or not {"startup_ok", non_database_ok, database_ok} <= {
+        _origin(run, term, finish_at)[0] for term in terms
+    }:
         raise GuardError("shutdown success must require every stage result")
-    succeeded = _bound_name(run, _unique(run, ("completion", ".", "finish", "("), "completion"))
+    succeeded = _bound_name(run, finish_at)
     reply = _call_arguments(run, ("reply", ".", "send", "("), "shutdown reply")
     if succeeded is None or reply != [[
         "if", succeeded, "{", "Ok", "(", "(", ")", ")", "}",
