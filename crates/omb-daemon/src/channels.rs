@@ -1228,7 +1228,7 @@ mod tests {
     /// reconciliation; its notice is consumed here, so no sender sees it.
     async fn unconfirmed(fixture: &mut Fixture, client: &Client) -> (Uuid, Run) {
         let mut terminals = fixture.take_terminals();
-        let (binding, thread) = rt::sender(fixture, client).await;
+        let (binding, thread) = rt::sender(fixture, client, "telegram").await;
         let run = rt::begun(fixture, client, binding, &thread).await;
         agent::initialized(client, &run.run).await;
         cancel_run(fixture, &run).await;
@@ -1351,13 +1351,15 @@ mod tests {
         drop(fixture.take_terminals());
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let (binding, thread) = rt::sender(&fixture, &client).await;
-        let done = rt::begun(&fixture, &client, binding, &thread).await;
+        // One sender per channel: the host resolves a binding's oldest run without a terminal.
+        let (telegram, thread) = rt::sender(&fixture, &client, "telegram").await;
+        let done = rt::begun(&fixture, &client, telegram, &thread).await;
         agent::settled(&fixture, &thread).await;
-        let stopped = rt::begun(&fixture, &client, binding, &thread).await;
+        let (feishu, other) = rt::sender(&fixture, &client, "feishu").await;
+        let stopped = rt::begun(&fixture, &client, feishu, &other).await;
         agent::initialized(&client, &stopped.run).await;
         cancel_run(&fixture, &stopped).await;
-        agent::settled(&fixture, &thread).await;
+        agent::settled(&fixture, &other).await;
         for run in [&done, &stopped] {
             assert!(rt::event(&client, &run.run).await["terminal_kind"].is_null());
         }
@@ -1632,7 +1634,7 @@ mod tests {
         let client = fixture.client().await;
         let fake = FakeTelegram::start().await;
         rt::sealed(&fixture, &client).await;
-        let (binding, thread) = rt::sender(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
         let engine = fixture.engine.as_ref().unwrap();
         let channels = Channels::start(
@@ -1687,7 +1689,7 @@ mod tests {
         let client = fixture.client().await;
         let fake = FakeTelegram::start().await;
         rt::sealed(&fixture, &client).await;
-        let (binding, thread) = rt::sender(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
         let engine = fixture.engine.as_ref().unwrap();
         let channels = Channels::start(
@@ -1741,7 +1743,7 @@ mod tests {
         let client = fixture.client().await;
         let fake = FakeTelegram::start().await;
         rt::sealed(&fixture, &client).await;
-        let (binding, thread) = rt::sender(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let run = rt::begun(&fixture, &client, binding, &thread).await;
         let id = rt::permission_of(&client, &run.run).await;
         let body: String = client
@@ -1796,7 +1798,7 @@ mod tests {
         let mut client = fixture.client().await;
         let fake = FakeTelegram::start().await;
         rt::sealed(&fixture, &client).await;
-        let (binding, thread) = rt::sender(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
         let engine = fixture.engine.as_ref().unwrap();
         let channels = Channels::start(
@@ -1830,12 +1832,12 @@ mod tests {
             "reconciliation_required"
         );
         // A later message of the same sender stays pending on the paused thread.
-        fake.push_update(update(1, "after the unknown stop"));
-        let later = event_by_key(&client, "1").await;
+        fake.push_update(update(2, "after the unknown stop"));
+        let later = event_by_key(&client, "2").await;
         assert_eq!(later["thread_id"], thread.as_str());
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(
-            event_by_key(&client, "1").await["dispatch_status"],
+            event_by_key(&client, "2").await["dispatch_status"],
             "pending"
         );
         // Moved to a fresh thread, it is dispatched.
@@ -1849,10 +1851,10 @@ mod tests {
         )
         .await
         .unwrap();
-        fake.push_update(update(2, "on the new thread"));
+        fake.push_update(update(3, "on the new thread"));
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            let moved = event_by_key(&client, "1").await;
+            let moved = event_by_key(&client, "2").await;
             if moved["dispatch_status"] == "dispatched" {
                 assert_eq!(moved["thread_id"], fresh.as_str());
                 break;
@@ -1860,8 +1862,6 @@ mod tests {
             assert!(tokio::time::Instant::now() < limit, "{moved}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        channels.stop().await;
-        runtime.stop().await;
         let sessions = client
             .query(
                 "SELECT row_to_json(h) FROM openmybot.host_driver_sessions h WHERE record_kind='session' AND pgid IS NOT NULL",
@@ -1872,6 +1872,8 @@ mod tests {
         for row in sessions {
             kill_group(&row.get(0));
         }
+        channels.stop().await;
+        runtime.stop().await;
         drop(client);
         fixture.stop().await;
     }

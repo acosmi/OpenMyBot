@@ -359,9 +359,13 @@ pub(crate) mod tests {
         };
         minted.thread_id
     }
-    /// An active Telegram sender on receiver source `1001` and chat `telegram:42`, on the
+    /// An active sender of `channel` on receiver source `1001` and chat `<channel>:42`, on the
     /// fixture's workspace, a freshly minted thread and the owner's current generation.
-    pub(crate) async fn sender(fixture: &Fixture, client: &Client) -> (Uuid, ThreadId) {
+    pub(crate) async fn sender(
+        fixture: &Fixture,
+        client: &Client,
+        channel: &str,
+    ) -> (Uuid, ThreadId) {
         let thread = mint(fixture).await;
         let workspace = fixture.root.join("home/ws");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -376,10 +380,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         let binding = Uuid::now_v7();
-        client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender','telegram','1001','telegram:42','telegram:42',$2,$3,$4,1,'active',statement_timestamp(),statement_timestamp())", &[&binding, &workspace.to_str().unwrap(), &thread.as_str(), &generation]).await.unwrap();
+        let identity = format!("{channel}:42");
+        client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$5,'1001',$6,$6,$2,$3,$4,1,'active',statement_timestamp(),statement_timestamp())", &[&binding, &workspace.to_str().unwrap(), &thread.as_str(), &generation, &channel, &identity]).await.unwrap();
         (binding, thread)
     }
-    /// A dispatched accepted message of the binding, begun through the delegated entry.
+    /// A dispatched accepted message of the binding, begun through the delegated entry. Its
+    /// event key is the next update id of the binding's channel and source, as a running
+    /// receiver reads the latest key as its offset.
     pub(crate) async fn begun(
         fixture: &Fixture,
         client: &Client,
@@ -387,10 +394,8 @@ pub(crate) mod tests {
         thread: &ThreadId,
     ) -> Run {
         let run = format!("run-{}", Uuid::now_v7());
-        let record =
-            testkit::insert_event_for_run(client, binding, &run, thread.as_str(), "dispatched")
-                .await;
-        testkit::shift_event(client, record, "dispatched_at", 0.0).await;
+        let record = Uuid::now_v7();
+        assert_eq!(client.execute("INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status,dispatched_at) SELECT $1,'event',b.channel_kind,b.source_key,(SELECT count(*)+1 FROM openmybot.channel_events e WHERE e.record_kind='event' AND e.channel_kind=b.channel_kind AND e.source_key=b.source_key)::text,statement_timestamp(),b.binding_id,'accepted_message','test message',sha256('test message'::bytea),$3,$4,'dispatched',statement_timestamp() FROM openmybot.channel_bindings b WHERE b.binding_id=$2", &[&record, &binding, &run, &thread.as_str()]).await.unwrap(), 1);
         fixture
             .engine()
             .assembly
@@ -487,7 +492,7 @@ pub(crate) mod tests {
     async fn finished(fixture: &mut Fixture, client: &Client) -> (Uuid, Run) {
         drop(fixture.take_terminals());
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
-        let (binding, thread) = sender(fixture, client).await;
+        let (binding, thread) = sender(fixture, client, "telegram").await;
         let run = begun(fixture, client, binding, &thread).await;
         agent::settled(fixture, &thread).await;
         runtime.stop().await;
@@ -708,7 +713,7 @@ pub(crate) mod tests {
         let mut fixture = Fixture::start_with_host(asking).await;
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
         let mut client = fixture.client().await;
-        let (binding, thread) = sender(&fixture, &client).await;
+        let (binding, thread) = sender(&fixture, &client, "telegram").await;
         let run = begun(&fixture, &client, binding, &thread).await;
         permission_of(&client, &run.run).await;
         let engine = fixture.engine();
