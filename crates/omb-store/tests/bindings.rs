@@ -44,7 +44,7 @@ async fn pending_sender(client: &mut Client) -> Uuid {
     .binding_id
 }
 /// Pairs a sender through the real store path and returns the active binding.
-async fn active_sender(client: &mut Client, _receiver: Uuid) -> Uuid {
+async fn active_sender(client: &mut Client) -> Uuid {
     let started = pair_start(
         client,
         PairStart {
@@ -211,7 +211,7 @@ async fn revoke_is_terminal_clears_secrets_and_cancels_pending_events() {
     revoke_binding(&mut session.client, pending, deadline())
         .await
         .unwrap();
-    let sender = active_sender(&mut session.client, receiver).await;
+    let sender = active_sender(&mut session.client).await;
     let other = host(&mut session.client).await.unwrap();
     let mine = pending_event(&session.client, sender, "run-1").await;
     let theirs = pending_event(&session.client, other, "run-2").await;
@@ -311,7 +311,7 @@ async fn authority_row_returns_only_active_sender_or_host() {
     revoke_binding(&mut session.client, pending, deadline())
         .await
         .unwrap();
-    let sender = active_sender(&mut session.client, receiver).await;
+    let sender = active_sender(&mut session.client).await;
     assert_eq!(
         authority_row(&session.client, sender).await.unwrap(),
         Some(AuthorityRow {

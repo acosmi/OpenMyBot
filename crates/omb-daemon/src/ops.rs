@@ -2006,19 +2006,7 @@ mod tests {
         assert_eq!(after["granted_generation"], before["granted_generation"]);
         let thread = after["thread_id"].as_str().unwrap();
         assert_ne!(thread, before["thread_id"].as_str().unwrap());
-        // A minted thread without runs is not yet known, but the engine reads it; an unminted id is refused.
-        let AppReply::ThreadStatus(_) = execute(
-            env.ops.application.as_ref(),
-            &env.ops.resolver,
-            AppCommand::GetThreadStatus {
-                thread_id: ThreadId::new(thread),
-            },
-        )
-        .await
-        .unwrap() else {
-            panic!("status reply");
-        };
-        assert!(ThreadIdentity::is_plausible(&ThreadId::new(thread)));
+        assert!(ThreadIdentity::new(&env.fixture.engine().deployment).owns(&ThreadId::new(thread)));
         assert_eq!(
             testkit::read_row(&env.client, "channel_events", "record_id", old).await,
             old_row

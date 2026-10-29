@@ -11,12 +11,12 @@ use testkit::{
 use tokio_postgres::Client;
 use uuid::Uuid;
 
-async fn setup() -> (Fixture, Session, Uuid) {
+async fn setup() -> (Fixture, Session) {
     let mut fixture = Fixture::new().await;
     let mut session = fixture.connect().await;
     migrate(&mut session.client, deadline()).await.unwrap();
-    let receiver = insert_receiver(&session.client, "telegram", "1001").await;
-    (fixture, session, receiver)
+    insert_receiver(&session.client, "telegram", "1001").await;
+    (fixture, session)
 }
 async fn start(client: &mut Client, channel: Channel) -> Result<PairStarted, StoreError> {
     pair_start(
@@ -35,7 +35,6 @@ async fn start(client: &mut Client, channel: Channel) -> Result<PairStarted, Sto
 async fn attempt(
     client: &mut Client,
     channel: Channel,
-    _receiver: Uuid,
     sender: &str,
     code: &str,
     event_key: &str,
@@ -110,13 +109,12 @@ async fn status(client: &Client, id: Uuid) -> (String, Option<String>) {
         .unwrap();
     (row.get(0), row.get(1))
 }
-async fn fail_five(client: &mut Client, receiver: Uuid, sender: &str, prefix: &str) {
+async fn fail_five(client: &mut Client, sender: &str, prefix: &str) {
     for index in 1..=5 {
         assert_eq!(
             attempt(
                 client,
                 Channel::Telegram,
-                receiver,
                 sender,
                 "WRONG000",
                 &format!("{prefix}{index}")
@@ -130,7 +128,7 @@ async fn fail_five(client: &mut Client, receiver: Uuid, sender: &str, prefix: &s
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_start_writes_pending_row_with_hash_expiry_and_grant_fields() {
-    let (fixture, mut session, _) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
     let row = session.client.query_one("SELECT binding_kind,channel_kind,source_key,workspace_dir,thread_id,granted_generation,run_deadline_seconds,status,sender_key IS NULL,revision,pairing_code_hash,extract(epoch FROM pairing_expires_at-created_at)::float8,pairing_expires_at,row_to_json(b)::text FROM openmybot.channel_bindings b WHERE binding_id=$1", &[&started.binding_id]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "sender");
@@ -199,14 +197,13 @@ async fn pair_start_requires_active_receiver() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_start_refuses_active_or_suspended_sender() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
     let code = started.code.display();
     assert!(matches!(
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             &code,
             "1"
@@ -238,7 +235,7 @@ async fn pair_start_refuses_active_or_suspended_sender() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_start_supersedes_existing_pending_row() {
-    let (fixture, mut session, _) = setup().await;
+    let (fixture, mut session) = setup().await;
     let first = start(&mut session.client, Channel::Telegram).await.unwrap();
     let second = start(&mut session.client, Channel::Telegram).await.unwrap();
     let row = session.client.query_one("SELECT status,status_reason,pairing_code_hash IS NULL,ended_at IS NOT NULL FROM openmybot.channel_bindings WHERE binding_id=$1", &[&first.binding_id]).await.unwrap();
@@ -257,14 +254,13 @@ async fn pair_start_supersedes_existing_pending_row() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_attempt_success_activates_with_revision_1_and_reply_delivery() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
     let typed = started.code.display().to_lowercase().replace('-', " - ");
     assert_eq!(
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:42",
             &typed,
             "100"
@@ -310,14 +306,13 @@ async fn pair_attempt_success_activates_with_revision_1_and_reply_delivery() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_code_is_single_use() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
     let code = started.code.display();
     assert!(matches!(
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             &code,
             "1"
@@ -330,7 +325,6 @@ async fn pair_code_is_single_use() {
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:2",
             &code,
             "2"
@@ -354,14 +348,13 @@ async fn pair_code_is_single_use() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn wrong_code_records_pairing_failed_without_reply() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
     let before = binding(&session.client, started.binding_id).await;
     assert_eq!(
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             "WRONG000",
             "1"
@@ -392,12 +385,11 @@ async fn wrong_code_records_pairing_failed_without_reply() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn no_pending_row_records_pairing_failed() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     assert_eq!(
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             "ABCD2345",
             "1"
@@ -426,14 +418,13 @@ async fn no_pending_row_records_pairing_failed() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn expired_pending_row_fails_and_becomes_expired_in_same_transaction() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
     set_pairing_expires_at(&session.client, started.binding_id, -1.0).await;
     assert_eq!(
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             &started.code.display(),
             "1"
@@ -457,9 +448,9 @@ async fn expired_pending_row_fails_and_becomes_expired_in_same_transaction() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn five_failures_lock_for_60_minutes_after_the_fifth_without_comparing_code() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
-    fail_five(&mut session.client, receiver, "telegram:1", "f").await;
+    fail_five(&mut session.client, "telegram:1", "f").await;
     // The newest failure is 59 minutes old: still inside the lock.
     for (index, key) in ["f1", "f2", "f3", "f4", "f5"].into_iter().enumerate() {
         set_accepted_at(&session.client, key, -3580.0 + 10.0 * index as f64).await;
@@ -469,7 +460,6 @@ async fn five_failures_lock_for_60_minutes_after_the_fifth_without_comparing_cod
             attempt(
                 &mut session.client,
                 Channel::Telegram,
-                receiver,
                 "telegram:1",
                 &started.code.display(),
                 key
@@ -497,9 +487,9 @@ async fn five_failures_lock_for_60_minutes_after_the_fifth_without_comparing_cod
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn lock_lifts_after_60_minutes_even_if_five_failures_remain_in_rolling_window() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
-    fail_five(&mut session.client, receiver, "telegram:1", "f").await;
+    fail_five(&mut session.client, "telegram:1", "f").await;
     for (key, offset) in [
         ("f1", -6900.0),
         ("f2", -6000.0),
@@ -513,7 +503,6 @@ async fn lock_lifts_after_60_minutes_even_if_five_failures_remain_in_rolling_win
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             &started.code.display(),
             "ok"
@@ -530,14 +519,13 @@ async fn lock_lifts_after_60_minutes_even_if_five_failures_remain_in_rolling_win
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn spread_failures_and_locked_rows_do_not_trigger_lock() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
-    fail_five(&mut session.client, receiver, "telegram:1", "f").await;
+    fail_five(&mut session.client, "telegram:1", "f").await;
     assert_eq!(
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             &started.code.display(),
             "locked"
@@ -552,7 +540,6 @@ async fn spread_failures_and_locked_rows_do_not_trigger_lock() {
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:1",
             &started.code.display(),
             "ok"
@@ -569,8 +556,8 @@ async fn spread_failures_and_locked_rows_do_not_trigger_lock() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pending_row_is_selected_by_arriving_channel() {
-    let (fixture, mut session, telegram) = setup().await;
-    let feishu = insert_receiver(&session.client, "feishu", "cli_app").await;
+    let (fixture, mut session) = setup().await;
+    insert_receiver(&session.client, "feishu", "cli_app").await;
     let on_telegram = start(&mut session.client, Channel::Telegram).await.unwrap();
     let on_feishu = start(&mut session.client, Channel::Feishu).await.unwrap();
     let feishu_code = on_feishu.code.display();
@@ -578,7 +565,6 @@ async fn pending_row_is_selected_by_arriving_channel() {
         attempt(
             &mut session.client,
             Channel::Telegram,
-            telegram,
             "telegram:1",
             &feishu_code,
             "1"
@@ -594,7 +580,6 @@ async fn pending_row_is_selected_by_arriving_channel() {
         attempt(
             &mut session.client,
             Channel::Feishu,
-            feishu,
             "feishu:ou_1",
             &feishu_code,
             "1"
@@ -615,7 +600,7 @@ async fn pending_row_is_selected_by_arriving_channel() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn concurrent_pair_attempts_with_same_code_succeed_once() {
-    let (mut fixture, mut session, receiver) = setup().await;
+    let (mut fixture, mut session) = setup().await;
     let mut a = fixture.connect().await;
     let mut b = fixture.connect().await;
     let mut c = fixture.connect().await;
@@ -635,7 +620,6 @@ async fn concurrent_pair_attempts_with_same_code_succeed_once() {
             attempt(
                 &mut a.client,
                 Channel::Telegram,
-                receiver,
                 &senders[0],
                 &code,
                 &keys[0]
@@ -643,7 +627,6 @@ async fn concurrent_pair_attempts_with_same_code_succeed_once() {
             attempt(
                 &mut b.client,
                 Channel::Telegram,
-                receiver,
                 &senders[1],
                 &code,
                 &keys[1]
@@ -651,7 +634,6 @@ async fn concurrent_pair_attempts_with_same_code_succeed_once() {
             attempt(
                 &mut c.client,
                 Channel::Telegram,
-                receiver,
                 &senders[2],
                 &code,
                 &keys[2]
@@ -659,7 +641,6 @@ async fn concurrent_pair_attempts_with_same_code_succeed_once() {
             attempt(
                 &mut d.client,
                 Channel::Telegram,
-                receiver,
                 &senders[3],
                 &code,
                 &keys[3]
@@ -693,7 +674,7 @@ async fn concurrent_pair_attempts_with_same_code_succeed_once() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_attempt_changes_roll_back_with_the_callers_transaction() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session) = setup().await;
     let started = start(&mut session.client, Channel::Telegram).await.unwrap();
     let before = snapshot(&session.client).await;
     let sender = IdentityKey::parse("telegram:42").unwrap();
@@ -737,7 +718,6 @@ async fn pair_attempt_changes_roll_back_with_the_callers_transaction() {
         attempt(
             &mut session.client,
             Channel::Telegram,
-            receiver,
             "telegram:42",
             &code,
             "1"
@@ -754,7 +734,7 @@ async fn pair_attempt_changes_roll_back_with_the_callers_transaction() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_attempt_writes_occurred_at_and_event_type_columns() {
-    let (fixture, mut session, _) = setup().await;
+    let (fixture, mut session) = setup().await;
     start(&mut session.client, Channel::Telegram).await.unwrap();
     let sender = IdentityKey::parse("telegram:42").unwrap();
     let occurred = time::OffsetDateTime::from_unix_timestamp(1_793_202_187).unwrap();

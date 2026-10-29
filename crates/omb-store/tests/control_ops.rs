@@ -2,9 +2,9 @@
 use omb_store::{
     AcceptOutcome, AcceptedEvent, Channel, Claim, Command, Content, Disposition, IdentityKey,
     NewReceiver, NormalizedEvent, OpenRun, PairAttempt, PairOutcome, PairStart, ReplyTexts,
-    ResetDone, SessionStart, StateLabels, StoreError, accept_event, activate_host,
+    ResetDone, SessionStart, StateLabels, StoreError, Suspension, accept_event, activate_host,
     activate_receiver, claim_dispatch, list_bindings, migrate, open_run, pair_attempt, pair_start,
-    receiver_row, reset_thread, revoke_binding, run_facts,
+    receiver_row, reset_thread, revoke_binding, run_facts, suspend_receiver,
     testkit::{
         Fixture, Session, deadline, insert_event_for_run, insert_host_binding,
         insert_permission_row, insert_receiver, insert_receiver_with, insert_sender,
@@ -176,9 +176,27 @@ async fn list_bindings_returns_live_rows_only_without_secret_columns() {
         .await
         .unwrap();
     let host = insert_host_binding(env.client(), "/workspaces/host").await;
+    let suspended = Uuid::now_v7();
+    insert_receiver_with(
+        env.client(),
+        suspended,
+        "feishu",
+        "cli_a",
+        "envelope-sentinel",
+    )
+    .await;
+    suspend_receiver(
+        &mut env.session.client,
+        suspended,
+        Suspension::CredentialRejected,
+        deadline(),
+    )
+    .await
+    .unwrap();
     let listed = list_bindings(env.client(), deadline()).await.unwrap();
     let ids: Vec<Uuid> = listed.iter().map(|view| view.binding_id).collect();
-    assert_eq!(ids, [host, receiver, pending]);
+    assert_eq!(ids, [host, suspended, receiver, pending]);
+    assert_eq!(listed[1].status, "suspended");
     assert!(!ids.contains(&expired) && !ids.contains(&revoked));
     let hash: Vec<u8> = env
         .client()
@@ -205,7 +223,7 @@ async fn list_bindings_returns_live_rows_only_without_secret_columns() {
             assert!(!text.as_bytes().windows(hash.len()).any(|w| w == hash));
         }
     }
-    let view = &listed[2];
+    let view = &listed[3];
     assert_eq!(
         (
             view.binding_kind.as_str(),

@@ -75,7 +75,8 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
     let mut data_dir = None;
     let mut json = false;
     let mut words = Vec::new();
-    let mut flags: Vec<(&str, &OsString)> = Vec::new();
+    // Each subcommand flag remembers how many command words preceded it.
+    let mut flags: Vec<(&str, &OsString, usize)> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].to_str().ok_or(UsageError)? {
@@ -84,12 +85,15 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
             flag if flag.starts_with("--") => {
                 index += 1;
                 let value = args.get(index).ok_or(UsageError)?;
+                if value.as_encoded_bytes().starts_with(b"--") {
+                    return Err(UsageError);
+                }
                 if flag == "--data-dir" && data_dir.is_none() {
                     data_dir = Some(absolute(value)?);
-                } else if flag == "--data-dir" || flags.iter().any(|(name, _)| *name == flag) {
+                } else if flag == "--data-dir" || flags.iter().any(|(name, ..)| *name == flag) {
                     return Err(UsageError);
                 } else {
-                    flags.push((flag, value));
+                    flags.push((flag, value, words.len()));
                 }
             }
             word => words.push(word),
@@ -104,14 +108,18 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["bindings", "receiver", "feishu"] => &["--app-id"],
         _ => &[],
     };
-    if flags.iter().any(|(name, _)| !allowed.contains(name)) {
+    // Subcommand flags are legal only after all command words.
+    if flags
+        .iter()
+        .any(|(name, _, at)| !allowed.contains(name) || *at != words.len())
+    {
         return Err(UsageError);
     }
     let flag = |name: &str| {
         flags
             .iter()
-            .find(|(flag, _)| *flag == name)
-            .map(|(_, value)| *value)
+            .find(|(flag, ..)| *flag == name)
+            .map(|(_, value, _)| *value)
     };
     let text = |name: &str| {
         flag(name)
@@ -292,6 +300,7 @@ impl SecretLine {
         let mut line = Vec::new();
         reader
             .by_ref()
+            // The 512-byte limit plus 3: room for a `\r\n` ending and one more byte, so an over-long line is detected.
             .take(515)
             .read_until(b'\n', &mut line)
             .map_err(|_| UsageError)?;
@@ -543,6 +552,10 @@ mod tests {
             vec!["bindings", "receiver", "telegram", "token"],
             vec!["status", "--unknown", "x"],
             vec!["cancel", "r1", "r2"],
+            vec!["--workspace", "/ws", "pair", "telegram"],
+            vec!["bindings", "reset-thread", "--ack-unknown", "r1", "b1"],
+            vec!["--pg-bin-dir", "/pg", "init"],
+            vec!["status", "--run", "--json"],
         ] {
             assert_eq!(command(&values), Err(UsageError), "{values:?}");
         }

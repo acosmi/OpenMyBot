@@ -261,7 +261,8 @@ async fn handle_with_uid(stream: &mut UnixStream, state: Arc<ControlState>, obse
             Ok(request) => match (Op::parse(&request.op), &state.ops) {
                 (None, _) => error_response(DaemonError::OpNotAllowed),
                 (Some(_), None) => error_response(DaemonError::InternalError),
-                // The operation runs to completion: every await inside is bounded by the deadline.
+                // The operation runs to completion and is never dropped here. Its store calls carry the
+                // deadline; waits for the control lock and engine calls are not bounded by it.
                 (Some(op), Some(ops)) => result_response(
                     ops.run(
                         op,
