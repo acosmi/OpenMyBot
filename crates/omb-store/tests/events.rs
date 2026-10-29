@@ -2,8 +2,11 @@
 use omb_store::{
     AcceptOutcome, Channel, Command, Content, Disposition, IdentityKey, NormalizedEvent, PairStart,
     PollGapReason, ReplyTexts, StateLabels, StoreError, accept_event, latest_update_id,
-    list_active_receivers, migrate, open_poll_gap, pair_start,
-    testkit::{Fixture, Session, deadline, insert_receiver, insert_sender, shift_event},
+    list_active_receivers, migrate, open_poll_gap, pair_start, receiver_row,
+    testkit::{
+        Fixture, Session, deadline, insert_receiver, insert_receiver_with, insert_sender,
+        shift_event,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -1274,5 +1277,49 @@ async fn list_active_receivers_returns_only_active_rows_of_the_channel() {
             "{status}"
         );
     }
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn receiver_rows_carry_the_channel_of_their_channel_kind() {
+    let env = Env::new().await;
+    let feishu = Uuid::now_v7();
+    insert_receiver_with(
+        &env.session.client,
+        feishu,
+        "feishu",
+        "cli_app",
+        "feishu-envelope",
+    )
+    .await;
+    let listed = list_active_receivers(&env.session.client, Channel::Feishu)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].binding_id, feishu);
+    assert_eq!(listed[0].channel, Channel::Feishu);
+    let listed = list_active_receivers(&env.session.client, Channel::Telegram)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].binding_id, env.receiver);
+    assert_eq!(listed[0].channel, Channel::Telegram);
+    for (id, channel) in [(feishu, Channel::Feishu), (env.receiver, Channel::Telegram)] {
+        let row = receiver_row(&env.session.client, id, deadline())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.channel, channel);
+    }
+    env.session.client.execute("UPDATE openmybot.channel_bindings SET status=$2,status_reason=$3,suspended_at=statement_timestamp(),ended_at=CASE WHEN $2='revoked' THEN statement_timestamp() END WHERE binding_id=$1", &[&feishu, &"suspended", &"credential_rejected"]).await.unwrap();
+    let row = receiver_row(&env.session.client, feishu, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.channel, Channel::Feishu);
+    let rendered = format!("{row:?}");
+    assert!(rendered.contains("channel: Feishu"), "{rendered}");
+    assert!(!rendered.contains("feishu-envelope"), "{rendered}");
     env.stop().await;
 }

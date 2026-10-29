@@ -347,6 +347,7 @@ pub async fn latest_update_id(
 
 pub struct ReceiverRow {
     pub binding_id: Uuid,
+    pub channel: Channel,
     pub source_key: String,
     pub credential_envelope: String,
 }
@@ -354,6 +355,7 @@ impl core::fmt::Debug for ReceiverRow {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ReceiverRow")
             .field("binding_id", &self.binding_id)
+            .field("channel", &self.channel)
             .field("source_key", &self.source_key)
             .field("credential_envelope", &"[REDACTED]")
             .finish()
@@ -370,6 +372,7 @@ pub async fn list_active_receivers(
         .map(|row| {
             Ok(ReceiverRow {
                 binding_id: row.try_get(0).map_err(|_| error)?,
+                channel,
                 source_key: row.try_get(1).map_err(|_| error)?,
                 credential_envelope: row.try_get(2).map_err(|_| error)?,
             })
@@ -384,14 +387,16 @@ pub async fn receiver_row(
     deadline: Instant,
 ) -> Result<Option<ReceiverRow>, StoreError> {
     let error = StoreError::EventFailed;
-    rows(client, "SELECT binding_id,source_key,credential_envelope FROM openmybot.channel_bindings WHERE binding_id=$1 AND binding_kind='receiver' AND status IN ('active','suspended')", &[&binding_id], deadline, error)
+    rows(client, "SELECT binding_id,channel_kind,source_key,credential_envelope FROM openmybot.channel_bindings WHERE binding_id=$1 AND binding_kind='receiver' AND status IN ('active','suspended')", &[&binding_id], deadline, error)
         .await?
         .first()
         .map(|row| {
             Ok(ReceiverRow {
                 binding_id: row.try_get(0).map_err(|_| error)?,
-                source_key: row.try_get(1).map_err(|_| error)?,
-                credential_envelope: row.try_get(2).map_err(|_| error)?,
+                channel: Channel::parse(row.try_get::<_, &str>(1).map_err(|_| error)?)
+                    .ok_or(error)?,
+                source_key: row.try_get(2).map_err(|_| error)?,
+                credential_envelope: row.try_get(3).map_err(|_| error)?,
             })
         })
         .transpose()
@@ -595,11 +600,8 @@ pub async fn channel_status(client: &Client) -> Result<Vec<ReceiverStatus>, Stor
         .iter()
         .map(|row| {
             let binding_id: Uuid = row.try_get(0).map_err(|_| error)?;
-            let channel = match row.try_get::<_, &str>(1).map_err(|_| error)? {
-                "telegram" => Channel::Telegram,
-                "feishu" => Channel::Feishu,
-                _ => return Err(error),
-            };
+            let channel =
+                Channel::parse(row.try_get::<_, &str>(1).map_err(|_| error)?).ok_or(error)?;
             Ok(ReceiverStatus {
                 channel,
                 binding_id,
