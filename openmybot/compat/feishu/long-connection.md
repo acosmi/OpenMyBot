@@ -38,7 +38,7 @@ Check date (UTC): 2026-10-29. The three commits above were rechecked on that dat
 | URL shape | `wss://<host>/<path>?device_id=<id>&service_id=<n>`; the complete URL is never logged or recorded |
 | URL checks | Parseable, scheme `ws` or `wss`, non-empty host, no userinfo, no fragment; production accepts `wss` only; the shape is checked by the safe dialer and a failure is a `connect_failed` gap |
 | `device_id` | Connection id, not used by this project |
-| `service_id` | Decimal int32 from the raw query value; empty or invalid gives 0; used as `service` of every ping frame |
+| `service_id` | Decimal int32 from the first form-decoded query value, as the Go SDK reads it; empty or invalid gives 0; used as `service` of every ping frame |
 | Message and frame size | WebSocket single message and single frame at most 1 MiB |
 | Connect time limit | 15 seconds for TCP connect, TLS and upgrade together |
 | Outbound path | Only through the safe dialer (resolution, address policy, TLS); the daemon never listens on TCP |

@@ -227,15 +227,10 @@ pub(crate) fn endpoint_reply(result: Result<(u16, &[u8]), SafeHttpError>) -> End
     else {
         return EndpointReply::ConnectFailed;
     };
-    // The raw query value: `+5` stays `+5` rather than becoming a form-decoded space.
     let service = url
-        .query()
-        .and_then(|query| {
-            query
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("service_id="))
-        })
-        .and_then(|value| value.parse::<i32>().ok())
+        .query_pairs()
+        .find(|(key, _)| key == "service_id")
+        .and_then(|(_, value)| value.parse::<i32>().ok())
         .unwrap_or(0);
     let ping = body
         .pointer("/data/ClientConfig")
@@ -1052,7 +1047,7 @@ mod tests {
             ("&service_id=x", 0),
             ("&service_id=2147483648", 0),
             ("&service_id=-3", -3),
-            ("&service_id=+5", 5),
+            ("&service_id=+5", 0),
             ("&service_id=1&service_id=2", 1),
         ] {
             assert_eq!(service_of(&format!("{base}{query}")), service, "{query}");
