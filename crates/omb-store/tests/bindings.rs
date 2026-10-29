@@ -44,7 +44,7 @@ async fn pending_sender(client: &mut Client) -> Uuid {
     .binding_id
 }
 /// Pairs a sender through the real store path and returns the active binding.
-async fn active_sender(client: &mut Client, receiver: Uuid) -> Uuid {
+async fn active_sender(client: &mut Client, _receiver: Uuid) -> Uuid {
     let started = pair_start(
         client,
         PairStart {
@@ -65,7 +65,7 @@ async fn active_sender(client: &mut Client, receiver: Uuid) -> Uuid {
         &tx,
         PairAttempt {
             channel: Channel::Telegram,
-            receiver_binding_id: receiver,
+            receiver_source_key: "1001",
             sender_key: &sender,
             chat_key: &chat,
             code_text: &started.code.display(),

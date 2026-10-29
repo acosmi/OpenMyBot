@@ -24,7 +24,7 @@ use tokio::{
 const READY: Duration = Duration::from_secs(30);
 const STOP: Duration = Duration::from_secs(30);
 
-fn map_store_error(error: omb_store::StoreError) -> DaemonError {
+pub(crate) fn map_store_error(error: omb_store::StoreError) -> DaemonError {
     match error {
         omb_store::StoreError::MigrationDrift => DaemonError::OmbMigrationDrift,
         omb_store::StoreError::SchemaNewer => DaemonError::OmbSchemaNewer,
@@ -594,40 +594,6 @@ impl Postgres {
             return Err(DaemonError::BindingFailed);
         }
         result
-    }
-    pub async fn pair_start(
-        &mut self,
-        input: omb_store::PairStart<'_>,
-    ) -> Result<omb_store::PairStarted, DaemonError> {
-        self.binding_call(async |client, deadline| {
-            omb_store::pair_start(client, input, deadline).await
-        })
-        .await
-    }
-    pub async fn revoke_binding(&mut self, binding_id: uuid::Uuid) -> Result<(), DaemonError> {
-        self.binding_call(async |client, deadline| {
-            omb_store::revoke_binding(client, binding_id, deadline).await
-        })
-        .await
-    }
-    pub async fn reconfirm_binding(
-        &mut self,
-        binding_id: uuid::Uuid,
-        granted_generation: u64,
-    ) -> Result<u64, DaemonError> {
-        self.binding_call(async |client, deadline| {
-            omb_store::reconfirm_binding(client, binding_id, granted_generation, deadline).await
-        })
-        .await
-    }
-    pub async fn activate_host(
-        &mut self,
-        input: omb_store::HostBinding<'_>,
-    ) -> Result<uuid::Uuid, DaemonError> {
-        self.binding_call(async |client, deadline| {
-            omb_store::activate_host(client, input, deadline).await
-        })
-        .await
     }
     pub(crate) async fn create_database(&mut self) -> Result<(), DaemonError> {
         let connection = self.connect("postgres", Instant::now() + READY).await?;

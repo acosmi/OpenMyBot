@@ -34,9 +34,10 @@ pub const TG_RESPONSE_MAX: usize = 8 * 1024 * 1024;
 /// Deadline of the tasks' own store writes.
 const STORE_BUDGET: Duration = Duration::from_secs(2);
 
-pub const OMB_REPLY_HELP_V1: &str = "OpenMyBot 已就绪。直接发送消息即可在绑定的工作区内开始一轮工作。命令：/status 查看当前状态，/help 显示本说明。";
+pub const OMB_REPLY_HELP_V1: &str = "OpenMyBot 已就绪。直接发送消息即可在绑定的工作区内开始一轮工作。命令：/status 查看当前状态，/cancel 取消当前任务，/help 显示本说明。";
 pub const OMB_REPLY_STATUS_V1: &str = "绑定：{channel} 已激活，工作区 {dir}。最近一轮：{state}。待处理：{pending} 条。最近中断：{gap}。";
-pub const OMB_REPLY_CANCEL_UNAVAILABLE_V1: &str = "取消暂不可用。";
+pub const OMB_REPLY_CANCEL_REQUESTED_V1: &str = "已请求取消当前任务。";
+pub const OMB_REPLY_CANCEL_NONE_V1: &str = "当前没有进行中的任务。";
 pub const OMB_REJECT_OUTSIDE_WINDOW_V1: &str = "消息时间超出接收窗口，未处理。";
 pub const OMB_REJECT_TOO_LONG_V1: &str = "消息过长，未处理。";
 pub const OMB_REJECT_UNSUPPORTED_V1: &str = "仅支持文本消息，未处理。";
@@ -59,7 +60,8 @@ pub const OMB_REPLY_TEXTS_V1: ReplyTexts<'static> = ReplyTexts {
     help: OMB_REPLY_HELP_V1,
     already_bound: OMB_REPLY_ALREADY_BOUND_V1,
     unknown_command: OMB_REPLY_UNKNOWN_COMMAND_V1,
-    cancel_unavailable: OMB_REPLY_CANCEL_UNAVAILABLE_V1,
+    cancel_requested: OMB_REPLY_CANCEL_REQUESTED_V1,
+    cancel_none: OMB_REPLY_CANCEL_NONE_V1,
     status: OMB_REPLY_STATUS_V1,
     states: OMB_STATE_LABELS_V1,
     outside_window: OMB_REJECT_OUTSIDE_WINDOW_V1,
@@ -67,6 +69,10 @@ pub const OMB_REPLY_TEXTS_V1: ReplyTexts<'static> = ReplyTexts {
     unsupported: OMB_REJECT_UNSUPPORTED_V1,
     queue_full: OMB_REJECT_QUEUE_FULL_V1,
 };
+/// Capacity of the `/cancel` hand-off from the receiver to the daemon's run canceller.
+pub const CANCEL_QUEUE: usize = 16;
+/// The narrow handle a receiver holds: it passes only the binding id of a committed `/cancel`.
+pub type CancelRequests = tokio::sync::mpsc::Sender<Uuid>;
 /// Status note of the Telegram receiver.
 pub const CHANNEL_NOTE: &str = "telegram 长轮询";
 
@@ -205,5 +211,21 @@ mod tests {
         assert_eq!(TG_POLL_LIMIT, 100);
         assert_eq!(TG_OFFSET_STALE, Duration::from_secs(6 * 24 * 3600));
         assert_eq!(TG_RESPONSE_MAX, 8 * 1024 * 1024);
+    }
+    #[test]
+    fn reply_constants_and_help_text_are_fixed() {
+        assert_eq!(
+            OMB_REPLY_HELP_V1,
+            "OpenMyBot 已就绪。直接发送消息即可在绑定的工作区内开始一轮工作。命令：/status 查看当前状态，/cancel 取消当前任务，/help 显示本说明。"
+        );
+        assert_eq!(OMB_REPLY_CANCEL_REQUESTED_V1, "已请求取消当前任务。");
+        assert_eq!(OMB_REPLY_CANCEL_NONE_V1, "当前没有进行中的任务。");
+        assert_eq!(
+            OMB_REPLY_TEXTS_V1.cancel_requested,
+            OMB_REPLY_CANCEL_REQUESTED_V1
+        );
+        assert_eq!(OMB_REPLY_TEXTS_V1.cancel_none, OMB_REPLY_CANCEL_NONE_V1);
+        assert_eq!(OMB_REPLY_TEXTS_V1.help, OMB_REPLY_HELP_V1);
+        assert_eq!(CANCEL_QUEUE, 16);
     }
 }

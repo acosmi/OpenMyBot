@@ -310,7 +310,7 @@ mod tests {
         .unwrap()
     }
     async fn sender(client: &mut Client, run_deadline: Option<RunDeadline>) -> Uuid {
-        let receiver = fixture::receiver(client, "telegram").await;
+        fixture::receiver(client, "telegram").await;
         let started = pending(client, run_deadline).await;
         let key = IdentityKey::parse("telegram:42").unwrap();
         let tx = client.transaction().await.unwrap();
@@ -318,7 +318,7 @@ mod tests {
             &tx,
             PairAttempt {
                 channel: Channel::Telegram,
-                receiver_binding_id: receiver,
+                receiver_source_key: "1001",
                 sender_key: &key,
                 chat_key: &key,
                 code_text: &started.code.display(),

@@ -35,7 +35,7 @@ async fn start(client: &mut Client, channel: Channel) -> Result<PairStarted, Sto
 async fn attempt(
     client: &mut Client,
     channel: Channel,
-    receiver: Uuid,
+    _receiver: Uuid,
     sender: &str,
     code: &str,
     event_key: &str,
@@ -52,7 +52,7 @@ async fn attempt(
         &tx,
         PairAttempt {
             channel,
-            receiver_binding_id: receiver,
+            receiver_source_key: source_key,
             sender_key: &sender,
             chat_key: &chat,
             code_text: code,
@@ -703,7 +703,7 @@ async fn pair_attempt_changes_roll_back_with_the_callers_transaction() {
         &tx,
         PairAttempt {
             channel: Channel::Telegram,
-            receiver_binding_id: receiver,
+            receiver_source_key: "1001",
             sender_key: &sender,
             chat_key: &sender,
             code_text: &code,
@@ -754,7 +754,7 @@ async fn pair_attempt_changes_roll_back_with_the_callers_transaction() {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pair_attempt_writes_occurred_at_and_event_type_columns() {
-    let (fixture, mut session, receiver) = setup().await;
+    let (fixture, mut session, _) = setup().await;
     start(&mut session.client, Channel::Telegram).await.unwrap();
     let sender = IdentityKey::parse("telegram:42").unwrap();
     let occurred = time::OffsetDateTime::from_unix_timestamp(1_793_202_187).unwrap();
@@ -767,7 +767,7 @@ async fn pair_attempt_writes_occurred_at_and_event_type_columns() {
             &tx,
             PairAttempt {
                 channel: Channel::Telegram,
-                receiver_binding_id: receiver,
+                receiver_source_key: "1001",
                 sender_key: &sender,
                 chat_key: &sender,
                 code_text: "WRONG000",

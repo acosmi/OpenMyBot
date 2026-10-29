@@ -1,7 +1,8 @@
 //! Telegram Bot API long polling: boundary parsing, fingerprints, offsets and the receive loop.
 use crate::{
-    ChannelError, Connection, Counters, OMB_REPLY_TEXTS_V1, STORE_BUDGET, TG_HTTP_MARGIN,
-    TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, Task, TelegramEndpoint, Timings,
+    CancelRequests, ChannelError, Connection, Counters, OMB_REPLY_TEXTS_V1, STORE_BUDGET,
+    TG_HTTP_MARGIN, TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, Task, TelegramEndpoint,
+    Timings,
 };
 use omb_store::{
     ACCEPT_TX_BUDGET, AcceptOutcome, Channel, Command, Content, Disposition, IdentityKey,
@@ -247,6 +248,7 @@ pub struct ReceiverContext {
     pub timings: Timings,
     pub counters: Arc<Counters>,
     pub wake: Arc<Notify>,
+    pub cancel: CancelRequests,
 }
 
 /// Starts the long-poll loop of one active receiver.
@@ -385,6 +387,11 @@ async fn receive(
                                 }
                                 Ok(AcceptOutcome::Recorded(Disposition::AcceptedMessage)) => {
                                     context.wake.notify_one();
+                                    true
+                                }
+                                // Sent only after commit; a closed channel means the daemon is stopping.
+                                Ok(AcceptOutcome::Cancel(binding)) => {
+                                    let _ = context.cancel.send(binding).await;
                                     true
                                 }
                                 Ok(_) => true,

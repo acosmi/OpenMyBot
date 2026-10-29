@@ -1,8 +1,9 @@
-use omb_cli::{Command, exit_code, parse_args};
+use omb_cli::{Command, SecretLine, exit_code, parse_args};
 use omb_daemon::{
-    DaemonError, DaemonOptions, DataDirectoryInput, InitOptions, StatusOptions, resolve_data_dir,
+    CallOptions, DaemonError, DaemonOptions, DataDirectoryInput, InitOptions, StatusOptions,
+    resolve_data_dir,
 };
-use std::{ffi::OsString, path::PathBuf, process::ExitCode};
+use std::{ffi::OsString, io::IsTerminal, path::PathBuf, process::ExitCode};
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -14,6 +15,19 @@ async fn main() -> ExitCode {
         }
     };
     let json = invocation.json;
+    // The secret is read before any connection; it never travels in argv or the environment.
+    let secret = if invocation.command.reads_secret() {
+        let stdin = std::io::stdin();
+        match SecretLine::read(&mut stdin.lock(), stdin.is_terminal()) {
+            Ok(secret) => Some(secret),
+            Err(_) => {
+                output_error("invalid_arguments", json);
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
     let result: Result<serde_json::Value, DaemonError> = async {
         let data_dir = resolve_data_dir(DataDirectoryInput {
             explicit: invocation.data_dir,
@@ -33,9 +47,20 @@ async fn main() -> ExitCode {
                 omb_daemon::daemon(DaemonOptions { data_dir }).await?;
                 Ok(serde_json::json!({}))
             }
-            Command::Status => {
+            Command::Status { run: None } => {
                 serde_json::to_value(omb_daemon::status(StatusOptions { data_dir }).await?)
                     .map_err(|_| DaemonError::InternalError)
+            }
+            command => {
+                let (op, args) = command
+                    .control_request(secret)
+                    .ok_or(DaemonError::InternalError)?;
+                omb_daemon::call(CallOptions {
+                    data_dir,
+                    op: op.into(),
+                    args,
+                })
+                .await
             }
         }
     }

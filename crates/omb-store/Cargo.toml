@@ -61,3 +61,7 @@ required-features = ["testkit"]
 [[test]]
 name = "host_sessions"
 required-features = ["testkit"]
+
+[[test]]
+name = "control_ops"
+required-features = ["testkit"]

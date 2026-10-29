@@ -27,7 +27,8 @@ const REPLIES: ReplyTexts<'static> = ReplyTexts {
     help: "R-help",
     already_bound: "R-already-bound",
     unknown_command: "R-unknown",
-    cancel_unavailable: "R-cancel",
+    cancel_requested: "R-cancel-requested",
+    cancel_none: "R-cancel-none",
     status: "{channel}|{dir}|{state}|{pending}|{gap}",
     states: STATES,
     outside_window: "R-window",
@@ -791,17 +792,20 @@ async fn control_commands_record_command_and_one_reply_each_without_run() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn cancel_records_cancel_command_and_replies_unavailable_text() {
+async fn cancel_command_with_only_pending_events_replies_none_and_leaves_them() {
     let mut env = Env::new().await;
-    env.sender().await;
+    let binding = env.sender().await;
     env.accept(&text("9", "work")).await;
-    env.accept(&command("10", "/cancel", Command::Cancel)).await;
+    assert_eq!(
+        env.accept(&command("10", "/cancel", Command::Cancel)).await,
+        AcceptOutcome::Cancel(binding)
+    );
     assert_eq!(row(&env.session.client, "10").await["command"], "cancel");
     let replies = replies(&env.session.client).await;
     assert_eq!(replies.len(), 1);
     assert_eq!(
         (replies[0].0.as_str(), replies[0].2.as_str()),
-        ("control_reply", "R-cancel")
+        ("control_reply", "R-cancel-none")
     );
     assert_eq!(
         row(&env.session.client, "9").await["dispatch_status"],
