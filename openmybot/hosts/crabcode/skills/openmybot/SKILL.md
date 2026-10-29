@@ -27,7 +27,7 @@ A failed call returns an error result whose text is one code:
 - `operation_conflict` and `run_not_terminal`: described with the tools above.
 - `invalid_request`: an argument is missing, unknown or outside its limits.
 - `nested_delegation_refused`: this process was started by OpenMyBot itself and cannot start further runs.
-- `request_timeout`, `internal_error`: the daemon did not answer in time or failed; the owner can check `openmybot status`.
+- `request_timeout`, `binding_failed`, `internal_error`: the daemon did not answer in time or failed; the owner can check `openmybot status`.
 
 ## Setup
 

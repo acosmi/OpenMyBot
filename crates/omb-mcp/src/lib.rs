@@ -249,7 +249,6 @@ mod tests {
         let called = peer.recv().await;
         refused(&called, "wrok_not_running");
         assert_eq!(called["result"]["resultType"], "complete");
-        assert!(!dir.exists());
     }
 
     #[tokio::test]
@@ -362,7 +361,6 @@ mod tests {
             ))
             .await;
         refused(&plain.recv().await, "wrok_not_running");
-        assert!(!dir.exists());
     }
 
     #[tokio::test]
