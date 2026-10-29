@@ -336,3 +336,83 @@ pub async fn answer_permission(
 ) -> Result<(), StoreError> {
     update(client, "UPDATE openmybot.host_driver_sessions SET answered_at=statement_timestamp() WHERE record_kind='permission' AND permission_id=$1 AND decision IS NOT NULL RETURNING record_id", &[&permission_id], deadline).await
 }
+
+/// The stored facts of one dispatched or pending run, as the owner inspects it.
+pub struct RunFacts {
+    pub binding_id: Uuid,
+    pub kind: GrantKind,
+    pub thread_id: String,
+    pub dispatch_status: String,
+    pub terminal_kind: Option<String>,
+    pub session: Option<SessionFacts>,
+    /// Ordered by request time.
+    pub permissions: Vec<PermissionFacts>,
+}
+pub struct SessionFacts {
+    pub end_reason: Option<String>,
+    pub stop_outcome: Option<String>,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<i32>,
+    pub started_at: OffsetDateTime,
+    pub ended_at: Option<OffsetDateTime>,
+}
+pub struct PermissionFacts {
+    pub permission_id: String,
+    pub tool_name: String,
+    pub input_summary: Option<String>,
+    pub requested_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+    pub decision: Option<String>,
+    pub decided_via: Option<String>,
+}
+/// The event, session and permission rows of a run; `None` when no event carries the run.
+pub async fn run_facts(
+    client: &Client,
+    run_id: &str,
+    deadline: Instant,
+) -> Result<Option<RunFacts>, StoreError> {
+    let event = rows(client, "SELECT e.binding_id,b.binding_kind='host',e.thread_id,e.dispatch_status,e.terminal_kind FROM openmybot.channel_events e JOIN openmybot.channel_bindings b ON b.binding_id=e.binding_id WHERE e.run_id=$1", &[&run_id], deadline, ERROR).await?;
+    let Some(event) = event.first() else {
+        return Ok(None);
+    };
+    let session = rows(client, "SELECT end_reason,stop_outcome,exit_code,exit_signal,started_at,ended_at FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id=$1", &[&run_id], deadline, ERROR).await?;
+    let permissions = rows(client, "SELECT permission_id,tool_name,input_summary,requested_at,expires_at,decision,decided_via FROM openmybot.host_driver_sessions WHERE record_kind='permission' AND run_id=$1 ORDER BY requested_at,record_id", &[&run_id], deadline, ERROR).await?;
+    Ok(Some(RunFacts {
+        binding_id: event.try_get(0).map_err(|_| ERROR)?,
+        kind: if event.try_get::<_, bool>(1).map_err(|_| ERROR)? {
+            GrantKind::Host
+        } else {
+            GrantKind::Sender
+        },
+        thread_id: event.try_get(2).map_err(|_| ERROR)?,
+        dispatch_status: event.try_get(3).map_err(|_| ERROR)?,
+        terminal_kind: event.try_get(4).map_err(|_| ERROR)?,
+        session: session
+            .first()
+            .map(|row| {
+                Ok(SessionFacts {
+                    end_reason: row.try_get(0).map_err(|_| ERROR)?,
+                    stop_outcome: row.try_get(1).map_err(|_| ERROR)?,
+                    exit_code: row.try_get(2).map_err(|_| ERROR)?,
+                    exit_signal: row.try_get(3).map_err(|_| ERROR)?,
+                    started_at: row.try_get(4).map_err(|_| ERROR)?,
+                    ended_at: row.try_get(5).map_err(|_| ERROR)?,
+                })
+            })
+            .transpose()?,
+        permissions: permissions
+            .iter()
+            .map(|row| {
+                Ok(PermissionFacts {
+                    permission_id: row.try_get(0).map_err(|_| ERROR)?,
+                    tool_name: row.try_get(1).map_err(|_| ERROR)?,
+                    input_summary: row.try_get(2).map_err(|_| ERROR)?,
+                    requested_at: row.try_get(3).map_err(|_| ERROR)?,
+                    expires_at: row.try_get(4).map_err(|_| ERROR)?,
+                    decision: row.try_get(5).map_err(|_| ERROR)?,
+                    decided_via: row.try_get(6).map_err(|_| ERROR)?,
+                })
+            })
+            .collect::<Result<_, StoreError>>()?,
+    }))
+}

@@ -100,7 +100,7 @@ impl AgentRuntime {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::delegation::{BOT_ID, fixture::Fixture};
     use omb_hostdriver::{HostDriverConfig, Limits, VersionWindow, WorkspaceRoots};
@@ -124,7 +124,7 @@ mod tests {
     use uuid::Uuid;
 
     /// The in-repository fake host binary, built by the hostdriver crate's testkit feature.
-    fn fake() -> PathBuf {
+    pub(crate) fn fake() -> PathBuf {
         let path = PathBuf::from(
             std::env::var_os("OMB_TEST_FAKE_CRABCODE")
                 .expect("OMB_TEST_FAKE_CRABCODE: absolute path of the fake host binary"),
@@ -132,18 +132,27 @@ mod tests {
         assert!(path.is_absolute());
         path
     }
-    /// A host driver on `<root>/home/ws` whose fake plays `scenario`.
-    fn host(root: &Path, scenario: &str, limits: Limits) -> HostDriverConfig {
+    /// A host driver on the root's `home/ws` whose fake plays `scenario` with `extra_env` added.
+    pub(crate) fn host(
+        root: &Path,
+        scenario: &str,
+        limits: Limits,
+        extra_env: &[(&str, &str)],
+    ) -> HostDriverConfig {
         let home = root.join("home");
         let workspace = home.join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
+        let mut environment = serde_json::json!({
+            "FAKE_CRABCODE_SCENARIO": scenario,
+            "FAKE_CRABCODE_REPORT": home.join("report.jsonl"),
+        });
+        for (name, value) in extra_env {
+            environment[*name] = serde_json::json!(value);
+        }
         let window = serde_json::json!({"accepted": [{
             "version": "1.1.16",
             "extra_args": [],
-            "extra_env": {
-                "FAKE_CRABCODE_SCENARIO": scenario,
-                "FAKE_CRABCODE_REPORT": home.join("report.jsonl"),
-            },
+            "extra_env": environment,
             "gates": {"G1": "pass", "G2": "pass", "G3": "pass", "G4": "pass", "G5": "pass", "G6": "pass"},
             "verified_at": "2026-10-28T00:00:00Z",
             "engine_commit": "0123456789abcdef0123456789abcdef01234567",
@@ -158,7 +167,7 @@ mod tests {
             limits,
         }
     }
-    fn quick() -> Limits {
+    pub(crate) fn quick() -> Limits {
         Limits {
             stop_grace: Duration::from_secs(2),
             term_grace: Duration::from_secs(1),
@@ -167,12 +176,12 @@ mod tests {
         }
     }
     fn happy(root: &Path) -> HostDriverConfig {
-        host(root, "happy", quick())
+        host(root, "happy", quick(), &[])
     }
-    fn cooperative(root: &Path) -> HostDriverConfig {
-        host(root, "cooperative", quick())
+    pub(crate) fn cooperative(root: &Path) -> HostDriverConfig {
+        host(root, "cooperative", quick(), &[])
     }
-    fn unconfirmable(root: &Path) -> HostDriverConfig {
+    pub(crate) fn unconfirmable(root: &Path) -> HostDriverConfig {
         host(
             root,
             "ignore_term",
@@ -182,6 +191,7 @@ mod tests {
                 kill_grace: Duration::ZERO,
                 ..Limits::default()
             },
+            &[],
         )
     }
     fn lingering(root: &Path) -> HostDriverConfig {
@@ -192,16 +202,17 @@ mod tests {
                 stop_grace: Duration::from_millis(300),
                 ..quick()
             },
+            &[],
         )
     }
 
-    struct Run {
-        thread: ThreadId,
-        run: RunId,
+    pub(crate) struct Run {
+        pub(crate) thread: ThreadId,
+        pub(crate) run: RunId,
     }
     /// Activates the host binding on the fixture's workspace, records its accepted event and
     /// begins the delegated run through the engine's delegated entry.
-    async fn begin(fixture: &mut Fixture) -> (Run, tokio_postgres::Client) {
+    pub(crate) async fn begin(fixture: &mut Fixture) -> (Run, tokio_postgres::Client) {
         let mut client = fixture.client().await;
         let local = fixture.engine().resolver.local_context().unwrap();
         let workspace = fixture.root.join("home/ws");
@@ -279,7 +290,10 @@ mod tests {
         snapshot
     }
     /// The conversation once its foreground run no longer queues, runs or cancels.
-    async fn settled(fixture: &Fixture, thread: &ThreadId) -> ThreadConversationSnapshot {
+    pub(crate) async fn settled(
+        fixture: &Fixture,
+        thread: &ThreadId,
+    ) -> ThreadConversationSnapshot {
         let limit = tokio::time::Instant::now() + Duration::from_secs(90);
         loop {
             let snapshot = conversation(fixture, thread).await;
@@ -297,7 +311,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    async fn session(client: &tokio_postgres::Client, run: &RunId) -> serde_json::Value {
+    pub(crate) async fn session(client: &tokio_postgres::Client, run: &RunId) -> serde_json::Value {
         client
             .query_one("SELECT row_to_json(h) FROM openmybot.host_driver_sessions h WHERE record_kind='session' AND run_id=$1", &[&run.as_str()])
             .await
@@ -305,7 +319,10 @@ mod tests {
             .get(0)
     }
     /// The session row once the child sent its `system/init`.
-    async fn initialized(client: &tokio_postgres::Client, run: &RunId) -> serde_json::Value {
+    pub(crate) async fn initialized(
+        client: &tokio_postgres::Client,
+        run: &RunId,
+    ) -> serde_json::Value {
         let limit = tokio::time::Instant::now() + Duration::from_secs(90);
         loop {
             let found = client
@@ -319,7 +336,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    fn group_gone(row: &serde_json::Value) -> bool {
+    pub(crate) fn group_gone(row: &serde_json::Value) -> bool {
         let pgid = rustix::process::Pid::from_raw(row["pgid"].as_i64().unwrap() as i32).unwrap();
         rustix::process::test_kill_process_group(pgid) == Err(rustix::io::Errno::SRCH)
     }

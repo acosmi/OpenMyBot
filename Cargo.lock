@@ -4591,6 +4591,7 @@ name = "omb-cli"
 version = "0.0.0"
 dependencies = [
  "omb-daemon",
+ "rustix",
  "serde_json",
  "tokio",
 ]

@@ -9,8 +9,9 @@ mod pairing;
 pub mod testkit;
 
 pub use bindings::{
-    AuthorityRow, GrantKind, HostBinding, IdentityKey, RunDeadline, activate_host, authority_row,
-    reconfirm_binding, revoke_binding,
+    AuthorityRow, BindingView, GrantKind, HostBinding, IdentityKey, NewReceiver, OpenRun,
+    ResetDone, RunDeadline, activate_host, activate_receiver, authority_row, list_bindings,
+    reconfirm_binding, reset_thread, revoke_binding,
 };
 pub use control_tokens::{
     ControlTokenRecord, ControlTokenStart, HeartbeatTick, read_heartbeat, start_control_token,

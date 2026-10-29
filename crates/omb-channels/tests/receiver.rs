@@ -1,11 +1,15 @@
 //! Telegram receiver end to end: an own PostgreSQL 17.11 cluster and the loopback fake Bot API.
 use omb_channels::{
-    Connection, Counters, CredentialProblem, ReceiverContext, TG_RESPONSE_MAX, Task, Timings,
-    start_receiver, testkit::FakeTelegram, verify_credentials,
+    CANCEL_QUEUE, CancelRequests, Connection, Counters, CredentialProblem,
+    OMB_REPLY_CANCEL_NONE_V1, OMB_REPLY_CANCEL_REQUESTED_V1, OMB_REPLY_HELP_V1, ReceiverContext,
+    TG_RESPONSE_MAX, Task, Timings, start_receiver, testkit::FakeTelegram, verify_credentials,
 };
 use omb_store::{
     PollGapReason, ReceiverRow, migrate, open_poll_gap,
-    testkit::{Fixture, Session, deadline, insert_receiver_with, insert_sender, shift_event},
+    testkit::{
+        Fixture, Session, deadline, insert_event_for_run, insert_permission_row,
+        insert_receiver_with, insert_sender, permission_row_json, shift_event,
+    },
 };
 use openbot_contracts::ids::{ActorId, TenantId};
 use openbot_domain::vault::{
@@ -18,7 +22,7 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -77,6 +81,9 @@ struct Env {
     envelope: String,
     counters: Arc<Counters>,
     wake: Arc<Notify>,
+    sender: Uuid,
+    cancel: CancelRequests,
+    cancels: mpsc::Receiver<Uuid>,
 }
 impl Env {
     async fn new() -> Self {
@@ -86,7 +93,7 @@ impl Env {
         let receiver = Uuid::now_v7();
         let envelope = seal(receiver, TOKEN);
         insert_receiver_with(&session.client, receiver, "telegram", "1001", &envelope).await;
-        insert_sender(
+        let sender = insert_sender(
             &session.client,
             "telegram",
             "1001",
@@ -94,6 +101,7 @@ impl Env {
             "thread-A",
         )
         .await;
+        let (cancel, cancels) = mpsc::channel(CANCEL_QUEUE);
         Self {
             fixture,
             session,
@@ -102,6 +110,9 @@ impl Env {
             envelope,
             counters: Arc::new(Counters::default()),
             wake: Arc::new(Notify::new()),
+            sender,
+            cancel,
+            cancels,
         }
     }
     async fn start(&mut self) -> Task {
@@ -124,6 +135,7 @@ impl Env {
                 timings: quick(),
                 counters: Arc::clone(&self.counters),
                 wake: Arc::clone(&self.wake),
+                cancel: self.cancel.clone(),
             },
         )
     }
@@ -1028,4 +1040,145 @@ async fn verify_credentials_never_calls_set_or_delete_webhook() {
             .iter()
             .all(|m| m != "setWebhook" && m != "deleteWebhook")
     );
+}
+
+async fn reply_bodies(client: &Client) -> Vec<String> {
+    client
+        .query(
+            "SELECT body FROM openmybot.deliveries ORDER BY created_at,delivery_id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+async fn cancel_request(env: &mut Env) -> Uuid {
+    tokio::time::timeout(Duration::from_secs(20), env.cancels.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn cancel_command_sends_the_binding_id_after_commit() {
+    let mut env = Env::new().await;
+    let run = insert_event_for_run(env.client(), env.sender, "r1", "thread-A", "dispatched").await;
+    // The receiver resumes from the latest event key of its bot, so the run's event needs an update id.
+    env.client()
+        .execute(
+            "UPDATE openmybot.channel_events SET event_key='0' WHERE record_id=$1",
+            &[&run],
+        )
+        .await
+        .unwrap();
+    env.fake.push_update(text(1, "/cancel"));
+    let task = env.start().await;
+    assert_eq!(cancel_request(&mut env).await, env.sender);
+    // Both rows are visible to another connection when the id arrives.
+    assert_eq!(
+        count(
+            env.client(),
+            "SELECT count(*) FROM openmybot.channel_events WHERE event_key='1' AND command='cancel'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        reply_bodies(env.client()).await,
+        [OMB_REPLY_CANCEL_REQUESTED_V1]
+    );
+    task.stop().await;
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn cancel_command_without_open_run_sends_binding_id_and_stores_none_reply() {
+    let mut env = Env::new().await;
+    env.fake.push_update(text(1, "/cancel"));
+    let task = env.start().await;
+    assert_eq!(cancel_request(&mut env).await, env.sender);
+    assert_eq!(reply_bodies(env.client()).await, [OMB_REPLY_CANCEL_NONE_V1]);
+    task.stop().await;
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn redelivered_cancel_command_sends_nothing_again() {
+    let mut env = Env::new().await;
+    env.fake
+        .script("getUpdates", 200, batch(&[text(1, "/cancel")]));
+    env.fake
+        .script("getUpdates", 200, batch(&[text(1, "/cancel")]));
+    let task = env.start().await;
+    assert_eq!(cancel_request(&mut env).await, env.sender);
+    let limit = tokio::time::Instant::now() + Duration::from_secs(20);
+    while env.fake.calls("getUpdates").len() < 3 {
+        assert!(tokio::time::Instant::now() < limit, "redelivery not polled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(env.cancels.try_recv().is_err());
+    assert_eq!(reply_bodies(env.client()).await.len(), 1);
+    task.stop().await;
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn cancel_from_unbound_sender_sends_nothing() {
+    let mut env = Env::new().await;
+    env.fake.push_update(message(1, 99, Some("/cancel")));
+    let task = env.start().await;
+    events(env.client(), 1).await;
+    assert_eq!(disposition(env.client(), "1").await, "dropped_unbound");
+    polled(&env.fake, |r| r.param("offset") == Some("2")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(env.cancels.try_recv().is_err());
+    task.stop().await;
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn help_command_reply_row_lists_status_cancel_and_help() {
+    let mut env = Env::new().await;
+    env.fake.push_update(text(1, "/help"));
+    let task = env.start().await;
+    events(env.client(), 1).await;
+    let bodies = reply_bodies(env.client()).await;
+    assert_eq!(bodies, [OMB_REPLY_HELP_V1]);
+    for command in ["/status", "/cancel", "/help"] {
+        assert!(bodies[0].contains(command), "{command}");
+    }
+    task.stop().await;
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn channel_text_yes_tongyi_and_approve_leave_the_permission_row_unchanged() {
+    let mut env = Env::new().await;
+    insert_permission_row(env.client(), env.sender, "r1", "hp-channel", 600.0).await;
+    let before = permission_row_json(env.client(), "hp-channel").await;
+    for (id, body) in [
+        (1, "yes"),
+        (2, "同意"),
+        (3, "approve hp-channel"),
+        (4, "deny hp-channel"),
+    ] {
+        env.fake.push_update(text(id, body));
+    }
+    let task = env.start().await;
+    events(env.client(), 4).await;
+    polled(&env.fake, |r| r.param("offset") == Some("5")).await;
+    let after = permission_row_json(env.client(), "hp-channel").await;
+    assert_eq!(after, before);
+    assert!(after["decision"].is_null());
+    task.stop().await;
+    env.stop().await;
 }
