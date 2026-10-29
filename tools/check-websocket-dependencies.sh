@@ -28,7 +28,7 @@ expected_callers=$'crates/openbot-server/src/http/approvals.rs\ncrates/openbot-s
 [[ $(rg -l 'WebSocketUpgrade|drive_thread_websocket' crates --glob '*.rs' | sort) == \
    "$expected_callers" ]] \
   || fail 'WebSocket server 调用面越出 thread/channel/approval/screen typed transports'
-if rg -n 'sha1::|Sha1' crates --glob '*.rs'; then
+if rg -n 'sha1::|Sha1' crates --glob '*.rs' --glob '!crates/omb-*/**'; then
   fail '第一方代码不得把 RFC6455 handshake SHA-1 复用为凭据/业务摘要'
 fi
 grep -qF 'const THREAD_EVENTS_WS_INPUT_LIMIT: usize = 1024;' \

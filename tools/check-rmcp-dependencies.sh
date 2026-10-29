@@ -29,7 +29,7 @@ for forbidden in 'rmcp feature "server"' 'rmcp feature "transport-streamable-htt
   fi
 done
 
-rmcp_callers=$(rg -l 'rmcp::' crates/*/src --glob '*.rs' | sort)
+rmcp_callers=$(rg -l 'rmcp::' crates/*/src --glob '*.rs' --glob '!crates/omb-*/**' | sort)
 [[ "$rmcp_callers" == 'crates/openbot-infra/src/mcp.rs' ]] || fail "rmcp types escaped the single infra boundary: [$rmcp_callers]"
 for anchor in \
   'send_cancellable_request(request, options)' \

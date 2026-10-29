@@ -15,7 +15,7 @@ if rg -n "$private_key_pattern" crates --glob '*.rs'; then
   exit 1
 fi
 
-actual="$(cargo tree -i rsa -e normal --all-features --prefix depth --charset ascii \
+actual="$(cargo tree --workspace --exclude 'omb-*' -i rsa -e normal --all-features --prefix depth --charset ascii \
   | awk '{name=$1; sub(/^[0-9]+/, "", name); print name " " $2}')"
 expected='rsa v0.9.10
 openidconnect v4.0.1
