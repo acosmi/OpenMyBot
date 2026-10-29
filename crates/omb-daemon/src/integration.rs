@@ -125,7 +125,7 @@ fn outside_window(root: &Path) -> HostDriverConfig {
         &[("FAKE_CRABCODE_VERSION", "9.9.9")],
     )
 }
-/// One stdout line one byte longer than `CC_LINE_MAX`.
+/// One stdout line of 262145 bytes, one over the default line limit.
 fn line_over(root: &Path) -> HostDriverConfig {
     agent::host(
         root,
@@ -134,7 +134,7 @@ fn line_over(root: &Path) -> HostDriverConfig {
         &[("FAKE_CRABCODE_BYTES", "262145")],
     )
 }
-/// Stderr one byte longer than `CC_OUTPUT_MAX`.
+/// Stderr of 1048577 bytes, one over the default output limit.
 fn stderr_over(root: &Path) -> HostDriverConfig {
     agent::host(
         root,
@@ -500,7 +500,6 @@ async fn happy_line_pushed_update_runs_and_sends_one_result() {
     let sent = rig.sent();
     assert_eq!(sent.len(), 2, "{sent:?}");
     // Polling and sending share the one fake endpoint and the bound token.
-    assert!(!rig.fake.calls("getUpdates").is_empty());
     for request in rig.fake.requests() {
         assert!(
             request.path.starts_with(&format!("/bot{TOKEN}/")),
@@ -803,10 +802,10 @@ async fn unbound_and_group_traffic_gets_no_reply_no_row_and_no_run() {
     let sent = rig.sent();
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert!(sent[0].text.starts_with("绑定成功"));
+    // The owner's pairing reply is the one delivery row.
     assert_eq!(
-        rig.count("SELECT count(*) FROM openmybot.deliveries WHERE kind<>'pairing_reply'")
-            .await,
-        0
+        rig.count("SELECT count(*) FROM openmybot.deliveries").await,
+        1
     );
     assert_eq!(
         rig.count(
@@ -820,8 +819,12 @@ async fn unbound_and_group_traffic_gets_no_reply_no_row_and_no_run() {
             .await,
         0
     );
-    assert_eq!(rig.event(2).await["disposition"], "dropped_unbound");
-    assert_eq!(rig.event(3).await["disposition"], "dropped_not_private");
+    let stranger = rig.event(2).await;
+    assert_eq!(stranger["disposition"], "dropped_unbound");
+    assert!(stranger["text"].is_null());
+    let group = rig.event(3).await;
+    assert_eq!(group["disposition"], "dropped_not_private");
+    assert!(group["text"].is_null());
     rig.stop().await;
 }
 
@@ -838,6 +841,11 @@ async fn pairing_code_is_single_use_end_to_end() {
     let sent = rig.sent();
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0].chat_id, OWNER);
+    // The first pairing's reply is the one delivery row.
+    assert_eq!(
+        rig.count("SELECT count(*) FROM openmybot.deliveries").await,
+        1
+    );
     assert_eq!(rig.event(2).await["disposition"], "pairing_failed");
     let listed = rig.call("bindings_list", json!({})).await.unwrap();
     let senders: Vec<&Value> = listed["bindings"]

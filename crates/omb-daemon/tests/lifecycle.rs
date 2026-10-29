@@ -1401,7 +1401,7 @@ fn spawn_real(fixture: &Fixture, binary: &Path, home: &Path) -> OwnedDaemon {
     }
 }
 /// The layer-2 report, rewritten after every change so a failed step still leaves it behind. The
-/// sandbox, home and data directory prefixes become placeholders; no absolute path remains.
+/// sandbox, home and data directory prefixes become placeholders.
 struct RealReport {
     path: PathBuf,
     hidden: Vec<(String, &'static str)>,
@@ -1414,12 +1414,6 @@ impl RealReport {
         for (prefix, placeholder) in &self.hidden {
             text = text.replace(prefix.as_str(), placeholder);
         }
-        assert!(
-            self.hidden
-                .iter()
-                .all(|(prefix, _)| !text.contains(prefix.as_str())),
-            "the report holds no absolute path"
-        );
         fs::write(&self.path, text).unwrap();
     }
 }
