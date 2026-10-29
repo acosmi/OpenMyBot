@@ -196,8 +196,8 @@ def _block_after(tokens: list[str], marker: tuple[str, ...], label: str) -> list
     return tokens[opening + 1:closing]
 
 
-def _bound_name(tokens: list[str], at: int) -> str | None:
-    """Name bound by the `let NAME = …;` statement that contains token `at`."""
+def _binding(tokens: list[str], at: int) -> tuple[str, int] | None:
+    """Name and `let` position of the `let NAME = …;` statement that contains token `at`."""
 
     for index in range(at - 1, -1, -1):
         if tokens[index] == ";":
@@ -207,17 +207,28 @@ def _bound_name(tokens: list[str], at: int) -> str | None:
             if cursor < at and tokens[cursor] == "mut":
                 cursor += 1
             if cursor < at and tokens[cursor].isidentifier() and "=" in tokens[cursor + 1:at]:
-                return tokens[cursor]
+                return tokens[cursor], index
             return None
     return None
 
 
 def _origin(tokens: list[str], name: str, before: int) -> tuple[str, int | None]:
-    """Follow `let name = other;` aliases back to the binding that introduced the value."""
+    """Follow visible `let name = other;` aliases back to the `let` that introduced the value.
 
+    Only bindings in the scope enclosing `before` count; a `let` inside an already closed block
+    (dead or not) is invisible there. The position, not the name, identifies the value.
+    """
+
+    nested = 0
     for index in range(before - 1, -1, -1):
+        if tokens[index] == "}":
+            nested += 1
+            continue
+        if tokens[index] == "{":
+            nested = max(nested - 1, 0)
+            continue
         cursor = index + 2 if tokens[index + 1:index + 2] == ["mut"] else index + 1
-        if tokens[index] != "let" or tokens[cursor:cursor + 1] != [name]:
+        if nested or tokens[index] != "let" or tokens[cursor:cursor + 1] != [name]:
             continue
         rhs = tokens[cursor + 1:cursor + 4]
         if len(rhs) == 3 and rhs[0] == "=" and rhs[1].isidentifier() and rhs[2] == ";":
@@ -331,26 +342,6 @@ def _method_calls(
         for index, token in enumerate(tokens)
         if token == method and index + 1 < len(tokens) and tokens[index + 1] == "("
     ]
-
-
-def _assigned_async_blocks(tokens: list[str]) -> dict[str, list[str]]:
-    blocks: dict[str, list[str]] = {}
-    for index in range(len(tokens) - 4):
-        if tokens[index] != "let":
-            continue
-        cursor = index + 1
-        if tokens[cursor] == "mut":
-            cursor += 1
-        if not tokens[cursor].isidentifier() or tokens[cursor + 1:cursor + 3] != ["=", "async"]:
-            continue
-        opening = cursor + 3
-        if tokens[opening] == "move":
-            opening += 1
-        if tokens[opening] != "{":
-            continue
-        closing = _paired(tokens, opening, "{", "}")
-        blocks[tokens[cursor]] = tokens[opening + 1:closing]
-    return blocks
 
 
 def _call_arguments(tokens: list[str], marker: tuple[str, ...], label: str) -> list[list[str]]:
@@ -696,13 +687,17 @@ def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) 
     )
     transport_value = [transport_result, ".", "within_deadline"]
     final = _strip_parentheses(after_join[final_start:])
+    used_at = final_start
     if len(final) == 1:
         origin, let_at = _origin(after_join, final[0], final_start)
         if let_at is not None and _matches(
             after_join, let_at, ("let", origin, "=", *transport_value, ";")
         ):
-            final = transport_value
-    if final != transport_value:
+            final, used_at = transport_value, let_at
+    if final != transport_value or _origin(after_join, transport_result, used_at) != (
+        transport_result,
+        None,
+    ):
         raise GuardError("the transport deadline result no longer gates non-database success")
 
 
@@ -732,12 +727,20 @@ def _check_owner_closing(tokens: list[str]) -> None:
         tokens, ("fn", "start_owned_local_closing_job", "("), "owned closing job starter"
     )
     start_depths = _brace_depths(start)
+    started_at = _unique(
+        start, ("let", "started", "=", "Instant", "::", "now", "(", ")", ";"), "closing start"
+    )
     deadline_at = _unique(
         start,
-        ("+", "crate", "::", "cancel", "::", "SHUTDOWN_DEADLINE", ";"),
+        ("let", "deadline", "=", "started", "+", "crate", "::", "cancel", "::",
+         "SHUTDOWN_DEADLINE", ";"),
         "shared shutdown deadline",
     )
-    if start_depths[deadline_at] != 0 or _bound_name(start, deadline_at) != "deadline":
+    if (
+        start_depths[started_at] != 0
+        or start_depths[deadline_at] != 0
+        or _origin(start, "started", deadline_at) != ("started", started_at)
+    ):
         raise GuardError("owned closing job lost the shared shutdown deadline")
     authority_calls = [
         index
@@ -754,8 +757,8 @@ def _check_owner_closing(tokens: list[str]) -> None:
     authority_close = _paired(start, authority_call + 1, "(", ")")
     if start[authority_close + 1:authority_close + 5] != [".", "is_ok", "(", ")"]:
         raise GuardError("authority revocation result is no longer checked")
-    authority_result = _bound_name(start, authority_call)
-    if authority_result is None:
+    authority_binding = _binding(start, authority_call)
+    if authority_binding is None:
         raise GuardError("authority revocation result binding is missing")
     spawn_at = _unique(
         start, ("spawn", "(", "run_owned_local_closing_job", "("), "owned closing job spawn"
@@ -766,7 +769,8 @@ def _check_owner_closing(tokens: list[str]) -> None:
         start, ("run_owned_local_closing_job", "("), "owned closing job spawn argument"
     )
     literal_at = _unique(start, ("DesktopLocalClosingJob", "{"), "owned closing job literal")
-    if len(spawned) != 1 or spawned[0] != [_bound_name(start, literal_at)]:
+    job_binding = _binding(start, literal_at)
+    if len(spawned) != 1 or job_binding is None or spawned[0] != [job_binding[0]]:
         raise GuardError("spawned closing job is not the reviewed owner literal")
     literal_close = _paired(start, literal_at + 1, "{", "}")
     fields = {
@@ -775,10 +779,15 @@ def _check_owner_closing(tokens: list[str]) -> None:
         )
         for field in _split_arguments(start[literal_at + 2:literal_close])
     }
-    if fields.get("owner") != ["owner"] or fields.get("deadline") != ["deadline"]:
+    deadline_field = fields.get("deadline", [])
+    if (
+        fields.get("owner") != ["owner"]
+        or len(deadline_field) != 1
+        or _origin(start, deadline_field[0], literal_at) != ("deadline", deadline_at)
+    ):
         raise GuardError("owned closing job no longer carries the owner and shared deadline")
-    if authority_result not in {
-        _origin(start, term, literal_at)[0]
+    if authority_binding not in {
+        _origin(start, term, literal_at)
         for term in _conjunction(fields.get("startup_ok", [])) or []
     }:
         raise GuardError("authority revocation result no longer gates shutdown success")
@@ -794,7 +803,6 @@ def _check_owner_closing(tokens: list[str]) -> None:
     if not {"owner", "deadline", "startup_ok", "completion", "reply"} <= bound:
         raise GuardError("owned closing job no longer destructures its reviewed fields")
     aliases = _simple_aliases(run, receiver="owner")
-    blocks = _assigned_async_blocks(run)
 
     timeout_at = _unique(
         run, ("tokio", "::", "time", "::", "timeout_at", "("), "non-database timeout"
@@ -810,14 +818,21 @@ def _check_owner_closing(tokens: list[str]) -> None:
         or _origin(run, timeout_arguments[0][8], timeout_at) != ("deadline", None)
     ):
         raise GuardError("non-database timeout no longer uses the shared closing deadline")
-    stage = (
-        _origin(run, timeout_arguments[1][0], timeout_at)[0]
+    stage, stage_at = (
+        _origin(run, timeout_arguments[1][0], timeout_at)
         if len(timeout_arguments[1]) == 1
-        else None
+        else ("", None)
     )
-    if stage not in blocks:
+    if stage_at is None or depths[stage_at] != 0 or run[stage_at + 1:stage_at + 4] != [
+        stage, "=", "async",
+    ]:
         raise GuardError("non-database stage no longer runs inside the reviewed timeout")
-    _check_non_database_stage(blocks[stage], aliases)
+    stage_open = stage_at + 5 if run[stage_at + 4] == "move" else stage_at + 4
+    if run[stage_open] != "{":
+        raise GuardError("non-database stage no longer runs inside the reviewed timeout")
+    _check_non_database_stage(
+        run[stage_open + 1:_paired(run, stage_open, "{", "}")], aliases
+    )
 
     joins = [
         index
@@ -835,6 +850,9 @@ def _check_owner_closing(tokens: list[str]) -> None:
         raise GuardError("non-database timeout result is not retained")
     timeout_result = run[let_at + 2]
     match_at = _unique(run, ("match", timeout_result, "{"), "non-database timeout match")
+    rebound_at = _origin(run, timeout_result, match_at)[1]
+    if rebound_at is not None and rebound_at > let_at:
+        raise GuardError("non-database timeout result is rebound before its projection")
     match_close = _paired(run, match_at + 2, "{", "}")
     observed_arms: dict[tuple[str, ...], str] = {}
     for pattern, arm_body in _match_arms(run[match_at + 3:match_close]):
@@ -847,7 +865,7 @@ def _check_owner_closing(tokens: list[str]) -> None:
         ("Err", "(", "_", ")"): "false",
     }:
         raise GuardError("non-database timeout success/failure projection drift")
-    non_database_ok = _bound_name(run, match_at)
+    non_database_ok = _binding(run, match_at)
 
     plane = ("owner", ".", "data_plane", ".", "take", "(", ")")
     database_matches = []
@@ -874,18 +892,18 @@ def _check_owner_closing(tokens: list[str]) -> None:
     database_open = run.index("{", database_at + 1)
     database_close = _paired(run, database_open, "{", "}")
     _check_database_arms(run[database_open + 1:database_close])
-    database_ok = _bound_name(run, database_at)
+    database_ok = _binding(run, database_at)
 
     finish_at = _unique(run, ("completion", ".", "finish", "("), "shutdown completion")
     finish = _call_arguments(run, ("completion", ".", "finish", "("), "shutdown completion")
     terms = _conjunction(finish[0]) if len(finish) == 1 else None
-    if terms is None or not {"startup_ok", non_database_ok, database_ok} <= {
-        _origin(run, term, finish_at)[0] for term in terms
+    if terms is None or not {("startup_ok", None), non_database_ok, database_ok} <= {
+        _origin(run, term, finish_at) for term in terms
     }:
         raise GuardError("shutdown success must require every stage result")
-    succeeded = _bound_name(run, finish_at)
+    succeeded = (_binding(run, finish_at) or ("", 0))[0]
     reply = _call_arguments(run, ("reply", ".", "send", "("), "shutdown reply")
-    if succeeded is None or reply != [[
+    if not succeeded or reply != [[
         "if", succeeded, "{", "Ok", "(", "(", ")", ")", "}",
         "else", "{", "Err", "(", "DesktopLocalRuntimeError", "::", "Shutdown", ")", "}",
     ]]:

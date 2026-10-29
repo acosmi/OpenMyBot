@@ -67,6 +67,28 @@ PROJECTION = """    let non_database_ok = match non_database {
         }
     };"""
 HELPER = "async fn finish_shutdown_stages("
+STARTED = "    let started = Instant::now();\n    " + DEADLINE + "\n"
+FINISH = "    let succeeded = completion.finish(\n"
+STAGE_START = "    let non_database = async {\n"
+STAGE_END = "        transport.within_deadline\n    };\n"
+
+
+def stage_block(source: str) -> str:
+    start = source.index(STAGE_START)
+    return source[start:source.index(STAGE_END, start) + len(STAGE_END)]
+
+
+def dead_stage_before_join(source: str) -> str:
+    block = stage_block(source)
+    dead = "    if false {\n" + block + "    }\n"
+    return replace_once(source, block, "    let non_database = async { true };\n" + dead)
+
+
+def dead_stage_after_database(source: str) -> str:
+    block = stage_block(source)
+    source = replace_once(source, block, "    let non_database = async { true };\n")
+    return replace_once(source, FINISH, "    if false {\n" + block + "    }\n" + FINISH)
+
 
 # Mutations of the production closing structure, each of which must be rejected.
 REVIEWED_MUTATIONS = {
@@ -169,6 +191,56 @@ REVIEWED_MUTATIONS = {
             "    if non_database_ok || database_ok {\n        Ok(())",
         )
     ],
+    # Review v1: stage results are identified by binding position, not by name.
+    "M21 database result shadowed": [
+        (FINISH, "    let database_ok = database_ok || true;\n" + FINISH)
+    ],
+    "M22 non-database result shadowed": [
+        (FINISH, "    let non_database_ok = non_database_ok || true;\n" + FINISH)
+    ],
+    "M23 startup result shadowed": [(FINISH, "    let startup_ok = startup_ok || true;\n" + FINISH)],
+    "M24 database result rebound after alias": [
+        (FINISH, "    let db = database_ok;\n    let database_ok = db || true;\n" + FINISH)
+    ],
+    "M25 authority result shadowed": [
+        (AUTHORITY, AUTHORITY + "    let authority_ok = authority_ok || true;\n")
+    ],
+    "M26 dead same-name stage before the join": [dead_stage_before_join],
+    "M27 dead same-name stage after the database stage": [dead_stage_after_database],
+    "M28 timeout result rebound before projection": [
+        (
+            "    let non_database_ok = match non_database {\n",
+            "    let non_database = Ok::<bool, ()>(true);\n"
+            "    let non_database_ok = match non_database {\n",
+        )
+    ],
+    "M29 transport result rebound after the join": [
+        (STAGE_RESULT, "        let transport = FakeTransportStop { within_deadline: true };\n" + STAGE_RESULT)
+    ],
+    # Review v1: the shared deadline is the verbatim started + SHUTDOWN_DEADLINE binding.
+    "M30 deadline prefix widened": [
+        (
+            DEADLINE,
+            "let deadline = started + Duration::from_secs(3600) + crate::cancel::SHUTDOWN_DEADLINE;",
+        )
+    ],
+    "M31 start instant widened": [
+        (
+            STARTED,
+            "    let started = Instant::now() + Duration::from_secs(3600);\n    " + DEADLINE + "\n",
+        )
+    ],
+    "M32 deadline rebound": [
+        (STARTED, STARTED + "    let deadline = deadline + Duration::from_secs(3600);\n")
+    ],
+    "M33 deadline rebound through an alias": [
+        (
+            STARTED,
+            STARTED
+            + "    let widened = deadline;\n"
+            + "    let deadline = widened + Duration::from_secs(3600);\n",
+        )
+    ],
 }
 
 
@@ -198,8 +270,8 @@ class AssemblyGuardTests(unittest.TestCase):
         for name, edits in REVIEWED_MUTATIONS.items():
             with self.subTest(mutation=name):
                 source = self.source
-                for old, new in edits:
-                    source = replace_once(source, old, new)
+                for edit in edits:
+                    source = edit(source) if callable(edit) else replace_once(source, *edit)
                 self.assert_rejected(source)
 
     def test_local_aliases_comments_and_join_branch_order_are_accepted(self) -> None:
