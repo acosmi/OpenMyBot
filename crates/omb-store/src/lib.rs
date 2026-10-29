@@ -1,10 +1,12 @@
 //! Product-owned PostgreSQL migrations, control-token records, pairing and binding lifecycle.
 mod bindings;
 mod control_tokens;
+mod deliveries;
 mod events;
 mod host_sessions;
 mod migration;
 mod pairing;
+mod sweep;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -17,6 +19,10 @@ pub use control_tokens::{
     ControlTokenRecord, ControlTokenStart, HeartbeatTick, read_heartbeat, start_control_token,
     stop_control_token, touch_heartbeat,
 };
+pub use deliveries::{
+    Claimed, DeliveryContent, ErrorCode, Finish, RunResultFacts, SendTarget, claim_delivery,
+    finish_delivery, mark_sending_unknown, run_result_facts, send_target,
+};
 pub use events::*;
 pub use host_sessions::*;
 pub use migration::{MigrationReport, migrate};
@@ -24,6 +30,7 @@ pub use pairing::{
     AcceptedEvent, Channel, PairAttempt, PairCode, PairOutcome, PairStart, PairStarted,
     pair_attempt, pair_start,
 };
+pub use sweep::{clear_content, delete_expired};
 
 pub const KEY_MAX: usize = 128;
 pub const PAIR_CODE_LEN: usize = 8;
@@ -72,6 +79,12 @@ pub enum StoreError {
     GapFailed,
     #[error("host_session_failed")]
     HostSessionFailed,
+    #[error("delivery_failed")]
+    DeliveryFailed,
+    #[error("sweep_failed")]
+    SweepFailed,
+    #[error("reconcile_failed")]
+    ReconcileFailed,
 }
 
 pub(crate) fn timely<T>(
@@ -156,4 +169,15 @@ pub(crate) async fn unique_rows(
             }
         });
     timely(deadline, result, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn new_store_error_variants_display_fixed_codes() {
+        assert_eq!(StoreError::DeliveryFailed.to_string(), "delivery_failed");
+        assert_eq!(StoreError::SweepFailed.to_string(), "sweep_failed");
+        assert_eq!(StoreError::ReconcileFailed.to_string(), "reconcile_failed");
+    }
 }

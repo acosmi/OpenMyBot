@@ -128,13 +128,15 @@ pub(crate) mod fixture {
         engine::{self, Engine},
         pg::Postgres,
     };
+    use omb_channels::{TERMINAL_QUEUE, TerminalQueue};
     use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots};
+    use openbot_application::RunTerminalNotice;
     use openbot_application::tenant::package::{
         TenantPackageAudienceContext, TenantPackageEnvironment, synchronize_tenant_package,
     };
     use openbot_contracts::ids::ActorId;
     use std::path::{Path, PathBuf};
-    use tokio::task::JoinHandle;
+    use tokio::{sync::mpsc, task::JoinHandle};
     use uuid::Uuid;
 
     /// One own PG17.11 data directory with the assembled engine and its host driver.
@@ -145,6 +147,8 @@ pub(crate) mod fixture {
         pub(crate) host: Option<HostDriver>,
         host_link: Option<JoinHandle<Result<(), tokio_postgres::Error>>>,
         pub(crate) deployment_id: String,
+        /// Receiving end of the engine's terminal-notice queue until a test takes it.
+        terminals: Option<mpsc::Receiver<RunTerminalNotice>>,
     }
     /// Test-only copy of the tenant package's agents: the Bot routed to the package provider
     /// instead of the `crabcode` extension.
@@ -212,7 +216,15 @@ pub(crate) mod fixture {
             }
             let resident = pg.open_resident_connection("omb-hostdriver").await.unwrap();
             let driver = HostDriver::new(host(&root), std::sync::Arc::new(resident.client));
-            let engine = engine::assemble(&root, prepared, &driver).await.unwrap();
+            let (queue, terminals) = mpsc::channel(TERMINAL_QUEUE);
+            let engine = engine::assemble(
+                &root,
+                prepared,
+                &driver,
+                Some(std::sync::Arc::new(TerminalQueue(queue))),
+            )
+            .await
+            .unwrap();
             Self {
                 root,
                 pg,
@@ -220,10 +232,15 @@ pub(crate) mod fixture {
                 host: Some(driver),
                 host_link: Some(resident.driver),
                 deployment_id: config.deployment_id,
+                terminals: Some(terminals),
             }
         }
         pub(crate) fn engine(&self) -> &Engine {
             self.engine.as_ref().unwrap()
+        }
+        /// The engine's terminal notices; taken once.
+        pub(crate) fn take_terminals(&mut self) -> mpsc::Receiver<RunTerminalNotice> {
+            self.terminals.take().unwrap()
         }
         /// A separate store connection for test setup and inspection.
         pub(crate) async fn client(&mut self) -> tokio_postgres::Client {

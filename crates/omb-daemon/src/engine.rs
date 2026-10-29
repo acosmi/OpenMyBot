@@ -1,7 +1,7 @@
 use crate::{DaemonError, config, delegation::OmbDelegationAuthority, pg::Postgres, tenant};
 use omb_hostdriver::HostDriver;
 use openbot_application::{
-    ProviderAdapter, ProviderExtensionKey,
+    ProviderAdapter, ProviderExtensionKey, RunTerminalSubscriber,
     tenant::package::{
         LoadedTenantPackage, TenantPackageAudienceContext, synchronize_tenant_package,
     },
@@ -119,6 +119,7 @@ pub(crate) async fn assemble(
     root: &Path,
     prepared: Prepared,
     host: &HostDriver,
+    run_event_subscriber: Option<Arc<dyn RunTerminalSubscriber>>,
 ) -> Result<Engine, DaemonError> {
     let Prepared {
         pool,
@@ -213,7 +214,7 @@ pub(crate) async fn assemble(
             ProviderExtensionKey::new("crabcode").map_err(|_| DaemonError::EngineAssemblyFailed)?,
             crabcode,
         )],
-        run_event_subscriber: None,
+        run_event_subscriber,
         delegation_authority: Some(authority.clone()),
     })
     .await

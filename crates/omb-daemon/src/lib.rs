@@ -11,6 +11,7 @@ mod init;
 mod ops;
 mod pairing;
 mod pg;
+mod reconcile;
 mod tenant;
 
 use serde::{Deserialize, Serialize};

@@ -26,7 +26,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{fmt, path::PathBuf, sync::Arc};
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
     time::{Instant, timeout_at},
 };
@@ -288,6 +288,7 @@ pub(crate) struct Ops {
     pub(crate) roots: WorkspaceRoots,
     pub(crate) endpoint: TelegramEndpoint,
     pub(crate) receiver: mpsc::Sender<ReceiverCommand>,
+    pub(crate) wake: Arc<Notify>,
 }
 impl Ops {
     pub(crate) async fn run(
@@ -402,6 +403,7 @@ impl Ops {
                         .map_err(failed)?
                     }
                 };
+                self.wake.notify_one();
                 Ok(json!({"binding_id": binding_id.to_string(), "revision": revision}))
             }
             Request::BindingsResetThread(binding_id, ack) => {
@@ -424,6 +426,7 @@ impl Ops {
                 )
                 .await
                 .map_err(failed)?;
+                self.wake.notify_one();
                 Ok(
                     json!({"binding_id": binding_id.to_string(), "thread_generation": done.thread_generation, "revision": done.revision}),
                 )
@@ -714,7 +717,7 @@ mod tests {
             AgentRuntime,
             tests::{self as agent, Run},
         },
-        channels::Channels,
+        channels::{Channels, Outbound},
         delegation::{
             BOT_ID,
             fixture::{self, Fixture},
@@ -1074,6 +1077,7 @@ mod tests {
                 roots: WorkspaceRoots::parse(&home, &[workspace]).unwrap(),
                 endpoint: fake.endpoint(),
                 receiver,
+                wake: Arc::new(Notify::new()),
             };
             Self {
                 fixture,
@@ -1103,18 +1107,23 @@ mod tests {
         async fn with_channels() -> Self {
             let mut env = Self::start().await;
             let (cancel, _) = mpsc::channel(CANCEL_QUEUE);
-            env.channels = Some(
-                Channels::start(
-                    &mut env.fixture.pg,
-                    env.fixture.engine.as_ref().unwrap(),
-                    env.token,
-                    quick_channels(),
-                    env.fake.endpoint(),
-                    cancel,
-                )
-                .await
-                .unwrap(),
-            );
+            let terminals = env.fixture.take_terminals();
+            let channels = Channels::start(
+                &mut env.fixture.pg,
+                env.fixture.engine.as_ref().unwrap(),
+                env.token,
+                quick_channels(),
+                env.fake.endpoint(),
+                cancel,
+                Outbound {
+                    terminals,
+                    crabcode: None,
+                },
+            )
+            .await
+            .unwrap();
+            env.ops.wake = channels.wake();
+            env.channels = Some(channels);
             env
         }
         fn workspace(&self) -> String {
@@ -2685,6 +2694,46 @@ mod tests {
         let open: i64 = env.client.query_one("SELECT count(*) FROM openmybot.channel_events WHERE binding_id=$1 AND record_kind='gap' AND gap_reason='receiver_suspended' AND gap_ended_at IS NULL", &[&binding]).await.unwrap().get(0);
         assert_eq!(open, 0);
         polls_with(&env.fake, "1001:reconfirm-token").await;
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn reconfirm_wakes_dispatcher_for_pending_events_of_the_reactivated_binding() {
+        let mut env = Env::with_channels().await;
+        let (sender, thread) = env.sender().await;
+        env.client.execute("UPDATE openmybot.channel_bindings SET status='suspended',status_reason='grant_stale',suspended_at=statement_timestamp(),granted_generation=0 WHERE binding_id=$1", &[&sender]).await.unwrap();
+        let event = testkit::insert_event_for_run(
+            &env.client,
+            sender,
+            &format!("run-{}", Uuid::now_v7()),
+            thread.as_str(),
+            "pending",
+        )
+        .await;
+        // On the suspended binding a wake-up leaves the event pending.
+        env.ops.wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            testkit::read_row(&env.client, "channel_events", "record_id", event).await["dispatch_status"],
+            "pending"
+        );
+        // No inbound message follows the reconfirm.
+        env.call(
+            "bindings_reconfirm",
+            json!({"binding_id": sender.to_string()}),
+        )
+        .await
+        .unwrap();
+        let limit = Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = testkit::read_row(&env.client, "channel_events", "record_id", event).await;
+            if row["dispatch_status"] == "dispatched" {
+                break;
+            }
+            assert!(Instant::now() < limit, "{row}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         env.stop().await;
     }
 

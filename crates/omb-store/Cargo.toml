@@ -65,3 +65,15 @@ required-features = ["testkit"]
 [[test]]
 name = "control_ops"
 required-features = ["testkit"]
+
+[[test]]
+name = "deliveries"
+required-features = ["testkit"]
+
+[[test]]
+name = "reconcile_rows"
+required-features = ["testkit"]
+
+[[test]]
+name = "sweep"
+required-features = ["testkit"]
