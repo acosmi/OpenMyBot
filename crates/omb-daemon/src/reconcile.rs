@@ -278,7 +278,9 @@ pub(crate) mod tests {
         },
         delegation::{BOT_ID, fixture::Fixture},
     };
-    use omb_channels::{SenderContext, start_sender, testkit::FakeTelegram};
+    use omb_channels::{
+        Endpoints, SenderContext, fake_feishu::FakeFeishu, start_sender, testkit::FakeTelegram,
+    };
     use omb_hostdriver::HostDriverConfig;
     use omb_store::{Decided, Decision, testkit};
     use openbot_application::{
@@ -1194,7 +1196,10 @@ pub(crate) mod tests {
             SenderContext {
                 vault: fixture.engine().vault.clone(),
                 owner: ActorId::new(SINGLE_USER_ACTOR_ID),
-                endpoint: fake.endpoint(),
+                endpoints: Endpoints {
+                    telegram: fake.endpoint(),
+                    feishu: FakeFeishu::endpoint_at(FakeTelegram::unused_port()),
+                },
                 timings: fast(),
                 wake: Arc::clone(&sent),
             },
@@ -1237,7 +1242,10 @@ pub(crate) mod tests {
             SenderContext {
                 vault: fixture.engine().vault.clone(),
                 owner: ActorId::new(SINGLE_USER_ACTOR_ID),
-                endpoint: fake.endpoint(),
+                endpoints: Endpoints {
+                    telegram: fake.endpoint(),
+                    feishu: FakeFeishu::endpoint_at(FakeTelegram::unused_port()),
+                },
                 timings: fast(),
                 wake: Arc::new(Notify::new()),
             },
