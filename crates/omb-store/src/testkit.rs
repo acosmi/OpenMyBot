@@ -457,3 +457,66 @@ pub async fn permission_row_json(
 ) -> serde_json::Value {
     client.query_one("SELECT row_to_json(h) FROM openmybot.host_driver_sessions h WHERE record_kind='permission' AND permission_id=$1",&[&permission_id]).await.unwrap().get(0)
 }
+/// A delivery row on the binding's channel and chat; a finished status gets `finished_at`, and
+/// `next_attempt_in_secs` schedules it relative to the database clock.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_delivery(
+    client: &tokio_postgres::Client,
+    binding: uuid::Uuid,
+    kind: &str,
+    key: &str,
+    body: Option<&str>,
+    status: &str,
+    next_attempt_in_secs: Option<f64>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    assert_eq!(client.execute("INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,next_attempt_at,created_at,finished_at) SELECT $1,b.binding_id,b.channel_kind,b.chat_key,$3,$4,$5,$6,statement_timestamp()+make_interval(secs=>$7),statement_timestamp(),CASE WHEN $6 IN ('sent','failed','unknown') THEN statement_timestamp() END FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding,&kind,&key,&body,&status,&next_attempt_in_secs]).await.unwrap(),1);
+    id
+}
+/// A session row of the run that already ended with `end_reason`, its summary and artifacts.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_ended_session(
+    client: &tokio_postgres::Client,
+    binding: uuid::Uuid,
+    run_id: &str,
+    end_reason: &str,
+    summary: Option<&str>,
+    artifacts: &[&str],
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    assert_eq!(client.execute("INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at,ended_at,end_reason,result_summary,artifact_paths,stderr_tail) SELECT $1,'session',$3,b.binding_id,'crabcode',b.workspace_dir,statement_timestamp(),statement_timestamp(),$4,$5,$6,'' FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding,&run_id,&end_reason,&summary,&artifacts]).await.unwrap(),1);
+    id
+}
+/// A session row of the run that started and never ended, with the given process group.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_orphan_session(
+    client: &tokio_postgres::Client,
+    binding: uuid::Uuid,
+    run_id: &str,
+    pgid: Option<i32>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    assert_eq!(client.execute("INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at,child_pid,pgid) SELECT $1,'session',$3,b.binding_id,'crabcode',b.workspace_dir,statement_timestamp(),$4,$4 FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding,&run_id,&pgid]).await.unwrap(),1);
+    id
+}
+/// Moves one timestamp column of one row, selected by its uuid key, relative to the database clock.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn shift_column(
+    client: &tokio_postgres::Client,
+    table: &str,
+    key_column: &str,
+    id: uuid::Uuid,
+    column: &str,
+    seconds_from_now: f64,
+) {
+    let sql = format!(
+        "UPDATE openmybot.{table} SET {column}=statement_timestamp()+make_interval(secs=>$2) WHERE {key_column}=$1"
+    );
+    assert_eq!(
+        client
+            .execute(&sql, &[&id, &seconds_from_now])
+            .await
+            .unwrap(),
+        1
+    );
+}

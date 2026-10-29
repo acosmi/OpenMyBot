@@ -416,3 +416,36 @@ pub async fn run_facts(
             .collect::<Result<_, StoreError>>()?,
     }))
 }
+
+/// A session row without an end, left by a daemon that did not stop its child.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanSession {
+    pub record_id: Uuid,
+    pub run_id: String,
+    pub pgid: Option<i32>,
+}
+/// Session rows not yet ended, oldest start first.
+pub async fn list_orphan_sessions(
+    client: &Client,
+    deadline: Instant,
+) -> Result<Vec<OrphanSession>, StoreError> {
+    let error = StoreError::ReconcileFailed;
+    rows(client, "SELECT record_id,run_id,pgid FROM openmybot.host_driver_sessions WHERE record_kind='session' AND ended_at IS NULL ORDER BY started_at,record_id", &[], deadline, error)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(OrphanSession {
+                record_id: row.try_get(0).map_err(|_| error)?,
+                run_id: row.try_get(1).map_err(|_| error)?,
+                pgid: row.try_get(2).map_err(|_| error)?,
+            })
+        })
+        .collect()
+}
+/// Denies every undecided permission request as `run_stopped`; returns how many were denied.
+pub async fn deny_undecided_permissions(
+    client: &Client,
+    deadline: Instant,
+) -> Result<u64, StoreError> {
+    rows(client, "UPDATE openmybot.host_driver_sessions SET decision='deny', decided_via='run_stopped', decided_at=now() WHERE record_kind='permission' AND decision IS NULL RETURNING record_id", &[], deadline, StoreError::ReconcileFailed).await.map(|denied| denied.len() as u64)
+}
