@@ -216,15 +216,18 @@ def _origin(tokens: list[str], name: str, before: int) -> tuple[str, int | None]
     """Follow visible `let name = other;` aliases back to the `let` that introduced the value.
 
     Only bindings in the scope enclosing `before` count; a `let` inside an already closed block
-    (dead or not) is invisible there. A macro call group (`name! { … }`) is not a block: its
-    statements may expand into the enclosing scope, so its braces stay transparent. The position,
-    not the name, identifies the value.
+    (dead or not) is invisible there. A macro call group (`name! { … }`, `name!( … )`,
+    `name![ … ]`) is not a block: a macro may expand its tokens, nested braces included, into the
+    enclosing scope, so every brace inside the group stays transparent. The position, not the
+    name, identifies the value.
     """
 
     transparent = set()
     for index in range(1, before):
-        if tokens[index] == "{" and tokens[index - 1] == "!":
-            transparent.update((index, _paired(tokens, index, "{", "}")))
+        if tokens[index - 1] == "!" and tokens[index] in {"(", "[", "{"}:
+            closing = {"(": ")", "[": "]", "{": "}"}[tokens[index]]
+            close = _paired(tokens, index, tokens[index], closing)
+            transparent.update(i for i in range(index, close + 1) if tokens[i] in {"{", "}"})
     nested = 0
     for index in range(before - 1, -1, -1):
         if index in transparent:
@@ -858,6 +861,8 @@ def _check_owner_closing(tokens: list[str]) -> None:
         raise GuardError("non-database timeout result is not retained")
     timeout_result = run[let_at + 2]
     match_at = _unique(run, ("match", timeout_result, "{"), "non-database timeout match")
+    if depths[match_at] != 0:
+        raise GuardError("non-database timeout projection left the top-level scope")
     if any(
         run[index] == "let"
         and run[index + 2 if run[index + 1] == "mut" else index + 1] == timeout_result

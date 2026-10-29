@@ -255,6 +255,24 @@ REVIEWED_MUTATIONS = {
         ),
         (FINISH, "    stmts! { let database_ok = true; }\n" + FINISH),
     ],
+    # Review v3: braces nested inside any macro call group stay transparent, and the timeout
+    # projection must stay at the top level of the closing job.
+    "M36 database result shadowed through a brace-stripping macro": [
+        (
+            "async fn run_owned_local_closing_job(",
+            "macro_rules! strip { ({ $($t:tt)* }) => { $($t)* }; }\n\n"
+            "async fn run_owned_local_closing_job(",
+        ),
+        (FINISH, "    strip!({ let database_ok = true; });\n" + FINISH),
+    ],
+    "M37 projection hidden in a block macro behind an outer fake": [
+        (
+            "async fn run_owned_local_closing_job(",
+            "macro_rules! blk { ($($t:tt)*) => {{ $($t)* }}; }\n\n"
+            "async fn run_owned_local_closing_job(",
+        ),
+        (PROJECTION, "    let non_database_ok = true;\n    blk! {\n" + PROJECTION + "\n    }"),
+    ],
 }
 
 
