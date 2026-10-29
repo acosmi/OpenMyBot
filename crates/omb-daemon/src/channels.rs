@@ -212,6 +212,10 @@ impl Channels {
             counters: Arc::clone(&self.context.counters),
         }
     }
+    /// The dispatcher's wake-up, shared with the receiver, the sender and the reconciler.
+    pub(crate) fn wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.context.wake)
+    }
     /// Stops the running receiver, then starts `row` on a new resident connection.
     pub(crate) async fn start_receiver(
         &mut self,
@@ -294,6 +298,7 @@ impl Channels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::{Op, Ops};
     use crate::{
         StatusSnapshot,
         delegation::fixture::{self, Fixture},
@@ -307,6 +312,7 @@ mod tests {
     };
     use omb_channels::OMB_REPLY_TEXTS_V1;
     use omb_channels::{CANCEL_QUEUE, TERMINAL_QUEUE, testkit::FakeTelegram};
+    use omb_hostdriver::WorkspaceRoots;
     use omb_store::testkit;
     use omb_store::{
         AcceptOutcome, Command, Content, Disposition, IdentityKey, NormalizedEvent, PairStart,
@@ -1777,7 +1783,7 @@ mod tests {
         let mut fixture = Fixture::start_with_host(agent::unconfirmable).await;
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
         let token = token(&mut fixture).await;
-        let mut client = fixture.client().await;
+        let client = fixture.client().await;
         let fake = FakeTelegram::start().await;
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
@@ -1818,18 +1824,46 @@ mod tests {
             event_by_key(&client, "2").await["dispatch_status"],
             "pending"
         );
-        // Moved to a fresh thread, it is dispatched.
-        let fresh = rt::mint(&fixture).await;
-        omb_store::reset_thread(
-            &mut client,
-            binding,
-            run.run.as_str(),
-            fresh.as_str(),
+        // Moved to a fresh thread by the control operation, it is dispatched without a further
+        // inbound message.
+        let control = fixture
+            .pg
+            .open_resident_connection("openmybot-control")
+            .await
+            .unwrap();
+        let engine = fixture.engine();
+        let ops = Ops {
+            control: tokio::sync::Mutex::new(control.client),
+            application: engine.assembly.application.clone(),
+            resolver: engine.resolver.clone(),
+            vault: engine.vault.clone(),
+            owner: ActorId::new(SINGLE_USER_ACTOR_ID),
+            roots: WorkspaceRoots::parse(
+                &fixture.root.join("home"),
+                &[fixture.root.join("home/ws")],
+            )
+            .unwrap(),
+            endpoint: fake.endpoint(),
+            receiver: mpsc::channel(8).0,
+            wake: channels.wake(),
+        };
+        ops.run(
+            Op::BindingsResetThread,
+            serde_json::json!({"binding_id": binding.to_string(), "ack_unknown": run.run.as_str()}),
             deadline(),
+            token,
         )
         .await
         .unwrap();
-        fake.push_update(update(3, "on the new thread"));
+        let fresh: String = client
+            .query_one(
+                "SELECT thread_id FROM openmybot.channel_bindings WHERE binding_id=$1",
+                &[&binding],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_ne!(fresh, thread.as_str());
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let moved = event_by_key(&client, "2").await;
@@ -1850,6 +1884,7 @@ mod tests {
         for row in sessions {
             kill_group(&row.get(0));
         }
+        drop(ops);
         channels.stop().await;
         runtime.stop().await;
         drop(client);

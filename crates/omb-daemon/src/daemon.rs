@@ -72,7 +72,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let endpoint=TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()));
         let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),endpoint.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary}).await?);
         canceller=Some(BindingRunCanceller::start(assembled.assembly.application.clone(),assembled.resolver.clone(),canceller_connection,requests));
-        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,endpoint,receiver};
+        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,endpoint,receiver,wake:started.wake()};
         let path=root.join("run/control.sock");
         let listener=UnixListener::bind(&path).map_err(|_|DaemonError::ControlSocketFailed)?;
         std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).map_err(|_|DaemonError::ControlSocketFailed)?;
