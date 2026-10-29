@@ -1,5 +1,6 @@
 //! Owner-initiated pairing: verified workspace, minted thread and a pending sender binding.
 use crate::{DaemonError, engine::Engine, pg::Postgres};
+use omb_hostdriver::WorkspaceRoots;
 use openbot_contracts::command::{AppCommand, AppReply};
 use std::path::PathBuf;
 
@@ -14,17 +15,13 @@ pub struct PairRequest {
 pub async fn pair(
     engine: &Engine,
     pg: &mut Postgres,
-    workspace_roots: &[PathBuf],
+    roots: &WorkspaceRoots,
     request: PairRequest,
 ) -> Result<omb_store::PairStarted, DaemonError> {
-    let workspace =
-        std::fs::canonicalize(&request.workspace).map_err(|_| DaemonError::WorkspaceInvalid)?;
-    let inside = workspace_roots
-        .iter()
-        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| workspace.starts_with(root)));
-    if !inside || !workspace.is_dir() {
-        return Err(DaemonError::WorkspaceInvalid);
-    }
+    let workspace = roots
+        .resolve(&request.workspace)
+        .filter(|workspace| workspace.is_dir())
+        .ok_or(DaemonError::WorkspaceInvalid)?;
     let workspace_dir = workspace.to_str().ok_or(DaemonError::WorkspaceInvalid)?;
     let auth = engine
         .resolver
@@ -58,6 +55,10 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::path::Path;
 
+    /// Roots validated against the system temporary directory standing in for `$HOME`.
+    fn typed(root: &Path) -> WorkspaceRoots {
+        WorkspaceRoots::parse(&std::env::temp_dir(), &[root.to_path_buf()]).unwrap()
+    }
     fn workspace(root: &Path, name: &str) -> PathBuf {
         let path = root.join(name);
         std::fs::create_dir_all(&path).unwrap();
@@ -92,7 +93,7 @@ mod tests {
         let started = pair(
             fixture.engine.as_ref().unwrap(),
             &mut fixture.pg,
-            std::slice::from_ref(&roots),
+            &typed(&roots),
             request(project.clone()),
         )
         .await
@@ -141,7 +142,7 @@ mod tests {
                 pair(
                     fixture.engine.as_ref().unwrap(),
                     &mut fixture.pg,
-                    std::slice::from_ref(&roots),
+                    &typed(&roots),
                     request(candidate),
                 )
                 .await
@@ -170,7 +171,7 @@ mod tests {
             pair(
                 fixture.engine.as_ref().unwrap(),
                 &mut fixture.pg,
-                std::slice::from_ref(&roots),
+                &typed(&roots),
                 request(link),
             )
             .await

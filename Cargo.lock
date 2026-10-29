@@ -4603,7 +4603,9 @@ dependencies = [
  "chrono",
  "getrandom 0.4.3",
  "omb-channels",
+ "omb-hostdriver",
  "omb-store",
+ "openbot-agent",
  "openbot-application",
  "openbot-computer",
  "openbot-contracts",
@@ -4621,6 +4623,25 @@ dependencies = [
  "tokio-postgres",
  "toml 0.9.8",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "omb-hostdriver"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "getrandom 0.4.3",
+ "omb-store",
+ "openbot-application",
+ "rustix",
+ "ryu",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
  "uuid",
 ]
 

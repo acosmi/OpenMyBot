@@ -83,6 +83,7 @@ impl Fixture {
             .env_clear()
             .env("OMB_TEST_CHILD_DATA", &self.root)
             .env("OMB_TEST_CHILD", "daemon")
+            .env("HOME", &self.root)
             .stdin(Stdio::null())
             .stdout(fs::OpenOptions::new().append(true).open(&out).unwrap())
             .stderr(fs::OpenOptions::new().append(true).open(&err).unwrap())
@@ -1012,5 +1013,67 @@ async fn daemon_restart_records_daemon_down_gap() {
             .any(|gap| gap.reason == "daemon_down" && gap.ended_at.is_some())
     );
     second.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+/// Rewrites the `hosts.crabcode` section of the initialized `config.toml`.
+fn configure_crabcode(fixture: &Fixture, binary: &str, roots: &[PathBuf]) {
+    let path = fixture.root.join("config.toml");
+    let mut config: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut section = toml::Table::new();
+    section.insert("binary".into(), toml::Value::String(binary.into()));
+    section.insert(
+        "workspace_roots".into(),
+        toml::Value::Array(
+            roots
+                .iter()
+                .map(|root| toml::Value::String(root.to_str().unwrap().into()))
+                .collect(),
+        ),
+    );
+    config
+        .get_mut("hosts")
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .insert("crabcode".into(), toml::Value::Table(section));
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_start_refuses_workspace_root_outside_home() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    // The child's HOME is the fixture root; its parent directory is outside it.
+    configure_crabcode(&fixture, "/usr/bin/false", &[std::env::temp_dir()]);
+    let mut process = fixture.spawn("daemon_start_refuses_workspace_root_outside_home");
+    assert_eq!(process.wait().await, 4);
+    assert!(process.output().contains("workspace_root_invalid"));
+    assert!(!fixture.root.join("pg/data/postmaster.pid").exists());
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_with_crabcode_configured_serves_status_and_stops_clean() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    configure_crabcode(&fixture, "/usr/bin/false", &[workspace]);
+    let mut process =
+        fixture.spawn("daemon_with_crabcode_configured_serves_status_and_stops_clean");
+    let snapshot = fixture.ready().await;
+    assert_eq!(snapshot.daemon_pid, process.pid());
+    process.stop(Signal::TERM).await;
     assert_runtime_released(&fixture);
 }

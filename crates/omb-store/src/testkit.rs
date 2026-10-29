@@ -388,3 +388,53 @@ pub async fn insert_sender(
     assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$2,$3,$4,$4,'/workspaces/project',$5,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&channel,&source_key,&sender_key,&thread_id]).await.unwrap(),1);
     id
 }
+/// An active host binding on the given workspace, revision 1.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_host_binding(client: &tokio_postgres::Client, workspace: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,workspace_dir,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'host','host','crabcode','host:crabcode',$2,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&workspace]).await.unwrap(),1);
+    id
+}
+/// Like `insert_sender`, on the given channel and workspace.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_sender_in(
+    client: &tokio_postgres::Client,
+    channel: &str,
+    source_key: &str,
+    sender_key: &str,
+    thread_id: &str,
+    workspace: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$2,$3,$4,$4,$5,$6,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&channel,&source_key,&sender_key,&workspace,&thread_id]).await.unwrap(),1);
+    id
+}
+/// An accepted message of the binding carrying the given run, thread and dispatch status.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_event_for_run(
+    client: &tokio_postgres::Client,
+    binding_id: uuid::Uuid,
+    run_id: &str,
+    thread_id: &str,
+    status: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status) SELECT $1,'event',b.channel_kind,b.source_key,$6,statement_timestamp(),b.binding_id,'accepted_message','test message',sha256('test message'::bytea),$3,$4,$5 FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding_id,&run_id,&thread_id,&status,&format!("op:{id}")]).await.unwrap(),1);
+    id
+}
+/// The control interface's decision, under a control token row written for it. Built only as
+/// `omb_store::testkit`: the targets that include this file by path have no crate items.
+#[cfg(not(test))]
+pub async fn decide(
+    client: &tokio_postgres::Client,
+    permission_id: &str,
+    decision: crate::Decision,
+) -> crate::Decided {
+    let token = uuid::Uuid::now_v7();
+    let mut digest = [0; 32];
+    getrandom::fill(&mut digest).unwrap();
+    assert_eq!(client.execute("INSERT INTO openmybot.control_tokens(token_id,token_sha256,daemon_pid,engine_pin,omb_version,pg_system_identifier,pg_timeline_id,restore_detected,created_at,last_heartbeat_at,revoked_at,revoke_reason) VALUES ($1,$2,1,'0123456789abcdef0123456789abcdef01234567','0.0.0','test',1,false,statement_timestamp(),statement_timestamp(),statement_timestamp(),'daemon_stop')",&[&token,&digest.as_slice()]).await.unwrap(),1);
+    crate::decide_permission(client, permission_id, decision, token, deadline())
+        .await
+        .unwrap()
+}

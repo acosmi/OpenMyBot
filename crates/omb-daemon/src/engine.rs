@@ -1,6 +1,10 @@
 use crate::{DaemonError, config, delegation::OmbDelegationAuthority, pg::Postgres, tenant};
-use openbot_application::tenant::package::{
-    LoadedTenantPackage, TenantPackageAudienceContext, synchronize_tenant_package,
+use omb_hostdriver::HostDriver;
+use openbot_application::{
+    ProviderAdapter, ProviderExtensionKey,
+    tenant::package::{
+        LoadedTenantPackage, TenantPackageAudienceContext, synchronize_tenant_package,
+    },
 };
 use openbot_computer::screen::{
     DEFAULT_SCREEN_VIEWERS_PER_STREAM, ScreenHub, ScreenSessionService,
@@ -99,6 +103,11 @@ pub struct Engine {
     pub(crate) authority: Arc<OmbDelegationAuthority>,
     pub(crate) resolver: SingleUserAuthResolver,
     pub(crate) vault: CredentialRecordVault,
+    /// The pool, scope and audit checkpoint key the Agent runtime is assembled from.
+    pub(crate) pool: DatabasePool,
+    pub(crate) deployment: DeploymentId,
+    pub(crate) tenant: TenantId,
+    pub(crate) agent_audit_key: SecretBytes,
 }
 impl Engine {
     pub(crate) async fn shutdown(self) {
@@ -106,7 +115,11 @@ impl Engine {
         self.authority.close().await;
     }
 }
-pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, DaemonError> {
+pub(crate) async fn assemble(
+    root: &Path,
+    prepared: Prepared,
+    host: &HostDriver,
+) -> Result<Engine, DaemonError> {
     let Prepared {
         pool,
         database,
@@ -139,6 +152,8 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
         .map_err(|_| DaemonError::EngineAssemblyFailed)?;
     let ui_audit_key = derive_application_key(&master, ApplicationKeyPurpose::AuditCheckpoint)
         .map_err(|_| DaemonError::EngineAssemblyFailed)?;
+    let agent_audit_key = SecretBytes::new(audit_key.expose().to_vec());
+    let crabcode: Arc<dyn ProviderAdapter> = host.adapter();
     let ui_preferences = Arc::new(
         PostgresUiPreferenceAdministration::new(
             pool.clone(),
@@ -165,10 +180,10 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
         .map_err(|_| DaemonError::EngineAssemblyFailed)?,
     );
     let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
-        pool,
+        pool: pool.clone(),
         listener_database: database.into(),
-        deployment,
-        tenant,
+        deployment: deployment.clone(),
+        tenant: tenant.clone(),
         single_user: true,
         admin_floor: None,
         model: package.package.model.default_model,
@@ -194,7 +209,10 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
         stall_timeout: None,
         oauth_public_url: None,
         app_url: None,
-        extra_provider_adapters: Vec::new(),
+        extra_provider_adapters: vec![(
+            ProviderExtensionKey::new("crabcode").map_err(|_| DaemonError::EngineAssemblyFailed)?,
+            crabcode,
+        )],
         run_event_subscriber: None,
         delegation_authority: Some(authority.clone()),
     })
@@ -208,5 +226,9 @@ pub(crate) async fn assemble(root: &Path, prepared: Prepared) -> Result<Engine, 
             default_session_lifetime(),
         ),
         vault,
+        pool,
+        deployment,
+        tenant,
+        agent_audit_key,
     })
 }

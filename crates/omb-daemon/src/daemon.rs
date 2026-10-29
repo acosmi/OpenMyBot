@@ -1,5 +1,6 @@
 use crate::{
     DaemonError, DaemonOptions, StatusSnapshot,
+    agent::AgentRuntime,
     channels::Channels,
     config,
     control::{self, ControlState, ENGINE_PIN},
@@ -7,8 +8,9 @@ use crate::{
     pg::{self, Postgres},
 };
 use omb_channels::{TelegramEndpoint, Timings};
+use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow};
 use openbot_infra::net::safe_http::{EgressPolicy, SafeDialer};
-use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::UnixListener,
     signal::unix::{SignalKind, signal},
@@ -19,6 +21,11 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     let root = &options.data_dir;
     let _lock = config::lock(root)?;
     let config = config::load(root)?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or(DaemonError::WorkspaceRootInvalid)?;
+    let crabcode = config::Crabcode::parse(&config, &home)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| DaemonError::InternalError)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(|_| DaemonError::InternalError)?;
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
@@ -29,16 +36,23 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     let mut engine = None;
     let mut token_id = None;
     let mut channels = None;
+    let mut agent = None;
+    let mut host: Option<HostDriver> = None;
+    let mut host_link = None;
     use sha2::Digest as _;
     let result=async {
         let prepared=engine::prepare(root,&config.deployment_id,&mut postgres).await?;
+        let resident=postgres.open_resident_connection("omb-hostdriver").await?;
+        host_link=Some(resident.driver);
+        let driver=host.insert(HostDriver::new(HostDriverConfig{binary:crabcode.binary,home,tmp_dir:root.join("hosts/crabcode/tmp"),roots:crabcode.roots,window:VersionWindow::embedded(),limits:Limits::default()},Arc::new(resident.client)));
         let token=config::hex_random(config::TOKEN_BYTES).map_err(|_|DaemonError::ControlTokenFailed)?;
         config::write_private(&root.join("run/control.token"),token.as_bytes(),true).map_err(|_|DaemonError::ControlTokenFailed)?;
         let current_token_id=uuid::Uuid::now_v7();
         token_id=Some(current_token_id);
         let token_sha256:[u8;32]=sha2::Sha256::digest(token.as_bytes()).into();
         postgres.start_control_token(omb_store::ControlTokenStart{token_id:current_token_id,token_sha256,daemon_pid:i32::try_from(std::process::id()).map_err(|_|DaemonError::ControlTokenFailed)?,engine_pin:ENGINE_PIN,omb_version:env!("CARGO_PKG_VERSION")}).await?;
-        let assembled=engine.insert(engine::assemble(root,prepared).await?);
+        let assembled=engine.insert(engine::assemble(root,prepared,driver).await?);
+        agent=Some(AgentRuntime::start(assembled,postgres.database_config())?);
         let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()))).await?);
         let path=root.join("run/control.sock");
         let listener=UnixListener::bind(&path).map_err(|_|DaemonError::ControlSocketFailed)?;
@@ -71,12 +85,25 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
             }
         };
         if let Some(started)=channels.take() {started.stop().await;}
+        if let Some(runtime)=agent.take() {runtime.stop().await;}
+        if let Some(driver)=host.take() {driver.shutdown().await;}
+        if let Some(link)=host_link.take() {link.abort();let _=link.await;}
         drop(listener);
         connections.abort_all();while connections.join_next().await.is_some() {}
         outcome
     }.await;
     if let Some(channels) = channels {
         channels.stop().await;
+    }
+    if let Some(runtime) = agent {
+        runtime.stop().await;
+    }
+    if let Some(driver) = host {
+        driver.shutdown().await;
+    }
+    if let Some(link) = host_link {
+        link.abort();
+        let _ = link.await;
     }
     if let Some(engine) = engine {
         engine.shutdown().await;

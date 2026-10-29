@@ -1,4 +1,5 @@
 use crate::{DaemonError, DataDirectoryInput};
+use omb_hostdriver::WorkspaceRoots;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -31,14 +32,39 @@ pub(crate) struct Config {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Hosts {
-    pub(crate) crabcode: Crabcode,
+    pub(crate) crabcode: CrabcodeSection,
 }
+/// The `hosts.crabcode` section as written in `config.toml`.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Crabcode {
+pub(crate) struct CrabcodeSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) binary: Option<PathBuf>,
     pub(crate) workspace_roots: Vec<PathBuf>,
+}
+/// The `hosts.crabcode` section as types: validated once at startup.
+pub(crate) struct Crabcode {
+    pub(crate) binary: Option<PathBuf>,
+    pub(crate) roots: WorkspaceRoots,
+}
+impl Crabcode {
+    /// The binary must be absolute; each root must be a proper subdirectory of `home` outside
+    /// `home/Library`.
+    pub(crate) fn parse(config: &Config, home: &Path) -> Result<Self, DaemonError> {
+        let section = &config.hosts.crabcode;
+        if section
+            .binary
+            .as_ref()
+            .is_some_and(|binary| !binary.is_absolute())
+        {
+            return Err(DaemonError::HostBinaryInvalid);
+        }
+        Ok(Self {
+            binary: section.binary.clone(),
+            roots: WorkspaceRoots::parse(home, &section.workspace_roots)
+                .map_err(|_| DaemonError::WorkspaceRootInvalid)?,
+        })
+    }
 }
 
 pub fn resolve_data_dir(input: DataDirectoryInput) -> Result<PathBuf, DaemonError> {
@@ -301,6 +327,77 @@ mod tests {
             )
             .is_err()
         );
+    }
+    fn crabcode(binary: Option<&str>, roots: &[PathBuf]) -> Config {
+        Config {
+            deployment_id: "omb-local-00000000000000000000000000000000".into(),
+            pg_bin_dir: "/pg".into(),
+            hosts: Hosts {
+                crabcode: CrabcodeSection {
+                    binary: binary.map(PathBuf::from),
+                    workspace_roots: roots.to_vec(),
+                },
+            },
+        }
+    }
+    #[test]
+    fn crabcode_section_is_parsed_once_into_typed_roots_and_absolute_binary() {
+        let home = test_dir();
+        let project = home.join("code/project");
+        fs::create_dir_all(&project).unwrap();
+        let text = format!(
+            "deployment_id='omb-local-00000000000000000000000000000000'\npg_bin_dir='/pg'\n[hosts.crabcode]\nbinary='/opt/crab/bin/crabcode'\nworkspace_roots=['{}']\n",
+            home.join("code").display()
+        );
+        let config: Config = toml::from_str(&text).unwrap();
+        let parsed = Crabcode::parse(&config, &home).unwrap();
+        assert_eq!(
+            parsed.binary.as_deref(),
+            Some(Path::new("/opt/crab/bin/crabcode"))
+        );
+        assert_eq!(
+            parsed.roots.resolve(&project),
+            Some(fs::canonicalize(&project).unwrap())
+        );
+        assert_eq!(parsed.roots.resolve(&home), None);
+        let default = Crabcode::parse(&crabcode(None, &[]), &home).unwrap();
+        assert!(default.binary.is_none());
+        assert_eq!(default.roots.resolve(&project), None);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn roots_outside_home_or_in_library_refuse_startup() {
+        let home = test_dir();
+        let outside = test_dir();
+        fs::create_dir_all(home.join("Library/Work")).unwrap();
+        for root in [
+            outside.clone(),
+            home.clone(),
+            home.join("Library/Work"),
+            home.join("missing"),
+            PathBuf::from("relative"),
+        ] {
+            assert_eq!(
+                Crabcode::parse(&crabcode(None, &[root]), &home).err(),
+                Some(DaemonError::WorkspaceRootInvalid)
+            );
+        }
+        assert_eq!(
+            DaemonError::WorkspaceRootInvalid.code(),
+            "workspace_root_invalid"
+        );
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+    #[test]
+    fn relative_binary_refuses_startup() {
+        let home = test_dir();
+        assert_eq!(
+            Crabcode::parse(&crabcode(Some("bin/crabcode"), &[]), &home).err(),
+            Some(DaemonError::HostBinaryInvalid)
+        );
+        assert_eq!(DaemonError::HostBinaryInvalid.code(), "host_binary_invalid");
+        fs::remove_dir_all(home).unwrap();
     }
     #[test]
     fn rejects_relative_and_overlong_socket_paths() {

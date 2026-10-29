@@ -3,8 +3,9 @@ use openbot_application::tenant::package::{LoadedTenantPackage, TenantPackageEnv
 use openbot_infra::tenant::load_tenant_package;
 use std::path::Path;
 
-// These five inputs describe composition only. There is no callable model or runtime entry.
-const AGENTS: &str = "agents: []\n";
+// These five inputs describe composition only. The one Bot is served by the `crabcode` provider
+// extension; there is no callable package model.
+const AGENTS: &str = "agents:\n  - id: omb-crabcode\n    name: OpenMyBot\n    title: OpenMyBot\n    role_description: OpenMyBot host bot\n    type: built-in\n    system_prompt: OpenMyBot\n    providerSource: extension:crabcode\n";
 const CHANNELS: &str = "channels: []\n";
 const MODEL: &str = "model:\n  provider: openai\n  default_model: omb-unconfigured\n  credential_secret_ref: omb-unconfigured\n";
 const KNOWLEDGE: &str = "sources: []\n";
@@ -39,14 +40,24 @@ pub(crate) fn write_and_load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openbot_application::tenant::package::TenantAgentConfiguration;
     #[test]
-    fn embedded_package_has_empty_runtime_entries_and_valid_scope() {
+    fn embedded_package_declares_only_the_crabcode_bot_and_valid_scope() {
         let root = config::test_dir();
         config::make_dir(&root.join("tenant")).unwrap();
         let id = "omb-local-0123456789abcdef0123456789abcdef";
         let loaded = write_and_load(&root, id).unwrap();
         assert_eq!(loaded.package.tenant_id, id);
-        assert!(loaded.package.agents.is_empty());
+        assert_eq!(loaded.package.agents.len(), 1);
+        let bot = &loaded.package.agents[0];
+        assert_eq!(bot.id, crate::delegation::BOT_ID);
+        let TenantAgentConfiguration::BuiltIn {
+            provider_source, ..
+        } = &bot.configuration
+        else {
+            panic!("built-in Bot expected");
+        };
+        assert_eq!(provider_source.as_str(), "extension:crabcode");
         assert!(loaded.package.channels.is_empty());
         assert!(loaded.package.knowledge_sources.is_empty());
         assert!(!loaded.package.model.default_model.is_empty());

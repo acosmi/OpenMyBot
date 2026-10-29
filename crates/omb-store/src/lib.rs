@@ -2,6 +2,7 @@
 mod bindings;
 mod control_tokens;
 mod events;
+mod host_sessions;
 mod migration;
 mod pairing;
 #[cfg(feature = "testkit")]
@@ -16,6 +17,7 @@ pub use control_tokens::{
     stop_control_token, touch_heartbeat,
 };
 pub use events::*;
+pub use host_sessions::*;
 pub use migration::{MigrationReport, migrate};
 pub use pairing::{
     AcceptedEvent, Channel, PairAttempt, PairCode, PairOutcome, PairStart, PairStarted,
@@ -67,6 +69,8 @@ pub enum StoreError {
     DispatchFailed,
     #[error("gap_failed")]
     GapFailed,
+    #[error("host_session_failed")]
+    HostSessionFailed,
 }
 
 pub(crate) fn timely<T>(
