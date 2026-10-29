@@ -5,11 +5,11 @@ use omb_channels::{
     testkit::{FakeTelegram, Reply, Sent},
 };
 use omb_store::{
-    migrate,
+    EndReason, SessionEnd, deny_undecided_permissions, end_session, migrate,
     testkit::{
         Fixture, Session, deadline, insert_delivery, insert_ended_session, insert_event_for_run,
-        insert_host_binding, insert_permission_row, insert_receiver_with, insert_sender, read_row,
-        set_terminal, shift_column,
+        insert_host_binding, insert_orphan_session, insert_permission_row, insert_receiver_with,
+        insert_sender, read_row, set_terminal, shift_column,
     },
 };
 use openbot_application::{RunTerminalKind, RunTerminalNotice};
@@ -223,7 +223,30 @@ async fn sends_pending_text_as_json_post_to_the_token_path_and_marks_sent() {
     assert!(row["first_attempt_at"].is_string());
     assert!(row["finished_at"].is_string());
     assert_eq!(row["platform_message_id"], "1");
-    let dump: String = env.client().query_one("SELECT concat_ws(',',(SELECT string_agg(row_to_json(d)::text,',') FROM openmybot.deliveries d),(SELECT string_agg(row_to_json(e)::text,',') FROM openmybot.channel_events e),(SELECT string_agg((to_jsonb(b)-'credential_envelope')::text,',') FROM openmybot.channel_bindings b),(SELECT string_agg(row_to_json(h)::text,',') FROM openmybot.host_driver_sessions h))", &[]).await.unwrap().get(0);
+    // Every row of every product table, envelope columns aside.
+    let mut dump = String::new();
+    for table in env
+        .client()
+        .query(
+            "SELECT tablename::text FROM pg_tables WHERE schemaname='openmybot'",
+            &[],
+        )
+        .await
+        .unwrap()
+    {
+        let table: String = table.get(0);
+        let rows: String = env
+            .client()
+            .query_one(
+                &format!("SELECT coalesce(string_agg((to_jsonb(t)-'credential_envelope')::text, ','), '') FROM openmybot.{table} t"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        dump.push_str(&rows);
+    }
+    assert!(dump.contains("telegram:42"));
     assert!(!dump.contains("SENTINEL"));
     assert!(!format!("{row:?}").contains("SENTINEL"));
     env.stop().await;
@@ -881,21 +904,33 @@ async fn run_result_text_uses_session_summary_and_artifact_paths_read_at_send_ti
 async fn failed_and_cancelled_texts_carry_no_stderr_tail() {
     let mut env = Env::new().await;
     let mut ids = Vec::new();
-    for (index, (terminal, reason)) in [("failed", "result_error"), ("cancelled", "stop_requested")]
-        .into_iter()
-        .enumerate()
+    for (index, (terminal, reason)) in [
+        ("failed", EndReason::ResultError),
+        ("cancelled", EndReason::StopRequested),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let run = format!("0192f1a2-0000-7000-8000-00000000010{index}");
         let event = env.event(&run).await;
         set_terminal(env.client(), event, terminal).await;
-        let session = insert_ended_session(env.client(), env.sender, &run, reason, None, &[]).await;
-        env.client()
-            .execute(
-                "UPDATE openmybot.host_driver_sessions SET stderr_tail='STDERR-SENTINEL tail' WHERE record_id=$1",
-                &[&session],
-            )
-            .await
-            .unwrap();
+        let session = insert_orphan_session(env.client(), env.sender, &run, None).await;
+        end_session(
+            env.client(),
+            session,
+            SessionEnd {
+                reason,
+                exit_code: None,
+                exit_signal: None,
+                stop: None,
+                result_summary: None,
+                artifact_paths: &[],
+                stderr_tail: "STDERR-SENTINEL tail",
+            },
+            deadline(),
+        )
+        .await
+        .unwrap();
         ids.push(
             env.delivery("run_result", &format!("result:{run}"), None)
                 .await,
@@ -925,7 +960,12 @@ async fn failed_and_cancelled_texts_carry_no_stderr_tail() {
 async fn expired_permission_notice_is_still_sent_verbatim() {
     let mut env = Env::new().await;
     insert_permission_row(env.client(), env.sender, "run-1", "p-old", -5.0).await;
-    env.client().execute("UPDATE openmybot.host_driver_sessions SET decision='deny',decided_via='run_stopped',decided_at=statement_timestamp() WHERE permission_id='p-old'", &[]).await.unwrap();
+    assert_eq!(
+        deny_undecided_permissions(env.client(), deadline())
+            .await
+            .unwrap(),
+        1
+    );
     let body = "run run-1 需要审批 Write，许可 p-old，openmybot approve p-old";
     let id = env
         .delivery("permission_notice", "perm:p-old", Some(body))

@@ -276,7 +276,7 @@ pub(crate) fn chat_id(chat_key: &str) -> Option<i64> {
         .parse()
         .ok()
 }
-/// `{"chat_id": <integer>, "text": <text>}` without `parse_mode`.
+/// `{"chat_id": <integer>, "text": <text>}` and no other key: the text is sent as plain text.
 pub(crate) fn request_body(chat_id: i64, text: &str) -> Vec<u8> {
     serde_json::json!({"chat_id": chat_id, "text": text})
         .to_string()
@@ -525,11 +525,13 @@ mod tests {
     fn request_body_has_exactly_chat_id_and_text() {
         let body: Value = serde_json::from_slice(&request_body(-42, "你好 \"x\"\n")).unwrap();
         let object = body.as_object().unwrap();
-        assert_eq!(object.len(), 2);
+        // Exactly these two keys: no formatting mode is ever requested.
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["chat_id", "text"]);
         assert_eq!(object["chat_id"], Value::from(-42));
         assert!(object["chat_id"].is_i64());
         assert_eq!(object["text"], "你好 \"x\"\n");
-        assert!(!object.contains_key("parse_mode"));
     }
     #[test]
     fn terminal_kind_maps_the_four_engine_kinds() {

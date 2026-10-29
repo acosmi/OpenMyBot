@@ -1178,6 +1178,27 @@ mod tests {
 
     // ---- Outbound delivery and reconciliation --------------------------------------------
 
+    /// Starts the channel tasks on the fixture's store and engine.
+    async fn started(
+        fixture: &mut Fixture,
+        token: Uuid,
+        timings: Timings,
+        endpoint: TelegramEndpoint,
+        outbound: Outbound,
+    ) -> Channels {
+        let engine = fixture.engine.as_ref().unwrap();
+        Channels::start(
+            &mut fixture.pg,
+            engine,
+            token,
+            timings,
+            endpoint,
+            cancel(),
+            outbound,
+        )
+        .await
+        .unwrap()
+    }
     /// Channel timings with a short delivery poll.
     fn outbound_timings() -> Timings {
         Timings {
@@ -1316,18 +1337,7 @@ mod tests {
         )
         .await;
         let timings = outbound_timings();
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
-            token,
-            timings,
-            fake.endpoint(),
-            cancel(),
-            outbound(),
-        )
-        .await
-        .unwrap();
+        let channels = started(&mut fixture, token, timings, fake.endpoint(), outbound()).await;
         let stored = testkit::read_row(&client, "deliveries", "delivery_id", row).await;
         assert_eq!(stored["status"], "unknown");
         assert_eq!(stored["last_error_code"], "daemon_restart");
@@ -1363,18 +1373,14 @@ mod tests {
         for run in [&done, &stopped] {
             assert!(rt::event(&client, &run.run).await["terminal_kind"].is_null());
         }
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let channels = started(
+            &mut fixture,
             token,
             outbound_timings(),
             refused_endpoint(),
-            cancel(),
             outbound(),
         )
-        .await
-        .unwrap();
+        .await;
         for (run, kind) in [(&done, "succeeded"), (&stopped, "cancelled")] {
             assert_eq!(rt::event(&client, &run.run).await["terminal_kind"], kind);
             assert_eq!(rt::results(&client, &run.run).await.len(), 1);
@@ -1493,18 +1499,14 @@ mod tests {
         let client = fixture.client().await;
         let fake = FakeTelegram::start().await;
         rt::sealed(&fixture, &client).await;
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let channels = started(
+            &mut fixture,
             token,
             outbound_timings(),
             fake.endpoint(),
-            cancel(),
             outbound(),
         )
-        .await
-        .unwrap();
+        .await;
         let six = [
             "openmybot-heartbeat",
             "openmybot-dispatcher",
@@ -1560,18 +1562,14 @@ mod tests {
         client.batch_execute(FAIL_ROW).await.unwrap();
         // The sender fails on its claim update.
         let first = token(&mut fixture).await;
-        let engine = fixture.engine.as_ref().unwrap();
-        let mut channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let mut channels = started(
+            &mut fixture,
             first,
             outbound_timings(),
             refused_endpoint(),
-            cancel(),
             outbound(),
         )
-        .await
-        .unwrap();
+        .await;
         client.batch_execute("CREATE TRIGGER fail_update BEFORE UPDATE ON openmybot.deliveries FOR EACH ROW EXECUTE FUNCTION openmybot.fail_row()").await.unwrap();
         testkit::insert_delivery(
             &client,
@@ -1596,10 +1594,8 @@ mod tests {
             .unwrap();
         // The sweeper fails on its first deletion.
         let second = token(&mut fixture).await;
-        let engine = fixture.engine.as_ref().unwrap();
-        let mut channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let mut channels = started(
+            &mut fixture,
             second,
             Timings {
                 sweep_interval: Duration::from_millis(150),
@@ -1607,11 +1603,9 @@ mod tests {
                 ..outbound_timings()
             },
             refused_endpoint(),
-            cancel(),
             outbound(),
         )
-        .await
-        .unwrap();
+        .await;
         client.batch_execute("CREATE TRIGGER fail_delete BEFORE DELETE ON openmybot.channel_events FOR EACH ROW EXECUTE FUNCTION openmybot.fail_row()").await.unwrap();
         let old =
             testkit::insert_event_for_run(&client, binding, "run-old", "T1", "conflict").await;
@@ -1636,21 +1630,17 @@ mod tests {
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let channels = started(
+            &mut fixture,
             token,
             outbound_timings(),
             fake.endpoint(),
-            cancel(),
             Outbound {
                 terminals,
                 crabcode: None,
             },
         )
-        .await
-        .unwrap();
+        .await;
         let run = rt::begun(&fixture, &client, binding, &thread).await;
         rt::messages(&fake, 1).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1691,21 +1681,17 @@ mod tests {
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let channels = started(
+            &mut fixture,
             token,
             outbound_timings(),
             fake.endpoint(),
-            cancel(),
             Outbound {
                 terminals,
                 crabcode: None,
             },
         )
-        .await
-        .unwrap();
+        .await;
         let run = rt::begun(&fixture, &client, binding, &thread).await;
         let id = rt::permission_of(&client, &run.run).await;
         let notice = rt::messages(&fake, 1).await;
@@ -1756,21 +1742,17 @@ mod tests {
             .get(0);
         // The owner never answers; the daemon starts and stops the run's permission.
         let terminals = fixture.take_terminals();
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let channels = started(
+            &mut fixture,
             token,
             outbound_timings(),
             fake.endpoint(),
-            cancel(),
             Outbound {
                 terminals,
                 crabcode: None,
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             testkit::permission_row_json(&client, &id).await["decided_via"],
             "run_stopped"
@@ -1800,21 +1782,17 @@ mod tests {
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let channels = started(
+            &mut fixture,
             token,
             outbound_timings(),
             fake.endpoint(),
-            cancel(),
             Outbound {
                 terminals,
                 crabcode: None,
             },
         )
-        .await
-        .unwrap();
+        .await;
         let run = rt::begun(&fixture, &client, binding, &thread).await;
         agent::initialized(&client, &run.run).await;
         cancel_run(&fixture, &run).await;
@@ -1927,18 +1905,14 @@ mod tests {
             AcceptOutcome::Recorded(Disposition::ControlCommand)
         );
         let fake = FakeTelegram::start().await;
-        let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(
-            &mut fixture.pg,
-            engine,
+        let channels = started(
+            &mut fixture,
             token,
             outbound_timings(),
             fake.endpoint(),
-            cancel(),
             outbound(),
         )
-        .await
-        .unwrap();
+        .await;
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
         let rows = loop {
             let rows: Vec<(String, String, String)> = client

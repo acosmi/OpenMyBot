@@ -304,10 +304,21 @@ mod tests {
     }
     #[test]
     fn production_endpoint_is_https_only() {
-        let endpoint = TelegramEndpoint::production(SafeDialer::new(
-            openbot_infra::net::safe_http::EgressPolicy::default(),
-        ));
-        assert_eq!(endpoint.scheme, SchemePolicy::HttpsOnly);
+        use openbot_infra::net::safe_http::{EgressPolicy, SafeHttpBudget, SafeHttpRequest};
+        let endpoint = TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()));
         assert_eq!(endpoint.api_base.as_str(), "https://api.telegram.org/");
+        // The endpoint's scheme policy admits the HTTPS base and refuses the same URL over HTTP.
+        let request = |url: &str| {
+            SafeHttpRequest::get(
+                Url::parse(url).unwrap(),
+                endpoint.scheme,
+                SafeHttpBudget::new(1024, Duration::from_secs(1)).unwrap(),
+            )
+        };
+        assert!(request("https://api.telegram.org/").is_ok());
+        assert_eq!(
+            request("http://api.telegram.org/").err(),
+            Some(openbot_infra::net::safe_http::SafeHttpError::SchemeRejected)
+        );
     }
 }
