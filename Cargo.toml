@@ -21,6 +21,7 @@ members = [
     "crates/omb-cli",
     "crates/omb-channels",
     "crates/omb-hostdriver",
+    "crates/omb-mcp",
     "crates/openbot-contracts",
     "crates/openbot-domain",
     "crates/openbot-application",

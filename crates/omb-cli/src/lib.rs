@@ -49,6 +49,7 @@ pub enum Command {
     Cancel {
         run_id: String,
     },
+    Mcp,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairChannel {
@@ -181,6 +182,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["cancel", id] => Command::Cancel {
             run_id: (*id).into(),
         },
+        ["mcp"] if !json => Command::Mcp,
         _ => return Err(UsageError),
     };
     Ok(Invocation {
@@ -197,7 +199,7 @@ impl Command {
             Self::BindingsReceiverTelegram | Self::BindingsReceiverFeishu { .. }
         )
     }
-    /// The control operation and its arguments; `init` and `daemon` run locally.
+    /// The control operation and its arguments; `init`, `daemon` and `mcp` run locally.
     pub fn control_request(&self, secret: Option<SecretLine>) -> Option<(&'static str, Value)> {
         let with_deadline = |mut args: Value, run_deadline: &Option<u32>| {
             if let Some(seconds) = run_deadline {
@@ -206,7 +208,7 @@ impl Command {
             args
         };
         Some(match self {
-            Self::Init { .. } | Self::Daemon => return None,
+            Self::Init { .. } | Self::Daemon | Self::Mcp => return None,
             Self::Status { run: None } => ("status", json!({})),
             Self::Status { run: Some(run_id) } => ("status_run", json!({"run_id": run_id})),
             Self::Pair {
@@ -347,7 +349,6 @@ mod tests {
         }
         assert!(parse_args(&args(&["init", "--pg-bin-dir", "/pg"])).is_ok());
         for values in [
-            vec!["mcp"],
             vec!["unknown"],
             vec!["pair"],
             vec!["approve"],
@@ -588,12 +589,21 @@ mod tests {
         }
     }
     #[test]
-    fn mcp_stays_a_usage_error() {
+    fn mcp_takes_no_words_flags_or_json() {
+        assert_eq!(command(&["mcp"]), Ok(Command::Mcp));
+        for values in [["--data-dir", "/d", "mcp"], ["mcp", "--data-dir", "/d"]] {
+            let invocation = parse_args(&args(&values)).unwrap();
+            assert_eq!(invocation.command, Command::Mcp);
+            assert_eq!(invocation.data_dir, Some(PathBuf::from("/d")));
+        }
         for values in [
-            vec!["mcp"],
             vec!["mcp", "serve"],
+            vec!["mcp", "extra"],
             vec!["mcp", "--json"],
+            vec!["--json", "mcp"],
+            vec!["mcp", "--workspace", "/w"],
             vec!["--json", "mcp", "run", "begin"],
+            vec!["mcp", "--data-dir", "relative"],
         ] {
             assert_eq!(command(&values), Err(UsageError), "{values:?}");
         }
@@ -707,6 +717,8 @@ mod tests {
         assert!(!command(&["approve", "hp1"]).unwrap().reads_secret());
         assert_eq!(request(&["daemon"], None), None);
         assert_eq!(request(&["init", "--pg-bin-dir", "/pg"], None), None);
+        assert_eq!(request(&["mcp"], None), None);
+        assert!(!command(&["mcp"]).unwrap().reads_secret());
     }
     #[test]
     fn control_op_names_equal_the_cli_command_words() {
