@@ -113,6 +113,14 @@ for file in "${test_only_network_files[@]}"; do
   done <<< "$client_lines"
 done
 
+# provider/custom.rs 的唯一回环探针在其 #[cfg(test)] mod v2_vault_tests 内；生产段再出现出网调用即红。
+custom_file=crates/openbot-infra/src/provider/custom.rs
+custom_test_module_line=$(awk 'previous == "#[cfg(test)]" && $0 == "mod v2_vault_tests {" { print NR - 1 } { previous = $0 }' "$custom_file")
+custom_client_lines=$(rg -n 'TcpStream::connect|lookup_host\(|TlsConnector|http1::handshake|reqwest::|hyper::client|tokio_rustls' "$custom_file" | cut -d: -f1)
+[[ "$custom_test_module_line" =~ ^[0-9]+$ && "$custom_client_lines" =~ ^[0-9]+$ ]] \
+  && (( custom_client_lines > custom_test_module_line )) \
+  || fail "custom provider loopback client 越出 cfg(test)：cfg=[$custom_test_module_line] callers=[$custom_client_lines]"
+
 metadata=$(cargo metadata --format-version 1 --locked)
 ring_manifest=$(printf '%s' "$metadata" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=[p["manifest_path"] for p in d["packages"] if p["name"]=="ring" and p["version"]=="0.17.14"];assert len(m)==1,m;print(m[0])')
 ring_dir=${ring_manifest%/Cargo.toml}
