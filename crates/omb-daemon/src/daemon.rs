@@ -5,7 +5,7 @@ use crate::{
     config,
     control::{self, ControlState, ENGINE_PIN},
     engine,
-    ops::{BindingRunCanceller, Ops, ReceiverCommand},
+    ops::{BindingRunCanceller, CancelQueue, Ops, ReceiverCommand, ThreadMinter},
     pg::{self, Postgres},
 };
 use omb_channels::{CANCEL_QUEUE, TERMINAL_QUEUE, TelegramEndpoint, TerminalQueue, Timings};
@@ -46,7 +46,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     let mut agent = None;
     let mut host: Option<HostDriver> = None;
     let mut host_link = None;
-    let mut canceller: Option<BindingRunCanceller> = None;
+    let mut canceller: Option<CancelQueue> = None;
     let mut control_link = None;
     use sha2::Digest as _;
     let result=async {
@@ -71,8 +71,9 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let (receiver,mut commands)=mpsc::channel(8);
         let endpoint=TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()));
         let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),endpoint.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary}).await?);
-        canceller=Some(BindingRunCanceller::start(assembled.assembly.application.clone(),assembled.resolver.clone(),canceller_connection,requests));
-        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,endpoint,receiver,wake:started.wake()};
+        let run_canceller=BindingRunCanceller::new(assembled.assembly.application.clone(),assembled.resolver.clone(),Arc::new(canceller_connection.client));
+        canceller=Some(CancelQueue::start(run_canceller.clone(),canceller_connection.driver,requests));
+        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,endpoint,receiver,wake:started.wake(),minter:ThreadMinter::new(assembled.assembly.application.clone(),assembled.resolver.clone()),canceller:run_canceller,counters:started.status_source().counters};
         let path=root.join("run/control.sock");
         let listener=UnixListener::bind(&path).map_err(|_|DaemonError::ControlSocketFailed)?;
         std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).map_err(|_|DaemonError::ControlSocketFailed)?;

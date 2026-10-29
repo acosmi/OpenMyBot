@@ -1831,6 +1831,11 @@ mod tests {
             .open_resident_connection("openmybot-control")
             .await
             .unwrap();
+        let canceller_connection = fixture
+            .pg
+            .open_resident_connection("openmybot-canceller")
+            .await
+            .unwrap();
         let engine = fixture.engine();
         let ops = Ops {
             control: tokio::sync::Mutex::new(control.client),
@@ -1846,6 +1851,16 @@ mod tests {
             endpoint: fake.endpoint(),
             receiver: mpsc::channel(8).0,
             wake: channels.wake(),
+            minter: crate::ops::ThreadMinter::new(
+                engine.assembly.application.clone(),
+                engine.resolver.clone(),
+            ),
+            canceller: crate::ops::BindingRunCanceller::new(
+                engine.assembly.application.clone(),
+                engine.resolver.clone(),
+                Arc::new(canceller_connection.client),
+            ),
+            counters: Arc::new(Counters::default()),
         };
         ops.run(
             Op::BindingsResetThread,

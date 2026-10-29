@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub use config::resolve_data_dir;
-pub use control::{call, status};
+pub use control::{call, call_mcp, status};
 pub use daemon::daemon;
 pub use engine::Engine;
 pub use init::init;
@@ -154,6 +154,11 @@ errors! {
     WebhookConflict => ("webhook_conflict", Rejected),
     ChannelUnreachable => ("channel_unreachable", Rejected),
     ChannelNotSupported => ("channel_not_supported", Rejected),
+    HostNotBound => ("host_not_bound", Rejected),
+    HostBindingSuspended => ("host_binding_suspended", Rejected),
+    OperationConflict => ("operation_conflict", Rejected),
+    RunNotTerminal => ("run_not_terminal", Rejected),
+    DispatchQueueFull => ("dispatch_queue_full", Rejected),
 }
 
 #[cfg(test)]
@@ -164,7 +169,7 @@ mod tests {
         for error in DaemonError::ALL {
             assert_eq!(DaemonError::from_code(error.code()), Some(*error));
         }
-        assert_eq!(DaemonError::ALL.len(), 42);
+        assert_eq!(DaemonError::ALL.len(), 47);
         for unknown in ["", "INTERNAL_ERROR", "not_a_code", "internal_error "] {
             assert_eq!(DaemonError::from_code(unknown), None);
         }
@@ -176,6 +181,11 @@ mod tests {
             ("webhook_conflict", DaemonError::WebhookConflict),
             ("channel_unreachable", DaemonError::ChannelUnreachable),
             ("channel_not_supported", DaemonError::ChannelNotSupported),
+            ("host_not_bound", DaemonError::HostNotBound),
+            ("host_binding_suspended", DaemonError::HostBindingSuspended),
+            ("operation_conflict", DaemonError::OperationConflict),
+            ("run_not_terminal", DaemonError::RunNotTerminal),
+            ("dispatch_queue_full", DaemonError::DispatchQueueFull),
         ] {
             assert_eq!(DaemonError::from_code(code), Some(error));
             assert_eq!(error.class(), ErrorClass::Rejected);

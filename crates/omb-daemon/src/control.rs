@@ -2,7 +2,7 @@ use crate::{
     CallOptions, DaemonError, StatusOptions, StatusSnapshot,
     channels::StatusSource,
     config,
-    ops::{Op, Ops},
+    ops::{McpOp, Op, Ops},
 };
 use serde::{
     Deserialize, Serialize,
@@ -252,7 +252,16 @@ pub(crate) async fn handle_with_uid(
             Ok(request) if request.r#type != "request" => {
                 error_response(DaemonError::InvalidRequest)
             }
-            Ok(_) if hello.client != Client::Cli => error_response(DaemonError::OpNotAllowed),
+            Ok(request) if hello.client == Client::Mcp => {
+                match (McpOp::parse(&request.op), &state.ops) {
+                    (None, _) => error_response(DaemonError::OpNotAllowed),
+                    (Some(_), None) => error_response(DaemonError::InternalError),
+                    (Some(op), Some(ops)) => result_response(
+                        ops.run_mcp(op, request.args, Instant::now() + REQUEST_TIMEOUT)
+                            .await,
+                    ),
+                }
+            }
             Ok(request) if request.op == "status" => {
                 if request.args.as_object().is_some_and(|a| a.is_empty()) {
                     result_response(state.snapshot().await.and_then(|data| {
@@ -304,6 +313,7 @@ fn error_response(error: DaemonError) -> Response {
 /// One authenticated request over the control socket: the daemon's hello and the response data.
 async fn exchange(
     root: &Path,
+    client: Client,
     op: &str,
     args: serde_json::Value,
 ) -> Result<(HelloOk, serde_json::Value), DaemonError> {
@@ -356,7 +366,7 @@ async fn exchange(
         &Hello {
             r#type: "hello".into(),
             token,
-            client: Client::Cli,
+            client,
             client_version: env!("CARGO_PKG_VERSION").into(),
         },
     )
@@ -401,12 +411,24 @@ async fn exchange(
 }
 /// Sends one control operation and returns its data or the daemon's refusal.
 pub async fn call(options: CallOptions) -> Result<serde_json::Value, DaemonError> {
-    exchange(&options.data_dir, &options.op, options.args)
+    exchange(&options.data_dir, Client::Cli, &options.op, options.args)
+        .await
+        .map(|(_, data)| data)
+}
+/// Like `call`, with client kind `mcp`; `Client` stays private.
+pub async fn call_mcp(options: CallOptions) -> Result<serde_json::Value, DaemonError> {
+    exchange(&options.data_dir, Client::Mcp, &options.op, options.args)
         .await
         .map(|(_, data)| data)
 }
 pub async fn status(options: StatusOptions) -> Result<StatusSnapshot, DaemonError> {
-    let (hello, data) = exchange(&options.data_dir, "status", serde_json::json!({})).await?;
+    let (hello, data) = exchange(
+        &options.data_dir,
+        Client::Cli,
+        "status",
+        serde_json::json!({}),
+    )
+    .await?;
     let data: StatusSnapshot =
         serde_json::from_value(data).map_err(|_| DaemonError::InternalError)?;
     if data.engine_pin == hello.engine_pin && data.daemon_version == hello.daemon_version {
@@ -608,10 +630,11 @@ mod tests {
                 r#"{"type":"request","op":"status","args":{}}"#,
                 "op_not_allowed",
             ),
+            // An MCP operation of an MCP client reaches its handler; this state has none.
             (
                 "mcp",
                 r#"{"type":"request","op":"mcp_run_begin","args":{}}"#,
-                "op_not_allowed",
+                "internal_error",
             ),
         ] {
             let (mut stream, task) = authenticated(client).await;
@@ -683,8 +706,8 @@ mod tests {
         "mcp_run_begin",
         "mcp_run_status",
         "mcp_run_cancel",
-        "mcp_run_events",
         "mcp_run_result",
+        "mcp_thread_list",
     ];
     async fn answer(client: &str, request: &str) -> Response {
         let (mut stream, task) = authenticated(client).await;
@@ -717,11 +740,20 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn mcp_client_gets_op_not_allowed_for_every_op() {
-        for op in ["status"].iter().chain(&OPS).chain(&MCP_OPS) {
+    async fn mcp_client_reaches_only_the_five_mcp_ops() {
+        for op in ["status"]
+            .iter()
+            .chain(&OPS)
+            .chain(&["unknown", "STATUS", ""])
+        {
             let response = answer("mcp", &request(op)).await;
             assert!(!response.ok);
             assert_eq!(response.code.as_deref(), Some("op_not_allowed"), "{op}");
+        }
+        // The handler is reached; this state has no operations.
+        for op in MCP_OPS {
+            let response = answer("mcp", &request(op)).await;
+            assert_eq!(response.code.as_deref(), Some("internal_error"), "{op}");
         }
     }
     #[tokio::test]
@@ -884,6 +916,95 @@ mod tests {
         .unwrap();
         assert_eq!(
             call(options(root.clone())).await,
+            Err(DaemonError::DaemonNotRunning)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn call_mcp_reaches_the_mcp_arm_and_call_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = config::test_dir();
+        config::make_dir(&root.join("run")).unwrap();
+        config::write_private(
+            &root.join("run/control.token"),
+            "a".repeat(64).as_bytes(),
+            true,
+        )
+        .unwrap();
+        let path = root.join("run/control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(handle(stream, state()));
+            }
+        });
+        let options = |op: &str| CallOptions {
+            data_dir: root.clone(),
+            op: op.into(),
+            args: serde_json::json!({}),
+        };
+        assert_eq!(
+            call_mcp(options("mcp_run_begin")).await,
+            Err(DaemonError::InternalError)
+        );
+        assert_eq!(
+            call(options("mcp_run_begin")).await,
+            Err(DaemonError::OpNotAllowed)
+        );
+        for op in ["status", "approve", "unknown"] {
+            assert_eq!(
+                call_mcp(options(op)).await,
+                Err(DaemonError::OpNotAllowed),
+                "{op}"
+            );
+        }
+        assert_eq!(
+            call(options("status_run")).await,
+            Err(DaemonError::InternalError)
+        );
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn call_mcp_reports_not_running_in_all_three_situations() {
+        use std::os::unix::fs::PermissionsExt;
+        let options = |data_dir| CallOptions {
+            data_dir,
+            op: "mcp_thread_list".into(),
+            args: serde_json::json!({}),
+        };
+        let missing =
+            std::env::temp_dir().join(format!("omb-missing-{}", config::hex_random(8).unwrap()));
+        assert_eq!(
+            call_mcp(options(missing)).await,
+            Err(DaemonError::DaemonNotRunning)
+        );
+        let root = config::test_dir();
+        config::make_dir(&root.join("run")).unwrap();
+        assert_eq!(
+            call_mcp(options(root.clone())).await,
+            Err(DaemonError::DaemonNotRunning)
+        );
+        config::write_private(
+            &root.join("run/control.token"),
+            "a".repeat(64).as_bytes(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            call_mcp(options(root.clone())).await,
+            Err(DaemonError::DaemonNotRunning)
+        );
+        let path = root.join("run/control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(listener);
+        assert!(path.exists());
+        assert_eq!(
+            call_mcp(options(root.clone())).await,
             Err(DaemonError::DaemonNotRunning)
         );
         std::fs::remove_dir_all(root).unwrap();

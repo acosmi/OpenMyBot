@@ -3,13 +3,15 @@ use crate::{
     DaemonError,
     channels::rfc3339_utc,
     pairing::{self, PairRequest},
-    pg::{self, AuthorityConnection},
+    pg,
 };
-use omb_channels::{CredentialProblem, TelegramEndpoint, verify_credentials};
+use omb_channels::{Counters, CredentialProblem, TelegramEndpoint, verify_credentials};
 use omb_hostdriver::WorkspaceRoots;
 use omb_store::{
-    Channel, Decided, Decision, GrantKind, HostBinding, IdentityKey, KEY_MAX, NewReceiver, OpenRun,
-    ReceiverRow, RunDeadline, StoreError,
+    Channel, Decided, Decision, EventCancel, GrantKind, HostAccept, HostBinding, HostBindingState,
+    HostMessage, IdentityKey, KEY_MAX, MCP_LIST_MAX, NewReceiver, OpenRun, OperationId,
+    ReceiverRow, RunDeadline, StoreError, accept_host_begin, binding_run, binding_runs,
+    cancel_event, host_binding_state,
 };
 use openbot_application::ApplicationService;
 use openbot_contracts::{
@@ -24,7 +26,11 @@ use openbot_infra::vault::CredentialRecordVault;
 use openbot_server::SingleUserAuthResolver;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{
+    fmt,
+    path::PathBuf,
+    sync::{Arc, atomic::Ordering},
+};
 use tokio::{
     sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
@@ -289,6 +295,10 @@ pub(crate) struct Ops {
     pub(crate) endpoint: TelegramEndpoint,
     pub(crate) receiver: mpsc::Sender<ReceiverCommand>,
     pub(crate) wake: Arc<Notify>,
+    pub(crate) minter: ThreadMinter,
+    pub(crate) canceller: BindingRunCanceller,
+    /// The receivers' counters: a host operation conflict counts as an event conflict.
+    pub(crate) counters: Arc<Counters>,
 }
 impl Ops {
     pub(crate) async fn run(
@@ -674,38 +684,293 @@ impl Ops {
     }
 }
 
-/// The narrow handle behind channel `/cancel`: cancels only the named binding's own open run.
+/// The MCP control operations, accepted only from an MCP client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpOp {
+    RunBegin,
+    RunStatus,
+    RunCancel,
+    RunResult,
+    ThreadList,
+}
+impl McpOp {
+    pub(crate) fn parse(name: &str) -> Option<McpOp> {
+        Some(match name {
+            "mcp_run_begin" => Self::RunBegin,
+            "mcp_run_status" => Self::RunStatus,
+            "mcp_run_cancel" => Self::RunCancel,
+            "mcp_run_result" => Self::RunResult,
+            "mcp_thread_list" => Self::ThreadList,
+            _ => return None,
+        })
+    }
+}
+
+/// The engine handle that only mints thread ids; a host run's thread is minted before its
+/// acceptance transaction.
+#[derive(Clone)]
+pub(crate) struct ThreadMinter {
+    application: Arc<dyn ApplicationService>,
+    resolver: SingleUserAuthResolver,
+}
+impl ThreadMinter {
+    pub(crate) fn new(
+        application: Arc<dyn ApplicationService>,
+        resolver: SingleUserAuthResolver,
+    ) -> Self {
+        Self {
+            application,
+            resolver,
+        }
+    }
+    pub(crate) async fn mint(&self) -> Result<ThreadId, DaemonError> {
+        let AppReply::ThreadMinted(minted) = execute(
+            self.application.as_ref(),
+            &self.resolver,
+            AppCommand::MintThreadId,
+        )
+        .await
+        .map_err(|_| DaemonError::InternalError)?
+        else {
+            return Err(DaemonError::InternalError);
+        };
+        Ok(minted.thread_id)
+    }
+}
+
+/// The narrow handle that cancels one run of one binding, behind channel `/cancel` and
+/// `wrok_run_cancel`; it runs on the canceller's own connection, not under the control lock.
+#[derive(Clone)]
 pub(crate) struct BindingRunCanceller {
+    application: Arc<dyn ApplicationService>,
+    resolver: SingleUserAuthResolver,
+    client: Arc<tokio_postgres::Client>,
+}
+impl BindingRunCanceller {
+    pub(crate) fn new(
+        application: Arc<dyn ApplicationService>,
+        resolver: SingleUserAuthResolver,
+        client: Arc<tokio_postgres::Client>,
+    ) -> Self {
+        Self {
+            application,
+            resolver,
+            client,
+        }
+    }
+    /// A pending message is cancelled at once; a dispatched run without a terminal is cancelled
+    /// in the engine; a run of another binding is not found.
+    pub(crate) async fn cancel(
+        &self,
+        binding_id: Uuid,
+        run_id: &str,
+    ) -> Result<&'static str, DaemonError> {
+        match cancel_event(&self.client, binding_id, run_id)
+            .await
+            .map_err(pg::map_store_error)?
+        {
+            EventCancel::NotFound => Err(DaemonError::RunNotFound),
+            EventCancel::Cancelled => Ok("requested"),
+            EventCancel::Ended => Ok("already_terminal"),
+            EventCancel::Open { thread_id } => {
+                cancel_run(
+                    self.application.as_ref(),
+                    &self.resolver,
+                    &thread_id,
+                    run_id,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// The `/cancel` queue of the channel receivers: each binding id cancels that binding's open run.
+pub(crate) struct CancelQueue {
     task: JoinHandle<()>,
     driver: JoinHandle<Result<(), tokio_postgres::Error>>,
 }
-impl BindingRunCanceller {
+impl CancelQueue {
     pub(crate) fn start(
-        application: Arc<dyn ApplicationService>,
-        resolver: SingleUserAuthResolver,
-        connection: AuthorityConnection,
+        canceller: BindingRunCanceller,
+        driver: JoinHandle<Result<(), tokio_postgres::Error>>,
         mut requests: mpsc::Receiver<Uuid>,
     ) -> Self {
-        let client = connection.client;
         let task = tokio::spawn(async move {
             while let Some(binding_id) = requests.recv().await {
                 // Any failure drops this request; the owner can send `/cancel` again.
-                if let Ok(Some(run)) = omb_store::open_run(&client, binding_id).await {
-                    let _ =
-                        cancel_run(application.as_ref(), &resolver, &run.thread_id, &run.run_id)
-                            .await;
+                if let Ok(Some(run)) = omb_store::open_run(&canceller.client, binding_id).await {
+                    let _ = canceller.cancel(binding_id, &run.run_id).await;
                 }
             }
         });
-        Self {
-            task,
-            driver: connection.driver,
-        }
+        Self { task, driver }
     }
-    /// Joins the task once every request sender is gone, then the connection it owned.
+    /// Joins the task once every request sender is gone, then ends the connection's driver:
+    /// clones of the handle still hold its client, so the connection does not end by itself.
     pub(crate) async fn stop(self) {
         let _ = self.task.await;
+        self.driver.abort();
         let _ = self.driver.await;
+    }
+}
+
+mod mcp {
+    use super::*;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BeginArgs {
+        operation_id: String,
+        message: String,
+    }
+    /// One MCP request after its single boundary parse.
+    pub(super) enum McpRequest {
+        Begin(OperationId, HostMessage),
+        Status(IdentityKey),
+        Cancel(IdentityKey),
+        Result(IdentityKey),
+        List,
+    }
+    pub(super) fn parse(op: McpOp, args: Value) -> Result<McpRequest, DaemonError> {
+        // A struct also deserializes from a JSON array, so anything but an object is refused here.
+        if !args.is_object() {
+            return Err(DaemonError::InvalidRequest);
+        }
+        Ok(match op {
+            McpOp::RunBegin => {
+                let args: BeginArgs = decode(args)?;
+                McpRequest::Begin(
+                    OperationId::parse(&args.operation_id).ok_or(DaemonError::InvalidRequest)?,
+                    HostMessage::parse(&args.message).ok_or(DaemonError::InvalidRequest)?,
+                )
+            }
+            McpOp::RunStatus => McpRequest::Status(key(&decode::<RunArgs>(args)?.run_id)?),
+            McpOp::RunCancel => McpRequest::Cancel(key(&decode::<RunArgs>(args)?.run_id)?),
+            McpOp::RunResult => McpRequest::Result(key(&decode::<RunArgs>(args)?.run_id)?),
+            McpOp::ThreadList => {
+                decode::<NoArgs>(args)?;
+                McpRequest::List
+            }
+        })
+    }
+
+    impl Ops {
+        /// The live host binding, checked by every operation but `RunBegin`, whose acceptance
+        /// transaction checks it.
+        async fn host_binding(&self, deadline: Instant) -> Result<Uuid, DaemonError> {
+            match host_binding_state(&*self.control.lock().await, deadline)
+                .await
+                .map_err(|error| store_error(error, deadline))?
+            {
+                HostBindingState::Active(binding_id) => Ok(binding_id),
+                HostBindingState::Suspended => Err(DaemonError::HostBindingSuspended),
+                HostBindingState::NotBound => Err(DaemonError::HostNotBound),
+            }
+        }
+        pub(crate) async fn run_mcp(
+            &self,
+            op: McpOp,
+            args: Value,
+            deadline: Instant,
+        ) -> Result<Value, DaemonError> {
+            let failed = |error| store_error(error, deadline);
+            match parse(op, args)? {
+                McpRequest::Begin(operation, message) => {
+                    let thread = self.minter.mint().await?;
+                    let accepted = accept_host_begin(
+                        &mut *self.control.lock().await,
+                        &operation,
+                        &message,
+                        thread.as_str(),
+                        deadline,
+                    )
+                    .await
+                    .map_err(failed)?;
+                    match accepted {
+                        HostAccept::Accepted(run) => {
+                            self.wake.notify_one();
+                            Ok(
+                                json!({"run_id": run.run_id, "thread_id": run.thread_id, "state": "accepted"}),
+                            )
+                        }
+                        HostAccept::Replayed(run) => Ok(
+                            json!({"run_id": run.run_id, "thread_id": run.thread_id, "state": "replayed"}),
+                        ),
+                        HostAccept::Conflict => {
+                            self.counters.event_conflict.fetch_add(1, Ordering::Relaxed);
+                            Err(DaemonError::OperationConflict)
+                        }
+                        HostAccept::NotBound => Err(DaemonError::HostNotBound),
+                        HostAccept::Suspended => Err(DaemonError::HostBindingSuspended),
+                        HostAccept::QueueFull => Err(DaemonError::DispatchQueueFull),
+                    }
+                }
+                McpRequest::Status(run_id) => {
+                    let binding_id = self.host_binding(deadline).await?;
+                    let view = binding_run(
+                        &*self.control.lock().await,
+                        binding_id,
+                        run_id.as_str(),
+                        deadline,
+                    )
+                    .await
+                    .map_err(failed)?
+                    .ok_or(DaemonError::RunNotFound)?;
+                    Ok(
+                        json!({"run_id": view.run_id, "state": view.state.as_str(), "permission_ids": view.permission_ids}),
+                    )
+                }
+                McpRequest::Result(run_id) => {
+                    let binding_id = self.host_binding(deadline).await?;
+                    let view = binding_run(
+                        &*self.control.lock().await,
+                        binding_id,
+                        run_id.as_str(),
+                        deadline,
+                    )
+                    .await
+                    .map_err(failed)?
+                    .ok_or(DaemonError::RunNotFound)?;
+                    if !view.state.is_terminal() {
+                        return Err(DaemonError::RunNotTerminal);
+                    }
+                    Ok(json!({
+                        "run_id": view.run_id,
+                        "terminal_kind": view.state.as_str(),
+                        "summary": view.summary,
+                        "artifacts": view.artifacts,
+                    }))
+                }
+                McpRequest::List => {
+                    let binding_id = self.host_binding(deadline).await?;
+                    let runs: Vec<Value> = binding_runs(
+                        &*self.control.lock().await,
+                        binding_id,
+                        MCP_LIST_MAX,
+                        deadline,
+                    )
+                    .await
+                    .map_err(failed)?
+                    .into_iter()
+                    .map(|view| {
+                        json!({
+                            "run_id": view.run_id,
+                            "thread_id": view.thread_id,
+                            "state": view.state.as_str(),
+                            "accepted_at": view.accepted_at,
+                        })
+                    })
+                    .collect();
+                    Ok(json!({ "runs": runs }))
+                }
+                McpRequest::Cancel(run_id) => {
+                    let binding_id = self.host_binding(deadline).await?;
+                    let state = self.canceller.cancel(binding_id, run_id.as_str()).await?;
+                    Ok(json!({"run_id": run_id.as_str(), "state": state}))
+                }
+            }
+        }
     }
 }
 
@@ -1036,6 +1301,7 @@ mod tests {
         channels: Option<Channels>,
         runtime: Option<AgentRuntime>,
         control_link: JoinHandle<Result<(), tokio_postgres::Error>>,
+        canceller_link: JoinHandle<Result<(), tokio_postgres::Error>>,
         client: Client,
         token: Uuid,
         fake: FakeTelegram,
@@ -1064,6 +1330,11 @@ mod tests {
                 .open_resident_connection("openmybot-control")
                 .await
                 .unwrap();
+            let canceller = fixture
+                .pg
+                .open_resident_connection("openmybot-canceller")
+                .await
+                .unwrap();
             let client = fixture.client().await;
             let fake = FakeTelegram::start().await;
             let (receiver, commands) = mpsc::channel(8);
@@ -1078,6 +1349,16 @@ mod tests {
                 endpoint: fake.endpoint(),
                 receiver,
                 wake: Arc::new(Notify::new()),
+                minter: ThreadMinter::new(
+                    engine.assembly.application.clone(),
+                    engine.resolver.clone(),
+                ),
+                canceller: BindingRunCanceller::new(
+                    engine.assembly.application.clone(),
+                    engine.resolver.clone(),
+                    Arc::new(canceller.client),
+                ),
+                counters: Arc::new(Counters::default()),
             };
             Self {
                 fixture,
@@ -1086,6 +1367,7 @@ mod tests {
                 channels: None,
                 runtime: None,
                 control_link: control.driver,
+                canceller_link: canceller.driver,
                 client,
                 token,
                 fake,
@@ -1290,6 +1572,8 @@ mod tests {
                 runtime.stop().await;
             }
             drop(self.ops);
+            self.canceller_link.abort();
+            let _ = self.canceller_link.await;
             self.control_link.abort();
             let _ = self.control_link.await;
             drop(self.client);
@@ -2898,7 +3182,7 @@ mod tests {
         env.stop().await;
     }
 
-    async fn canceller(env: &mut Env) -> (BindingRunCanceller, mpsc::Sender<Uuid>) {
+    async fn canceller(env: &mut Env) -> (CancelQueue, mpsc::Sender<Uuid>) {
         let connection = env
             .fixture
             .pg
@@ -2907,10 +3191,13 @@ mod tests {
             .unwrap();
         let (cancel, requests) = mpsc::channel(CANCEL_QUEUE);
         (
-            BindingRunCanceller::start(
-                env.ops.application.clone(),
-                env.ops.resolver.clone(),
-                connection,
+            CancelQueue::start(
+                BindingRunCanceller::new(
+                    env.ops.application.clone(),
+                    env.ops.resolver.clone(),
+                    Arc::new(connection.client),
+                ),
+                connection.driver,
                 requests,
             ),
             cancel,
@@ -3026,6 +3313,799 @@ mod tests {
         env.call("bindings_revoke", args).await.unwrap();
         assert_eq!(env.binding(binding).await["status"], "revoked");
         drop(holder);
+        env.stop().await;
+    }
+
+    #[test]
+    fn mcp_op_names_are_exactly_the_five_spec_names() {
+        for (name, op) in [
+            ("mcp_run_begin", McpOp::RunBegin),
+            ("mcp_run_status", McpOp::RunStatus),
+            ("mcp_run_cancel", McpOp::RunCancel),
+            ("mcp_run_result", McpOp::RunResult),
+            ("mcp_thread_list", McpOp::ThreadList),
+        ] {
+            assert_eq!(McpOp::parse(name), Some(op));
+            assert_eq!(Op::parse(name), None);
+        }
+        for name in [
+            "",
+            "mcp_run_events",
+            "mcp_run_begin ",
+            "MCP_RUN_BEGIN",
+            "wrok_run_begin",
+            "status",
+            "status_run",
+            "pair_start",
+            "bindings_list",
+            "bindings_revoke",
+            "bindings_reconfirm",
+            "bindings_reset_thread",
+            "bindings_receiver",
+            "bindings_host",
+            "approve",
+            "deny",
+            "cancel",
+        ] {
+            assert_eq!(McpOp::parse(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn mcp_arguments_parse_once_into_narrow_types() {
+        let invalid = |op, args| matches!(mcp::parse(op, args), Err(DaemonError::InvalidRequest));
+        assert!(matches!(
+            mcp::parse(McpOp::RunBegin, json!({"operation_id": "a", "message": ""})),
+            Ok(mcp::McpRequest::Begin(operation, message))
+                if operation.as_str() == "a" && message.as_str().is_empty()
+        ));
+        let longest = "a".repeat(125);
+        assert!(matches!(
+            mcp::parse(McpOp::RunBegin, json!({"operation_id": longest, "message": "m"})),
+            Ok(mcp::McpRequest::Begin(operation, _)) if operation.as_str() == longest
+        ));
+        for args in [
+            json!({"operation_id": "a".repeat(126), "message": "m"}),
+            json!({"operation_id": "", "message": "m"}),
+            json!({"operation_id": "a b", "message": "m"}),
+            json!({"operation_id": "a/b", "message": "m"}),
+            json!({"operation_id": "a", "message": "x".repeat(4097)}),
+            json!({"operation_id": "a", "message": "a\u{0}b"}),
+            json!({"operation_id": "a"}),
+            json!({"operation_id": "a", "message": "m", "x": 1}),
+            json!({"operation_id": 1, "message": "m"}),
+            json!({"operation_id": "a", "message": 5}),
+        ] {
+            assert!(invalid(McpOp::RunBegin, args.clone()), "{args}");
+        }
+        for op in [McpOp::RunStatus, McpOp::RunCancel, McpOp::RunResult] {
+            let key = match mcp::parse(op, json!({"run_id": "r1"})) {
+                Ok(
+                    mcp::McpRequest::Status(key)
+                    | mcp::McpRequest::Cancel(key)
+                    | mcp::McpRequest::Result(key),
+                ) => key,
+                _ => panic!("{op:?}"),
+            };
+            assert_eq!(key, IdentityKey::parse("r1").unwrap());
+            for args in [
+                json!({"run_id": ""}),
+                json!({"run_id": "r".repeat(129)}),
+                json!({"run_id": "r\u{1}1"}),
+                json!({}),
+                json!({"run_id": "r1", "x": 1}),
+                json!({"run_id": 5}),
+            ] {
+                assert!(invalid(op, args.clone()), "{op:?} {args}");
+            }
+        }
+        assert!(matches!(
+            mcp::parse(McpOp::ThreadList, json!({})),
+            Ok(mcp::McpRequest::List)
+        ));
+        assert!(invalid(McpOp::ThreadList, json!({"x": 1})));
+        for op in [
+            McpOp::RunBegin,
+            McpOp::RunStatus,
+            McpOp::RunCancel,
+            McpOp::RunResult,
+            McpOp::ThreadList,
+        ] {
+            for args in [json!([]), json!("x"), json!(5), Value::Null] {
+                assert!(invalid(op, args.clone()), "{op:?} {args}");
+            }
+        }
+    }
+
+    async fn mcp_call(env: &Env, op: McpOp, args: Value) -> Result<Value, DaemonError> {
+        env.ops.run_mcp(op, args, later()).await
+    }
+    fn begin(operation_id: &str, message: &str) -> Value {
+        json!({"operation_id": operation_id, "message": message})
+    }
+    /// Takes the dispatcher wake-up a host acceptance leaves behind.
+    async fn woken(env: &Env) -> bool {
+        tokio::time::timeout(Duration::from_millis(100), env.ops.wake.notified())
+            .await
+            .is_ok()
+    }
+    async fn events(env: &Env) -> i64 {
+        env.client
+            .query_one("SELECT count(*) FROM openmybot.channel_events", &[])
+            .await
+            .unwrap()
+            .get(0)
+    }
+    async fn host_event(env: &Env, operation_id: &str) -> Value {
+        env.client
+            .query_one(
+                "SELECT row_to_json(e) FROM openmybot.channel_events e WHERE event_key=$1",
+                &[&format!("op:{operation_id}")],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+    /// Binds the host on the workspace through the owner's `bindings host` operation.
+    async fn bound(env: &mut Env) -> Uuid {
+        let workspace = env.workspace();
+        let bound = env
+            .call("bindings_host", json!({"workspace": workspace}))
+            .await
+            .unwrap();
+        Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn begin_accepts_then_replays_and_wakes_only_for_the_accepted() {
+        let env = Env::start().await;
+        let host = host_binding(&env).await;
+        let accepted = mcp_call(&env, McpOp::RunBegin, begin("op-1", "hello"))
+            .await
+            .unwrap();
+        let keys: Vec<&String> = accepted.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["run_id", "state", "thread_id"]);
+        assert_eq!(accepted["state"], "accepted");
+        let run_id = accepted["run_id"].as_str().unwrap();
+        assert_eq!(run_id.len(), 36);
+        assert!(Uuid::parse_str(run_id).is_ok());
+        let row = host_event(&env, "op-1").await;
+        assert_eq!(row["binding_id"], host.to_string());
+        assert_eq!(row["run_id"], accepted["run_id"]);
+        assert_eq!(row["thread_id"], accepted["thread_id"]);
+        assert_eq!(row["text"], "hello");
+        assert_eq!(row["dispatch_status"], "pending");
+        assert!(woken(&env).await);
+        let replayed = mcp_call(&env, McpOp::RunBegin, begin("op-1", "hello"))
+            .await
+            .unwrap();
+        assert_eq!(replayed["state"], "replayed");
+        assert_eq!(replayed["run_id"], accepted["run_id"]);
+        assert_eq!(replayed["thread_id"], accepted["thread_id"]);
+        assert_eq!(events(&env).await, 1);
+        assert!(!woken(&env).await);
+        let longest = mcp_call(&env, McpOp::RunBegin, begin(&"a".repeat(125), "m"))
+            .await
+            .unwrap();
+        assert_eq!(longest["state"], "accepted");
+        assert!(woken(&env).await);
+        for args in [
+            begin(&"a".repeat(126), "m"),
+            begin("op-2", &"x".repeat(4097)),
+            begin("op-2", "a\u{0}b"),
+        ] {
+            assert_eq!(
+                mcp_call(&env, McpOp::RunBegin, args).await,
+                Err(DaemonError::InvalidRequest)
+            );
+        }
+        assert_eq!(events(&env).await, 2);
+        assert!(!woken(&env).await);
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("op-3", ""))
+                .await
+                .unwrap()["state"],
+            "accepted"
+        );
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn conflicting_begin_counts_one_conflict_and_writes_nothing() {
+        let env = Env::start().await;
+        host_binding(&env).await;
+        mcp_call(&env, McpOp::RunBegin, begin("op-1", "a"))
+            .await
+            .unwrap();
+        assert!(woken(&env).await);
+        let conflicts = || env.ops.counters.event_conflict.load(Ordering::Relaxed);
+        assert_eq!(conflicts(), 0);
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("op-1", "b")).await,
+            Err(DaemonError::OperationConflict)
+        );
+        assert_eq!(conflicts(), 1);
+        assert_eq!(events(&env).await, 1);
+        assert_eq!(host_event(&env, "op-1").await["text"], "a");
+        assert!(!woken(&env).await);
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("op-1", "b")).await,
+            Err(DaemonError::OperationConflict)
+        );
+        assert_eq!(conflicts(), 2);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn every_mcp_op_checks_the_host_binding_first() {
+        let mut env = Env::start().await;
+        let calls = || {
+            [
+                (McpOp::RunBegin, begin("o", "m")),
+                (McpOp::RunStatus, json!({"run_id": "r1"})),
+                (McpOp::RunCancel, json!({"run_id": "r1"})),
+                (McpOp::RunResult, json!({"run_id": "r1"})),
+                (McpOp::ThreadList, json!({})),
+            ]
+        };
+        for (op, args) in calls() {
+            assert_eq!(
+                mcp_call(&env, op, args).await,
+                Err(DaemonError::HostNotBound)
+            );
+        }
+        let host = host_binding(&env).await;
+        testkit::suspend_binding(&env.client, host).await;
+        for (op, args) in calls() {
+            assert_eq!(
+                mcp_call(&env, op, args).await,
+                Err(DaemonError::HostBindingSuspended)
+            );
+        }
+        omb_store::revoke_binding(&mut env.client, host, later())
+            .await
+            .unwrap();
+        for (op, args) in calls() {
+            assert_eq!(
+                mcp_call(&env, op, args).await,
+                Err(DaemonError::HostNotBound)
+            );
+        }
+        assert_eq!(events(&env).await, 0);
+        host_binding(&env).await;
+        let [begun, status, cancel, result, list] = calls();
+        let accepted = mcp_call(&env, begun.0, begun.1).await.unwrap();
+        assert_eq!(accepted["state"], "accepted");
+        for (op, args) in [status, cancel, result] {
+            assert_eq!(
+                mcp_call(&env, op, args).await,
+                Err(DaemonError::RunNotFound)
+            );
+        }
+        let runs = mcp_call(&env, list.0, list.1).await.unwrap();
+        assert_eq!(runs["runs"][0]["run_id"], accepted["run_id"]);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn begin_refuses_the_twenty_first_pending_run() {
+        let env = Env::start().await;
+        host_binding(&env).await;
+        let mut runs = Vec::new();
+        for index in 1..=20 {
+            let accepted = mcp_call(&env, McpOp::RunBegin, begin(&format!("op-{index}"), "m"))
+                .await
+                .unwrap();
+            assert_eq!(accepted["state"], "accepted");
+            runs.push(accepted["run_id"].clone());
+        }
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("op-21", "m")).await,
+            Err(DaemonError::DispatchQueueFull)
+        );
+        assert_eq!(events(&env).await, 20);
+        let replayed = mcp_call(&env, McpOp::RunBegin, begin("op-4", "m"))
+            .await
+            .unwrap();
+        assert_eq!(replayed["state"], "replayed");
+        assert_eq!(replayed["run_id"], runs[3]);
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("op-4", "other")).await,
+            Err(DaemonError::OperationConflict)
+        );
+        assert_eq!(
+            mcp_call(&env, McpOp::RunCancel, json!({"run_id": runs[0]}))
+                .await
+                .unwrap()["state"],
+            "requested"
+        );
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("op-21", "m"))
+                .await
+                .unwrap()["state"],
+            "accepted"
+        );
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn status_words_come_from_store_rows_without_an_engine_call() {
+        let env = Env::start().await;
+        let host = host_binding(&env).await;
+        let client = &env.client;
+        let event = async |run: &str, status: &str| {
+            testkit::insert_event_for_run(client, host, run, &format!("thread-{run}"), status).await
+        };
+        event("pending", "pending").await;
+        event("running", "dispatched").await;
+        event("asking", "dispatched").await;
+        testkit::insert_permission_row(client, host, "asking", "p-1", 600.0).await;
+        for (run, kind) in [
+            ("ok", "succeeded"),
+            ("bad", "failed"),
+            ("stopped", "cancelled"),
+            ("unknown", "reconciliation_required"),
+        ] {
+            let record = event(run, "dispatched").await;
+            testkit::set_terminal(client, record, kind).await;
+        }
+        event("expired", "expired").await;
+        event("cancelled", "cancelled").await;
+        event("conflict", "conflict").await;
+        for (run, state, permissions) in [
+            ("pending", "pending", vec![]),
+            ("running", "running", vec![]),
+            ("asking", "awaiting_permission", vec!["p-1"]),
+            ("ok", "succeeded", vec![]),
+            ("bad", "failed", vec![]),
+            ("stopped", "cancelled", vec![]),
+            ("unknown", "reconciliation_required", vec![]),
+            ("expired", "cancelled", vec![]),
+            ("cancelled", "cancelled", vec![]),
+            ("conflict", "failed", vec![]),
+        ] {
+            assert_eq!(
+                mcp_call(&env, McpOp::RunStatus, json!({"run_id": run}))
+                    .await
+                    .unwrap(),
+                json!({"run_id": run, "state": state, "permission_ids": permissions}),
+                "{run}"
+            );
+        }
+        let (sender, thread) = env.sender().await;
+        testkit::insert_event_for_run(client, sender, "sender-run", thread.as_str(), "pending")
+            .await;
+        for run in ["sender-run", "no-such-run"] {
+            assert_eq!(
+                mcp_call(&env, McpOp::RunStatus, json!({"run_id": run})).await,
+                Err(DaemonError::RunNotFound)
+            );
+        }
+        for run in [String::new(), "r".repeat(129), "r\u{1}1".to_owned()] {
+            assert_eq!(
+                mcp_call(&env, McpOp::RunStatus, json!({"run_id": run})).await,
+                Err(DaemonError::InvalidRequest)
+            );
+        }
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn result_returns_the_terminal_facts_or_run_not_terminal() {
+        let env = Env::start().await;
+        let host = host_binding(&env).await;
+        let client = &env.client;
+        let event = async |run: &str, status: &str| {
+            testkit::insert_event_for_run(client, host, run, &format!("thread-{run}"), status).await
+        };
+        let result =
+            async |run: &str| mcp_call(&env, McpOp::RunResult, json!({"run_id": run})).await;
+        event("pending", "pending").await;
+        event("running", "dispatched").await;
+        for run in ["pending", "running"] {
+            assert_eq!(result(run).await, Err(DaemonError::RunNotTerminal));
+        }
+        let record = event("ok", "dispatched").await;
+        testkit::set_terminal(client, record, "succeeded").await;
+        let workspace = env.workspace();
+        let session = omb_store::upsert_session(
+            client,
+            omb_store::SessionStart {
+                run_id: "ok",
+                binding_id: host,
+                workspace_dir: &workspace,
+            },
+            later(),
+        )
+        .await
+        .unwrap();
+        omb_store::end_session(
+            client,
+            session,
+            omb_store::SessionEnd {
+                reason: omb_store::EndReason::ResultSuccess,
+                exit_code: Some(0),
+                exit_signal: None,
+                stop: None,
+                result_summary: Some("done"),
+                artifact_paths: &["a.txt".to_owned()],
+                stderr_tail: "",
+            },
+            later(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result("ok").await.unwrap(),
+            json!({"run_id": "ok", "terminal_kind": "succeeded", "summary": "done", "artifacts": ["a.txt"]})
+        );
+        let record = event("bad", "dispatched").await;
+        testkit::set_terminal(client, record, "failed").await;
+        assert_eq!(
+            result("bad").await.unwrap(),
+            json!({"run_id": "bad", "terminal_kind": "failed", "summary": null, "artifacts": []})
+        );
+        client
+            .execute(
+                "UPDATE openmybot.host_driver_sessions SET result_summary=NULL WHERE record_id=$1",
+                &[&session],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result("ok").await.unwrap()["summary"], Value::Null);
+        for (run, status, kind) in [
+            ("expired", "expired", "cancelled"),
+            ("cancelled", "cancelled", "cancelled"),
+            ("conflict", "conflict", "failed"),
+        ] {
+            event(run, status).await;
+            assert_eq!(
+                result(run).await.unwrap(),
+                json!({"run_id": run, "terminal_kind": kind, "summary": null, "artifacts": []})
+            );
+        }
+        assert_eq!(result("no-such-run").await, Err(DaemonError::RunNotFound));
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn thread_list_is_newest_first_and_capped_at_fifty() {
+        let env = Env::start().await;
+        let host = host_binding(&env).await;
+        assert_eq!(
+            mcp_call(&env, McpOp::ThreadList, json!({})).await.unwrap(),
+            json!({"runs": []})
+        );
+        for index in 0..55 {
+            let record = testkit::insert_event_for_run(
+                &env.client,
+                host,
+                &format!("run-{index:02}"),
+                &format!("thread-{index:02}"),
+                "pending",
+            )
+            .await;
+            testkit::shift_event(&env.client, record, "accepted_at", f64::from(index) - 100.0)
+                .await;
+        }
+        let (sender, thread) = env.sender().await;
+        testkit::insert_event_for_run(
+            &env.client,
+            sender,
+            "sender-run",
+            thread.as_str(),
+            "pending",
+        )
+        .await;
+        let listed = mcp_call(&env, McpOp::ThreadList, json!({})).await.unwrap();
+        let runs = listed["runs"].as_array().unwrap();
+        let expected: Vec<String> = (5..55)
+            .rev()
+            .map(|index| format!("run-{index:02}"))
+            .collect();
+        let ids: Vec<&str> = runs
+            .iter()
+            .map(|run| run["run_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, expected);
+        for run in runs {
+            let keys: Vec<&String> = run.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["accepted_at", "run_id", "state", "thread_id"]);
+            let accepted_at = run["accepted_at"].as_str().unwrap().as_bytes();
+            assert_eq!(accepted_at.len(), 24);
+            assert_eq!(accepted_at[10], b'T');
+            assert_eq!(accepted_at[19], b'.');
+            assert_eq!(accepted_at[23], b'Z');
+        }
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn cancel_answers_every_branch_of_the_run_lifecycle() {
+        let mut env = Env::new(Fixture::start_with_host(agent::cooperative).await).await;
+        let host = bound(&mut env).await;
+        let cancel = async |env: &Env, run: &str| {
+            mcp_call(env, McpOp::RunCancel, json!({"run_id": run})).await
+        };
+        let queued = mcp_call(&env, McpOp::RunBegin, begin("c-1", "queued"))
+            .await
+            .unwrap();
+        let queued = queued["run_id"].as_str().unwrap();
+        assert_eq!(
+            cancel(&env, queued).await.unwrap(),
+            json!({"run_id": queued, "state": "requested"})
+        );
+        assert_eq!(
+            host_event(&env, "c-1").await["dispatch_status"],
+            "cancelled"
+        );
+        assert_eq!(
+            mcp_call(&env, McpOp::RunStatus, json!({"run_id": queued}))
+                .await
+                .unwrap()["state"],
+            "cancelled"
+        );
+        assert_eq!(
+            cancel(&env, queued).await.unwrap()["state"],
+            "already_terminal"
+        );
+        let thread = env.minted().await;
+        let run = env.begun(host, &thread).await;
+        for state in ["requested", "already_requested"] {
+            assert_eq!(
+                cancel(&env, run.run.as_str()).await.unwrap()["state"],
+                state
+            );
+        }
+        env.runtime = Some(
+            AgentRuntime::start(env.fixture.engine(), env.fixture.pg.database_config()).unwrap(),
+        );
+        agent::settled(&env.fixture, &run.thread).await;
+        assert_eq!(
+            cancel(&env, run.run.as_str()).await.unwrap()["state"],
+            "already_terminal"
+        );
+        // Neither the engine nor the store knows this thread; the terminal alone answers.
+        let ended = dispatched(&env.client, host, "run-ended", "thread-ended").await;
+        testkit::set_terminal(&env.client, ended, "succeeded").await;
+        assert_eq!(
+            cancel(&env, "run-ended").await.unwrap()["state"],
+            "already_terminal"
+        );
+        let (sender, sender_thread) = env.sender().await;
+        let foreign = testkit::insert_event_for_run(
+            &env.client,
+            sender,
+            "run-foreign",
+            sender_thread.as_str(),
+            "pending",
+        )
+        .await;
+        for run in ["run-foreign", "no-such-run"] {
+            assert_eq!(cancel(&env, run).await, Err(DaemonError::RunNotFound));
+        }
+        assert_eq!(
+            testkit::read_row(&env.client, "channel_events", "record_id", foreign).await["dispatch_status"],
+            "pending"
+        );
+        dispatched(&env.client, host, "run-refused", "thread-not-minted").await;
+        assert_eq!(
+            cancel(&env, "run-refused").await,
+            Err(DaemonError::InternalError)
+        );
+        assert_eq!(
+            mcp_call(&env, McpOp::RunStatus, json!({"run_id": queued}))
+                .await
+                .unwrap()["state"],
+            "cancelled"
+        );
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn host_run_flows_from_begin_through_the_dispatcher_to_the_result() {
+        let mut env = Env::running(Fixture::start_with_host(happy).await).await;
+        let (cancel, _) = mpsc::channel(CANCEL_QUEUE);
+        let terminals = env.fixture.take_terminals();
+        let channels = Channels::start(
+            &mut env.fixture.pg,
+            env.fixture.engine.as_ref().unwrap(),
+            env.token,
+            quick_channels(),
+            env.fake.endpoint(),
+            cancel,
+            Outbound {
+                terminals,
+                crabcode: None,
+            },
+        )
+        .await
+        .unwrap();
+        env.channels = Some(channels);
+        env.ops.wake = env.channels.as_ref().unwrap().wake();
+        let host = bound(&mut env).await;
+        let accepted = mcp_call(&env, McpOp::RunBegin, begin("e2e-1", "do the work"))
+            .await
+            .unwrap();
+        assert_eq!(accepted["state"], "accepted");
+        let run_id = accepted["run_id"].as_str().unwrap();
+        let order = ["pending", "running", "awaiting_permission", "succeeded"];
+        let mut reached = 0;
+        let limit = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = mcp_call(&env, McpOp::RunStatus, json!({"run_id": run_id}))
+                .await
+                .unwrap();
+            let state = status["state"].as_str().unwrap();
+            let at = order
+                .iter()
+                .position(|word| *word == state)
+                .unwrap_or_else(|| panic!("{state}"));
+            assert!(at >= reached, "{state} after {}", order[reached]);
+            reached = at;
+            if state == "succeeded" {
+                break;
+            }
+            assert!(Instant::now() < limit, "host run deadline");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            mcp_call(&env, McpOp::RunResult, json!({"run_id": run_id}))
+                .await
+                .unwrap(),
+            json!({"run_id": run_id, "terminal_kind": "succeeded", "summary": "hello from fake", "artifacts": []})
+        );
+        let listed = mcp_call(&env, McpOp::ThreadList, json!({})).await.unwrap();
+        assert!(
+            listed["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["run_id"] == run_id && run["state"] == "succeeded"),
+            "{listed}"
+        );
+        let replayed = mcp_call(&env, McpOp::RunBegin, begin("e2e-1", "do the work"))
+            .await
+            .unwrap();
+        assert_eq!(replayed["state"], "replayed");
+        assert_eq!(replayed["run_id"], run_id);
+        let deliveries: i64 = env
+            .client
+            .query_one(
+                "SELECT count(*) FROM openmybot.deliveries WHERE binding_id=$1",
+                &[&host],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(deliveries, 0);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn thread_minter_mints_distinct_ids_and_writes_no_row() {
+        let env = Env::start().await;
+        let minter = ThreadMinter::new(env.ops.application.clone(), env.ops.resolver.clone());
+        let before = env.rows().await;
+        let first = minter.mint().await.unwrap();
+        let second = minter.mint().await.unwrap();
+        assert_ne!(first.as_str(), second.as_str());
+        for thread in [&first, &second] {
+            assert!((1..=128).contains(&thread.as_str().len()), "{thread:?}");
+        }
+        assert_eq!(env.rows().await, before);
+        host_binding(&env).await;
+        mcp_call(&env, McpOp::RunBegin, begin("op-1", "m"))
+            .await
+            .unwrap();
+        let accepted = env.rows().await;
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("op-1", "m"))
+                .await
+                .unwrap()["state"],
+            "replayed"
+        );
+        assert_eq!(env.rows().await, accepted);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn host_event_expiry_does_not_end_the_dispatcher() {
+        let mut env = Env::with_channels().await;
+        let host = bound(&mut env).await;
+        let thread = env.minted().await;
+        let aged = accept_host_begin(
+            &mut env.client,
+            &OperationId::parse("aged-1").unwrap(),
+            &HostMessage::parse("old").unwrap(),
+            thread.as_str(),
+            later(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(aged, HostAccept::Accepted(_)));
+        let record = host_event(&env, "aged-1").await["record_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        testkit::shift_event(&env.client, record, "accepted_at", -100_000.0).await;
+        env.ops.wake.notify_one();
+        let limit = Instant::now() + Duration::from_secs(30);
+        while host_event(&env, "aged-1").await["dispatch_status"] != "expired" {
+            assert!(Instant::now() < limit, "expiry deadline");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let deliveries: i64 = env
+            .client
+            .query_one(
+                "SELECT count(*) FROM openmybot.deliveries WHERE binding_id=$1",
+                &[&host],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(deliveries, 0);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                env.channels.as_mut().unwrap().finished()
+            )
+            .await
+            .is_err()
+        );
+        let fresh = mcp_call(&env, McpOp::RunBegin, begin("fresh-1", "new"))
+            .await
+            .unwrap();
+        assert_eq!(fresh["state"], "accepted");
+        let limit = Instant::now() + Duration::from_secs(30);
+        while mcp_call(&env, McpOp::RunStatus, json!({"run_id": fresh["run_id"]}))
+            .await
+            .unwrap()["state"]
+            != "running"
+        {
+            assert!(Instant::now() < limit, "dispatch deadline");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn cancel_queue_stop_returns_while_a_handle_clone_is_alive() {
+        let mut env = Env::start().await;
+        let connection = env
+            .fixture
+            .pg
+            .open_resident_connection("openmybot-canceller")
+            .await
+            .unwrap();
+        let (cancel, requests) = mpsc::channel(CANCEL_QUEUE);
+        let handle = BindingRunCanceller::new(
+            env.ops.application.clone(),
+            env.ops.resolver.clone(),
+            Arc::new(connection.client),
+        );
+        let queue = CancelQueue::start(handle.clone(), connection.driver, requests);
+        drop(cancel);
+        tokio::time::timeout(Duration::from_secs(5), queue.stop())
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.cancel(Uuid::now_v7(), "r").await,
+            Err(DaemonError::InternalError)
+        );
         env.stop().await;
     }
 }
