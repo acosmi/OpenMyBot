@@ -451,7 +451,8 @@ impl SafeHttpRequest {
         Self::post_json_with_scheme(url, SchemePolicy::HttpsOnly, body, authorization, budget)
     }
 
-    pub(crate) fn post_json_with_scheme(
+    /// 生产调用方传 `HttpsOnly`；`HttpOrHttps` 只供经出站策略白名单到达的回环服务器（渠道一致性测试）。
+    pub fn post_json_with_scheme(
         url: Url,
         scheme_policy: SchemePolicy,
         body: Vec<u8>,
@@ -1935,5 +1936,107 @@ mod tests {
             }
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn post_json_with_scheme_accepts_http_url_under_http_or_https() {
+        let request = SafeHttpRequest::post_json_with_scheme(
+            Url::parse("http://127.0.0.1:1/x").unwrap(),
+            SchemePolicy::HttpOrHttps,
+            b"{}".to_vec(),
+            None,
+            budget(1024),
+        )
+        .unwrap();
+        assert_eq!(request.method, SafeMethod::PostJson);
+        assert!(request.follow_redirects);
+        assert_eq!(request.scheme_policy, SchemePolicy::HttpOrHttps);
+    }
+
+    #[test]
+    fn post_json_with_scheme_rejects_http_url_under_https_only() {
+        let result = SafeHttpRequest::post_json_with_scheme(
+            Url::parse("http://127.0.0.1:1/x").unwrap(),
+            SchemePolicy::HttpsOnly,
+            b"{}".to_vec(),
+            None,
+            budget(1024),
+        );
+        assert_eq!(result.unwrap_err(), SafeHttpError::SchemeRejected);
+    }
+
+    #[test]
+    fn post_json_remains_https_only() {
+        let http = SafeHttpRequest::post_json(
+            Url::parse("http://127.0.0.1:1/x").unwrap(),
+            b"{}".to_vec(),
+            None,
+            budget(1024),
+        );
+        assert_eq!(http.unwrap_err(), SafeHttpError::SchemeRejected);
+        let https = SafeHttpRequest::post_json(
+            Url::parse("https://127.0.0.1:1/x").unwrap(),
+            b"{}".to_vec(),
+            None,
+            budget(1024),
+        )
+        .unwrap();
+        assert_eq!(https.scheme_policy, SchemePolicy::HttpsOnly);
+    }
+
+    #[tokio::test]
+    async fn http_json_post_with_scheme_reaches_loopback_server() {
+        const BODY: &[u8] = br#"{"chat_id":42,"text":"hello"}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            while bytes.len() < header_end + BODY.len() {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let head = String::from_utf8(bytes[..header_end].to_vec())
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(head.starts_with("post /bot/sendmessage "));
+            assert!(head.contains("content-type: application/json"));
+            assert_eq!(&bytes[header_end..], BODY);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .unwrap();
+        });
+        let request = SafeHttpRequest::post_json_with_scheme(
+            Url::parse(&format!(
+                "http://127.0.0.1:{}/bot/sendMessage",
+                address.port()
+            ))
+            .unwrap(),
+            SchemePolicy::HttpOrHttps,
+            BODY.to_vec(),
+            None,
+            budget(1024),
+        )
+        .unwrap();
+        let response = SafeDialer::new(loopback_policy())
+            .execute(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body(), br#"{"ok":true}"#);
+        server.await.unwrap();
     }
 }
