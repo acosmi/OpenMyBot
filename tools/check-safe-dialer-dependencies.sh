@@ -87,6 +87,12 @@ expected_proxy_hop_callers=$'crates/openbot-infra/src/net/safe_http.rs\ncrates/o
 [[ "$proxy_hop_callers" == "$expected_proxy_hop_callers" ]] \
   || fail "scope proxy hop escaped its two owning modules: [$proxy_hop_callers]"
 
+# §10.5 第 7 项：WebSocket 客户端只在 SafeDialer::connect_websocket_stream 返回的已验证流上握手；
+# tokio-tungstenite 的自拨号（connect_async 族）与自带 TLS（client_async_tls 族）入口不得出现在第一方源码。
+if rg -n '\b(connect_async|client_async_tls)' crates/*/src --glob '*.rs'; then
+  fail 'tokio-tungstenite 自拨号/自带 TLS 入口绕过 SafeDialer'
+fi
+
 # Seven test modules own these loopback probes. Desktop has two existing exit-observation
 # probes (unclean Drop and owned orphan shutdown); every other module has exactly one.
 # Pin each count and require every caller to remain after the unique cfg(test) module marker.

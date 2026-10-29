@@ -21,8 +21,10 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,10 +40,11 @@ use hyper_util::rt::TokioIo;
 use ipnet::IpNet;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use url::{Position, Url};
 
 /// 第一真源固定的 redirect 上限。
@@ -684,6 +687,64 @@ impl fmt::Debug for SafeHttpStreamResponse {
     }
 }
 
+/// SafeDialer 为 `ws`/`wss` URL 建立的已验证双向字节流：`ws` 为直连已验证地址的 TCP，`wss` 为其上的
+/// rustls 会话。WebSocket 握手与帧由调用方在本流上完成。`Debug` 只显示是否 TLS。
+pub struct SafeStream(StreamTransport);
+
+enum StreamTransport {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for SafeStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut self.get_mut().0 {
+            StreamTransport::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            StreamTransport::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for SafeStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut self.get_mut().0 {
+            StreamTransport::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            StreamTransport::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut self.get_mut().0 {
+            StreamTransport::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            StreamTransport::Tls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut self.get_mut().0 {
+            StreamTransport::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            StreamTransport::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl fmt::Debug for SafeStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SafeStream")
+            .field("tls", &matches!(self.0, StreamTransport::Tls(_)))
+            .finish_non_exhaustive()
+    }
+}
+
 /// 唯一网络实现。
 #[derive(Clone)]
 pub struct SafeDialer {
@@ -790,6 +851,40 @@ impl SafeDialer {
         match tokio::time::timeout(request.budget.timeout(), self.execute_stream_inner(request))
             .await
         {
+            Ok(result) => result,
+            Err(_) => Err(SafeHttpError::DeadlineExceeded),
+        }
+    }
+
+    /// 为 `ws`/`wss` URL 建立已验证的双向字节流：与 `execute` 同一条解析 → 出站策略 → 直连已验证地址 →
+    /// TLS（SNI 取原 host、peer 复核、ALPN http/1.1）路径；不重定向、不重试；`timeout` 包住 DNS、连接与
+    /// TLS。WebSocket 握手与帧由调用方在返回的流上完成。生产调用方传 `HttpsOnly`（只收 `wss`）；
+    /// `HttpOrHttps` 另收 `ws`，只供经出站策略白名单到达的回环服务器。
+    pub async fn connect_websocket_stream(
+        &self,
+        url: &Url,
+        scheme_policy: SchemePolicy,
+        timeout: Duration,
+    ) -> Result<SafeStream, SafeHttpError> {
+        let tls = match url.scheme() {
+            "ws" => false,
+            "wss" => true,
+            _ => return Err(SafeHttpError::SchemeRejected),
+        };
+        if !scheme_policy.accepts(if tls { "https" } else { "http" }) {
+            return Err(SafeHttpError::SchemeRejected);
+        }
+        validate_url_shape(url)?;
+        let connect = async {
+            let addresses = self.resolve_and_filter(url).await?;
+            let (stream, peer) = connect_validated(&addresses).await?;
+            Ok::<_, SafeHttpError>(SafeStream(if tls {
+                StreamTransport::Tls(Box::new(self.connect_tls(url, stream, peer).await?))
+            } else {
+                StreamTransport::Plain(stream)
+            }))
+        };
+        match tokio::time::timeout(timeout, connect).await {
             Ok(result) => result,
             Err(_) => Err(SafeHttpError::DeadlineExceeded),
         }
@@ -959,24 +1054,38 @@ impl SafeDialer {
         match request.url.scheme() {
             "http" => send_http1(stream, http_request).await,
             "https" => {
-                let server_name = match request.url.host().ok_or(SafeHttpError::InvalidUrl)? {
-                    url::Host::Ipv4(ip) => ServerName::IpAddress(IpAddr::V4(ip).into()),
-                    url::Host::Ipv6(ip) => ServerName::IpAddress(IpAddr::V6(ip).into()),
-                    url::Host::Domain(host) => ServerName::try_from(host.to_owned())
-                        .map_err(|_| SafeHttpError::InvalidUrl)?,
-                };
-                let tls = TlsConnector::from(Arc::clone(&self.tls))
-                    .connect(server_name, stream)
-                    .await
-                    .map_err(|_| SafeHttpError::TlsFailed)?;
-                // 正向对照连接绑定：TLS 包装后底层 peer 仍必须等于刚才实际连接的地址。
-                if tls.get_ref().0.peer_addr().ok() != Some(peer) {
-                    return Err(SafeHttpError::PeerMismatch);
-                }
-                send_http1(tls, http_request).await
+                send_http1(
+                    self.connect_tls(&request.url, stream, peer).await?,
+                    http_request,
+                )
+                .await
             }
             _ => Err(SafeHttpError::SchemeRejected),
         }
+    }
+
+    async fn connect_tls(
+        &self,
+        url: &Url,
+        stream: TcpStream,
+        peer: SocketAddr,
+    ) -> Result<TlsStream<TcpStream>, SafeHttpError> {
+        let server_name = match url.host().ok_or(SafeHttpError::InvalidUrl)? {
+            url::Host::Ipv4(ip) => ServerName::IpAddress(IpAddr::V4(ip).into()),
+            url::Host::Ipv6(ip) => ServerName::IpAddress(IpAddr::V6(ip).into()),
+            url::Host::Domain(host) => {
+                ServerName::try_from(host.to_owned()).map_err(|_| SafeHttpError::InvalidUrl)?
+            }
+        };
+        let tls = TlsConnector::from(Arc::clone(&self.tls))
+            .connect(server_name, stream)
+            .await
+            .map_err(|_| SafeHttpError::TlsFailed)?;
+        // 正向对照连接绑定：TLS 包装后底层 peer 仍必须等于刚才实际连接的地址。
+        if tls.get_ref().0.peer_addr().ok() != Some(peer) {
+            return Err(SafeHttpError::PeerMismatch);
+        }
+        Ok(tls)
     }
 }
 
@@ -1176,6 +1285,10 @@ fn validate_url(url: &Url, policy: SchemePolicy) -> Result<(), SafeHttpError> {
     if !policy.accepts(url.scheme()) {
         return Err(SafeHttpError::SchemeRejected);
     }
+    validate_url_shape(url)
+}
+
+fn validate_url_shape(url: &Url) -> Result<(), SafeHttpError> {
     if url.cannot_be_a_base()
         || url.host_str().is_none()
         || url.port_or_known_default().is_none()
@@ -1870,7 +1983,7 @@ mod tests {
         );
     }
 
-    async fn tls_response_server() -> (SocketAddr, CertificateDer<'static>, JoinHandle<()>) {
+    fn test_tls_acceptor() -> (TlsAcceptor, CertificateDer<'static>) {
         let root = CertificateDer::from(BASE64_STANDARD.decode(TEST_CA_DER_BASE64).unwrap());
         let certificate =
             CertificateDer::from(BASE64_STANDARD.decode(TEST_LEAF_DER_BASE64).unwrap());
@@ -1884,10 +1997,14 @@ mod tests {
             .with_single_cert(vec![certificate.clone()], key)
             .unwrap();
         server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        (TlsAcceptor::from(Arc::new(server_config)), root)
+    }
+
+    async fn tls_response_server() -> (SocketAddr, CertificateDer<'static>, JoinHandle<()>) {
+        let (acceptor, root) = test_tls_acceptor();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let Ok(mut tls) = acceptor.accept(stream).await else {
@@ -2037,6 +2154,188 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body(), br#"{"ok":true}"#);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_round_trips_ws_bytes_to_a_loopback_echo() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut echo = [0u8; 16];
+            stream.read_exact(&mut echo).await.unwrap();
+            stream.write_all(&echo).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let url = Url::parse(&format!(
+            "ws://127.0.0.1:{}/ws?device_id=secret-device&service_id=7",
+            address.port()
+        ))
+        .unwrap();
+        let mut stream = SafeDialer::new(loopback_policy())
+            .connect_websocket_stream(&url, SchemePolicy::HttpOrHttps, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(format!("{stream:?}"), "SafeStream { tls: false, .. }");
+        stream.write_all(b"vetted-ws-bytes!").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut echoed = [0u8; 16];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"vetted-ws-bytes!");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_accepts_only_wss_under_https_only() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        let dialer = SafeDialer::with_resolver(loopback_policy(), resolver.clone());
+        let ws = Url::parse("ws://loop.test:1/ws").unwrap();
+        let result = dialer
+            .connect_websocket_stream(&ws, SchemePolicy::HttpsOnly, Duration::from_secs(2))
+            .await;
+        assert_eq!(result.unwrap_err(), SafeHttpError::SchemeRejected);
+        assert!(resolver.calls().is_empty());
+
+        let wss = Url::parse("wss://loop.test:1/ws").unwrap();
+        let result = dialer
+            .connect_websocket_stream(&wss, SchemePolicy::HttpsOnly, Duration::from_secs(2))
+            .await;
+        assert_eq!(result.unwrap_err(), SafeHttpError::DnsUnavailable);
+        assert_eq!(resolver.calls(), vec!["loop.test"]);
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_rejects_other_schemes_and_malformed_urls() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        let dialer = SafeDialer::with_resolver(loopback_policy(), resolver.clone());
+        for (raw, expected) in [
+            ("http://loop.test/", SafeHttpError::SchemeRejected),
+            ("https://loop.test/", SafeHttpError::SchemeRejected),
+            ("ftp://loop.test/", SafeHttpError::SchemeRejected),
+            ("file:///etc/passwd", SafeHttpError::SchemeRejected),
+            ("wss://user@loop.test/", SafeHttpError::InvalidUrl),
+            ("wss://user:pw@loop.test/", SafeHttpError::InvalidUrl),
+            ("ws://loop.test/#fragment", SafeHttpError::InvalidUrl),
+        ] {
+            let url = Url::parse(raw).unwrap();
+            let result = dialer
+                .connect_websocket_stream(&url, SchemePolicy::HttpOrHttps, Duration::from_secs(2))
+                .await;
+            assert_eq!(result.unwrap_err(), expected, "{raw}");
+        }
+        assert!(resolver.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_denies_unlisted_destinations_without_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let loopback = Url::parse(&format!("ws://127.0.0.1:{port}/")).unwrap();
+        let result = SafeDialer::new(EgressPolicy::default())
+            .connect_websocket_stream(&loopback, SchemePolicy::HttpOrHttps, Duration::from_secs(2))
+            .await;
+        assert_eq!(result.unwrap_err(), SafeHttpError::DestinationDenied);
+
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.push(
+            "private.test",
+            vec![
+                SocketAddr::new("10.0.0.9".parse().unwrap(), port),
+                SocketAddr::new("169.254.169.254".parse().unwrap(), port),
+            ],
+        );
+        let private = Url::parse(&format!("ws://private.test:{port}/")).unwrap();
+        let result = SafeDialer::with_resolver(loopback_policy(), resolver.clone())
+            .connect_websocket_stream(&private, SchemePolicy::HttpOrHttps, Duration::from_secs(2))
+            .await;
+        assert_eq!(result.unwrap_err(), SafeHttpError::DestinationDenied);
+        assert_eq!(resolver.calls(), vec!["private.test"]);
+        // 若有连接，内核已在方法返回前完成三次握手，accept 会立即就绪；超时即证明未连接。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_timeout_covers_an_unanswered_tls_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut chunk = [0u8; 1024];
+            while let Ok(count) = stream.read(&mut chunk).await {
+                if count == 0 {
+                    break;
+                }
+            }
+        });
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.push("idp.test", vec![address]);
+        let url = Url::parse(&format!("wss://idp.test:{}/ws", address.port())).unwrap();
+        let result = SafeDialer::with_resolver(loopback_policy(), resolver)
+            .connect_websocket_stream(&url, SchemePolicy::HttpsOnly, Duration::from_millis(50))
+            .await;
+        assert_eq!(result.unwrap_err(), SafeHttpError::DeadlineExceeded);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wss_stream_verifies_the_original_hostname_with_http11_alpn_over_the_vetted_ip() {
+        let (acceptor, root) = test_tls_acceptor();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            assert_eq!(tls.get_ref().1.server_name(), Some("idp.test"));
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(b"http/1.1".as_slice())
+            );
+            let mut echo = [0u8; 16];
+            tls.read_exact(&mut echo).await.unwrap();
+            tls.write_all(&echo).await.unwrap();
+            tls.flush().await.unwrap();
+        });
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.push("idp.test", vec![address]);
+        let url = Url::parse(&format!(
+            "wss://idp.test:{}/ws?device_id=secret-device&service_id=7",
+            address.port()
+        ))
+        .unwrap();
+        let dialer =
+            SafeDialer::with_extra_roots(loopback_policy(), resolver.clone(), [root]).unwrap();
+        let mut stream = dialer
+            .connect_websocket_stream(&url, SchemePolicy::HttpsOnly, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(format!("{stream:?}"), "SafeStream { tls: true, .. }");
+        stream.write_all(b"vetted-ws-bytes!").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut echoed = [0u8; 16];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"vetted-ws-bytes!");
+        assert_eq!(resolver.calls(), vec!["idp.test"]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wss_stream_rejects_a_certificate_for_another_hostname() {
+        let (address, root, server) = tls_response_server().await;
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.push("other.test", vec![address]);
+        let url = Url::parse(&format!("wss://other.test:{}/ws", address.port())).unwrap();
+        let dialer =
+            SafeDialer::with_extra_roots(loopback_policy(), resolver.clone(), [root]).unwrap();
+        let result = dialer
+            .connect_websocket_stream(&url, SchemePolicy::HttpsOnly, Duration::from_secs(2))
+            .await;
+        assert_eq!(result.unwrap_err(), SafeHttpError::TlsFailed);
+        assert_eq!(resolver.calls(), vec!["other.test"]);
         server.await.unwrap();
     }
 }
