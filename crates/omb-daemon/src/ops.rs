@@ -139,6 +139,10 @@ enum Request {
     Cancel(IdentityKey),
 }
 fn decode<T: DeserializeOwned>(args: Value) -> Result<T, DaemonError> {
+    // A struct also deserializes from a JSON array, so anything but an object is refused here.
+    if !args.is_object() {
+        return Err(DaemonError::InvalidRequest);
+    }
     serde_json::from_value(args).map_err(|_| DaemonError::InvalidRequest)
 }
 fn uuid(text: &str) -> Result<Uuid, DaemonError> {
@@ -833,10 +837,6 @@ mod mcp {
         List,
     }
     pub(super) fn parse(op: McpOp, args: Value) -> Result<McpRequest, DaemonError> {
-        // A struct also deserializes from a JSON array, so anything but an object is refused here.
-        if !args.is_object() {
-            return Err(DaemonError::InvalidRequest);
-        }
         Ok(match op {
             McpOp::RunBegin => {
                 let args: BeginArgs = decode(args)?;
@@ -1023,6 +1023,7 @@ mod tests {
                     json!({}),
                     json!({"run_id": "r1", "x": 1}),
                     json!({"run_id": 1}),
+                    json!(["r1"]),
                 ],
             ),
             (
@@ -1040,7 +1041,7 @@ mod tests {
             (
                 "bindings_list",
                 json!({}),
-                vec![json!({"x": 1}), json!("x"), json!(null)],
+                vec![json!({"x": 1}), json!("x"), json!(null), json!([])],
             ),
             (
                 "bindings_revoke",
