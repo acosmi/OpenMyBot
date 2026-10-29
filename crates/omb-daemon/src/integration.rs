@@ -921,7 +921,7 @@ async fn channel_text_yes_tongyi_and_approve_leave_the_permission_row_undecided(
             .unwrap()["decision"],
         "deny"
     );
-    rig.terminal_of(&run).await;
+    assert_eq!(rig.terminal_of(&run).await, "succeeded");
     let row = testkit::permission_row_json(&rig.client, &id).await;
     assert_eq!(row["decision"], "deny");
     assert_eq!(row["decided_via"], "cli");
