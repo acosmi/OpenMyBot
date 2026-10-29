@@ -855,7 +855,6 @@ mod tests {
             (DaemonError::CredentialRejected, 4),
             (DaemonError::WebhookConflict, 4),
             (DaemonError::ChannelUnreachable, 4),
-            (DaemonError::ChannelNotSupported, 4),
             (DaemonError::RequestTimeout, 4),
         ] {
             assert_eq!(exit_code(&error), expected);

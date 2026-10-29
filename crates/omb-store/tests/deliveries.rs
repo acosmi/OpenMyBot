@@ -1,9 +1,9 @@
 //! Terminal recording, the delivery claim and the end of one attempt against an own PostgreSQL
 //! 17.11 cluster.
 use omb_store::{
-    Claimed, DeliveryContent, DispatchOutcome, ErrorCode, Finish, GrantKind, RunResultFacts,
-    StoreError, TerminalKind, TerminalWrite, claim_delivery, finish_delivery, migrate,
-    record_dispatch, record_terminal, run_result_facts, send_target,
+    Channel, Claimed, DeliveryContent, DispatchOutcome, ErrorCode, Finish, GrantKind,
+    RunResultFacts, StoreError, TerminalKind, TerminalWrite, claim_delivery, finish_delivery,
+    migrate, record_dispatch, record_terminal, run_result_facts, send_target,
     testkit::{
         Fixture, Session, deadline, insert_delivery, insert_ended_session, insert_event_for_run,
         insert_host_binding, insert_receiver_with, insert_sender, read_row, set_terminal,
@@ -586,7 +586,7 @@ async fn rows_of(env: &Env, ids: &[Uuid]) -> Vec<Value> {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn claim_delivery_ignores_feishu_rows() {
+async fn claim_delivery_claims_feishu_rows_with_channel_and_idempotency_key() {
     let env = Env::new().await;
     let feishu = insert_sender(env.client(), "feishu", "2002", "feishu:7", "T2").await;
     let id = insert_delivery(
@@ -599,10 +599,24 @@ async fn claim_delivery_ignores_feishu_rows() {
         None,
     )
     .await;
-    let before = env.row(id).await;
-    assert_eq!(before["channel_kind"], "feishu");
-    assert_eq!(env.claim().await, None);
-    assert_eq!(env.row(id).await, before);
+    assert_eq!(env.row(id).await["channel_kind"], "feishu");
+    let claimed = env.claim().await.unwrap();
+    assert_eq!(claimed.delivery_id, id);
+    assert_eq!(claimed.binding_id, feishu);
+    assert_eq!(claimed.channel, Channel::Feishu);
+    assert_eq!(claimed.chat_key, "feishu:7");
+    assert_eq!(claimed.idempotency_key, "control_reply:f");
+    assert_eq!(claimed.attempts, 1);
+    assert_eq!(claimed.content, DeliveryContent::Text("x".into()));
+    assert_eq!(env.row(id).await["status"], "sending");
+    let telegram = env
+        .delivery("control_reply", "control_reply:t", Some("y"), "pending")
+        .await;
+    let claimed = env.claim().await.unwrap();
+    assert_eq!(claimed.delivery_id, telegram);
+    assert_eq!(claimed.channel, Channel::Telegram);
+    assert_eq!(claimed.chat_key, "telegram:42");
+    assert_eq!(claimed.idempotency_key, "control_reply:t");
     env.stop().await;
 }
 
@@ -830,7 +844,7 @@ async fn finish_of_row_not_sending_is_refused_without_change() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn send_target_reports_sender_status_and_active_telegram_receiver() {
+async fn send_target_reports_sender_status_and_the_active_receiver_of_its_channel() {
     let env = Env::new().await;
     let receiver = Uuid::now_v7();
     insert_receiver_with(
@@ -848,30 +862,45 @@ async fn send_target_reports_sender_status_and_active_telegram_receiver() {
         ("expired", false),
     ] {
         set_status(env.client(), env.sender, status).await;
-        let target = send_target(env.client(), env.sender, deadline())
+        let target = send_target(env.client(), env.sender, Channel::Telegram, deadline())
             .await
             .unwrap();
         assert_eq!(target.sender_active, active, "{status}");
-        let row = target.receiver.unwrap();
+        let (row, revision) = target.receiver.unwrap();
         assert_eq!(row.binding_id, receiver);
+        assert_eq!(row.channel, Channel::Telegram);
         assert_eq!(row.source_key, "1001");
         assert_eq!(row.credential_envelope, "sealed-envelope");
+        assert_eq!(revision, 1);
     }
+    let feishu_sender = insert_sender(env.client(), "feishu", "cli_a", "feishu:7", "T2").await;
+    let feishu = Uuid::now_v7();
+    insert_receiver_with(env.client(), feishu, "feishu", "cli_a", "feishu-envelope").await;
+    let target = send_target(env.client(), feishu_sender, Channel::Feishu, deadline())
+        .await
+        .unwrap();
+    assert!(target.sender_active);
+    let (row, revision) = target.receiver.unwrap();
+    assert_eq!(row.binding_id, feishu);
+    assert_eq!(row.channel, Channel::Feishu);
+    assert_eq!(row.source_key, "cli_a");
+    assert_eq!(row.credential_envelope, "feishu-envelope");
+    assert_eq!(revision, 1);
     env.stop().await;
 }
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn send_target_without_active_telegram_receiver_has_none() {
+async fn send_target_without_an_active_receiver_of_its_channel_has_none() {
     let env = Env::new().await;
-    let none = send_target(env.client(), env.sender, deadline())
+    let none = send_target(env.client(), env.sender, Channel::Telegram, deadline())
         .await
         .unwrap();
     assert!(none.sender_active);
     assert!(none.receiver.is_none());
     let feishu = Uuid::now_v7();
     insert_receiver_with(env.client(), feishu, "feishu", "cli_a", "feishu-envelope").await;
-    let only_feishu = send_target(env.client(), env.sender, deadline())
+    let only_feishu = send_target(env.client(), env.sender, Channel::Telegram, deadline())
         .await
         .unwrap();
     assert!(only_feishu.receiver.is_none());
@@ -886,7 +915,31 @@ async fn send_target_without_active_telegram_receiver_has_none() {
     .await;
     for status in ["suspended", "revoked"] {
         set_status(env.client(), receiver, status).await;
-        let target = send_target(env.client(), env.sender, deadline())
+        let target = send_target(env.client(), env.sender, Channel::Telegram, deadline())
+            .await
+            .unwrap();
+        assert!(target.receiver.is_none(), "{status}");
+    }
+    // A Feishu sender is served only by the Feishu receiver.
+    let feishu_sender = insert_sender(env.client(), "feishu", "cli_a", "feishu:7", "T2").await;
+    set_status(env.client(), feishu, "suspended").await;
+    let telegram = Uuid::now_v7();
+    insert_receiver_with(
+        env.client(),
+        telegram,
+        "telegram",
+        "1001",
+        "sealed-envelope",
+    )
+    .await;
+    let only_telegram = send_target(env.client(), feishu_sender, Channel::Feishu, deadline())
+        .await
+        .unwrap();
+    assert!(only_telegram.sender_active);
+    assert!(only_telegram.receiver.is_none());
+    for status in ["suspended", "revoked"] {
+        set_status(env.client(), feishu, status).await;
+        let target = send_target(env.client(), feishu_sender, Channel::Feishu, deadline())
             .await
             .unwrap();
         assert!(target.receiver.is_none(), "{status}");

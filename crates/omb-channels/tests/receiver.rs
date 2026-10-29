@@ -1,11 +1,12 @@
 //! Telegram receiver end to end: an own PostgreSQL 17.11 cluster and the loopback fake Bot API.
 use omb_channels::{
-    CANCEL_QUEUE, CancelRequests, Connection, Counters, CredentialProblem,
+    CANCEL_QUEUE, CancelRequests, Connection, Counters, CredentialProblem, Endpoints,
     OMB_REPLY_CANCEL_NONE_V1, OMB_REPLY_CANCEL_REQUESTED_V1, OMB_REPLY_HELP_V1, ReceiverContext,
-    TG_RESPONSE_MAX, Task, Timings, start_receiver, testkit::FakeTelegram, verify_credentials,
+    TG_RESPONSE_MAX, Task, Timings, fake_feishu::FakeFeishu, start_receiver, testkit::FakeTelegram,
+    verify_credentials,
 };
 use omb_store::{
-    PollGapReason, ReceiverRow, migrate, open_poll_gap,
+    Channel, PollGapReason, ReceiverRow, migrate, open_poll_gap,
     testkit::{
         Fixture, Session, deadline, insert_event_for_run, insert_permission_row,
         insert_receiver_with, insert_sender, permission_row_json, shift_event,
@@ -125,13 +126,17 @@ impl Env {
             Connection { client, driver },
             ReceiverRow {
                 binding_id: self.receiver,
+                channel: Channel::Telegram,
                 source_key: "1001".into(),
                 credential_envelope: self.envelope.clone(),
             },
             ReceiverContext {
                 vault: vault(),
                 owner: owner(),
-                endpoint,
+                endpoints: Endpoints {
+                    telegram: endpoint,
+                    feishu: FakeFeishu::endpoint_at(FakeTelegram::unused_port()),
+                },
                 timings: quick(),
                 counters: Arc::clone(&self.counters),
                 wake: Arc::clone(&self.wake),
@@ -942,6 +947,7 @@ async fn token_sentinel_absent_from_rows_errors_and_debug() {
         env.counters,
         ReceiverRow {
             binding_id: env.receiver,
+            channel: Channel::Telegram,
             source_key: "1001".into(),
             credential_envelope: TOKEN.into()
         },

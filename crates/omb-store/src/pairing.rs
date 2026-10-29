@@ -22,6 +22,14 @@ impl Channel {
             Self::Feishu => "feishu",
         }
     }
+    /// The channel of a stored `channel_kind`; any other text is not a channel.
+    pub(crate) fn parse(text: &str) -> Option<Channel> {
+        match text {
+            "telegram" => Some(Self::Telegram),
+            "feishu" => Some(Self::Feishu),
+            _ => None,
+        }
+    }
 }
 
 /// Plaintext pairing code; shown once and never stored.
@@ -236,5 +244,16 @@ mod tests {
         let expected: [u8; 32] = expected.finalize().into();
         assert_eq!(code_hash(id, "ABCD2345"), expected);
         assert_ne!(code_hash(Uuid::now_v7(), "ABCD2345"), expected);
+    }
+    #[test]
+    fn channel_parse_inverts_as_str_and_refuses_other_text() {
+        assert_eq!(Channel::parse("telegram"), Some(Channel::Telegram));
+        assert_eq!(Channel::parse("feishu"), Some(Channel::Feishu));
+        for channel in [Channel::Telegram, Channel::Feishu] {
+            assert_eq!(Channel::parse(channel.as_str()), Some(channel));
+        }
+        for text in ["host", "", "Telegram", "feishu ", " telegram"] {
+            assert_eq!(Channel::parse(text), None, "{text:?}");
+        }
     }
 }

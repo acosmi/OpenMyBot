@@ -964,7 +964,10 @@ async fn daemon_status_reports_channel_segment_over_control_socket() {
     );
     assert_eq!(channel.pending_dispatch, 0);
     assert!(channel.gaps.is_empty());
-    assert_eq!(channel.note, "telegram 长轮询");
+    assert_eq!(
+        channel.note,
+        "telegram 长轮询；中断区间内的更新在平台保留期内补回"
+    );
     assert_eq!(
         (
             channel.counters.platform_payload_unparseable,
@@ -1203,20 +1206,20 @@ async fn daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn daemon_refuses_feishu_receiver_and_malformed_token_without_leaking_the_secret() {
+async fn daemon_refuses_malformed_receiver_credentials_without_leaking_the_secret() {
     if child_entry().await {
         return;
     }
     let fixture = Fixture::new();
     fixture.initialize().await;
-    let mut process = fixture
-        .spawn("daemon_refuses_feishu_receiver_and_malformed_token_without_leaking_the_secret");
+    let mut process =
+        fixture.spawn("daemon_refuses_malformed_receiver_credentials_without_leaking_the_secret");
     fixture.ready().await;
     let mut seen = Vec::new();
     for (args, expected) in [
         (
-            serde_json::json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "feishu-SENTINEL"}),
-            DaemonError::ChannelNotSupported,
+            serde_json::json!({"channel": "feishu", "app_id": "", "app_secret": "feishu-SENTINEL"}),
+            DaemonError::InvalidRequest,
         ),
         (
             serde_json::json!({"channel": "telegram", "token": "SENTINEL-without-bot-id"}),
@@ -1356,7 +1359,10 @@ async fn daemon_resumed_after_sigstop_records_daemon_suspended_gap_and_resumes_h
             .iter()
             .any(|gap| gap.reason == "daemon_suspended" && gap.ended_at.is_some())
     );
-    assert_eq!(channel.note, "telegram 长轮询");
+    assert_eq!(
+        channel.note,
+        "telegram 长轮询；中断区间内的更新在平台保留期内补回"
+    );
     let resumed: i64 = query_own(&fixture, heartbeat).await[0].get(0);
     tokio::time::sleep(Duration::from_secs(35)).await;
     let later: i64 = query_own(&fixture, heartbeat).await[0].get(0);

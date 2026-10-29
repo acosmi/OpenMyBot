@@ -1,23 +1,27 @@
-//! The outbound sender: records run terminals from the engine's notices, then claims due Telegram
-//! delivery rows and sends each through the receiver's endpoint. Nothing is logged: the request
-//! URL carries the bot token.
+//! The outbound sender: records run terminals from the engine's notices, then claims due delivery
+//! rows of either channel and sends each through the receiver's endpoint. Nothing is logged: the
+//! request URL carries the bot token.
 use crate::{
-    ChannelError, Connection, DELIVERY_BODY_MAX, OMB_RESULT_CANCELLED_V1, OMB_RESULT_FAILED_V1,
-    OMB_RESULT_SUCCEEDED_V1, OMB_RESULT_UNKNOWN_V1, STORE_BUDGET, Task, TelegramEndpoint, Timings,
+    ChannelError, Connection, DELIVERY_BODY_MAX, Endpoints, FS_TOKEN_MARGIN,
+    OMB_RESULT_CANCELLED_V1, OMB_RESULT_FAILED_V1, OMB_RESULT_SUCCEEDED_V1, OMB_RESULT_UNKNOWN_V1,
+    STORE_BUDGET, Task, Timings,
+    feishu::{TokenReply, tenant_token},
 };
 use omb_store::{
-    Claimed, DeliveryContent, ErrorCode, Finish, RunResultFacts, TerminalKind, claim_delivery,
-    finish_delivery, record_terminal, run_result_facts, send_target,
+    Channel, Claimed, DeliveryContent, ErrorCode, Finish, RunResultFacts, TerminalKind,
+    claim_delivery, finish_delivery, record_terminal, run_result_facts, send_target,
 };
 use openbot_application::{RunTerminalKind, RunTerminalNotice, RunTerminalSubscriber};
 use openbot_contracts::ids::ActorId;
 use openbot_domain::vault::{SecretKind, SecretPrincipal, ServiceId};
 use openbot_infra::{
-    net::safe_http::{SafeHttpBudget, SafeHttpError, SafeHttpRequest},
+    net::safe_http::{AuthorizationValue, SafeHttpBudget, SafeHttpError, SafeHttpRequest},
     vault::CredentialRecordVault,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
+use time::OffsetDateTime;
 use tokio::{
     sync::{
         Notify,
@@ -26,6 +30,7 @@ use tokio::{
     },
     time::Instant,
 };
+use uuid::Uuid;
 
 /// The engine's terminal subscriber: it only enqueues; a full or closed queue drops the notice,
 /// which reconciliation recovers.
@@ -40,10 +45,26 @@ impl RunTerminalSubscriber for TerminalQueue {
 pub struct SenderContext {
     pub vault: CredentialRecordVault,
     pub owner: ActorId,
-    pub endpoint: TelegramEndpoint,
+    pub endpoints: Endpoints,
     pub timings: Timings,
     /// The dispatcher's wake-up, signalled after a first terminal write.
     pub wake: Arc<Notify>,
+}
+/// The sender's in-memory tenant token of one receiver revision; the expiry is on the wall clock,
+/// which keeps counting while the machine sleeps. No `Debug` and no `Clone`: the value is a bearer
+/// credential.
+struct TenantToken {
+    receiver: Uuid,
+    revision: u64,
+    value: String,
+    expires_at: OffsetDateTime,
+}
+impl TenantToken {
+    fn usable(&self, receiver: Uuid, revision: u64, now: OffsetDateTime) -> bool {
+        self.receiver == receiver
+            && self.revision == revision
+            && self.expires_at - now >= FS_TOKEN_MARGIN
+    }
 }
 
 /// Bytes read of one `sendMessage` response.
@@ -68,6 +89,7 @@ async fn send(
     let store = |_| ChannelError::StoreFailed;
     let mut queue_open = true;
     let mut received = None;
+    let mut token: Option<TenantToken> = None;
     while matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
         loop {
             let notice: RunTerminalNotice = match received.take() {
@@ -98,7 +120,7 @@ async fn send(
             .await
             .map_err(store)?
         {
-            deliver(&client, &context, claimed).await?;
+            deliver(&client, &context, claimed, &mut token).await?;
             continue;
         }
         tokio::select! {
@@ -112,18 +134,25 @@ async fn send(
     }
     Ok(())
 }
-/// One attempt of a claimed row: the binding and receiver are read again, the token is opened
-/// from the receiver's envelope for this attempt only, and the outcome ends the attempt.
+/// One attempt of a claimed row: the binding and receiver are read again, the credential is opened
+/// from the receiver's envelope for this attempt only, and the outcome ends the attempt. A Feishu
+/// tenant token is kept across attempts while its receiver revision is unchanged.
 async fn deliver(
     client: &tokio_postgres::Client,
     context: &SenderContext,
     claimed: Claimed,
+    token: &mut Option<TenantToken>,
 ) -> Result<(), ChannelError> {
     let store = |_| ChannelError::StoreFailed;
     let timings = &context.timings;
-    let target = send_target(client, claimed.binding_id, Instant::now() + STORE_BUDGET)
-        .await
-        .map_err(store)?;
+    let target = send_target(
+        client,
+        claimed.binding_id,
+        claimed.channel,
+        Instant::now() + STORE_BUDGET,
+    )
+    .await
+    .map_err(store)?;
     let message_id;
     let finish = 'decide: {
         if !target.sender_active {
@@ -131,74 +160,183 @@ async fn deliver(
                 code: ErrorCode::BindingInactive,
             };
         }
-        let secret = target.receiver.as_ref().and_then(|receiver| {
-            context
-                .vault
-                .open(
-                    &receiver.binding_id,
-                    SecretKind::Connector,
-                    SecretPrincipal::Actor(context.owner.clone()),
-                    SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
-                    &receiver.credential_envelope,
+        let verdict = match claimed.channel {
+            Channel::Telegram => {
+                let secret = target.receiver.as_ref().and_then(|(receiver, _)| {
+                    context
+                        .vault
+                        .open(
+                            &receiver.binding_id,
+                            SecretKind::Connector,
+                            SecretPrincipal::Actor(context.owner.clone()),
+                            SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
+                            &receiver.credential_envelope,
+                        )
+                        .ok()
+                        .map(|opened| opened.into_secret())
+                });
+                let token = secret
+                    .as_ref()
+                    .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
+                    .filter(|token| {
+                        target.receiver.as_ref().is_some_and(|(receiver, _)| {
+                            token
+                                .split_once(':')
+                                .is_some_and(|(bot_id, _)| bot_id == receiver.source_key)
+                        })
+                    });
+                let Some(token) = token else {
+                    break 'decide after_failure(
+                        claimed.attempts,
+                        ErrorCode::ReceiverInactive,
+                        None,
+                        &timings.delivery_retry,
+                    );
+                };
+                let Some(chat) = chat_id(&claimed.chat_key) else {
+                    break 'decide Finish::Failed {
+                        code: ErrorCode::ClientError,
+                    };
+                };
+                let text = match &claimed.content {
+                    DeliveryContent::Text(text) => text.clone(),
+                    DeliveryContent::RunResult { run_id } => {
+                        let facts = run_result_facts(client, run_id, Instant::now() + STORE_BUDGET)
+                            .await
+                            .map_err(store)?;
+                        compose_result(run_id, &facts)
+                    }
+                };
+                let mut url = context.endpoints.telegram.api_base.clone();
+                url.set_path(&format!("/bot{token}/sendMessage"));
+                let response = async {
+                    let budget = SafeHttpBudget::new(SEND_RESPONSE_MAX, timings.http_send_timeout)?;
+                    context
+                        .endpoints
+                        .telegram
+                        .dialer
+                        .execute(SafeHttpRequest::post_json_with_scheme(
+                            url,
+                            context.endpoints.telegram.scheme,
+                            request_body(chat, &text),
+                            None,
+                            budget,
+                        )?)
+                        .await
+                }
+                .await;
+                classify(
+                    response
+                        .as_ref()
+                        .map(|response| (response.status().as_u16(), response.body()))
+                        .map_err(|error| *error),
                 )
-                .ok()
-                .map(|opened| opened.into_secret())
-        });
-        let token = secret
-            .as_ref()
-            .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
-            .filter(|token| {
-                target.receiver.as_ref().is_some_and(|receiver| {
-                    token
-                        .split_once(':')
-                        .is_some_and(|(bot_id, _)| bot_id == receiver.source_key)
-                })
-            });
-        let Some(token) = token else {
-            break 'decide after_failure(
-                claimed.attempts,
-                ErrorCode::ReceiverInactive,
-                None,
-                &timings.delivery_retry,
-            );
-        };
-        let Some(chat) = chat_id(&claimed.chat_key) else {
-            break 'decide Finish::Failed {
-                code: ErrorCode::ClientError,
-            };
-        };
-        let text = match &claimed.content {
-            DeliveryContent::Text(text) => text.clone(),
-            DeliveryContent::RunResult { run_id } => {
-                let facts = run_result_facts(client, run_id, Instant::now() + STORE_BUDGET)
+            }
+            Channel::Feishu => {
+                let secret = target.receiver.as_ref().and_then(|(receiver, _)| {
+                    context
+                        .vault
+                        .open(
+                            &receiver.binding_id,
+                            SecretKind::Connector,
+                            SecretPrincipal::Actor(context.owner.clone()),
+                            SecretPrincipal::Service(ServiceId::new("openmybot.feishu")),
+                            &receiver.credential_envelope,
+                        )
+                        .ok()
+                        .map(|opened| opened.into_secret())
+                });
+                let app_secret = secret
+                    .as_ref()
+                    .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
+                    .filter(|secret| !secret.is_empty());
+                let (Some((receiver, revision)), Some(app_secret)) = (&target.receiver, app_secret)
+                else {
+                    break 'decide after_failure(
+                        claimed.attempts,
+                        ErrorCode::ReceiverInactive,
+                        None,
+                        &timings.delivery_retry,
+                    );
+                };
+                let Some(chat) = feishu_chat_id(&claimed.chat_key) else {
+                    break 'decide Finish::Failed {
+                        code: ErrorCode::ClientError,
+                    };
+                };
+                let text = match &claimed.content {
+                    DeliveryContent::Text(text) => text.clone(),
+                    DeliveryContent::RunResult { run_id } => {
+                        let facts = run_result_facts(client, run_id, Instant::now() + STORE_BUDGET)
+                            .await
+                            .map_err(store)?;
+                        compose_result(run_id, &facts)
+                    }
+                };
+                let endpoint = &context.endpoints.feishu;
+                let reused = token.take().filter(|cached| {
+                    cached.usable(receiver.binding_id, *revision, OffsetDateTime::now_utc())
+                });
+                let cached = match reused {
+                    Some(cached) => cached,
+                    None => match tenant_token(
+                        endpoint,
+                        &receiver.source_key,
+                        app_secret,
+                        timings.http_send_timeout,
+                    )
                     .await
-                    .map_err(store)?;
-                compose_result(run_id, &facts)
+                    {
+                        TokenReply::Granted { token, expire } => TenantToken {
+                            receiver: receiver.binding_id,
+                            revision: *revision,
+                            value: token,
+                            expires_at: OffsetDateTime::now_utc() + expire,
+                        },
+                        TokenReply::Retry(code) => {
+                            break 'decide after_failure(
+                                claimed.attempts,
+                                code,
+                                None,
+                                &timings.delivery_retry,
+                            );
+                        }
+                        TokenReply::Rejected => {
+                            break 'decide Finish::Failed {
+                                code: ErrorCode::ClientError,
+                            };
+                        }
+                    },
+                };
+                let cached = token.insert(cached);
+                let mut url = endpoint.api_base.clone();
+                url.set_path("/open-apis/im/v1/messages");
+                url.set_query(Some("receive_id_type=chat_id"));
+                let response = async {
+                    let budget = SafeHttpBudget::new(SEND_RESPONSE_MAX, timings.http_send_timeout)?;
+                    let authorization =
+                        AuthorizationValue::parse(&format!("Bearer {}", cached.value))?;
+                    endpoint
+                        .dialer
+                        .execute(SafeHttpRequest::post_json_with_scheme(
+                            url,
+                            endpoint.scheme,
+                            feishu_body(chat, &text, &claimed.idempotency_key),
+                            Some(authorization),
+                            budget,
+                        )?)
+                        .await
+                }
+                .await;
+                classify_feishu(
+                    response
+                        .as_ref()
+                        .map(|response| (response.status().as_u16(), response.body()))
+                        .map_err(|error| *error),
+                )
             }
         };
-        let mut url = context.endpoint.api_base.clone();
-        url.set_path(&format!("/bot{token}/sendMessage"));
-        let response = async {
-            let budget = SafeHttpBudget::new(SEND_RESPONSE_MAX, timings.http_send_timeout)?;
-            context
-                .endpoint
-                .dialer
-                .execute(SafeHttpRequest::post_json_with_scheme(
-                    url,
-                    context.endpoint.scheme,
-                    request_body(chat, &text),
-                    None,
-                    budget,
-                )?)
-                .await
-        }
-        .await;
-        match classify(
-            response
-                .as_ref()
-                .map(|response| (response.status().as_u16(), response.body()))
-                .map_err(|error| *error),
-        ) {
+        match verdict {
             Verdict::Sent { message_id: sent } => {
                 message_id = sent;
                 Finish::Sent {
@@ -282,6 +420,29 @@ pub(crate) fn request_body(chat_id: i64, text: &str) -> Vec<u8> {
         .to_string()
         .into_bytes()
 }
+/// The chat id after the `feishu:` prefix, kept as the platform's text.
+pub(crate) fn feishu_chat_id(chat_key: &str) -> Option<&str> {
+    chat_key
+        .strip_prefix("feishu:")
+        .filter(|chat_id| !chat_id.is_empty())
+}
+/// `receive_id`, `msg_type`, `content` and `uuid` and no other key: `content` is the JSON text of
+/// `{"text": <text>}`, and `uuid` the first 16 bytes of the idempotency key's SHA-256 in lower-case
+/// hex, so a resent row is deduplicated by the platform.
+pub(crate) fn feishu_body(chat_id: &str, text: &str, idempotency_key: &str) -> Vec<u8> {
+    let uuid: String = Sha256::digest(idempotency_key.as_bytes())[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    json!({
+        "receive_id": chat_id,
+        "msg_type": "text",
+        "content": json!({"text": text}).to_string(),
+        "uuid": uuid,
+    })
+    .to_string()
+    .into_bytes()
+}
 
 /// What one `sendMessage` outcome means for the row.
 #[derive(Debug, PartialEq, Eq)]
@@ -349,6 +510,76 @@ pub(crate) fn classify(result: Result<(u16, &[u8]), SafeHttpError>) -> Verdict {
                 message_id: id.to_string(),
             }),
         Ok(_) => Verdict::Failed {
+            code: ErrorCode::ClientError,
+        },
+    }
+}
+/// The Feishu send outcome: the rate-limit codes 230020 and 99991400 count as 429 whatever the
+/// status, and only code 0 with a message id is sent.
+pub(crate) fn classify_feishu(result: Result<(u16, &[u8]), SafeHttpError>) -> Verdict {
+    let (status, body) = match result {
+        Err(
+            SafeHttpError::DnsUnavailable
+            | SafeHttpError::DestinationDenied
+            | SafeHttpError::ConnectFailed
+            | SafeHttpError::PeerMismatch
+            | SafeHttpError::TlsFailed
+            | SafeHttpError::InvalidUrl
+            | SafeHttpError::SchemeRejected
+            | SafeHttpError::InvalidBudget
+            | SafeHttpError::InvalidHeader
+            | SafeHttpError::InvalidAllowlist,
+        ) => {
+            return Verdict::Retry {
+                code: ErrorCode::Unreachable,
+                retry_after: None,
+            };
+        }
+        Err(
+            SafeHttpError::DeadlineExceeded
+            | SafeHttpError::ProtocolFailed
+            | SafeHttpError::ResponseTooLarge
+            | SafeHttpError::StreamStalled
+            | SafeHttpError::RedirectInvalid
+            | SafeHttpError::RedirectLimit
+            | SafeHttpError::RedirectMethodRejected
+            | SafeHttpError::SensitiveRedirectRejected,
+        ) => return Verdict::Unknown,
+        Ok((429, _)) => {
+            return Verdict::Retry {
+                code: ErrorCode::RateLimited,
+                retry_after: None,
+            };
+        }
+        Ok((500..=599, _)) => {
+            return Verdict::Retry {
+                code: ErrorCode::ServerError,
+                retry_after: None,
+            };
+        }
+        Ok(reply) => reply,
+    };
+    let body = serde_json::from_slice::<Value>(body).ok();
+    match (
+        status,
+        body.as_ref()
+            .and_then(|body| body.get("code"))
+            .and_then(Value::as_i64),
+    ) {
+        (_, Some(230_020 | 99_991_400)) => Verdict::Retry {
+            code: ErrorCode::RateLimited,
+            retry_after: None,
+        },
+        (200..=299, Some(0)) => body
+            .as_ref()
+            .and_then(|body| body.pointer("/data/message_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map_or(Verdict::Unknown, |id| Verdict::Sent {
+                message_id: id.to_owned(),
+            }),
+        (200..=299, None) => Verdict::Unknown,
+        _ => Verdict::Failed {
             code: ErrorCode::ClientError,
         },
     }
@@ -737,5 +968,151 @@ mod tests {
         let queue = TerminalQueue(sender);
         queue.on_run_terminal(notice("first"));
         queue.on_run_terminal(notice("second"));
+    }
+    #[test]
+    fn feishu_chat_id_is_the_raw_text_after_the_feishu_prefix() {
+        assert_eq!(feishu_chat_id("feishu:oc_1"), Some("oc_1"));
+        assert_eq!(feishu_chat_id("feishu:ou 1"), Some("ou 1"));
+        for key in ["feishu:", "telegram:42", "oc_1"] {
+            assert_eq!(feishu_chat_id(key), None, "{key}");
+        }
+        assert_eq!(chat_id("feishu:42"), None);
+    }
+    #[test]
+    fn feishu_body_has_four_keys_and_uuid_is_the_sha256_prefix() {
+        let body: Value =
+            serde_json::from_slice(&feishu_body("oc_1", "你好 \"x\"\n", "control_reply:f1"))
+                .unwrap();
+        let object = body.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["content", "msg_type", "receive_id", "uuid"]);
+        assert_eq!(object["receive_id"], "oc_1");
+        assert_eq!(object["msg_type"], "text");
+        let content: Value = serde_json::from_str(object["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["text"], "你好 \"x\"\n");
+        for (key, uuid) in [
+            ("control_reply:f1", "95f12bd8e78f5b6e7d886b7f16c05d03"),
+            ("result:run-9", "10587490d704f9cc303b3c5e1ad34e44"),
+        ] {
+            let body: Value = serde_json::from_slice(&feishu_body("oc_1", "x", key)).unwrap();
+            assert_eq!(body["uuid"], uuid);
+            assert_eq!(uuid.len(), 32);
+            assert!(
+                uuid.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+        }
+    }
+    #[test]
+    fn classify_feishu_follows_the_closed_classification() {
+        for error in [
+            SafeHttpError::DnsUnavailable,
+            SafeHttpError::DestinationDenied,
+            SafeHttpError::ConnectFailed,
+            SafeHttpError::PeerMismatch,
+            SafeHttpError::TlsFailed,
+            SafeHttpError::InvalidUrl,
+            SafeHttpError::SchemeRejected,
+            SafeHttpError::InvalidBudget,
+            SafeHttpError::InvalidHeader,
+            SafeHttpError::InvalidAllowlist,
+        ] {
+            assert_eq!(
+                classify_feishu(Err(error)),
+                Verdict::Retry {
+                    code: ErrorCode::Unreachable,
+                    retry_after: None,
+                },
+                "{error:?}"
+            );
+        }
+        for error in [
+            SafeHttpError::DeadlineExceeded,
+            SafeHttpError::ProtocolFailed,
+            SafeHttpError::ResponseTooLarge,
+            SafeHttpError::StreamStalled,
+            SafeHttpError::RedirectInvalid,
+            SafeHttpError::RedirectLimit,
+            SafeHttpError::RedirectMethodRejected,
+            SafeHttpError::SensitiveRedirectRejected,
+        ] {
+            assert_eq!(classify_feishu(Err(error)), Verdict::Unknown, "{error:?}");
+        }
+        let rate_limited = Verdict::Retry {
+            code: ErrorCode::RateLimited,
+            retry_after: None,
+        };
+        for (status, body) in [
+            (429, r#"{"parameters":{"retry_after":9}}"#),
+            (400, r#"{"code":230020}"#),
+            (400, r#"{"code":99991400}"#),
+            (200, r#"{"code":230020}"#),
+        ] {
+            assert_eq!(
+                classify_feishu(Ok((status, body.as_bytes()))),
+                rate_limited,
+                "{status} {body}"
+            );
+        }
+        for status in [500, 502] {
+            assert_eq!(
+                classify_feishu(Ok((status, b""))),
+                Verdict::Retry {
+                    code: ErrorCode::ServerError,
+                    retry_after: None,
+                }
+            );
+        }
+        assert_eq!(
+            classify_feishu(Ok((200, br#"{"code":0,"data":{"message_id":"om_1"}}"#))),
+            Verdict::Sent {
+                message_id: "om_1".into()
+            }
+        );
+        for body in [
+            r#"{"code":0}"#,
+            r#"{"code":0,"data":{"message_id":""}}"#,
+            "x",
+            r#"{"code":"0"}"#,
+        ] {
+            assert_eq!(
+                classify_feishu(Ok((200, body.as_bytes()))),
+                Verdict::Unknown,
+                "{body}"
+            );
+        }
+        for (status, body) in [
+            (200, r#"{"code":230001}"#),
+            (400, r#"{"code":230002}"#),
+            (404, ""),
+            (403, r#"{"code":99991672}"#),
+            (302, ""),
+        ] {
+            assert_eq!(
+                classify_feishu(Ok((status, body.as_bytes()))),
+                Verdict::Failed {
+                    code: ErrorCode::ClientError
+                },
+                "{status} {body}"
+            );
+        }
+    }
+    #[test]
+    fn tenant_token_is_usable_only_with_the_margin_left_on_the_wall_clock() {
+        let now = OffsetDateTime::from_unix_timestamp(1_793_260_800).unwrap();
+        let receiver = Uuid::from_u128(1);
+        let token = |expires_at| TenantToken {
+            receiver,
+            revision: 3,
+            value: "t-1".to_owned(),
+            expires_at,
+        };
+        assert!(token(now + Duration::from_secs(30 * 60)).usable(receiver, 3, now));
+        assert!(!token(now + Duration::from_secs(30 * 60 - 1)).usable(receiver, 3, now));
+        assert!(token(now + Duration::from_secs(2 * 3600)).usable(receiver, 3, now));
+        assert!(!token(now + Duration::from_secs(2 * 3600)).usable(Uuid::from_u128(2), 3, now));
+        assert!(!token(now + Duration::from_secs(2 * 3600)).usable(receiver, 4, now));
+        assert!(!token(now - Duration::from_secs(3600)).usable(receiver, 3, now));
     }
 }

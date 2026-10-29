@@ -153,7 +153,6 @@ errors! {
     CredentialRejected => ("credential_rejected", Rejected),
     WebhookConflict => ("webhook_conflict", Rejected),
     ChannelUnreachable => ("channel_unreachable", Rejected),
-    ChannelNotSupported => ("channel_not_supported", Rejected),
     HostNotBound => ("host_not_bound", Rejected),
     HostBindingSuspended => ("host_binding_suspended", Rejected),
     OperationConflict => ("operation_conflict", Rejected),
@@ -169,7 +168,8 @@ mod tests {
         for error in DaemonError::ALL {
             assert_eq!(DaemonError::from_code(error.code()), Some(*error));
         }
-        assert_eq!(DaemonError::ALL.len(), 47);
+        assert_eq!(DaemonError::ALL.len(), 46);
+        assert_eq!(DaemonError::from_code("channel_not_supported"), None);
         for unknown in ["", "INTERNAL_ERROR", "not_a_code", "internal_error "] {
             assert_eq!(DaemonError::from_code(unknown), None);
         }
@@ -180,7 +180,6 @@ mod tests {
             ("credential_rejected", DaemonError::CredentialRejected),
             ("webhook_conflict", DaemonError::WebhookConflict),
             ("channel_unreachable", DaemonError::ChannelUnreachable),
-            ("channel_not_supported", DaemonError::ChannelNotSupported),
             ("host_not_bound", DaemonError::HostNotBound),
             ("host_binding_suspended", DaemonError::HostBindingSuspended),
             ("operation_conflict", DaemonError::OperationConflict),

@@ -5,7 +5,9 @@ use crate::{
     pairing::{self, PairRequest},
     pg,
 };
-use omb_channels::{Counters, CredentialProblem, TelegramEndpoint, verify_credentials};
+use omb_channels::{
+    Counters, CredentialProblem, Endpoints, verify_credentials, verify_feishu_credentials,
+};
 use omb_hostdriver::WorkspaceRoots;
 use omb_store::{
     Channel, Decided, Decision, EventCancel, GrantKind, HostAccept, HostBinding, HostBindingState,
@@ -101,17 +103,8 @@ struct ResetArgs {
 #[derive(Deserialize)]
 #[serde(tag = "channel", rename_all = "lowercase", deny_unknown_fields)]
 enum ReceiverArgs {
-    Telegram {
-        token: String,
-    },
-    #[allow(
-        dead_code,
-        reason = "accepted for its syntax until the Feishu receiver exists"
-    )]
-    Feishu {
-        app_id: String,
-        app_secret: String,
-    },
+    Telegram { token: String },
+    Feishu { app_id: String, app_secret: String },
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,8 +182,9 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
             ReceiverArgs::Telegram { token } => Request::BindingsReceiver(
                 ChannelSecret::telegram(token).ok_or(DaemonError::InvalidRequest)?,
             ),
-            // The Feishu receiver arrives with a later task; its syntax is accepted and refused.
-            ReceiverArgs::Feishu { .. } => return Err(DaemonError::ChannelNotSupported),
+            ReceiverArgs::Feishu { app_id, app_secret } => Request::BindingsReceiver(
+                ChannelSecret::feishu(app_id, app_secret).ok_or(DaemonError::InvalidRequest)?,
+            ),
         },
         Op::BindingsHost => {
             let args: HostArgs = decode(args)?;
@@ -208,10 +202,15 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
     })
 }
 
-/// A Bot token parsed once at the boundary: `<decimal bot_id>:<non-empty rest>`.
-pub(crate) struct ChannelSecret {
-    bot_id: String,
-    token: SecretBytes,
+/// A channel credential parsed once at the boundary.
+pub(crate) enum ChannelSecret {
+    /// A Bot token: `<decimal bot_id>:<non-empty rest>`.
+    Telegram { bot_id: String, token: SecretBytes },
+    /// An app id of the source key's form and a non-empty app secret.
+    Feishu {
+        app_id: IdentityKey,
+        app_secret: SecretBytes,
+    },
 }
 impl fmt::Debug for ChannelSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -226,17 +225,43 @@ impl ChannelSecret {
             && bot_id.bytes().all(|b| b.is_ascii_digit())
             && !rest.is_empty();
         let bot_id = valid.then(|| bot_id.to_owned())?;
-        Some(ChannelSecret {
+        Some(ChannelSecret::Telegram {
             bot_id,
             token: SecretBytes::new(token.into_bytes()),
         })
     }
-    pub(crate) fn bot_id(&self) -> &str {
-        &self.bot_id
+    pub(crate) fn feishu(app_id: String, app_secret: String) -> Option<ChannelSecret> {
+        let app_id = IdentityKey::parse(&app_id)?;
+        (!app_secret.is_empty()).then(|| ChannelSecret::Feishu {
+            app_id,
+            app_secret: SecretBytes::new(app_secret.into_bytes()),
+        })
     }
-    pub(crate) fn token(&self) -> &SecretBytes {
-        &self.token
+    pub(crate) fn channel(&self) -> Channel {
+        match self {
+            Self::Telegram { .. } => Channel::Telegram,
+            Self::Feishu { .. } => Channel::Feishu,
+        }
     }
+    pub(crate) fn source_key(&self) -> &str {
+        match self {
+            Self::Telegram { bot_id, .. } => bot_id,
+            Self::Feishu { app_id, .. } => app_id.as_str(),
+        }
+    }
+    pub(crate) fn secret(&self) -> &SecretBytes {
+        match self {
+            Self::Telegram { token, .. } => token,
+            Self::Feishu { app_secret, .. } => app_secret,
+        }
+    }
+}
+/// The vault consumer of a channel's receiver credential.
+fn service(channel: Channel) -> ServiceId {
+    ServiceId::new(match channel {
+        Channel::Telegram => "openmybot.telegram",
+        Channel::Feishu => "openmybot.feishu",
+    })
 }
 
 /// A runtime receiver change the daemon's main loop performs; each carries its receipt.
@@ -296,7 +321,7 @@ pub(crate) struct Ops {
     pub(crate) vault: CredentialRecordVault,
     pub(crate) owner: ActorId,
     pub(crate) roots: WorkspaceRoots,
-    pub(crate) endpoint: TelegramEndpoint,
+    pub(crate) endpoints: Endpoints,
     pub(crate) receiver: mpsc::Sender<ReceiverCommand>,
     pub(crate) wake: Arc<Notify>,
     pub(crate) minter: ThreadMinter,
@@ -379,18 +404,19 @@ impl Ops {
                         .map_err(failed)?;
                 let revision = match receiver {
                     Some(row) => {
-                        let token = self
+                        let secret = self
                             .vault
                             .open(
                                 &row.binding_id,
                                 SecretKind::Connector,
                                 SecretPrincipal::Actor(self.owner.clone()),
-                                SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
+                                SecretPrincipal::Service(service(row.channel)),
                                 &row.credential_envelope,
                             )
                             .map_err(|_| DaemonError::CredentialRejected)?
                             .into_secret();
-                        self.verify(&token, &row.source_key, deadline).await?;
+                        self.verify(row.channel, &row.source_key, &secret, deadline)
+                            .await?;
                         let generation = self.generation()?;
                         let mut client = self.control.lock().await;
                         let revision = omb_store::reconfirm_binding(
@@ -446,8 +472,13 @@ impl Ops {
                 )
             }
             Request::BindingsReceiver(secret) => {
-                self.verify(secret.token(), secret.bot_id(), deadline)
-                    .await?;
+                self.verify(
+                    secret.channel(),
+                    secret.source_key(),
+                    secret.secret(),
+                    deadline,
+                )
+                .await?;
                 let binding_id = Uuid::now_v7();
                 let envelope = self
                     .vault
@@ -455,8 +486,8 @@ impl Ops {
                         &binding_id,
                         SecretKind::Connector,
                         SecretPrincipal::Actor(self.owner.clone()),
-                        SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
-                        secret.token(),
+                        SecretPrincipal::Service(service(secret.channel())),
+                        secret.secret(),
                     )
                     .map_err(|_| DaemonError::InternalError)?;
                 let runs = {
@@ -465,8 +496,8 @@ impl Ops {
                         &mut client,
                         NewReceiver {
                             binding_id,
-                            channel: Channel::Telegram,
-                            source_key: secret.bot_id(),
+                            channel: secret.channel(),
+                            source_key: secret.source_key(),
                             credential_envelope: &envelope,
                         },
                         deadline,
@@ -475,7 +506,8 @@ impl Ops {
                     .map_err(failed)?;
                     let row = ReceiverRow {
                         binding_id,
-                        source_key: secret.bot_id().to_owned(),
+                        channel: secret.channel(),
+                        source_key: secret.source_key().to_owned(),
                         credential_envelope: envelope,
                     };
                     self.command(|done| ReceiverCommand::Start(row, done), deadline)
@@ -483,7 +515,7 @@ impl Ops {
                     runs
                 };
                 self.cancel_all(&runs).await?;
-                Ok(json!({"binding_id": binding_id.to_string(), "source_key": secret.bot_id()}))
+                Ok(json!({"binding_id": binding_id.to_string(), "source_key": secret.source_key()}))
             }
             Request::BindingsHost(workspace, run_deadline) => {
                 let workspace = self
@@ -641,14 +673,31 @@ impl Ops {
             .auth_generation()
             .get())
     }
-    /// Bind-time credential check within the operation's deadline.
+    /// Bind-time credential check of the channel within the operation's deadline.
     async fn verify(
         &self,
-        token: &SecretBytes,
-        bot_id: &str,
+        channel: Channel,
+        source_key: &str,
+        secret: &SecretBytes,
         deadline: Instant,
     ) -> Result<(), DaemonError> {
-        match timeout_at(deadline, verify_credentials(&self.endpoint, token, bot_id)).await {
+        let checked = match channel {
+            Channel::Telegram => {
+                timeout_at(
+                    deadline,
+                    verify_credentials(&self.endpoints.telegram, secret, source_key),
+                )
+                .await
+            }
+            Channel::Feishu => {
+                timeout_at(
+                    deadline,
+                    verify_feishu_credentials(&self.endpoints.feishu, source_key, secret),
+                )
+                .await
+            }
+        };
+        match checked {
             Err(_) => Err(DaemonError::RequestTimeout),
             Ok(Ok(())) => Ok(()),
             Ok(Err(CredentialProblem::CredentialRejected)) => Err(DaemonError::CredentialRejected),
@@ -988,7 +1037,11 @@ mod tests {
             fixture::{self, Fixture},
         },
     };
-    use omb_channels::{CANCEL_QUEUE, Timings, testkit::FakeTelegram};
+    use omb_channels::{
+        CANCEL_QUEUE, Timings,
+        fake_feishu::FakeFeishu,
+        testkit::{FakeTelegram, Reply},
+    };
     use omb_hostdriver::{HostDriverConfig, Limits, OMB_NOTICE_PERMISSION_V1};
     use omb_store::{Claim, Suspension, testkit};
     use openbot_application::{BeginDelegatedThreadRun, DelegatedUntrustedMaterial};
@@ -1082,6 +1135,11 @@ mod tests {
                     json!({"channel": "telegram", "token": "1:x", "x": 1}),
                     json!({"channel": "slack", "token": "1:x"}),
                     json!({"channel": "feishu", "app_id": "a"}),
+                    json!({"channel": "feishu", "app_secret": "s"}),
+                    json!({"channel": "feishu", "app_id": 1, "app_secret": "s"}),
+                    json!({"channel": "feishu", "app_id": "a", "app_secret": "s", "x": 1}),
+                    json!({"channel": "feishu", "app_id": "", "app_secret": "s"}),
+                    json!({"channel": "feishu", "app_id": "a", "app_secret": ""}),
                 ],
             ),
             (
@@ -1127,14 +1185,14 @@ mod tests {
                 assert!(invalid(op, args.clone()), "{op} {args}");
             }
         }
-        // Feishu's syntax is accepted and refused as unsupported.
-        assert!(matches!(
-            parse(
-                Op::BindingsReceiver,
-                json!({"channel": "feishu", "app_id": "a", "app_secret": "s"})
-            ),
-            Err(DaemonError::ChannelNotSupported)
-        ));
+        let Ok(Request::BindingsReceiver(secret)) = parse(
+            Op::BindingsReceiver,
+            json!({"channel": "feishu", "app_id": "a", "app_secret": "s"}),
+        ) else {
+            panic!("not a receiver request");
+        };
+        assert_eq!(secret.channel(), Channel::Feishu);
+        assert_eq!(secret.source_key(), "a");
     }
 
     #[test]
@@ -1175,8 +1233,35 @@ mod tests {
         let secret = ChannelSecret::telegram("123456:SENTINEL-debug".into()).unwrap();
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
         assert_eq!(format!("{secret:#?}"), "[REDACTED]");
-        assert_eq!(secret.bot_id(), "123456");
-        assert_eq!(secret.token().expose(), b"123456:SENTINEL-debug");
+        assert_eq!(secret.source_key(), "123456");
+        assert_eq!(secret.secret().expose(), b"123456:SENTINEL-debug");
+        assert_eq!(secret.channel(), Channel::Telegram);
+    }
+
+    #[test]
+    fn feishu_secret_parses_app_id_once_and_needs_a_secret() {
+        let secret = ChannelSecret::feishu("cli_a".into(), "s".into()).unwrap();
+        assert_eq!(secret.channel(), Channel::Feishu);
+        assert_eq!(secret.source_key(), "cli_a");
+        assert_eq!(secret.secret().expose(), b"s");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        let long = "x".repeat(129);
+        for app_id in ["", long.as_str(), "é", "a\u{7f}"] {
+            assert!(
+                ChannelSecret::feishu(app_id.into(), "s".into()).is_none(),
+                "{app_id}"
+            );
+        }
+        assert!(ChannelSecret::feishu("cli_a".into(), String::new()).is_none());
+        assert_eq!(
+            ChannelSecret::feishu("cli a".into(), "s".into())
+                .unwrap()
+                .source_key(),
+            "cli a"
+        );
+        let telegram = ChannelSecret::telegram("1:x".into()).unwrap();
+        assert_eq!(telegram.channel(), Channel::Telegram);
+        assert_eq!(telegram.source_key(), "1");
     }
 
     #[test]
@@ -1195,11 +1280,13 @@ mod tests {
         }
         let max = format!("{}:rest", "1".repeat(128));
         assert_eq!(
-            ChannelSecret::telegram(max).unwrap().bot_id(),
+            ChannelSecret::telegram(max).unwrap().source_key(),
             "1".repeat(128)
         );
         assert_eq!(
-            ChannelSecret::telegram("42:a:b".into()).unwrap().bot_id(),
+            ChannelSecret::telegram("42:a:b".into())
+                .unwrap()
+                .source_key(),
             "42"
         );
     }
@@ -1293,8 +1380,9 @@ mod tests {
         agent::host(root, "happy", agent::quick(), &[])
     }
 
-    /// `Ops` over the fixture's engine, a `FakeTelegram` endpoint and a temporary `HOME` with one
-    /// workspace root `home/ws` under it; the test serves the receiver commands itself.
+    /// `Ops` over the fixture's engine, `FakeTelegram` and `FakeFeishu` endpoints and a temporary
+    /// `HOME` with one workspace root `home/ws` under it; the test serves the receiver commands
+    /// itself.
     struct Env {
         fixture: Fixture,
         ops: Ops,
@@ -1306,6 +1394,7 @@ mod tests {
         client: Client,
         token: Uuid,
         fake: FakeTelegram,
+        feishu: FakeFeishu,
     }
     impl Env {
         async fn new(mut fixture: Fixture) -> Self {
@@ -1338,6 +1427,7 @@ mod tests {
                 .unwrap();
             let client = fixture.client().await;
             let fake = FakeTelegram::start().await;
+            let feishu = FakeFeishu::start().await;
             let (receiver, commands) = mpsc::channel(8);
             let engine = fixture.engine();
             let ops = Ops {
@@ -1347,7 +1437,10 @@ mod tests {
                 vault: engine.vault.clone(),
                 owner: ActorId::new(SINGLE_USER_ACTOR_ID),
                 roots: WorkspaceRoots::parse(&home, &[workspace]).unwrap(),
-                endpoint: fake.endpoint(),
+                endpoints: Endpoints {
+                    telegram: fake.endpoint(),
+                    feishu: feishu.endpoint(),
+                },
                 receiver,
                 wake: Arc::new(Notify::new()),
                 minter: ThreadMinter::new(
@@ -1372,6 +1465,7 @@ mod tests {
                 client,
                 token,
                 fake,
+                feishu,
             }
         }
         async fn start() -> Self {
@@ -1396,7 +1490,10 @@ mod tests {
                 env.fixture.engine.as_ref().unwrap(),
                 env.token,
                 quick_channels(),
-                env.fake.endpoint(),
+                Endpoints {
+                    telegram: env.fake.endpoint(),
+                    feishu: env.feishu.endpoint(),
+                },
                 cancel,
                 Outbound {
                     terminals,
@@ -2590,7 +2687,7 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_unreachable_is_channel_unreachable_and_writes_nothing() {
         let mut env = Env::start().await;
-        env.ops.endpoint = FakeTelegram::endpoint_at(FakeTelegram::unused_port());
+        env.ops.endpoints.telegram = FakeTelegram::endpoint_at(FakeTelegram::unused_port());
         refused_receiver(&mut env, "1001:token", DaemonError::ChannelUnreachable).await;
         env.stop().await;
     }
@@ -2608,27 +2705,221 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "own PG17.11; explicit binary directory; serial"]
-    async fn bindings_receiver_feishu_is_channel_not_supported_and_writes_nothing() {
-        let mut env = Env::start().await;
+    async fn bindings_receiver_feishu_verifies_the_token_seals_activates_and_connects() {
+        let mut env = Env::with_channels().await;
+        let bound = env
+            .call(
+                "bindings_receiver",
+                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "secret"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound["source_key"], "cli_a");
+        let binding = Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap();
+        let tokens = env.feishu.calls(TOKEN_PATH);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&tokens[0].body).unwrap(),
+            json!({"app_id": "cli_a", "app_secret": "secret"})
+        );
+        let row = env.binding(binding).await;
+        assert_eq!(
+            [
+                &row["binding_kind"],
+                &row["channel_kind"],
+                &row["source_key"],
+                &row["status"],
+            ],
+            ["receiver", "feishu", "cli_a", "active"]
+        );
+        assert_eq!(row["revision"], 1);
+        let envelope = row["credential_envelope"].as_str().unwrap();
+        let open = |service: &str| {
+            env.ops.vault.open(
+                &binding,
+                SecretKind::Connector,
+                SecretPrincipal::Actor(env.ops.owner.clone()),
+                SecretPrincipal::Service(ServiceId::new(service)),
+                envelope,
+            )
+        };
+        assert_eq!(
+            open("openmybot.feishu").unwrap().into_secret().expose(),
+            b"secret"
+        );
+        assert!(open("openmybot.telegram").is_err());
+        connected(&env.feishu, 1).await;
+        assert_eq!(env.feishu.calls(ENDPOINT_PATH).len(), 1);
+        let paired = env
+            .call(
+                "pair_start",
+                json!({"channel": "feishu", "workspace": env.workspace()}),
+            )
+            .await
+            .unwrap();
+        assert!(paired["code"].is_string());
+        assert!(env.fake.requests().is_empty());
+        env.stop().await;
+    }
+
+    const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
+    const ENDPOINT_PATH: &str = "/callback/ws/endpoint";
+    fn respond(status: u16, body: &[u8]) -> Reply {
+        Reply::Respond {
+            status,
+            body: body.to_vec(),
+        }
+    }
+    async fn connected(feishu: &FakeFeishu, handshakes: usize) {
+        let limit = Instant::now() + Duration::from_secs(10);
+        while feishu.handshakes().len() < handshakes {
+            assert!(Instant::now() < limit, "no Feishu connection");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    async fn refused_feishu(env: &mut Env, app_id: &str, app_secret: &str, expected: DaemonError) {
         let before = env.rows().await;
         assert_eq!(
             env.call(
                 "bindings_receiver",
-                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "secret"})
+                json!({"channel": "feishu", "app_id": app_id, "app_secret": app_secret})
             )
             .await,
-            Err(DaemonError::ChannelNotSupported)
-        );
-        assert_eq!(
-            env.call(
-                "pair_start",
-                json!({"channel": "feishu", "workspace": env.workspace()})
-            )
-            .await,
-            Err(DaemonError::ReceiverNotActive)
+            Err(expected)
         );
         assert_eq!(env.rows().await, before);
-        assert!(env.fake.requests().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn bindings_receiver_feishu_rejected_token_is_credential_rejected_and_leaks_nothing() {
+        let mut env = Env::start().await;
+        env.feishu.script(
+            TOKEN_PATH,
+            respond(200, br#"{"code":10014,"msg":"app secret invalid"}"#),
+        );
+        let before = env.rows().await;
+        let refused = env
+            .call(
+                "bindings_receiver",
+                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "SENTINEL-feishu-ops"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused, DaemonError::CredentialRejected);
+        assert_eq!(env.rows().await, before);
+        let listed = env.call("bindings_list", json!({})).await.unwrap();
+        let bindings: String = env
+            .client
+            .query_one(
+                "SELECT coalesce(string_agg(row_to_json(b)::text, ','), '') FROM openmybot.channel_bindings b",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let rendered = format!(
+            "{refused} {refused:?} {} {listed} {bindings} {:?}",
+            refused.code(),
+            ChannelSecret::feishu("cli_a".into(), "SENTINEL-feishu-ops".into()).unwrap()
+        );
+        assert_eq!(rendered.matches("SENTINEL").count(), 0);
+        assert_eq!(env.feishu.calls(TOKEN_PATH).len(), 1);
+        assert!(env.feishu.calls(ENDPOINT_PATH).is_empty());
+        assert!(env.feishu.handshakes().is_empty());
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn bindings_receiver_feishu_unreachable_or_server_error_is_channel_unreachable() {
+        let mut env = Env::start().await;
+        env.ops.endpoints.feishu = FakeFeishu::endpoint_at(FakeTelegram::unused_port());
+        refused_feishu(&mut env, "cli_a", "secret", DaemonError::ChannelUnreachable).await;
+        env.ops.endpoints.feishu = env.feishu.endpoint();
+        for status in [503, 429] {
+            env.feishu.script(TOKEN_PATH, respond(status, b"{}"));
+            refused_feishu(&mut env, "cli_a", "secret", DaemonError::ChannelUnreachable).await;
+        }
+        assert_eq!(env.feishu.calls(TOKEN_PATH).len(), 2);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn bindings_receiver_feishu_malformed_args_are_invalid_request_without_network_call() {
+        let mut env = Env::start().await;
+        let long = "x".repeat(129);
+        for (app_id, app_secret) in [
+            ("", "secret"),
+            ("é", "secret"),
+            (long.as_str(), "secret"),
+            ("cli_a", ""),
+        ] {
+            refused_feishu(&mut env, app_id, app_secret, DaemonError::InvalidRequest).await;
+        }
+        assert!(env.feishu.requests().is_empty());
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn reconfirm_feishu_receiver_rechecks_the_token_and_restarts_it() {
+        let mut env = Env::with_channels().await;
+        let bound = env
+            .call(
+                "bindings_receiver",
+                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "secret"}),
+            )
+            .await
+            .unwrap();
+        let binding = Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap();
+        connected(&env.feishu, 1).await;
+        // The reconnect after the server closes fetches the endpoint again and is refused.
+        env.feishu
+            .script(ENDPOINT_PATH, respond(200, br#"{"code":10014}"#));
+        env.feishu.disconnect();
+        let limit = Instant::now() + Duration::from_secs(10);
+        while env.binding(binding).await["status"] != "suspended" {
+            assert!(Instant::now() < limit, "receiver did not suspend");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            env.binding(binding).await["status_reason"],
+            "credential_rejected"
+        );
+        env.feishu
+            .script(TOKEN_PATH, respond(200, br#"{"code":10014}"#));
+        assert_eq!(
+            env.call(
+                "bindings_reconfirm",
+                json!({"binding_id": binding.to_string()})
+            )
+            .await,
+            Err(DaemonError::CredentialRejected)
+        );
+        let row = env.binding(binding).await;
+        assert_eq!(row["status"], "suspended");
+        assert_eq!(row["revision"], 1);
+        let handshakes = env.feishu.handshakes().len();
+        let reconfirmed = env
+            .call(
+                "bindings_reconfirm",
+                json!({"binding_id": binding.to_string()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconfirmed["revision"], 2);
+        assert_eq!(env.binding(binding).await["status"], "active");
+        connected(&env.feishu, handshakes + 1).await;
+        let tokens = env.feishu.calls(TOKEN_PATH);
+        assert_eq!(tokens.len(), 3);
+        for request in &tokens {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap()["app_id"],
+                "cli_a"
+            );
+        }
         env.stop().await;
     }
 
@@ -3922,7 +4213,10 @@ mod tests {
             env.fixture.engine.as_ref().unwrap(),
             env.token,
             quick_channels(),
-            env.fake.endpoint(),
+            Endpoints {
+                telegram: env.fake.endpoint(),
+                feishu: env.feishu.endpoint(),
+            },
             cancel,
             Outbound {
                 terminals,

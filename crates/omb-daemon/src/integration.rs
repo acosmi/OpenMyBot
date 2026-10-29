@@ -12,7 +12,8 @@ use crate::{
     ops::{BindingRunCanceller, CancelQueue, Op, Ops, ReceiverCommand, ThreadMinter},
 };
 use omb_channels::{
-    CANCEL_QUEUE, Counters, OMB_REPLY_CANCEL_REQUESTED_V1, TERMINAL_QUEUE, Timings,
+    CANCEL_QUEUE, Counters, Endpoints, OMB_REPLY_CANCEL_REQUESTED_V1, TERMINAL_QUEUE, Timings,
+    fake_feishu::FakeFeishu,
     testkit::{FakeTelegram, Reply, Sent},
 };
 use omb_hostdriver::{HostDriverConfig, Limits, WorkspaceRoots};
@@ -56,6 +57,17 @@ fn timings() -> Timings {
 fn update(id: u64, from: i64, chat: i64, text: &str) -> Value {
     let kind = if chat == from { "private" } else { "group" };
     json!({"update_id": id, "message": {"message_id": id, "date": chrono::Utc::now().timestamp(), "from": {"id": from, "is_bot": false}, "chat": {"id": chat, "type": kind}, "text": text}})
+}
+/// A private Feishu text of the paired sender, as a 2.0 `im.message.receive_v1` envelope created now.
+fn feishu_text(event_id: &str, text: &str) -> Value {
+    json!({
+        "schema": "2.0",
+        "header": {"event_id": event_id, "event_type": "im.message.receive_v1", "create_time": chrono::Utc::now().timestamp_millis().to_string()},
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_rig"}, "sender_type": "user"},
+            "message": {"message_id": format!("om_{event_id}"), "chat_id": "oc_rig", "chat_type": "p2p", "message_type": "text", "content": json!({"text": text}).to_string()}
+        }
+    })
 }
 /// One scripted `getUpdates` answer.
 fn batch(updates: &[Value]) -> Vec<u8> {
@@ -150,6 +162,7 @@ fn stderr_over(root: &Path) -> HostDriverConfig {
 struct Rig {
     fixture: Fixture,
     fake: FakeTelegram,
+    feishu: FakeFeishu,
     token: Uuid,
     /// Setup and inspection connection outside the assembly.
     client: Client,
@@ -174,6 +187,7 @@ impl Rig {
             .unwrap();
         let client = fixture.client().await;
         let fake = FakeTelegram::start().await;
+        let feishu = FakeFeishu::start().await;
         let (receiver, commands) = mpsc::channel(8);
         let home = fixture.root.join("home");
         let canceller = fixture
@@ -189,7 +203,10 @@ impl Rig {
             vault: engine.vault.clone(),
             owner: ActorId::new(SINGLE_USER_ACTOR_ID),
             roots: WorkspaceRoots::parse(&home, &[home.join("ws")]).unwrap(),
-            endpoint: fake.endpoint(),
+            endpoints: Endpoints {
+                telegram: fake.endpoint(),
+                feishu: feishu.endpoint(),
+            },
             receiver,
             // Replaced by the channels' wake-up at every start of the channel tasks.
             wake: Arc::new(Notify::new()),
@@ -204,6 +221,7 @@ impl Rig {
         Rig {
             fixture,
             fake,
+            feishu,
             token,
             client,
             ops: Some(ops),
@@ -235,7 +253,10 @@ impl Rig {
             engine,
             self.token,
             timings,
-            self.fake.endpoint(),
+            Endpoints {
+                telegram: self.fake.endpoint(),
+                feishu: self.feishu.endpoint(),
+            },
             cancel,
             Outbound {
                 terminals,
@@ -333,6 +354,50 @@ impl Rig {
         assert_eq!(reply.chat_id, OWNER);
         assert_eq!(self.binding(binding).await["status"], "active");
         (binding, code)
+    }
+    /// Binds the Feishu receiver through `bindings_receiver` and waits for its connection.
+    async fn bind_feishu(&mut self) {
+        self.call(
+            "bindings_receiver",
+            json!({"channel": "feishu", "app_id": "cli_rig", "app_secret": "rig-secret"}),
+        )
+        .await
+        .unwrap();
+        until(LIMIT, async || {
+            (!self.feishu.handshakes().is_empty()).then_some(())
+        })
+        .await;
+    }
+    /// Pairs the Feishu chat `oc_rig` of `ou_rig`.
+    async fn pair_feishu(&mut self) {
+        let workspace = self.fixture.root.join("home/ws");
+        let started = self
+            .call(
+                "pair_start",
+                json!({"channel": "feishu", "workspace": workspace}),
+            )
+            .await
+            .unwrap();
+        let binding = Uuid::parse_str(started["binding_id"].as_str().unwrap()).unwrap();
+        let code = started["code"].as_str().unwrap();
+        assert!(
+            self.feishu
+                .push_event(&feishu_text("ev_rig_pair", &format!("/pair {code}")))
+        );
+        let reply = until(LIMIT, async || {
+            self.feishu.sent_messages().into_iter().next()
+        })
+        .await;
+        assert!(
+            reply.content.starts_with(r#"{"text":"绑定成功"#),
+            "{reply:?}"
+        );
+        assert_eq!(reply.receive_id, "oc_rig");
+        let row = self.binding(binding).await;
+        assert_eq!(
+            [&row["status"], &row["chat_key"]],
+            ["active", "feishu:oc_rig"]
+        );
     }
     fn sent(&self) -> Vec<Sent> {
         self.fake.sent_messages()
@@ -809,6 +874,68 @@ async fn race_duplicate_delivery_dispatcher_and_engine_run_once_per_round() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn feishu_redelivery_racing_dispatch_adds_no_run() {
+    let mut rig = Rig::start(agent::happy, timings()).await;
+    rig.bind_feishu().await;
+    rig.pair_feishu().await;
+    let results = |rig: &Rig| {
+        rig.feishu
+            .sent_messages()
+            .into_iter()
+            .filter(|sent| sent.content.starts_with(r#"{"text":"[OpenMyBot] 已完成"#))
+            .count() as i64
+    };
+    // RACE_REPEAT_MIN rounds; each round's redeliveries overlap the claim, `begin` and the start.
+    for round in 1..=10_i64 {
+        let event = format!("ev_rig_{round}");
+        let message = feishu_text(&event, &format!("work {round}"));
+        for _ in 0..3 {
+            assert!(rig.feishu.push_event(&message));
+        }
+        let run: String = until(LIMIT, async || {
+            let rows = rig.client.query("SELECT run_id FROM openmybot.channel_events WHERE channel_kind='feishu' AND event_key=$1 AND run_id IS NOT NULL", &[&event]).await.unwrap();
+            rows.first().map(|row| row.get(0))
+        })
+        .await;
+        assert_eq!(rig.terminal_of(&run).await, "succeeded");
+        until(LIMIT, async || (results(&rig) >= round).then_some(())).await;
+        let acks = || {
+            rig.feishu
+                .acks()
+                .into_iter()
+                .filter(|ack| ack.message_id == event && ack.valid)
+                .count()
+        };
+        until(LIMIT, async || (acks() >= 3).then_some(())).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(acks(), 3, "round {round}");
+        assert_eq!(results(&rig), round, "round {round}");
+        assert_eq!(
+            rig.count(&format!("SELECT count(*) FROM openmybot.channel_events WHERE channel_kind='feishu' AND event_key='{event}'")).await,
+            1,
+            "round {round}"
+        );
+        assert_eq!(
+            rig.count(&format!(
+                "SELECT count(*) FROM openmybot.channel_events WHERE run_id='{run}'"
+            ))
+            .await,
+            1
+        );
+        assert_eq!(
+            rig.count(
+                "SELECT count(*) FROM openmybot.host_driver_sessions WHERE record_kind='session'"
+            )
+            .await,
+            round
+        );
+        assert_eq!(event_conflicts(&rig).await, 0, "round {round}");
+    }
+    rig.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn unbound_and_group_traffic_gets_no_reply_no_row_and_no_run() {
     let mut rig = Rig::start(agent::happy, timings()).await;
     rig.bind_receiver().await;
@@ -1111,7 +1238,10 @@ async fn telegram_offset_catch_up_after_channels_restart_adds_no_duplicates_and_
         .read()
         .await
         .unwrap();
-    assert_eq!(channels[0].note, "telegram 长轮询");
+    assert_eq!(
+        channels[0].note,
+        "telegram 长轮询；中断区间内的更新在平台保留期内补回"
+    );
     assert_eq!(channels[0].counters.event_conflict, 0);
     assert!(
         channels[0]

@@ -4570,7 +4570,9 @@ dependencies = [
 name = "omb-channels"
 version = "0.0.0"
 dependencies = [
+ "futures-util",
  "getrandom 0.4.3",
+ "http",
  "omb-store",
  "openbot-application",
  "openbot-contracts",
@@ -4582,6 +4584,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-postgres",
+ "tokio-tungstenite",
  "url",
  "uuid",
 ]
