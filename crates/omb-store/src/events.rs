@@ -1,7 +1,7 @@
 use crate::{
     ACCEPT_TX_BUDGET, AcceptedEvent, Channel, DISPATCH_QUEUE_MAX, EVENT_FUTURE_WINDOW,
-    EVENT_PAST_WINDOW, GAP_DISPLAY, GrantKind, IdentityKey, MSG_TEXT_MAX, OpenRun, PairAttempt,
-    PairOutcome, READ_BUDGET, StoreError, command, finish, pair_attempt, rows, timely,
+    EVENT_PAST_WINDOW, GAP_DISPLAY, GrantKind, IdentityKey, KEY_MAX, MSG_TEXT_MAX, OpenRun,
+    PairAttempt, PairOutcome, READ_BUDGET, StoreError, command, finish, pair_attempt, rows, timely,
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -492,7 +492,7 @@ pub async fn expire_pending(
     deadline: Instant,
 ) -> Result<Expired, StoreError> {
     let error = StoreError::DispatchFailed;
-    let found = rows(client, "WITH x AS (UPDATE openmybot.channel_events SET dispatch_status='expired' WHERE dispatch_status='pending' AND accepted_at<=statement_timestamp()-make_interval(secs=>$1) RETURNING record_id,binding_id,channel_kind), d AS (INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,created_at) SELECT gen_random_uuid(),x.binding_id,x.channel_kind,b.chat_key,'expiry_notice','expiry_notice:'||x.record_id,$2,'pending',statement_timestamp() FROM x JOIN openmybot.channel_bindings b ON b.binding_id=x.binding_id RETURNING 1) SELECT (SELECT count(*) FROM x),(SELECT min(accepted_at)+make_interval(secs=>$1) FROM openmybot.channel_events WHERE dispatch_status='pending' AND accepted_at>statement_timestamp()-make_interval(secs=>$1))", &[&ttl.as_secs_f64(), &notice], deadline, error).await?;
+    let found = rows(client, "WITH x AS (UPDATE openmybot.channel_events SET dispatch_status='expired' WHERE dispatch_status='pending' AND accepted_at<=statement_timestamp()-make_interval(secs=>$1) RETURNING record_id,binding_id,channel_kind), d AS (INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,created_at) SELECT gen_random_uuid(),x.binding_id,x.channel_kind,b.chat_key,'expiry_notice','expiry_notice:'||x.record_id,$2,'pending',statement_timestamp() FROM x JOIN openmybot.channel_bindings b ON b.binding_id=x.binding_id WHERE x.channel_kind IN ('telegram','feishu') RETURNING 1) SELECT (SELECT count(*) FROM x),(SELECT min(accepted_at)+make_interval(secs=>$1) FROM openmybot.channel_events WHERE dispatch_status='pending' AND accepted_at>statement_timestamp()-make_interval(secs=>$1))", &[&ttl.as_secs_f64(), &notice], deadline, error).await?;
     let row = found.first().ok_or(error)?;
     Ok(Expired {
         count: count(row, 0, error)?,
@@ -701,6 +701,165 @@ pub async fn unfinished_runs(
         .collect()
 }
 
+/// 1..=125 bytes of `[A-Za-z0-9._:-]`: `op:` plus the id stays within `KEY_MAX` bytes
+/// (`channel_events_check_8`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationId(String);
+impl OperationId {
+    pub fn parse(text: &str) -> Option<Self> {
+        let valid = (1..=KEY_MAX - "op:".len()).contains(&text.len())
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+        valid.then(|| Self(text.to_owned()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+/// 0..=`MSG_TEXT_MAX` UTF-8 bytes without U+0000 (PostgreSQL text cannot hold it; the engine
+/// refuses it too).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostMessage(String);
+impl HostMessage {
+    pub fn parse(text: &str) -> Option<Self> {
+        (text.len() <= MSG_TEXT_MAX && !text.contains('\0')).then(|| Self(text.to_owned()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostRun {
+    pub run_id: String,
+    pub thread_id: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostAccept {
+    Accepted(HostRun),
+    /// The operation was already accepted with the same or no fingerprint; nothing written.
+    Replayed(HostRun),
+    /// The operation was already accepted with another message; nothing written.
+    Conflict,
+    NotBound,
+    Suspended,
+    QueueFull,
+}
+/// SHA-256 of the canonical `host.run_begin` text: keys in byte order, values escaped as RFC 8785
+/// requires.
+fn host_fingerprint(binding_id: Uuid, operation: &OperationId, message: &HostMessage) -> [u8; 32] {
+    let string = |value: &str| serde_json::to_string(value).unwrap_or_default();
+    let text = format!(
+        r#"{{"data":{{"bindingId":{},"message":{},"operationId":{}}},"eventType":"host.run_begin"}}"#,
+        string(&binding_id.to_string()),
+        string(message.as_str()),
+        string(operation.as_str()),
+    );
+    Sha256::digest(text.as_bytes()).into()
+}
+/// Accepts one host run request in one transaction: the live host binding, the operation's
+/// earlier acceptance and the binding's pending queue decide; only a new operation writes its
+/// pending event, on `thread_id` minted by the caller.
+pub async fn accept_host_begin(
+    client: &mut Client,
+    operation: &OperationId,
+    message: &HostMessage,
+    thread_id: &str,
+    deadline: Instant,
+) -> Result<HostAccept, StoreError> {
+    let error = StoreError::EventFailed;
+    let event_key = format!("op:{}", operation.as_str());
+    timely(deadline, Ok(()), error)?;
+    let tx = timeout_at(deadline, client.transaction())
+        .await
+        .map_err(|_| error)?
+        .map_err(|_| error)?;
+    let outcome = async {
+        timeout_at(deadline, tx.batch_execute(&format!("SET LOCAL statement_timeout={}", ACCEPT_TX_BUDGET.as_millis())))
+            .await
+            .map_err(|_| error)?
+            .map_err(|_| error)?;
+        let bound = rows(&tx, "SELECT binding_id,status FROM openmybot.channel_bindings WHERE binding_kind='host' AND status IN ('pending','active','suspended') FOR SHARE", &[], deadline, error).await?;
+        let Some(binding) = bound.first() else {
+            return Ok(HostAccept::NotBound);
+        };
+        if binding.try_get::<_, &str>(1).map_err(|_| error)? == "suspended" {
+            return Ok(HostAccept::Suspended);
+        }
+        let binding_id: Uuid = binding.try_get(0).map_err(|_| error)?;
+        // Serializes concurrent begins of one operation; the next statement sees the winner's row.
+        rows(&tx, "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1,0))", &[&format!("host\ncrabcode\n{event_key}")], deadline, error).await?;
+        let fingerprint = host_fingerprint(binding_id, operation, message);
+        let seen = rows(&tx, "SELECT fingerprint,run_id,thread_id FROM openmybot.channel_events WHERE channel_kind='host' AND source_key='crabcode' AND event_key=$1", &[&event_key], deadline, error).await?;
+        if let Some(row) = seen.first() {
+            let stored: Option<Vec<u8>> = row.try_get(0).map_err(|_| error)?;
+            if stored.is_some_and(|stored| stored[..] != fingerprint[..]) {
+                return Ok(HostAccept::Conflict);
+            }
+            return Ok(HostAccept::Replayed(HostRun {
+                run_id: row.try_get(1).map_err(|_| error)?,
+                thread_id: row.try_get(2).map_err(|_| error)?,
+            }));
+        }
+        let pending = rows(&tx, "SELECT count(*) FROM openmybot.channel_events WHERE binding_id=$1 AND dispatch_status='pending'", &[&binding_id], deadline, error).await?;
+        if pending.first().ok_or(error)?.try_get::<_, i64>(0).map_err(|_| error)? >= DISPATCH_QUEUE_MAX {
+            return Ok(HostAccept::QueueFull);
+        }
+        let record_id = Uuid::now_v7();
+        let run = run_id(binding_id, record_id).to_string();
+        rows(&tx, "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,event_type,occurred_at,accepted_at,fingerprint,sender_key,chat_key,binding_id,disposition,command,text,text_sha256,run_id,thread_id,dispatch_status) VALUES ($1,'event','host','crabcode',$2,'host.run_begin',NULL,statement_timestamp(),$3,'host:crabcode',NULL,$4,'accepted_message',NULL,$5,$6,$7,$8,'pending') RETURNING record_id", &[&record_id, &event_key, &fingerprint.as_slice(), &binding_id, &message.as_str(), &Sha256::digest(message.as_str().as_bytes()).as_slice(), &run, &thread_id], deadline, error).await?;
+        Ok(HostAccept::Accepted(HostRun {
+            run_id: run,
+            thread_id: thread_id.to_owned(),
+        }))
+    }
+    .await?;
+    timeout_at(deadline, tx.commit())
+        .await
+        .map_err(|_| error)?
+        .map_err(|_| error)?;
+    timely(deadline, Ok(outcome), error)
+}
+
+/// Where one accepted message of a binding stands after a cancel request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventCancel {
+    /// No accepted message of the binding carries the run.
+    NotFound,
+    /// The message was still pending and is now cancelled.
+    Cancelled,
+    /// The run was dispatched and has no terminal yet.
+    Open { thread_id: String },
+    /// The run has a terminal, or its message never started.
+    Ended,
+}
+/// Cancels the binding's accepted message of `run_id` at once while it is pending; otherwise says
+/// where the run stands. Any binding kind; a dispatched message is left unchanged.
+pub async fn cancel_event(
+    client: &Client,
+    binding_id: Uuid,
+    run_id: &str,
+) -> Result<EventCancel, StoreError> {
+    let error = StoreError::EventFailed;
+    let deadline = Instant::now() + READ_BUDGET;
+    let cancelled = rows(client, "UPDATE openmybot.channel_events SET dispatch_status='cancelled' WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message' AND dispatch_status='pending' AND terminal_kind IS NULL RETURNING record_id", &[&binding_id, &run_id], deadline, error).await?;
+    if !cancelled.is_empty() {
+        return Ok(EventCancel::Cancelled);
+    }
+    let found = rows(client, "SELECT dispatch_status,terminal_kind,thread_id FROM openmybot.channel_events WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message'", &[&binding_id, &run_id], deadline, error).await?;
+    let Some(row) = found.first() else {
+        return Ok(EventCancel::NotFound);
+    };
+    let dispatched = row.try_get::<_, &str>(0).map_err(|_| error)? == "dispatched";
+    let terminal: Option<&str> = row.try_get(1).map_err(|_| error)?;
+    Ok(match (dispatched, terminal) {
+        (true, None) => EventCancel::Open {
+            thread_id: row.try_get(2).map_err(|_| error)?,
+        },
+        _ => EventCancel::Ended,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,5 +905,93 @@ mod tests {
         ] {
             assert!(check.contains(&format!("'{}'", kind.as_str())), "{kind:?}");
         }
+    }
+    #[test]
+    fn operation_id_takes_one_to_125_bytes_of_the_closed_alphabet() {
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-";
+        assert_eq!(alphabet.len(), 66);
+        for valid in ["a".to_owned(), alphabet.to_owned(), "a".repeat(125)] {
+            assert_eq!(OperationId::parse(&valid).unwrap().as_str(), valid);
+        }
+        for invalid in [
+            String::new(),
+            "a".repeat(126),
+            "op 1".into(),
+            "op/1".into(),
+            "op,1".into(),
+            "op=1".into(),
+            "op\n1".into(),
+            "op\u{0}1".into(),
+            "op\u{7f}1".into(),
+            "opé1".into(),
+        ] {
+            assert_eq!(OperationId::parse(&invalid), None, "{invalid:?}");
+        }
+        assert_eq!("op:".len() + 125, KEY_MAX);
+    }
+    #[test]
+    fn host_message_takes_zero_to_4096_bytes_without_nul() {
+        let exact = format!("{}a", "€".repeat(1365));
+        assert_eq!(exact.len(), 4096);
+        for valid in [
+            String::new(),
+            "x".into(),
+            "x".repeat(4096),
+            exact,
+            "a\nb\tc\u{1}d\u{7f}e𝔸".into(),
+        ] {
+            assert_eq!(HostMessage::parse(&valid).unwrap().as_str(), valid);
+        }
+        let over = "€".repeat(1366);
+        assert_eq!((over.chars().count(), over.len()), (1366, 4098));
+        for invalid in ["x".repeat(4097), over, "a\u{0}b".into()] {
+            assert_eq!(HostMessage::parse(&invalid), None, "{invalid:?}");
+        }
+    }
+    #[test]
+    fn host_fingerprint_is_the_digest_of_the_canonical_text() {
+        let hex = |digest: [u8; 32]| -> String {
+            digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        let binding = Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap();
+        let operation = OperationId::parse("op-1").unwrap();
+        let message = |text: &str| HostMessage::parse(text).unwrap();
+        // Vectors computed independently with Python's `hashlib.sha256` over the canonical text.
+        for (text, expected) in [
+            (
+                "hello",
+                "06c188a969ce7766e698f8c0dddbd3c29be9f65ac386ee36eda24530e2b2b95f",
+            ),
+            (
+                "say \"hi\"\\\n\t\u{1}\u{7f} é 𝔸",
+                "e3789a981da5e30369f81e560c3d956899051f61929c9ff982155e4d3a7aa9ad",
+            ),
+            (
+                "",
+                "f445bbf5cb490b93cb148bba16dc2420acb550c4d58c05607ddb7fe80a6f441b",
+            ),
+        ] {
+            assert_eq!(
+                hex(host_fingerprint(binding, &operation, &message(text))),
+                expected
+            );
+        }
+        let base = host_fingerprint(binding, &operation, &message("hello"));
+        assert_ne!(
+            host_fingerprint(Uuid::now_v7(), &operation, &message("hello")),
+            base
+        );
+        assert_ne!(
+            host_fingerprint(
+                binding,
+                &OperationId::parse("op-2").unwrap(),
+                &message("hello")
+            ),
+            base
+        );
+        assert_ne!(
+            host_fingerprint(binding, &operation, &message("hello!")),
+            base
+        );
     }
 }

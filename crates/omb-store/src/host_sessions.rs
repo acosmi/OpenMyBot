@@ -449,3 +449,153 @@ pub async fn deny_undecided_permissions(
 ) -> Result<u64, StoreError> {
     rows(client, "UPDATE openmybot.host_driver_sessions SET decision='deny', decided_via='run_stopped', decided_at=now() WHERE record_kind='permission' AND decision IS NULL RETURNING record_id", &[], deadline, StoreError::ReconcileFailed).await.map(|denied| denied.len() as u64)
 }
+
+/// A run's state as the host sees it, derived from its event, session and permission rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunState {
+    Pending,
+    Running,
+    AwaitingPermission,
+    Succeeded,
+    Failed,
+    Cancelled,
+    ReconciliationRequired,
+}
+impl RunState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::AwaitingPermission => "awaiting_permission",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::ReconciliationRequired => "reconciliation_required",
+        }
+    }
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::ReconciliationRequired
+        )
+    }
+}
+/// One accepted message of a binding with its run's state and stored result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunView {
+    pub run_id: String,
+    pub thread_id: String,
+    pub state: RunState,
+    /// `YYYY-MM-DDTHH:MM:SS.mmmZ` in UTC, milliseconds truncated.
+    pub accepted_at: String,
+    /// Undecided, unexpired requests of a dispatched run without a terminal, by request time.
+    pub permission_ids: Vec<String>,
+    /// The session's result text while the sweeper has not cleared it.
+    pub summary: Option<String>,
+    pub artifacts: Vec<String>,
+}
+/// The binding's accepted messages, newest first, optionally only the one carrying `run_id`.
+async fn run_views(
+    client: &Client,
+    binding_id: Uuid,
+    run_id: Option<&str>,
+    limit: i64,
+    deadline: Instant,
+) -> Result<Vec<RunView>, StoreError> {
+    rows(client, "SELECT e.run_id,e.thread_id,CASE WHEN e.terminal_kind IS NOT NULL THEN e.terminal_kind WHEN e.dispatch_status='pending' THEN 'pending' WHEN e.dispatch_status IN ('expired','cancelled') THEN 'cancelled' WHEN e.dispatch_status='conflict' THEN 'failed' WHEN p.ids IS NOT NULL THEN 'awaiting_permission' ELSE 'running' END,to_char(e.accepted_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),COALESCE(p.ids,ARRAY[]::text[]),s.result_summary,COALESCE(s.artifact_paths,ARRAY[]::text[]) FROM openmybot.channel_events e LEFT JOIN LATERAL (SELECT array_agg(h.permission_id ORDER BY h.requested_at,h.record_id) AS ids FROM openmybot.host_driver_sessions h WHERE h.record_kind='permission' AND h.run_id=e.run_id AND h.decision IS NULL AND h.expires_at>statement_timestamp() AND e.dispatch_status='dispatched' AND e.terminal_kind IS NULL) p ON true LEFT JOIN openmybot.host_driver_sessions s ON s.record_kind='session' AND s.run_id=e.run_id WHERE e.binding_id=$1 AND e.disposition='accepted_message' AND ($2::text IS NULL OR e.run_id=$2) ORDER BY e.accepted_at DESC,e.record_id DESC LIMIT $3", &[&binding_id, &run_id, &limit], deadline, ERROR)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(RunView {
+                run_id: row.try_get(0).map_err(|_| ERROR)?,
+                thread_id: row.try_get(1).map_err(|_| ERROR)?,
+                state: match row.try_get::<_, &str>(2).map_err(|_| ERROR)? {
+                    "pending" => RunState::Pending,
+                    "running" => RunState::Running,
+                    "awaiting_permission" => RunState::AwaitingPermission,
+                    "succeeded" => RunState::Succeeded,
+                    "failed" => RunState::Failed,
+                    "cancelled" => RunState::Cancelled,
+                    "reconciliation_required" => RunState::ReconciliationRequired,
+                    _ => return Err(ERROR),
+                },
+                accepted_at: row.try_get(3).map_err(|_| ERROR)?,
+                permission_ids: row.try_get(4).map_err(|_| ERROR)?,
+                summary: row.try_get(5).map_err(|_| ERROR)?,
+                artifacts: row.try_get(6).map_err(|_| ERROR)?,
+            })
+        })
+        .collect()
+}
+/// The binding's accepted message carrying `run_id`; `None` when no such message exists.
+pub async fn binding_run(
+    client: &Client,
+    binding_id: Uuid,
+    run_id: &str,
+    deadline: Instant,
+) -> Result<Option<RunView>, StoreError> {
+    Ok(run_views(client, binding_id, Some(run_id), 1, deadline)
+        .await?
+        .into_iter()
+        .next())
+}
+/// The binding's latest `limit` accepted messages, newest first.
+pub async fn binding_runs(
+    client: &Client,
+    binding_id: Uuid,
+    limit: i64,
+    deadline: Instant,
+) -> Result<Vec<RunView>, StoreError> {
+    run_views(client, binding_id, None, limit, deadline).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn run_state_words_equal_the_migration_check_values() {
+        let migration = include_str!("../migrations/omb_0001_initial.sql");
+        let check = migration
+            .lines()
+            .find(|line| line.contains("CONSTRAINT channel_events_check_20"))
+            .unwrap();
+        let open = check.find("IN (").unwrap() + "IN (".len();
+        let words: Vec<&str> = check[open..check.rfind(')').unwrap() - 1]
+            .split(',')
+            .map(|word| word.trim_matches('\''))
+            .collect();
+        let terminal = [
+            RunState::Succeeded,
+            RunState::Failed,
+            RunState::Cancelled,
+            RunState::ReconciliationRequired,
+        ];
+        assert_eq!(words, terminal.map(RunState::as_str));
+        let all = [
+            RunState::Pending,
+            RunState::Running,
+            RunState::AwaitingPermission,
+            RunState::Succeeded,
+            RunState::Failed,
+            RunState::Cancelled,
+            RunState::ReconciliationRequired,
+        ];
+        for state in all {
+            assert_eq!(state.is_terminal(), terminal.contains(&state), "{state:?}");
+        }
+        for (index, state) in all.iter().enumerate() {
+            assert!(
+                !all[..index]
+                    .iter()
+                    .any(|earlier| earlier.as_str() == state.as_str())
+            );
+        }
+        for state in [
+            RunState::Pending,
+            RunState::Running,
+            RunState::AwaitingPermission,
+        ] {
+            assert!(!words.contains(&state.as_str()), "{state:?}");
+        }
+    }
+}

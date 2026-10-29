@@ -11,9 +11,9 @@ mod sweep;
 pub mod testkit;
 
 pub use bindings::{
-    AuthorityRow, BindingView, GrantKind, HostBinding, IdentityKey, NewReceiver, OpenRun,
-    ResetDone, RunDeadline, activate_host, activate_receiver, authority_row, list_bindings,
-    reconfirm_binding, reset_thread, revoke_binding,
+    AuthorityRow, BindingView, GrantKind, HostBinding, HostBindingState, IdentityKey, NewReceiver,
+    OpenRun, ResetDone, RunDeadline, activate_host, activate_receiver, authority_row,
+    host_binding_state, list_bindings, reconfirm_binding, reset_thread, revoke_binding,
 };
 pub use control_tokens::{
     ControlTokenRecord, ControlTokenStart, HeartbeatTick, read_heartbeat, start_control_token,
@@ -43,6 +43,8 @@ pub const RUN_DEADLINE_MAX: u32 = 86_400;
 pub const MSG_TEXT_MAX: usize = 4096;
 /// Pending events per binding before new messages are refused.
 pub const DISPATCH_QUEUE_MAX: i64 = 20;
+/// Runs one host thread list returns, newest first.
+pub const MCP_LIST_MAX: i64 = 50;
 pub const ACCEPT_TX_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 pub const EVENT_PAST_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 pub const EVENT_FUTURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5 * 60);

@@ -520,3 +520,8 @@ pub async fn shift_column(
         1
     );
 }
+/// Suspends an active binding the way a stale grant does.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn suspend_binding(client: &tokio_postgres::Client, binding_id: uuid::Uuid) {
+    assert_eq!(client.execute("UPDATE openmybot.channel_bindings SET status='suspended',status_reason='grant_stale',suspended_at=statement_timestamp() WHERE binding_id=$1 AND status='active'",&[&binding_id]).await.unwrap(),1);
+}
