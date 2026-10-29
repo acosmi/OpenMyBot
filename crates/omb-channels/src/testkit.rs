@@ -201,14 +201,20 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) {
         body: received[end..end + length].to_vec(),
     };
     state.log.lock().unwrap().push(request.clone());
+    // `sendMessage` is a POST; any other verb is refused without using a scripted answer.
+    let refused = request.method == "sendMessage" && !text.starts_with("POST ");
     let scripted = {
         let mut scripted = state.scripted.lock().unwrap();
         let index = scripted
             .iter()
-            .position(|(method, _)| *method == request.method);
+            .position(|(method, _)| !refused && *method == request.method);
         index.and_then(|index| scripted.remove(index))
     };
     let (status, body) = match scripted {
+        None if refused => (
+            405,
+            br#"{"ok":false,"error_code":405,"description":"Method Not Allowed"}"#.to_vec(),
+        ),
         Some((_, Reply::Respond { status, body })) => (status, body),
         Some((
             _,

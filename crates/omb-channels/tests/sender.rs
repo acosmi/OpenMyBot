@@ -212,6 +212,7 @@ async fn sends_pending_text_as_json_post_to_the_token_path_and_marks_sent() {
     let mut env = Env::new().await;
     let id = env.reply("control_reply:1", "状态：已激活").await;
     let (task, _queue) = env.start(quick()).await;
+    // The fake answers a `sendMessage` that is not a POST with 405, so `sent` shows the verb.
     let row = env.status(id, "sent").await;
     task.stop().await;
     assert_eq!(env.fake.sent_messages(), [sent("状态：已激活")]);

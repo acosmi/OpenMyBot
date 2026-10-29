@@ -1123,7 +1123,8 @@ pub(crate) mod tests {
             reconciler(&fixture),
             timings,
         );
-        // No sweep at start: the first one comes one interval later.
+        // No sweep at start: half an interval in, the first one is still ahead.
+        tokio::time::sleep(timings.sweep_interval / 2).await;
         assert_eq!(body(&client, early).await, "reply");
         let limit = Instant::now() + Duration::from_secs(10);
         while !body(&client, early).await.is_null() {
