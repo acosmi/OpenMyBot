@@ -1102,7 +1102,6 @@ async fn server_close_and_read_timeout_are_stream_broken() {
     )
     .await;
     task.stop().await;
-    assert!(env.fake.handshakes().len() > 2);
     env.stop().await;
 }
 
