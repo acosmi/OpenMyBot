@@ -4591,6 +4591,7 @@ name = "omb-cli"
 version = "0.0.0"
 dependencies = [
  "omb-daemon",
+ "omb-mcp",
  "rustix",
  "serde_json",
  "tokio",
@@ -4644,6 +4645,16 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "uuid",
+]
+
+[[package]]
+name = "omb-mcp"
+version = "0.0.0"
+dependencies = [
+ "omb-daemon",
+ "rmcp",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

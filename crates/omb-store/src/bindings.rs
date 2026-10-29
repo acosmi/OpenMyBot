@@ -204,6 +204,28 @@ pub async fn authority_row(
     Ok(convert())
 }
 
+/// The live host binding; `binding_live_kind` keeps at most one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostBindingState {
+    NotBound,
+    Suspended,
+    Active(Uuid),
+}
+pub async fn host_binding_state(
+    client: &Client,
+    deadline: Instant,
+) -> Result<HostBindingState, StoreError> {
+    let error = StoreError::BindingFailed;
+    let found = rows(client, "SELECT binding_id,status FROM openmybot.channel_bindings WHERE binding_kind='host' AND status IN ('active','suspended')", &[], deadline, error).await?;
+    let Some(row) = found.first() else {
+        return Ok(HostBindingState::NotBound);
+    };
+    Ok(match row.try_get::<_, &str>(1).map_err(|_| error)? {
+        "active" => HostBindingState::Active(row.try_get(0).map_err(|_| error)?),
+        _ => HostBindingState::Suspended,
+    })
+}
+
 /// One live binding as the owner lists it; secret and pairing columns are never read.
 pub struct BindingView {
     pub binding_id: Uuid,

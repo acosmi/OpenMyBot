@@ -9,10 +9,10 @@ use crate::{
     config,
     control::{self, ControlState, ENGINE_PIN},
     delegation::fixture::Fixture,
-    ops::{BindingRunCanceller, Op, Ops, ReceiverCommand},
+    ops::{BindingRunCanceller, CancelQueue, Op, Ops, ReceiverCommand, ThreadMinter},
 };
 use omb_channels::{
-    CANCEL_QUEUE, OMB_REPLY_CANCEL_REQUESTED_V1, TERMINAL_QUEUE, Timings,
+    CANCEL_QUEUE, Counters, OMB_REPLY_CANCEL_REQUESTED_V1, TERMINAL_QUEUE, Timings,
     testkit::{FakeTelegram, Reply, Sent},
 };
 use omb_hostdriver::{HostDriverConfig, Limits, WorkspaceRoots};
@@ -156,9 +156,10 @@ struct Rig {
     ops: Option<Ops>,
     commands: mpsc::Receiver<ReceiverCommand>,
     channels: Option<Channels>,
-    canceller: Option<BindingRunCanceller>,
+    canceller: Option<CancelQueue>,
     runtime: AgentRuntime,
     control_link: JoinHandle<Result<(), tokio_postgres::Error>>,
+    canceller_link: JoinHandle<Result<(), tokio_postgres::Error>>,
 }
 impl Rig {
     /// Everything up to the channel tasks, in the daemon's order.
@@ -175,6 +176,11 @@ impl Rig {
         let fake = FakeTelegram::start().await;
         let (receiver, commands) = mpsc::channel(8);
         let home = fixture.root.join("home");
+        let canceller = fixture
+            .pg
+            .open_resident_connection("openmybot-canceller")
+            .await
+            .unwrap();
         let engine = fixture.engine();
         let ops = Ops {
             control: Mutex::new(control.client),
@@ -187,6 +193,13 @@ impl Rig {
             receiver,
             // Replaced by the channels' wake-up at every start of the channel tasks.
             wake: Arc::new(Notify::new()),
+            minter: ThreadMinter::new(engine.assembly.application.clone(), engine.resolver.clone()),
+            canceller: BindingRunCanceller::new(
+                engine.assembly.application.clone(),
+                engine.resolver.clone(),
+                Arc::new(canceller.client),
+            ),
+            counters: Arc::new(Counters::default()),
         };
         Rig {
             fixture,
@@ -199,6 +212,7 @@ impl Rig {
             canceller: None,
             runtime,
             control_link: control.driver,
+            canceller_link: canceller.driver,
         }
     }
     /// Starts the channel tasks on the fake endpoint with `terminals` as the engine's notices,
@@ -230,12 +244,17 @@ impl Rig {
         )
         .await
         .unwrap();
-        self.canceller = Some(BindingRunCanceller::start(
+        let canceller = BindingRunCanceller::new(
             engine.assembly.application.clone(),
             engine.resolver.clone(),
-            connection,
+            Arc::new(connection.client),
+        );
+        self.canceller = Some(CancelQueue::start(
+            canceller.clone(),
+            connection.driver,
             requests,
         ));
+        self.ops.as_mut().unwrap().canceller = canceller;
         self.ops.as_mut().unwrap().wake = channels.wake();
         self.channels = Some(channels);
     }
@@ -420,6 +439,8 @@ impl Rig {
         }
         self.runtime.stop().await;
         drop(self.ops);
+        self.canceller_link.abort();
+        let _ = self.canceller_link.await;
         self.control_link.abort();
         let _ = self.control_link.await;
         drop(self.client);

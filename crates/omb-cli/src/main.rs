@@ -15,6 +15,9 @@ async fn main() -> ExitCode {
         }
     };
     let json = invocation.json;
+    let serving = invocation.command == Command::Mcp;
+    // Read once at start: a host-driver child's MCP server refuses every tool call.
+    let nested = std::env::var_os("OPENMYBOT_HOST_DRIVER_CHILD").is_some_and(|value| value == "1");
     // The secret is read before any connection; it never travels in argv or the environment.
     let secret = if invocation.command.reads_secret() {
         let stdin = std::io::stdin();
@@ -51,6 +54,10 @@ async fn main() -> ExitCode {
                 serde_json::to_value(omb_daemon::status(StatusOptions { data_dir }).await?)
                     .map_err(|_| DaemonError::InternalError)
             }
+            Command::Mcp => {
+                omb_mcp::serve(omb_mcp::McpOptions { data_dir, nested }).await?;
+                Ok(serde_json::Value::Null)
+            }
             command => {
                 let (op, args) = command
                     .control_request(secret)
@@ -66,6 +73,8 @@ async fn main() -> ExitCode {
     }
     .await;
     match result {
+        // stdout carries only MCP frames.
+        Ok(_) if serving => ExitCode::SUCCESS,
         Ok(data) => {
             if json {
                 println!("{}", serde_json::json!({"ok":true,"data":data}));
