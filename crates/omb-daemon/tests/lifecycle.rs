@@ -1,7 +1,7 @@
 //! Own disposable clusters only. Run ignored cases serially with OMB_TEST_PG_BIN_DIR set explicitly.
 use omb_daemon::{
-    DaemonError, DaemonOptions, ErrorClass, InitOptions, StatusOptions, StatusSnapshot, daemon,
-    init, status,
+    CallOptions, DaemonError, DaemonOptions, ErrorClass, InitOptions, StatusOptions,
+    StatusSnapshot, call, daemon, init, status,
 };
 use rustix::process::{Pid, Signal};
 use std::{
@@ -1075,5 +1075,163 @@ async fn daemon_with_crabcode_configured_serves_status_and_stops_clean() {
     let snapshot = fixture.ready().await;
     assert_eq!(snapshot.daemon_pid, process.pid());
     process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+async fn op(
+    fixture: &Fixture,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, DaemonError> {
+    call(CallOptions {
+        data_dir: fixture.root.clone(),
+        op: name.into(),
+        args,
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_serves_status_run_and_refusals_for_approve_deny_cancel_over_the_control_socket() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture.spawn(
+        "daemon_serves_status_run_and_refusals_for_approve_deny_cancel_over_the_control_socket",
+    );
+    fixture.ready().await;
+    for name in ["status_run", "cancel"] {
+        assert_eq!(
+            op(&fixture, name, serde_json::json!({"run_id": "run-unknown"})).await,
+            Err(DaemonError::RunNotFound),
+            "{name}"
+        );
+    }
+    for name in ["approve", "deny"] {
+        assert_eq!(
+            op(
+                &fixture,
+                name,
+                serde_json::json!({"permission_id": "hp-unknown"})
+            )
+            .await,
+            Err(DaemonError::PermissionNotPending),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_revoke",
+            serde_json::json!({"binding_id": uuid::Uuid::now_v7().to_string()})
+        )
+        .await,
+        Err(DaemonError::BindingNotFound)
+    );
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_revoke",
+            serde_json::json!({"binding_id": "not-a-uuid"})
+        )
+        .await,
+        Err(DaemonError::InvalidRequest)
+    );
+    // The status op keeps working beside the refusals.
+    fixture.ready().await;
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    configure_crabcode(&fixture, "/usr/bin/false", std::slice::from_ref(&workspace));
+    let mut process =
+        fixture.spawn("daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket");
+    fixture.ready().await;
+    let workspace = workspace.to_str().unwrap();
+    assert_eq!(
+        op(
+            &fixture,
+            "pair_start",
+            serde_json::json!({"channel": "telegram", "workspace": workspace})
+        )
+        .await,
+        Err(DaemonError::ReceiverNotActive)
+    );
+    let host = op(
+        &fixture,
+        "bindings_host",
+        serde_json::json!({"workspace": workspace}),
+    )
+    .await
+    .unwrap();
+    let listed = op(&fixture, "bindings_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    let bindings = listed["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0]["binding_id"], host["binding_id"]);
+    assert_eq!(bindings[0]["binding_kind"], "host");
+    assert_eq!(bindings[0]["status"], "active");
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_host",
+            serde_json::json!({"workspace": workspace})
+        )
+        .await,
+        Err(DaemonError::ChannelAlreadyBound)
+    );
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_refuses_feishu_receiver_and_malformed_token_without_leaking_the_secret() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture
+        .spawn("daemon_refuses_feishu_receiver_and_malformed_token_without_leaking_the_secret");
+    fixture.ready().await;
+    let mut seen = Vec::new();
+    for (args, expected) in [
+        (
+            serde_json::json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "feishu-SENTINEL"}),
+            DaemonError::ChannelNotSupported,
+        ),
+        (
+            serde_json::json!({"channel": "telegram", "token": "SENTINEL-without-bot-id"}),
+            DaemonError::InvalidRequest,
+        ),
+    ] {
+        let error = op(&fixture, "bindings_receiver", args).await.unwrap_err();
+        assert_eq!(error, expected);
+        seen.push(format!("{error} {error:?} {}", error.code()));
+    }
+    fixture.ready().await;
+    process.stop(Signal::TERM).await;
+    seen.push(process.output());
+    for text in &seen {
+        assert!(!text.contains("SENTINEL"), "{text}");
+    }
     assert_runtime_released(&fixture);
 }

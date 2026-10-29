@@ -39,3 +39,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 openbot-contracts = { path = "../openbot-contracts", features = ["testkit"] }
+omb-channels = { path = "../omb-channels", features = ["testkit"] }
+omb-store = { path = "../omb-store", features = ["testkit"] }

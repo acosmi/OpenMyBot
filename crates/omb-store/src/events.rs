@@ -1,6 +1,6 @@
 use crate::{
     ACCEPT_TX_BUDGET, AcceptedEvent, Channel, DISPATCH_QUEUE_MAX, EVENT_FUTURE_WINDOW,
-    EVENT_PAST_WINDOW, GAP_DISPLAY, IdentityKey, MSG_TEXT_MAX, PairAttempt, PairOutcome,
+    EVENT_PAST_WINDOW, GAP_DISPLAY, IdentityKey, MSG_TEXT_MAX, OpenRun, PairAttempt, PairOutcome,
     READ_BUDGET, StoreError, command, finish, pair_attempt, rows, timely,
 };
 use sha2::{Digest, Sha256};
@@ -123,6 +123,8 @@ pub enum AcceptOutcome {
     /// The key was already recorded with a different fingerprint; nothing written.
     Conflict,
     Recorded(Disposition),
+    /// A `/cancel` control command of the bound sender, already committed with its reply row.
+    Cancel(Uuid),
 }
 /// `/status` labels of the binding's latest accepted message.
 pub struct StateLabels<'a> {
@@ -141,7 +143,9 @@ pub struct ReplyTexts<'a> {
     pub help: &'a str,
     pub already_bound: &'a str,
     pub unknown_command: &'a str,
-    pub cancel_unavailable: &'a str,
+    /// `/cancel` while the binding has a dispatched run without a terminal.
+    pub cancel_requested: &'a str,
+    pub cancel_none: &'a str,
     /// Template with `{channel}`, `{dir}`, `{state}`, `{pending}` and `{gap}`.
     pub status: &'a str,
     pub states: StateLabels<'a>,
@@ -172,10 +176,8 @@ pub async fn accept_event(
             .await
             .map_err(|_| error)?
             .map_err(|_| error)?;
-        let receiver = rows(&tx, "SELECT 1 FROM openmybot.channel_bindings WHERE binding_id=$1 AND binding_kind='receiver' AND status='active' FOR SHARE", &[&receiver_binding_id], deadline, error).await?;
-        if receiver.is_empty() {
-            return Err(StoreError::ReceiverNotActive);
-        }
+        let receiver = rows(&tx, "SELECT source_key FROM openmybot.channel_bindings WHERE binding_id=$1 AND binding_kind='receiver' AND status='active' FOR SHARE", &[&receiver_binding_id], deadline, error).await?;
+        let receiver_source_key: String = receiver.first().ok_or(StoreError::ReceiverNotActive)?.try_get(0).map_err(|_| error)?;
         // Serializes concurrent deliveries of one key; the next statement sees the winner's row.
         let identity = format!("{channel}\n{}\n{}", event.source_key, event.event_key);
         rows(&tx, "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1,0))", &[&identity], deadline, error).await?;
@@ -216,7 +218,7 @@ pub async fn accept_event(
                 let Content::Text { pair_code: Some(code), .. } = content else {
                     break 'decide bare(Disposition::DroppedUnbound);
                 };
-                let outcome = pair_attempt(&tx, PairAttempt { channel: event.channel, receiver_binding_id, sender_key: sender, chat_key: chat, code_text: code, event: AcceptedEvent { event_key: &event.event_key, source_key: &event.source_key, fingerprint, occurred_at: event.occurred_at, event_type: Some(&event.event_type) } }, deadline).await?;
+                let outcome = pair_attempt(&tx, PairAttempt { channel: event.channel, receiver_source_key: &receiver_source_key, sender_key: sender, chat_key: chat, code_text: code, event: AcceptedEvent { event_key: &event.event_key, source_key: &event.source_key, fingerprint, occurred_at: event.occurred_at, event_type: Some(&event.event_type) } }, deadline).await?;
                 return Ok(AcceptOutcome::Recorded(match outcome {
                     PairOutcome::Succeeded { .. } => Disposition::PairingSucceeded,
                     PairOutcome::Failed => Disposition::PairingFailed,
@@ -242,7 +244,13 @@ pub async fn accept_event(
             if let Some(command) = *command {
                 let body = match command {
                     Command::Help | Command::Start => replies.help.to_owned(),
-                    Command::Cancel => replies.cancel_unavailable.to_owned(),
+                    Command::Cancel => {
+                        let open = rows(&tx, "SELECT EXISTS (SELECT 1 FROM openmybot.channel_events WHERE binding_id=$1 AND dispatch_status='dispatched' AND terminal_kind IS NULL)", &[&binding_id], deadline, error).await?;
+                        match open.first().ok_or(error)?.try_get::<_, bool>(0).map_err(|_| error)? {
+                            true => replies.cancel_requested.to_owned(),
+                            false => replies.cancel_none.to_owned(),
+                        }
+                    }
                     Command::Pair => replies.already_bound.to_owned(),
                     Command::Unknown => replies.unknown_command.to_owned(),
                     Command::Status => {
@@ -304,7 +312,10 @@ pub async fn accept_event(
         if let Some((kind, body, chat_key)) = &record.reply {
             rows(&tx, "INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',statement_timestamp()) RETURNING delivery_id", &[&Uuid::now_v7(), &record.binding, &channel, chat_key, kind, &format!("{kind}:{record_id}"), body], deadline, error).await?;
         }
-        Ok(AcceptOutcome::Recorded(record.disposition))
+        Ok(match (record.command, record.binding) {
+            (Some(Command::Cancel), Some(binding)) => AcceptOutcome::Cancel(binding),
+            _ => AcceptOutcome::Recorded(record.disposition),
+        })
     }
     .await?;
     timeout_at(deadline, tx.commit())
@@ -366,6 +377,40 @@ pub async fn list_active_receivers(
         .collect()
 }
 
+/// The active or suspended receiver row with its sealed envelope.
+pub async fn receiver_row(
+    client: &Client,
+    binding_id: Uuid,
+    deadline: Instant,
+) -> Result<Option<ReceiverRow>, StoreError> {
+    let error = StoreError::EventFailed;
+    rows(client, "SELECT binding_id,source_key,credential_envelope FROM openmybot.channel_bindings WHERE binding_id=$1 AND binding_kind='receiver' AND status IN ('active','suspended')", &[&binding_id], deadline, error)
+        .await?
+        .first()
+        .map(|row| {
+            Ok(ReceiverRow {
+                binding_id: row.try_get(0).map_err(|_| error)?,
+                source_key: row.try_get(1).map_err(|_| error)?,
+                credential_envelope: row.try_get(2).map_err(|_| error)?,
+            })
+        })
+        .transpose()
+}
+/// The binding's dispatched run without a terminal; dispatch keeps at most one.
+pub async fn open_run(client: &Client, binding_id: Uuid) -> Result<Option<OpenRun>, StoreError> {
+    let error = StoreError::EventFailed;
+    rows(client, "SELECT thread_id,run_id FROM openmybot.channel_events WHERE binding_id=$1 AND dispatch_status='dispatched' AND terminal_kind IS NULL AND run_id IS NOT NULL ORDER BY dispatched_at,record_id LIMIT 1", &[&binding_id], Instant::now() + READ_BUDGET, error)
+        .await?
+        .first()
+        .map(|row| {
+            Ok(OpenRun {
+                thread_id: row.try_get(0).map_err(|_| error)?,
+                run_id: row.try_get(1).map_err(|_| error)?,
+            })
+        })
+        .transpose()
+}
+
 pub struct DispatchItem {
     pub record_id: Uuid,
     pub binding_id: Uuid,
@@ -383,11 +428,11 @@ pub enum Claim {
     },
 }
 /// Reads the oldest dispatchable event: per active binding only its oldest pending event, and only
-/// while the binding has no dispatched event without a terminal and its latest dispatched event
-/// did not end in reconciliation.
+/// while the binding has no dispatched event without a terminal and the latest dispatched event of
+/// its current thread did not end in reconciliation (a host binding has no thread to pause).
 pub async fn claim_dispatch(client: &Client) -> Result<Claim, StoreError> {
     let error = StoreError::DispatchFailed;
-    let heads = rows(client, "SELECT e.record_id,e.binding_id,b.revision,e.thread_id,e.run_id,e.text,e.dispatch_attempts,e.next_dispatch_at,e.next_dispatch_at IS NULL OR e.next_dispatch_at<=statement_timestamp() FROM openmybot.channel_events e JOIN openmybot.channel_bindings b ON b.binding_id=e.binding_id WHERE e.dispatch_status='pending' AND b.status='active' AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events p WHERE p.binding_id=e.binding_id AND p.dispatch_status='pending' AND (p.accepted_at,p.record_id)<(e.accepted_at,e.record_id)) AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.dispatch_status='dispatched' AND d.terminal_kind IS NULL) AND (SELECT d.terminal_kind FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.dispatch_status='dispatched' ORDER BY d.dispatched_at DESC,d.record_id DESC LIMIT 1) IS DISTINCT FROM 'reconciliation_required' ORDER BY e.accepted_at,e.record_id", &[], Instant::now() + READ_BUDGET, error).await?;
+    let heads = rows(client, "SELECT e.record_id,e.binding_id,b.revision,e.thread_id,e.run_id,e.text,e.dispatch_attempts,e.next_dispatch_at,e.next_dispatch_at IS NULL OR e.next_dispatch_at<=statement_timestamp() FROM openmybot.channel_events e JOIN openmybot.channel_bindings b ON b.binding_id=e.binding_id WHERE e.dispatch_status='pending' AND b.status='active' AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events p WHERE p.binding_id=e.binding_id AND p.dispatch_status='pending' AND (p.accepted_at,p.record_id)<(e.accepted_at,e.record_id)) AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.dispatch_status='dispatched' AND d.terminal_kind IS NULL) AND (SELECT d.terminal_kind FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.thread_id=b.thread_id AND d.dispatch_status='dispatched' ORDER BY d.dispatched_at DESC,d.record_id DESC LIMIT 1) IS DISTINCT FROM 'reconciliation_required' ORDER BY e.accepted_at,e.record_id", &[], Instant::now() + READ_BUDGET, error).await?;
     let mut wake_at = None;
     for row in &heads {
         if row.try_get::<_, bool>(8).map_err(|_| error)? {

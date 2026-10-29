@@ -5,10 +5,10 @@ use crate::{
     pg::{AuthorityConnection, Postgres},
 };
 use omb_channels::{
-    CHANNEL_NOTE, Connection, Counters, ReceiverContext, Task, TelegramEndpoint, Timings,
-    start_dispatcher, start_heartbeat, start_receiver,
+    CHANNEL_NOTE, CancelRequests, Connection, Counters, ReceiverContext, Task, TelegramEndpoint,
+    Timings, start_dispatcher, start_heartbeat, start_receiver,
 };
-use omb_store::Channel;
+use omb_store::{Channel, ReceiverRow};
 use openbot_contracts::ids::ActorId;
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
 use std::sync::{Arc, atomic::Ordering};
@@ -20,17 +20,18 @@ pub(crate) struct StatusSource {
     pub(crate) client: Arc<tokio_postgres::Client>,
     pub(crate) counters: Arc<Counters>,
 }
+/// RFC 3339 in UTC with `Z` and only the fractional digits the instant needs.
+pub(crate) fn rfc3339_utc(unix_nanos: i128) -> Result<String, DaemonError> {
+    i64::try_from(unix_nanos)
+        .map(|nanos| {
+            chrono::DateTime::from_timestamp_nanos(nanos)
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        })
+        .map_err(|_| DaemonError::InternalError)
+}
 impl StatusSource {
     pub(crate) async fn read(&self) -> Result<Vec<ChannelStatus>, DaemonError> {
         let error = DaemonError::InternalError;
-        let time = |unix_nanos: i128| {
-            i64::try_from(unix_nanos)
-                .map(|nanos| {
-                    chrono::DateTime::from_timestamp_nanos(nanos)
-                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-                })
-                .map_err(|_| error)
-        };
         let counters = ChannelCounters {
             platform_payload_unparseable: self
                 .counters
@@ -60,10 +61,10 @@ impl StatusSource {
                         .map(|gap| {
                             Ok(GapStatus {
                                 reason: gap.reason,
-                                started_at: time(gap.started_at.unix_timestamp_nanos())?,
+                                started_at: rfc3339_utc(gap.started_at.unix_timestamp_nanos())?,
                                 ended_at: gap
                                     .ended_at
-                                    .map(|at| time(at.unix_timestamp_nanos()))
+                                    .map(|at| rfc3339_utc(at.unix_timestamp_nanos()))
                                     .transpose()?,
                             })
                         })
@@ -76,14 +77,15 @@ impl StatusSource {
     }
 }
 
-/// The running receiver, dispatcher and heartbeat, and the status connection.
+/// The running receiver with its binding, the dispatcher and heartbeat, the context every
+/// receiver starts with, and the status connection.
 pub(crate) struct Channels {
-    receiver: Option<Task>,
+    receiver: Option<(Uuid, Task)>,
+    context: ReceiverContext,
     dispatcher: Task,
     heartbeat: Task,
     status: Arc<tokio_postgres::Client>,
     status_driver: JoinHandle<Result<(), tokio_postgres::Error>>,
-    counters: Arc<Counters>,
 }
 impl Channels {
     /// Records startup gaps, then starts the heartbeat, the dispatcher and each active receiver,
@@ -94,6 +96,7 @@ impl Channels {
         token_id: Uuid,
         timings: Timings,
         endpoint: TelegramEndpoint,
+        cancel: CancelRequests,
     ) -> Result<Self, DaemonError> {
         postgres.record_startup_gaps(token_id).await?;
         let receivers = postgres.list_active_receivers(Channel::Telegram).await?;
@@ -131,34 +134,64 @@ impl Channels {
             )),
             None => None,
         };
-        let counters = Arc::new(Counters::default());
         let wake = Arc::new(Notify::new());
+        let context = ReceiverContext {
+            vault: engine.vault.clone(),
+            owner: ActorId::new(SINGLE_USER_ACTOR_ID),
+            endpoint,
+            timings,
+            counters: Arc::new(Counters::default()),
+            wake: Arc::clone(&wake),
+            cancel,
+        };
         Ok(Self {
             heartbeat: start_heartbeat(heartbeat, token_id, timings),
-            dispatcher: start_dispatcher(dispatcher, entry, timings, Arc::clone(&wake)),
+            dispatcher: start_dispatcher(dispatcher, entry, timings, wake),
             receiver: receiver.map(|(row, opened)| {
-                start_receiver(
-                    opened,
-                    row,
-                    ReceiverContext {
-                        vault: engine.vault.clone(),
-                        owner: ActorId::new(SINGLE_USER_ACTOR_ID),
-                        endpoint,
-                        timings,
-                        counters: Arc::clone(&counters),
-                        wake,
-                    },
-                )
+                (row.binding_id, start_receiver(opened, row, context.clone()))
             }),
+            context,
             status: Arc::new(status.client),
             status_driver: status.driver,
-            counters,
         })
     }
     pub(crate) fn status_source(&self) -> StatusSource {
         StatusSource {
             client: Arc::clone(&self.status),
-            counters: Arc::clone(&self.counters),
+            counters: Arc::clone(&self.context.counters),
+        }
+    }
+    /// Stops the running receiver, then starts `row` on a new resident connection.
+    pub(crate) async fn start_receiver(
+        &mut self,
+        postgres: &mut Postgres,
+        row: ReceiverRow,
+    ) -> Result<(), DaemonError> {
+        if let Some((_, task)) = self.receiver.take() {
+            task.stop().await;
+        }
+        let opened = postgres
+            .open_resident_connection("openmybot-receiver")
+            .await?;
+        let connection = Connection {
+            client: opened.client,
+            driver: opened.driver,
+        };
+        self.receiver = Some((
+            row.binding_id,
+            start_receiver(connection, row, self.context.clone()),
+        ));
+        Ok(())
+    }
+    /// Stops the running receiver only when it serves `binding_id`.
+    pub(crate) async fn stop_receiver(&mut self, binding_id: Uuid) {
+        if self
+            .receiver
+            .as_ref()
+            .is_some_and(|(running, _)| *running == binding_id)
+            && let Some((_, task)) = self.receiver.take()
+        {
+            task.stop().await;
         }
     }
     /// Resolves with `internal_error` when the heartbeat or the dispatcher ends, or a receiver
@@ -176,7 +209,7 @@ impl Channels {
                 _ = dispatcher.finished() => return DaemonError::InternalError,
                 ended = async {
                     match receiver.as_mut() {
-                        Some(task) => task.finished().await,
+                        Some((_, task)) => task.finished().await,
                         None => std::future::pending().await,
                     }
                 } => ended,
@@ -190,7 +223,7 @@ impl Channels {
     /// Stops the receiver, the dispatcher and the heartbeat in that order, then ends the status
     /// connection that request handlers may still share.
     pub(crate) async fn stop(self) {
-        if let Some(receiver) = self.receiver {
+        if let Some((_, receiver)) = self.receiver {
             receiver.stop().await;
         }
         self.dispatcher.stop().await;
@@ -208,6 +241,7 @@ mod tests {
         delegation::fixture::{self, Fixture},
     };
     use omb_channels::OMB_REPLY_TEXTS_V1;
+    use omb_channels::{CANCEL_QUEUE, testkit::FakeTelegram};
     use omb_store::{
         AcceptOutcome, Command, Content, Disposition, IdentityKey, NormalizedEvent, PairStart,
         PollGapReason, accept_event, open_poll_gap, pair_start,
@@ -222,6 +256,10 @@ mod tests {
     use openbot_infra::net::safe_http::{CidrAllowlist, EgressPolicy, SafeDialer, SchemePolicy};
     use std::time::Duration;
     use tokio_postgres::Client;
+
+    fn cancel() -> CancelRequests {
+        tokio::sync::mpsc::channel(CANCEL_QUEUE).0
+    }
 
     fn deadline() -> tokio::time::Instant {
         tokio::time::Instant::now() + Duration::from_secs(30)
@@ -739,10 +777,16 @@ mod tests {
         let receiver = fixture::receiver(&client, "telegram").await;
         let second = token(&mut fixture).await;
         let engine = fixture.engine.as_ref().unwrap();
-        let channels =
-            Channels::start(&mut fixture.pg, engine, second, quick(), refused_endpoint())
-                .await
-                .unwrap();
+        let channels = Channels::start(
+            &mut fixture.pg,
+            engine,
+            second,
+            quick(),
+            refused_endpoint(),
+            cancel(),
+        )
+        .await
+        .unwrap();
         let rows = client.query("SELECT binding_id,gap_started_at=(SELECT last_heartbeat_at FROM openmybot.control_tokens WHERE token_id=$1),gap_ended_at>=(SELECT created_at FROM openmybot.control_tokens WHERE token_id=$2) FROM openmybot.channel_events WHERE gap_reason='daemon_down'", &[&first, &second]).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, Uuid>(0), receiver);
@@ -778,9 +822,16 @@ mod tests {
             .await
             .unwrap();
         let engine = fixture.engine.as_ref().unwrap();
-        let channels = Channels::start(&mut fixture.pg, engine, token, quick(), refused_endpoint())
-            .await
-            .unwrap();
+        let channels = Channels::start(
+            &mut fixture.pg,
+            engine,
+            token,
+            quick(),
+            refused_endpoint(),
+            cancel(),
+        )
+        .await
+        .unwrap();
         let live = "SELECT count(*) FROM pg_stat_activity WHERE application_name IN ('openmybot-heartbeat','openmybot-dispatcher','openmybot-status','openmybot-receiver')";
         let limit = tokio::time::Instant::now() + Duration::from_secs(10);
         while client.query_one(live, &[]).await.unwrap().get::<_, i64>(0) < 4 {
@@ -830,6 +881,219 @@ mod tests {
                 .unwrap(),
             AppReply::ThreadMinted(_)
         ));
+        fixture.stop().await;
+    }
+
+    #[test]
+    fn rfc3339_utc_matches_the_status_segment_format() {
+        for (nanos, expected) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (1_500_000_000, "1970-01-01T00:00:01.500Z"),
+            (1_000_001_000, "1970-01-01T00:00:01.000001Z"),
+            (1_793_202_187_000_000_007, "2026-10-28T15:43:07.000000007Z"),
+        ] {
+            let text = rfc3339_utc(nanos).unwrap();
+            assert_eq!(text, expected);
+            let parsed = chrono::DateTime::parse_from_rfc3339(&text).unwrap();
+            assert_eq!(parsed.offset().local_minus_utc(), 0);
+            assert_eq!(i128::from(parsed.timestamp_nanos_opt().unwrap()), nanos);
+        }
+        assert_eq!(
+            rfc3339_utc(i128::from(i64::MAX) + 1),
+            Err(DaemonError::InternalError)
+        );
+    }
+
+    /// An active Telegram receiver row whose envelope seals `token` for the owner.
+    async fn sealed_receiver(fixture: &Fixture, client: &Client, token: &str) -> ReceiverRow {
+        let binding_id = fixture::receiver(client, "telegram").await;
+        ReceiverRow {
+            binding_id,
+            source_key: "1001".into(),
+            credential_envelope: resealed(fixture, client, binding_id, token).await,
+        }
+    }
+    async fn resealed(fixture: &Fixture, client: &Client, binding_id: Uuid, token: &str) -> String {
+        let envelope = fixture
+            .engine()
+            .vault
+            .seal(
+                &binding_id,
+                SecretKind::Connector,
+                SecretPrincipal::Actor(ActorId::new(SINGLE_USER_ACTOR_ID)),
+                SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
+                &SecretBytes::new(token.as_bytes().to_vec()),
+            )
+            .unwrap();
+        client
+            .execute(
+                "UPDATE openmybot.channel_bindings SET credential_envelope=$2 WHERE binding_id=$1",
+                &[&binding_id, &envelope],
+            )
+            .await
+            .unwrap();
+        envelope
+    }
+    async fn receivers(client: &Client) -> i64 {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name='openmybot-receiver'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+    async fn receivers_reach(client: &Client, expected: i64) {
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        while receivers(client).await != expected {
+            assert!(tokio::time::Instant::now() < limit, "receiver connections");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    async fn polls_with(fake: &FakeTelegram, token: &str) -> usize {
+        let path = format!("/bot{token}/getUpdates");
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = fake
+                .calls("getUpdates")
+                .iter()
+                .filter(|request| request.path == path)
+                .count();
+            if seen > 0 {
+                return seen;
+            }
+            assert!(tokio::time::Instant::now() < limit, "no poll with {token}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn runtime_receiver_start_and_stop_through_commands_with_fake_telegram() {
+        let mut fixture = Fixture::start().await;
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        let engine = fixture.engine.as_ref().unwrap();
+        let mut channels = Channels::start(
+            &mut fixture.pg,
+            engine,
+            token,
+            quick(),
+            fake.endpoint(),
+            cancel(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receivers(&client).await, 0);
+        let row = sealed_receiver(&fixture, &client, "1001:runtime-token").await;
+        let binding = row.binding_id;
+        channels.start_receiver(&mut fixture.pg, row).await.unwrap();
+        polls_with(&fake, "1001:runtime-token").await;
+        receivers_reach(&client, 1).await;
+        channels.stop_receiver(binding).await;
+        let seen = fake.requests().len();
+        receivers_reach(&client, 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fake.requests().len(), seen);
+        channels.stop().await;
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn stop_receiver_for_another_binding_id_is_a_no_op_and_start_replaces_the_running_receiver()
+     {
+        let mut fixture = Fixture::start().await;
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        let engine = fixture.engine.as_ref().unwrap();
+        let mut channels = Channels::start(
+            &mut fixture.pg,
+            engine,
+            token,
+            quick(),
+            fake.endpoint(),
+            cancel(),
+        )
+        .await
+        .unwrap();
+        let first = sealed_receiver(&fixture, &client, "1001:token-a").await;
+        let binding = first.binding_id;
+        channels
+            .start_receiver(&mut fixture.pg, first)
+            .await
+            .unwrap();
+        let before = polls_with(&fake, "1001:token-a").await;
+        channels.stop_receiver(Uuid::now_v7()).await;
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        while polls_with(&fake, "1001:token-a").await <= before {
+            assert!(tokio::time::Instant::now() < limit, "receiver stopped");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let envelope = resealed(&fixture, &client, binding, "1001:token-b").await;
+        let second = ReceiverRow {
+            binding_id: binding,
+            source_key: "1001".into(),
+            credential_envelope: envelope.clone(),
+        };
+        channels
+            .start_receiver(&mut fixture.pg, second)
+            .await
+            .unwrap();
+        polls_with(&fake, "1001:token-b").await;
+        let requests = fake.calls("getUpdates");
+        let last_old = requests
+            .iter()
+            .filter(|r| r.path.contains("token-a"))
+            .map(|r| r.at)
+            .max()
+            .unwrap();
+        let first_new = requests
+            .iter()
+            .filter(|r| r.path.contains("token-b"))
+            .map(|r| r.at)
+            .min()
+            .unwrap();
+        assert!(last_old < first_new);
+        receivers_reach(&client, 1).await;
+        // A receiver that suspended itself can be started again.
+        fake.script(
+            "getUpdates",
+            401,
+            br#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#.to_vec(),
+        );
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        while binding_state(&client, binding).await.0 != "suspended" {
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "receiver did not suspend"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        client.execute("UPDATE openmybot.channel_bindings SET status='active',status_reason=NULL WHERE binding_id=$1", &[&binding]).await.unwrap();
+        let seen = fake.calls("getUpdates").len();
+        let third = ReceiverRow {
+            binding_id: binding,
+            source_key: "1001".into(),
+            credential_envelope: envelope,
+        };
+        channels
+            .start_receiver(&mut fixture.pg, third)
+            .await
+            .unwrap();
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        while fake.calls("getUpdates").len() <= seen {
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "restarted receiver did not poll"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        receivers_reach(&client, 1).await;
+        channels.stop().await;
         fixture.stop().await;
     }
 }

@@ -134,7 +134,8 @@ pub struct AcceptedEvent<'a> {
 }
 pub struct PairAttempt<'a> {
     pub channel: Channel,
-    pub receiver_binding_id: Uuid,
+    /// The active receiver's source, read and share-locked by the caller's transaction.
+    pub receiver_source_key: &'a str,
     pub sender_key: &'a IdentityKey,
     pub chat_key: &'a IdentityKey,
     pub code_text: &'a str,
@@ -157,13 +158,8 @@ pub async fn pair_attempt(
     let error = StoreError::BindingFailed;
     let channel = input.channel.as_str();
     let sender = input.sender_key.as_str();
+    let source_key = input.receiver_source_key;
     async {
-        let receiver = rows(client, "SELECT source_key FROM openmybot.channel_bindings WHERE binding_id=$1 AND binding_kind='receiver' AND channel_kind=$2 AND status='active'", &[&input.receiver_binding_id, &channel], deadline, error).await?;
-        let source_key: String = receiver
-            .first()
-            .ok_or(StoreError::ReceiverNotActive)?
-            .try_get(0)
-            .map_err(|_| error)?;
         let lock = rows(client, "SELECT count(*)=$2 AND max(a)-min(a)<=make_interval(secs=>$3) AND statement_timestamp()<max(a)+make_interval(secs=>$3) FROM (SELECT accepted_at a FROM openmybot.channel_events WHERE sender_key=$1 AND disposition='pairing_failed' ORDER BY accepted_at DESC LIMIT $2) recent", &[&sender, &PAIR_FAIL_LIMIT, &PAIR_LOCK.as_secs_f64()], deadline, error).await?;
         let locked: bool = lock.first().ok_or(error)?.try_get(0).map_err(|_| error)?;
         let (outcome, binding_id) = if locked {

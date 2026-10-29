@@ -438,3 +438,22 @@ pub async fn decide(
         .await
         .unwrap()
 }
+/// An undecided permission row of the run that expires `expires_in_secs` after the database clock.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_permission_row(
+    client: &tokio_postgres::Client,
+    binding_id: uuid::Uuid,
+    run_id: &str,
+    permission_id: &str,
+    expires_in_secs: f64,
+) {
+    assert_eq!(client.execute("INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,permission_id,native_request_id,tool_name,input_summary,input_sha256,requested_at,expires_at) VALUES (gen_random_uuid(),'permission',$2,$1,$3,$3,'Write','{\"file_path\":\"notes.txt\"}',sha256('notes.txt'::bytea),statement_timestamp(),statement_timestamp()+make_interval(secs=>$4))",&[&binding_id,&run_id,&permission_id,&expires_in_secs]).await.unwrap(),1);
+}
+/// One permission row as JSON.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn permission_row_json(
+    client: &tokio_postgres::Client,
+    permission_id: &str,
+) -> serde_json::Value {
+    client.query_one("SELECT row_to_json(h) FROM openmybot.host_driver_sessions h WHERE record_kind='permission' AND permission_id=$1",&[&permission_id]).await.unwrap().get(0)
+}

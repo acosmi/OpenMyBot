@@ -8,6 +8,7 @@ mod daemon;
 mod delegation;
 mod engine;
 mod init;
+mod ops;
 mod pairing;
 mod pg;
 mod tenant;
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub use config::resolve_data_dir;
-pub use control::status;
+pub use control::{call, status};
 pub use daemon::daemon;
 pub use engine::Engine;
 pub use init::init;
@@ -37,6 +38,12 @@ pub struct DaemonOptions {
 }
 pub struct StatusOptions {
     pub data_dir: PathBuf,
+}
+/// One control operation and its arguments; the arguments may carry a channel secret.
+pub struct CallOptions {
+    pub data_dir: PathBuf,
+    pub op: String,
+    pub args: serde_json::Value,
 }
 #[derive(Debug, Serialize)]
 pub struct InitResult {
@@ -96,6 +103,8 @@ macro_rules! errors {
         impl DaemonError {
             pub const fn code(&self) -> &'static str { match self { $(Self::$variant => $code),+ } }
             pub const fn class(&self) -> ErrorClass { match self { $(Self::$variant => ErrorClass::$class),+ } }
+            pub fn from_code(code: &str) -> Option<DaemonError> { match code { $($code => Some(Self::$variant),)+ _ => None } }
+            pub const ALL: &'static [DaemonError] = &[$(Self::$variant),+];
         }
     }
 }
@@ -135,4 +144,38 @@ errors! {
     HostBinaryInvalid => ("host_binary_invalid", Rejected),
     WorkspaceRootInvalid => ("workspace_root_invalid", Rejected),
     AgentRuntimeFailed => ("agent_runtime_failed", Internal),
+    PermissionNotPending => ("permission_not_pending", Rejected),
+    PermissionExpired => ("permission_expired", Rejected),
+    RunNotFound => ("run_not_found", Rejected),
+    CredentialRejected => ("credential_rejected", Rejected),
+    WebhookConflict => ("webhook_conflict", Rejected),
+    ChannelUnreachable => ("channel_unreachable", Rejected),
+    ChannelNotSupported => ("channel_not_supported", Rejected),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn from_code_inverts_code_for_every_variant() {
+        for error in DaemonError::ALL {
+            assert_eq!(DaemonError::from_code(error.code()), Some(*error));
+        }
+        assert_eq!(DaemonError::ALL.len(), 42);
+        for unknown in ["", "INTERNAL_ERROR", "not_a_code", "internal_error "] {
+            assert_eq!(DaemonError::from_code(unknown), None);
+        }
+        for (code, error) in [
+            ("permission_not_pending", DaemonError::PermissionNotPending),
+            ("permission_expired", DaemonError::PermissionExpired),
+            ("run_not_found", DaemonError::RunNotFound),
+            ("credential_rejected", DaemonError::CredentialRejected),
+            ("webhook_conflict", DaemonError::WebhookConflict),
+            ("channel_unreachable", DaemonError::ChannelUnreachable),
+            ("channel_not_supported", DaemonError::ChannelNotSupported),
+        ] {
+            assert_eq!(DaemonError::from_code(code), Some(error));
+            assert_eq!(error.class(), ErrorClass::Rejected);
+        }
+    }
 }
