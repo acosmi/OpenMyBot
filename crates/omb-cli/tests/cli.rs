@@ -572,7 +572,10 @@ async fn mcp_call_timeout_bounds_the_whole_call_and_the_server_keeps_serving() {
     };
     let server = serve(listener, vec![slow, success(json!({"runs": []}))]);
     let mut child = spawn_mcp(Some(&root), &[], &[]);
-    child.send(&call(1, "wrok_thread_list", Some(json!({}))));
+    // The clock starts once the server answers, so process start-up stays outside the bound.
+    child.send(&rpc(1, "tools/list", json!({})));
+    five_tools(&child.recv(WITHIN).await);
+    child.send(&call(2, "wrok_thread_list", Some(json!({}))));
     let sent = tokio::time::Instant::now();
     let answer = child.recv(WITHIN).await;
     let took = sent.elapsed();
@@ -581,7 +584,7 @@ async fn mcp_call_timeout_bounds_the_whole_call_and_the_server_keeps_serving() {
         took >= Duration::from_millis(9500) && took < Duration::from_millis(11500),
         "{took:?}"
     );
-    child.send(&call(2, "wrok_thread_list", Some(json!({}))));
+    child.send(&call(3, "wrok_thread_list", Some(json!({}))));
     tool_data(&child.recv(WITHIN).await, &json!({"runs": []}));
     server.await.unwrap();
     let (status, _, _) = child.finish(WITHIN).await;
