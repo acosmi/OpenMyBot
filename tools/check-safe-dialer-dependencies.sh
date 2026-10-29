@@ -54,6 +54,7 @@ network_callers=$(rg -l 'TcpStream::connect|lookup_host\(|TlsConnector|http1::ha
 # 测试夹具：标注的文件只经 #[cfg(test)] 或 #[cfg(all(test, …))] 模块编入，其回环探针不是生产出网调用方；
 # provider/custom.rs 是生产文件，命中行在其 #[cfg(test)] mod v2_vault_tests 内。
 expected_callers_list=(
+  crates/omb-channels/src/testkit.rs # 测试夹具 PR #243（testkit feature 模块，命中在其 #[cfg(test)] mod tests 内）
   crates/openbot-computer/src/engine/process.rs
   crates/openbot-desktop/src/postgres_sidecar.rs
   crates/openbot-desktop/src/tauri_host/approval_preference_local_tests.rs # 测试夹具 PR #147
