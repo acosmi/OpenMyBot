@@ -20,6 +20,7 @@ actual="$(cargo tree --workspace --exclude 'omb-*' -i rsa -e normal --all-featur
 expected='rsa v0.9.10
 openidconnect v4.0.1
 openbot-infra v0.0.0
+openbot-desktop v0.0.0
 openbot-server v0.0.0'
 
 if [[ "$actual" != "$expected" ]]; then

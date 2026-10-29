@@ -30,7 +30,8 @@ for forbidden in 'rmcp feature "server"' 'rmcp feature "transport-streamable-htt
 done
 
 rmcp_callers=$(rg -l 'rmcp::' crates/*/src --glob '*.rs' --glob '!crates/omb-*/**' | sort)
-[[ "$rmcp_callers" == 'crates/openbot-infra/src/mcp.rs' ]] || fail "rmcp types escaped the single infra boundary: [$rmcp_callers]"
+# 测试夹具：mcp/selected_target_tests.rs 只经 mcp.rs 的 #[cfg(test)] mod 编入（PR #118）。
+[[ "$rmcp_callers" == $'crates/openbot-infra/src/mcp.rs\ncrates/openbot-infra/src/mcp/selected_target_tests.rs' ]] || fail "rmcp types escaped the single infra boundary: [$rmcp_callers]"
 for anchor in \
   'send_cancellable_request(request, options)' \
   'notify_cancelled(CancelledNotificationParam::new(' \

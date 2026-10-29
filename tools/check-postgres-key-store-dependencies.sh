@@ -80,7 +80,7 @@ keychain_consumers=$(
     fi
   done < <(rg -l 'security_framework(::|_sys::)' crates --glob '*.rs' | sort || true)
 )
-[[ "$keychain_consumers" == "crates/openbot-desktop/src/os_secret_store.rs" ]] || fail "Security.framework consumer set drift: ${keychain_consumers:-none}"
+[[ "$keychain_consumers" == $'crates/openbot-desktop/src/os_secret_store.rs\ncrates/openbot-desktop/src/os_secret_store/macos_interaction.rs' ]] || fail "Security.framework consumer set drift: ${keychain_consumers:-none}"
 
 credential_consumers=$(rg -l 'Cred(ReadW|WriteW|Free|DeleteW)' crates --glob '*.rs' | sort || true)
 [[ "$credential_consumers" == "crates/openbot-windows-sandbox/src/windows.rs" ]] || fail "Credential Manager FFI consumer set drift: ${credential_consumers:-none}"
