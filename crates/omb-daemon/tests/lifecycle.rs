@@ -1235,3 +1235,470 @@ async fn daemon_refuses_feishu_receiver_and_malformed_token_without_leaking_the_
     }
     assert_runtime_released(&fixture);
 }
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_restore_detected_suspends_bindings_and_expires_pending_events_until_reconfirmed() {
+    if child_entry().await {
+        return;
+    }
+    let name =
+        "daemon_restore_detected_suspends_bindings_and_expires_pending_events_until_reconfirmed";
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    configure_crabcode(&fixture, "/usr/bin/false", std::slice::from_ref(&workspace));
+    let mut first = fixture.spawn(name);
+    fixture.ready().await;
+    let host = op(
+        &fixture,
+        "bindings_host",
+        serde_json::json!({"workspace": workspace}),
+    )
+    .await
+    .unwrap();
+    let binding = host["binding_id"].as_str().unwrap().to_owned();
+    first.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+    // The cluster now looks restored: the latest token row names another system identifier.
+    inspect_stopped(&fixture, "UPDATE openmybot.control_tokens SET pg_system_identifier='different' WHERE token_id=(SELECT token_id FROM openmybot.control_tokens ORDER BY created_at DESC,token_id DESC LIMIT 1) RETURNING token_id").await;
+    inspect_stopped(&fixture, &format!("INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status) VALUES (gen_random_uuid(),'event','host','crabcode','op:restore',statement_timestamp(),'{binding}','accepted_message','do the work',sha256('do the work'::bytea),'run-restore','thread-restore','pending') RETURNING record_id")).await;
+    let mut second = fixture.spawn(name);
+    fixture.ready().await;
+    let listed = op(&fixture, "bindings_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    let row = &listed["bindings"][0];
+    assert_eq!(row["binding_id"], binding.as_str());
+    assert_eq!(row["status"], "suspended");
+    assert_eq!(row["status_reason"], "restore_detected");
+    let revision = row["revision"].as_i64().unwrap();
+    let rows = query_own(&fixture, "SELECT (SELECT dispatch_status FROM openmybot.channel_events WHERE event_key='op:restore'),(SELECT restore_detected FROM openmybot.control_tokens ORDER BY created_at DESC,token_id DESC LIMIT 1),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions)").await;
+    assert_eq!(rows[0].get::<_, String>(0), "expired");
+    assert!(rows[0].get::<_, bool>(1));
+    assert_eq!(rows[0].get::<_, i64>(2), 0);
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_reconfirm",
+            serde_json::json!({"binding_id": binding})
+        )
+        .await
+        .unwrap(),
+        serde_json::json!({"binding_id": binding, "revision": revision + 1})
+    );
+    let listed = op(&fixture, "bindings_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(listed["bindings"][0]["status"], "active");
+    assert!(listed["bindings"][0]["reconfirmed_at"].is_string());
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_reconfirm",
+            serde_json::json!({"binding_id": binding})
+        )
+        .await,
+        Err(DaemonError::BindingStateInvalid)
+    );
+    second.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_resumed_after_sigstop_records_daemon_suspended_gap_and_resumes_heartbeat() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture
+        .spawn("daemon_resumed_after_sigstop_records_daemon_suspended_gap_and_resumes_heartbeat");
+    fixture.ready().await;
+    // An active receiver row the running daemon does not poll for.
+    let rows = query_own(&fixture, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,revision,created_at,activated_at) VALUES (gen_random_uuid(),'receiver','telegram','1001','test-envelope','active',1,statement_timestamp(),statement_timestamp()) RETURNING binding_id").await;
+    let receiver: uuid::Uuid = rows[0].get(0);
+    let heartbeat = "SELECT (extract(epoch FROM last_heartbeat_at)*1000000)::bigint FROM openmybot.control_tokens WHERE revoked_at IS NULL";
+    let gaps = format!(
+        "SELECT (extract(epoch FROM gap_started_at)*1000000)::bigint,(extract(epoch FROM gap_ended_at)*1000000)::bigint FROM openmybot.channel_events WHERE gap_reason='daemon_suspended' AND binding_id='{receiver}'"
+    );
+    process.signal(Signal::STOP);
+    // HEARTBEAT_GAP is 90 s; the stopped daemon cannot move its heartbeat meanwhile.
+    tokio::time::sleep(Duration::from_secs(95)).await;
+    let before: i64 = query_own(&fixture, heartbeat).await[0].get(0);
+    process.signal(Signal::CONT);
+    let limit = tokio::time::Instant::now() + Duration::from_secs(60);
+    let rows = loop {
+        let rows = query_own(&fixture, &gaps).await;
+        if !rows.is_empty() {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < limit,
+            "suspension gap deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), before);
+    assert!(rows[0].get::<_, i64>(1) > before + 90_000_000);
+    let snapshot = fixture.ready().await;
+    let channel = &snapshot.channels[0];
+    assert_eq!(channel.binding_id, receiver.to_string());
+    assert!(
+        channel
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "daemon_suspended" && gap.ended_at.is_some())
+    );
+    assert_eq!(channel.note, "telegram 长轮询");
+    let resumed: i64 = query_own(&fixture, heartbeat).await[0].get(0);
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    let later: i64 = query_own(&fixture, heartbeat).await[0].get(0);
+    assert!(later > resumed);
+    assert_eq!(query_own(&fixture, &gaps).await.len(), 1);
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+// ---- Layer 2: the real CrabCode host under the release binary ---------------------------------
+
+use openbot_contracts::ids::{DeploymentId, thread::ThreadIdentity};
+use sha2::Digest as _;
+
+/// The release binary's daemon in a process group of its own, with only `HOME` (the real home:
+/// `home` isolation) and `PATH` set; output goes to private files as in `spawn`.
+fn spawn_real(fixture: &Fixture, binary: &Path, home: &Path) -> OwnedDaemon {
+    let mut random = [0; 4];
+    getrandom::fill(&mut random).unwrap();
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let out = fixture.root.join(format!("{suffix}.out"));
+    let err = fixture.root.join(format!("{suffix}.err"));
+    private_file(&out, b"");
+    private_file(&err, b"");
+    let child = Command::new(binary)
+        .arg("--data-dir")
+        .arg(&fixture.root)
+        .args(["--json", "daemon"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .stdin(Stdio::null())
+        .stdout(fs::OpenOptions::new().append(true).open(&out).unwrap())
+        .stderr(fs::OpenOptions::new().append(true).open(&err).unwrap())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    OwnedDaemon {
+        child: Some(child),
+        out,
+        err,
+    }
+}
+/// The layer-2 report, rewritten after every change so a failed step still leaves it behind. The
+/// sandbox, home and data directory prefixes become placeholders.
+struct RealReport {
+    path: PathBuf,
+    hidden: Vec<(String, &'static str)>,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+impl RealReport {
+    fn set(&mut self, key: &str, value: serde_json::Value) {
+        self.fields.insert(key.into(), value);
+        let mut text = serde_json::to_string_pretty(&self.fields).unwrap();
+        for (prefix, placeholder) in &self.hidden {
+            text = text.replace(prefix.as_str(), placeholder);
+        }
+        fs::write(&self.path, text).unwrap();
+    }
+}
+/// One `<binary> --data-dir <data directory> --json <args>` run; its exit code and JSON output
+/// are appended to the report's call log.
+fn openmybot(
+    fixture: &Fixture,
+    binary: &Path,
+    home: &Path,
+    report: &mut RealReport,
+    args: &[&str],
+) -> (i32, serde_json::Value) {
+    let output = Command::new(binary)
+        .arg("--data-dir")
+        .arg(&fixture.root)
+        .arg("--json")
+        .args(args)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let code = output.status.code().unwrap_or(-1);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+    let mut calls = report
+        .fields
+        .remove("calls")
+        .unwrap_or_else(|| serde_json::json!([]));
+    calls
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"command": args, "exit_code": code, "output": value}));
+    report.set("calls", calls);
+    (code, value)
+}
+
+#[tokio::test]
+#[ignore = "real CrabCode on this machine; run by the controller"]
+async fn real_crabcode_daemon_recheck_with_cli_approve_and_cancel() {
+    let required = |name: &str| {
+        PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is required")))
+    };
+    let crabcode = required("OMB_REAL_CRABCODE_BIN");
+    let binary = required("OMB_REAL_OPENMYBOT_BIN");
+    assert!(crabcode.is_absolute() && binary.is_absolute());
+    let sandbox = fs::canonicalize(required("OMB_REAL_RECHECK_SANDBOX")).unwrap();
+    let report_path = required("OMB_REAL_RECHECK_REPORT");
+    assert!(
+        report_path.starts_with(&sandbox),
+        "the report stays in the sandbox"
+    );
+    let home = fs::canonicalize(required("HOME")).unwrap();
+    assert!(
+        sandbox.starts_with(&home) && sandbox != home && !sandbox.starts_with(home.join("Library"))
+    );
+    let fixture = Fixture::new();
+    let mut report = RealReport {
+        path: report_path,
+        hidden: vec![
+            (sandbox.to_str().unwrap().to_owned(), "<sandbox>"),
+            (home.to_str().unwrap().to_owned(), "<home>"),
+            (fixture.root.to_str().unwrap().to_owned(), "<data-dir>"),
+        ],
+        fields: serde_json::Map::new(),
+    };
+    let digest = |path: &Path| -> String {
+        sha2::Sha256::digest(fs::read(path).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let probe = Command::new(&crabcode)
+        .arg("--version")
+        .current_dir(&sandbox)
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    report.set(
+        "version_line",
+        serde_json::json!(
+            String::from_utf8_lossy(&probe.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+        ),
+    );
+    report.set("binary_sha256", serde_json::json!(digest(&crabcode)));
+    report.set("openmybot_sha256", serde_json::json!(digest(&binary)));
+    report.set(
+        "build_id",
+        serde_json::json!(
+            fs::read_to_string(crabcode.parent().unwrap().join("build-id"))
+                .ok()
+                .map(|text| text.trim().to_owned())
+        ),
+    );
+    report.set("engine_pin", serde_json::json!(env!("OMB_ENGINE_PIN")));
+
+    // (1) The sandbox workspace and the real host configured on it.
+    let workspace = sandbox.join("ws");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("notes.txt"), "pineapple\n").unwrap();
+    fixture.initialize().await;
+    configure_crabcode(
+        &fixture,
+        crabcode.to_str().unwrap(),
+        std::slice::from_ref(&sandbox),
+    );
+
+    // (2) The host binding through the release binary, then a stop.
+    let mut first = spawn_real(&fixture, &binary, &home);
+    fixture.ready().await;
+    let workspace_arg = workspace.to_str().unwrap();
+    let (code, bound) = openmybot(
+        &fixture,
+        &binary,
+        &home,
+        &mut report,
+        &["bindings", "host", "crabcode", "--workspace", workspace_arg],
+    );
+    assert_eq!(code, 0, "{bound}");
+    let binding = bound["data"]["binding_id"].as_str().unwrap().to_owned();
+    first.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+
+    // (3) Two pending messages of the host binding in one statement, on a thread minted from the
+    // deployment fingerprint.
+    let config: toml::Table =
+        toml::from_str(&fs::read_to_string(fixture.root.join("config.toml")).unwrap()).unwrap();
+    let deployment = DeploymentId::new(config["deployment_id"].as_str().unwrap());
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let thread = ThreadIdentity::new(&deployment).mint_from_entropy(entropy);
+    let (write_event, stop_event) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let (write_run, stop_run) = (format!("run-{write_event}"), format!("run-{stop_event}"));
+    let write = "Use the Read tool to read notes.txt in the current directory. Then use the Write tool to create approved-by-cli.txt containing the word yes. Finally reply with the word DONE.";
+    let count =
+        "Count from 1 to 300, writing each number on its own line with a short sentence about it.";
+    inspect_stopped(&fixture, &format!("INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status) VALUES ('{write_event}','event','host','crabcode','op:{write_event}',statement_timestamp(),'{binding}','accepted_message','{write}',sha256('{write}'::bytea),'{write_run}','{thread}','pending'),('{stop_event}','event','host','crabcode','op:{stop_event}',statement_timestamp(),'{binding}','accepted_message','{count}',sha256('{count}'::bytea),'{stop_run}','{thread}','pending') RETURNING record_id")).await;
+
+    // (4) The daemon again; its engine pin is this build's.
+    let mut second = spawn_real(&fixture, &binary, &home);
+    fixture.ready().await;
+    let (code, status) = openmybot(&fixture, &binary, &home, &mut report, &["status"]);
+    assert_eq!(code, 0, "{status}");
+    let pin_matches = status["data"]["engine_pin"] == env!("OMB_ENGINE_PIN");
+    report.set(
+        "step_daemon_engine_pin",
+        serde_json::json!({"result": if pin_matches { "pass" } else { "fail" }}),
+    );
+    assert!(pin_matches, "{status}");
+
+    // (5) The first run starts and asks for Write; read-only calls are recorded as observed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let permission_id = loop {
+        let (code, run) = openmybot(
+            &fixture,
+            &binary,
+            &home,
+            &mut report,
+            &["status", "--run", &write_run],
+        );
+        assert_eq!(code, 0, "{run}");
+        assert!(run["data"]["terminal_kind"].is_null(), "{run}");
+        let initialized: i64 = query_own(&fixture, &format!("SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id='{write_run}' AND init_at IS NOT NULL")).await[0].get(0);
+        let asked = run["data"]["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["tool_name"] == "Write" && p["decision"].is_null())
+            .map(|p| p["permission_id"].as_str().unwrap().to_owned());
+        if let Some(id) = asked.filter(|_| initialized > 0) {
+            break id;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{run}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    report.set(
+        "step_start_and_write_blocked",
+        serde_json::json!({"result": "pass", "observation": "system/init seen; Write waits for the owner"}),
+    );
+
+    // (6) The owner allows it through the release binary; the run ends succeeded.
+    let (code, approved) = openmybot(
+        &fixture,
+        &binary,
+        &home,
+        &mut report,
+        &["approve", &permission_id],
+    );
+    assert_eq!(code, 0, "{approved}");
+    assert_eq!(approved["data"]["decision"], "allow");
+    let finished = loop {
+        let (code, run) = openmybot(
+            &fixture,
+            &binary,
+            &home,
+            &mut report,
+            &["status", "--run", &write_run],
+        );
+        assert_eq!(code, 0, "{run}");
+        if !run["data"]["terminal_kind"].is_null() {
+            break run;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{run}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let file_written = workspace.join("approved-by-cli.txt").exists();
+    let permissions = finished["data"]["permissions"].as_array().unwrap();
+    report.set(
+        "step_readonly",
+        serde_json::json!({"result": "observed", "readonly_rule_rows": permissions.iter().filter(|p| p["decided_via"] == "readonly_rule").count(), "read_requested": permissions.iter().any(|p| p["tool_name"] == "Read")}),
+    );
+    report.set(
+        "step_allow_and_terminal",
+        serde_json::json!({"file_written": file_written, "terminal_kind": finished["data"]["terminal_kind"], "end_reason": finished["data"]["session"]["end_reason"]}),
+    );
+    assert!(file_written);
+    assert_eq!(finished["data"]["terminal_kind"], "succeeded");
+    assert_eq!(finished["data"]["session"]["end_reason"], "result_success");
+
+    // (7) The second run, cancelled mid-way through the release binary.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let initialized: i64 = query_own(&fixture, &format!("SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id='{stop_run}' AND init_at IS NOT NULL")).await[0].get(0);
+        if initialized > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second run init deadline"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (code, cancelled) = openmybot(
+        &fixture,
+        &binary,
+        &home,
+        &mut report,
+        &["cancel", &stop_run],
+    );
+    assert_eq!(code, 0, "{cancelled}");
+    assert_eq!(cancelled["data"]["state"], "requested");
+    let stopped = loop {
+        let (code, run) = openmybot(
+            &fixture,
+            &binary,
+            &home,
+            &mut report,
+            &["status", "--run", &stop_run],
+        );
+        assert_eq!(code, 0, "{run}");
+        if !run["data"]["terminal_kind"].is_null()
+            && !run["data"]["session"]["stop_outcome"].is_null()
+        {
+            break run;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{run}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    let pgid: i32 = query_own(&fixture, &format!("SELECT pgid FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id='{stop_run}'")).await[0].get(0);
+    let group_empty = rustix::process::test_kill_process_group(Pid::from_raw(pgid).unwrap())
+        == Err(rustix::io::Errno::SRCH);
+    report.set(
+        "step_cancel",
+        serde_json::json!({"terminal_kind": stopped["data"]["terminal_kind"], "end_reason": stopped["data"]["session"]["end_reason"], "stop_outcome": stopped["data"]["session"]["stop_outcome"], "process_group_empty": group_empty}),
+    );
+    assert_eq!(stopped["data"]["terminal_kind"], "cancelled");
+    assert_eq!(stopped["data"]["session"]["end_reason"], "stop_requested");
+    assert_eq!(stopped["data"]["session"]["stop_outcome"], "confirmed");
+    assert!(group_empty);
+    let counts = query_own(&fixture, "SELECT (SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session' AND init_at IS NOT NULL),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission' AND decision='allow'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission' AND decision='deny'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission' AND decided_via='readonly_rule')").await;
+    let count_at = |index: usize| counts[0].get::<_, i64>(index);
+    report.set(
+        "event_counts",
+        serde_json::json!({"sessions": count_at(0), "system_init": count_at(1), "permission_requests": count_at(2), "allow": count_at(3), "deny": count_at(4), "readonly_allow": count_at(5)}),
+    );
+
+    // (8) The daemon stops and releases everything it owned.
+    second.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}

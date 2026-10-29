@@ -203,7 +203,11 @@ pub(crate) async fn handle(mut stream: UnixStream, state: Arc<ControlState>) {
     };
     handle_with_uid(&mut stream, state, uid).await;
 }
-async fn handle_with_uid(stream: &mut UnixStream, state: Arc<ControlState>, observed_uid: u32) {
+pub(crate) async fn handle_with_uid(
+    stream: &mut UnixStream,
+    state: Arc<ControlState>,
+    observed_uid: u32,
+) {
     if observed_uid != config::uid() {
         reject(&state);
         return;
