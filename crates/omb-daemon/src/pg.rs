@@ -39,6 +39,9 @@ pub(crate) fn map_store_error(error: omb_store::StoreError) -> DaemonError {
         | omb_store::StoreError::DispatchFailed
         | omb_store::StoreError::GapFailed
         | omb_store::StoreError::HostSessionFailed => DaemonError::InternalError,
+        omb_store::StoreError::DeliveryFailed
+        | omb_store::StoreError::SweepFailed
+        | omb_store::StoreError::ReconcileFailed => DaemonError::InternalError,
     }
 }
 fn ready_result<T>(deadline: Instant, result: Result<T, DaemonError>) -> Result<T, DaemonError> {
@@ -1126,5 +1129,16 @@ mod tests {
         child.kill().await.unwrap();
         child.wait().await.unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn map_store_error_maps_delivery_sweep_and_reconcile_failures_to_internal_error() {
+        for error in [
+            omb_store::StoreError::DeliveryFailed,
+            omb_store::StoreError::SweepFailed,
+            omb_store::StoreError::ReconcileFailed,
+        ] {
+            assert_eq!(map_store_error(error), DaemonError::InternalError);
+        }
     }
 }

@@ -1,18 +1,28 @@
 //! Daemon wiring of the channel receivers, the dispatcher, the heartbeat and the status segment.
+use crate::reconcile::{self, REPLAY_DEADLINE, Reconciler};
 use crate::{
     ChannelCounters, ChannelStatus, DaemonError, GapStatus,
     engine::Engine,
-    pg::{AuthorityConnection, Postgres},
+    pg::{AuthorityConnection, Postgres, map_store_error},
 };
 use omb_channels::{
     CHANNEL_NOTE, CancelRequests, Connection, Counters, ReceiverContext, Task, TelegramEndpoint,
     Timings, start_dispatcher, start_heartbeat, start_receiver,
 };
+use omb_channels::{SenderContext, start_sender};
+use omb_hostdriver::{CC_KILL_GRACE, CC_TERM_GRACE};
 use omb_store::{Channel, ReceiverRow};
+use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::ActorId;
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
-use std::sync::{Arc, atomic::Ordering};
-use tokio::{sync::Notify, task::JoinHandle};
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::Ordering},
+};
+use tokio::{
+    sync::{Notify, mpsc},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 /// Read side of the status channel segment: its own connection plus the receivers' counters.
@@ -77,8 +87,15 @@ impl StatusSource {
     }
 }
 
+/// What the outbound side starts from: the engine's terminal notices and the configured host
+/// binary that startup reconciliation compares orphan process-group leaders with.
+pub(crate) struct Outbound {
+    pub(crate) terminals: mpsc::Receiver<RunTerminalNotice>,
+    pub(crate) crabcode: Option<PathBuf>,
+}
+
 /// The running receiver with its binding, the dispatcher and heartbeat, the context every
-/// receiver starts with, and the status connection.
+/// receiver starts with, the status connection, the outbound sender and the sweeper.
 pub(crate) struct Channels {
     receiver: Option<(Uuid, Task)>,
     context: ReceiverContext,
@@ -86,10 +103,12 @@ pub(crate) struct Channels {
     heartbeat: Task,
     status: Arc<tokio_postgres::Client>,
     status_driver: JoinHandle<Result<(), tokio_postgres::Error>>,
+    sender: Task,
+    sweeper: Task,
 }
 impl Channels {
-    /// Records startup gaps, then starts the heartbeat, the dispatcher and each active receiver,
-    /// every one on its own connection.
+    /// Records startup gaps, reconciles the store, then starts the heartbeat, the dispatcher, each
+    /// active receiver, the outbound sender and the sweeper, every one on its own connection.
     pub(crate) async fn start(
         postgres: &mut Postgres,
         engine: &Engine,
@@ -97,6 +116,7 @@ impl Channels {
         timings: Timings,
         endpoint: TelegramEndpoint,
         cancel: CancelRequests,
+        outbound: Outbound,
     ) -> Result<Self, DaemonError> {
         postgres.record_startup_gaps(token_id).await?;
         let receivers = postgres.list_active_receivers(Channel::Telegram).await?;
@@ -114,7 +134,7 @@ impl Channels {
                 .open_resident_connection("openmybot-heartbeat")
                 .await?,
         );
-        let dispatcher = connection(
+        let mut dispatcher = connection(
             postgres
                 .open_resident_connection("openmybot-dispatcher")
                 .await?,
@@ -134,6 +154,16 @@ impl Channels {
             )),
             None => None,
         };
+        let delivery = connection(
+            postgres
+                .open_resident_connection("openmybot-delivery")
+                .await?,
+        );
+        let sweeper = connection(
+            postgres
+                .open_resident_connection("openmybot-sweeper")
+                .await?,
+        );
         let wake = Arc::new(Notify::new());
         let context = ReceiverContext {
             vault: engine.vault.clone(),
@@ -144,12 +174,33 @@ impl Channels {
             wake: Arc::clone(&wake),
             cancel,
         };
+        let reconciler = Reconciler {
+            application: engine.assembly.application.clone(),
+            resolver: engine.resolver.clone(),
+            crabcode: outbound.crabcode,
+            term_grace: CC_TERM_GRACE,
+            kill_grace: CC_KILL_GRACE,
+            replay_deadline: REPLAY_DEADLINE,
+            wake: Arc::clone(&wake),
+        };
+        reconcile::startup(&mut dispatcher.client, &reconciler)
+            .await
+            .map_err(map_store_error)?;
+        let sender = SenderContext {
+            vault: engine.vault.clone(),
+            owner: ActorId::new(SINGLE_USER_ACTOR_ID),
+            endpoint: context.endpoint.clone(),
+            timings,
+            wake: Arc::clone(&wake),
+        };
         Ok(Self {
             heartbeat: start_heartbeat(heartbeat, token_id, timings),
             dispatcher: start_dispatcher(dispatcher, entry, timings, wake),
             receiver: receiver.map(|(row, opened)| {
                 (row.binding_id, start_receiver(opened, row, context.clone()))
             }),
+            sender: start_sender(delivery, sender, outbound.terminals),
+            sweeper: reconcile::start_sweeper(sweeper, reconciler, timings),
             context,
             status: Arc::new(status.client),
             status_driver: status.driver,
@@ -160,6 +211,10 @@ impl Channels {
             client: Arc::clone(&self.status),
             counters: Arc::clone(&self.context.counters),
         }
+    }
+    /// The dispatcher's wake-up, shared with the receiver, the sender and the reconciler.
+    pub(crate) fn wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.context.wake)
     }
     /// Stops the running receiver, then starts `row` on a new resident connection.
     pub(crate) async fn start_receiver(
@@ -194,19 +249,24 @@ impl Channels {
             task.stop().await;
         }
     }
-    /// Resolves with `internal_error` when the heartbeat or the dispatcher ends, or a receiver
-    /// fails; a receiver that stopped itself after suspension or deactivation is only removed.
+    /// Resolves with `internal_error` when the heartbeat, the dispatcher, the sender or the
+    /// sweeper ends, or a receiver fails; a receiver that stopped itself after suspension or
+    /// deactivation is only removed.
     pub(crate) async fn finished(&mut self) -> DaemonError {
         let Self {
             receiver,
             dispatcher,
             heartbeat,
+            sender,
+            sweeper,
             ..
         } = self;
         loop {
             let ended = tokio::select! {
                 _ = heartbeat.finished() => return DaemonError::InternalError,
                 _ = dispatcher.finished() => return DaemonError::InternalError,
+                _ = sender.finished() => return DaemonError::InternalError,
+                _ = sweeper.finished() => return DaemonError::InternalError,
                 ended = async {
                     match receiver.as_mut() {
                         Some((_, task)) => task.finished().await,
@@ -220,12 +280,14 @@ impl Channels {
             *receiver = None;
         }
     }
-    /// Stops the receiver, the dispatcher and the heartbeat in that order, then ends the status
-    /// connection that request handlers may still share.
+    /// Stops the receiver, the sender, the sweeper, the dispatcher and the heartbeat in that
+    /// order, then ends the status connection that request handlers may still share.
     pub(crate) async fn stop(self) {
         if let Some((_, receiver)) = self.receiver {
             receiver.stop().await;
         }
+        self.sender.stop().await;
+        self.sweeper.stop().await;
         self.dispatcher.stop().await;
         self.heartbeat.stop().await;
         self.status_driver.abort();
@@ -236,17 +298,29 @@ impl Channels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::{Op, Ops};
     use crate::{
         StatusSnapshot,
         delegation::fixture::{self, Fixture},
     };
+    use crate::{
+        agent::{
+            AgentRuntime,
+            tests::{self as agent, Run},
+        },
+        reconcile::tests as rt,
+    };
     use omb_channels::OMB_REPLY_TEXTS_V1;
-    use omb_channels::{CANCEL_QUEUE, testkit::FakeTelegram};
+    use omb_channels::{CANCEL_QUEUE, TERMINAL_QUEUE, testkit::FakeTelegram};
+    use omb_hostdriver::WorkspaceRoots;
+    use omb_store::testkit;
     use omb_store::{
         AcceptOutcome, Command, Content, Disposition, IdentityKey, NormalizedEvent, PairStart,
         PollGapReason, accept_event, open_poll_gap, pair_start,
     };
+    use openbot_application::RunTerminalKind;
     use openbot_application::{BeginDelegatedThreadRun, DelegatedUntrustedMaterial};
+    use openbot_contracts::command::CancelThreadRun;
     use openbot_contracts::{
         auth::DelegationSource,
         command::{AppCommand, AppReply},
@@ -259,6 +333,13 @@ mod tests {
 
     fn cancel() -> CancelRequests {
         tokio::sync::mpsc::channel(CANCEL_QUEUE).0
+    }
+    /// The outbound side on a queue of its own, without a configured host binary.
+    fn outbound() -> Outbound {
+        Outbound {
+            terminals: mpsc::channel(TERMINAL_QUEUE).1,
+            crabcode: None,
+        }
     }
 
     fn deadline() -> tokio::time::Instant {
@@ -784,6 +865,7 @@ mod tests {
             quick(),
             refused_endpoint(),
             cancel(),
+            outbound(),
         )
         .await
         .unwrap();
@@ -829,6 +911,7 @@ mod tests {
             quick(),
             refused_endpoint(),
             cancel(),
+            outbound(),
         )
         .await
         .unwrap();
@@ -983,6 +1066,7 @@ mod tests {
             quick(),
             fake.endpoint(),
             cancel(),
+            outbound(),
         )
         .await
         .unwrap();
@@ -1017,6 +1101,7 @@ mod tests {
             quick(),
             fake.endpoint(),
             cancel(),
+            outbound(),
         )
         .await
         .unwrap();
@@ -1094,6 +1179,802 @@ mod tests {
         }
         receivers_reach(&client, 1).await;
         channels.stop().await;
+        fixture.stop().await;
+    }
+
+    // ---- Outbound delivery and reconciliation --------------------------------------------
+
+    /// Starts the channel tasks on the fixture's store and engine.
+    async fn started(
+        fixture: &mut Fixture,
+        token: Uuid,
+        timings: Timings,
+        endpoint: TelegramEndpoint,
+        outbound: Outbound,
+    ) -> Channels {
+        let engine = fixture.engine.as_ref().unwrap();
+        Channels::start(
+            &mut fixture.pg,
+            engine,
+            token,
+            timings,
+            endpoint,
+            cancel(),
+            outbound,
+        )
+        .await
+        .unwrap()
+    }
+    /// Channel timings with a short delivery poll.
+    fn outbound_timings() -> Timings {
+        Timings {
+            delivery_poll: Duration::from_millis(50),
+            ..quick()
+        }
+    }
+    fn slow(root: &std::path::Path) -> omb_hostdriver::HostDriverConfig {
+        agent::host(
+            root,
+            "slow_result",
+            agent::quick(),
+            &[("FAKE_CRABCODE_DELAY_MS", "1500")],
+        )
+    }
+    async fn cancel_run(fixture: &Fixture, run: &Run) {
+        let engine = fixture.engine();
+        engine
+            .assembly
+            .application
+            .execute(
+                engine.resolver.local_context().unwrap(),
+                AppCommand::CancelThreadRun(CancelThreadRun {
+                    thread_id: run.thread.clone(),
+                    run_id: run.run.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    /// Waits for the engine's terminal notice of `run` on the fixture's queue.
+    async fn noticed(
+        terminals: &mut mpsc::Receiver<RunTerminalNotice>,
+        run: &Run,
+    ) -> RunTerminalKind {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                let notice = terminals.recv().await.unwrap();
+                if notice.run_id == run.run {
+                    return notice.terminal;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    /// A run of an `unconfirmable` host on a sender binding, cancelled until the engine requires
+    /// reconciliation; its notice is consumed here, so no sender sees it.
+    async fn unconfirmed(fixture: &mut Fixture, client: &Client) -> (Uuid, Run) {
+        let mut terminals = fixture.take_terminals();
+        let (binding, thread) = rt::sender(fixture, client, "telegram").await;
+        let run = rt::begun(fixture, client, binding, &thread).await;
+        agent::initialized(client, &run.run).await;
+        cancel_run(fixture, &run).await;
+        assert_eq!(
+            noticed(&mut terminals, &run).await,
+            RunTerminalKind::ReconciliationRequired
+        );
+        let engine = fixture.engine();
+        let conversation = engine
+            .assembly
+            .application
+            .execute(
+                engine.resolver.local_context().unwrap(),
+                AppCommand::GetThreadConversation {
+                    thread_id: run.thread.clone(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                conversation,
+                Err(openbot_contracts::error::AppError::DependencyUnavailable { .. })
+            ),
+            "{conversation:?}"
+        );
+        (binding, run)
+    }
+    fn kill_group(row: &serde_json::Value) {
+        let pgid = rustix::process::Pid::from_raw(row["pgid"].as_i64().unwrap() as i32).unwrap();
+        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+    }
+    /// A private Telegram text message from the paired chat `42`.
+    fn update(id: u64, text: &str) -> serde_json::Value {
+        serde_json::json!({"update_id": id, "message": {"message_id": id, "date": chrono::Utc::now().timestamp(), "from": {"id": 42, "is_bot": false}, "chat": {"id": 42, "type": "private"}, "text": text}})
+    }
+    async fn event_by_key(client: &Client, key: &str) -> serde_json::Value {
+        let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = client
+                .query(
+                    "SELECT row_to_json(e) FROM openmybot.channel_events e WHERE event_key=$1",
+                    &[&key],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = found.first() {
+                return row.get(0);
+            }
+            assert!(tokio::time::Instant::now() < limit, "event {key} deadline");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    async fn application_names(client: &Client) -> Vec<String> {
+        client
+            .query(
+                "SELECT application_name FROM pg_stat_activity WHERE application_name LIKE 'openmybot-%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+    const FAIL_ROW: &str = "CREATE FUNCTION openmybot.fail_row() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'test failure'; END$$";
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn channels_start_marks_sending_deliveries_unknown_and_sends_nothing() {
+        let mut fixture = Fixture::start().await;
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        rt::sealed(&fixture, &client).await;
+        let binding =
+            testkit::insert_sender(&client, "telegram", "1001", "telegram:42", "T1").await;
+        let row = testkit::insert_delivery(
+            &client,
+            binding,
+            "control_reply",
+            "control_reply:1",
+            Some("reply"),
+            "sending",
+            None,
+        )
+        .await;
+        let timings = outbound_timings();
+        let channels = started(&mut fixture, token, timings, fake.endpoint(), outbound()).await;
+        let stored = testkit::read_row(&client, "deliveries", "delivery_id", row).await;
+        assert_eq!(stored["status"], "unknown");
+        assert_eq!(stored["last_error_code"], "daemon_restart");
+        assert!(stored["finished_at"].is_string());
+        tokio::time::sleep(timings.delivery_poll * 4).await;
+        assert!(fake.calls("sendMessage").is_empty());
+        assert_eq!(
+            testkit::read_row(&client, "deliveries", "delivery_id", row).await,
+            stored
+        );
+        channels.stop().await;
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn channels_start_backfills_terminal_and_result_row_from_the_replayed_journal() {
+        let mut fixture = Fixture::start_with_host(slow).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        // The notices are lost: nobody receives from the engine's queue.
+        drop(fixture.take_terminals());
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        // One sender per channel: the host resolves a binding's oldest run without a terminal.
+        let (telegram, thread) = rt::sender(&fixture, &client, "telegram").await;
+        let done = rt::begun(&fixture, &client, telegram, &thread).await;
+        agent::settled(&fixture, &thread).await;
+        let (feishu, other) = rt::sender(&fixture, &client, "feishu").await;
+        let stopped = rt::begun(&fixture, &client, feishu, &other).await;
+        agent::initialized(&client, &stopped.run).await;
+        cancel_run(&fixture, &stopped).await;
+        agent::settled(&fixture, &other).await;
+        for run in [&done, &stopped] {
+            assert!(rt::event(&client, &run.run).await["terminal_kind"].is_null());
+        }
+        let channels = started(
+            &mut fixture,
+            token,
+            outbound_timings(),
+            refused_endpoint(),
+            outbound(),
+        )
+        .await;
+        for (run, kind) in [(&done, "succeeded"), (&stopped, "cancelled")] {
+            assert_eq!(rt::event(&client, &run.run).await["terminal_kind"], kind);
+            assert_eq!(rt::results(&client, &run.run).await.len(), 1);
+        }
+        channels.stop().await;
+        runtime.stop().await;
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn startup_backfills_reconciliation_required_although_the_conversation_read_is_unavailable()
+     {
+        let mut fixture = Fixture::start_with_host(agent::unconfirmable).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        let mut client = fixture.client().await;
+        let (_, run) = unconfirmed(&mut fixture, &client).await;
+        assert!(rt::event(&client, &run.run).await["terminal_kind"].is_null());
+        reconcile::startup(&mut client, &rt::reconciler(&fixture))
+            .await
+            .unwrap();
+        assert_eq!(
+            rt::event(&client, &run.run).await["terminal_kind"],
+            "reconciliation_required"
+        );
+        let rows = rt::results(&client, &run.run).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "pending");
+        kill_group(&agent::session(&client, &run.run).await);
+        runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn startup_replay_is_bounded_by_the_replay_deadline() {
+        let mut fixture = Fixture::start_with_host(agent::unconfirmable).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        let mut client = fixture.client().await;
+        let (binding, run) = unconfirmed(&mut fixture, &client).await;
+        // Another dispatched run on the same thread whose terminal never enters the journal.
+        let ghost = RunId::new(format!("run-{}", Uuid::now_v7()));
+        let record = testkit::insert_event_for_run(
+            &client,
+            binding,
+            ghost.as_str(),
+            run.thread.as_str(),
+            "dispatched",
+        )
+        .await;
+        testkit::shift_event(&client, record, "dispatched_at", 0.0).await;
+        let reconciler = Reconciler {
+            replay_deadline: Duration::from_millis(300),
+            ..rt::reconciler(&fixture)
+        };
+        let started = tokio::time::Instant::now();
+        reconcile::startup(&mut client, &reconciler).await.unwrap();
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        assert!(rt::event(&client, &ghost).await["terminal_kind"].is_null());
+        assert!(rt::results(&client, &ghost).await.is_empty());
+        assert_eq!(
+            rt::event(&client, &run.run).await["terminal_kind"],
+            "reconciliation_required"
+        );
+        kill_group(&agent::session(&client, &run.run).await);
+        runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn engine_notifies_the_terminal_queue_for_a_finished_run() {
+        let mut fixture = Fixture::start_with_host(rt::happy).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        let mut terminals = fixture.take_terminals();
+        let (run, client) = agent::begin(&mut fixture).await;
+        assert_eq!(
+            noticed(&mut terminals, &run).await,
+            RunTerminalKind::Succeeded
+        );
+        runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn notice_after_the_queue_receiver_is_closed_is_dropped_and_shutdown_is_clean() {
+        let mut fixture = Fixture::start_with_host(rt::happy).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        drop(fixture.take_terminals());
+        let (run, client) = agent::begin(&mut fixture).await;
+        let snapshot = agent::settled(&fixture, &run.thread).await;
+        assert_eq!(snapshot.active_run_id, None);
+        assert_eq!(
+            agent::session(&client, &run.run).await["end_reason"],
+            "result_success"
+        );
+        runtime.stop().await;
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(60), fixture.stop())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn start_opens_delivery_and_sweeper_connections_and_stop_closes_them_before_the_dispatcher()
+     {
+        let mut fixture = Fixture::start().await;
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        rt::sealed(&fixture, &client).await;
+        let channels = started(
+            &mut fixture,
+            token,
+            outbound_timings(),
+            fake.endpoint(),
+            outbound(),
+        )
+        .await;
+        let six = [
+            "openmybot-heartbeat",
+            "openmybot-dispatcher",
+            "openmybot-status",
+            "openmybot-receiver",
+            "openmybot-delivery",
+            "openmybot-sweeper",
+        ];
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let names = application_names(&client).await;
+            if six.iter().all(|name| names.iter().any(|seen| seen == name)) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < limit, "{names:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stopping = tokio::spawn(channels.stop());
+        // The poll at which each connection was first seen gone.
+        let mut gone = [None; 3];
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        for poll in 0_usize.. {
+            let names = application_names(&client).await;
+            for (slot, name) in gone.iter_mut().zip([
+                "openmybot-delivery",
+                "openmybot-sweeper",
+                "openmybot-dispatcher",
+            ]) {
+                if slot.is_none() && !names.iter().any(|seen| seen == name) {
+                    *slot = Some(poll);
+                }
+            }
+            if stopping.is_finished() && !names.iter().any(|seen| six.contains(&seen.as_str())) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < limit, "{names:?}");
+        }
+        stopping.await.unwrap();
+        let [delivery, sweeper, dispatcher] = gone.map(Option::unwrap);
+        assert!(delivery <= dispatcher, "{gone:?}");
+        assert!(sweeper <= dispatcher, "{gone:?}");
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn finished_reports_internal_error_when_the_sender_or_the_sweeper_ends() {
+        let mut fixture = Fixture::start().await;
+        let client = fixture.client().await;
+        let binding =
+            testkit::insert_sender(&client, "telegram", "1001", "telegram:42", "T1").await;
+        client.batch_execute(FAIL_ROW).await.unwrap();
+        // The sender fails on its claim update.
+        let first = token(&mut fixture).await;
+        let mut channels = started(
+            &mut fixture,
+            first,
+            outbound_timings(),
+            refused_endpoint(),
+            outbound(),
+        )
+        .await;
+        client.batch_execute("CREATE TRIGGER fail_update BEFORE UPDATE ON openmybot.deliveries FOR EACH ROW EXECUTE FUNCTION openmybot.fail_row()").await.unwrap();
+        testkit::insert_delivery(
+            &client,
+            binding,
+            "control_reply",
+            "control_reply:1",
+            Some("reply"),
+            "pending",
+            None,
+        )
+        .await;
+        let ended = tokio::time::timeout(Duration::from_secs(10), channels.finished())
+            .await
+            .unwrap();
+        assert_eq!(ended, DaemonError::InternalError);
+        channels.stop().await;
+        client
+            .batch_execute(
+                "DROP TRIGGER fail_update ON openmybot.deliveries; DELETE FROM openmybot.deliveries",
+            )
+            .await
+            .unwrap();
+        // The sweeper fails on its first deletion.
+        let second = token(&mut fixture).await;
+        let mut channels = started(
+            &mut fixture,
+            second,
+            Timings {
+                sweep_interval: Duration::from_millis(150),
+                tombstone_retention: Duration::from_secs(20),
+                ..outbound_timings()
+            },
+            refused_endpoint(),
+            outbound(),
+        )
+        .await;
+        client.batch_execute("CREATE TRIGGER fail_delete BEFORE DELETE ON openmybot.channel_events FOR EACH ROW EXECUTE FUNCTION openmybot.fail_row()").await.unwrap();
+        let old =
+            testkit::insert_event_for_run(&client, binding, "run-old", "T1", "conflict").await;
+        testkit::shift_event(&client, old, "accepted_at", -60.0).await;
+        let ended = tokio::time::timeout(Duration::from_secs(10), channels.finished())
+            .await
+            .unwrap();
+        assert_eq!(ended, DaemonError::InternalError);
+        channels.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn e2e_happy_run_sends_one_result_message_through_the_same_endpoint() {
+        let mut fixture = Fixture::start_with_host(rt::happy).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        rt::sealed(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
+        let terminals = fixture.take_terminals();
+        let channels = started(
+            &mut fixture,
+            token,
+            outbound_timings(),
+            fake.endpoint(),
+            Outbound {
+                terminals,
+                crabcode: None,
+            },
+        )
+        .await;
+        let run = rt::begun(&fixture, &client, binding, &thread).await;
+        rt::messages(&fake, 1).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let sent = fake.sent_messages();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].chat_id, 42);
+        assert_eq!(sent[0].path, format!("/bot{}/sendMessage", rt::TOKEN));
+        assert!(!sent[0].has_parse_mode);
+        assert_eq!(
+            sent[0].text,
+            format!(
+                "[OpenMyBot] 已完成 · run {}\nhello from fake",
+                &run.run.as_str()[..8]
+            )
+        );
+        assert!(!fake.calls("getUpdates").is_empty());
+        let rows = rt::results(&client, &run.run).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "sent");
+        assert_eq!(
+            rt::event(&client, &run.run).await["terminal_kind"],
+            "succeeded"
+        );
+        channels.stop().await;
+        runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn e2e_permission_run_sends_notice_then_result_with_artifacts_after_cli_approve() {
+        let mut fixture = Fixture::start_with_host(rt::asking).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        rt::sealed(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
+        let terminals = fixture.take_terminals();
+        let channels = started(
+            &mut fixture,
+            token,
+            outbound_timings(),
+            fake.endpoint(),
+            Outbound {
+                terminals,
+                crabcode: None,
+            },
+        )
+        .await;
+        let run = rt::begun(&fixture, &client, binding, &thread).await;
+        let id = rt::permission_of(&client, &run.run).await;
+        let notice = rt::messages(&fake, 1).await;
+        assert!(notice[0].contains(&id), "{notice:?}");
+        assert_eq!(
+            testkit::decide(&client, &id, omb_store::Decision::Allow).await,
+            omb_store::Decided::Decided
+        );
+        let sent = rt::messages(&fake, 2).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(fake.sent_messages().len(), 2);
+        let result = &sent[1];
+        assert!(
+            result.starts_with(&format!(
+                "[OpenMyBot] 已完成 · run {}",
+                &run.run.as_str()[..8]
+            )),
+            "{result}"
+        );
+        let (_, artifacts) = result.split_once("\n成果：").unwrap();
+        assert_eq!(artifacts, "approved.txt");
+        assert!(!result.contains(fixture.root.to_str().unwrap()), "{result}");
+        channels.stop().await;
+        runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn e2e_expired_permission_notice_is_sent_and_late_approve_is_not_pending() {
+        let mut fixture = Fixture::start_with_host(rt::asking).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        rt::sealed(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
+        let run = rt::begun(&fixture, &client, binding, &thread).await;
+        let id = rt::permission_of(&client, &run.run).await;
+        let body: String = client
+            .query_one(
+                "SELECT body FROM openmybot.deliveries WHERE kind='permission_notice' AND idempotency_key LIKE '%'||$1",
+                &[&id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        // The owner never answers; the daemon starts and stops the run's permission.
+        let terminals = fixture.take_terminals();
+        let channels = started(
+            &mut fixture,
+            token,
+            outbound_timings(),
+            fake.endpoint(),
+            Outbound {
+                terminals,
+                crabcode: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            testkit::permission_row_json(&client, &id).await["decided_via"],
+            "run_stopped"
+        );
+        let sent = rt::messages(&fake, 1).await;
+        assert_eq!(sent[0], body);
+        assert_eq!(
+            testkit::decide(&client, &id, omb_store::Decision::Allow).await,
+            omb_store::Decided::NotPending
+        );
+        agent::settled(&fixture, &thread).await;
+        channels.stop().await;
+        runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn e2e_unconfirmable_stop_writes_reconciliation_required_and_keeps_later_events_pending()
+    {
+        let mut fixture = Fixture::start_with_host(agent::unconfirmable).await;
+        let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
+        let token = token(&mut fixture).await;
+        let client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        rt::sealed(&fixture, &client).await;
+        let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
+        let terminals = fixture.take_terminals();
+        let channels = started(
+            &mut fixture,
+            token,
+            outbound_timings(),
+            fake.endpoint(),
+            Outbound {
+                terminals,
+                crabcode: None,
+            },
+        )
+        .await;
+        let run = rt::begun(&fixture, &client, binding, &thread).await;
+        agent::initialized(&client, &run.run).await;
+        cancel_run(&fixture, &run).await;
+        let sent = rt::messages(&fake, 1).await;
+        assert!(
+            sent[0].starts_with(&format!(
+                "[OpenMyBot] 结果未知，在本机执行 openmybot status --run {} 核对 · run {}",
+                run.run.as_str(),
+                &run.run.as_str()[..8]
+            )),
+            "{sent:?}"
+        );
+        assert_eq!(
+            rt::event(&client, &run.run).await["terminal_kind"],
+            "reconciliation_required"
+        );
+        // A later message of the same sender stays pending on the paused thread.
+        fake.push_update(update(2, "after the unknown stop"));
+        let later = event_by_key(&client, "2").await;
+        assert_eq!(later["thread_id"], thread.as_str());
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            event_by_key(&client, "2").await["dispatch_status"],
+            "pending"
+        );
+        // Moved to a fresh thread by the control operation, it is dispatched without a further
+        // inbound message.
+        let control = fixture
+            .pg
+            .open_resident_connection("openmybot-control")
+            .await
+            .unwrap();
+        let engine = fixture.engine();
+        let ops = Ops {
+            control: tokio::sync::Mutex::new(control.client),
+            application: engine.assembly.application.clone(),
+            resolver: engine.resolver.clone(),
+            vault: engine.vault.clone(),
+            owner: ActorId::new(SINGLE_USER_ACTOR_ID),
+            roots: WorkspaceRoots::parse(
+                &fixture.root.join("home"),
+                &[fixture.root.join("home/ws")],
+            )
+            .unwrap(),
+            endpoint: fake.endpoint(),
+            receiver: mpsc::channel(8).0,
+            wake: channels.wake(),
+        };
+        ops.run(
+            Op::BindingsResetThread,
+            serde_json::json!({"binding_id": binding.to_string(), "ack_unknown": run.run.as_str()}),
+            deadline(),
+            token,
+        )
+        .await
+        .unwrap();
+        let fresh: String = client
+            .query_one(
+                "SELECT thread_id FROM openmybot.channel_bindings WHERE binding_id=$1",
+                &[&binding],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_ne!(fresh, thread.as_str());
+        let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let moved = event_by_key(&client, "2").await;
+            if moved["dispatch_status"] == "dispatched" {
+                assert_eq!(moved["thread_id"], fresh.as_str());
+                break;
+            }
+            assert!(tokio::time::Instant::now() < limit, "{moved}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let sessions = client
+            .query(
+                "SELECT row_to_json(h) FROM openmybot.host_driver_sessions h WHERE record_kind='session' AND pgid IS NOT NULL",
+                &[],
+            )
+            .await
+            .unwrap();
+        for row in sessions {
+            kill_group(&row.get(0));
+        }
+        drop(ops);
+        channels.stop().await;
+        runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn e2e_pairing_reply_and_control_reply_are_sent_to_the_chat() {
+        let mut fixture = Fixture::start_with_bot().await;
+        let token = token(&mut fixture).await;
+        let (mut client, _) = paired(&mut fixture).await;
+        let receiver: Uuid = client
+            .query_one(
+                "SELECT binding_id FROM openmybot.channel_bindings WHERE binding_kind='receiver'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        resealed(&fixture, &client, receiver, rt::TOKEN).await;
+        let now = client
+            .query_one("SELECT statement_timestamp()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let status = NormalizedEvent {
+            channel: Channel::Telegram,
+            source_key: "1001".into(),
+            event_key: "20".into(),
+            event_type: "telegram.message".into(),
+            occurred_at: Some(now),
+            private: true,
+            sender: IdentityKey::parse("telegram:42"),
+            chat: IdentityKey::parse("telegram:42"),
+            fingerprint: Some([20; 32]),
+            content: Content::Text {
+                text: "/status".into(),
+                command: Some(Command::Status),
+                pair_code: None,
+            },
+        };
+        assert_eq!(
+            accept_event(
+                &mut client,
+                receiver,
+                &status,
+                &OMB_REPLY_TEXTS_V1,
+                deadline()
+            )
+            .await
+            .unwrap(),
+            AcceptOutcome::Recorded(Disposition::ControlCommand)
+        );
+        let fake = FakeTelegram::start().await;
+        let channels = started(
+            &mut fixture,
+            token,
+            outbound_timings(),
+            fake.endpoint(),
+            outbound(),
+        )
+        .await;
+        let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+        let rows = loop {
+            let rows: Vec<(String, String, String)> = client
+                .query(
+                    "SELECT kind,body,status FROM openmybot.deliveries WHERE kind IN ('pairing_reply','control_reply') ORDER BY created_at",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.get(0), row.get(1), row.get(2)))
+                .collect();
+            if rows.len() == 2 && rows.iter().all(|(_, _, status)| status == "sent") {
+                break rows;
+            }
+            assert!(tokio::time::Instant::now() < limit, "{rows:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(rows[0].0, "pairing_reply");
+        assert_eq!(rows[1].0, "control_reply");
+        let sent = fake.sent_messages();
+        for (_, body, _) in &rows {
+            let message = sent.iter().find(|sent| &sent.text == body).unwrap();
+            assert_eq!(message.chat_id, 42);
+        }
+        channels.stop().await;
+        drop(client);
         fixture.stop().await;
     }
 }

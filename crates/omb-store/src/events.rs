@@ -1,7 +1,7 @@
 use crate::{
     ACCEPT_TX_BUDGET, AcceptedEvent, Channel, DISPATCH_QUEUE_MAX, EVENT_FUTURE_WINDOW,
-    EVENT_PAST_WINDOW, GAP_DISPLAY, IdentityKey, MSG_TEXT_MAX, OpenRun, PairAttempt, PairOutcome,
-    READ_BUDGET, StoreError, command, finish, pair_attempt, rows, timely,
+    EVENT_PAST_WINDOW, GAP_DISPLAY, GrantKind, IdentityKey, MSG_TEXT_MAX, OpenRun, PairAttempt,
+    PairOutcome, READ_BUDGET, StoreError, command, finish, pair_attempt, rows, timely,
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -622,6 +622,85 @@ pub async fn channel_status(client: &Client) -> Result<Vec<ReceiverStatus>, Stor
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalKind {
+    Succeeded,
+    Failed,
+    Cancelled,
+    ReconciliationRequired,
+}
+impl TerminalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::ReconciliationRequired => "reconciliation_required",
+        }
+    }
+}
+/// The binding facts of a run's event; `written` is false when a terminal was already recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalWrite {
+    pub written: bool,
+    pub binding_kind: GrantKind,
+    pub binding_id: Uuid,
+    pub chat_key: Option<String>,
+    pub channel_kind: String,
+}
+/// Records a run's terminal on its event and, for a sender binding, queues the run's single
+/// `run_result` delivery in the same transaction; `None` when no event carries the run.
+pub async fn record_terminal(
+    client: &mut Client,
+    run_id: &str,
+    kind: TerminalKind,
+    deadline: Instant,
+) -> Result<Option<TerminalWrite>, StoreError> {
+    let error = StoreError::DeliveryFailed;
+    let result = async {
+        command(client, "BEGIN", deadline, error).await?;
+        let written = !rows(client, "UPDATE openmybot.channel_events SET terminal_kind=$2, terminal_at=now() WHERE run_id=$1 AND terminal_kind IS NULL RETURNING binding_id", &[&run_id, &kind.as_str()], deadline, error).await?.is_empty();
+        let found = rows(client, "SELECT b.binding_id,b.binding_kind='host',b.chat_key,b.channel_kind FROM openmybot.channel_events e JOIN openmybot.channel_bindings b ON b.binding_id=e.binding_id WHERE e.run_id=$1", &[&run_id], deadline, error).await?;
+        let Some(row) = found.first() else {
+            return timely(deadline, Ok(None), error);
+        };
+        let terminal = TerminalWrite {
+            written,
+            binding_kind: if row.try_get::<_, bool>(1).map_err(|_| error)? {
+                GrantKind::Host
+            } else {
+                GrantKind::Sender
+            },
+            binding_id: row.try_get(0).map_err(|_| error)?,
+            chat_key: row.try_get(2).map_err(|_| error)?,
+            channel_kind: row.try_get(3).map_err(|_| error)?,
+        };
+        if written && terminal.binding_kind == GrantKind::Sender {
+            rows(client, "INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,status,created_at) SELECT gen_random_uuid(), b.binding_id, b.channel_kind, b.chat_key, 'run_result', 'result:'||$1, 'pending', now() FROM openmybot.channel_bindings b WHERE b.binding_id=$2 ON CONFLICT (idempotency_key) DO NOTHING", &[&run_id, &terminal.binding_id], deadline, error).await?;
+        }
+        timely(deadline, Ok(Some(terminal)), error)
+    }
+    .await;
+    finish(client, deadline, result, error).await
+}
+/// Dispatched runs of either binding kind whose event has no terminal, oldest dispatch first.
+pub async fn unfinished_runs(
+    client: &Client,
+    deadline: Instant,
+) -> Result<Vec<OpenRun>, StoreError> {
+    let error = StoreError::ReconcileFailed;
+    rows(client, "SELECT thread_id,run_id FROM openmybot.channel_events WHERE dispatch_status='dispatched' AND terminal_kind IS NULL AND run_id IS NOT NULL ORDER BY dispatched_at,record_id", &[], deadline, error)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(OpenRun {
+                thread_id: row.try_get(0).map_err(|_| error)?,
+                run_id: row.try_get(1).map_err(|_| error)?,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,4 +731,20 @@ mod tests {
         assert_ne!(run_id(trigger, binding), run_id(binding, trigger));
     }
     const RUN_VECTOR: &str = "3b5a3661-5a30-58d9-9995-50796e16f538";
+    #[test]
+    fn terminal_kind_strings_match_the_migration_check_values() {
+        let migration = include_str!("../migrations/omb_0001_initial.sql");
+        let check = migration
+            .lines()
+            .find(|line| line.contains("channel_events_check_20"))
+            .unwrap();
+        for kind in [
+            TerminalKind::Succeeded,
+            TerminalKind::Failed,
+            TerminalKind::Cancelled,
+            TerminalKind::ReconciliationRequired,
+        ] {
+            assert!(check.contains(&format!("'{}'", kind.as_str())), "{kind:?}");
+        }
+    }
 }
