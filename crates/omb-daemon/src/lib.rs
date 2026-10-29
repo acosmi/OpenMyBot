@@ -8,6 +8,8 @@ mod daemon;
 mod delegation;
 mod engine;
 mod init;
+#[cfg(test)]
+mod integration;
 mod ops;
 mod pairing;
 mod pg;

@@ -175,7 +175,7 @@ pub(crate) mod tests {
             ..Limits::default()
         }
     }
-    fn happy(root: &Path) -> HostDriverConfig {
+    pub(crate) fn happy(root: &Path) -> HostDriverConfig {
         host(root, "happy", quick(), &[])
     }
     pub(crate) fn cooperative(root: &Path) -> HostDriverConfig {
