@@ -714,7 +714,7 @@ mod tests {
             AgentRuntime,
             tests::{self as agent, Run},
         },
-        channels::Channels,
+        channels::{Channels, Outbound},
         delegation::{
             BOT_ID,
             fixture::{self, Fixture},
@@ -1103,6 +1103,7 @@ mod tests {
         async fn with_channels() -> Self {
             let mut env = Self::start().await;
             let (cancel, _) = mpsc::channel(CANCEL_QUEUE);
+            let terminals = env.fixture.take_terminals();
             env.channels = Some(
                 Channels::start(
                     &mut env.fixture.pg,
@@ -1111,6 +1112,10 @@ mod tests {
                     quick_channels(),
                     env.fake.endpoint(),
                     cancel,
+                    Outbound {
+                        terminals,
+                        crabcode: None,
+                    },
                 )
                 .await
                 .unwrap(),

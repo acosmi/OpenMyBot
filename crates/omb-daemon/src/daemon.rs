@@ -1,15 +1,16 @@
 use crate::{
     DaemonError, DaemonOptions, StatusSnapshot,
     agent::AgentRuntime,
-    channels::Channels,
+    channels::{Channels, Outbound},
     config,
     control::{self, ControlState, ENGINE_PIN},
     engine,
     ops::{BindingRunCanceller, Ops, ReceiverCommand},
     pg::{self, Postgres},
 };
-use omb_channels::{CANCEL_QUEUE, TelegramEndpoint, Timings};
+use omb_channels::{CANCEL_QUEUE, TERMINAL_QUEUE, TelegramEndpoint, TerminalQueue, Timings};
 use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow};
+use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::ActorId;
 use openbot_infra::{
     auth::single_user::SINGLE_USER_ACTOR_ID,
@@ -52,6 +53,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let prepared=engine::prepare(root,&config.deployment_id,&mut postgres).await?;
         let resident=postgres.open_resident_connection("omb-hostdriver").await?;
         host_link=Some(resident.driver);
+        let crabcode_binary=crabcode.binary.clone();
         let driver=host.insert(HostDriver::new(HostDriverConfig{binary:crabcode.binary,home,tmp_dir:root.join("hosts/crabcode/tmp"),roots:crabcode.roots.clone(),window:VersionWindow::embedded(),limits:Limits::default()},Arc::new(resident.client)));
         let token=config::hex_random(config::TOKEN_BYTES).map_err(|_|DaemonError::ControlTokenFailed)?;
         config::write_private(&root.join("run/control.token"),token.as_bytes(),true).map_err(|_|DaemonError::ControlTokenFailed)?;
@@ -59,7 +61,8 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         token_id=Some(current_token_id);
         let token_sha256:[u8;32]=sha2::Sha256::digest(token.as_bytes()).into();
         postgres.start_control_token(omb_store::ControlTokenStart{token_id:current_token_id,token_sha256,daemon_pid:i32::try_from(std::process::id()).map_err(|_|DaemonError::ControlTokenFailed)?,engine_pin:ENGINE_PIN,omb_version:env!("CARGO_PKG_VERSION")}).await?;
-        let assembled=engine.insert(engine::assemble(root,prepared,driver).await?);
+        let (queue,terminals)=mpsc::channel::<RunTerminalNotice>(TERMINAL_QUEUE);
+        let assembled=engine.insert(engine::assemble(root,prepared,driver,Some(Arc::new(TerminalQueue(queue)))).await?);
         agent=Some(AgentRuntime::start(assembled,postgres.database_config())?);
         let control_connection=postgres.open_resident_connection("openmybot-control").await?;
         control_link=Some(control_connection.driver);
@@ -67,7 +70,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let (cancel,requests)=mpsc::channel(CANCEL_QUEUE);
         let (receiver,mut commands)=mpsc::channel(8);
         let endpoint=TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()));
-        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),endpoint.clone(),cancel).await?);
+        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),endpoint.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary}).await?);
         canceller=Some(BindingRunCanceller::start(assembled.assembly.application.clone(),assembled.resolver.clone(),canceller_connection,requests));
         let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,endpoint,receiver};
         let path=root.join("run/control.sock");
