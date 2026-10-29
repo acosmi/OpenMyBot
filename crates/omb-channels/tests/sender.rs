@@ -1,7 +1,9 @@
 //! The outbound sender end to end: an own PostgreSQL 17.11 cluster, the loopback fake Bot API and
 //! a real credential vault.
 use omb_channels::{
-    ChannelError, Connection, SenderContext, Task, TelegramEndpoint, Timings, start_sender,
+    ChannelError, Connection, Endpoints, SenderContext, Task, TelegramEndpoint, Timings,
+    fake_feishu::FakeFeishu,
+    start_sender,
     testkit::{FakeTelegram, Reply, Sent},
 };
 use omb_store::{
@@ -83,6 +85,7 @@ struct Env {
     fixture: Fixture,
     session: Session,
     fake: FakeTelegram,
+    feishu: FakeFeishu,
     receiver: Uuid,
     sender: Uuid,
     wake: Arc<Notify>,
@@ -107,6 +110,7 @@ impl Env {
             fixture,
             session,
             fake: FakeTelegram::start().await,
+            feishu: FakeFeishu::start().await,
             receiver,
             sender,
             wake: Arc::new(Notify::new()),
@@ -131,7 +135,10 @@ impl Env {
             SenderContext {
                 vault: vault(),
                 owner: owner(),
-                endpoint,
+                endpoints: Endpoints {
+                    telegram: endpoint,
+                    feishu: self.feishu.endpoint(),
+                },
                 timings,
                 wake: Arc::clone(&self.wake),
             },
@@ -285,8 +292,19 @@ async fn sends_rows_in_created_at_order() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn feishu_rows_are_never_claimed() {
+async fn feishu_rows_are_claimed_and_sent_through_the_feishu_endpoint() {
     let mut env = Env::new().await;
+    let receiver = Uuid::now_v7();
+    let envelope = vault()
+        .seal(
+            &receiver,
+            SecretKind::Connector,
+            SecretPrincipal::Actor(owner()),
+            SecretPrincipal::Service(ServiceId::new("openmybot.feishu")),
+            &SecretBytes::new(b"feishu-secret".to_vec()),
+        )
+        .unwrap();
+    insert_receiver_with(env.client(), receiver, "feishu", "cli_a", &envelope).await;
     let feishu = insert_sender(env.client(), "feishu", "cli_a", "feishu:7", "T2").await;
     let id = insert_delivery(
         env.client(),
@@ -299,11 +317,10 @@ async fn feishu_rows_are_never_claimed() {
     )
     .await;
     let (task, _queue) = env.start(quick()).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let row = env.status(id, "sent").await;
     task.stop().await;
-    let row = env.row(id).await;
-    assert_eq!(row["status"], "pending");
-    assert_eq!(row["attempts"], 0);
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(env.feishu.sent_messages()[0].receive_id, "7");
     assert_eq!(env.fake.requests().len(), 0);
     env.stop().await;
 }

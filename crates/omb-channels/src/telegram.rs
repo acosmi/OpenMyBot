@@ -1,8 +1,8 @@
 //! Telegram Bot API long polling: boundary parsing, fingerprints, offsets and the receive loop.
 use crate::{
-    CancelRequests, ChannelError, Connection, Counters, OMB_REPLY_TEXTS_V1, STORE_BUDGET,
-    TG_HTTP_MARGIN, TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, Task, TelegramEndpoint,
-    Timings,
+    CancelRequests, ChannelError, Connection, Counters, Endpoints, OMB_REPLY_TEXTS_V1,
+    STORE_BUDGET, TG_HTTP_MARGIN, TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, Task,
+    TelegramEndpoint, Timings,
 };
 use omb_store::{
     ACCEPT_TX_BUDGET, AcceptOutcome, Channel, Command, Content, Disposition, IdentityKey,
@@ -244,7 +244,7 @@ fn verdict(status: u16, body: &[u8]) -> Verdict {
 pub struct ReceiverContext {
     pub vault: CredentialRecordVault,
     pub owner: ActorId,
-    pub endpoint: TelegramEndpoint,
+    pub endpoints: Endpoints,
     pub timings: Timings,
     pub counters: Arc<Counters>,
     pub wake: Arc<Notify>,
@@ -252,7 +252,7 @@ pub struct ReceiverContext {
 }
 
 /// Starts the long-poll loop of one active receiver.
-pub fn start_receiver(
+pub(crate) fn start_receiver(
     connection: Connection,
     receiver: ReceiverRow,
     context: ReceiverContext,
@@ -306,7 +306,7 @@ async fn receive(
             .await
             .map_err(store)?;
         let url = updates_url(
-            &context.endpoint,
+            &context.endpoints.telegram,
             token,
             next_offset(stored, memory, OffsetDateTime::now_utc()),
             timings.poll_timeout,
@@ -315,7 +315,7 @@ async fn receive(
             _ = &mut stop => return Ok(()),
             response = async {
                 let budget = SafeHttpBudget::new(TG_RESPONSE_MAX, timings.poll_timeout + TG_HTTP_MARGIN)?;
-                context.endpoint.dialer.execute(SafeHttpRequest::get(url, context.endpoint.scheme, budget)?).await
+                context.endpoints.telegram.dialer.execute(SafeHttpRequest::get(url, context.endpoints.telegram.scheme, budget)?).await
             } => response,
         };
         let (reason, delay) = match response.map(|r| verdict(r.status().as_u16(), r.body())) {
@@ -950,6 +950,7 @@ mod tests {
         .unwrap();
         let row = ReceiverRow {
             binding_id: uuid::Uuid::now_v7(),
+            channel: Channel::Telegram,
             source_key: "1001".into(),
             credential_envelope: sentinel.into(),
         };

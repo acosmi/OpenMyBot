@@ -1,19 +1,22 @@
 //! Outbound channel receivers, the delegated-run dispatcher and the daemon heartbeat.
 mod dispatcher;
+#[cfg(feature = "testkit")]
+pub mod fake_feishu;
+mod feishu;
 mod sender;
 mod telegram;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
 pub use dispatcher::start_dispatcher;
+pub use feishu::verify_feishu_credentials;
 pub use sender::{SenderContext, TerminalQueue, start_sender};
 pub use telegram::{
     CredentialProblem, FingerprintInput, Normalized, ReceiverContext, backoff, backoff_ceiling,
-    canonical_json, classify, fingerprint, next_offset, normalize, start_receiver,
-    verify_credentials,
+    canonical_json, classify, fingerprint, next_offset, normalize, verify_credentials,
 };
 
-use omb_store::{ReplyTexts, StateLabels, touch_heartbeat};
+use omb_store::{Channel, ReceiverRow, ReplyTexts, StateLabels, touch_heartbeat};
 use openbot_infra::net::safe_http::{SafeDialer, SchemePolicy};
 use std::{future::Future, sync::atomic::AtomicU64, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
@@ -51,6 +54,19 @@ pub const HTTP_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 pub const TOMBSTONE_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
 pub const CONTENT_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+/// A Feishu event is acknowledged only within this budget after its last fragment arrived.
+pub const FS_ACK_BUDGET: Duration = Duration::from_secs(2);
+/// A cached tenant token with less validity left is fetched again.
+pub const FS_TOKEN_MARGIN: Duration = Duration::from_secs(30 * 60);
+/// The long connection's ping interval until the platform's `PingInterval` replaces it.
+pub const FS_PING_INTERVAL: Duration = Duration::from_secs(120);
+/// The read deadline is twice the ping interval plus this grace after the last message.
+pub const FS_READ_GRACE: Duration = Duration::from_secs(5);
+pub const FS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Fragments of an event not completed within this time after the latest one are dropped.
+pub const FS_FRAGMENT_TTL: Duration = Duration::from_secs(5);
+/// Bytes of one WebSocket message or frame, and of one event reassembled from its fragments.
+pub const FS_FRAME_MAX: usize = 1024 * 1024;
 /// Capacity of the engine's terminal notices on their way to the sender.
 pub const TERMINAL_QUEUE: usize = 256;
 
@@ -97,8 +113,9 @@ pub const OMB_REPLY_TEXTS_V1: ReplyTexts<'static> = ReplyTexts {
 pub const CANCEL_QUEUE: usize = 16;
 /// The narrow handle a receiver holds: it passes only the binding id of a committed `/cancel`.
 pub type CancelRequests = tokio::sync::mpsc::Sender<Uuid>;
-/// Status note of the Telegram receiver.
-pub const CHANNEL_NOTE: &str = "telegram 长轮询";
+/// Status note of each channel.
+pub const TELEGRAM_NOTE: &str = "telegram 长轮询；中断区间内的更新在平台保留期内补回";
+pub const FEISHU_NOTE: &str = "feishu 长连接；断开区间内的事件丢失，不补回";
 
 /// Task intervals; `Default` is the specified budget, tests shorten them.
 #[derive(Clone, Copy, Debug)]
@@ -116,6 +133,10 @@ pub struct Timings {
     pub sweep_interval: Duration,
     pub tombstone_retention: Duration,
     pub content_retention: Duration,
+    pub fs_ack_budget: Duration,
+    pub fs_ping_interval: Duration,
+    pub fs_read_grace: Duration,
+    pub fs_fragment_ttl: Duration,
 }
 impl Default for Timings {
     fn default() -> Self {
@@ -133,6 +154,10 @@ impl Default for Timings {
             sweep_interval: SWEEP_INTERVAL,
             tombstone_retention: TOMBSTONE_RETENTION,
             content_retention: CONTENT_RETENTION,
+            fs_ack_budget: FS_ACK_BUDGET,
+            fs_ping_interval: FS_PING_INTERVAL,
+            fs_read_grace: FS_READ_GRACE,
+            fs_fragment_ttl: FS_FRAGMENT_TTL,
         }
     }
 }
@@ -163,6 +188,29 @@ impl TelegramEndpoint {
             scheme: SchemePolicy::HttpsOnly,
         }
     }
+}
+/// Where the Feishu open platform is reached; production is HTTPS to the public endpoint only.
+#[derive(Clone)]
+pub struct FeishuEndpoint {
+    pub api_base: Url,
+    pub dialer: SafeDialer,
+    pub scheme: SchemePolicy,
+}
+impl FeishuEndpoint {
+    pub fn production(dialer: SafeDialer) -> Self {
+        Self {
+            api_base: Url::parse("https://open.feishu.cn/").expect("static open platform origin"),
+            dialer,
+            scheme: SchemePolicy::HttpsOnly,
+        }
+    }
+}
+/// Both channels' endpoints; the receivers and the sender share one value, so each channel is
+/// reached through the same outbound client.
+#[derive(Clone)]
+pub struct Endpoints {
+    pub telegram: TelegramEndpoint,
+    pub feishu: FeishuEndpoint,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ChannelError {
@@ -204,6 +252,18 @@ impl Task {
             let _ = self.handle.await;
         }
         let _ = self.driver.await;
+    }
+}
+
+/// Starts the receive loop of the row's channel; the only place the channel is matched.
+pub fn start_receiver(
+    connection: Connection,
+    receiver: ReceiverRow,
+    context: ReceiverContext,
+) -> Task {
+    match receiver.channel {
+        Channel::Telegram => telegram::start_receiver(connection, receiver, context),
+        Channel::Feishu => feishu::start_receiver(connection, receiver, context),
     }
 }
 
@@ -319,6 +379,90 @@ mod tests {
         assert_eq!(
             request("http://api.telegram.org/").err(),
             Some(openbot_infra::net::safe_http::SafeHttpError::SchemeRejected)
+        );
+    }
+    #[test]
+    fn timings_default_adds_the_four_feishu_values() {
+        let timings = Timings::default();
+        assert_eq!(timings.fs_ack_budget, Duration::from_secs(2));
+        assert_eq!(timings.fs_ping_interval, Duration::from_secs(120));
+        assert_eq!(timings.fs_read_grace, Duration::from_secs(5));
+        assert_eq!(timings.fs_fragment_ttl, Duration::from_secs(5));
+        assert_eq!(
+            2 * timings.fs_ping_interval + timings.fs_read_grace,
+            Duration::from_secs(245)
+        );
+        assert_eq!(timings.delivery_poll, Duration::from_secs(1));
+        assert_eq!(
+            timings.delivery_retry,
+            [60, 120, 240, 480, 960].map(Duration::from_secs)
+        );
+        assert_eq!(timings.http_send_timeout, Duration::from_secs(15));
+        assert_eq!(timings.sweep_interval, Duration::from_secs(600));
+        assert_eq!(
+            timings.tombstone_retention,
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        assert_eq!(
+            timings.content_retention,
+            Duration::from_secs(7 * 24 * 3600)
+        );
+        assert_eq!(timings.heartbeat, Duration::from_secs(30));
+        assert_eq!(timings.heartbeat_gap, Duration::from_secs(90));
+        assert_eq!(timings.backoff_min, Duration::from_secs(1));
+        assert_eq!(timings.backoff_max, Duration::from_secs(60));
+        assert_eq!(timings.poll_timeout, Duration::from_secs(50));
+        assert_eq!(timings.dispatch_retry, Duration::from_secs(5));
+        assert_eq!(timings.pending_ttl, Duration::from_secs(24 * 3600));
+    }
+    #[test]
+    fn feishu_constants_and_status_notes_are_fixed() {
+        assert_eq!(FS_ACK_BUDGET, Duration::from_secs(2));
+        assert_eq!(FS_TOKEN_MARGIN, Duration::from_secs(1800));
+        assert_eq!(FS_PING_INTERVAL, Duration::from_secs(120));
+        assert_eq!(FS_READ_GRACE, Duration::from_secs(5));
+        assert_eq!(FS_WRITE_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(FS_FRAGMENT_TTL, Duration::from_secs(5));
+        assert_eq!(FS_FRAME_MAX, 1_048_576);
+        assert_eq!(HTTP_SEND_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(
+            TELEGRAM_NOTE,
+            "telegram 长轮询；中断区间内的更新在平台保留期内补回"
+        );
+        assert_eq!(FEISHU_NOTE, "feishu 长连接；断开区间内的事件丢失，不补回");
+        assert_ne!(TELEGRAM_NOTE, FEISHU_NOTE);
+    }
+    #[tokio::test]
+    async fn feishu_production_endpoint_is_https_only() {
+        use openbot_infra::net::safe_http::{
+            EgressPolicy, SafeHttpBudget, SafeHttpError, SafeHttpRequest,
+        };
+        let endpoint = FeishuEndpoint::production(SafeDialer::new(EgressPolicy::default()));
+        assert_eq!(endpoint.api_base.as_str(), "https://open.feishu.cn/");
+        let request = |url: &str| {
+            SafeHttpRequest::get(
+                Url::parse(url).unwrap(),
+                endpoint.scheme,
+                SafeHttpBudget::new(1024, Duration::from_secs(1)).unwrap(),
+            )
+        };
+        assert!(request("https://open.feishu.cn/").is_ok());
+        assert_eq!(
+            request("http://open.feishu.cn/").err(),
+            Some(SafeHttpError::SchemeRejected)
+        );
+        // The scheme is refused before any name is resolved.
+        assert_eq!(
+            endpoint
+                .dialer
+                .connect_websocket_stream(
+                    &Url::parse("ws://open.feishu.cn/ws").unwrap(),
+                    endpoint.scheme,
+                    Duration::from_secs(1),
+                )
+                .await
+                .err(),
+            Some(SafeHttpError::SchemeRejected)
         );
     }
 }

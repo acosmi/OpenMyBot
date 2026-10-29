@@ -28,6 +28,9 @@ url.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+http.workspace = true
 
 [dev-dependencies]
 omb-store = { path = "../omb-store", features = ["testkit"] }
@@ -38,4 +41,8 @@ required-features = ["testkit"]
 
 [[test]]
 name = "sender"
+required-features = ["testkit"]
+
+[[test]]
+name = "feishu"
 required-features = ["testkit"]
