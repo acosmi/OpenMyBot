@@ -708,9 +708,11 @@ async fn receive(
                     Normalized::Event(event) => {
                         // Dropped on stop, the acceptance has rolled back or committed; either way
                         // the redelivery is deduplicated.
+                        // When both are ready, the acceptance and its post-commit steps win.
                         let accepted = tokio::select! {
-                            _ = &mut stop => return Ok(()),
+                            biased;
                             accepted = accept_event(&mut client, receiver.binding_id, &event, &OMB_REPLY_TEXTS_V1, Instant::now() + ACCEPT_TX_BUDGET) => accepted,
+                            _ = &mut stop => return Ok(()),
                         };
                         match accepted {
                             Ok(AcceptOutcome::Conflict) => {
