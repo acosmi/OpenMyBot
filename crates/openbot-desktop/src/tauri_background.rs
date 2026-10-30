@@ -2013,8 +2013,11 @@ pub fn register_desktop_local_runtime(
                     )))]
                     let authority =
                         VerifiedDesktopWindowAuthority::from_verified_session(auth, None);
-                    let window =
-                        lifecycle.create_verified_window(&window_handle, window_label, authority);
+                    let window = lifecycle.create_verified_window(
+                        &window_handle,
+                        window_label,
+                        authority, // The fixture or ordinary session authority bound above.
+                    );
                     if window.is_err() {
                         request_shutdown(Arc::clone(&window_state), window_handle, 1);
                         return;
