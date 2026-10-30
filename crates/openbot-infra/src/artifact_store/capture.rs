@@ -334,8 +334,7 @@ fn snapshot(
         output_capacity_bytes: 0,
         retained: std::mem::take(&mut hold.retained),
     };
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bounds.check()?;
+    let result = (|| {
         clock.require_effect()?;
         let _original_mutex = hold
             .store
@@ -356,14 +355,26 @@ fn snapshot(
         // inode is equal. Account them and the bridge's fixed slots before its first IO.
         prepare_directory_bridge(&mut count, &files, &bounds)?;
         verify_original_capture_store(&hold.store, &mut count, &files, &bounds, clock)?;
-        let original_directories = hold.store.bytes.capture_original_directories_before(clock)?;
+        let original_directories = hold
+            .store
+            .bytes
+            .capture_original_directories_before(clock)?;
         {
             let store_root = metadata(&hold.store.root, clock)?;
             let byte_root = metadata(original_directories.original_fds().0, clock)?;
             if !byte_root.is_dir()
                 || byte_root.mode() & 0o7777 != 0o700
-                || (byte_root.dev(), byte_root.ino(), byte_root.uid(), byte_root.mode())
-                    != (store_root.dev(), store_root.ino(), store_root.uid(), store_root.mode())
+                || (
+                    byte_root.dev(),
+                    byte_root.ino(),
+                    byte_root.uid(),
+                    byte_root.mode(),
+                ) != (
+                    store_root.dev(),
+                    store_root.ino(),
+                    store_root.uid(),
+                    store_root.mode(),
+                )
             {
                 return Err(WholePgCarrierFault::SourceChanged);
             }
@@ -425,8 +436,7 @@ fn snapshot(
         }
         clock.require_effect()?;
         Ok(())
-    }))
-    .unwrap_or(Err(WholePgCarrierFault::ClosingPending));
+    })();
     // No fallible postcheck remains between custody transfer and returning either result.
     hold.retained = count.retained;
     match result {
@@ -1021,18 +1031,14 @@ fn prepare_directory_bridge(
             .checked_add(std::mem::size_of::<
                 std::array::IntoIter<ChildObservation<'_>, 2>,
             >())
-            .and_then(|n| {
-                n.checked_add(std::mem::size_of::<Option<ChildObservation<'_>>>())
-            })
+            .and_then(|n| n.checked_add(std::mem::size_of::<Option<ChildObservation<'_>>>()))
             .and_then(|n| n.checked_add(std::mem::size_of::<ChildObservation<'_>>()))
             .ok_or(WholePgCarrierFault::BoundsOverflow)?;
         let factory_loop_slots = std::mem::size_of::<[&std::fs::Metadata; 3]>()
             .checked_add(std::mem::size_of::<
                 std::array::IntoIter<&std::fs::Metadata, 3>,
             >())
-            .and_then(|n| {
-                n.checked_add(std::mem::size_of::<Option<&std::fs::Metadata>>())
-            })
+            .and_then(|n| n.checked_add(std::mem::size_of::<Option<&std::fs::Metadata>>()))
             .and_then(|n| n.checked_add(std::mem::size_of::<&std::fs::Metadata>()))
             .ok_or(WholePgCarrierFault::BoundsOverflow)?;
         // The factory loop ends before its identity block exits and verification begins.
@@ -1042,12 +1048,23 @@ fn prepare_directory_bridge(
             .and_then(|n| n.checked_add(loop_slots))
             .and_then(|n| n.checked_add(std::mem::size_of::<[(u64, u64); 3]>()))
             .and_then(|n| n.checked_add(std::mem::size_of::<[std::fs::Metadata; 3]>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<Result<std::fs::Metadata, WholePgCarrierFault>>()))
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<
+                    Result<std::fs::Metadata, WholePgCarrierFault>,
+                >())
+            })
             .and_then(|n| n.checked_add(std::mem::size_of::<rustix::fs::Stat>()))
-            .and_then(|n| n.checked_add(std::mem::size_of::<Result<rustix::fs::Stat, WholePgCarrierFault>>()))
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<
+                    Result<rustix::fs::Stat, WholePgCarrierFault>,
+                >())
+            })
             .and_then(|n| u64::try_from(n).ok())
             .ok_or(WholePgCarrierFault::BoundsOverflow)?;
-        count.retained.metadata.charge(fixed_bytes, bounds.max_metadata_bytes)?;
+        count
+            .retained
+            .metadata
+            .charge(fixed_bytes, bounds.max_metadata_bytes)?;
         count.retained.directory_bridge_reserved = true;
     }
     Ok(())

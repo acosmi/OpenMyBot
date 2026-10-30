@@ -20,12 +20,16 @@ use crate::db::InfraError;
 
 pub(super) mod owner;
 
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
+pub use owner::CapturePgIo;
 use owner::{ClientLease, OwnerSupervisor, SupervisedConnect};
 pub use owner::{
     ConnectionDestruction, ConnectionObservation, ConnectionSnapshot, OwnershipSnapshot,
 };
-#[cfg(feature = "desktop-local-vault")]
-pub use owner::CapturePgIo;
 
 /// 封闭连接层错误。底层 PG 错误、SQL、连接配置和秘密不进入这个诊断接口。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -770,7 +774,11 @@ pub(super) async fn connect_config(
     Ok(pool)
 }
 
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 pub(super) async fn connect_config_retained(
     config: tokio_postgres::Config,
     max_pool_size: usize,

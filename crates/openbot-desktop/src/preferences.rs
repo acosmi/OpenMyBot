@@ -1202,7 +1202,6 @@ mod capture_projection {
             self: Arc<Self>,
             bounds: WholePgCarrierBounds,
         ) -> Result<(Arc<Self>, RetainedPreferenceCapture), Fault> {
-            let bounds = bounds.check()?;
             if SNAPSHOT_LEAF.len() as u64 > bounds.max_path_bytes {
                 return Err(Fault::CapacityExceeded);
             }

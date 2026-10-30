@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+use crate::backup::whole_pg_capture_stream::CaptureClockCheck;
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
 use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault;
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
-#[cfg(all(feature = "server-runtime", target_os = "macos"))]
-use crate::backup::whole_pg_capture_stream::CaptureClockCheck;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant};
 
@@ -297,19 +297,35 @@ impl ArtifactByteStore {
         // Compile-time qualification of the caller's elementary-field fee.
         const {
             let thin = (std::mem::size_of::<&()>(), std::mem::align_of::<&()>());
-            let clock = (std::mem::size_of::<&dyn CaptureClockCheck>(),
-                std::mem::align_of::<&dyn CaptureClockCheck>());
+            let clock = (
+                std::mem::size_of::<&dyn CaptureClockCheck>(),
+                std::mem::align_of::<&dyn CaptureClockCheck>(),
+            );
             let word = (std::mem::size_of::<u64>(), std::mem::align_of::<u64>());
             let a = if thin.1 > clock.1 { thin.1 } else { clock.1 };
             let a = if a > word.1 { a } else { word.1 };
-            let thin = thin.0.checked_add(thin.1 - 1).expect("capture fee overflow");
-            let clock = clock.0.checked_add(clock.1 - 1).expect("capture fee overflow");
-            let words = word.0.checked_add(word.1 - 1).expect("capture fee overflow")
-                .checked_mul(6).expect("capture fee overflow");
+            let thin = thin
+                .0
+                .checked_add(thin.1 - 1)
+                .expect("capture fee overflow");
+            let clock = clock
+                .0
+                .checked_add(clock.1 - 1)
+                .expect("capture fee overflow");
+            let words = word
+                .0
+                .checked_add(word.1 - 1)
+                .expect("capture fee overflow")
+                .checked_mul(6)
+                .expect("capture fee overflow");
             let padding = (a - 1).checked_mul(5).expect("capture fee overflow");
-            let upper = thin.checked_add(clock).expect("capture fee overflow")
-                .checked_add(words).expect("capture fee overflow")
-                .checked_add(padding).expect("capture fee overflow");
+            let upper = thin
+                .checked_add(clock)
+                .expect("capture fee overflow")
+                .checked_add(words)
+                .expect("capture fee overflow")
+                .checked_add(padding)
+                .expect("capture fee overflow");
             assert!(std::mem::size_of::<ArtifactCaptureDirectoryBorrow<'static>>() <= upper);
         }
         // End these three observations before the second, named/held verification pass.
@@ -325,7 +341,11 @@ impl ArtifactByteStore {
                     return Err(WholePgCarrierFault::SourceChanged);
                 }
             }
-            [Identity::of(&root), Identity::of(&objects), Identity::of(&staging)]
+            [
+                Identity::of(&root),
+                Identity::of(&objects),
+                Identity::of(&staging),
+            ]
         };
         let original = ArtifactCaptureDirectoryBorrow {
             directories: &self.directories,
@@ -340,7 +360,11 @@ impl ArtifactByteStore {
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 impl ArtifactCaptureDirectoryBorrow<'_> {
     pub(crate) fn original_fds(&self) -> (&File, &File, &File) {
-        (&self.directories.root, &self.directories.objects, &self.directories.staging)
+        (
+            &self.directories.root,
+            &self.directories.objects,
+            &self.directories.staging,
+        )
     }
 
     pub(crate) fn verify_original_before(&self) -> Result<(), WholePgCarrierFault> {
@@ -361,17 +385,14 @@ impl ArtifactCaptureDirectoryBorrow<'_> {
                 return Err(WholePgCarrierFault::SourceChanged);
             }
             self.clock.require_effect()?;
-            let observed = rustix::fs::statat(
-                &self.directories.root,
-                name,
-                AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(|error| match error {
-                rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP => {
-                    WholePgCarrierFault::SourceChanged
-                }
-                _ => WholePgCarrierFault::IoFailure,
-            });
+            let observed =
+                rustix::fs::statat(&self.directories.root, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|error| match error {
+                        rustix::io::Errno::NOENT
+                        | rustix::io::Errno::NOTDIR
+                        | rustix::io::Errno::LOOP => WholePgCarrierFault::SourceChanged,
+                        _ => WholePgCarrierFault::IoFailure,
+                    });
             // Always observe E after an attempted syscall, including Err. The original
             // syscall refusal remains the first fault if this postcheck also refuses.
             let after_effect = self.clock.require_effect();

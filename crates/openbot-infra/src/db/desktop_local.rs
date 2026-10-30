@@ -13,9 +13,17 @@ use openbot_domain::vault::SecretBytes;
 use tokio_postgres::{Client, Config};
 
 use super::InfraError;
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 use super::pool::connect_config_retained;
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 pub use super::pool::owner::{
     DesktopCaptureDrivers, DesktopLocalDriverCustody, DesktopPoolJoinBounds,
     OriginalDriverJoinFact, OriginalDriverJoinOutcome, OriginalDriverRetirement,
@@ -53,7 +61,11 @@ pub struct DesktopLocalDatabase {
     pool: DatabasePool,
     origin: DesktopLocalDatabaseOrigin,
     owner: Arc<()>,
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     retention: Option<DesktopLocalDriverCustody>,
 }
 
@@ -71,7 +83,11 @@ pub struct UnattestedDesktopLocalAdmin {
     pool: DatabasePool,
     port: u16,
     password: SecretBytes,
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     retention: Option<DesktopLocalDriverCustody>,
 }
 
@@ -91,7 +107,11 @@ impl UnattestedDesktopLocalAdmin {
             pool: self.pool,
             port: self.port,
             password: self.password,
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             retention: self.retention,
         }
     }
@@ -108,7 +128,11 @@ pub struct AttestedDesktopLocalAdmin {
     pool: DatabasePool,
     port: u16,
     password: SecretBytes,
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     retention: Option<DesktopLocalDriverCustody>,
 }
 
@@ -144,7 +168,11 @@ impl AttestedDesktopLocalAdmin {
             self.password.expose(),
             LocalDatabase::Application,
         );
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         let pool = match self.retention.as_ref() {
             Some(custody) => {
                 connect_config_retained(
@@ -168,7 +196,11 @@ impl AttestedDesktopLocalAdmin {
             }
         }
         .map_err(DesktopLocalDatabaseError::Connect)?;
-        #[cfg(not(feature = "desktop-local-vault"))]
+        #[cfg(not(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        )))]
         let pool = connect_config(
             configuration,
             APPLICATION_POOL_SIZE,
@@ -181,7 +213,11 @@ impl AttestedDesktopLocalAdmin {
             pool,
             origin,
             owner: Arc::new(()),
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             retention: self.retention,
         })
     }
@@ -297,14 +333,22 @@ pub async fn connect_for_attestation(
         pool: admin,
         port,
         password,
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         retention: None,
     })
 }
 
 /// Retain the actual administrative driver before its first connect poll. This is not a live
 /// attestation or capture capability; the existing attestation and business bootstrap still run.
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 pub async fn connect_for_attestation_retained(
     port: u16,
     password: SecretBytes,

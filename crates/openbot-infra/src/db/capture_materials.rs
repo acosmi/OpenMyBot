@@ -60,7 +60,9 @@ impl CaptureDecodeBudget {
         if max_count == 0 || max_one_bytes < 8 * 1024 {
             return Err(CaptureSqlFailure::Bounds);
         }
-        max_count.checked_mul(max_one_bytes).ok_or(CaptureSqlFailure::Bounds)?;
+        max_count
+            .checked_mul(max_one_bytes)
+            .ok_or(CaptureSqlFailure::Bounds)?;
         usize::try_from(max_one_bytes).map_err(|_| CaptureSqlFailure::Bounds)?;
         Ok(std::sync::Arc::new(Self {
             state: std::sync::Mutex::new(SensitiveDecodeBound {
@@ -85,39 +87,48 @@ impl CaptureDecodeBudget {
         // Keep the actual clock resident even if its first effect observation fails.
         // A failed bind must never leave later wire reads in the cold-start branch.
         state.clock = Some(clock);
-        let checked = state.clock.as_ref().ok_or(CaptureSqlFailure::Bounds)?
-            .require_effect().map_err(|_| CaptureSqlFailure::Clock);
+        let checked = state
+            .clock
+            .as_ref()
+            .ok_or(CaptureSqlFailure::Bounds)?
+            .require_effect()
+            .map_err(|_| CaptureSqlFailure::Clock);
         if checked.is_err() {
             state.poisoned = true;
         }
         checked
     }
 
-    pub fn reserve_allocations(
-        &self,
-        allocations: &[(u64, u64)],
-    ) -> Result<(), CaptureSqlFailure> {
+    pub fn reserve_allocations(&self, allocations: &[(u64, u64)]) -> Result<(), CaptureSqlFailure> {
         let mut state = self.state.lock().map_err(|_| CaptureSqlFailure::Bounds)?;
         if state.poisoned {
             return Err(CaptureSqlFailure::Bounds);
         }
         let checked = (|| {
             if let Some(clock) = state.clock.as_ref() {
-                clock.require_effect().map_err(|_| CaptureSqlFailure::Clock)?;
+                clock
+                    .require_effect()
+                    .map_err(|_| CaptureSqlFailure::Clock)?;
             }
             let mut copies = 0_u64;
             for &(count, one_bytes) in allocations {
                 if one_bytes > state.max_one_bytes || (count != 0 && one_bytes == 0) {
                     return Err(CaptureSqlFailure::Bounds);
                 }
-                count.checked_mul(one_bytes).ok_or(CaptureSqlFailure::Bounds)?;
+                count
+                    .checked_mul(one_bytes)
+                    .ok_or(CaptureSqlFailure::Bounds)?;
                 copies = copies.checked_add(count).ok_or(CaptureSqlFailure::Bounds)?;
             }
-            let next = state.charged_count.checked_add(copies)
+            let next = state
+                .charged_count
+                .checked_add(copies)
                 .filter(|next| *next <= state.max_count)
                 .ok_or(CaptureSqlFailure::Bounds)?;
             if let Some(clock) = state.clock.as_ref() {
-                clock.require_effect().map_err(|_| CaptureSqlFailure::Clock)?;
+                clock
+                    .require_effect()
+                    .map_err(|_| CaptureSqlFailure::Clock)?;
             }
             Ok(next)
         })();
@@ -137,7 +148,11 @@ impl CaptureDecodeBudget {
     // Immutable M is returned to the original socket adapter only after one full credit
     // has been admitted by the same reserve_allocations transaction.
     pub(crate) fn reserve_wire_credit(&self) -> Result<u64, CaptureSqlFailure> {
-        let one = self.state.lock().map_err(|_| CaptureSqlFailure::Bounds)?.max_one_bytes;
+        let one = self
+            .state
+            .lock()
+            .map_err(|_| CaptureSqlFailure::Bounds)?
+            .max_one_bytes;
         self.reserve_allocations(&[(1, one)])?;
         Ok(one)
     }
@@ -727,9 +742,9 @@ impl CapturedDbFacts {
         }
         for (index, name) in names.iter().enumerate() {
             if names[..index].contains(name)
-                || !ALL_PROJECTIONS.iter().any(|projection| {
-                    projection.name == *name && !projection.sensitive
-                })
+                || !ALL_PROJECTIONS
+                    .iter()
+                    .any(|projection| projection.name == *name && !projection.sensitive)
             {
                 return Err(CaptureSqlFailure::UnknownLayout);
             }
@@ -1522,23 +1537,36 @@ mod capture_frontier_regression_tests {
 
     fn writer_facts(rows: Vec<CapturedDbRow>) -> CapturedDbFacts {
         CapturedDbFacts {
-            rows, sensitive: Vec::new(), schema_sha256: [0; 32],
-            migrations_sha256: [0; 32], frontier_sha256: [0; 32],
-            system_identifier: "owned-writer-test".to_owned(), database_oid: 1,
+            rows,
+            sensitive: Vec::new(),
+            schema_sha256: [0; 32],
+            migrations_sha256: [0; 32],
+            frontier_sha256: [0; 32],
+            system_identifier: "owned-writer-test".to_owned(),
+            database_oid: 1,
         }
     }
 
     #[test]
     fn projection_selection_refuses_before_any_output_and_preserves_known_rows() {
-        let facts = writer_facts(vec![row("calls", &[Some("call"), Some("run"), Some("tool")])]);
+        let facts = writer_facts(vec![row(
+            "calls",
+            &[Some("call"), Some("run"), Some("tool")],
+        )]);
         let refused: [&[&str]; 6] = [
-            &[], &["unknown"], &["canary"], &["calls", "unknown"],
-            &["calls", "canary"], &["calls", "calls"],
+            &[],
+            &["unknown"],
+            &["canary"],
+            &["calls", "unknown"],
+            &["calls", "canary"],
+            &["calls", "calls"],
         ];
         for names in refused {
             let mut output = b"prior".to_vec();
-            assert_eq!(facts.write_projection(names, &mut output),
-                Err(CaptureSqlFailure::UnknownLayout));
+            assert_eq!(
+                facts.write_projection(names, &mut output),
+                Err(CaptureSqlFailure::UnknownLayout)
+            );
             assert_eq!(output, b"prior");
         }
         let mut output = Vec::new();

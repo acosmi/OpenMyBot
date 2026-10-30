@@ -492,9 +492,9 @@ struct Layout {
     lengths: Vec<u64>,
 }
 impl FrozenWholePgManifest {
-    /// Checks claim structure and bounds, then freezes manifest length/digest and expected frame layout.
+    /// Checks claim structure against bounds already validated by [`WholePgCarrierBounds::check`],
+    /// then freezes manifest length/digest and expected frame layout.
     pub fn check(claim: WholePgManifestClaim, bounds: WholePgCarrierBounds) -> Result<Self> {
-        let bounds = bounds.check()?;
         if claim.schema != "wrokbot-whole-pg-capture" || claim.version != 1 {
             return Err(WholePgCarrierFault::UnsupportedVersion);
         }

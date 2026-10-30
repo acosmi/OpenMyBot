@@ -367,9 +367,14 @@ impl StartupJournal {
         Ok((file, self.bytes.clone()))
     }
 
-    #[cfg(all(feature = "desktop-launcher", feature = "postgres-maintenance", target_os = "macos"))]
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
     pub(super) fn capture_original_data_directory_matches(
-        &self, retained: &File,
+        &self,
+        retained: &File,
         clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
     ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
         use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
@@ -382,12 +387,15 @@ impl StartupJournal {
         let other = retained.metadata();
         clock.require_effect()?;
         let other = other.map_err(|_| Fault::IoFailure)?;
-        if !original.is_dir() || !other.is_dir()
-            || original.mode() & 0o777 != 0o700 || other.mode() & 0o777 != 0o700
+        if !original.is_dir()
+            || !other.is_dir()
+            || original.mode() & 0o777 != 0o700
+            || other.mode() & 0o777 != 0o700
             || (original.dev(), original.ino(), original.uid())
                 != (self.data_dir_device, self.data_dir_inode, self.root_uid)
             || (other.dev(), other.ino(), other.uid())
-                != (self.data_dir_device, self.data_dir_inode, self.root_uid) {
+                != (self.data_dir_device, self.data_dir_inode, self.root_uid)
+        {
             return Err(Fault::SourceChanged);
         }
         Ok(())

@@ -51,7 +51,9 @@ impl VerifiedDesktopWindowAuthority {
         auth: AuthContext,
         fixture: &crate::tauri_background::SelfOwnedCaptureFixtureBinding,
     ) -> Result<Self, DesktopWindowLifecycleError> {
-        fixture.require_window_witness().map_err(|_| DesktopWindowLifecycleError::RegistryUnavailable)?;
+        fixture
+            .require_window_witness()
+            .map_err(|_| DesktopWindowLifecycleError::RegistryUnavailable)?;
         Ok(Self {
             auth,
             fresh_for: None,

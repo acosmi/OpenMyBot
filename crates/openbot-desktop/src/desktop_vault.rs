@@ -232,7 +232,8 @@ impl ArmedCaptureVault {
         if self.journal.dataset_id() != self.dataset_id
             || self.journal.deployment_id() != self.deployment_id
             || self.journal.tenant_id() != self.tenant_id
-            || self.journal.key_id() != self.key_id || self.key_version != 1
+            || self.journal.key_id() != self.key_id
+            || self.key_version != 1
         {
             return Err(Fault::SourceChanged);
         }
@@ -253,14 +254,18 @@ impl ArmedCaptureVault {
             || row.deployment_id() != self.deployment_id
             || row.tenant_id() != self.tenant_id
             || row.key_id() != self.key_id
-            || row.key_version() != self.key_version || row.canary_schema() != 1
+            || row.key_version() != self.key_version
+            || row.canary_schema() != 1
         {
             return Err(Fault::SourceChanged);
         }
         clock.require_effect()?;
         let observed_binding = DesktopVaultCanaryBinding::new(
-            self.dataset_id.clone(), self.deployment_id.clone(), self.tenant_id.clone(),
-            self.key_id.clone(), KeyVersion::new(1),
+            self.dataset_id.clone(),
+            self.deployment_id.clone(),
+            self.tenant_id.clone(),
+            self.key_id.clone(),
+            KeyVersion::new(1),
         );
         clock.require_effect()?;
         let binding = observed_binding.map_err(|_| Fault::SecretInvalid)?;
@@ -273,13 +278,6 @@ impl ArmedCaptureVault {
         clock.require_effect()?;
         observed_canary.map_err(|_| Fault::SecretInvalid)?;
         self.revalidate_before(clock)
-    }
-
-    pub(crate) fn journal_material(
-        &self,
-    ) -> Result<(std::fs::File, Vec<u8>), DesktopVaultKeyError> {
-        self.revalidate()?;
-        self.journal.retained_material().map_err(map_journal)
     }
 
     pub(crate) fn dataset_id(&self) -> &str {
@@ -298,17 +296,22 @@ impl ArmedCaptureVault {
         self.key_version
     }
 
-    /// Move the original secret, keeping the original journal owner separately resident.
+    /// Move the original secret together with the original journal owner, which the caller
+    /// keeps separately resident.
     pub(crate) fn into_original_master_before(
         self,
         clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
-    ) -> Result<(SecretBytes, std::fs::File, Vec<u8>),
-                (Self, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault)> {
+    ) -> Result<
+        (SecretBytes, MasterInitializationJournal),
+        (
+            Self,
+            openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
+        ),
+    > {
         if let Err(error) = self.revalidate_before(clock) {
             return Err((self, error));
         }
-        let (file, bytes) = self.journal.into_retained_material();
-        Ok((self.master.0, file, bytes))
+        Ok((self.master.0, self.journal))
     }
 }
 

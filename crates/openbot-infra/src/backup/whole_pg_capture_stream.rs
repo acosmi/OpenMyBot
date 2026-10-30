@@ -137,8 +137,7 @@ fn checked_mul(a: u64, b: u64) -> Result<u64, WholePgCarrierFault> {
     a.checked_mul(b).ok_or(WholePgCarrierFault::BoundsOverflow)
 }
 fn check_parts(parts: &WholePgOwnedStreamParts) -> Result<u64, WholePgCarrierFault> {
-    let bounds = parts.carrier_bounds.check()?;
-    parts.secret_bounds.check()?;
+    let bounds = parts.carrier_bounds;
     if parts.sources.len() != parts.manifest.materials().len()
         || parts.sources.len() as u64 > bounds.max_material_files
     {
@@ -434,9 +433,9 @@ pub fn run_owned_stream(
     let mut retained = Some(inputs.parts);
     let mut io = RetainedStreamIo::empty();
     let mut release_stage = StreamReleaseStage::Retained;
-    // The closure borrows the original resident owners. A caught ordinary panic cannot
-    // discard live inputs, or turn an irreversible release followed by a clock fault into success.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // The closure borrows the original resident owners, so an ordinary failure cannot discard
+    // live inputs or turn an irreversible release followed by a clock fault into success.
+    let result = (|| {
         let verified = stream(
             retained
                 .as_mut()
@@ -453,8 +452,7 @@ pub fn run_owned_stream(
         release_stage = StreamReleaseStage::Released;
         clock.require_closing()?;
         Ok(verified)
-    }))
-    .unwrap_or(Err(WholePgCarrierFault::ClosingPending));
+    })();
     match result {
         Ok((wire_bytes, carrier_sha256)) => Ok(CarrierReadbackReceipt {
             wire_bytes,
@@ -1651,11 +1649,7 @@ mod tests {
             Ok(v) => v,
             Err(v) => panic!("{}", v.fault),
         };
-        assert!(
-            receipt.key_verified
-                && receipt.temporary_verified
-                && receipt.published_verified
-        );
+        assert!(receipt.key_verified && receipt.temporary_verified && receipt.published_verified);
         assert_eq!(receipt.wire_bytes, wire);
         let bytes = std::fs::read(root.join("output").join(FINAL)).unwrap();
         assert_eq!(&bytes[..8], b"WBPGCAP1");

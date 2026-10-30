@@ -2144,7 +2144,11 @@ pub(super) fn spawn_program(
 impl ProgramOwner {
     /// Current retained pipe-handle presence only; not creation history, join or closure.
     pub(super) fn original_pipe_handles(&self) -> [bool; 3] {
-        [self.input.is_some(), self.output.is_some(), self.error.is_some()]
+        [
+            self.input.is_some(),
+            self.output.is_some(),
+            self.error.is_some(),
+        ]
     }
     pub(super) fn original_child_mut(&mut self) -> &mut Child {
         &mut self.child
@@ -2180,9 +2184,7 @@ impl ToolObservation {
 }
 impl NativeReceipt {
     /// Original native observations; these join values do not redefine ToolObservation's.
-    pub(super) fn original_wait_pipe_worker_observations(
-        &self,
-    ) -> (bool, [bool; 3], bool, bool) {
+    pub(super) fn original_wait_pipe_worker_observations(&self) -> (bool, [bool; 3], bool, bool) {
         (
             self.original_child_wait,
             [

@@ -171,7 +171,8 @@ impl MasterInitializationJournal {
         use std::os::unix::fs::{FileExt as _, MetadataExt as _};
         clock.require_effect()?;
         if self.record.phase != MasterJournalPhase::CanaryConfirmed
-            || self.bytes.is_empty() || self.bytes.len() > MAX_BYTES
+            || self.bytes.is_empty()
+            || self.bytes.len() > MAX_BYTES
         {
             return Err(Fault::SourceChanged);
         }
@@ -184,11 +185,23 @@ impl MasterInitializationJournal {
         clock.require_effect()?;
         let held = observed_held.map_err(|_| Fault::IoFailure)?;
         let identity = |m: &fs::Metadata| {
-            (m.dev(), m.ino(), m.uid(), m.mode(), m.nlink(), m.len(),
-                m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec())
+            (
+                m.dev(),
+                m.ino(),
+                m.uid(),
+                m.mode(),
+                m.nlink(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
         };
-        if !shape(&before, self.bytes.len()) || !shape(&held, self.bytes.len())
-            || !same(&before, &held) || nlink(&held) != Some(1)
+        if !shape(&before, self.bytes.len())
+            || !shape(&held, self.bytes.len())
+            || !same(&before, &held)
+            || nlink(&held) != Some(1)
             || held.uid() != rustix::process::geteuid().as_raw()
             || held.mode() & 0o7777 != 0o600
             || identity(&before) != identity(&held)
@@ -200,7 +213,9 @@ impl MasterInitializationJournal {
         let mut offset = 0;
         while offset < self.bytes.len() {
             clock.require_effect()?;
-            let observed = self.file.read_at(&mut value[offset..self.bytes.len()], offset as u64);
+            let observed = self
+                .file
+                .read_at(&mut value[offset..self.bytes.len()], offset as u64);
             clock.require_effect()?;
             match observed {
                 Ok(0) => return Err(Fault::SourceChanged),
@@ -232,8 +247,10 @@ impl MasterInitializationJournal {
         let observed_held = self.file.metadata();
         clock.require_effect()?;
         let held_after = observed_held.map_err(|_| Fault::IoFailure)?;
-        if !shape(&after, self.bytes.len()) || !shape(&held_after, self.bytes.len())
-            || !same(&after, &held_after) || nlink(&held_after) != Some(1)
+        if !shape(&after, self.bytes.len())
+            || !shape(&held_after, self.bytes.len())
+            || !same(&after, &held_after)
+            || nlink(&held_after) != Some(1)
             || identity(&after) != identity(&held_after)
             || identity(&held) != identity(&held_after)
         {
@@ -247,22 +264,7 @@ impl MasterInitializationJournal {
         feature = "postgres-maintenance",
         target_os = "macos"
     ))]
-    pub(super) fn retained_material(&self) -> Result<(File, Vec<u8>), JournalError> {
-        self.revalidate_retained()?;
-        let file = self
-            .file
-            .try_clone()
-            .map_err(|_| JournalError::Unavailable)?;
-        self.revalidate_retained()?;
-        Ok((file, self.bytes.clone()))
-    }
-
-    #[cfg(all(
-        feature = "desktop-launcher",
-        feature = "postgres-maintenance",
-        target_os = "macos"
-    ))]
-    pub(super) fn into_retained_material(self) -> (File, Vec<u8>) {
+    pub(crate) fn into_retained_material(self) -> (File, Vec<u8>) {
         // The unique parent validates immediately before this pure, infallible ownership move.
         (self.file, self.bytes)
     }

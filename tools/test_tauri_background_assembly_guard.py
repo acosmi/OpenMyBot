@@ -33,7 +33,10 @@ def replace_after(source: str, marker: str, old: str, new: str) -> str:
 
 
 
-AUTHORITY = "    let authority_ok = owner.lifecycle.shutdown_authority().is_ok();\n"
+AUTHORITY = "    let authority_ok = capturing || owner.lifecycle.shutdown_authority().is_ok();\n"
+CAPTURING_OFF = "    let capturing = false;\n"
+CAPTURE_ENTRY = "        let result = capture::run_normal_exit_capture(&mut job, ready).await;\n"
+CAPTURE_RETURN = "        return;\n    }\n    let DesktopLocalClosingJob {"
 STARTUP_OK = "        startup_ok: authority_ok && state_install_ok,"
 SPAWN = "    tauri::async_runtime::spawn(run_owned_local_closing_job(job));\n"
 DEADLINE = "let deadline = started + crate::cancel::SHUTDOWN_DEADLINE;"
@@ -675,7 +678,36 @@ class AssemblyGuardTests(unittest.TestCase):
             )
         )
         self.assert_rejected(
-            replace_once(self.source, "        None => false,", "        None => true,")
+            replace_once(
+                self.source, DATABASE, DATABASE.replace("None => false,", "None => true,")
+            )
+        )
+
+    def test_armed_capture_gate_and_branch_shape_are_exact(self) -> None:
+        # Only the cfg-gated armed flag may skip revocation; the ordinary build keeps false.
+        self.assert_rejected(
+            replace_once(self.source, CAPTURING_OFF, "    let capturing = true;\n")
+        )
+        self.assert_rejected(
+            replace_once(
+                self.source,
+                AUTHORITY,
+                "    let authority_ok = startup_ok || owner.lifecycle.shutdown_authority().is_ok();\n",
+            )
+        )
+        # The job still carries the original owner, retained for the capture branch.
+        self.assert_rejected(replace_once(self.source, "        owner: Some(owner),", "        owner: None,"))
+        # The capture branch hands the job to one capture entry and ends the job itself.
+        self.assert_rejected(replace_once(self.source, CAPTURE_ENTRY, CAPTURE_ENTRY + CAPTURE_ENTRY))
+        self.assert_rejected(
+            replace_once(self.source, CAPTURE_RETURN, "    }\n    let DesktopLocalClosingJob {")
+        )
+        self.assert_rejected(
+            replace_once(
+                self.source,
+                "    if let Some(ready) = job.normal_ready.take() {",
+                "    if let Some(ready) = job.normal_ready.clone() {",
+            )
         )
 
     def test_database_owner_and_some_binding_aliases_are_accepted(self) -> None:

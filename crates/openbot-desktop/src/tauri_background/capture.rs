@@ -1,7 +1,9 @@
 //! Same-owner normal-exit capture. Configuration and durable observations are not capabilities.
 use std::sync::{Arc, Mutex, Weak};
 
-use openbot_domain::backup::whole_pg_carrier::{WholePgCarrierBounds, WholePgCarrierFault as Fault};
+use openbot_domain::backup::whole_pg_carrier::{
+    WholePgCarrierBounds, WholePgCarrierFault as Fault,
+};
 use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
 use openbot_infra::db::desktop_local::{
     DesktopCaptureDrivers, OriginalDriverJoinFact, OriginalDriverJoinOutcome,
@@ -44,15 +46,29 @@ struct OriginalControlStorageFacts {
 }
 
 impl OriginalControlStorageFacts {
-    fn observe(&mut self, device: u64, inode: u64, blocks: u64, retained_prior: u64) -> Result<(), Fault> {
+    fn observe(
+        &mut self,
+        device: u64,
+        inode: u64,
+        blocks: u64,
+        retained_prior: u64,
+    ) -> Result<(), Fault> {
         let fact = OriginalControlObjectFact {
             device,
             inode,
             allocation: blocks.checked_mul(512).ok_or(Fault::BoundsOverflow)?,
             retained_prior,
         };
-        if let Some(prior) = self.objects.iter().find(|prior| prior.device == device && prior.inode == inode) {
-            return if *prior == fact { Ok(()) } else { Err(Fault::SourceChanged) };
+        if let Some(prior) = self
+            .objects
+            .iter()
+            .find(|prior| prior.device == device && prior.inode == inode)
+        {
+            return if *prior == fact {
+                Ok(())
+            } else {
+                Err(Fault::SourceChanged)
+            };
         }
         if self.objects.len() >= self.objects.capacity() {
             return Err(Fault::CapacityExceeded);
@@ -74,7 +90,6 @@ pub(crate) struct CaptureResourceTotals {
 pub(super) fn prepare_original_capture_resources(
     bounds: &WholePgCarrierBounds,
 ) -> Result<Arc<Mutex<CaptureResourceTotals>>, Fault> {
-    let bounds = (*bounds).check()?;
     // Pinned Rust 1.98.0 ArcInner is repr(C): two atomic usize headers followed by T.
     // This accounts for its requested layout and the original startup/Armed/Operation Arc
     // words. It does not claim an allocator-internal or whole-operation peak measurement.
@@ -89,7 +104,9 @@ pub(super) fn prepare_original_capture_resources(
         .ok_or(Fault::BoundsOverflow)?;
     let control_fixed = control::original_control_data_fixed_bytes()?;
     let metadata_reserved = u64::try_from(
-        allocation.checked_add(references).and_then(|n| n.checked_add(control_fixed))
+        allocation
+            .checked_add(references)
+            .and_then(|n| n.checked_add(control_fixed))
             .ok_or(Fault::BoundsOverflow)?,
     )
     .map_err(|_| Fault::BoundsOverflow)?;
@@ -104,12 +121,17 @@ pub(super) fn prepare_original_capture_resources(
         fd_admissions: 0,
         metadata_reserved,
         original_control_storage: OriginalControlStorageFacts {
-            objects: Vec::new(), original_owner: owner_instance,
-            roots: [OriginalControlRootObservation::Unobserved; 4], classified: false,
+            objects: Vec::new(),
+            original_owner: owner_instance,
+            roots: [OriginalControlRootObservation::Unobserved; 4],
+            classified: false,
             max_total_allocation_bytes: bounds.max_total_allocation_bytes,
             max_retained_prior_bytes: bounds.max_retained_prior_bytes,
-            growth_ready: false, allocation_admitted: 0, allocation_observed_peak: 0,
-            allocation_update_pending: false, object_slots_admitted: 0,
+            growth_ready: false,
+            allocation_admitted: 0,
+            allocation_observed_peak: 0,
+            allocation_update_pending: false,
+            object_slots_admitted: 0,
         },
     })))
 }
@@ -123,8 +145,10 @@ fn original_capture_resource_identity(
         || totals.max_fds != bounds.max_open_files
         || totals.max_metadata != bounds.max_metadata_bytes
         || totals.original_control_storage.original_owner != totals.owner_instance
-        || totals.original_control_storage.max_total_allocation_bytes != bounds.max_total_allocation_bytes
-        || totals.original_control_storage.max_retained_prior_bytes != bounds.max_retained_prior_bytes
+        || totals.original_control_storage.max_total_allocation_bytes
+            != bounds.max_total_allocation_bytes
+        || totals.original_control_storage.max_retained_prior_bytes
+            != bounds.max_retained_prior_bytes
         || totals.fd_admissions > totals.max_fds
         || totals.metadata_reserved > totals.max_metadata
     {
@@ -142,8 +166,14 @@ pub(crate) fn reserve_capture_resources(
     if totals.owner_instance == [0; 16] || totals.max_fds == 0 || totals.max_metadata == 0 {
         return Err(Fault::IntentMismatch);
     }
-    let fds = totals.fd_admissions.checked_add(fd_delta).ok_or(Fault::BoundsOverflow)?;
-    let metadata = totals.metadata_reserved.checked_add(metadata_delta).ok_or(Fault::BoundsOverflow)?;
+    let fds = totals
+        .fd_admissions
+        .checked_add(fd_delta)
+        .ok_or(Fault::BoundsOverflow)?;
+    let metadata = totals
+        .metadata_reserved
+        .checked_add(metadata_delta)
+        .ok_or(Fault::BoundsOverflow)?;
     if fds > totals.max_fds || metadata > totals.max_metadata {
         return Err(Fault::CapacityExceeded);
     }
@@ -162,8 +192,14 @@ pub(crate) fn remaining_capture_resources(
         return Err(Fault::IntentMismatch);
     }
     Ok((
-        totals.max_fds.checked_sub(totals.fd_admissions).ok_or(Fault::CapacityExceeded)?,
-        totals.max_metadata.checked_sub(totals.metadata_reserved).ok_or(Fault::CapacityExceeded)?,
+        totals
+            .max_fds
+            .checked_sub(totals.fd_admissions)
+            .ok_or(Fault::CapacityExceeded)?,
+        totals
+            .max_metadata
+            .checked_sub(totals.metadata_reserved)
+            .ok_or(Fault::CapacityExceeded)?,
     ))
 }
 
@@ -181,15 +217,23 @@ fn prepare_original_control_storage(
         {
             return Err(Fault::IntentMismatch);
         }
-        (totals.original_control_storage.max_total_allocation_bytes,
-            totals.original_control_storage.max_retained_prior_bytes)
+        (
+            totals.original_control_storage.max_total_allocation_bytes,
+            totals.original_control_storage.max_retained_prior_bytes,
+        )
     };
-    let bytes = maximum.checked_mul(core::mem::size_of::<OriginalControlObjectFact>())
-        .and_then(|n| u64::try_from(n).ok()).ok_or(Fault::BoundsOverflow)?;
+    let bytes = maximum
+        .checked_mul(core::mem::size_of::<OriginalControlObjectFact>())
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or(Fault::BoundsOverflow)?;
     reserve_capture_resources(resources, 0, bytes)?;
     let mut objects = Vec::new();
-    objects.try_reserve_exact(maximum).map_err(|_| Fault::CapacityExceeded)?;
-    if objects.capacity() != maximum { return Err(Fault::CapacityExceeded); }
+    objects
+        .try_reserve_exact(maximum)
+        .map_err(|_| Fault::CapacityExceeded)?;
+    if objects.capacity() != maximum {
+        return Err(Fault::CapacityExceeded);
+    }
     Ok(OriginalControlStorageFacts {
         objects,
         original_owner: owner,
@@ -197,8 +241,11 @@ fn prepare_original_control_storage(
         classified: false,
         max_total_allocation_bytes: frozen.0,
         max_retained_prior_bytes: frozen.1,
-        growth_ready: false, allocation_admitted: 0, allocation_observed_peak: 0,
-        allocation_update_pending: false, object_slots_admitted: 0,
+        growth_ready: false,
+        allocation_admitted: 0,
+        allocation_observed_peak: 0,
+        allocation_update_pending: false,
+        object_slots_admitted: 0,
     })
 }
 
@@ -208,37 +255,66 @@ fn install_original_control_storage(
 ) -> Result<(), Fault> {
     let mut totals = resources.lock().map_err(|_| Fault::ClosingPending)?;
     let original = &totals.original_control_storage;
-    if facts.original_owner != totals.owner_instance || !facts.classified
-        || original.classified || !original.objects.is_empty()
-        || facts.growth_ready || facts.allocation_update_pending
-        || facts.allocation_admitted != 0 || facts.allocation_observed_peak != 0
+    if facts.original_owner != totals.owner_instance
+        || !facts.classified
+        || original.classified
+        || !original.objects.is_empty()
+        || facts.growth_ready
+        || facts.allocation_update_pending
+        || facts.allocation_admitted != 0
+        || facts.allocation_observed_peak != 0
         || facts.object_slots_admitted != 0
         || facts.max_total_allocation_bytes != original.max_total_allocation_bytes
         || facts.max_retained_prior_bytes != original.max_retained_prior_bytes
-        || !matches!(facts.roots[0], OriginalControlRootObservation::Present { .. })
-        || !matches!(facts.roots[1], OriginalControlRootObservation::Present { .. } | OriginalControlRootObservation::Absent)
-        || !matches!(facts.roots[2], OriginalControlRootObservation::Present { .. })
-        || !matches!(facts.roots[3], OriginalControlRootObservation::Present { .. })
+        || !matches!(
+            facts.roots[0],
+            OriginalControlRootObservation::Present { .. }
+        )
+        || !matches!(
+            facts.roots[1],
+            OriginalControlRootObservation::Present { .. } | OriginalControlRootObservation::Absent
+        )
+        || !matches!(
+            facts.roots[2],
+            OriginalControlRootObservation::Present { .. }
+        )
+        || !matches!(
+            facts.roots[3],
+            OriginalControlRootObservation::Present { .. }
+        )
     {
         return Err(Fault::IntentMismatch);
     }
     let mut allocation = 0u64;
     let mut retained = 0u64;
     for (index, fact) in facts.objects.iter().enumerate() {
-        if facts.objects[..index].iter().any(|prior| prior.device == fact.device && prior.inode == fact.inode) {
+        if facts.objects[..index]
+            .iter()
+            .any(|prior| prior.device == fact.device && prior.inode == fact.inode)
+        {
             return Err(Fault::IntentMismatch);
         }
-        allocation = allocation.checked_add(fact.allocation).ok_or(Fault::BoundsOverflow)?;
-        retained = retained.checked_add(fact.retained_prior).ok_or(Fault::BoundsOverflow)?;
+        allocation = allocation
+            .checked_add(fact.allocation)
+            .ok_or(Fault::BoundsOverflow)?;
+        retained = retained
+            .checked_add(fact.retained_prior)
+            .ok_or(Fault::BoundsOverflow)?;
     }
     for root in facts.roots {
         if let OriginalControlRootObservation::Present { device, inode } = root {
-            if !facts.objects.iter().any(|fact| fact.device == device && fact.inode == inode) {
+            if !facts
+                .objects
+                .iter()
+                .any(|fact| fact.device == device && fact.inode == inode)
+            {
                 return Err(Fault::IntentMismatch);
             }
         }
     }
-    if allocation > original.max_total_allocation_bytes || retained > original.max_retained_prior_bytes {
+    if allocation > original.max_total_allocation_bytes
+        || retained > original.max_retained_prior_bytes
+    {
         return Err(Fault::CapacityExceeded);
     }
     facts.allocation_admitted = allocation;
@@ -252,51 +328,72 @@ fn install_original_control_storage(
 // FS01 is pure DATA on the original book, not an OS reservation or another owner.
 fn mark_original_control_growth_after_history(
     resources: &Arc<Mutex<CaptureResourceTotals>>,
-    owner_instance: [u8;16],
+    owner_instance: [u8; 16],
 ) -> Result<(), Fault> {
     let mut totals = resources.lock().map_err(|_| Fault::ClosingPending)?;
-    if totals.owner_instance != owner_instance || owner_instance == [0;16] {
+    if totals.owner_instance != owner_instance || owner_instance == [0; 16] {
         return Err(Fault::IntentMismatch);
     }
     let facts = &mut totals.original_control_storage;
-    if facts.original_owner != owner_instance || !facts.classified || facts.growth_ready
-        || facts.allocation_update_pending || facts.object_slots_admitted != facts.objects.len()
-    { return Err(Fault::IntentMismatch); }
+    if facts.original_owner != owner_instance
+        || !facts.classified
+        || facts.growth_ready
+        || facts.allocation_update_pending
+        || facts.object_slots_admitted != facts.objects.len()
+    {
+        return Err(Fault::IntentMismatch);
+    }
     let mut allocation = 0u64;
     for object in &facts.objects {
-        allocation = allocation.checked_add(object.allocation).ok_or(Fault::BoundsOverflow)?;
+        allocation = allocation
+            .checked_add(object.allocation)
+            .ok_or(Fault::BoundsOverflow)?;
     }
-    if allocation != facts.allocation_admitted || allocation != facts.allocation_observed_peak
+    if allocation != facts.allocation_admitted
+        || allocation != facts.allocation_observed_peak
         || allocation > facts.max_total_allocation_bytes
-    { return Err(Fault::SourceChanged); }
+    {
+        return Err(Fault::SourceChanged);
+    }
     facts.growth_ready = true;
     Ok(())
 }
 
 fn reserve_original_control_growth(
     resources: &Arc<Mutex<CaptureResourceTotals>>,
-    owner_instance: [u8;16],
+    owner_instance: [u8; 16],
     parent_device: u64,
     parent_inode: u64,
     increment_plan: u64,
     new_objects: usize,
 ) -> Result<u64, Fault> {
     let mut totals = resources.lock().map_err(|_| Fault::ClosingPending)?;
-    if totals.owner_instance != owner_instance || owner_instance == [0;16] {
+    if totals.owner_instance != owner_instance || owner_instance == [0; 16] {
         return Err(Fault::IntentMismatch);
     }
     let facts = &mut totals.original_control_storage;
     if facts.original_owner != owner_instance || !facts.classified || !facts.growth_ready {
         return Err(Fault::IntentMismatch);
     }
-    if facts.allocation_update_pending { return Err(Fault::ClosingPending); }
-    if increment_plan == 0 || facts.allocation_observed_peak > facts.allocation_admitted
-        || !facts.objects.iter().any(|object|
-            object.device == parent_device && object.inode == parent_inode)
-    { return Err(Fault::SourceChanged); }
-    let admitted = facts.allocation_admitted.checked_add(increment_plan)
+    if facts.allocation_update_pending {
+        return Err(Fault::ClosingPending);
+    }
+    if increment_plan == 0
+        || facts.allocation_observed_peak > facts.allocation_admitted
+        || !facts
+            .objects
+            .iter()
+            .any(|object| object.device == parent_device && object.inode == parent_inode)
+    {
+        return Err(Fault::SourceChanged);
+    }
+    let admitted = facts
+        .allocation_admitted
+        .checked_add(increment_plan)
         .ok_or(Fault::BoundsOverflow)?;
-    let slots = facts.object_slots_admitted.checked_add(new_objects)
+    let slots = facts
+        .object_slots_admitted
+        .checked_add(new_objects)
         .ok_or(Fault::BoundsOverflow)?;
     if admitted > facts.max_total_allocation_bytes || slots > facts.objects.capacity() {
         return Err(Fault::CapacityExceeded);
@@ -310,44 +407,76 @@ fn reserve_original_control_growth(
 
 fn observe_original_control_allocation(
     resources: &Arc<Mutex<CaptureResourceTotals>>,
-    owner_instance: [u8;16],
-    observations: [(u64,u64,u64);2],
+    owner_instance: [u8; 16],
+    observations: [(u64, u64, u64); 2],
 ) -> Result<(), Fault> {
     let mut totals = resources.lock().map_err(|_| Fault::ClosingPending)?;
-    if totals.owner_instance != owner_instance || owner_instance == [0;16] {
+    if totals.owner_instance != owner_instance || owner_instance == [0; 16] {
         return Err(Fault::IntentMismatch);
     }
     let facts = &mut totals.original_control_storage;
-    if facts.original_owner != owner_instance || !facts.classified || !facts.growth_ready
+    if facts.original_owner != owner_instance
+        || !facts.classified
+        || !facts.growth_ready
         || !facts.allocation_update_pending
-    { return Err(Fault::IntentMismatch); }
+    {
+        return Err(Fault::IntentMismatch);
+    }
     let actual = [
-        (observations[0].0, observations[0].1,
-            observations[0].2.checked_mul(512).ok_or(Fault::BoundsOverflow)?),
-        (observations[1].0, observations[1].1,
-            observations[1].2.checked_mul(512).ok_or(Fault::BoundsOverflow)?),
+        (
+            observations[0].0,
+            observations[0].1,
+            observations[0]
+                .2
+                .checked_mul(512)
+                .ok_or(Fault::BoundsOverflow)?,
+        ),
+        (
+            observations[1].0,
+            observations[1].1,
+            observations[1]
+                .2
+                .checked_mul(512)
+                .ok_or(Fault::BoundsOverflow)?,
+        ),
     ];
-    if actual[0].0 != actual[1].0 || actual.iter().any(|row| row.0 == 0 || row.1 == 0)
+    if actual[0].0 != actual[1].0
+        || actual.iter().any(|row| row.0 == 0 || row.1 == 0)
         || ((actual[0].0, actual[0].1) == (actual[1].0, actual[1].1) && actual[0].2 != actual[1].2)
-    { return Err(Fault::SourceChanged); }
+    {
+        return Err(Fault::SourceChanged);
+    }
     let mut allocation = 0u64;
     let mut additional = 0usize;
     for object in &facts.objects {
-        let amount = actual.iter().find(|row|
-            row.0 == object.device && row.1 == object.inode)
+        let amount = actual
+            .iter()
+            .find(|row| row.0 == object.device && row.1 == object.inode)
             .map_or(object.allocation, |row| row.2);
-        allocation = allocation.checked_add(amount).ok_or(Fault::BoundsOverflow)?;
+        allocation = allocation
+            .checked_add(amount)
+            .ok_or(Fault::BoundsOverflow)?;
     }
     for index in 0..2 {
-        if index == 1 && (actual[0].0, actual[0].1) == (actual[1].0, actual[1].1) { continue; }
-        if !facts.objects.iter().any(|object|
-            object.device == actual[index].0 && object.inode == actual[index].1)
+        if index == 1 && (actual[0].0, actual[0].1) == (actual[1].0, actual[1].1) {
+            continue;
+        }
+        if !facts
+            .objects
+            .iter()
+            .any(|object| object.device == actual[index].0 && object.inode == actual[index].1)
         {
             additional = additional.checked_add(1).ok_or(Fault::BoundsOverflow)?;
-            allocation = allocation.checked_add(actual[index].2).ok_or(Fault::BoundsOverflow)?;
+            allocation = allocation
+                .checked_add(actual[index].2)
+                .ok_or(Fault::BoundsOverflow)?;
         }
     }
-    let length = facts.objects.len().checked_add(additional).ok_or(Fault::BoundsOverflow)?;
+    let length = facts
+        .objects
+        .len()
+        .checked_add(additional)
+        .ok_or(Fault::BoundsOverflow)?;
     if length > facts.object_slots_admitted || length > facts.objects.capacity() {
         return Err(Fault::CapacityExceeded);
     }
@@ -356,18 +485,26 @@ fn observe_original_control_allocation(
     if facts.allocation_observed_peak > facts.max_total_allocation_bytes {
         return Err(Fault::CapacityExceeded);
     }
-    let admitted = facts.allocation_admitted.max(facts.allocation_observed_peak);
+    let admitted = facts
+        .allocation_admitted
+        .max(facts.allocation_observed_peak);
     for index in 0..2 {
-        if index == 1 && (actual[0].0, actual[0].1) == (actual[1].0, actual[1].1) { continue; }
-        if let Some(object) = facts.objects.iter_mut().find(|object|
-            object.device == actual[index].0 && object.inode == actual[index].1)
+        if index == 1 && (actual[0].0, actual[0].1) == (actual[1].0, actual[1].1) {
+            continue;
+        }
+        if let Some(object) = facts
+            .objects
+            .iter_mut()
+            .find(|object| object.device == actual[index].0 && object.inode == actual[index].1)
         {
             object.allocation = actual[index].2;
         } else {
             // Original fixed capacity and charged slots were checked before any mutation.
             facts.objects.push(OriginalControlObjectFact {
-                device: actual[index].0, inode: actual[index].1,
-                allocation: actual[index].2, retained_prior: 0,
+                device: actual[index].0,
+                inode: actual[index].1,
+                allocation: actual[index].2,
+                retained_prior: 0,
             });
         }
     }
@@ -733,10 +870,10 @@ impl ArmedNormalCapture {
             .profile
             .validate_master_retention()
             .map_err(|_| Fault::ProfileInvalid)?;
-        let owner_instance = original_capture_resource_identity(
-            &resources, &request.profile.carrier_bounds()?,
-        )?;
-        control.revalidate_original_storage_owner(&resources, &request.profile.carrier_bounds()?)?;
+        let owner_instance =
+            original_capture_resource_identity(&resources, &request.profile.carrier_bounds()?)?;
+        control
+            .revalidate_original_storage_owner(&resources, &request.profile.carrier_bounds()?)?;
         vault.revalidate().map_err(|_| Fault::SourceChanged)?;
         if capture_audit_key.len() != 32 {
             return Err(Fault::SecretInvalid);
@@ -829,24 +966,6 @@ pub(super) struct CaptureClosingPending {
     fault: Fault,
 }
 
-// Only the original phase owner stays outside this borrowed future. Catch an ordinary
-// unwind from polling this local step; process abort, runtime loss, and a panicking
-// destructor are not turned into resource-closure or success evidence.
-async fn await_resident_capture_step<T>(
-    step: impl std::future::Future<Output = Result<T, Fault>>,
-) -> Result<T, Fault> {
-    let mut step = std::pin::pin!(step);
-    std::future::poll_fn(|context| {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            std::future::Future::poll(step.as_mut(), context)
-        })) {
-            Ok(polled) => polled,
-            Err(_) => std::task::Poll::Ready(Err(Fault::ClosingPending)),
-        }
-    })
-    .await
-}
-
 /// The original resident ClosingJob alone may complete a normal-exit capture.
 pub(super) async fn run_normal_exit_capture(
     job: &mut super::DesktopLocalClosingJob,
@@ -854,14 +973,22 @@ pub(super) async fn run_normal_exit_capture(
 ) -> Result<CaptureCompleted, CaptureClosingPending> {
     fn original_witness(phase: &CaptureOwnerPhase) -> Result<&CaptureIntentWitness, Fault> {
         match phase {
-            CaptureOwnerPhase::Normal(normal) => normal.intent.as_ref().ok_or(Fault::IntentMismatch),
-            CaptureOwnerPhase::Closed(closed) => closed.normal.intent.as_ref().ok_or(Fault::IntentMismatch),
+            CaptureOwnerPhase::Normal(normal) => {
+                normal.intent.as_ref().ok_or(Fault::IntentMismatch)
+            }
+            CaptureOwnerPhase::Closed(closed) => {
+                closed.normal.intent.as_ref().ok_or(Fault::IntentMismatch)
+            }
             CaptureOwnerPhase::Permit(permit) => permit.intent_witness(),
             CaptureOwnerPhase::Source(source) => source.intent_witness(),
             CaptureOwnerPhase::Materials(materials) => materials.intent_witness(),
             CaptureOwnerPhase::Failed(failure) => match &failure.retained {
-                RetainedCaptureOwners::Normal(normal) => normal.intent.as_ref().ok_or(Fault::IntentMismatch),
-                RetainedCaptureOwners::Closed(closed) => closed.normal.intent.as_ref().ok_or(Fault::IntentMismatch),
+                RetainedCaptureOwners::Normal(normal) => {
+                    normal.intent.as_ref().ok_or(Fault::IntentMismatch)
+                }
+                RetainedCaptureOwners::Closed(closed) => {
+                    closed.normal.intent.as_ref().ok_or(Fault::IntentMismatch)
+                }
                 RetainedCaptureOwners::Permit(permit) => permit.intent_witness(),
                 RetainedCaptureOwners::Source(source) => source.intent_witness(),
             },
@@ -890,7 +1017,7 @@ pub(super) async fn run_normal_exit_capture(
         let witness = original_witness(phase)?;
         let control = custody.control.as_mut().ok_or(Fault::ClosingPending)?;
         // This future only borrows the original resident source and journal owners.
-        await_resident_capture_step(control.append(witness, operation, stage, facts)).await
+        control.append(witness, operation, stage, facts).await
     }
     fn original_facts(
         custody: &CaptureJobCustody,
@@ -914,27 +1041,40 @@ pub(super) async fn run_normal_exit_capture(
             }
         } else {
             // This program point precedes the only call that can spawn the stream.
-            if custody.stream_task.is_some() || custody.stream_result.is_some()
-                || custody.stream_join_failure.is_some() || custody.stream_input_failure.is_some()
+            if custody.stream_task.is_some()
+                || custody.stream_result.is_some()
+                || custody.stream_join_failure.is_some()
+                || custody.stream_input_failure.is_some()
                 || custody.stream_inputs.is_some()
             {
                 return Err(Fault::IntentMismatch);
             }
             (0u64, 0u64)
         };
-        let original = normal.0.checked_add(source_original)
-            .and_then(|n| n.checked_add(stream_original)).ok_or(Fault::BoundsOverflow)?;
-        let joined = normal.1.checked_add(source_joined)
-            .and_then(|n| n.checked_add(stream_joined)).ok_or(Fault::BoundsOverflow)?;
-        let proxies = normal.2.checked_add(source_proxies).ok_or(Fault::BoundsOverflow)?;
+        let original = normal
+            .0
+            .checked_add(source_original)
+            .and_then(|n| n.checked_add(stream_original))
+            .ok_or(Fault::BoundsOverflow)?;
+        let joined = normal
+            .1
+            .checked_add(source_joined)
+            .and_then(|n| n.checked_add(stream_joined))
+            .ok_or(Fault::BoundsOverflow)?;
+        let proxies = normal
+            .2
+            .checked_add(source_proxies)
+            .ok_or(Fault::BoundsOverflow)?;
         if joined > original {
             return Err(Fault::IntentMismatch);
         }
         let mut facts = actual_stage_facts(original, joined, proxies);
         // Count actually issued original task effects, including the normal stop task.
         // This finite task-effect observation is not a count of helper-internal syscalls.
-        facts.issued_effects = source_original.checked_add(stream_original)
-            .and_then(|n| n.checked_add(1)).ok_or(Fault::BoundsOverflow)?;
+        facts.issued_effects = source_original
+            .checked_add(stream_original)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Fault::BoundsOverflow)?;
         if let Some((wire_bytes, digest)) = output {
             if wire_bytes == 0 {
                 return Err(Fault::ReadbackFailed);
@@ -942,15 +1082,27 @@ pub(super) async fn run_normal_exit_capture(
             // One ordinary SHA text is newly requested by this call, before Control owns it.
             let known = (std::mem::size_of::<String>() as u64)
                 .checked_add(64)
-                .and_then(|n| n.checked_add(std::mem::size_of::<std::array::IntoIter<u8, 32>>() as u64))
+                .and_then(|n| {
+                    n.checked_add(std::mem::size_of::<std::array::IntoIter<u8, 32>>() as u64)
+                })
                 .and_then(|n| n.checked_add(std::mem::size_of::<Option<u8>>() as u64))
-                .and_then(|n| n.checked_add(std::mem::size_of::<Result<(), std::collections::TryReserveError>>() as u64))
+                .and_then(|n| {
+                    n.checked_add(
+                        std::mem::size_of::<Result<(), std::collections::TryReserveError>>() as u64,
+                    )
+                })
                 .ok_or(Fault::BoundsOverflow)?;
-            custody.operation.as_ref().ok_or(Fault::IntentMismatch)?
+            custody
+                .operation
+                .as_ref()
+                .ok_or(Fault::IntentMismatch)?
                 .reserve_original_resources(0, known)?;
             let mut text = String::new();
-            text.try_reserve_exact(64).map_err(|_| Fault::CapacityExceeded)?;
-            if text.capacity() != 64 { return Err(Fault::CapacityExceeded); }
+            text.try_reserve_exact(64)
+                .map_err(|_| Fault::CapacityExceeded)?;
+            if text.capacity() != 64 {
+                return Err(Fault::CapacityExceeded);
+            }
             let alphabet = b"0123456789abcdef";
             for byte in digest {
                 text.push(char::from(alphabet[usize::from(byte >> 4)]));
@@ -963,14 +1115,16 @@ pub(super) async fn run_normal_exit_capture(
     }
 
     // Preparation borrows this job; every resource is installed in it before a real await.
-    let prepared = await_resident_capture_step(async {
-        prepare_original_capture_source_permit(job, ready).await.map_err(|pending| pending.fault)
-    }).await;
+    let prepared = prepare_original_capture_source_permit(job, ready)
+        .await
+        .map_err(|pending| pending.fault);
     let custody = match job.capture.as_mut() {
         Some(custody) => custody,
-        None => return Err(CaptureClosingPending {
-            fault: prepared.err().unwrap_or(Fault::IntentMismatch),
-        }),
+        None => {
+            return Err(CaptureClosingPending {
+                fault: prepared.err().unwrap_or(Fault::IntentMismatch),
+            });
+        }
     };
     let operation = match custody.operation.as_ref() {
         Some(operation) => Arc::clone(operation),
@@ -980,150 +1134,192 @@ pub(super) async fn run_normal_exit_capture(
     let mut stream_requested = false;
     let result: Result<CaptureCompleted, Fault> = match prepared {
         Err(fault) => Err(fault),
-        Ok(()) => async {
-            operation.require_effect()?;
-            let normal = match custody.phase.as_ref() {
-                Some(CaptureOwnerPhase::Permit(permit)) => {
-                    let normal = &permit.closed.normal;
-                    if normal.stopped.is_none() || normal.stop_task.is_some()
-                        || normal.retained_stop_failure.is_some() || normal.stop_join_failure.is_some()
-                    {
-                        return Err(Fault::ClosingPending);
+        Ok(()) => {
+            async {
+                operation.require_effect()?;
+                let normal = match custody.phase.as_ref() {
+                    Some(CaptureOwnerPhase::Permit(permit)) => {
+                        let normal = &permit.closed.normal;
+                        if normal.stopped.is_none()
+                            || normal.stop_task.is_some()
+                            || normal.retained_stop_failure.is_some()
+                            || normal.stop_join_failure.is_some()
+                        {
+                            return Err(Fault::ClosingPending);
+                        }
+                        let facts = permit.closed_driver_facts()?;
+                        if facts.live_proxy_futures != 0
+                            || facts.original_joins.iter().any(|fact| {
+                                fact.destruction().is_none()
+                                    || fact.outcome() == OriginalDriverJoinOutcome::Panicked
+                            })
+                        {
+                            return Err(Fault::ClosingPending);
+                        }
+                        // The extra task is the actual stop_for_capture result retained in stopped.
+                        let count = facts
+                            .joined_before_freeze
+                            .checked_add(
+                                u64::try_from(facts.original_joins.len())
+                                    .map_err(|_| Fault::BoundsOverflow)?,
+                            )
+                            .and_then(|n| n.checked_add(1))
+                            .ok_or(Fault::BoundsOverflow)?;
+                        (count, count, facts.live_proxy_futures)
                     }
-                    let facts = permit.closed_driver_facts()?;
-                    if facts.live_proxy_futures != 0
-                        || facts.original_joins.iter().any(|fact|
-                            fact.destruction().is_none()
-                                || fact.outcome() == OriginalDriverJoinOutcome::Panicked)
-                    {
-                        return Err(Fault::ClosingPending);
-                    }
-                    // The extra task is the actual stop_for_capture result retained in stopped.
-                    let count = facts.joined_before_freeze
-                        .checked_add(u64::try_from(facts.original_joins.len()).map_err(|_| Fault::BoundsOverflow)?)
-                        .and_then(|n| n.checked_add(1)).ok_or(Fault::BoundsOverflow)?;
-                    (count, count, facts.live_proxy_futures)
-                }
-                _ => return Err(Fault::IntentMismatch),
-            };
-            normal_facts = Some(normal);
-            let permit = match custody.phase.take() {
-                Some(CaptureOwnerPhase::Permit(permit)) => permit,
-                other => {
-                    custody.phase = other;
-                    return Err(Fault::IntentMismatch);
-                }
-            };
-            // R472 permits this owning, linear await in the original resident job.
-            // No consumptive timeout or detached substitute owns the permit/source.
-            match crate::postgres_sidecar::start_capture_source(*permit, operation.as_ref()).await {
-                Ok(source) => custody.phase = Some(CaptureOwnerPhase::Source(Box::new(source))),
-                Err(retained) => {
-                    let fault = retained.fault();
-                    custody.phase = Some(CaptureOwnerPhase::Failed(retained));
-                    return Err(fault);
-                }
-            }
-            let mut facts = original_facts(custody, normal, false, None)?;
-            let (parent, entry) = original_source(
-                custody.phase.as_ref().ok_or(Fault::ClosingPending)?,
-            )?.original_socket_directory_observations()?;
-            facts.parent_device = Some(parent.0);
-            facts.parent_inode = Some(parent.1);
-            facts.entry_device = Some(entry.0);
-            facts.entry_inode = Some(entry.1);
-            append_original(custody, &operation, control::ControlStage::SourceStarted, facts).await?;
-            operation.require_effect()?;
-            let source = match custody.phase.take() {
-                Some(CaptureOwnerPhase::Source(source)) => source,
-                other => {
-                    custody.phase = other;
-                    return Err(Fault::IntentMismatch);
-                }
-            };
-            match crate::postgres_maintenance::capture::run_capture(*source, operation.as_ref()).await {
-                Ok(materials) => custody.phase = Some(CaptureOwnerPhase::Materials(Box::new(materials))),
-                Err(retained) => {
-                    let fault = retained.fault();
-                    custody.phase = Some(CaptureOwnerPhase::Failed(retained));
-                    return Err(fault);
-                }
-            }
-            original_source(custody.phase.as_ref().ok_or(Fault::ClosingPending)?)?
-                .require_sources_closed()?;
-            // These records observe the genuine returned full material/closed-source pair.
-            // A missing real producer or a late/unknown owner has already returned Err.
-            for stage in [control::ControlStage::MaterialsFrozen, control::ControlStage::SourceClosed] {
-                let facts = if stage == control::ControlStage::MaterialsFrozen {
-                    let control = custody.control.as_ref().ok_or(Fault::IntentMismatch)?;
-                    let materials = match custody.phase.as_ref() {
-                        Some(CaptureOwnerPhase::Materials(closed)) => &closed.materials,
-                        _ => return Err(Fault::MaterialMissing),
-                    };
-                    let (parent, entry, bytes, sha256) =
-                        materials.original_audit_record_observations(
-                            control.operation_directory()?, &operation,
-                        )?;
-                    let mut facts = original_facts(custody, normal, false, Some((bytes, sha256)))?;
-                    facts.parent_device = Some(parent.0);
-                    facts.parent_inode = Some(parent.1);
-                    facts.entry_device = Some(entry.0);
-                    facts.entry_inode = Some(entry.1);
-                    facts
-                } else {
-                    original_facts(custody, normal, false, None)?
+                    _ => return Err(Fault::IntentMismatch),
                 };
-                if facts.original_tasks != facts.joined_original_tasks || facts.live_proxy_futures != 0 {
+                normal_facts = Some(normal);
+                let permit = match custody.phase.take() {
+                    Some(CaptureOwnerPhase::Permit(permit)) => permit,
+                    other => {
+                        custody.phase = other;
+                        return Err(Fault::IntentMismatch);
+                    }
+                };
+                // R472 permits this owning, linear await in the original resident job.
+                // No consumptive timeout or detached substitute owns the permit/source.
+                match crate::postgres_sidecar::start_capture_source(*permit, operation.as_ref())
+                    .await
+                {
+                    Ok(source) => custody.phase = Some(CaptureOwnerPhase::Source(Box::new(source))),
+                    Err(retained) => {
+                        let fault = retained.fault();
+                        custody.phase = Some(CaptureOwnerPhase::Failed(retained));
+                        return Err(fault);
+                    }
+                }
+                let mut facts = original_facts(custody, normal, false, None)?;
+                let (parent, entry) =
+                    original_source(custody.phase.as_ref().ok_or(Fault::ClosingPending)?)?
+                        .original_socket_directory_observations()?;
+                facts.parent_device = Some(parent.0);
+                facts.parent_inode = Some(parent.1);
+                facts.entry_device = Some(entry.0);
+                facts.entry_inode = Some(entry.1);
+                append_original(
+                    custody,
+                    &operation,
+                    control::ControlStage::SourceStarted,
+                    facts,
+                )
+                .await?;
+                operation.require_effect()?;
+                let source = match custody.phase.take() {
+                    Some(CaptureOwnerPhase::Source(source)) => source,
+                    other => {
+                        custody.phase = other;
+                        return Err(Fault::IntentMismatch);
+                    }
+                };
+                match crate::postgres_maintenance::capture::run_capture(*source, operation.as_ref())
+                    .await
+                {
+                    Ok(materials) => {
+                        custody.phase = Some(CaptureOwnerPhase::Materials(Box::new(materials)))
+                    }
+                    Err(retained) => {
+                        let fault = retained.fault();
+                        custody.phase = Some(CaptureOwnerPhase::Failed(retained));
+                        return Err(fault);
+                    }
+                }
+                original_source(custody.phase.as_ref().ok_or(Fault::ClosingPending)?)?
+                    .require_sources_closed()?;
+                // These records observe the genuine returned full material/closed-source pair.
+                // A missing real producer or a late/unknown owner has already returned Err.
+                for stage in [
+                    control::ControlStage::MaterialsFrozen,
+                    control::ControlStage::SourceClosed,
+                ] {
+                    let facts = if stage == control::ControlStage::MaterialsFrozen {
+                        let control = custody.control.as_ref().ok_or(Fault::IntentMismatch)?;
+                        let materials = match custody.phase.as_ref() {
+                            Some(CaptureOwnerPhase::Materials(closed)) => &closed.materials,
+                            _ => return Err(Fault::MaterialMissing),
+                        };
+                        let (parent, entry, bytes, sha256) = materials
+                            .original_audit_record_observations(
+                                control.operation_directory()?,
+                                &operation,
+                            )?;
+                        let mut facts =
+                            original_facts(custody, normal, false, Some((bytes, sha256)))?;
+                        facts.parent_device = Some(parent.0);
+                        facts.parent_inode = Some(parent.1);
+                        facts.entry_device = Some(entry.0);
+                        facts.entry_inode = Some(entry.1);
+                        facts
+                    } else {
+                        original_facts(custody, normal, false, None)?
+                    };
+                    if facts.original_tasks != facts.joined_original_tasks
+                        || facts.live_proxy_futures != 0
+                    {
+                        return Err(Fault::ClosingPending);
+                    }
+                    append_original(custody, &operation, stage, facts).await?;
+                }
+                prepare_original_owned_stream(custody)?;
+                stream_requested = true;
+                join_original_stream_worker(custody).await?;
+                let output = match custody.stream_result.as_ref() {
+                    Some(Ok(receipt))
+                        if receipt.key_medium_verified()
+                            && receipt.temporary_verified()
+                            && receipt.published_verified() =>
+                    {
+                        (receipt.wire_bytes(), *receipt.carrier_sha256())
+                    }
+                    _ => return Err(Fault::ReadbackFailed),
+                };
+                // The whole real receipt stays resident while its original journal ACKs run.
+                for stage in [
+                    control::ControlStage::KeyMediumVerified,
+                    control::ControlStage::TemporaryVerified,
+                    control::ControlStage::PublishedVerified,
+                    control::ControlStage::Closed,
+                ] {
+                    let facts = original_facts(custody, normal, true, Some(output))?;
+                    if facts.original_tasks != facts.joined_original_tasks
+                        || facts.live_proxy_futures != 0
+                    {
+                        return Err(Fault::ClosingPending);
+                    }
+                    append_original(custody, &operation, stage, facts).await?;
+                }
+                // Successful original join + receipt + final ACK are the closure evidence;
+                // empty slots alone never confer completion.
+                if custody.stream_task.is_some()
+                    || custody.stream_join_failure.is_some()
+                    || custody.stream_input_failure.is_some()
+                    || custody.stream_inputs.is_some()
+                    || !custody.original_sources.is_empty()
+                    || !custody.material_claims.is_empty()
+                    || custody.stream_output_directory.is_some()
+                    || custody.stream_key_medium_directory.is_some()
+                {
                     return Err(Fault::ClosingPending);
                 }
-                append_original(custody, &operation, stage, facts).await?;
+                operation.require_closing()?;
+                drop(custody.original_master_journal.take());
+                operation.require_closing()?;
+                drop(custody.original_master_journal_bytes.take());
+                operation.require_closing()?;
+                drop(custody.retained_materials.take());
+                operation.require_closing()?;
+                // Every journal worker has actually ACKed; only its passive original files remain.
+                drop(custody.control.take());
+                operation.require_closing()?;
+                // This closes the original source's passive FDs and outer continuous kernel lease last.
+                drop(custody.phase.take());
+                operation.require_closing()?;
+                Ok(CaptureCompleted {
+                    operation: operation.operation_id(),
+                })
             }
-            prepare_original_owned_stream(custody)?;
-            stream_requested = true;
-            await_resident_capture_step(join_original_stream_worker(custody)).await?;
-            let output = match custody.stream_result.as_ref() {
-                Some(Ok(receipt)) if receipt.key_medium_verified()
-                    && receipt.temporary_verified() && receipt.published_verified() =>
-                    (receipt.wire_bytes(), *receipt.carrier_sha256()),
-                _ => return Err(Fault::ReadbackFailed),
-            };
-            // The whole real receipt stays resident while its original journal ACKs run.
-            for stage in [
-                control::ControlStage::KeyMediumVerified,
-                control::ControlStage::TemporaryVerified,
-                control::ControlStage::PublishedVerified,
-                control::ControlStage::Closed,
-            ] {
-                let facts = original_facts(custody, normal, true, Some(output))?;
-                if facts.original_tasks != facts.joined_original_tasks || facts.live_proxy_futures != 0 {
-                    return Err(Fault::ClosingPending);
-                }
-                append_original(custody, &operation, stage, facts).await?;
-            }
-            // Successful original join + receipt + final ACK are the closure evidence;
-            // empty slots alone never confer completion.
-            if custody.stream_task.is_some() || custody.stream_join_failure.is_some()
-                || custody.stream_input_failure.is_some() || custody.stream_inputs.is_some()
-                || !custody.original_sources.is_empty() || !custody.material_claims.is_empty()
-                || custody.stream_output_directory.is_some() || custody.stream_key_medium_directory.is_some()
-            {
-                return Err(Fault::ClosingPending);
-            }
-            operation.require_closing()?;
-            drop(custody.original_master_journal.take());
-            operation.require_closing()?;
-            drop(custody.original_master_journal_bytes.take());
-            operation.require_closing()?;
-            drop(custody.retained_materials.take());
-            operation.require_closing()?;
-            // Every journal worker has actually ACKed; only its passive original files remain.
-            drop(custody.control.take());
-            operation.require_closing()?;
-            // This closes the original source's passive FDs and outer continuous kernel lease last.
-            drop(custody.phase.take());
-            operation.require_closing()?;
-            Ok(CaptureCompleted { operation: operation.operation_id() })
-        }.await,
+            .await
+        }
     };
     match result {
         Ok(completed) => Ok(completed),
@@ -1166,8 +1362,12 @@ pub(super) async fn run_normal_exit_capture(
                             Fault::ClosingPending => "ClosingPending",
                         }));
                         let _observed = append_original(
-                            custody, &operation, control::ControlStage::ClosingPending, facts,
-                        ).await;
+                            custody,
+                            &operation,
+                            control::ControlStage::ClosingPending,
+                            facts,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1209,7 +1409,12 @@ async fn prepare_original_capture_source_permit(
     let request = armed.request.take().ok_or(CaptureClosingPending {
         fault: Fault::IntentMismatch,
     })?;
-    let operation = match CaptureOperation::start(request, armed.owner_instance, &armed.resources, job.deadline) {
+    let operation = match CaptureOperation::start(
+        request,
+        armed.owner_instance,
+        &armed.resources,
+        job.deadline,
+    ) {
         Ok(operation) => operation,
         Err((request, fault)) => {
             armed.request = Some(request);
@@ -1217,8 +1422,11 @@ async fn prepare_original_capture_source_permit(
         }
     };
     custody.operation = Some(Arc::clone(&operation));
-    if armed.materials.original_decode_budget()
-        .bind_original_clock(operation.clock_view()).is_err()
+    if armed
+        .materials
+        .original_decode_budget()
+        .bind_original_clock(operation.clock_view())
+        .is_err()
     {
         return Err(custody.pending(Fault::IntentMismatch));
     }
@@ -1283,7 +1491,7 @@ async fn prepare_original_capture_source_permit(
     }
     let closed_result = match (custody.phase.as_mut(), custody.control.as_mut()) {
         (Some(CaptureOwnerPhase::Normal(normal)), Some(control)) => {
-            await_resident_capture_step(close_normal_originals(normal, &operation, control)).await
+            close_normal_originals(normal, &operation, control).await
         }
         _ => Err(Fault::IntentMismatch),
     };
@@ -1305,7 +1513,7 @@ async fn prepare_original_capture_source_permit(
     })));
     let confirmed = match (custody.phase.as_mut(), custody.control.as_mut()) {
         (Some(CaptureOwnerPhase::Closed(closed)), Some(control)) => {
-            await_resident_capture_step(confirm_closed_original(closed, &operation, control)).await
+            confirm_closed_original(closed, &operation, control).await
         }
         _ => Err(Fault::IntentMismatch),
     };
@@ -1377,8 +1585,13 @@ fn prepare_original_owned_stream(custody: &mut CaptureJobCustody) -> Result<(), 
         .retained_materials
         .as_ref()
         .ok_or(Fault::MaterialMissing)?;
-    let provenance = materials.provenance.as_ref().ok_or(Fault::MaterialMissing)?;
-    let tool = materials.files.iter()
+    let provenance = materials
+        .provenance
+        .as_ref()
+        .ok_or(Fault::MaterialMissing)?;
+    let tool = materials
+        .files
+        .iter()
         .find(|file| file.material_id == provenance.tool_inventory_material_id)
         .ok_or(Fault::MaterialMissing)?;
     if (tool.plain_len, tool.plain_sha256) != materials.tool_inventory_identity {
@@ -1555,9 +1768,13 @@ fn prepare_original_owned_stream(custody: &mut CaptureJobCustody) -> Result<(), 
             materials: std::mem::take(&mut custody.material_claims),
             // Last: all earlier source/tool/preparation checks preserve this exact DATA owner.
             // The existing pure check consumes its claim on Err; original Source/FDs stay retained.
-            provenance: custody.retained_materials.as_mut()
+            provenance: custody
+                .retained_materials
+                .as_mut()
                 .expect("checked original material custody remains resident")
-                .provenance.take().expect("checked original provenance remains resident"),
+                .provenance
+                .take()
+                .expect("checked original provenance remains resident"),
         },
         bounds,
     )?;
@@ -1642,21 +1859,18 @@ async fn join_original_stream_worker(custody: &mut CaptureJobCustody) -> Result<
         run_owned_stream(inputs, clock)
     }));
     // Bound only the borrowed wait by the original remaining C. The original
-    // worker and inputs stay resident on timeout or an ordinary local poll unwind.
-    let waited = await_resident_capture_step(async {
-        let remaining = operation
-            .closing_remaining_ns()
-            .map_err(|_| Fault::ClosingPending)?;
-        Ok(tokio::time::timeout(
+    // worker and inputs stay resident on timeout.
+    let waited = match operation.closing_remaining_ns() {
+        Ok(remaining) => Ok(tokio::time::timeout(
             std::time::Duration::from_nanos(remaining),
             custody
                 .stream_task
                 .as_mut()
                 .expect("original stream handle retained"),
         )
-        .await)
-    })
-    .await;
+        .await),
+        Err(_) => Err(Fault::ClosingPending),
+    };
     let failed = match waited {
         Ok(Ok(Ok(result))) => {
             let failed = result.is_err();
@@ -1758,7 +1972,11 @@ pub(crate) struct CaptureStartPermit {
 impl CaptureStartPermit {
     /// Borrow only the original begin/ACK witness retained by this permit's normal owner.
     pub(crate) fn intent_witness(&self) -> Result<&CaptureIntentWitness, Fault> {
-        self.closed.normal.intent.as_ref().ok_or(Fault::IntentMismatch)
+        self.closed
+            .normal
+            .intent
+            .as_ref()
+            .ok_or(Fault::IntentMismatch)
     }
     pub(crate) fn revalidate_original(
         &self,
@@ -1785,7 +2003,8 @@ impl CaptureStartPermit {
         self.stopped()?.revalidate(operation.as_ref())?;
         materials::revalidate_original_source_config(
             normal.materials.as_ref().ok_or(Fault::MaterialMissing)?,
-            self.stopped()?, operation.as_ref(),
+            self.stopped()?,
+            operation.as_ref(),
         )?;
         use std::os::unix::fs::MetadataExt as _;
         operation.require_effect()?;
@@ -1871,13 +2090,22 @@ impl CaptureStartPermit {
     pub(crate) fn operation_path(&self) -> &std::path::Path {
         &self.operation_path
     }
-    pub(crate) fn materials_mut(&mut self) -> Result<&mut materials::NormalCaptureMaterials, Fault> {
-        self.closed.normal.materials.as_mut().ok_or(Fault::MaterialMissing)
+    pub(crate) fn materials_mut(
+        &mut self,
+    ) -> Result<&mut materials::NormalCaptureMaterials, Fault> {
+        self.closed
+            .normal
+            .materials
+            .as_mut()
+            .ok_or(Fault::MaterialMissing)
     }
     pub(crate) fn restore_materials(
-        &mut self, materials: materials::NormalCaptureMaterials,
+        &mut self,
+        materials: materials::NormalCaptureMaterials,
     ) -> Result<(), materials::NormalCaptureMaterials> {
-        if self.closed.normal.materials.is_some() { return Err(materials); }
+        if self.closed.normal.materials.is_some() {
+            return Err(materials);
+        }
         self.closed.normal.materials = Some(materials);
         Ok(())
     }
@@ -2231,74 +2459,6 @@ fn actual_stage_facts(original: u64, joined: u64, proxies: u64) -> control::Cont
 }
 
 #[cfg(test)]
-mod resident_capture_step_tests {
-    use super::{Fault, await_resident_capture_step};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Waker};
-
-    // A plain borrowed test allocation, not a capture job, source, clock, or capability.
-    struct DropProbe {
-        polls: usize,
-        dropped: Arc<AtomicUsize>,
-    }
-    impl Drop for DropProbe {
-        fn drop(&mut self) {
-            self.dropped.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    async fn panic_while_borrowing(probe: &mut DropProbe) -> Result<(), Fault> {
-        probe.polls += 1;
-        panic!("expected ordinary borrowed-step poll panic");
-    }
-
-    #[test]
-    fn ordinary_poll_unwind_leaves_the_borrowed_probe_with_its_caller() {
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let mut probe = DropProbe {
-            polls: 0,
-            dropped: Arc::clone(&dropped),
-        };
-        {
-            let mut step = std::pin::pin!(await_resident_capture_step(panic_while_borrowing(
-                &mut probe
-            )));
-            let mut context = Context::from_waker(Waker::noop());
-            assert!(matches!(
-                std::future::Future::poll(step.as_mut(), &mut context),
-                Poll::Ready(Err(Fault::ClosingPending))
-            ));
-        }
-        assert_eq!(probe.polls, 1);
-        assert_eq!(dropped.load(Ordering::SeqCst), 0);
-        drop(probe);
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn dropping_only_a_pending_borrowed_step_does_not_drop_the_callers_probe() {
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let mut probe = DropProbe {
-            polls: 0,
-            dropped: Arc::clone(&dropped),
-        };
-        {
-            let borrowed = std::future::poll_fn(|_| {
-                probe.polls += 1;
-                Poll::<Result<(), Fault>>::Pending
-            });
-            let mut step = std::pin::pin!(await_resident_capture_step(borrowed));
-            let mut context = Context::from_waker(Waker::noop());
-            assert!(std::future::Future::poll(step.as_mut(), &mut context).is_pending());
-        }
-        assert_eq!(probe.polls, 1);
-        assert_eq!(dropped.load(Ordering::SeqCst), 0);
-        drop(probe);
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    }
-}
-
-#[cfg(test)]
 pub(crate) fn original_capture_resources_for_test(
     bounds: &WholePgCarrierBounds,
 ) -> Result<Arc<Mutex<CaptureResourceTotals>>, Fault> {
@@ -2311,14 +2471,23 @@ mod original_capture_resource_tests {
 
     fn book(fds: u64, metadata: u64) -> Arc<Mutex<CaptureResourceTotals>> {
         Arc::new(Mutex::new(CaptureResourceTotals {
-            owner_instance: [1; 16], max_fds: fds, max_metadata: metadata,
-            fd_admissions: 0, metadata_reserved: 0,
+            owner_instance: [1; 16],
+            max_fds: fds,
+            max_metadata: metadata,
+            fd_admissions: 0,
+            metadata_reserved: 0,
             original_control_storage: OriginalControlStorageFacts {
-                objects: Vec::new(), original_owner: [1; 16],
-                roots: [OriginalControlRootObservation::Unobserved; 4], classified: false,
-                max_total_allocation_bytes: u64::MAX, max_retained_prior_bytes: u64::MAX,
-                growth_ready: false, allocation_admitted: 0, allocation_observed_peak: 0,
-                allocation_update_pending: false, object_slots_admitted: 0,
+                objects: Vec::new(),
+                original_owner: [1; 16],
+                roots: [OriginalControlRootObservation::Unobserved; 4],
+                classified: false,
+                max_total_allocation_bytes: u64::MAX,
+                max_retained_prior_bytes: u64::MAX,
+                growth_ready: false,
+                allocation_admitted: 0,
+                allocation_observed_peak: 0,
+                allocation_update_pending: false,
+                object_slots_admitted: 0,
             },
         }))
     }
@@ -2327,30 +2496,42 @@ mod original_capture_resource_tests {
     fn a_two_dimension_rejection_never_partially_spends_or_refunds() {
         let resources = book(2, 10);
         reserve_capture_resources(&resources, 1, 7).unwrap();
-        assert_eq!(reserve_capture_resources(&resources, 1, 4), Err(Fault::CapacityExceeded));
+        assert_eq!(
+            reserve_capture_resources(&resources, 1, 4),
+            Err(Fault::CapacityExceeded)
+        );
         assert_eq!(remaining_capture_resources(&resources), Ok((1, 3)));
         let carried = Arc::clone(&resources);
         drop(resources);
         assert_eq!(remaining_capture_resources(&carried), Ok((1, 3)));
         reserve_capture_resources(&carried, 1, 3).unwrap();
         assert_eq!(remaining_capture_resources(&carried), Ok((0, 0)));
-        assert_eq!(reserve_capture_resources(&carried, 1, 0), Err(Fault::CapacityExceeded));
+        assert_eq!(
+            reserve_capture_resources(&carried, 1, 0),
+            Err(Fault::CapacityExceeded)
+        );
     }
 
     #[test]
     fn two_real_concurrent_callers_share_one_atomic_remaining_allowance() {
         let resources = book(1, 9);
         let barrier = Arc::new(std::sync::Barrier::new(3));
-        let callers: Vec<_> = (0..2).map(|_| {
-            let resources = Arc::clone(&resources);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                reserve_capture_resources(&resources, 1, 9)
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let resources = Arc::clone(&resources);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reserve_capture_resources(&resources, 1, 9)
+                })
             })
-        }).collect();
+            .collect();
         barrier.wait();
-        let successes = callers.into_iter().map(|caller| caller.join().unwrap()).filter(|outcome| outcome.is_ok()).count();
+        let successes = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .filter(|outcome| outcome.is_ok())
+            .count();
         assert_eq!(successes, 1);
         assert_eq!(remaining_capture_resources(&resources), Ok((0, 0)));
     }
@@ -2359,15 +2540,24 @@ mod original_capture_resource_tests {
     fn arithmetic_overflow_and_poison_do_not_clear_original_counters() {
         let resources = book(u64::MAX, 10);
         resources.lock().unwrap().fd_admissions = u64::MAX - 1;
-        assert_eq!(reserve_capture_resources(&resources, 2, 1), Err(Fault::BoundsOverflow));
+        assert_eq!(
+            reserve_capture_resources(&resources, 2, 1),
+            Err(Fault::BoundsOverflow)
+        );
         assert_eq!(remaining_capture_resources(&resources), Ok((1, 10)));
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held_original = resources.lock().unwrap();
             panic!("original-capture-resource-book-poison");
         }));
         assert!(panic.is_err());
-        assert_eq!(reserve_capture_resources(&resources, 0, 0), Err(Fault::ClosingPending));
-        assert_eq!(remaining_capture_resources(&resources), Err(Fault::ClosingPending));
+        assert_eq!(
+            reserve_capture_resources(&resources, 0, 0),
+            Err(Fault::ClosingPending)
+        );
+        assert_eq!(
+            remaining_capture_resources(&resources),
+            Err(Fault::ClosingPending)
+        );
         let retained = match resources.lock() {
             Err(poisoned) => poisoned.into_inner(),
             Ok(_) => panic!("original poison must not be cleared"),
@@ -2376,11 +2566,13 @@ mod original_capture_resource_tests {
         assert_eq!(retained.metadata_reserved, 0);
     }
 
-
     fn original_storage_fixture(
         allocation_limit: u64,
         prior_limit: u64,
-    ) -> (Arc<Mutex<CaptureResourceTotals>>, OriginalControlStorageFacts) {
+    ) -> (
+        Arc<Mutex<CaptureResourceTotals>>,
+        OriginalControlStorageFacts,
+    ) {
         let resources = book(8, u64::MAX);
         {
             let mut totals = resources.lock().unwrap();
@@ -2391,16 +2583,31 @@ mod original_capture_resource_tests {
             objects: Vec::with_capacity(8),
             original_owner: [1; 16],
             roots: [
-                OriginalControlRootObservation::Present { device: 7, inode: 1 },
-                OriginalControlRootObservation::Present { device: 7, inode: 2 },
-                OriginalControlRootObservation::Present { device: 8, inode: 3 },
-                OriginalControlRootObservation::Present { device: 8, inode: 4 },
+                OriginalControlRootObservation::Present {
+                    device: 7,
+                    inode: 1,
+                },
+                OriginalControlRootObservation::Present {
+                    device: 7,
+                    inode: 2,
+                },
+                OriginalControlRootObservation::Present {
+                    device: 8,
+                    inode: 3,
+                },
+                OriginalControlRootObservation::Present {
+                    device: 8,
+                    inode: 4,
+                },
             ],
             classified: true,
             max_total_allocation_bytes: allocation_limit,
             max_retained_prior_bytes: prior_limit,
-            growth_ready: false, allocation_admitted: 0, allocation_observed_peak: 0,
-            allocation_update_pending: false, object_slots_admitted: 0,
+            growth_ready: false,
+            allocation_admitted: 0,
+            allocation_observed_peak: 0,
+            allocation_update_pending: false,
+            object_slots_admitted: 0,
         };
         for (device, inode) in [(7, 1), (7, 2), (8, 3), (8, 4)] {
             facts.observe(device, inode, 1, 0).unwrap();
@@ -2428,12 +2635,21 @@ mod original_capture_resource_tests {
         for (allocation_limit, prior_limit) in [(3071, 800), (3072, 799)] {
             let (resources, mut facts) = original_storage_fixture(allocation_limit, prior_limit);
             facts.observe(7, 20, 2, 800).unwrap();
-            assert_eq!(install_original_control_storage(&resources, facts), Err(Fault::CapacityExceeded));
+            assert_eq!(
+                install_original_control_storage(&resources, facts),
+                Err(Fault::CapacityExceeded)
+            );
             let totals = resources.lock().unwrap();
             assert!(!totals.original_control_storage.classified);
             assert!(totals.original_control_storage.objects.is_empty());
-            assert_eq!(totals.original_control_storage.max_total_allocation_bytes, allocation_limit);
-            assert_eq!(totals.original_control_storage.max_retained_prior_bytes, prior_limit);
+            assert_eq!(
+                totals.original_control_storage.max_total_allocation_bytes,
+                allocation_limit
+            );
+            assert_eq!(
+                totals.original_control_storage.max_retained_prior_bytes,
+                prior_limit
+            );
         }
     }
 
@@ -2446,7 +2662,10 @@ mod original_capture_resource_tests {
         assert_eq!(facts.objects.len(), 5);
         assert_eq!(facts.objects[4].allocation, 1024);
         facts.original_owner = [2; 16];
-        assert_eq!(install_original_control_storage(&resources, facts), Err(Fault::IntentMismatch));
+        assert_eq!(
+            install_original_control_storage(&resources, facts),
+            Err(Fault::IntentMismatch)
+        );
         let carried = Arc::clone(&resources);
         drop(resources);
         let totals = carried.lock().unwrap();
@@ -2465,14 +2684,20 @@ mod original_capture_resource_tests {
             } else {
                 facts.max_retained_prior_bytes += 1;
             }
-            assert_eq!(install_original_control_storage(&resources, facts), Err(Fault::IntentMismatch));
+            assert_eq!(
+                install_original_control_storage(&resources, facts),
+                Err(Fault::IntentMismatch)
+            );
             let totals = resources.lock().unwrap();
             assert!(!totals.original_control_storage.classified);
             assert!(totals.original_control_storage.objects.is_empty());
         }
         let (resources, mut facts) = original_storage_fixture(u64::MAX, u64::MAX);
         facts.observe(9, 99, u64::MAX / 512, 0).unwrap();
-        assert_eq!(install_original_control_storage(&resources, facts), Err(Fault::BoundsOverflow));
+        assert_eq!(
+            install_original_control_storage(&resources, facts),
+            Err(Fault::BoundsOverflow)
+        );
         let totals = resources.lock().unwrap();
         assert!(!totals.original_control_storage.classified);
         assert!(totals.original_control_storage.objects.is_empty());
@@ -2482,9 +2707,11 @@ mod original_capture_resource_tests {
     fn control_growth_rejects_full_original_allocation_before_effect() {
         let (resources, facts) = original_storage_fixture(2048, 800);
         install_original_control_storage(&resources, facts).unwrap();
-        mark_original_control_growth_after_history(&resources, [1;16]).unwrap();
-        assert_eq!(reserve_original_control_growth(&resources, [1;16], 7, 2, 512, 1),
-            Err(Fault::CapacityExceeded));
+        mark_original_control_growth_after_history(&resources, [1; 16]).unwrap();
+        assert_eq!(
+            reserve_original_control_growth(&resources, [1; 16], 7, 2, 512, 1),
+            Err(Fault::CapacityExceeded)
+        );
         let totals = resources.lock().unwrap();
         let facts = &totals.original_control_storage;
         assert!(facts.growth_ready);
@@ -2500,9 +2727,9 @@ mod original_capture_resource_tests {
     fn control_growth_counts_alias_once_and_keeps_unknown_pending() {
         let (resources, facts) = original_storage_fixture(8192, 800);
         install_original_control_storage(&resources, facts).unwrap();
-        mark_original_control_growth_after_history(&resources, [1;16]).unwrap();
-        reserve_original_control_growth(&resources, [1;16], 7, 2, 512, 1).unwrap();
-        observe_original_control_allocation(&resources, [1;16], [(7,2,1),(7,20,2)]).unwrap();
+        mark_original_control_growth_after_history(&resources, [1; 16]).unwrap();
+        reserve_original_control_growth(&resources, [1; 16], 7, 2, 512, 1).unwrap();
+        observe_original_control_allocation(&resources, [1; 16], [(7, 2, 1), (7, 20, 2)]).unwrap();
         {
             let totals = resources.lock().unwrap();
             let facts = &totals.original_control_storage;
@@ -2511,8 +2738,8 @@ mod original_capture_resource_tests {
             assert_eq!(facts.allocation_observed_peak, 3072);
             assert!(!facts.allocation_update_pending);
         }
-        reserve_original_control_growth(&resources, [1;16], 7, 2, 512, 0).unwrap();
-        observe_original_control_allocation(&resources, [1;16], [(7,20,2),(7,20,2)]).unwrap();
+        reserve_original_control_growth(&resources, [1; 16], 7, 2, 512, 0).unwrap();
+        observe_original_control_allocation(&resources, [1; 16], [(7, 20, 2), (7, 20, 2)]).unwrap();
         {
             let totals = resources.lock().unwrap();
             let facts = &totals.original_control_storage;
@@ -2521,11 +2748,15 @@ mod original_capture_resource_tests {
             assert_eq!(facts.allocation_admitted, 3584);
             assert_eq!(facts.allocation_observed_peak, 3072);
         }
-        reserve_original_control_growth(&resources, [1;16], 7, 2, 512, 0).unwrap();
-        assert_eq!(observe_original_control_allocation(&resources, [1;16],
-            [(7,2,1),(7,20,20)]), Err(Fault::CapacityExceeded));
-        assert_eq!(reserve_original_control_growth(&resources, [1;16], 7, 2, 512, 0),
-            Err(Fault::ClosingPending));
+        reserve_original_control_growth(&resources, [1; 16], 7, 2, 512, 0).unwrap();
+        assert_eq!(
+            observe_original_control_allocation(&resources, [1; 16], [(7, 2, 1), (7, 20, 20)]),
+            Err(Fault::CapacityExceeded)
+        );
+        assert_eq!(
+            reserve_original_control_growth(&resources, [1; 16], 7, 2, 512, 0),
+            Err(Fault::ClosingPending)
+        );
         {
             let totals = resources.lock().unwrap();
             let facts = &totals.original_control_storage;
@@ -2536,10 +2767,12 @@ mod original_capture_resource_tests {
         }
         let (unknown, facts) = original_storage_fixture(8192, 800);
         install_original_control_storage(&unknown, facts).unwrap();
-        mark_original_control_growth_after_history(&unknown, [1;16]).unwrap();
-        reserve_original_control_growth(&unknown, [1;16], 7, 2, 512, 1).unwrap();
-        assert_eq!(reserve_original_control_growth(&unknown, [1;16], 7, 2, 512, 1),
-            Err(Fault::ClosingPending));
+        mark_original_control_growth_after_history(&unknown, [1; 16]).unwrap();
+        reserve_original_control_growth(&unknown, [1; 16], 7, 2, 512, 1).unwrap();
+        assert_eq!(
+            reserve_original_control_growth(&unknown, [1; 16], 7, 2, 512, 1),
+            Err(Fault::ClosingPending)
+        );
         let totals = unknown.lock().unwrap();
         assert!(totals.original_control_storage.allocation_update_pending);
         assert_eq!(totals.original_control_storage.allocation_admitted, 2560);

@@ -148,7 +148,11 @@ pub(super) struct OwnerSupervisor {
     registry: Mutex<Registry>,
     creations: AtomicUsize,
     fault: watch::Sender<Option<PoolError>>,
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     retention: Option<retained::SupervisorRetention>,
 }
 
@@ -159,12 +163,20 @@ impl OwnerSupervisor {
             registry: Mutex::new(Registry::default()),
             creations: AtomicUsize::new(0),
             fault,
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             retention: None,
         })
     }
 
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     fn new_retained(retention: retained::SupervisorRetention, registry: Registry) -> Arc<Self> {
         let (fault, _) = watch::channel(None);
         Arc::new(Self {
@@ -212,7 +224,11 @@ impl OwnerSupervisor {
             self.fail(PoolError::IdentityCollision);
             return Err(PoolError::IdentityCollision);
         }
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if self.retention.is_some() && registry.pending.len() >= registry.pending.capacity() {
             return Err(PoolError::CreationLimit);
         }
@@ -258,7 +274,11 @@ impl OwnerSupervisor {
     }
 
     fn can_return(&self, id: ObjectId, owner: &Arc<DriverOwner>) -> bool {
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if self
             .retention
             .as_ref()
@@ -299,7 +319,11 @@ impl OwnerSupervisor {
             if !Arc::ptr_eq(pending, &owner) || !owner.live() {
                 return Err(PoolError::OwnershipUnavailable);
             }
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             if self.retention.is_some() && registry.bound.len() >= registry.bound.capacity() {
                 return Err(PoolError::CreationLimit);
             }
@@ -343,11 +367,19 @@ impl OwnerSupervisor {
         if stock.is_closed() {
             return Err(PoolError::Closed);
         }
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if let Some(retention) = self.retention.as_ref() {
             retention.ensure_running()?;
         }
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         let metadata_ticket = match self.retention.as_ref() {
             Some(retention) => Some(retention.reserve_checkout()?),
             None => None,
@@ -355,7 +387,11 @@ impl OwnerSupervisor {
         let trace = Arc::new(CheckoutTrace::new(
             self,
             session_permit,
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             metadata_ticket,
         ));
         let mut cancellation = CheckoutCancellation {
@@ -380,7 +416,11 @@ impl OwnerSupervisor {
             deadpool_postgres::PoolError::Closed => PoolError::Closed,
             _ => self.current_fault().unwrap_or(PoolError::Unavailable),
         })?;
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         let _retained_gate = match self.retention.as_ref() {
             Some(retention) => match retention.lock_running() {
                 Ok(guard) => Some(guard),
@@ -401,7 +441,11 @@ impl OwnerSupervisor {
             Ok(owner) => owner,
             Err(error) => {
                 self.fail(error);
-                #[cfg(feature = "desktop-local-vault")]
+                #[cfg(all(
+                    feature = "desktop-local-vault",
+                    feature = "server-runtime",
+                    target_os = "macos"
+                ))]
                 drop(_retained_gate);
                 let wrapper = Client::take(object);
                 drop(wrapper);
@@ -532,7 +576,11 @@ struct CheckoutTrace {
     created: Mutex<Vec<Arc<DriverOwner>>>,
     session_custody: Option<Arc<SessionPermitCustody>>,
     // Last: refund only after the actual trace vector/session state is dropped.
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     metadata_ticket: Option<retained::CheckoutMetadataTicket>,
 }
 
@@ -540,23 +588,38 @@ impl CheckoutTrace {
     fn new(
         supervisor: &Arc<OwnerSupervisor>,
         permit: Option<OwnedSemaphorePermit>,
-        #[cfg(feature = "desktop-local-vault")] metadata_ticket: Option<
-            retained::CheckoutMetadataTicket,
-        >,
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
+        metadata_ticket: Option<retained::CheckoutMetadataTicket>,
     ) -> Self {
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         let created = if metadata_ticket.is_some() {
             Vec::with_capacity(1)
         } else {
             Vec::new()
         };
-        #[cfg(not(feature = "desktop-local-vault"))]
+        #[cfg(not(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        )))]
         let created = Vec::new();
         Self {
             supervisor: Arc::downgrade(supervisor),
             created: Mutex::new(created),
             session_custody: permit.map(SessionPermitCustody::new),
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             metadata_ticket,
         }
     }
@@ -579,7 +642,11 @@ impl CheckoutTrace {
             .created
             .lock()
             .map_err(|_| PoolError::OwnershipUnavailable)?;
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if self.metadata_ticket.is_some() && !created.is_empty() {
             return Err(PoolError::OwnershipUnavailable);
         }
@@ -603,7 +670,11 @@ impl CheckoutTrace {
     }
 
     fn retire_created(&self) {
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if self.metadata_ticket.is_some() {
             let owner = self
                 .created
@@ -648,7 +719,11 @@ struct DriverOwner {
     state: watch::Sender<ConnectionSnapshot>,
     abort: Mutex<Option<AbortHandle>>,
     session_custody: Mutex<Option<Arc<SessionPermitCustody>>>,
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     retention: Option<retained::DriverRetention>,
 }
 
@@ -661,12 +736,20 @@ impl DriverOwner {
             state,
             abort: Mutex::new(None),
             session_custody: Mutex::new(None),
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             retention: None,
         })
     }
 
-    #[cfg(feature = "desktop-local-vault")]
+    #[cfg(all(
+        feature = "desktop-local-vault",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
     fn new_retained(
         sequence: usize,
         supervisor: &Arc<OwnerSupervisor>,
@@ -713,7 +796,11 @@ impl DriverOwner {
         *slot = Some(abort);
         drop(slot);
         if requested {
-            #[cfg(feature = "desktop-local-vault")]
+            #[cfg(all(
+                feature = "desktop-local-vault",
+                feature = "server-runtime",
+                target_os = "macos"
+            ))]
             if let Some(retention) = self.retention.as_ref() {
                 retention.wake();
                 return;
@@ -725,7 +812,11 @@ impl DriverOwner {
     fn request_retirement(&self) {
         self.state
             .send_modify(|state| state.retirement_requested = true);
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if let Some(retention) = self.retention.as_ref() {
             retention.retirement_requested();
             return;
@@ -753,7 +844,11 @@ impl DriverOwner {
     fn driving_started(&self) {
         self.state
             .send_modify(|state| state.connection_started = true);
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if let Some(retention) = self.retention.as_ref() {
             retention.driving_started();
         }
@@ -785,7 +880,11 @@ impl DriverOwner {
             custody.finish(self.sequence);
         }
         drop(held);
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if first && let Some(retention) = self.retention.as_ref() {
             retention.after_drop(destruction);
         }
@@ -825,7 +924,11 @@ impl Connect for SupervisedConnect {
                 return Box::pin(pending());
             }
         };
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if let Some(retention) = supervisor.retention.as_ref() {
             return retention.connect(Arc::clone(&supervisor), pg_config, trace);
         }
@@ -946,7 +1049,11 @@ impl Future for OriginalDriver {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        #[cfg(feature = "desktop-local-vault")]
+        #[cfg(all(
+            feature = "desktop-local-vault",
+            feature = "server-runtime",
+            target_os = "macos"
+        ))]
         if this
             .owner
             .retention
@@ -1070,7 +1177,11 @@ impl Drop for ClientLease {
     }
 }
 
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 mod capture_io {
     use super::*;
     use crate::db::capture_materials::{CaptureDecodeBudget, CaptureSqlFailure};
@@ -1083,7 +1194,10 @@ mod capture_io {
     enum Endpoint {
         Tcp(SocketAddr),
         #[cfg(unix)]
-        Unix { bytes: [u8; 104], len: usize },
+        Unix {
+            bytes: [u8; 104],
+            len: usize,
+        },
     }
     #[derive(Clone, Copy)]
     struct TcpOptions {
@@ -1118,16 +1232,15 @@ mod capture_io {
             || !config.get_hostaddrs().is_empty()
             || config.get_ssl_mode() == tokio_postgres::config::SslMode::Require
             || config.get_channel_binding() == tokio_postgres::config::ChannelBinding::Require
-            || config.get_target_session_attrs()
-                != tokio_postgres::config::TargetSessionAttrs::Any
+            || config.get_target_session_attrs() != tokio_postgres::config::TargetSessionAttrs::Any
         {
             return Err(CaptureSqlFailure::Bounds);
         }
         let port = config.get_ports()[0];
         match config.get_hosts() {
-            [tokio_postgres::config::Host::Tcp(host)] if host == "127.0.0.1" => {
-                Ok(Endpoint::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))))
-            }
+            [tokio_postgres::config::Host::Tcp(host)] if host == "127.0.0.1" => Ok(Endpoint::Tcp(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
+            )),
             #[cfg(unix)]
             [tokio_postgres::config::Host::Unix(root)] => {
                 use std::os::unix::ffi::OsStrExt;
@@ -1143,16 +1256,24 @@ mod capture_io {
                     first -= 1;
                     digits[first] = b'0' + (n % 10) as u8;
                     n /= 10;
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                 }
                 let slash = usize::from(!root.ends_with(b"/"));
-                let len = root.len().checked_add(slash)
+                let len = root
+                    .len()
+                    .checked_add(slash)
                     .and_then(|n| n.checked_add(b".s.PGSQL.".len()))
                     .and_then(|n| n.checked_add(5 - first))
-                    .filter(|len| *len < bytes.len()).ok_or(CaptureSqlFailure::Bounds)?;
+                    .filter(|len| *len < bytes.len())
+                    .ok_or(CaptureSqlFailure::Bounds)?;
                 bytes[..root.len()].copy_from_slice(root);
                 let mut at = root.len();
-                if slash != 0 { bytes[at] = b'/'; at += 1; }
+                if slash != 0 {
+                    bytes[at] = b'/';
+                    at += 1;
+                }
                 bytes[at..at + 9].copy_from_slice(b".s.PGSQL.");
                 at += 9;
                 bytes[at..len].copy_from_slice(&digits[first..]);
@@ -1165,10 +1286,15 @@ mod capture_io {
     // All endpoint/option inputs are copied nonsecret DATA. This is the one actual
     // lazy factory used both for the connection and its unpolled Layout calculation.
     fn original_socket(
-        endpoint: Endpoint, timeout: Option<Duration>, options: TcpOptions,
+        endpoint: Endpoint,
+        timeout: Option<Duration>,
+        options: TcpOptions,
     ) -> impl Future<Output = io::Result<OriginalSocket>> + Send {
         async move {
-            async fn connect(endpoint: Endpoint, options: TcpOptions) -> io::Result<OriginalSocket> {
+            async fn connect(
+                endpoint: Endpoint,
+                options: TcpOptions,
+            ) -> io::Result<OriginalSocket> {
                 match endpoint {
                     Endpoint::Tcp(address) => {
                         let stream = tokio::net::TcpStream::connect(address).await?;
@@ -1179,13 +1305,16 @@ mod capture_io {
                     Endpoint::Unix { bytes, len } => {
                         use std::os::unix::ffi::OsStrExt;
                         let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..len]));
-                        Ok(OriginalSocket::Unix(tokio::net::UnixStream::connect(path).await?))
+                        Ok(OriginalSocket::Unix(
+                            tokio::net::UnixStream::connect(path).await?,
+                        ))
                     }
                 }
             }
             match timeout {
                 Some(duration) => tokio::time::timeout(duration, connect(endpoint, options))
-                    .await.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
                 None => connect(endpoint, options).await,
             }
         }
@@ -1194,13 +1323,19 @@ mod capture_io {
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)] // Only this locked-platform FFI helper; crate/workspace deny stays.
     fn preserve_captured_tcp_options(
-        original: &tokio::net::TcpStream, options: &TcpOptions,
+        original: &tokio::net::TcpStream,
+        options: &TcpOptions,
     ) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         use std::os::raw::{c_int, c_void};
         unsafe extern "C" {
-            fn setsockopt(fd: c_int, level: c_int, name: c_int,
-                value: *const c_void, length: u32) -> c_int;
+            fn setsockopt(
+                fd: c_int,
+                level: c_int,
+                name: c_int,
+                value: *const c_void,
+                length: u32,
+            ) -> c_int;
         }
         fn set(fd: c_int, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
             // SAFETY: fd is borrowed from the live original TcpStream for this synchronous
@@ -1210,10 +1345,19 @@ mod capture_io {
             // are the locked Darwin SOL_SOCKET/TCP constants below; errno is read immediately.
             // The declaration is scoped to this audited helper and no other unsafe is allowed.
             let result = unsafe {
-                setsockopt(fd, level, name, (&value as *const c_int).cast(),
-                    std::mem::size_of::<c_int>() as u32)
+                setsockopt(
+                    fd,
+                    level,
+                    name,
+                    (&value as *const c_int).cast(),
+                    std::mem::size_of::<c_int>() as u32,
+                )
             };
-            if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
         }
         // tokio-postgres 0.7.18 connect_socket and socket2 0.6.5 perform this exact
         // NODELAY / KEEPALIVE sequence. TCP_USER_TIMEOUT is ignored on macOS upstream.
@@ -1223,14 +1367,19 @@ mod capture_io {
             set(fd, 0xffff, 0x0008, 1)?;
             let secs = |d: Duration| d.as_secs().min(i32::MAX as u64) as i32;
             set(fd, 6, 0x10, secs(options.idle))?;
-            if let Some(interval) = options.interval { set(fd, 6, 0x101, secs(interval))?; }
-            if let Some(retries) = options.retries { set(fd, 6, 0x102, retries as i32)?; }
+            if let Some(interval) = options.interval {
+                set(fd, 6, 0x101, secs(interval))?;
+            }
+            if let Some(retries) = options.retries {
+                set(fd, 6, 0x102, retries as i32)?;
+            }
         }
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     fn preserve_captured_tcp_options(
-        _original: &tokio::net::TcpStream, _options: &TcpOptions,
+        _original: &tokio::net::TcpStream,
+        _options: &TcpOptions,
     ) -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
@@ -1240,7 +1389,10 @@ mod capture_io {
             match future.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(socket)) => *state = SocketState::Connected(socket),
-                Poll::Ready(Err(error)) => { *state = SocketState::Failed; return Poll::Ready(Err(error)); }
+                Poll::Ready(Err(error)) => {
+                    *state = SocketState::Failed;
+                    return Poll::Ready(Err(error));
+                }
             }
         }
         match state {
@@ -1249,12 +1401,18 @@ mod capture_io {
         }
     }
     fn read_socket(
-        state: &mut SocketState, cx: &mut Context<'_>, dst: &mut ReadBuf<'_>,
+        state: &mut SocketState,
+        cx: &mut Context<'_>,
+        dst: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match state {
-            SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_read(cx, dst),
+            SocketState::Connected(OriginalSocket::Tcp(stream)) => {
+                Pin::new(stream).poll_read(cx, dst)
+            }
             #[cfg(unix)]
-            SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_read(cx, dst),
+            SocketState::Connected(OriginalSocket::Unix(stream)) => {
+                Pin::new(stream).poll_read(cx, dst)
+            }
             _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
         }
     }
@@ -1274,22 +1432,35 @@ mod capture_io {
     }
     impl Unpin for CapturePgIo {}
     impl CapturePgIo {
-        pub fn prepare(config: &PgConfig, decode: Arc<CaptureDecodeBudget>)
-            -> Result<Self, CaptureSqlFailure>
-        {
-            if !cfg!(target_os = "macos") { return Err(CaptureSqlFailure::Bounds); }
+        pub fn prepare(
+            config: &PgConfig,
+            decode: Arc<CaptureDecodeBudget>,
+        ) -> Result<Self, CaptureSqlFailure> {
+            if !cfg!(target_os = "macos") {
+                return Err(CaptureSqlFailure::Bounds);
+            }
             let endpoint = endpoint(config)?;
             let options = TcpOptions::from_original(config);
             // This initial charge precedes both the lazy future Box and Framed::new.
             let m = decode.reserve_wire_credit()?;
-            let frame = m.checked_div(4).and_then(|n| n.checked_sub(1))
-                .filter(|n| *n >= 5).ok_or(CaptureSqlFailure::Bounds)?;
+            let frame = m
+                .checked_div(4)
+                .and_then(|n| n.checked_sub(1))
+                .filter(|n| *n >= 5)
+                .ok_or(CaptureSqlFailure::Bounds)?;
             let max_frame = usize::try_from(frame).map_err(|_| CaptureSqlFailure::Bounds)?;
-            let original = original_socket(endpoint, config.get_connect_timeout().copied(), options);
+            let original =
+                original_socket(endpoint, config.get_connect_timeout().copied(), options);
             Ok(Self {
                 socket: SocketState::Connecting(Box::pin(original)),
-                decode, header: [0; 5], header_read: 0, header_sent: 0,
-                body_remaining: 0, max_frame, credit: false, failed: false,
+                decode,
+                header: [0; 5],
+                header_read: 0,
+                header_sent: 0,
+                body_remaining: 0,
+                max_frame,
+                credit: false,
+                failed: false,
             })
         }
 
@@ -1298,22 +1469,34 @@ mod capture_io {
         pub fn checked_metadata_bytes(originals: u64) -> Result<u64, CaptureSqlFailure> {
             let original = original_socket(
                 Endpoint::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))),
-                None, TcpOptions { keepalive: false, idle: Duration::ZERO,
-                    interval: None, retries: None },
+                None,
+                TcpOptions {
+                    keepalive: false,
+                    idle: Duration::ZERO,
+                    interval: None,
+                    retries: None,
+                },
             );
             let layout = std::alloc::Layout::for_value(&original);
-            let unit = std::mem::size_of::<Self>().checked_add(layout.size())
+            let unit = std::mem::size_of::<Self>()
+                .checked_add(layout.size())
                 .ok_or(CaptureSqlFailure::Bounds)?;
-            u64::try_from(unit).map_err(|_| CaptureSqlFailure::Bounds)?
-                .checked_mul(originals).ok_or(CaptureSqlFailure::Bounds)
+            u64::try_from(unit)
+                .map_err(|_| CaptureSqlFailure::Bounds)?
+                .checked_mul(originals)
+                .ok_or(CaptureSqlFailure::Bounds)
         }
         fn guard(&mut self) -> io::Result<()> {
-            if self.failed { return Err(io::Error::from(io::ErrorKind::InvalidData)); }
+            if self.failed {
+                return Err(io::Error::from(io::ErrorKind::InvalidData));
+            }
             self.decode.reserve_allocations(&[]).map_err(|failure| {
                 self.failed = true;
                 io::Error::from(if failure == CaptureSqlFailure::Clock {
                     io::ErrorKind::TimedOut
-                } else { io::ErrorKind::InvalidData })
+                } else {
+                    io::ErrorKind::InvalidData
+                })
             })
         }
         fn ensure_credit(&mut self) -> io::Result<()> {
@@ -1322,7 +1505,9 @@ mod capture_io {
                     self.failed = true;
                     io::Error::from(if failure == CaptureSqlFailure::Clock {
                         io::ErrorKind::TimedOut
-                    } else { io::ErrorKind::InvalidData })
+                    } else {
+                        io::ErrorKind::InvalidData
+                    })
                 })?;
                 self.credit = true;
             }
@@ -1330,14 +1515,22 @@ mod capture_io {
         }
     }
     impl AsyncRead for CapturePgIo {
-        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, dst: &mut ReadBuf<'_>)
-            -> Poll<io::Result<()>>
-        {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            dst: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
-            if dst.remaining() == 0 { return Poll::Ready(Ok(())); }
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if dst.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             let connecting = poll_connect(&mut this.socket, cx);
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             match connecting {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -1354,19 +1547,25 @@ mod capture_io {
                     (result, header.filled().len())
                 };
                 this.header_read += n;
-                if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+                if let Err(error) = this.guard() {
+                    return Poll::Ready(Err(error));
+                }
                 match result {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                     Poll::Ready(Ok(())) if n == 0 => {
-                        return Poll::Ready(if this.header_read == 0 { Ok(()) }
-                            else { Err(io::Error::from(io::ErrorKind::UnexpectedEof)) });
+                        return Poll::Ready(if this.header_read == 0 {
+                            Ok(())
+                        } else {
+                            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+                        });
                     }
                     Poll::Ready(Ok(())) => {}
                 }
             }
             if this.header_sent == 0 {
-                let length = i32::from_be_bytes(this.header[1..5].try_into().expect("fixed header"));
+                let length =
+                    i32::from_be_bytes(this.header[1..5].try_into().expect("fixed header"));
                 let total = usize::try_from(length).ok().and_then(|n| n.checked_add(1));
                 match total {
                     Some(total) if length >= 4 && total <= this.max_frame => {
@@ -1378,13 +1577,17 @@ mod capture_io {
                     }
                 }
             }
-            if let Err(error) = this.ensure_credit() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.ensure_credit() {
+                return Poll::Ready(Err(error));
+            }
             if this.header_sent < 5 {
                 let n = (5 - this.header_sent).min(dst.remaining());
                 dst.put_slice(&this.header[this.header_sent..this.header_sent + n]);
                 this.header_sent += n;
                 this.credit = false;
-                if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+                if let Err(error) = this.guard() {
+                    return Poll::Ready(Err(error));
+                }
                 return Poll::Ready(Ok(()));
             }
             let len = this.body_remaining.min(dst.remaining());
@@ -1394,8 +1597,12 @@ mod capture_io {
                 (result, body.filled().len())
             };
             this.body_remaining -= n;
-            if n != 0 { this.credit = false; }
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if n != 0 {
+                this.credit = false;
+            }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             match result {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
@@ -1403,78 +1610,121 @@ mod capture_io {
                     this.failed = true;
                     Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)))
                 }
-                Poll::Ready(Ok(())) => { dst.advance(n); Poll::Ready(Ok(())) }
+                Poll::Ready(Ok(())) => {
+                    dst.advance(n);
+                    Poll::Ready(Ok(()))
+                }
             }
         }
     }
     impl AsyncWrite for CapturePgIo {
-        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, src: &[u8])
-            -> Poll<io::Result<usize>>
-        {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            src: &[u8],
+        ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             let connecting = poll_connect(&mut this.socket, cx);
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             match connecting {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(())) => {}
             }
             let result = match &mut this.socket {
-                SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_write(cx, src),
+                SocketState::Connected(OriginalSocket::Tcp(stream)) => {
+                    Pin::new(stream).poll_write(cx, src)
+                }
                 #[cfg(unix)]
-                SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_write(cx, src),
+                SocketState::Connected(OriginalSocket::Unix(stream)) => {
+                    Pin::new(stream).poll_write(cx, src)
+                }
                 _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
             };
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             result
         }
         fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             let connecting = poll_connect(&mut this.socket, cx);
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             match connecting {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(())) => {}
             }
             let result = match &mut this.socket {
-                SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_flush(cx),
+                SocketState::Connected(OriginalSocket::Tcp(stream)) => {
+                    Pin::new(stream).poll_flush(cx)
+                }
                 #[cfg(unix)]
-                SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_flush(cx),
+                SocketState::Connected(OriginalSocket::Unix(stream)) => {
+                    Pin::new(stream).poll_flush(cx)
+                }
                 _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
             };
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             result
         }
         fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             let connecting = poll_connect(&mut this.socket, cx);
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             match connecting {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(())) => {}
             }
             let result = match &mut this.socket {
-                SocketState::Connected(OriginalSocket::Tcp(stream)) => Pin::new(stream).poll_shutdown(cx),
+                SocketState::Connected(OriginalSocket::Tcp(stream)) => {
+                    Pin::new(stream).poll_shutdown(cx)
+                }
                 #[cfg(unix)]
-                SocketState::Connected(OriginalSocket::Unix(stream)) => Pin::new(stream).poll_shutdown(cx),
+                SocketState::Connected(OriginalSocket::Unix(stream)) => {
+                    Pin::new(stream).poll_shutdown(cx)
+                }
                 _ => Poll::Ready(Err(io::Error::from(io::ErrorKind::NotConnected))),
             };
-            if let Err(error) = this.guard() { return Poll::Ready(Err(error)); }
+            if let Err(error) = this.guard() {
+                return Poll::Ready(Err(error));
+            }
             result
         }
     }
 }
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 pub use capture_io::CapturePgIo;
 
 // The armed Local graph retains original tasks independently of the stock lifecycle proxy.
 // This module does not authorize capture, construct a source, or interpret a transaction result.
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 mod retained {
     use super::*;
     use std::collections::VecDeque;
@@ -1590,11 +1840,13 @@ mod retained {
                 std::mem::size_of::<DriverRetention>(),
                 8192,
                 std::mem::size_of_val(&retained_original_connect(None)),
-                usize::try_from(CapturePgIo::checked_metadata_bytes(1)
-                    .map_err(|_| PoolError::CreationLimit)?)
-                    .map_err(|_| PoolError::CreationLimit)?,
-                std::mem::size_of::<tokio_postgres::Connection<
-                    CapturePgIo, tokio_postgres::tls::NoTlsStream>>(),
+                usize::try_from(
+                    CapturePgIo::checked_metadata_bytes(1).map_err(|_| PoolError::CreationLimit)?,
+                )
+                .map_err(|_| PoolError::CreationLimit)?,
+                std::mem::size_of::<
+                    tokio_postgres::Connection<CapturePgIo, tokio_postgres::tls::NoTlsStream>,
+                >(),
             ])?;
             let proxy_charge = metadata_add(&[
                 std::mem::size_of::<ProxyFuture>(),
@@ -2117,12 +2369,14 @@ mod retained {
                 let owner = DriverOwner::new_retained(sequence, &supervisor, retention);
                 let (ready, receiver) = oneshot::channel();
                 let configuration = config.clone();
-                let original_io = CapturePgIo::prepare(
-                    &configuration, Arc::clone(&self.gate.original_decode),
-                ).map_err(|_| PoolError::CreationLimit)?;
-                let connecting: ConnectingFuture = Box::pin(retained_original_connect(
-                    Some((configuration, original_io, Arc::clone(&owner))),
-                ));
+                let original_io =
+                    CapturePgIo::prepare(&configuration, Arc::clone(&self.gate.original_decode))
+                        .map_err(|_| PoolError::CreationLimit)?;
+                let connecting: ConnectingFuture = Box::pin(retained_original_connect(Some((
+                    configuration,
+                    original_io,
+                    Arc::clone(&owner),
+                ))));
                 let driver = OriginalDriver {
                     resource: OriginalResource::Connecting(connecting),
                     ready: Some(ready),
@@ -2583,7 +2837,11 @@ mod retained {
         }
     }
 }
-#[cfg(feature = "desktop-local-vault")]
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
 pub use retained::{
     DesktopCaptureDrivers, DesktopLocalDriverCustody, DesktopPoolJoinBounds,
     OriginalDriverJoinFact, OriginalDriverJoinOutcome, OriginalDriverRetirement,

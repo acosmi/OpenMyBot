@@ -54,7 +54,9 @@ pub const INSTANCE_BRAND_TEMPLATE: &str =
 
 mod capture_request;
 use capture_request::CaptureField;
-pub(crate) use capture_request::{CaptureProfile, ReviewedNormalCaptureRequest};
+pub(crate) use capture_request::{
+    CaptureProfile, ReviewedNormalCaptureRequest, TrustedDestination,
+};
 
 const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const TENANT_FILE_MAX_BYTES: u64 = 1024 * 1024;
@@ -341,21 +343,7 @@ impl VerifiedDesktopRelease {
             .map_err(|_| DesktopReleaseError::Postgres)?;
         let postgres =
             VerifiedPostgresBundle::open(root.join(&manifest.postgres.root), expected_pg, &signer)
-                .map_err(|_error| {
-                    #[cfg(debug_assertions)]
-                    if capture.is_some() {
-                        use crate::postgres_sidecar::PostgresSidecarError;
-                        let code = match &_error {
-                            PostgresSidecarError::Io(_) => "postgres_sidecar_io",
-                            PostgresSidecarError::ManifestDigest => "postgres_sidecar_manifest_digest",
-                            PostgresSidecarError::BundleShape => "postgres_sidecar_bundle_shape",
-                            PostgresSidecarError::FileDigest => "postgres_sidecar_file_digest",
-                            _ => "wrok_bot_release_postgres_invalid",
-                        };
-                        eprintln!("{code}");
-                    }
-                    DesktopReleaseError::Postgres
-                })?;
+                .map_err(|_| DesktopReleaseError::Postgres)?;
         // Only these already verified release inputs are sealed. The original maintenance
         // verify/FD/error order above is unchanged; nothing is published while DATA is absent.
         if let Some(capture) = capture.as_mut() {
@@ -388,8 +376,9 @@ impl VerifiedDesktopRelease {
     /// Reuse the existing authority → real PG/SCRAM → current PG actor → OS Vault → Agent → window
     /// assembly. The lazy real Keychain adapter is first touched by that background assembly.
     pub fn into_runtime_config(self) -> Result<DesktopLocalRuntimeConfig, DesktopReleaseError> {
-        let fixture = crate::tauri_background::bind_self_owned_capture_fixture(self.capture.as_ref())
-            .map_err(|_| DesktopReleaseError::Application)?;
+        let fixture =
+            crate::tauri_background::bind_self_owned_capture_fixture(self.capture.as_ref())
+                .map_err(|_| DesktopReleaseError::Application)?;
         let (fixture_binding, secret_store): (_, Arc<dyn OsSecretStore>) = match fixture {
             Some((binding, store)) => (Some(binding), store),
             None => (None, Arc::new(DeferredCurrentUserKeychain::default())),
@@ -415,7 +404,8 @@ impl VerifiedDesktopRelease {
         let tenant = self.tenant;
         let runtime = DesktopLocalRuntimeConfig::new(release, self.application, move |authority| {
             tenant.bind(authority.auth_context().tenant().as_str())
-        }).with_reviewed_normal_capture(self.capture);
+        })
+        .with_reviewed_normal_capture(self.capture);
         Ok(match fixture_binding {
             Some(binding) => runtime.with_self_owned_capture_fixture(binding),
             None => runtime,
@@ -538,7 +528,7 @@ pub fn validate_product_context(
     Ok(())
 }
 
-fn decode_digest(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_digest(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64
         || !value
             .bytes()

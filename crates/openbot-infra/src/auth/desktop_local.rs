@@ -1356,8 +1356,13 @@ impl InstallationCaptureIdentity {
         clock.require_effect()?;
         let meta = observed.map_err(|_| Fault::IoFailure)?;
         Ok(Self {
-            device: meta.dev(), inode: meta.ino(), uid: meta.uid(), mode: meta.mode(),
-            links: meta.nlink(), bytes: meta.len(), mtime: meta.mtime(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            uid: meta.uid(),
+            mode: meta.mode(),
+            links: meta.nlink(),
+            bytes: meta.len(),
+            mtime: meta.mtime(),
             mtime_ns: meta.mtime_nsec(),
         })
     }
@@ -1504,16 +1509,20 @@ impl RetainedInstallationCapture {
         clock.require_effect()?;
         let root = InstallationCaptureIdentity::observe_before(&self.root, clock)?;
         if (root.device, root.inode, root.uid, root.mode)
-            != (self.root_identity.device, self.root_identity.inode,
-                self.root_identity.uid, self.root_identity.mode)
+            != (
+                self.root_identity.device,
+                self.root_identity.inode,
+                self.root_identity.uid,
+                self.root_identity.mode,
+            )
             || InstallationCaptureIdentity::observe_before(&self.marker, clock)?
                 != self.marker_identity
         {
             return Err(Fault::SourceChanged);
         }
         self.verify_marker_name_before(clock)?;
-        let length = usize::try_from(self.marker_identity.bytes)
-            .map_err(|_| Fault::BoundsOverflow)?;
+        let length =
+            usize::try_from(self.marker_identity.bytes).map_err(|_| Fault::BoundsOverflow)?;
         if length == 0 || length > FILE_MAX_BYTES as usize {
             return Err(Fault::SourceChanged);
         }
@@ -1543,8 +1552,7 @@ impl RetainedInstallationCapture {
                 Err(_) => return Err(Fault::IoFailure),
             }
         }
-        let parsed = parse(std::str::from_utf8(&raw[..length])
-            .map_err(|_| Fault::SourceChanged)?)
+        let parsed = parse(std::str::from_utf8(&raw[..length]).map_err(|_| Fault::SourceChanged)?)
             .map_err(|_| Fault::SourceChanged)?;
         if encode(parsed) != self.original_instance.as_ref()
             || InstallationCaptureIdentity::observe_before(&self.marker, clock)?
@@ -1555,8 +1563,12 @@ impl RetainedInstallationCapture {
         self.verify_marker_name_before(clock)?;
         let root = InstallationCaptureIdentity::observe_before(&self.root, clock)?;
         if (root.device, root.inode, root.uid, root.mode)
-            != (self.root_identity.device, self.root_identity.inode,
-                self.root_identity.uid, self.root_identity.mode)
+            != (
+                self.root_identity.device,
+                self.root_identity.inode,
+                self.root_identity.uid,
+                self.root_identity.mode,
+            )
         {
             return Err(Fault::SourceChanged);
         }
@@ -1569,9 +1581,8 @@ impl RetainedInstallationCapture {
     ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
         use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
         clock.require_effect()?;
-        let observed = rustix::fs::statat(
-            &self.root, FILE_NAME, rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        );
+        let observed =
+            rustix::fs::statat(&self.root, FILE_NAME, rustix::fs::AtFlags::SYMLINK_NOFOLLOW);
         clock.require_effect()?;
         let named = observed.map_err(|_| Fault::IoFailure)?;
         if named.st_ino != self.marker_identity.inode
