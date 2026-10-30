@@ -2978,9 +2978,16 @@ mod retained {
             let mut custody = custody();
             custody.register_stock(false, stock(&config)).unwrap();
             let gate = Arc::clone(&custody.core.gate);
-            let checkout = connect_admin(&custody, &config);
+            let mut checkout = connect_admin(&custody, &config);
             assert_eq!(gate.counts.live_proxies.load(Ordering::Acquire), 1);
-            // Nothing has yielded since the spawn, so the proxy task was never polled.
+            // One inline poll arms the creation guard without yielding to the runtime, so
+            // the proxy task was never polled when the guard aborts it on drop.
+            assert!(
+                checkout
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             drop(checkout);
             for _ in 0..10_000 {
                 if gate.counts.live_proxies.load(Ordering::Acquire) == 0 {

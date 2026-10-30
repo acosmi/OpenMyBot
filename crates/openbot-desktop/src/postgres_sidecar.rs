@@ -4120,7 +4120,10 @@ mod tests {
     }
 
     // The armed application pool reads through CapturePgIo, whose largest accepted backend
-    // message is M / 4 - 1 bytes for M = decodeCryptoTemporary.maxOneBytes.
+    // message is F = M / 4 - 1 bytes for M = decodeCryptoTemporary.maxOneBytes. A fresh
+    // startup reads the 0052 Thread history writer schema observation as one 643066-byte
+    // DataRow during schema initialization, so F must reach that frame before the layout
+    // check (one 297619-byte schema-facts DataRow) is even reached.
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",
@@ -4130,15 +4133,16 @@ mod tests {
     #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
     async fn armed_application_frame_limit_decides_the_fresh_layout_check() {
         use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault;
+        use openbot_infra::auth::single_user::desktop_local::DesktopLocalBootstrapError;
         use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
+        use openbot_infra::db::InfraError;
         use openbot_infra::db::capture_materials::{
             CaptureDbExpectation, CaptureDecodeBudget, CaptureSqlBudget, CaptureSqlFailure,
             CaptureSqlLimits, collect_database_materials_before,
         };
         use openbot_infra::db::desktop_local::{DesktopLocalDriverCustody, DesktopPoolJoinBounds};
-        use openbot_infra::db::desktop_vault_canary::{
-            DesktopVaultCanaryError, verify_current_layout,
-        };
+        use openbot_infra::db::desktop_vault_canary::verify_current_layout;
+        use openbot_infra::db::initialization::DatabaseInitializationError;
         struct UnitClock;
         impl CaptureClockCheck for UnitClock {
             fn require_effect(&self) -> Result<(), WholePgCarrierFault> {
@@ -4157,11 +4161,9 @@ mod tests {
                 Ok(1)
             }
         }
-        let profile: crate::desktop_release::CaptureProfile = serde_json::from_str(
-            crate::tauri_background::capture::control::tests::ORDINARY_STARTUP_HISTORY_PROFILE_JSON,
-        )
-        .unwrap();
-        for (max_one_bytes, layout_fits) in [(534_804, false), (2_097_152, true)] {
+        // 534804 (retired fixture) and 2097152 leave F below the 643066-byte frame; the
+        // current fixture value 4194304 (F = 1048575) is above it.
+        for (max_one_bytes, starts) in [(534_804, false), (2_097_152, false), (4_194_304, true)] {
             let fixture = MasterJournalPgFixture::new("armed-frame-limit").await;
             let running = PostgresSidecarSupervisor::start(
                 VerifiedPostgresBundle::open(
@@ -4178,10 +4180,10 @@ mod tests {
             )
             .await
             .unwrap();
-            // The reviewed fixture profiles keep maxCount 65536; only maxOneBytes differs.
+            // The fixture profile keeps maxCount 65536 and drivers 64/64/64/17/16 MiB.
             let decode = CaptureDecodeBudget::checked(65_536, max_one_bytes).unwrap();
             let custody = DesktopLocalDriverCustody::prepare(
-                DesktopPoolJoinBounds::checked(17, 17, 16, 17, 64 << 20).unwrap(),
+                DesktopPoolJoinBounds::checked(64, 64, 64, 17, 16 << 20).unwrap(),
                 Arc::clone(&decode),
             )
             .unwrap();
@@ -4193,66 +4195,70 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(
-                plane
-                    .initialize_fresh_schema(&fixture.package)
-                    .await
-                    .is_ok()
-            );
-            let layout = verify_current_layout(plane.pool()).await;
-            if layout_fits {
-                assert!(layout.is_ok());
-                let q = &profile.sql;
+            let initialized = plane.initialize_fresh_schema(&fixture.package).await;
+            if !starts {
+                assert!(matches!(
+                    initialized,
+                    Err(DesktopLocalCompositionError::Bootstrap(
+                        DesktopLocalBootstrapError::Database(DatabaseInitializationError::Infra(
+                            InfraError::Query { .. }
+                        ))
+                    ))
+                ));
+                plane.shutdown().await.unwrap();
+                continue;
+            }
+            initialized.unwrap();
+            verify_current_layout(plane.pool()).await.unwrap();
+            decode.bind_original_clock(Arc::new(UnitClock)).unwrap();
+            let neutral = CaptureDbExpectation {
+                deployment_id: String::new(),
+                tenant_id: String::new(),
+                dataset_id: String::new(),
+                instance_id: String::new(),
+                system_identifier: String::new(),
+                database_oid: 0,
+                store_id: String::new(),
+                root_device: String::new(),
+                root_inode: String::new(),
+                root_uid: String::new(),
+            };
+            let client = plane.pool().get().await.unwrap();
+            // The retired maxRowBytes 44540 refuses one catalog_functions row whose weighted
+            // size is 44594. With the current fixture value 65536, every projection is read
+            // before the missing vault canary is reported, and the decode count still admits
+            // a credit.
+            for (max_row_bytes, expected) in [
+                (44_540, CaptureSqlFailure::Bounds),
+                (65_536, CaptureSqlFailure::SourceMismatch),
+            ] {
                 let mut budget = CaptureSqlBudget::new(
                     CaptureSqlLimits {
-                        max_rows: q.max_rows,
-                        max_row_bytes: q.max_row_bytes,
-                        max_field_bytes: q.max_field_bytes,
-                        max_pages: q.max_pages,
-                        page_rows: q.page_rows,
-                        max_catalog_objects: q.max_catalog_objects,
-                        max_query_tasks: q.max_query_tasks,
-                        phase_ns: q.phase_ns,
+                        max_rows: 12_288,
+                        max_row_bytes,
+                        max_field_bytes: 8_192,
+                        max_pages: 1_024,
+                        page_rows: 8,
+                        max_catalog_objects: 8_192,
+                        max_query_tasks: 1_152,
+                        phase_ns: 30_000_000_000,
                     },
-                    profile.carrier.max_metadata_bytes,
+                    256 << 20,
                     0,
                 )
                 .unwrap();
                 budget
                     .bind_sensitive_decode_bound(Arc::clone(&decode))
                     .unwrap();
-                let neutral = CaptureDbExpectation {
-                    deployment_id: String::new(),
-                    tenant_id: String::new(),
-                    dataset_id: String::new(),
-                    instance_id: String::new(),
-                    system_identifier: String::new(),
-                    database_oid: 0,
-                    store_id: String::new(),
-                    root_device: String::new(),
-                    root_inode: String::new(),
-                    root_uid: String::new(),
-                };
-                // No vault canary exists yet, so every projection is read before the missing
-                // canary is reported; an exhausted decode count would stop earlier as Bounds.
-                let client = plane.pool().get().await.unwrap();
                 assert_eq!(
                     collect_database_materials_before(&client, &neutral, &mut budget, &UnitClock)
                         .await
                         .err(),
-                    Some(CaptureSqlFailure::SourceMismatch)
+                    Some(expected)
                 );
-                drop(client);
                 assert!(decode.reserve_allocations(&[(1, 8192)]).is_ok());
-            } else {
-                // One schema-facts DataRow is larger than F = 534804 / 4 - 1 = 133700 bytes.
-                assert!(matches!(
-                    layout,
-                    Err(DesktopVaultCanaryError::Infra(
-                        openbot_infra::db::InfraError::Query { .. }
-                    ))
-                ));
             }
+            drop(client);
             plane.shutdown().await.unwrap();
         }
     }
