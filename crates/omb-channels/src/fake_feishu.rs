@@ -79,6 +79,7 @@ struct State {
     ws_url: Mutex<Option<String>>,
     pong_config: Mutex<Option<Value>>,
     silent: Mutex<bool>,
+    stalled: Mutex<bool>,
     handshakes: Mutex<Vec<String>>,
     acks: Mutex<Vec<Ack>>,
     pings: Mutex<Vec<Ping>>,
@@ -170,6 +171,11 @@ impl FakeFeishu {
     pub fn set_silent(&self, silent: bool) {
         *self.state.silent.lock().unwrap() = silent;
     }
+    /// While stalled, the current connection reads nothing and stays open, so the client's writes
+    /// back up once the socket buffers are full.
+    pub fn set_stalled(&self, stalled: bool) {
+        *self.state.stalled.lock().unwrap() = stalled;
+    }
     /// One encoded single-fragment data frame of type `kind`.
     pub fn data_frame(&self, kind: &str, payload: &Value) -> Vec<u8> {
         let seq_id = self.next_frame();
@@ -186,6 +192,21 @@ impl FakeFeishu {
     }
     pub fn event_frame(&self, payload: &Value) -> Vec<u8> {
         self.data_frame("event", payload)
+    }
+    /// An event frame with a trailing `pad` header of `bytes` bytes, which its acknowledgement
+    /// echoes.
+    pub fn padded_event_frame(&self, payload: &Value, bytes: usize) -> Vec<u8> {
+        let seq_id = self.next_frame();
+        let mut padded = frame(
+            seq_id,
+            "event",
+            &message_id(payload, seq_id),
+            1,
+            0,
+            serde_json::to_vec(payload).unwrap(),
+        );
+        padded.headers.push(("pad".to_owned(), "x".repeat(bytes)));
+        padded.encode()
     }
     /// The payload cut into `parts` fragments of one message id: each but the last holds
     /// `len / parts` bytes.
@@ -540,7 +561,7 @@ async fn connect(mut stream: TcpStream, state: Arc<State>) {
                 }
                 None => break,
             },
-            incoming = read.next() => {
+            incoming = read.next(), if !*state.stalled.lock().unwrap() => {
                 let bytes = match incoming {
                     Some(Ok(Message::Binary(bytes))) => bytes,
                     Some(Ok(_)) => continue,
