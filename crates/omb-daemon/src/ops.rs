@@ -290,22 +290,24 @@ async fn execute(
         .execute(resolver.local_context()?, command)
         .await
 }
+/// The engine's word for cancelling the run; `None` when the engine has no such run.
 async fn cancel_run(
     application: &dyn ApplicationService,
     resolver: &SingleUserAuthResolver,
     thread_id: &str,
     run_id: &str,
-) -> Result<&'static str, DaemonError> {
+) -> Result<Option<&'static str>, DaemonError> {
     let command = AppCommand::CancelThreadRun(CancelThreadRun {
         thread_id: ThreadId::new(thread_id),
         run_id: RunId::new(run_id),
     });
     match execute(application, resolver, command).await {
-        Ok(AppReply::ThreadRunCancellation(cancellation)) => Ok(match cancellation.state {
+        Ok(AppReply::ThreadRunCancellation(cancellation)) => Ok(Some(match cancellation.state {
             ThreadRunCancellationState::Requested => "requested",
             ThreadRunCancellationState::AlreadyRequested => "already_requested",
             ThreadRunCancellationState::AlreadyTerminal => "already_terminal",
-        }),
+        })),
+        Err(AppError::NotVisible) => Ok(None),
         _ => Err(DaemonError::InternalError),
     }
 }
@@ -573,7 +575,8 @@ impl Ops {
                     &facts.thread_id,
                     run_id.as_str(),
                 )
-                .await?;
+                .await?
+                .ok_or(DaemonError::InternalError)?;
                 Ok(json!({"run_id": run_id.as_str(), "state": state}))
             }
         }
@@ -731,7 +734,8 @@ impl Ops {
                 &run.thread_id,
                 &run.run_id,
             )
-            .await?;
+            .await?
+            .ok_or(DaemonError::InternalError)?;
         }
         Ok(())
     }
@@ -811,28 +815,50 @@ impl BindingRunCanceller {
             client,
         }
     }
-    /// A pending message is cancelled at once; a dispatched run without a terminal is cancelled
-    /// in the engine; a run of another binding is not found.
+    /// A pending message without a begin attempt is cancelled at once; after an attempt its run
+    /// may exist, so the engine cancels the run it has, and the message is cancelled only when the
+    /// engine has none and no later attempt was recorded. A dispatched run without a terminal is
+    /// cancelled in the engine; a run of another binding is not found.
     pub(crate) async fn cancel(
         &self,
         binding_id: Uuid,
         run_id: &str,
     ) -> Result<&'static str, DaemonError> {
-        match cancel_event(&self.client, binding_id, run_id)
-            .await
-            .map_err(pg::map_store_error)?
-        {
-            EventCancel::NotFound => Err(DaemonError::RunNotFound),
-            EventCancel::Cancelled => Ok("requested"),
-            EventCancel::Ended => Ok("already_terminal"),
-            EventCancel::Open { thread_id } => {
-                cancel_run(
-                    self.application.as_ref(),
-                    &self.resolver,
-                    &thread_id,
-                    run_id,
-                )
+        let mut attempts = 0;
+        loop {
+            match cancel_event(&self.client, binding_id, run_id, attempts)
                 .await
+                .map_err(pg::map_store_error)?
+            {
+                EventCancel::NotFound => return Err(DaemonError::RunNotFound),
+                EventCancel::Cancelled => return Ok("requested"),
+                EventCancel::Ended => return Ok("already_terminal"),
+                EventCancel::Open { thread_id } => {
+                    return cancel_run(
+                        self.application.as_ref(),
+                        &self.resolver,
+                        &thread_id,
+                        run_id,
+                    )
+                    .await?
+                    .ok_or(DaemonError::InternalError);
+                }
+                EventCancel::Retrying {
+                    thread_id,
+                    attempts: recorded,
+                } => {
+                    match cancel_run(
+                        self.application.as_ref(),
+                        &self.resolver,
+                        &thread_id,
+                        run_id,
+                    )
+                    .await?
+                    {
+                        Some(state) => return Ok(state),
+                        None => attempts = recorded,
+                    }
+                }
             }
         }
     }
@@ -1043,7 +1069,7 @@ mod tests {
         testkit::{FakeTelegram, Reply},
     };
     use omb_hostdriver::{HostDriverConfig, Limits, OMB_NOTICE_PERMISSION_V1};
-    use omb_store::{Claim, Suspension, testkit};
+    use omb_store::{Claim, DispatchOutcome, Suspension, lock_dispatch, record_dispatch, testkit};
     use openbot_application::{BeginDelegatedThreadRun, DelegatedUntrustedMaterial};
     use openbot_contracts::{
         auth::DelegationSource,
@@ -1483,16 +1509,21 @@ mod tests {
         /// Like `start`, with the daemon's channel tasks serving the receiver commands.
         async fn with_channels() -> Self {
             let mut env = Self::start().await;
+            env.serve().await;
+            env
+        }
+        /// Starts the daemon's channel tasks; the dispatcher takes over the wake-up.
+        async fn serve(&mut self) {
             let (cancel, _) = mpsc::channel(CANCEL_QUEUE);
-            let terminals = env.fixture.take_terminals();
+            let terminals = self.fixture.take_terminals();
             let channels = Channels::start(
-                &mut env.fixture.pg,
-                env.fixture.engine.as_ref().unwrap(),
-                env.token,
+                &mut self.fixture.pg,
+                self.fixture.engine.as_ref().unwrap(),
+                self.token,
                 quick_channels(),
                 Endpoints {
-                    telegram: env.fake.endpoint(),
-                    feishu: env.feishu.endpoint(),
+                    telegram: self.fake.endpoint(),
+                    feishu: self.feishu.endpoint(),
                 },
                 cancel,
                 Outbound {
@@ -1502,9 +1533,8 @@ mod tests {
             )
             .await
             .unwrap();
-            env.ops.wake = channels.wake();
-            env.channels = Some(channels);
-            env
+            self.ops.wake = channels.wake();
+            self.channels = Some(channels);
         }
         fn workspace(&self) -> String {
             self.fixture
@@ -1616,6 +1646,7 @@ mod tests {
                 run.run.as_str(),
             )
             .await
+            .unwrap()
             .unwrap()
         }
         async fn binding(&self, id: Uuid) -> Value {
@@ -4401,6 +4432,275 @@ mod tests {
             handle.cancel(Uuid::now_v7(), "r").await,
             Err(DaemonError::InternalError)
         );
+        env.stop().await;
+    }
+
+    /// Polls `sql`, one boolean, until it holds.
+    async fn until(client: &Client, what: &str, sql: &str) {
+        let limit = Instant::now() + Duration::from_secs(20);
+        while !client.query_one(sql, &[]).await.unwrap().get::<_, bool>(0) {
+            assert!(Instant::now() < limit, "{what} deadline");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    /// Whether operation `next` was dispatched no earlier than operation `ended` reached its terminal.
+    async fn dispatched_after_terminal(env: &Env, ended: &str, next: &str) -> bool {
+        env.client
+            .query_one(
+                "SELECT n.dispatched_at>=e.terminal_at FROM openmybot.channel_events e, openmybot.channel_events n WHERE e.event_key=$1 AND n.event_key=$2",
+                &[&format!("op:{ended}"), &format!("op:{next}")],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    }
+    /// Cancels the dispatched run of `operation_id` and waits for its terminal.
+    async fn cancelled_after_dispatch(env: &Env, operation_id: &str) {
+        let key = format!("op:{operation_id}");
+        until(
+            &env.client,
+            "dispatch",
+            &format!("SELECT dispatch_status='dispatched' FROM openmybot.channel_events WHERE event_key='{key}'"),
+        )
+        .await;
+        let run = host_event(env, operation_id).await["run_id"].clone();
+        assert_eq!(
+            mcp_call(env, McpOp::RunCancel, json!({"run_id": run}))
+                .await
+                .unwrap()["state"],
+            "requested"
+        );
+        until(
+            &env.client,
+            "terminal",
+            &format!("SELECT terminal_kind IS NOT NULL FROM openmybot.channel_events WHERE event_key='{key}'"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn cancel_during_the_dispatch_begin_stops_the_run_before_the_next_event() {
+        let mut env = Env::running(Fixture::start_with_host(agent::cooperative).await).await;
+        env.serve().await;
+        bound(&mut env).await;
+        let gate = env.fixture.client().await;
+        for round in 0..10 {
+            let (first, second) = (format!("a-{round}"), format!("b-{round}"));
+            let thread = env.minted().await;
+            // The engine's begin takes this thread's transaction lock first; holding it parks the
+            // dispatcher inside the begin with the event locked.
+            gate.execute(
+                "SELECT pg_advisory_lock(hashtextextended($1,0))",
+                &[&thread.as_str()],
+            )
+            .await
+            .unwrap();
+            for (operation, on) in [(&first, thread.clone()), (&second, env.minted().await)] {
+                let accepted = accept_host_begin(
+                    &mut env.client,
+                    &OperationId::parse(operation).unwrap(),
+                    &HostMessage::parse("work").unwrap(),
+                    on.as_str(),
+                    later(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(accepted, HostAccept::Accepted(_)), "round {round}");
+            }
+            env.ops.wake.notify_one();
+            until(
+                &gate,
+                "begin parked",
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)",
+            )
+            .await;
+            let run = host_event(&env, &first).await["run_id"].clone();
+            let (cancelled, ()) = tokio::join!(
+                mcp_call(&env, McpOp::RunCancel, json!({"run_id": run})),
+                async {
+                    until(
+                        &gate,
+                        "cancel waits on the event",
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name='openmybot-canceller' AND wait_event_type='Lock')",
+                    )
+                    .await;
+                    gate.execute(
+                        "SELECT pg_advisory_unlock(hashtextextended($1,0))",
+                        &[&thread.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                }
+            );
+            assert_eq!(cancelled.unwrap()["state"], "requested", "round {round}");
+            let key = format!("op:{first}");
+            until(
+                &env.client,
+                "first terminal",
+                &format!("SELECT terminal_kind IS NOT NULL FROM openmybot.channel_events WHERE event_key='{key}'"),
+            )
+            .await;
+            let ended = host_event(&env, &first).await;
+            assert_eq!(ended["dispatch_status"], "dispatched", "round {round}");
+            assert_eq!(ended["terminal_kind"], "cancelled", "round {round}");
+            cancelled_after_dispatch(&env, &second).await;
+            assert!(
+                dispatched_after_terminal(&env, &first, &second).await,
+                "round {round}"
+            );
+        }
+        drop(gate);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn cancel_in_the_reconciliation_backoff_stops_the_begun_run_before_the_next_event() {
+        let mut env = Env::running(Fixture::start_with_host(agent::cooperative).await).await;
+        let host = bound(&mut env).await;
+        for (operation, message) in [("a-1", "first"), ("b-1", "second")] {
+            mcp_call(&env, McpOp::RunBegin, begin(operation, message))
+                .await
+                .unwrap();
+        }
+        // The dispatcher's begin committed the run, yet its receipt was an accepted
+        // reconciliation: the run executes while the event waits for its retry.
+        let row = host_event(&env, "a-1").await;
+        let record: Uuid = row["record_id"].as_str().unwrap().parse().unwrap();
+        let run = row["run_id"].as_str().unwrap();
+        env.fixture
+            .engine()
+            .assembly
+            .delegated_entry
+            .clone()
+            .unwrap()
+            .begin(BeginDelegatedThreadRun {
+                source: DelegationSource::ExternalBinding {
+                    binding_id: host.to_string(),
+                },
+                revision: env.binding(host).await["revision"].as_u64().unwrap(),
+                trigger_id: record.to_string(),
+                thread_id: ThreadId::new(row["thread_id"].as_str().unwrap()),
+                run_id: RunId::new(run),
+                bot_id: BotId::new(BOT_ID),
+                untrusted_material: Some(DelegatedUntrustedMaterial {
+                    source_ref: format!("omb:channel_events:{record}"),
+                    text: "first".into(),
+                }),
+            })
+            .await
+            .unwrap();
+        let dispatch = lock_dispatch(&mut env.client, record, later())
+            .await
+            .unwrap()
+            .unwrap();
+        record_dispatch(
+            dispatch,
+            record,
+            DispatchOutcome::RetryAfter(Duration::from_secs(5)),
+            later(),
+        )
+        .await
+        .unwrap();
+        env.serve().await;
+        assert_eq!(
+            mcp_call(&env, McpOp::RunCancel, json!({"run_id": run}))
+                .await
+                .unwrap()["state"],
+            "requested"
+        );
+        // The cancel landed inside the backoff: the event still waits for its retry.
+        let waiting = host_event(&env, "a-1").await;
+        assert_eq!(
+            (&waiting["dispatch_status"], &waiting["dispatch_attempts"]),
+            (&json!("pending"), &json!(1))
+        );
+        assert_eq!(host_event(&env, "b-1").await["dispatch_status"], "pending");
+        until(
+            &env.client,
+            "first terminal",
+            "SELECT terminal_kind IS NOT NULL FROM openmybot.channel_events WHERE event_key='op:a-1'",
+        )
+        .await;
+        let ended = host_event(&env, "a-1").await;
+        assert_eq!(ended["terminal_kind"], "cancelled");
+        cancelled_after_dispatch(&env, "b-1").await;
+        assert!(dispatched_after_terminal(&env, "a-1", "b-1").await);
+        assert_eq!(
+            host_event(&env, "a-1").await["dispatch_status"],
+            "dispatched"
+        );
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn cancel_before_the_claim_never_starts_the_run_and_the_next_event_proceeds() {
+        let mut env = Env::running(Fixture::start_with_host(agent::cooperative).await).await;
+        bound(&mut env).await;
+        for (operation, message) in [("a-1", "first"), ("b-1", "second")] {
+            mcp_call(&env, McpOp::RunBegin, begin(operation, message))
+                .await
+                .unwrap();
+        }
+        let first = host_event(&env, "a-1").await;
+        assert_eq!(
+            mcp_call(&env, McpOp::RunCancel, json!({"run_id": first["run_id"]}))
+                .await
+                .unwrap()["state"],
+            "requested"
+        );
+        env.serve().await;
+        cancelled_after_dispatch(&env, "b-1").await;
+        let first = host_event(&env, "a-1").await;
+        assert_eq!(first["dispatch_status"], "cancelled");
+        assert_eq!(first["dispatch_attempts"], 0);
+        assert!(first["terminal_kind"].is_null());
+        let run = first["run_id"].as_str().unwrap();
+        assert_eq!(
+            cancel_run(
+                env.ops.application.as_ref(),
+                &env.ops.resolver,
+                first["thread_id"].as_str().unwrap(),
+                run,
+            )
+            .await,
+            Ok(None)
+        );
+        let sessions: i64 = env
+            .client
+            .query_one(
+                "SELECT count(*) FROM openmybot.host_driver_sessions WHERE run_id=$1",
+                &[&run],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(sessions, 0);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn begin_whose_commit_ends_past_the_deadline_still_wakes_the_dispatcher() {
+        let mut env = Env::with_channels().await;
+        bound(&mut env).await;
+        env.client.batch_execute("CREATE FUNCTION openmybot.fixture_commit_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1.5); RETURN NULL; END $$; CREATE CONSTRAINT TRIGGER fixture_commit_delay AFTER INSERT ON openmybot.channel_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_commit_delay()").await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let accepted = env
+            .ops
+            .run_mcp(McpOp::RunBegin, begin("late-1", "m"), deadline)
+            .await
+            .unwrap();
+        assert!(Instant::now() >= deadline);
+        assert_eq!(accepted["state"], "accepted");
+        until(
+            &env.client,
+            "dispatch",
+            "SELECT dispatch_status='dispatched' FROM openmybot.channel_events WHERE event_key='op:late-1'",
+        )
+        .await;
         env.stop().await;
     }
 }

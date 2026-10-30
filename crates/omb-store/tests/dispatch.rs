@@ -2,7 +2,7 @@
 use omb_store::{
     AcceptOutcome, Channel, Claim, Content, DispatchOutcome, Disposition, IdentityKey,
     NormalizedEvent, ReplyTexts, StateLabels, accept_event, claim_dispatch, expire_pending,
-    migrate, record_dispatch, revoke_binding,
+    lock_dispatch, migrate, record_dispatch, revoke_binding,
     testkit::{
         Fixture, Session, deadline, insert_receiver, insert_sender, set_terminal, shift_event,
     },
@@ -130,10 +130,16 @@ impl Env {
             Claim::Idle { .. } => None,
         }
     }
+    /// Records `outcome` as the dispatcher does: under the event's lock, only while it is pending.
     async fn record(&mut self, id: Uuid, outcome: DispatchOutcome) {
-        record_dispatch(&mut self.session.client, id, outcome, deadline())
+        if let Some(dispatch) = lock_dispatch(&mut self.session.client, id, deadline())
             .await
-            .unwrap();
+            .unwrap()
+        {
+            record_dispatch(dispatch, id, outcome, deadline())
+                .await
+                .unwrap();
+        }
     }
     async fn stop(self) {
         self.session.close().await;

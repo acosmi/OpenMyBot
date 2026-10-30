@@ -1,7 +1,8 @@
 //! Turns pending accepted messages into delegated runs through the engine's single entry.
 use crate::{ChannelError, Connection, OMB_EXPIRY_NOTICE_V1, STORE_BUDGET, Task, Timings, backoff};
 use omb_store::{
-    Claim, DispatchItem, DispatchOutcome, claim_dispatch, expire_pending, record_dispatch,
+    Claim, DispatchItem, DispatchOutcome, claim_dispatch, expire_pending, lock_dispatch,
+    record_dispatch,
 };
 use openbot_application::{BeginDelegatedThreadRun, DelegatedRunEntry, DelegatedUntrustedMaterial};
 use openbot_contracts::{
@@ -90,9 +91,17 @@ async fn dispatch(
         match claim_dispatch(&client).await.map_err(store)? {
             Claim::Item(item) => {
                 let (record_id, attempts) = (item.record_id, item.attempts);
+                // The event stays locked from before the begin until its receipt is recorded.
+                let Some(dispatch) =
+                    lock_dispatch(&mut client, record_id, Instant::now() + STORE_BUDGET)
+                        .await
+                        .map_err(store)?
+                else {
+                    continue;
+                };
                 let receipt = entry.begin(request(item)).await;
                 record_dispatch(
-                    &mut client,
+                    dispatch,
                     record_id,
                     outcome(&receipt, attempts, &timings),
                     Instant::now() + STORE_BUDGET,

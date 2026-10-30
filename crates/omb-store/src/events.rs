@@ -6,8 +6,8 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
-use tokio::time::{Instant, timeout_at};
-use tokio_postgres::Client;
+use tokio::time::{Instant, timeout, timeout_at};
+use tokio_postgres::{Client, Transaction};
 use uuid::Uuid;
 
 /// UUIDv5(NAMESPACE_URL, `urn:openmybot:v1`).
@@ -466,22 +466,43 @@ pub enum DispatchOutcome {
     RetryAfter(Duration),
     GrantStale,
 }
-/// Records one `begin` receipt; an event that is no longer pending is left unchanged.
-pub async fn record_dispatch(
+/// Opens the transaction of one dispatch and locks its event while the event is still pending: a
+/// cancel of the event waits until the receipt is recorded, then sees it. `None` when the event
+/// left pending after it was claimed.
+pub async fn lock_dispatch(
     client: &mut Client,
+    record_id: Uuid,
+    deadline: Instant,
+) -> Result<Option<Transaction<'_>>, StoreError> {
+    let error = StoreError::DispatchFailed;
+    let tx = timeout_at(deadline, client.transaction())
+        .await
+        .map_err(|_| error)?
+        .map_err(|_| error)?;
+    let locked = rows(&tx, "SELECT 1 FROM openmybot.channel_events WHERE record_id=$1 AND dispatch_status='pending' FOR UPDATE", &[&record_id], deadline, error).await?;
+    Ok((!locked.is_empty()).then_some(tx))
+}
+/// Records one `begin` receipt in the dispatch's transaction and commits it; every receipt counts
+/// one attempt.
+pub async fn record_dispatch(
+    tx: Transaction<'_>,
     record_id: Uuid,
     outcome: DispatchOutcome,
     deadline: Instant,
 ) -> Result<(), StoreError> {
     let error = StoreError::DispatchFailed;
-    match outcome {
-        DispatchOutcome::Dispatched => rows(client, "UPDATE openmybot.channel_events SET dispatch_status='dispatched',dispatched_at=statement_timestamp(),dispatch_attempts=dispatch_attempts+1 WHERE record_id=$1 AND dispatch_status='pending' RETURNING record_id", &[&record_id], deadline, error).await,
-        DispatchOutcome::Conflict => rows(client, "UPDATE openmybot.channel_events SET dispatch_status='conflict',dispatch_attempts=dispatch_attempts+1 WHERE record_id=$1 AND dispatch_status='pending' RETURNING record_id", &[&record_id], deadline, error).await,
-        DispatchOutcome::RetryAfter(delay) => rows(client, "UPDATE openmybot.channel_events SET dispatch_attempts=dispatch_attempts+1,next_dispatch_at=statement_timestamp()+make_interval(secs=>$2) WHERE record_id=$1 AND dispatch_status='pending' RETURNING record_id", &[&record_id, &delay.as_secs_f64()], deadline, error).await,
+    let recorded = match outcome {
+        DispatchOutcome::Dispatched => rows(&tx, "UPDATE openmybot.channel_events SET dispatch_status='dispatched',dispatched_at=statement_timestamp(),dispatch_attempts=dispatch_attempts+1 WHERE record_id=$1 AND dispatch_status='pending' RETURNING record_id", &[&record_id], deadline, error).await,
+        DispatchOutcome::Conflict => rows(&tx, "UPDATE openmybot.channel_events SET dispatch_status='conflict',dispatch_attempts=dispatch_attempts+1 WHERE record_id=$1 AND dispatch_status='pending' RETURNING record_id", &[&record_id], deadline, error).await,
+        DispatchOutcome::RetryAfter(delay) => rows(&tx, "UPDATE openmybot.channel_events SET dispatch_attempts=dispatch_attempts+1,next_dispatch_at=statement_timestamp()+make_interval(secs=>$2) WHERE record_id=$1 AND dispatch_status='pending' RETURNING record_id", &[&record_id, &delay.as_secs_f64()], deadline, error).await,
         // One statement: the event is cancelled and its still-active binding suspended together.
-        DispatchOutcome::GrantStale => rows(client, "WITH e AS (UPDATE openmybot.channel_events SET dispatch_status='cancelled',dispatch_attempts=dispatch_attempts+1 WHERE record_id=$1 AND dispatch_status='pending' RETURNING binding_id) UPDATE openmybot.channel_bindings b SET status='suspended',status_reason='grant_stale',suspended_at=statement_timestamp() FROM e WHERE b.binding_id=e.binding_id AND b.status='active' RETURNING b.binding_id", &[&record_id], deadline, error).await,
-    }
-    .map(drop)
+        DispatchOutcome::GrantStale => rows(&tx, "WITH e AS (UPDATE openmybot.channel_events SET dispatch_status='cancelled',dispatch_attempts=dispatch_attempts+1 WHERE record_id=$1 AND dispatch_status='pending' RETURNING binding_id) UPDATE openmybot.channel_bindings b SET status='suspended',status_reason='grant_stale',suspended_at=statement_timestamp() FROM e WHERE b.binding_id=e.binding_id AND b.status='active' RETURNING b.binding_id", &[&record_id], deadline, error).await,
+    };
+    recorded?;
+    timeout_at(deadline, tx.commit())
+        .await
+        .map_err(|_| error)?
+        .map_err(|_| error)
 }
 
 pub struct Expired {
@@ -816,11 +837,13 @@ pub async fn accept_host_begin(
         }))
     }
     .await?;
-    timeout_at(deadline, tx.commit())
+    // The commit is awaited on its own budget and its outcome returned even past the deadline: a
+    // caller told of a written event can wake the dispatcher for it.
+    timeout(ACCEPT_TX_BUDGET, tx.commit())
         .await
         .map_err(|_| error)?
         .map_err(|_| error)?;
-    timely(deadline, Ok(outcome), error)
+    Ok(outcome)
 }
 
 /// Where one accepted message of a binding stands after a cancel request.
@@ -828,35 +851,46 @@ pub async fn accept_host_begin(
 pub enum EventCancel {
     /// No accepted message of the binding carries the run.
     NotFound,
-    /// The message was still pending and is now cancelled.
+    /// The message was still pending with the given attempt count and is now cancelled.
     Cancelled,
+    /// The message is pending after another count of begin attempts, so its run may exist.
+    Retrying { thread_id: String, attempts: u32 },
     /// The run was dispatched and has no terminal yet.
     Open { thread_id: String },
     /// The run has a terminal, or its message never started.
     Ended,
 }
-/// Cancels the binding's accepted message of `run_id` at once while it is pending; otherwise says
-/// where the run stands. Any binding kind; a dispatched message is left unchanged.
+/// Cancels the binding's accepted message of `run_id` at once while it is pending and has exactly
+/// `attempts` recorded begin attempts; otherwise says where the run stands. A dispatch holds its
+/// event locked until its receipt counts the attempt, so the update waits for a dispatch in
+/// flight. Any binding kind; a dispatched message is left unchanged.
 pub async fn cancel_event(
     client: &Client,
     binding_id: Uuid,
     run_id: &str,
+    attempts: u32,
 ) -> Result<EventCancel, StoreError> {
     let error = StoreError::EventFailed;
     let deadline = Instant::now() + READ_BUDGET;
-    let cancelled = rows(client, "UPDATE openmybot.channel_events SET dispatch_status='cancelled' WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message' AND dispatch_status='pending' AND terminal_kind IS NULL RETURNING record_id", &[&binding_id, &run_id], deadline, error).await?;
+    let attempts = i32::try_from(attempts).map_err(|_| error)?;
+    let cancelled = rows(client, "UPDATE openmybot.channel_events SET dispatch_status='cancelled' WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message' AND dispatch_status='pending' AND dispatch_attempts=$3 AND terminal_kind IS NULL RETURNING record_id", &[&binding_id, &run_id, &attempts], deadline, error).await?;
     if !cancelled.is_empty() {
         return Ok(EventCancel::Cancelled);
     }
-    let found = rows(client, "SELECT dispatch_status,terminal_kind,thread_id FROM openmybot.channel_events WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message'", &[&binding_id, &run_id], deadline, error).await?;
+    let found = rows(client, "SELECT dispatch_status,terminal_kind,thread_id,dispatch_attempts FROM openmybot.channel_events WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message'", &[&binding_id, &run_id], deadline, error).await?;
     let Some(row) = found.first() else {
         return Ok(EventCancel::NotFound);
     };
-    let dispatched = row.try_get::<_, &str>(0).map_err(|_| error)? == "dispatched";
+    let status: &str = row.try_get(0).map_err(|_| error)?;
     let terminal: Option<&str> = row.try_get(1).map_err(|_| error)?;
-    Ok(match (dispatched, terminal) {
-        (true, None) => EventCancel::Open {
+    Ok(match (status, terminal) {
+        ("dispatched", None) => EventCancel::Open {
             thread_id: row.try_get(2).map_err(|_| error)?,
+        },
+        ("pending", None) => EventCancel::Retrying {
+            thread_id: row.try_get(2).map_err(|_| error)?,
+            attempts: u32::try_from(row.try_get::<_, i32>(3).map_err(|_| error)?)
+                .map_err(|_| error)?,
         },
         _ => EventCancel::Ended,
     })

@@ -1,8 +1,8 @@
 //! Host run acceptance and per-binding cancel against an own PostgreSQL 17.11 cluster.
 use omb_store::{
     Claim, DISPATCH_QUEUE_MAX, DispatchOutcome, EventCancel, HostAccept, HostMessage, HostRun,
-    OperationId, accept_host_begin, cancel_event, claim_dispatch, expire_pending, migrate,
-    reconfirm_binding, record_dispatch, revoke_binding,
+    OperationId, accept_host_begin, cancel_event, claim_dispatch, expire_pending, lock_dispatch,
+    migrate, reconfirm_binding, record_dispatch, revoke_binding,
     testkit::{
         Fixture, Session, deadline, insert_event_for_run, insert_host_binding, insert_sender,
         set_terminal, shift_event, suspend_binding,
@@ -289,7 +289,7 @@ async fn queue_full_refuses_the_next_pending_but_still_replays() {
     );
     assert_eq!(env.begin("op-3", "other").await, HostAccept::Conflict);
     assert_eq!(
-        cancel_event(env.client(), host, &runs[0].run_id)
+        cancel_event(env.client(), host, &runs[0].run_id, 0)
             .await
             .unwrap(),
         EventCancel::Cancelled
@@ -316,14 +316,13 @@ async fn accepted_begins_are_claimed_oldest_first_one_open_run_at_a_time() {
     assert_eq!(item.run_id, first.run_id);
     assert_eq!(item.text, "first");
     assert_eq!(item.attempts, 0);
-    record_dispatch(
-        &mut env.session.client,
-        record,
-        DispatchOutcome::Dispatched,
-        deadline(),
-    )
-    .await
-    .unwrap();
+    let dispatch = lock_dispatch(&mut env.session.client, record, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    record_dispatch(dispatch, record, DispatchOutcome::Dispatched, deadline())
+        .await
+        .unwrap();
     assert!(matches!(
         claim_dispatch(env.client()).await.unwrap(),
         Claim::Idle { .. }
@@ -462,14 +461,14 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     let pending = accepted(env.begin("op-p", "work").await);
     let p = env.record("op-p").await;
     assert_eq!(
-        cancel_event(env.client(), host, &pending.run_id)
+        cancel_event(env.client(), host, &pending.run_id, 0)
             .await
             .unwrap(),
         EventCancel::Cancelled
     );
     assert_eq!(env.row(p).await["dispatch_status"], "cancelled");
     assert_eq!(
-        cancel_event(env.client(), host, &pending.run_id)
+        cancel_event(env.client(), host, &pending.run_id, 0)
             .await
             .unwrap(),
         EventCancel::Ended
@@ -491,7 +490,7 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     let s = insert_event_for_run(client, sender, "run-s", "T-S", "dispatched").await;
     let before_d = env.row(d).await;
     assert_eq!(
-        cancel_event(env.client(), host, "run-d").await.unwrap(),
+        cancel_event(env.client(), host, "run-d", 0).await.unwrap(),
         EventCancel::Open {
             thread_id: "T-D".into()
         }
@@ -506,7 +505,7 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     ] {
         let before = env.row(record).await;
         assert_eq!(
-            cancel_event(env.client(), host, run).await.unwrap(),
+            cancel_event(env.client(), host, run, 0).await.unwrap(),
             EventCancel::Ended,
             "{run}"
         );
@@ -516,14 +515,16 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     let before_s = env.row(s).await;
     for run in ["run-s", "run-missing"] {
         assert_eq!(
-            cancel_event(env.client(), host, run).await.unwrap(),
+            cancel_event(env.client(), host, run, 0).await.unwrap(),
             EventCancel::NotFound,
             "{run}"
         );
     }
     assert_eq!(env.row(s).await, before_s);
     assert_eq!(
-        cancel_event(env.client(), sender, "run-s").await.unwrap(),
+        cancel_event(env.client(), sender, "run-s", 0)
+            .await
+            .unwrap(),
         EventCancel::Open {
             thread_id: "T-S".into()
         }
@@ -538,36 +539,152 @@ async fn cancel_racing_the_dispatch_receipt_leaves_one_consistent_outcome() {
     let mut env = Env::new().await;
     let host = env.host().await;
     let canceller = env.fixture.connect().await;
-    let mut receipt = env.fixture.connect().await;
-    for round in 0..10 {
+    let mut dispatcher = env.fixture.connect().await;
+    for round in 0..10u64 {
         let id = format!("race-{round}");
         let run = accepted(env.begin(&id, "work").await);
         let record = env.record(&id).await;
-        let (cancelled, dispatched) = tokio::join!(
-            cancel_event(&canceller.client, host, &run.run_id),
-            record_dispatch(
-                &mut receipt.client,
-                record,
-                DispatchOutcome::Dispatched,
-                deadline()
-            ),
+        let outcome = match round % 2 {
+            0 => DispatchOutcome::Dispatched,
+            _ => DispatchOutcome::RetryAfter(Duration::from_secs(60)),
+        };
+        // The dispatcher's side: the lock, an engine begin of a few milliseconds, the receipt.
+        let dispatch = async {
+            let Some(dispatch) = lock_dispatch(&mut dispatcher.client, record, deadline())
+                .await
+                .unwrap()
+            else {
+                return false;
+            };
+            tokio::time::sleep(Duration::from_millis(round % 3)).await;
+            record_dispatch(dispatch, record, outcome, deadline())
+                .await
+                .unwrap();
+            true
+        };
+        let (cancelled, begun) = tokio::join!(
+            cancel_event(&canceller.client, host, &run.run_id, 0),
+            dispatch
         );
-        dispatched.unwrap();
         let row = env.row(record).await;
         match cancelled.unwrap() {
             EventCancel::Cancelled => {
+                assert!(!begun, "round {round}");
                 assert_eq!(row["dispatch_status"], "cancelled", "round {round}");
                 assert_eq!(row["dispatch_attempts"], 0, "round {round}");
             }
             EventCancel::Open { thread_id } => {
+                assert!(
+                    begun && outcome == DispatchOutcome::Dispatched,
+                    "round {round}"
+                );
                 assert_eq!(thread_id, run.thread_id, "round {round}");
                 assert_eq!(row["dispatch_status"], "dispatched", "round {round}");
                 assert_eq!(row["dispatch_attempts"], 1, "round {round}");
+            }
+            EventCancel::Retrying {
+                thread_id,
+                attempts,
+            } => {
+                assert!(
+                    begun && outcome != DispatchOutcome::Dispatched,
+                    "round {round}"
+                );
+                assert_eq!((thread_id, attempts), (run.thread_id, 1), "round {round}");
+                assert_eq!(row["dispatch_status"], "pending", "round {round}");
+                assert_eq!(
+                    cancel_event(&canceller.client, host, &run.run_id, 1)
+                        .await
+                        .unwrap(),
+                    EventCancel::Cancelled,
+                    "round {round}"
+                );
             }
             other => panic!("round {round}: {other:?}"),
         }
     }
     canceller.close().await;
-    receipt.close().await;
+    dispatcher.close().await;
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn cancel_waits_for_a_dispatch_in_flight_and_then_needs_its_attempt_count() {
+    let mut env = Env::new().await;
+    let host = env.host().await;
+    let run = accepted(env.begin("op-r", "work").await);
+    let record = env.record("op-r").await;
+    let canceller = env.fixture.connect().await;
+    let mut dispatcher = env.fixture.connect().await;
+    let pid: i32 = canceller
+        .client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let dispatch = lock_dispatch(&mut dispatcher.client, record, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    let (cancelled, ()) = tokio::join!(
+        cancel_event(&canceller.client, host, &run.run_id, 0),
+        async {
+            // The begin is in flight: the cancel waits on the event's lock.
+            let limit = tokio::time::Instant::now() + Duration::from_secs(20);
+            while !env
+                .client()
+                .query_one(
+                    "SELECT wait_event_type IS NOT DISTINCT FROM 'Lock' FROM pg_stat_activity WHERE pid=$1",
+                    &[&pid],
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+            {
+                assert!(tokio::time::Instant::now() < limit, "cancel never waited");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            record_dispatch(
+                dispatch,
+                record,
+                DispatchOutcome::RetryAfter(Duration::from_secs(60)),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        }
+    );
+    let retrying = EventCancel::Retrying {
+        thread_id: run.thread_id.clone(),
+        attempts: 1,
+    };
+    assert_eq!(cancelled.unwrap(), retrying);
+    let before = env.row(record).await;
+    assert_eq!(before["dispatch_status"], "pending");
+    assert_eq!(before["dispatch_attempts"], 1);
+    // A count older than the recorded one leaves the message; the recorded count cancels it.
+    assert_eq!(
+        cancel_event(env.client(), host, &run.run_id, 0)
+            .await
+            .unwrap(),
+        retrying
+    );
+    assert_eq!(env.row(record).await, before);
+    assert_eq!(
+        cancel_event(env.client(), host, &run.run_id, 1)
+            .await
+            .unwrap(),
+        EventCancel::Cancelled
+    );
+    assert_eq!(env.row(record).await["dispatch_status"], "cancelled");
+    assert!(
+        lock_dispatch(&mut dispatcher.client, record, deadline())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    canceller.close().await;
+    dispatcher.close().await;
     env.stop().await;
 }
