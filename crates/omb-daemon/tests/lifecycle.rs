@@ -1603,16 +1603,16 @@ async fn real_crabcode_daemon_recheck_with_cli_approve_and_cancel() {
                 )
             })
             .collect();
+        for (id, _) in pending.iter().filter(|(_, write)| !write) {
+            let (code, denied) = openmybot(&fixture, &binary, &home, &mut report, &["deny", id]);
+            assert_eq!(code, 0, "{denied}");
+        }
         let asked = pending
             .iter()
             .find(|(_, write)| *write)
             .map(|(id, _)| id.clone());
         if let Some(id) = asked.filter(|_| initialized > 0) {
             break id;
-        }
-        for (id, _) in pending.iter().filter(|(_, write)| !write) {
-            let (code, denied) = openmybot(&fixture, &binary, &home, &mut report, &["deny", id]);
-            assert_eq!(code, 0, "{denied}");
         }
         assert!(tokio::time::Instant::now() < deadline, "{run}");
         tokio::time::sleep(Duration::from_secs(2)).await;
