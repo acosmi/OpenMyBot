@@ -649,10 +649,10 @@ impl FrozenWholePgManifest {
                 WholePgMaterialKind::ScramSecret => Some(("secrets/scram", 64)),
                 _ => None,
             };
-            if let Some((path, len)) = secret_expected {
-                if material.relative_path != path || material.plain_len != len {
-                    return Err(WholePgCarrierFault::SecretInvalid);
-                }
+            if let Some((path, len)) = secret_expected
+                && (material.relative_path != path || material.plain_len != len)
+            {
+                return Err(WholePgCarrierFault::SecretInvalid);
             }
             total = add(total, material.plain_len)?;
             chunks = add(chunks, count)?;
@@ -1291,7 +1291,7 @@ mod hex32 {
                     return Err(E::custom("whole_pg_digest_invalid"));
                 }
                 let mut out = [0u8; 32];
-                for (i, p) in v.as_bytes().chunks_exact(2).enumerate() {
+                for (i, p) in v.as_bytes().as_chunks::<2>().0.iter().enumerate() {
                     out[i] = hex_digit(p[0]).ok_or_else(|| E::custom("whole_pg_digest_invalid"))?
                         * 16
                         + hex_digit(p[1]).ok_or_else(|| E::custom("whole_pg_digest_invalid"))?;

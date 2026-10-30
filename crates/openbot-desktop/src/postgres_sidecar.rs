@@ -392,6 +392,7 @@ impl core::fmt::Debug for PostgresStartLock {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // Moved once into the start path, never stored.
 enum StartControlInspection {
     Ordinary,
     #[cfg(all(
@@ -422,7 +423,7 @@ impl PostgresStartLock {
         )
     }
 
-    #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
+    #[cfg(all(test, feature = "postgres-supervisor", target_os = "macos"))]
     fn acquire_with_data_dir(
         app_data_root: &Path,
         instance_id: &str,
@@ -1446,6 +1447,7 @@ impl RetainedSidecarCaptureFailure {
 ))]
 impl RunningPostgresSidecar {
     /// The caller stores this future's original task before awaiting it. No timeout drops it.
+    #[allow(clippy::result_large_err)] // Err hands the original sidecar back by value.
     pub(crate) async fn stop_for_capture(
         self,
         clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
@@ -1606,14 +1608,6 @@ impl CaptureStoppedPostgres {
         self.original.port
     }
 
-    pub(crate) fn original_scram(&self) -> &[u8] {
-        self.original
-            .secret
-            .as_ref()
-            .expect("stopped capsule retains original SCRAM")
-            .expose()
-    }
-
     /// Borrow the same original allocation; no password payload is copied or independently minted.
     pub(crate) fn native_scram_allocation(
         &self,
@@ -1645,26 +1639,12 @@ impl CaptureStoppedPostgres {
         }
     }
 
-    pub(crate) fn exit_journal_material(
-        &self,
-        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
-    ) -> Result<(File, Vec<u8>), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault>
-    {
-        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
-        self.revalidate(clock)?;
-        self.original
-            .startup_journal
-            .capture_exit_material(self.original.lock.as_ref().ok_or(Fault::SourceChanged)?)
-            .map_err(|_| Fault::SourceChanged)
-    }
-
     /// Unit-only comparison with this capsule's original journal-held directory.
     pub(crate) fn capture_original_data_directory_matches(
         &self,
         retained: &File,
         clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
     ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
-        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
         clock.require_effect()?;
         let actual = self
             .original
@@ -1679,26 +1659,6 @@ impl CaptureStoppedPostgres {
             .startup_journal
             .capture_data_directory()
             .map_err(map_startup_journal_error)
-    }
-
-    /// Release only after the later maintenance source has genuinely closed and publication ended.
-    pub(crate) fn release_after_capture(
-        mut self,
-        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
-    ) -> Result<(), RetainedSidecarCaptureFailure> {
-        let check = self.revalidate(clock);
-        if let Err(fault) = check {
-            return Err(RetainedSidecarCaptureFailure {
-                original: Some(self.original),
-                helper: None,
-                fault,
-            });
-        }
-        if let Some(lock) = self.original.lock.as_mut() {
-            lock.remove_after_confirmed_exit();
-        }
-        drop(self.original.lock.take());
-        Ok(())
     }
 }
 
@@ -4157,6 +4117,144 @@ mod tests {
             .expect("probe driver task join")
             .expect("probe driver close");
         exists
+    }
+
+    // The armed application pool reads through CapturePgIo, whose largest accepted backend
+    // message is M / 4 - 1 bytes for M = decodeCryptoTemporary.maxOneBytes.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    #[tokio::test]
+    #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+    async fn armed_application_frame_limit_decides_the_fresh_layout_check() {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault;
+        use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
+        use openbot_infra::db::capture_materials::{
+            CaptureDbExpectation, CaptureDecodeBudget, CaptureSqlBudget, CaptureSqlFailure,
+            CaptureSqlLimits, collect_database_materials_before,
+        };
+        use openbot_infra::db::desktop_local::{DesktopLocalDriverCustody, DesktopPoolJoinBounds};
+        use openbot_infra::db::desktop_vault_canary::{
+            DesktopVaultCanaryError, verify_current_layout,
+        };
+        struct UnitClock;
+        impl CaptureClockCheck for UnitClock {
+            fn require_effect(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn require_closing(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn effect_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn closing_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn observed_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(1)
+            }
+        }
+        let profile: crate::desktop_release::CaptureProfile = serde_json::from_str(
+            crate::tauri_background::capture::control::tests::ORDINARY_STARTUP_HISTORY_PROFILE_JSON,
+        )
+        .unwrap();
+        for (max_one_bytes, layout_fits) in [(534_804, false), (2_097_152, true)] {
+            let fixture = MasterJournalPgFixture::new("armed-frame-limit").await;
+            let running = PostgresSidecarSupervisor::start(
+                VerifiedPostgresBundle::open(
+                    &fixture.bundle_root,
+                    fixture.digest,
+                    &fixture.signing,
+                )
+                .unwrap(),
+                &fixture.app_root,
+                &fixture.instance,
+                &fixture.data_dir,
+                &fixture.scram,
+                &fixture.scram_service,
+            )
+            .await
+            .unwrap();
+            // The reviewed fixture profiles keep maxCount 65536; only maxOneBytes differs.
+            let decode = CaptureDecodeBudget::checked(65_536, max_one_bytes).unwrap();
+            let custody = DesktopLocalDriverCustody::prepare(
+                DesktopPoolJoinBounds::checked(17, 17, 16, 17, 64 << 20).unwrap(),
+                Arc::clone(&decode),
+            )
+            .unwrap();
+            let plane = crate::desktop_local_bootstrap::prepare_running_sidecar_retained(
+                fixture.installation.clone(),
+                running,
+                &fixture.package,
+                custody,
+            )
+            .await
+            .unwrap();
+            assert!(
+                plane
+                    .initialize_fresh_schema(&fixture.package)
+                    .await
+                    .is_ok()
+            );
+            let layout = verify_current_layout(plane.pool()).await;
+            if layout_fits {
+                assert!(layout.is_ok());
+                let q = &profile.sql;
+                let mut budget = CaptureSqlBudget::new(
+                    CaptureSqlLimits {
+                        max_rows: q.max_rows,
+                        max_row_bytes: q.max_row_bytes,
+                        max_field_bytes: q.max_field_bytes,
+                        max_pages: q.max_pages,
+                        page_rows: q.page_rows,
+                        max_catalog_objects: q.max_catalog_objects,
+                        max_query_tasks: q.max_query_tasks,
+                        phase_ns: q.phase_ns,
+                    },
+                    profile.carrier.max_metadata_bytes,
+                    0,
+                )
+                .unwrap();
+                budget
+                    .bind_sensitive_decode_bound(Arc::clone(&decode))
+                    .unwrap();
+                let neutral = CaptureDbExpectation {
+                    deployment_id: String::new(),
+                    tenant_id: String::new(),
+                    dataset_id: String::new(),
+                    instance_id: String::new(),
+                    system_identifier: String::new(),
+                    database_oid: 0,
+                    store_id: String::new(),
+                    root_device: String::new(),
+                    root_inode: String::new(),
+                    root_uid: String::new(),
+                };
+                // No vault canary exists yet, so every projection is read before the missing
+                // canary is reported; an exhausted decode count would stop earlier as Bounds.
+                let client = plane.pool().get().await.unwrap();
+                assert_eq!(
+                    collect_database_materials_before(&client, &neutral, &mut budget, &UnitClock)
+                        .await
+                        .err(),
+                    Some(CaptureSqlFailure::SourceMismatch)
+                );
+                drop(client);
+                assert!(decode.reserve_allocations(&[(1, 8192)]).is_ok());
+            } else {
+                // One schema-facts DataRow is larger than F = 534804 / 4 - 1 = 133700 bytes.
+                assert!(matches!(
+                    layout,
+                    Err(DesktopVaultCanaryError::Infra(
+                        openbot_infra::db::InfraError::Query { .. }
+                    ))
+                ));
+            }
+            plane.shutdown().await.unwrap();
+        }
     }
 
     #[cfg(all(feature = "desktop-local-runtime", unix))]

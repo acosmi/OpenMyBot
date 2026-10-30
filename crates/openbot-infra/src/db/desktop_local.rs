@@ -66,6 +66,7 @@ pub struct DesktopLocalDatabase {
         feature = "server-runtime",
         target_os = "macos"
     ))]
+    #[allow(dead_code)] // Keeps the retained driver custody alive with this database.
     retention: Option<DesktopLocalDriverCustody>,
 }
 

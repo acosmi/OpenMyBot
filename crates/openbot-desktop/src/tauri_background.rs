@@ -367,6 +367,7 @@ pub(crate) fn checked_self_owned_fixture_metadata_bytes(
 }
 
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[allow(clippy::type_complexity)]
 pub(crate) fn bind_self_owned_capture_fixture(
     request: Option<&crate::desktop_release::ReviewedNormalCaptureRequest>,
 ) -> Result<
@@ -1167,6 +1168,14 @@ impl DesktopLocalRuntimeState {
             .and_then(|inner| inner.lifecycle.clone())
     }
 
+    #[cfg(any(
+        test,
+        not(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))
+    ))]
     fn begin_shutdown(
         &self,
     ) -> Result<Option<Box<dyn RuntimeShutdownOwner>>, DesktopLocalRuntimeError> {
@@ -1194,6 +1203,7 @@ impl DesktopLocalRuntimeState {
         feature = "postgres-maintenance",
         target_os = "macos"
     ))]
+    #[allow(clippy::type_complexity)]
     fn begin_native_exit_shutdown(
         &self,
         requested_code: Option<i32>,
@@ -2014,11 +2024,11 @@ pub fn register_desktop_local_runtime(
                         feature = "postgres-maintenance",
                         target_os = "macos"
                     ))]
-                    if let Some(binding) = self_owned_capture_fixture.take() {
-                        if binding.retire_before_window_ready().is_err() {
-                            request_shutdown(Arc::clone(&window_state), window_handle, 1);
-                            return;
-                        }
+                    if let Some(binding) = self_owned_capture_fixture.take()
+                        && binding.retire_before_window_ready().is_err()
+                    {
+                        request_shutdown(Arc::clone(&window_state), window_handle, 1);
+                        return;
                     }
                     let ready = window_state.mark_ready();
                     let exit_requested = if self_owned_exit {
@@ -2298,13 +2308,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
     ))]
     let mut capture_resources = match capture_request.as_ref() {
         Some(request) => Some(
-            capture::prepare_original_capture_resources(
-                &request
-                    .profile
-                    .carrier_bounds()
-                    .map_err(|_| DesktopLocalRuntimeError::Configuration)?,
-            )
-            .map_err(|_| DesktopLocalRuntimeError::Configuration)?,
+            capture::prepare_original_capture_resources(&request.carrier_bounds)
+                .map_err(|_| DesktopLocalRuntimeError::Configuration)?,
         ),
         None => None,
     };
@@ -2346,7 +2351,9 @@ pub(crate) async fn prepare_desktop_local_runtime(
     {
         let observed = capture::control::inspect_startup_control_for_capture(
             &app,
-            capture_request.as_ref().map(|request| &request.profile),
+            capture_request
+                .as_ref()
+                .map(|request| &request.carrier_bounds),
             capture_limits.as_ref(),
             capture_request
                 .as_ref()
@@ -2403,10 +2410,6 @@ pub(crate) async fn prepare_desktop_local_runtime(
         }
         match capture_request.as_ref().zip(capture_limits) {
             Some((request, limits)) => {
-                request
-                    .profile
-                    .validate_master_retention()
-                    .map_err(|_| DesktopLocalRuntimeError::Configuration)?;
                 let app = capture::open_app_data_read_only(app_data_root.as_path())
                     .map_err(|_| DesktopLocalRuntimeError::Authority)?
                     .ok_or(DesktopLocalRuntimeError::Authority)?;
@@ -2554,13 +2557,12 @@ pub(crate) async fn prepare_desktop_local_runtime(
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
-        if let Some(request) = capture_request.as_ref() {
+        if capture_request.is_some() {
             return prepared_data_plane
                 .verify_application_key_material_for_capture(
                     secret_store.as_ref(),
                     &vault_key_store_service,
                     &package,
-                    request,
                 )
                 .await;
         }
@@ -2837,16 +2839,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
             // One original pre-t0 book is shared by both components and carried into Armed.
             // The local bounds remain ceilings; every actual component admission debits this
             // same book. Other owners and opaque peaks still require original global closure.
-            let bounds = match request.profile.carrier_bounds() {
-                Ok(bounds) => bounds,
-                Err(_) => {
-                    return Err(cleanup_data_plane(
-                        data_plane,
-                        DesktopLocalRuntimeError::Application,
-                    )
-                    .await);
-                }
-            };
+            let bounds = request.carrier_bounds;
             let resources = match capture_resources.take() {
                 Some(resources) => resources,
                 None => {
@@ -3054,18 +3047,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 .await);
             }
         };
-        let bounds = match request.profile.carrier_bounds() {
-            Ok(bounds) => bounds,
-            Err(_) => {
-                return Err(cleanup_agent_host(
-                    data_plane,
-                    assembly,
-                    agent_host,
-                    DesktopLocalRuntimeError::Application,
-                )
-                .await);
-            }
-        };
+        let bounds = request.carrier_bounds;
         if transport
             .bind_original_capture_resources(Arc::clone(resources))
             .and_then(|()| transport.arm_capture_retention(&bounds))
@@ -4416,6 +4398,183 @@ mod tests {
         state.join_terminal_exit().await.unwrap();
         assert!(!state.can_create_window());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    fn private_fixture_root(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "wrok-bot-{label}-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        for directory in [
+            root.clone(),
+            root.join("release"),
+            root.join("capture-output"),
+            root.join("independent-key-medium"),
+        ] {
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
+    }
+
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    #[test]
+    fn retired_fixture_outers_are_a_closed_refusal_set() {
+        let fixture = SelfOwnedFixturePin {
+            outer: "abababababababababababababababababababababababababababababababab",
+            request_id: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            device: 1,
+            uid: 1,
+            root_inode: 1,
+            release_inode: 2,
+            output_inode: 3,
+            key_inode: 4,
+        };
+        // The two first fixture pins and the retired second fixture pin all refuse.
+        for retired in RETIRED_SELF_OWNED_CAPTURE_OUTERS {
+            assert!(matches!(
+                self_owned_fixture_selected(Some(retired), &fixture),
+                Err(DesktopLocalRuntimeError::Configuration)
+            ));
+        }
+        assert!(
+            RETIRED_SELF_OWNED_CAPTURE_OUTERS
+                .contains(&"f9ee6d061d6202b15edd9de72a1560212ccc70e1438625a2559025b21edaaaf6")
+        );
+        assert!(matches!(
+            self_owned_fixture_selected(None, &fixture),
+            Ok(false)
+        ));
+        assert!(matches!(
+            self_owned_fixture_selected(Some(&"0".repeat(64)), &fixture),
+            Ok(false)
+        ));
+        assert!(matches!(
+            self_owned_fixture_selected(Some(fixture.outer), &fixture),
+            Ok(true)
+        ));
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    #[test]
+    fn fixture_layout_requires_every_pinned_device_inode_owner_and_path() {
+        use crate::desktop_release::TrustedDestination;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let root = private_fixture_root("fixture-layout");
+        let release = root.join("release");
+        let observed = |leaf: &str| fs::symlink_metadata(root.join(leaf)).unwrap();
+        let destination = |leaf: &str| {
+            let metadata = observed(leaf);
+            TrustedDestination {
+                absolute_path: root.join(leaf),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                uid: metadata.uid(),
+            }
+        };
+        let base = fs::symlink_metadata(&root).unwrap();
+        let pin = SelfOwnedFixturePin {
+            outer: "abababababababababababababababababababababababababababababababab",
+            request_id: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            device: base.dev(),
+            uid: base.uid(),
+            root_inode: base.ino(),
+            release_inode: observed("release").ino(),
+            output_inode: observed("capture-output").ino(),
+            key_inode: observed("independent-key-medium").ino(),
+        };
+        let held = fs::File::open(&release).unwrap();
+        let (output, key) = (
+            destination("capture-output"),
+            destination("independent-key-medium"),
+        );
+        assert_eq!(
+            verify_self_owned_fixture_layout(&pin, &held, &release, &output, &key).ok(),
+            Some(root.clone())
+        );
+        let refused =
+            |pin: &SelfOwnedFixturePin, output: &TrustedDestination, key: &TrustedDestination| {
+                matches!(
+                    verify_self_owned_fixture_layout(pin, &held, &release, output, key),
+                    Err(DesktopLocalRuntimeError::Configuration)
+                )
+            };
+        let shifted = |change: fn(&mut SelfOwnedFixturePin)| {
+            let mut other = SelfOwnedFixturePin { ..pin };
+            change(&mut other);
+            other
+        };
+        for other in [
+            shifted(|pin| pin.device += 1),
+            shifted(|pin| pin.uid += 1),
+            shifted(|pin| pin.root_inode += 1),
+            shifted(|pin| pin.release_inode += 1),
+            shifted(|pin| pin.output_inode += 1),
+            shifted(|pin| pin.key_inode += 1),
+        ] {
+            assert!(refused(&other, &output, &key));
+        }
+        // The destinations must be the root's own fixed leaves, with the pinned identity.
+        let mut moved = destination("capture-output");
+        moved.absolute_path = root.join("release");
+        assert!(refused(&pin, &moved, &key));
+        let mut other_inode = destination("independent-key-medium");
+        other_inode.inode += 1;
+        assert!(refused(&pin, &output, &other_inode));
+        assert!(refused(&pin, &key, &output));
+        // A non-private pinned directory or an existing app-data root refuses.
+        fs::set_permissions(
+            root.join("capture-output"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        assert!(refused(&pin, &output, &key));
+        fs::set_permissions(
+            root.join("capture-output"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::create_dir(root.join("app-data")).unwrap();
+        assert!(refused(&pin, &output, &key));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    #[test]
+    fn no_capture_request_keeps_a_fresh_start_ordinary() {
+        // No compiled fixture pin and no request: no fixture binding and no secret-store swap.
+        assert!(matches!(bind_self_owned_capture_fixture(None), Ok(None)));
+        let root = private_fixture_root("fresh-ordinary");
+        let app = fs::File::open(&root).unwrap();
+        assert!(
+            capture::control::inspect_startup_control_for_capture(&app, None, None, None, None)
+                .is_ok()
+        );
+        // The ordinary inspection of a fresh app-data root creates nothing.
+        let mut names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["capture-output", "independent-key-medium", "release"]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

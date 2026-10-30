@@ -147,6 +147,7 @@ impl CaptureDecodeBudget {
     // A crate-private charging action, not a charged-count getter or a second writer.
     // Immutable M is returned to the original socket adapter only after one full credit
     // has been admitted by the same reserve_allocations transaction.
+    #[cfg(feature = "desktop-local-vault")]
     pub(crate) fn reserve_wire_credit(&self) -> Result<u64, CaptureSqlFailure> {
         let one = self
             .state

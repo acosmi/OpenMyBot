@@ -225,6 +225,7 @@ impl DatasetBoundArtifactStore {
 
 /// The returned original handle must be installed in the outer resident owner before awaiting.
 /// No timeout or task Drop here releases the original Store gate or deletes partial snapshots.
+#[allow(clippy::result_large_err)] // Err hands the original owners back by value.
 pub fn start_capture_snapshot(
     hold: ArtifactCaptureHold,
     spool: OwnedCaptureSpool,
@@ -320,6 +321,7 @@ impl SnapshotMetadata {
     }
 }
 
+#[allow(clippy::result_large_err)] // Err hands the original owners back by value.
 fn snapshot(
     mut hold: ArtifactCaptureHold,
     spool: OwnedCaptureSpool,
@@ -388,8 +390,6 @@ fn snapshot(
         {
             return Err(WholePgCarrierFault::PathUnsafe);
         }
-        // These observations are no longer needed while the bridge verifies subtrees.
-        drop((destination, source));
         let reader = retain_directory_reader(&spool.root, &bounds, clock, &mut count, &files)?;
         loop {
             clock.require_effect()?;
@@ -456,6 +456,7 @@ fn snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_directory(
     source: &File,
     target: &File,
@@ -602,7 +603,6 @@ fn copy_directory(
             {
                 return Err(WholePgCarrierFault::SourceChanged);
             }
-            drop(child_meta);
             check_snapshot_capacity(target, count, output, 0, bounds, clock)?;
             copy_directory(
                 child,

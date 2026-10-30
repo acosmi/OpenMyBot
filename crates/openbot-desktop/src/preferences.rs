@@ -334,7 +334,6 @@ mod capture_projection {
     use sha2::{Digest, Sha256};
     use std::alloc::Layout;
     use std::future::{Future as _, poll_fn};
-    use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{FileExt as _, MetadataExt as _};
     use std::task::{Context, Poll};
@@ -446,6 +445,7 @@ mod capture_projection {
         tasks: JoinSet<Result<(), UiPreferenceAdministrationError>>,
         active: u64,
         fault: Option<Fault>,
+        #[allow(clippy::type_complexity)]
         unmatched: Option<Result<(Id, Result<(), UiPreferenceAdministrationError>), JoinError>>,
         fd_admissions: u64,
         metadata_reserved: u64,
@@ -474,15 +474,14 @@ mod capture_projection {
             if self.settled {
                 return;
             }
-            if let Ok(mut gate) = self.state.gate.lock() {
-                if let Some(operation) = gate.operations.get_mut(self.slot) {
-                    if matches!(
-                        operation.phase,
-                        OperationPhase::Sql | OperationPhase::Projection
-                    ) {
-                        operation.phase = OperationPhase::Unknown;
-                    }
-                }
+            if let Ok(mut gate) = self.state.gate.lock()
+                && let Some(operation) = gate.operations.get_mut(self.slot)
+                && matches!(
+                    operation.phase,
+                    OperationPhase::Sql | OperationPhase::Projection
+                )
+            {
+                operation.phase = OperationPhase::Unknown;
             }
             self.state.changed.notify_waiters();
         }
@@ -1348,34 +1347,6 @@ mod capture_projection {
             Ok(())
         }
 
-        // Registered pure DATA seam. These cumulative known charges are not a claim that
-        // this local bound is the whole-operation/global remaining budget.
-        pub(crate) fn retained_resource_usage(&self) -> Result<(u64, u64), Fault> {
-            if self.worker_spawn_entered && self.worker.is_none() && self.joined.is_none() {
-                return Err(Fault::ClosingPending);
-            }
-            if matches!(self.joined.as_ref(), Some(Err(_) | Ok(Err(_)))) {
-                return Err(Fault::ClosingPending);
-            }
-            let gate = self
-                .state
-                .gate
-                .try_lock()
-                .map_err(|_| Fault::ClosingPending)?;
-            if let Some(fault) = gate.fault {
-                return Err(fault);
-            }
-            if gate.unmatched.is_some()
-                || gate
-                    .operations
-                    .iter()
-                    .any(|op| op.phase == OperationPhase::Unknown)
-            {
-                return Err(Fault::ClosingPending);
-            }
-            Ok((gate.fd_admissions, gate.metadata_reserved))
-        }
-
         pub(crate) async fn close_and_snapshot(
             &mut self,
             destination: &File,
@@ -1488,12 +1459,9 @@ mod capture_projection {
                     }
                 })
                 .await;
-                match result {
-                    Some(result) => {
-                        result?;
-                        break;
-                    }
-                    None => {}
+                if let Some(result) = result {
+                    result?;
+                    break;
                 }
             }
             clock.require_effect()?;

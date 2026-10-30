@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Default)]
+#[allow(clippy::large_enum_variant)] // Parsed once and moved into the reviewed request.
 pub(super) enum CaptureField {
     #[default]
     Missing,
@@ -400,7 +401,6 @@ impl CaptureProfile {
         &self,
         fixture_metadata: u64,
     ) -> Result<(), DesktopReleaseError> {
-        self.validate_master_retention()?;
         let k = &self.secrets.classes;
         if k.master_source.max_count < 4
             || k.master_source.max_one_bytes < 64
@@ -661,6 +661,9 @@ pub(crate) struct ReviewedNormalCaptureRequest {
     pub(crate) maintenance_digest: [u8; 32],
     pub(crate) maintenance: VerifiedMaintenanceBundle,
     pub(crate) profile: CaptureProfile,
+    // Checked once from `profile` when this request is verified.
+    pub(crate) carrier_bounds: openbot_domain::backup::whole_pg_carrier::WholePgCarrierBounds,
+    pub(crate) secret_bounds: openbot_domain::backup::whole_pg_carrier::WholePgSecretBounds,
     pub(crate) output: TrustedDestination,
     pub(crate) key_medium: TrustedDestination,
     // None exists only inside original open before its final successful release binding.
@@ -782,12 +785,20 @@ impl RawCaptureRequest {
         }
         Ok(())
     }
+    // Only reached from the release open after `ReleaseManifest::parse` validated this request.
     pub(super) fn verify(
         self,
         root: &Path,
         release_digest: [u8; 32],
     ) -> Result<ReviewedNormalCaptureRequest, DesktopReleaseError> {
-        self.validate()?;
+        let carrier_bounds = self
+            .profile
+            .carrier_bounds()
+            .map_err(|_| DesktopReleaseError::Manifest)?;
+        let secret_bounds = self
+            .profile
+            .secret_bounds()
+            .map_err(|_| DesktopReleaseError::Manifest)?;
         let digest =
             decode_digest(&self.maintenance_outer_sha256).ok_or(DesktopReleaseError::Manifest)?;
         let directory = root.join(&self.maintenance_root);
@@ -831,6 +842,8 @@ impl RawCaptureRequest {
             maintenance_digest: digest,
             maintenance,
             profile: self.profile,
+            carrier_bounds,
+            secret_bounds,
             output: self.output_root,
             key_medium: self.independent_key_medium,
             release_compatibility: None,

@@ -64,6 +64,7 @@ pub struct WholePgOwnedStreamParts {
 pub struct OwnedCaptureStreamInputs {
     parts: WholePgOwnedStreamParts,
 }
+#[allow(dead_code)] // Fields hold the original owners until this failure drops.
 pub struct OwnedCaptureStreamFailure {
     fault: WholePgCarrierFault,
     // Before release, retain the genuine original FD/secret values on every failure.
@@ -116,6 +117,7 @@ impl CarrierReadbackReceipt {
 pub type OwnedCaptureStreamResult = Result<CarrierReadbackReceipt, OwnedCaptureStreamFailure>;
 
 impl OwnedCaptureStreamInputs {
+    #[allow(clippy::result_large_err)] // Err hands the original owners back by value.
     pub fn from_owned_parts(
         parts: WholePgOwnedStreamParts,
     ) -> Result<Self, OwnedCaptureStreamFailure> {
@@ -426,6 +428,7 @@ impl FileIdentity {
 
 /// Synchronous single original stream worker. It owns all source FDs and secrets; its caller
 /// must store the original blocking JoinHandle before awaiting and retain it on cancellation.
+#[allow(clippy::result_large_err)] // Err hands the original owners back by value.
 pub fn run_owned_stream(
     inputs: OwnedCaptureStreamInputs,
     clock: Arc<dyn CaptureClockCheck + Send + Sync>,
@@ -478,7 +481,6 @@ fn stream(
     let parts_metadata = check_parts(parts)?;
     clock.require_effect()?;
     let b = parts.carrier_bounds;
-    let s = parts.secret_bounds;
     let frame_capacity = b.max_manifest_bytes.max(b.max_chunk_plain_bytes).max(84);
     if frame_capacity > 4 * 1024 * 1024
         || parts.manifest.metadata_bytes() > b.max_metadata_bytes
@@ -980,6 +982,7 @@ fn verify_sources(
     buffer.clear();
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 fn readback(
     parts: &WholePgOwnedStreamParts,
     name: &str,
@@ -1662,7 +1665,6 @@ mod tests {
             std::fs::metadata(root.join("key").join(KEY)).unwrap().len(),
             104
         );
-        drop(receipt);
         finish(root);
     }
     #[test]
@@ -1865,7 +1867,6 @@ mod tests {
         };
         rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
         assert!(receipt.published_verified());
-        drop(receipt);
         drop(probe);
         finish(root);
 

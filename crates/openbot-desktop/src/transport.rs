@@ -388,6 +388,7 @@ impl InProcessTransport {
 
     /// Cumulative known requested backing retained/reserved by this component; no new OS FD
     /// is opened by the transport itself. This is not an opaque-runtime or global peak claim.
+    #[cfg(test)]
     pub(crate) fn retained_resource_usage(&self) -> Result<(u64, u64), WholePgCarrierFault> {
         let registry = self
             .pumps
@@ -501,18 +502,17 @@ impl InProcessTransport {
                 .map_err(|_| OpenSessionError::ShuttingDown)?;
             capture.metadata_reserved = metadata;
             capture.admissions = admissions;
-            if new_capacity > old_capacity {
-                if capture.originals.try_reserve_exact(additional).is_err()
-                    || capture.originals.capacity() != new_capacity
-                {
-                    // try_reserve_exact leaves existing elements unchanged on allocation Err.
-                    // Refuse without refund/reconstruction, and retain every original handle.
-                    capture.closed = true;
-                    capture
-                        .fault
-                        .get_or_insert(CaptureTransportFault::Cancelled);
-                    return Err(OpenSessionError::ShuttingDown);
-                }
+            if new_capacity > old_capacity
+                && (capture.originals.try_reserve_exact(additional).is_err()
+                    || capture.originals.capacity() != new_capacity)
+            {
+                // try_reserve_exact leaves existing elements unchanged on allocation Err.
+                // Refuse without refund/reconstruction, and retain every original handle.
+                capture.closed = true;
+                capture
+                    .fault
+                    .get_or_insert(CaptureTransportFault::Cancelled);
+                return Err(OpenSessionError::ShuttingDown);
             }
             capture.pending = pending;
             capture.label_limit

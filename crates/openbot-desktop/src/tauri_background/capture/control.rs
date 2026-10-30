@@ -989,6 +989,7 @@ struct JournalWork {
     // Separate from the two original writer FDs and canonical record bodies.
     record_files: Vec<File>,
     record_bytes: Vec<u8>,
+    #[allow(clippy::type_complexity)]
     record_results: [Option<Result<(usize, Vec<u8>), Fault>>; 4],
     destination_identities: [Option<Identity>; 2],
     operation_path: Option<PathBuf>,
@@ -2420,7 +2421,7 @@ fn original_stage_body(
 }
 
 impl CaptureControlOwner {
-    pub(crate) fn prepare(
+    pub(in crate::tauri_background) fn prepare(
         app_data_root: &File,
         reviewed: &ReviewedNormalCaptureRequest,
         limits: Limits,
@@ -2535,11 +2536,8 @@ impl CaptureControlOwner {
             .and_then(|n| usize::try_from(n).ok())
             .ok_or(Fault::BoundsOverflow)?;
         // The only new object backing is paid before this allocation and scan.
-        let mut storage = super::prepare_original_control_storage(
-            &resources,
-            &reviewed.profile.carrier_bounds()?,
-            maximum,
-        )?;
+        let mut storage =
+            super::prepare_original_control_storage(&resources, &reviewed.carrier_bounds, maximum)?;
         let history = match &control {
             Some(fd) => scan_closed_history(fd, &limits, 7, Some(&mut storage), None)?,
             // This is the second actual NOENT on the original held parent, not caller DATA.
@@ -4405,7 +4403,6 @@ impl JournalWork {
                     &clock.resources,
                     clock.owner_instance(),
                 )?;
-                drop(io);
                 // The actual NOENT above does not authorize adoption on EEXIST.
                 // The original exclusive New operation and owner slot remain.
                 let mut io = HistoryIo {
@@ -4812,7 +4809,7 @@ pub(crate) fn inspect_startup_control(app: &File, limits: Option<&Limits>) -> Re
 }
 pub(in crate::tauri_background) fn inspect_startup_control_for_capture(
     app: &File,
-    profile: Option<&CaptureProfile>,
+    bounds: Option<&openbot_domain::backup::whole_pg_carrier::WholePgCarrierBounds>,
     limits: Option<&Limits>,
     reviewed_request_id: Option<&str>,
     resources: Option<&Arc<std::sync::Mutex<super::CaptureResourceTotals>>>,
@@ -4822,7 +4819,7 @@ pub(in crate::tauri_background) fn inspect_startup_control_for_capture(
         inspect_startup_control(app, limits)?;
         return Ok(OriginalControlHistoryFootprint::unobserved());
     }
-    let profile = profile.ok_or(Fault::ClosingPending)?;
+    let bounds = bounds.ok_or(Fault::ClosingPending)?;
     let limits = limits.ok_or(Fault::ClosingPending)?;
     let reviewed_request_id = reviewed_request_id.ok_or(Fault::IntentMismatch)?;
     if !digest_text(reviewed_request_id) {
@@ -4830,7 +4827,7 @@ pub(in crate::tauri_background) fn inspect_startup_control_for_capture(
     }
     super::original_capture_resource_identity(
         resources.expect("checked original book exists"),
-        &profile.carrier_bounds()?,
+        bounds,
     )?;
     let app_before = app.metadata().map_err(io_fault)?;
     private_directory(app)?;
@@ -5623,16 +5620,15 @@ impl HistoryIo<'_> {
         if self.directory.is_some() {
             return Err(Fault::IntentMismatch);
         }
-        if let HistoryFd::Frame(index) = fd {
-            if self
+        if let HistoryFd::Frame(index) = fd
+            && self
                 .frames
                 .get(index)
                 .ok_or(Fault::IntentMismatch)?
                 .entries
                 .is_some()
-            {
-                return Err(Fault::IntentMismatch);
-            }
+        {
+            return Err(Fault::IntentMismatch);
         }
         let before = self.metadata(fd)?;
         let identity = RecordIdentity::of(&before);
@@ -6013,7 +6009,7 @@ fn history_read_record_core(
     name: &str,
     limit: u64,
     expected: Option<RecordIdentity>,
-    mut objects: Option<&mut super::OriginalControlStorageFacts>,
+    objects: Option<&mut super::OriginalControlStorageFacts>,
     io: &mut HistoryIo<'_>,
 ) -> Result<(usize, usize), Fault> {
     // New core/legacy-wrapper tuple returns are distinct from the actual body
@@ -6168,7 +6164,7 @@ fn history_read_record_core(
         {
             return Err(Fault::IntentMismatch);
         }
-        if let Some(objects) = objects.as_deref_mut() {
+        if let Some(objects) = objects {
             objects.observe(after.dev(), after.ino(), after.blocks(), after.len())?;
         }
         io.observe(&after, after.len())?;
@@ -6224,10 +6220,10 @@ fn scan_closed_history_observed(
     io: &mut HistoryIo<'_>,
     reviewed_request: Option<(&str, &mut bool)>,
 ) -> Result<History, Fault> {
-    if let Some((id, _)) = reviewed_request.as_ref() {
-        if !digest_text(id) {
-            return Err(Fault::IntentMismatch);
-        }
+    if let Some((id, _)) = reviewed_request.as_ref()
+        && !digest_text(id)
+    {
+        return Err(Fault::IntentMismatch);
     }
     let mut completed_request = false;
     history_private_directory(root, io)?;
@@ -6805,6 +6801,7 @@ impl ClosedHistoryScan<'_, '_> {
         }
         self.io.observe(&after, 0)
     }
+    #[allow(clippy::too_many_arguments)]
     fn file(
         &mut self,
         parent: HistoryFd<'_>,
@@ -7321,6 +7318,7 @@ impl ClosedHistoryScan<'_, '_> {
         self.io.retire(materials)
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn scan_closed_spool(
     operations: HistoryFd<'_>,
     operation_name: &str,
@@ -7421,7 +7419,7 @@ impl OrdinaryAuditBinding {
             return Err(Fault::ClosingPending);
         }
         let mut sha256 = [0_u8; 32];
-        for (out, pair) in sha256.iter_mut().zip(digest.as_bytes().chunks_exact(2)) {
+        for (out, pair) in sha256.iter_mut().zip(digest.as_bytes().as_chunks::<2>().0) {
             let digit = |b: u8| match b {
                 b'0'..=b'9' => Ok(b - b'0'),
                 b'a'..=b'f' => Ok(b - b'a' + 10),
@@ -7477,71 +7475,7 @@ fn ordinary_named_identity(
     }
     Ok(())
 }
-fn verify_ordinary_audit(
-    operations: &File,
-    operation_name: &str,
-    operation: &File,
-    binding: &OrdinaryAuditBinding,
-    current: &Limits,
-    original: &Limits,
-    history: &mut History,
-    objects: Option<&mut super::OriginalControlStorageFacts>,
-) -> Result<(), Fault> {
-    verify_ordinary_audit_at(
-        operations,
-        operation_name,
-        operation,
-        ORDINARY_AUDIT_LEAF,
-        binding,
-        current,
-        original,
-        history,
-        objects,
-    )
-}
-fn verify_ordinary_audit_at(
-    operations: &File,
-    operation_name: &str,
-    operation: &File,
-    audit_leaf: &str,
-    binding: &OrdinaryAuditBinding,
-    current: &Limits,
-    original: &Limits,
-    history: &mut History,
-    objects: Option<&mut super::OriginalControlStorageFacts>,
-) -> Result<(), Fault> {
-    let mut files = Vec::new();
-    let mut directory = None;
-    let mut frames = Vec::new();
-    let mut matched = Vec::new();
-    let mut raw = None;
-    let mut bytes = Vec::new();
-    let mut io = HistoryIo {
-        fs_admission: None,
-        fs_observations: None,
-        clock: None,
-        original_objects: None,
-        maximum_files: 2,
-        files: &mut files,
-        directory: &mut directory,
-        frames: &mut frames,
-        matched: &mut matched,
-        raw: &mut raw,
-        bytes: &mut bytes,
-    };
-    verify_ordinary_audit_at_observed(
-        HistoryFd::Original(operations),
-        operation_name,
-        HistoryFd::Original(operation),
-        audit_leaf,
-        binding,
-        current,
-        original,
-        history,
-        objects,
-        &mut io,
-    )
-}
+#[allow(clippy::too_many_arguments)]
 fn verify_ordinary_audit_observed(
     operations: HistoryFd<'_>,
     operation_name: &str,
@@ -7566,6 +7500,7 @@ fn verify_ordinary_audit_observed(
         io,
     )
 }
+#[allow(clippy::too_many_arguments)]
 fn verify_ordinary_audit_at_observed(
     operations: HistoryFd<'_>,
     operation_name: &str,
@@ -7725,10 +7660,10 @@ fn verify_ordinary_audit_at_observed(
         return Err(Fault::ClosingPending);
     }
     history_named_identity(operations, operation_name, parent_identity, true, io)?;
-    if objects.is_some() || io.original_objects.is_some() {
-        if parent_after.blocks() != parent_before.blocks() {
-            return Err(Fault::ClosingPending);
-        }
+    if (objects.is_some() || io.original_objects.is_some())
+        && parent_after.blocks() != parent_before.blocks()
+    {
+        return Err(Fault::ClosingPending);
     }
     if let Some(objects) = objects {
         objects.observe(after.dev(), after.ino(), after.blocks(), after.len())?;
@@ -7744,61 +7679,6 @@ fn verify_ordinary_audit_at_observed(
     io.retire(file)
 }
 
-fn charge(dir: &File, name: &str, bytes: &[u8], l: &Limits, h: &mut History) -> Result<(), Fault> {
-    let f = open_read(dir, name)?;
-    let m = f.metadata().map_err(io_fault)?;
-    h.bytes = checked_add(h.bytes, bytes.len() as u64)?;
-    h.allocation = checked_add(
-        h.allocation,
-        m.blocks().checked_mul(512).ok_or(Fault::BoundsOverflow)?,
-    )?;
-    h.records = checked_add(h.records, 1)?;
-    if h.bytes > l.journal
-        || h.retained_bytes()? > l.retained
-        || h.allocation > l.allocation
-        || h.records > l.records
-    {
-        return Err(Fault::CapacityExceeded);
-    }
-    Ok(())
-}
-fn names(dir: &File, l: &Limits, h: &mut History) -> Result<Vec<String>, Fault> {
-    bounded_names(dir, l, h, l.records)
-}
-fn operation_entry_names(dir: &File, l: &Limits, h: &mut History) -> Result<Vec<String>, Fault> {
-    bounded_names(dir, l, h, checked_add(l.records, 5)?)
-}
-fn bounded_names(
-    dir: &File,
-    l: &Limits,
-    h: &mut History,
-    maximum: u64,
-) -> Result<Vec<String>, Fault> {
-    h.dirs = checked_add(h.dirs, 1)?;
-    if h.dirs > l.dirs {
-        return Err(Fault::CapacityExceeded);
-    }
-    let mut result = Vec::new();
-    let mut iter = rustix::fs::Dir::read_from(dir).map_err(|_| Fault::IoFailure)?;
-    for entry in &mut iter {
-        let e = entry.map_err(|_| Fault::IoFailure)?;
-        let bytes = e.file_name().to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        h.metadata = checked_add(h.metadata, bytes.len() as u64 + 128)?;
-        if h.metadata > l.metadata || result.len() as u64 >= maximum {
-            return Err(Fault::CapacityExceeded);
-        }
-        result.push(
-            std::str::from_utf8(bytes)
-                .map_err(|_| Fault::PathUnsafe)?
-                .to_string(),
-        );
-    }
-    result.sort();
-    Ok(result)
-}
 pub(in crate::tauri_background) fn open_trusted_directory(
     path: &Path,
     private: bool,
@@ -7878,14 +7758,10 @@ fn optional_directory(parent: &File, name: &str) -> Result<Option<File>, Fault> 
         Err(_) => Err(Fault::ClosingPending),
     }
 }
-fn open_child_directory(parent: &File, name: &str) -> Result<File, Fault> {
-    optional_directory(parent, name)?.ok_or(Fault::ClosingPending)
-}
 #[derive(Clone, Copy)]
 enum DirectoryMode {
     New,
     Existing,
-    ExistingOrNew,
 }
 fn place_directory(
     parent: &File,
@@ -8051,13 +7927,6 @@ fn place_directory(
                     }
                 }
             }
-            Some(JournalHistoryIoResult::Open(Err(rustix::io::Errno::NOENT)))
-                if matches!(mode, DirectoryMode::ExistingOrNew) =>
-            {
-                // The same original permitted absence is a normal grammar
-                // edge, like HistoryIo::absent, not a selected IO failure.
-                io.raw.take();
-            }
             Some(JournalHistoryIoResult::Open(Err(_))) => return Err(Fault::IoFailure),
             _ => return Err(Fault::IntentMismatch),
         }
@@ -8216,7 +8085,7 @@ fn verify_named_directory(
     {
         return Err(Fault::PathUnsafe);
     }
-    if (st.st_dev as u64, st.st_ino as u64, st.st_uid) != (m.dev(), m.ino(), m.uid()) {
+    if (st.st_dev as u64, st.st_ino, st.st_uid) != (m.dev(), m.ino(), m.uid()) {
         return Err(Fault::SourceChanged);
     }
     if st.st_mode as u32 & 0o7777 != m.mode() & 0o7777 {
@@ -8224,13 +8093,7 @@ fn verify_named_directory(
     }
     Ok(())
 }
-fn runtime_clone(
-    file: &File,
-    clock: &CaptureOperation,
-    slot: &mut Option<File>,
-) -> Result<(), Fault> {
-    runtime_clone_for_fact(file, clock, false, &clock.resources, slot)
-}
+#[cfg(test)]
 fn runtime_clone_for_fact(
     file: &File,
     clock: &dyn CaptureClockCheck,
@@ -8721,34 +8584,7 @@ fn runtime_bound_path(
     }
     Ok(())
 }
-fn open_read(parent: &File, name: &str) -> Result<File, Fault> {
-    let fd = rustix::fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(File::from)
-    .map_err(|_| Fault::PathUnsafe)?;
-    let m = fd.metadata().map_err(io_fault)?;
-    if !m.is_file()
-        || m.nlink() != 1
-        || m.uid() != rustix::process::geteuid().as_raw()
-        || m.mode() & 0o7777 != 0o600
-    {
-        return Err(Fault::PathUnsafe);
-    }
-    Ok(fd)
-}
-fn read_record(
-    parent: &File,
-    name: &str,
-    limit: u64,
-    clock: Option<(&CaptureOperation, bool)>,
-    objects: Option<&mut super::OriginalControlStorageFacts>,
-) -> Result<Vec<u8>, Fault> {
-    read_bound_record_observed(parent, name, limit, clock, None, objects)
-}
+#[cfg(test)]
 fn read_bound_record(
     parent: &File,
     name: &str,
@@ -8758,6 +8594,7 @@ fn read_bound_record(
 ) -> Result<Vec<u8>, Fault> {
     read_bound_record_observed(parent, name, limit, clock, expected, None)
 }
+#[cfg(test)]
 fn read_bound_record_observed(
     parent: &File,
     name: &str,
@@ -8946,6 +8783,7 @@ fn read_bound_record_resident(
     io.guard()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_record(
     parent: &File,
     name: &str,
@@ -9377,10 +9215,10 @@ fn fault_text(s: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const ORDINARY_STARTUP_HISTORY_PROFILE_JSON: &str = r#"{
+    pub(crate) const ORDINARY_STARTUP_HISTORY_PROFILE_JSON: &str = r#"{
   "native": {
     "effectNs": 120000000000,
     "convergenceNs": 30000000000,
@@ -9799,12 +9637,11 @@ mod tests {
         }
         operation_file.sync_all().unwrap();
         File::open(&operations).unwrap().sync_all().unwrap();
-        let resources =
-            super::super::prepare_original_capture_resources(&profile.carrier_bounds().unwrap())
-                .unwrap();
+        let bounds = profile.carrier_bounds().unwrap();
+        let resources = super::super::prepare_original_capture_resources(&bounds).unwrap();
         let observed = inspect_startup_control_for_capture(
             &app,
-            Some(&profile),
+            Some(&bounds),
             Some(&limits),
             Some(&request.request_id),
             Some(&resources),
@@ -9815,7 +9652,7 @@ mod tests {
         assert!(!observed.completed_request(&other_request));
         let other = inspect_startup_control_for_capture(
             &app,
-            Some(&profile),
+            Some(&bounds),
             Some(&limits),
             Some(&other_request),
             Some(&resources),
@@ -9828,7 +9665,7 @@ mod tests {
         assert!(matches!(
             inspect_startup_control_for_capture(
                 &app,
-                Some(&profile),
+                Some(&bounds),
                 Some(&limits),
                 Some(&request.request_id),
                 Some(&resources)

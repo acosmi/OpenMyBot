@@ -298,6 +298,7 @@ impl ArmedCaptureVault {
 
     /// Move the original secret together with the original journal owner, which the caller
     /// keeps separately resident.
+    #[allow(clippy::result_large_err)] // Err hands the original material back by value.
     pub(crate) fn into_original_master_before(
         self,
         clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
@@ -315,23 +316,25 @@ impl ArmedCaptureVault {
     }
 }
 
-enum MasterRetention<'a> {
+enum MasterRetention {
     Ordinary,
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",
         target_os = "macos"
     ))]
-    Armed(&'a crate::desktop_release::ReviewedNormalCaptureRequest),
-    #[cfg(not(all(
-        feature = "desktop-launcher",
-        feature = "postgres-maintenance",
-        target_os = "macos"
-    )))]
-    _Lifetime(std::marker::PhantomData<&'a ()>),
+    Armed,
 }
 
 impl VaultReadyDesktopMaterial {
+    #[cfg(any(
+        test,
+        not(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))
+    ))]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -391,15 +394,9 @@ impl PreparedDesktopLocalDataPlane {
         store: &S,
         service: &ReviewedDesktopVaultKeyStoreService,
         package: &openbot_application::tenant::package::LoadedTenantPackage,
-        request: &crate::desktop_release::ReviewedNormalCaptureRequest,
     ) -> Result<VaultReadyDesktopMaterial, DesktopVaultKeyError> {
-        self.verify_application_key_material_inner(
-            store,
-            service,
-            package,
-            MasterRetention::Armed(request),
-        )
-        .await
+        self.verify_application_key_material_inner(store, service, package, MasterRetention::Armed)
+            .await
     }
 
     async fn verify_application_key_material_inner<S: OsSecretStore + ?Sized>(
@@ -407,20 +404,8 @@ impl PreparedDesktopLocalDataPlane {
         store: &S,
         service: &ReviewedDesktopVaultKeyStoreService,
         package: &openbot_application::tenant::package::LoadedTenantPackage,
-        retention: MasterRetention<'_>,
+        retention: MasterRetention,
     ) -> Result<VaultReadyDesktopMaterial, DesktopVaultKeyError> {
-        // Validate the full finite secret profile before the original master is acquired.
-        #[cfg(all(
-            feature = "desktop-launcher",
-            feature = "postgres-maintenance",
-            target_os = "macos"
-        ))]
-        if let MasterRetention::Armed(request) = &retention {
-            request
-                .profile
-                .validate_master_retention()
-                .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
-        }
         self.ensure_owner_current()
             .map_err(|_| DesktopVaultKeyError::DataPlaneNotRunning)?;
         let mut journal = MasterInitializationJournal::load(self).map_err(map_journal)?;
@@ -569,7 +554,7 @@ impl PreparedDesktopLocalDataPlane {
             target_os = "macos"
         ))]
         let retained_capture = match retention {
-            MasterRetention::Armed(_) => Some(ArmedCaptureVault {
+            MasterRetention::Armed => Some(ArmedCaptureVault {
                 dataset_id: proof.dataset_id().to_owned(),
                 deployment_id: proof.deployment_id().to_owned(),
                 tenant_id: proof.tenant_id().to_owned(),

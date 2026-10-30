@@ -970,24 +970,6 @@ impl DatasetBoundArtifactStore {
             .ok_or(ArtifactStoreError::Unavailable)
     }
 
-    pub(crate) fn write_text_once(
-        &self,
-        id: Uuid,
-        expected: [u8; 32],
-        text: &[u8],
-    ) -> VerifiedArtifactByteObservation {
-        let Ok(capture_operation) = self.begin_capture_mutation() else {
-            return self.observation(
-                id,
-                ArtifactByteWritePhase::BeforeWrite,
-                ArtifactByteObservationState::Indeterminate,
-            );
-        };
-        let result = self.write_text_once_admitted(&capture_operation, id, expected, text);
-        capture_operation.complete();
-        result
-    }
-
     pub(crate) fn write_text_once_admitted(
         &self,
         admitted: &CaptureMutationLease,

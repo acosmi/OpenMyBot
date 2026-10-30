@@ -1285,38 +1285,33 @@ mod capture_io {
 
     // All endpoint/option inputs are copied nonsecret DATA. This is the one actual
     // lazy factory used both for the connection and its unpolled Layout calculation.
-    fn original_socket(
+    async fn original_socket(
         endpoint: Endpoint,
         timeout: Option<Duration>,
         options: TcpOptions,
-    ) -> impl Future<Output = io::Result<OriginalSocket>> + Send {
-        async move {
-            async fn connect(
-                endpoint: Endpoint,
-                options: TcpOptions,
-            ) -> io::Result<OriginalSocket> {
-                match endpoint {
-                    Endpoint::Tcp(address) => {
-                        let stream = tokio::net::TcpStream::connect(address).await?;
-                        preserve_captured_tcp_options(&stream, &options)?;
-                        Ok(OriginalSocket::Tcp(stream))
-                    }
-                    #[cfg(unix)]
-                    Endpoint::Unix { bytes, len } => {
-                        use std::os::unix::ffi::OsStrExt;
-                        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..len]));
-                        Ok(OriginalSocket::Unix(
-                            tokio::net::UnixStream::connect(path).await?,
-                        ))
-                    }
+    ) -> io::Result<OriginalSocket> {
+        async fn connect(endpoint: Endpoint, options: TcpOptions) -> io::Result<OriginalSocket> {
+            match endpoint {
+                Endpoint::Tcp(address) => {
+                    let stream = tokio::net::TcpStream::connect(address).await?;
+                    preserve_captured_tcp_options(&stream, &options)?;
+                    Ok(OriginalSocket::Tcp(stream))
+                }
+                #[cfg(unix)]
+                Endpoint::Unix { bytes, len } => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&bytes[..len]));
+                    Ok(OriginalSocket::Unix(
+                        tokio::net::UnixStream::connect(path).await?,
+                    ))
                 }
             }
-            match timeout {
-                Some(duration) => tokio::time::timeout(duration, connect(endpoint, options))
-                    .await
-                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
-                None => connect(endpoint, options).await,
-            }
+        }
+        match timeout {
+            Some(duration) => tokio::time::timeout(duration, connect(endpoint, options))
+                .await
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+            None => connect(endpoint, options).await,
         }
     }
 
@@ -1928,6 +1923,8 @@ mod retained {
         pool: RetainedPoolKind,
         sequence: usize,
     }
+    // The proxy keeps the delivered copy only as its observed marker.
+    #[allow(dead_code)]
     #[derive(Clone, Copy)]
     struct CopyDestructionFact {
         pool: RetainedPoolKind,
@@ -2121,6 +2118,7 @@ mod retained {
         pending: AtomicBool,
         destruction: Mutex<Option<oneshot::Sender<CopyDestructionFact>>>,
         // Last non-Copy field: actual owner-header custody, not cancellation, releases the slot.
+        #[allow(dead_code)] // Held only for its Drop refund.
         metadata_ticket: DriverMetadataTicket,
     }
     impl DriverRetention {
@@ -2447,21 +2445,19 @@ mod retained {
     // The real factory is also instantiated with None for Layout only, never polled.
     // The original raw connect future is scoped inline so it is actually dropped before
     // connecting_destroyed; no additional erased inner Box needs a guessed size.
-    fn retained_original_connect(
+    async fn retained_original_connect(
         original: Option<(PgConfig, CapturePgIo, Arc<DriverOwner>)>,
-    ) -> impl Future<Output = Result<(PgClient, DrivingFuture), PgError>> + Send {
-        async move {
-            let (configuration, original_io, connecting_owner) =
-                original.expect("only admitted original inputs are polled");
-            let result = {
-                let original = configuration.connect_raw(original_io, NoTls);
-                tokio::pin!(original);
-                connecting_owner.connecting_started();
-                original.as_mut().await
-            };
-            connecting_owner.connecting_destroyed();
-            result.map(|(client, connection)| (client, Box::pin(connection) as DrivingFuture))
-        }
+    ) -> Result<(PgClient, DrivingFuture), PgError> {
+        let (configuration, original_io, connecting_owner) =
+            original.expect("only admitted original inputs are polled");
+        let result = {
+            let original = configuration.connect_raw(original_io, NoTls);
+            tokio::pin!(original);
+            connecting_owner.connecting_started();
+            original.as_mut().await
+        };
+        connecting_owner.connecting_destroyed();
+        result.map(|(client, connection)| (client, Box::pin(connection) as DrivingFuture))
     }
     type PgClientReady = oneshot::Receiver<Result<PgClient, PgError>>;
     struct ProxyCreationCancellation {
@@ -2553,7 +2549,7 @@ mod retained {
                 core: Arc::clone(&self.core),
             }
         }
-        pub(in crate::db) fn supervisor(&self, application: bool) -> Arc<OwnerSupervisor> {
+        pub(in crate::db::pool) fn supervisor(&self, application: bool) -> Arc<OwnerSupervisor> {
             Arc::clone(if application {
                 &self.core.application
             } else {
@@ -2775,8 +2771,7 @@ mod retained {
             if self.gate.counts.fault.load(Ordering::Acquire) {
                 return usize::MAX;
             }
-            usize::try_from(self.gate.counts.originals.load(Ordering::Acquire))
-                .unwrap_or(usize::MAX)
+            self.gate.counts.originals.load(Ordering::Acquire)
         }
         /// Original joins whose actual Connection destruction fact is unavailable.
         pub fn original_destructions_missing(&self) -> u64 {
@@ -2809,9 +2804,7 @@ mod retained {
                     result = self.application.set.join_next_with_id() => (RetainedPoolKind::Application, result),
                 },
             };
-            let Some(joined) = result.1 else {
-                return None;
-            };
+            let joined = result.1?;
             let mut state = match self.gate.state.lock() {
                 Ok(state) => state,
                 Err(_) => {
@@ -2834,6 +2827,274 @@ mod retained {
         }
         pub fn live_proxy_future_count(&self) -> u64 {
             u64::try_from(self.gate.counts.live_proxies.load(Ordering::Acquire)).unwrap_or(u64::MAX)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::db::capture_materials::CaptureDecodeBudget;
+        use std::time::Duration;
+
+        const METADATA: u64 = 64 << 20;
+        const WAIT: Duration = Duration::from_secs(10);
+
+        fn custody() -> DesktopLocalDriverCustody {
+            let bounds = DesktopPoolJoinBounds::checked(17, 17, 16, 17, METADATA).unwrap();
+            DesktopLocalDriverCustody::prepare(
+                bounds,
+                CaptureDecodeBudget::checked(64, 1 << 16).unwrap(),
+            )
+            .unwrap()
+        }
+        fn loopback(port: u16) -> PgConfig {
+            let mut config = PgConfig::new();
+            config
+                .host("127.0.0.1")
+                .port(port)
+                .user("unit")
+                .dbname("unit");
+            config
+        }
+        // An unpolled stock pool: freeze only needs its published slot and later closes it.
+        fn stock(config: &PgConfig) -> Pool {
+            let manager = deadpool_postgres::Manager::from_config(
+                config.clone(),
+                NoTls,
+                deadpool_postgres::ManagerConfig {
+                    recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+                },
+            );
+            Pool::builder(manager).max_size(1).build().unwrap()
+        }
+        // One real admin original through the retained factory; the checkout stays unpolled.
+        fn connect_admin(
+            custody: &DesktopLocalDriverCustody,
+            config: &PgConfig,
+        ) -> ConnectResultFuture<'static> {
+            let supervisor = custody.supervisor(false);
+            let retention = supervisor.retention.as_ref().unwrap();
+            let ticket = retention.reserve_checkout().unwrap();
+            let trace = Arc::new(CheckoutTrace::new(&supervisor, None, Some(ticket)));
+            retention.connect(Arc::clone(&supervisor), config, trace)
+        }
+        // A loopback peer that accepts and then never answers the startup message.
+        async fn silent_peer() -> (u16, JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let task = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            });
+            (port, task)
+        }
+
+        #[test]
+        fn prepare_keeps_room_for_the_admin_tail_after_sixteen_application_owners() {
+            let decode = || CaptureDecodeBudget::checked(1, 8192).unwrap();
+            for (live, unjoined, pending, proxies) in [
+                (16, 17, 16, 17),
+                (17, 16, 16, 17),
+                (17, 17, 15, 17),
+                (17, 17, 16, 16),
+            ] {
+                let bounds =
+                    DesktopPoolJoinBounds::checked(live, unjoined, pending, proxies, METADATA)
+                        .unwrap();
+                assert_eq!(
+                    DesktopLocalDriverCustody::prepare(bounds, decode()).err(),
+                    Some(PoolError::CreationLimit)
+                );
+            }
+            let bounds = DesktopPoolJoinBounds::checked(17, 17, 16, 17, METADATA).unwrap();
+            assert!(DesktopLocalDriverCustody::prepare(bounds, decode()).is_ok());
+        }
+
+        #[tokio::test]
+        async fn natural_original_end_is_reported_from_its_own_join() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = loopback(listener.local_addr().unwrap().port());
+            let peer = tokio::spawn(async move {
+                let _closed = listener.accept().await;
+            });
+            let mut custody = custody();
+            custody.register_stock(false, stock(&config)).unwrap();
+            let checkout = tokio::time::timeout(WAIT, connect_admin(&custody, &config))
+                .await
+                .unwrap();
+            assert!(checkout.is_err());
+            peer.await.unwrap();
+            let mut drivers = custody.freeze().unwrap();
+            let fact = tokio::time::timeout(WAIT, drivers.join_next_original())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fact.pool_name(), "admin");
+            assert_eq!(fact.outcome(), OriginalDriverJoinOutcome::Returned);
+            assert_eq!(
+                fact.destruction(),
+                Some(ConnectionDestruction::ConnectingFutureDestroyed)
+            );
+            assert_eq!(drivers.original_tasks_remaining(), 0);
+            assert_eq!(drivers.original_destructions_missing(), 0);
+            assert!(drivers.next_retirement().is_none());
+            assert!(drivers.join_next_original().await.is_none());
+        }
+
+        #[tokio::test]
+        async fn timeout_keeps_the_original_set_until_retirement_joins_it_cancelled() {
+            let (port, _peer) = silent_peer().await;
+            let config = loopback(port);
+            let mut custody = custody();
+            custody.register_stock(false, stock(&config)).unwrap();
+            let checkout = connect_admin(&custody, &config);
+            let mut drivers = custody.freeze().unwrap();
+            // A bounded wait that elapses drops only the join future, never the original task.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), drivers.join_next_original())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(drivers.original_tasks_remaining(), 1);
+            drivers.next_retirement().unwrap().request();
+            assert!(drivers.next_retirement().is_none());
+            let fact = tokio::time::timeout(WAIT, drivers.join_next_original())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fact.outcome(), OriginalDriverJoinOutcome::Cancelled);
+            assert!(fact.destruction().is_some());
+            assert_eq!(drivers.original_tasks_remaining(), 0);
+            assert_eq!(drivers.original_destructions_missing(), 0);
+            drop(checkout);
+        }
+
+        #[tokio::test]
+        async fn proxy_dropped_before_first_poll_queues_retirement_then_acks_last() {
+            let (port, _peer) = silent_peer().await;
+            let config = loopback(port);
+            let mut custody = custody();
+            custody.register_stock(false, stock(&config)).unwrap();
+            let gate = Arc::clone(&custody.core.gate);
+            let checkout = connect_admin(&custody, &config);
+            assert_eq!(gate.counts.live_proxies.load(Ordering::Acquire), 1);
+            // Nothing has yielded since the spawn, so the proxy task was never polled.
+            drop(checkout);
+            for _ in 0..10_000 {
+                if gate.counts.live_proxies.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(gate.counts.live_proxies.load(Ordering::Acquire), 0);
+            {
+                let state = gate.state.lock().unwrap();
+                assert_eq!(state.entries.len(), 1);
+                assert!(
+                    state
+                        .entries
+                        .values()
+                        .all(|entry| entry.requested
+                            && entry.proxy.destroyed.load(Ordering::Acquire))
+                );
+            }
+            assert!(!gate.counts.fault.load(Ordering::Acquire));
+            // The queued request lets the original owner retire itself while still Running.
+            let owner = {
+                let retention = custody.core.admin.retention.as_ref().unwrap();
+                let tasks = retention.tasks.lock().unwrap();
+                Arc::clone(tasks.as_ref().unwrap().owners.values().next().unwrap())
+            };
+            for _ in 0..10_000 {
+                if owner.snapshot().destruction.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(owner.snapshot().destruction.is_some());
+            let mut drivers = custody.freeze().unwrap();
+            let fact = tokio::time::timeout(WAIT, drivers.join_next_original())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fact.outcome(), OriginalDriverJoinOutcome::Returned);
+            assert!(fact.destruction().is_some());
+            assert_eq!(drivers.live_proxy_future_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn creation_admitted_before_freeze_is_refused_after_it() {
+            let (port, _peer) = silent_peer().await;
+            let config = loopback(port);
+            let mut custody = custody();
+            custody.register_stock(false, stock(&config)).unwrap();
+            let late = custody.shared();
+            let supervisor = custody.supervisor(true);
+            let retention = supervisor.retention.as_ref().unwrap();
+            let ticket = retention.reserve_checkout().unwrap();
+            let mut drivers = custody.freeze().unwrap();
+            let trace = Arc::new(CheckoutTrace::new(&supervisor, None, Some(ticket)));
+            drop(retention.connect(Arc::clone(&supervisor), &config, trace));
+            assert_eq!(supervisor.current_fault(), Some(PoolError::Closed));
+            assert_eq!(drivers.original_tasks_remaining(), 0);
+            assert!(drivers.next_retirement().is_none());
+            assert!(drivers.join_next_original().await.is_none());
+            assert_eq!(retention.reserve_checkout().err(), Some(PoolError::Closed));
+            assert_eq!(retention.ensure_running(), Err(PoolError::Closed));
+            assert_eq!(
+                late.register_stock(true, stock(&config)).err(),
+                Some(PoolError::Closed)
+            );
+            assert_eq!(custody.freeze().err(), Some(PoolError::Closed));
+            assert_eq!(drivers.live_proxy_future_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn panicked_original_is_classified_from_its_join_error() {
+            let bounds = DesktopPoolJoinBounds::checked(17, 17, 16, 17, METADATA).unwrap();
+            let metadata = MetadataReservation::checked(&bounds).unwrap();
+            let mut tasks = OriginalTasks::new(&metadata).unwrap();
+            let supervisor = OwnerSupervisor::new();
+            fn original_driver_panics() {
+                panic!("unit original driver panic")
+            }
+            let id = tasks.set.spawn(async { original_driver_panics() }).id();
+            tasks.owners.insert(id, DriverOwner::new(3, &supervisor));
+            let key = DriverKey {
+                pool: RetainedPoolKind::Admin,
+                sequence: 3,
+            };
+            let mut state = GateState {
+                phase: Phase::Frozen,
+                entries: HashMap::new(),
+            };
+            state.entries.insert(
+                key,
+                QueueEntry {
+                    requested: false,
+                    joined: false,
+                    proxy: Arc::new(ProxyMetadata {
+                        destroyed: AtomicBool::new(true),
+                    }),
+                    wake: Weak::new(),
+                },
+            );
+            let counts = Counters::new();
+            counts.originals.store(1, Ordering::Release);
+            let joined = tasks.set.join_next_with_id().await.unwrap();
+            let fact = tasks
+                .record_join(joined, RetainedPoolKind::Admin, &mut state, &counts)
+                .unwrap();
+            assert_eq!(fact.outcome(), OriginalDriverJoinOutcome::Panicked);
+            assert_eq!(fact.task_id(), id);
+            assert_eq!(fact.destruction(), None);
+            assert!(counts.fault.load(Ordering::Acquire));
+            assert_eq!(counts.missing_destruction.load(Ordering::Acquire), 1);
+            assert_eq!(counts.originals.load(Ordering::Acquire), 0);
+            assert!(state.entries[&key].joined);
+            assert!(tasks.owners.is_empty());
         }
     }
 }

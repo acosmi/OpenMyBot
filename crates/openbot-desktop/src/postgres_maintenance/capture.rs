@@ -1,6 +1,6 @@
 //! Real capture-source ownership. This module cannot initialize or adopt an arbitrary database.
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs::File;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -68,15 +68,11 @@ use crate::tauri_background::capture::{
 type Connecting =
     JoinHandle<Result<(Client, Connection<CapturePgIo, NoTlsStream>), tokio_postgres::Error>>;
 
-fn original_capture_connect(
+async fn original_capture_connect(
     original: Option<(tokio_postgres::Config, CapturePgIo)>,
-) -> impl std::future::Future<
-    Output = Result<(Client, Connection<CapturePgIo, NoTlsStream>), tokio_postgres::Error>,
-> + Send {
-    async move {
-        let (config, io) = original.expect("only admitted original source inputs are polled");
-        config.connect_raw(io, NoTls).await
-    }
+) -> Result<(Client, Connection<CapturePgIo, NoTlsStream>), tokio_postgres::Error> {
+    let (config, io) = original.expect("only admitted original source inputs are polled");
+    config.connect_raw(io, NoTls).await
 }
 
 // Same actual unpolled factory, private DATA only. No socket/config/key is created.
@@ -731,6 +727,7 @@ impl CaptureSourceOwner {
     }
 
     /// Pure original source_started DATA. The real source still holds all four FDs.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn original_socket_directory_observations(
         &self,
     ) -> Result<((u64, u64), (u64, u64)), Fault> {
@@ -947,7 +944,7 @@ impl CaptureSourceOwner {
                 Ok(Err(error)) => {
                     let retry = retryable_source_connect(&error);
                     self.connection_failures
-                        .push(SourceConnectFailure::Postgres(error));
+                        .push(SourceConnectFailure::Postgres);
                     operation.require_effect()?;
                     if !retry {
                         return Err(Fault::SourceChanged);
@@ -958,9 +955,8 @@ impl CaptureSourceOwner {
                     tokio::time::sleep(wait).await;
                     operation.require_effect()?;
                 }
-                Err(error) => {
-                    self.connection_failures
-                        .push(SourceConnectFailure::Join(error));
+                Err(_) => {
+                    self.connection_failures.push(SourceConnectFailure::Join);
                     operation.require_effect()?;
                     return Err(Fault::ClosingPending);
                 }
@@ -1449,17 +1445,6 @@ impl CaptureSourceOwner {
         Ok(work.range.take().expect("checked original range retained"))
     }
 
-    pub(crate) fn capture_sql_client(&mut self) -> Result<&mut Client, Fault> {
-        self.operation.require_effect()?;
-        if self.start_phase != SourceStartPhase::Ready
-            || self.closed.is_some()
-            || self.sql_driver_result.is_some()
-            || self.sql_driver.as_ref().is_none_or(JoinHandle::is_finished)
-        {
-            return Err(Fault::SourceChanged);
-        }
-        self.sql_client.as_mut().ok_or(Fault::SourceChanged)
-    }
     pub(crate) fn capture_sql_and_materials(
         &mut self,
     ) -> Result<(&mut Client, &mut NormalCaptureMaterials), Fault> {
@@ -1481,15 +1466,6 @@ impl CaptureSourceOwner {
     }
     pub(crate) fn take_materials(&mut self) -> Result<NormalCaptureMaterials, Fault> {
         self.permit.take_materials()
-    }
-    pub(crate) fn store_materials(
-        &mut self,
-        materials: NormalCaptureMaterials,
-    ) -> Result<(), NormalCaptureMaterials> {
-        self.permit.restore_materials(materials)
-    }
-    pub(crate) fn capture_vault(&self) -> Result<&crate::desktop_vault::ArmedCaptureVault, Fault> {
-        self.permit.vault()
     }
 
     /// Pure observations of this same maintenance source's original tasks.
@@ -1518,7 +1494,7 @@ impl CaptureSourceOwner {
             || self
                 .connection_failures
                 .iter()
-                .any(|failure| matches!(failure, SourceConnectFailure::Join(_)))
+                .any(|failure| matches!(failure, SourceConnectFailure::Join))
         {
             return Err(Fault::ClosingPending);
         }
@@ -1889,10 +1865,10 @@ impl CaptureSourceOwner {
                         u32::from(named.st_mode),
                         u64::from(named.st_nlink),
                         named_len,
-                        i64::try_from(named.st_mtime).map_err(|_| Fault::BoundsOverflow)?,
-                        i64::try_from(named.st_mtime_nsec).map_err(|_| Fault::BoundsOverflow)?,
-                        i64::try_from(named.st_ctime).map_err(|_| Fault::BoundsOverflow)?,
-                        i64::try_from(named.st_ctime_nsec).map_err(|_| Fault::BoundsOverflow)?,
+                        named.st_mtime,
+                        named.st_mtime_nsec,
+                        named.st_ctime,
+                        named.st_ctime_nsec,
                     )
             {
                 return Err(Fault::SourceChanged);
@@ -2100,10 +2076,10 @@ impl CaptureSourceOwner {
                         u32::from(named.st_mode),
                         u64::from(named.st_nlink),
                         named_len,
-                        i64::try_from(named.st_mtime).map_err(|_| Fault::BoundsOverflow)?,
-                        i64::try_from(named.st_mtime_nsec).map_err(|_| Fault::BoundsOverflow)?,
-                        i64::try_from(named.st_ctime).map_err(|_| Fault::BoundsOverflow)?,
-                        i64::try_from(named.st_ctime_nsec).map_err(|_| Fault::BoundsOverflow)?,
+                        named.st_mtime,
+                        named.st_mtime_nsec,
+                        named.st_ctime,
+                        named.st_ctime_nsec,
                     )
             {
                 return Err(Fault::SourceChanged);
@@ -2315,63 +2291,6 @@ impl CaptureSourceOwner {
             return Err(Fault::ClosingPending);
         }
         Ok(())
-    }
-    /// The actual closed plain-backup directory names, including empty PostgreSQL directories.
-    pub(crate) fn closed_pg_directory_inventory(&self) -> Result<Vec<String>, Fault> {
-        self.require_sources_closed()?;
-        self.operation.require_effect()?;
-        let observed_pg = rustix::fs::openat(
-            self.work_directory()?,
-            "pg",
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        );
-        self.operation.require_effect()?;
-        let pg = File::from(observed_pg.map_err(|_| Fault::PathUnsafe)?);
-        let mut names = Vec::new();
-        let mut nodes = 0u64;
-        let mut metadata = 0u64;
-        closed_directories(
-            &pg,
-            "",
-            0,
-            &self.operation,
-            &mut names,
-            &mut nodes,
-            &mut metadata,
-        )?;
-        let physical = self.physical.as_ref().ok_or(Fault::MaterialMissing)?;
-        let all_directories = (names.len() as u64)
-            .checked_add(1)
-            .ok_or(Fault::BoundsOverflow)?;
-        let all_nodes = (physical.files.len() as u64)
-            .checked_add(all_directories)
-            .and_then(|n| n.checked_sub(1))
-            .ok_or(Fault::BoundsOverflow)?;
-        if all_directories != physical.directory_count()
-            || nodes != all_nodes
-            || all_directories > self.operation.profile().carrier.max_directories
-        {
-            return Err(Fault::SourceChanged);
-        }
-        let root_cost = 6u64
-            .checked_add(std::mem::size_of::<String>() as u64)
-            .ok_or(Fault::BoundsOverflow)?;
-        if metadata
-            .checked_add(root_cost)
-            .is_none_or(|n| n > self.operation.profile().carrier.max_metadata_bytes)
-        {
-            return Err(Fault::CapacityExceeded);
-        }
-        names
-            .try_reserve_exact(1)
-            .map_err(|_| Fault::CapacityExceeded)?;
-        names.push("pgdata".into());
-        names.sort();
-        Ok(names)
     }
     pub(crate) fn closed_backup_range(&self) -> Result<(String, String, u32, u32), Fault> {
         self.require_sources_closed()?;
@@ -2788,6 +2707,7 @@ impl CaptureSourceOwner {
         Err(Fault::PathUnsafe)
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn take_original_secrets(
         &mut self,
     ) -> Result<(SecretBytes, SecretBytes, File, zeroize::Zeroizing<Vec<u8>>), Fault> {
@@ -2990,152 +2910,6 @@ fn read_exact_metadata(
     Ok(bytes)
 }
 
-fn closed_directories(
-    directory: &File,
-    relative: &str,
-    depth: u64,
-    operation: &CaptureOperation,
-    names: &mut Vec<String>,
-    nodes: &mut u64,
-    metadata: &mut u64,
-) -> Result<(), Fault> {
-    operation.require_effect()?;
-    let observed_before = directory.metadata();
-    operation.require_effect()?;
-    let before = observed_before.map_err(|_| Fault::IoFailure)?;
-    let bounds = &operation.profile().carrier;
-    let native = &operation.profile().native;
-    if !before.is_dir()
-        || before.uid() != rustix::process::geteuid().as_raw()
-        || before.mode() & 0o077 != 0
-        || depth > bounds.max_path_depth.min(native.max_depth)
-    {
-        return Err(Fault::PathUnsafe);
-    }
-    if !relative.is_empty() {
-        *metadata = metadata
-            .checked_add(
-                (relative.len() as u64)
-                    .checked_add(7)
-                    .ok_or(Fault::BoundsOverflow)?,
-            )
-            .and_then(|n| n.checked_add(std::mem::size_of::<String>() as u64))
-            .ok_or(Fault::BoundsOverflow)?;
-        if *metadata > bounds.max_metadata_bytes
-            || names.len() as u64 >= bounds.max_directories.min(native.max_directories)
-        {
-            return Err(Fault::CapacityExceeded);
-        }
-        names
-            .try_reserve_exact(1)
-            .map_err(|_| Fault::CapacityExceeded)?;
-        names.push(format!("pgdata/{relative}"));
-    }
-    operation.require_effect()?;
-    let observed_entries = rustix::fs::Dir::read_from(directory);
-    operation.require_effect()?;
-    let mut entries = observed_entries.map_err(|_| Fault::IoFailure)?;
-    loop {
-        operation.require_effect()?;
-        let observed_entry = entries.next();
-        operation.require_effect()?;
-        let Some(entry) = observed_entry else {
-            break;
-        };
-        let entry = entry.map_err(|_| Fault::IoFailure)?;
-        let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
-            continue;
-        }
-        *nodes = nodes.checked_add(1).ok_or(Fault::BoundsOverflow)?;
-        if *nodes
-            > bounds
-                .max_material_files
-                .min(native.max_material_files)
-                .checked_add(bounds.max_directories.min(native.max_directories))
-                .ok_or(Fault::BoundsOverflow)?
-        {
-            return Err(Fault::CapacityExceeded);
-        }
-        let name_str = name.to_str().map_err(|_| Fault::PathUnsafe)?;
-        if name_str.is_empty() || name_str.contains('/') || name_str.contains('\\') {
-            return Err(Fault::PathUnsafe);
-        }
-        let next = if relative.is_empty() {
-            name_str.to_owned()
-        } else {
-            format!("{relative}/{name_str}")
-        };
-        if next.len() as u64 > bounds.max_path_bytes.min(native.max_path_bytes) {
-            return Err(Fault::CapacityExceeded);
-        }
-        operation.require_effect()?;
-        let observed_named =
-            rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW);
-        operation.require_effect()?;
-        let st = observed_named.map_err(|_| Fault::SourceChanged)?;
-        if st.st_uid != before.uid() || st.st_mode & 0o077 != 0 {
-            return Err(Fault::PathUnsafe);
-        }
-        match rustix::fs::FileType::from_raw_mode(st.st_mode) {
-            rustix::fs::FileType::Directory => {
-                // These are the original necessary local depth/FD guards, before the FD effect.
-                if depth
-                    .checked_add(1)
-                    .and_then(|n| n.checked_mul(2))
-                    .and_then(|n| n.checked_add(5))
-                    .is_none_or(|n| n > bounds.max_open_files.min(native.max_open_files))
-                {
-                    return Err(Fault::SourceChanged);
-                }
-                let child_depth = depth.checked_add(1).ok_or(Fault::BoundsOverflow)?;
-                if child_depth > bounds.max_path_depth.min(native.max_depth) {
-                    return Err(Fault::PathUnsafe);
-                }
-                operation.require_effect()?;
-                let observed_child = rustix::fs::openat(
-                    directory,
-                    name,
-                    rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::DIRECTORY
-                        | rustix::fs::OFlags::NOFOLLOW
-                        | rustix::fs::OFlags::CLOEXEC,
-                    rustix::fs::Mode::empty(),
-                );
-                operation.require_effect()?;
-                let child = File::from(observed_child.map_err(|_| Fault::PathUnsafe)?);
-                operation.require_effect()?;
-                let observed_held = child.metadata();
-                operation.require_effect()?;
-                let held = observed_held.map_err(|_| Fault::IoFailure)?;
-                if (held.dev(), held.ino(), held.uid()) != (st.st_dev as u64, st.st_ino, st.st_uid)
-                {
-                    return Err(Fault::SourceChanged);
-                }
-                closed_directories(
-                    &child,
-                    &next,
-                    child_depth,
-                    operation,
-                    names,
-                    nodes,
-                    metadata,
-                )?;
-            }
-            rustix::fs::FileType::RegularFile if st.st_nlink == 1 => {}
-            _ => return Err(Fault::PathUnsafe),
-        }
-    }
-    operation.require_effect()?;
-    let observed_after = directory.metadata();
-    operation.require_effect()?;
-    let after = observed_after.map_err(|_| Fault::IoFailure)?;
-    if identity(&before) != identity(&after) {
-        return Err(Fault::SourceChanged);
-    }
-    operation.require_effect()
-}
-
 const SOURCE_MAIN: &str = "source-postgresql.conf";
 const SOURCE_HBA: &str = "source-pg-hba.conf";
 const SOURCE_IDENT: &str = "source-pg-ident.conf";
@@ -3176,8 +2950,8 @@ struct OriginalSocketDirectoryIdentity {
     mode: u32,
 }
 enum SourceConnectFailure {
-    Postgres(tokio_postgres::Error),
-    Join(tokio::task::JoinError),
+    Postgres,
+    Join,
 }
 type SourceConnectResult = Result<
     Result<(Client, Connection<CapturePgIo, NoTlsStream>), tokio_postgres::Error>,

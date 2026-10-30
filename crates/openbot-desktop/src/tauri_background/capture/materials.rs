@@ -128,7 +128,6 @@ pub(crate) struct NormalCaptureMaterials {
     transport: Option<crate::transport::RetainedTransportClosing>,
     writer_facts: Option<StoppedNormalWriters>,
     files: Vec<CaptureOwnedMaterialFile>,
-    workspace: Option<File>,
     // Obtained originals stay in this same source owner before every fallible postcheck.
     opened: Vec<File>,
     host_directory: Option<rustix::fs::Dir>,
@@ -293,7 +292,6 @@ impl NormalCaptureMaterials {
             transport: None,
             writer_facts: None,
             files: Vec::new(),
-            workspace: None,
             opened: Vec::new(),
             host_directory: None,
             local_new_fd_admissions: 0,
@@ -1322,6 +1320,7 @@ struct OriginalRootInventoryHeader<'a> {
     logical_projection: &'static str,
     app_local_state: Option<OriginalPreferenceMaterialFact>,
 }
+#[allow(clippy::too_many_arguments)]
 fn write_original_root_inventory(
     producer: OriginalMetadataProducer,
     screen: &CaptureScreenAssemblySeal,
@@ -1733,11 +1732,11 @@ impl std::io::Write for AuditMaterialWriter<'_> {
         };
         let observed = file.write_at(bytes, self.length);
         // Actual progress is recorded before the fallible same-clock postcheck.
-        if let Ok(n) = &observed {
-            if *n <= bytes.len() {
-                self.length += *n as u64;
-                self.sha.update(&bytes[..*n]);
-            }
+        if let Ok(n) = &observed
+            && *n <= bytes.len()
+        {
+            self.length += *n as u64;
+            self.sha.update(&bytes[..*n]);
         }
         if let Err(fault) = self.operation.require_effect() {
             return Err(self.fail(fault));
@@ -3286,6 +3285,7 @@ pub(crate) struct CaptureMaterialsClosed {
 impl CaptureMaterialsClosed {
     /// Ordinary prior readback DATA plus fresh identities from the same held owner chain.
     /// This does not rehash payload or mint a source/Closed capability.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn original_audit_record_observations(
         &self,
         operation_directory: &File,
@@ -3444,6 +3444,7 @@ pub(crate) struct ClosedMaterialParts {
     pub(crate) backup_range: (String, String, u32, u32),
     pub(crate) provenance: Option<WholePgProvenanceClaim>,
     pub(crate) tool_inventory_identity: (u64, [u8; 32]),
+    #[allow(dead_code)] // Holds the original materials owner with these parts.
     pub(crate) retained: NormalCaptureMaterials,
 }
 
@@ -3923,7 +3924,7 @@ async fn freeze_original_artifact_snapshot(
         .and_then(|n| n.checked_add(7))
         .ok_or(Fault::BoundsOverflow)?;
     let local_fds = new_fds.checked_add(5).ok_or(Fault::BoundsOverflow)?;
-    let bounds = op.profile().carrier_bounds()?;
+    let bounds = op.request.carrier_bounds;
     let g = (state.files.len() as u64)
         .checked_add(f)
         .ok_or(Fault::BoundsOverflow)?;

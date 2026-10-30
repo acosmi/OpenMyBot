@@ -2593,11 +2593,6 @@ pub(super) struct MaterialInventory {
     wal_range_and_headers_verified: bool,
     all_regular_files_and_directories_synced: bool,
 }
-impl MaterialInventory {
-    pub(super) fn directory_count(&self) -> u64 {
-        self.counters.directories
-    }
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PgManifest {
@@ -3474,10 +3469,10 @@ pub(super) async fn owned_test_case(
         std::io::stderr().lock(),
         "WROKBOT_PG_MAINTENANCE_TEST_RESULT result_error={error:?}"
     );
-    if let Err(close_error) = source.close_original_sources().await {
-        if error.is_none() {
-            error = Some(close_error);
-        }
+    if let Err(close_error) = source.close_original_sources().await
+        && error.is_none()
+    {
+        error = Some(close_error);
     }
     if !source.original_owners_closed() {
         let native = source.native.as_ref();
@@ -3502,7 +3497,7 @@ pub(super) async fn owned_test_case(
                     let known = observed.len() == 64
                         && known_sha
                             .iter()
-                            .zip(observed.chunks_exact(2))
+                            .zip(observed.as_chunks::<2>().0)
                             .all(|(byte, pair)| {
                                 const HEX: &[u8; 16] = b"0123456789abcdef";
                                 pair[0] == HEX[usize::from(*byte >> 4)]

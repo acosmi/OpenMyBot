@@ -302,14 +302,13 @@ fn install_original_control_storage(
             .ok_or(Fault::BoundsOverflow)?;
     }
     for root in facts.roots {
-        if let OriginalControlRootObservation::Present { device, inode } = root {
-            if !facts
+        if let OriginalControlRootObservation::Present { device, inode } = root
+            && !facts
                 .objects
                 .iter()
                 .any(|fact| fact.device == device && fact.inode == inode)
-            {
-                return Err(Fault::IntentMismatch);
-            }
+        {
+            return Err(Fault::IntentMismatch);
         }
     }
     if allocation > original.max_total_allocation_bytes
@@ -527,6 +526,7 @@ pub(crate) struct CaptureOperation {
 }
 
 impl CaptureOperation {
+    #[allow(clippy::result_large_err)] // Err hands the original owner back by value.
     fn start(
         request: ReviewedNormalCaptureRequest,
         owner_instance: [u8; 16],
@@ -535,20 +535,12 @@ impl CaptureOperation {
     ) -> Result<Arc<Self>, (ReviewedNormalCaptureRequest, Fault)> {
         // Before the unique request moves, preserve it on every fallible preparation path.
         let prepared = (|| {
-            request
-                .profile
-                .validate()
-                .map_err(|_| Fault::ProfileInvalid)?;
-            request
-                .profile
-                .validate_master_retention()
-                .map_err(|_| Fault::ProfileInvalid)?;
             if owner_instance == [0; 16] {
                 return Err(Fault::ProfileInvalid);
             }
             // The original pre-t0 ledger is carried, never reconstructed at t0. Refuse a
             // different owner or profile before starting the one original E/C clock.
-            if original_capture_resource_identity(resources, &request.profile.carrier_bounds()?)?
+            if original_capture_resource_identity(resources, &request.carrier_bounds)?
                 != owner_instance
             {
                 return Err(Fault::IntentMismatch);
@@ -628,10 +620,6 @@ impl CaptureOperation {
 
     pub(crate) fn shared_original(&self) -> Result<Arc<Self>, Fault> {
         self.self_reference.upgrade().ok_or(Fault::ClockUnavailable)
-    }
-
-    pub(crate) fn pid(&self) -> u32 {
-        std::process::id()
     }
 
     pub(crate) fn original_t0_ns(&self) -> u64 {
@@ -852,6 +840,7 @@ pub(super) struct ArmedNormalCapture {
     materials: NormalCaptureMaterials,
 }
 impl ArmedNormalCapture {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_original_startup(
         request: ReviewedNormalCaptureRequest,
         control: CaptureControlOwner,
@@ -862,18 +851,9 @@ impl ArmedNormalCapture {
         materials: NormalCaptureMaterials,
         resources: Arc<Mutex<CaptureResourceTotals>>,
     ) -> Result<Self, Fault> {
-        request
-            .profile
-            .validate()
-            .map_err(|_| Fault::ProfileInvalid)?;
-        request
-            .profile
-            .validate_master_retention()
-            .map_err(|_| Fault::ProfileInvalid)?;
         let owner_instance =
-            original_capture_resource_identity(&resources, &request.profile.carrier_bounds()?)?;
-        control
-            .revalidate_original_storage_owner(&resources, &request.profile.carrier_bounds()?)?;
+            original_capture_resource_identity(&resources, &request.carrier_bounds)?;
+        control.revalidate_original_storage_owner(&resources, &request.carrier_bounds)?;
         vault.revalidate().map_err(|_| Fault::SourceChanged)?;
         if capture_audit_key.len() != 32 {
             return Err(Fault::SecretInvalid);
@@ -951,16 +931,9 @@ impl CaptureJobCustody {
         self.last_fault = Some(fault);
         CaptureClosingPending { fault }
     }
-    fn retained_failure(&mut self, retained: RetainedCaptureFailure) -> CaptureClosingPending {
-        let fault = retained.fault();
-        self.phase = Some(CaptureOwnerPhase::Failed(retained));
-        self.pending(fault)
-    }
 }
 /// Only the final original owner may construct this after publication and control closure.
-pub(super) struct CaptureCompleted {
-    operation: [u8; 16],
-}
+pub(super) struct CaptureCompleted(());
 /// This is a result tag only; the original job retains every unclosed owner and input.
 pub(super) struct CaptureClosingPending {
     fault: Fault,
@@ -1314,9 +1287,7 @@ pub(super) async fn run_normal_exit_capture(
                 // This closes the original source's passive FDs and outer continuous kernel lease last.
                 drop(custody.phase.take());
                 operation.require_closing()?;
-                Ok(CaptureCompleted {
-                    operation: operation.operation_id(),
-                })
+                Ok(CaptureCompleted(()))
             }
             .await
         }
@@ -1327,49 +1298,48 @@ pub(super) async fn run_normal_exit_capture(
             let first = *custody.last_fault.get_or_insert(fault);
             // No record is manufactured when genuine current owner observations are unavailable.
             // A failed/late log cannot replace the first original fault or discard its owners.
-            if operation.require_closing().is_ok() {
-                if let Some(normal) = normal_facts {
-                    if let Ok(mut facts) = original_facts(custody, normal, stream_requested, None) {
-                        facts.outcome = control::ControlOutcome::Unknown;
-                        facts.fault = Some(String::from(match first {
-                            Fault::InvalidArgument => "InvalidArgument",
-                            Fault::UnsupportedVersion => "UnsupportedVersion",
-                            Fault::ProfileMissing => "ProfileMissing",
-                            Fault::ProfileInvalid => "ProfileInvalid",
-                            Fault::BoundsOverflow => "BoundsOverflow",
-                            Fault::CapacityExceeded => "CapacityExceeded",
-                            Fault::ClockUnavailable => "ClockUnavailable",
-                            Fault::DeadlineExpired => "DeadlineExpired",
-                            Fault::Cancelled => "Cancelled",
-                            Fault::IntentMismatch => "IntentMismatch",
-                            Fault::ManifestInvalid => "ManifestInvalid",
-                            Fault::NonCanonical => "NonCanonical",
-                            Fault::MaterialMissing => "MaterialMissing",
-                            Fault::ExtraMaterial => "ExtraMaterial",
-                            Fault::SourceChanged => "SourceChanged",
-                            Fault::PathUnsafe => "PathUnsafe",
-                            Fault::SecretInvalid => "SecretInvalid",
-                            Fault::NonceExhausted => "NonceExhausted",
-                            Fault::FrameInvalid => "FrameInvalid",
-                            Fault::AuthenticationFailed => "AuthenticationFailed",
-                            Fault::ShortRead => "ShortRead",
-                            Fault::ExtraTail => "ExtraTail",
-                            Fault::TerminalMissing => "TerminalMissing",
-                            Fault::KeyMediumInvalid => "KeyMediumInvalid",
-                            Fault::ReadbackFailed => "ReadbackFailed",
-                            Fault::PublishUnknown => "PublishUnknown",
-                            Fault::IoFailure => "IoFailure",
-                            Fault::ClosingPending => "ClosingPending",
-                        }));
-                        let _observed = append_original(
-                            custody,
-                            &operation,
-                            control::ControlStage::ClosingPending,
-                            facts,
-                        )
-                        .await;
-                    }
-                }
+            if operation.require_closing().is_ok()
+                && let Some(normal) = normal_facts
+                && let Ok(mut facts) = original_facts(custody, normal, stream_requested, None)
+            {
+                facts.outcome = control::ControlOutcome::Unknown;
+                facts.fault = Some(String::from(match first {
+                    Fault::InvalidArgument => "InvalidArgument",
+                    Fault::UnsupportedVersion => "UnsupportedVersion",
+                    Fault::ProfileMissing => "ProfileMissing",
+                    Fault::ProfileInvalid => "ProfileInvalid",
+                    Fault::BoundsOverflow => "BoundsOverflow",
+                    Fault::CapacityExceeded => "CapacityExceeded",
+                    Fault::ClockUnavailable => "ClockUnavailable",
+                    Fault::DeadlineExpired => "DeadlineExpired",
+                    Fault::Cancelled => "Cancelled",
+                    Fault::IntentMismatch => "IntentMismatch",
+                    Fault::ManifestInvalid => "ManifestInvalid",
+                    Fault::NonCanonical => "NonCanonical",
+                    Fault::MaterialMissing => "MaterialMissing",
+                    Fault::ExtraMaterial => "ExtraMaterial",
+                    Fault::SourceChanged => "SourceChanged",
+                    Fault::PathUnsafe => "PathUnsafe",
+                    Fault::SecretInvalid => "SecretInvalid",
+                    Fault::NonceExhausted => "NonceExhausted",
+                    Fault::FrameInvalid => "FrameInvalid",
+                    Fault::AuthenticationFailed => "AuthenticationFailed",
+                    Fault::ShortRead => "ShortRead",
+                    Fault::ExtraTail => "ExtraTail",
+                    Fault::TerminalMissing => "TerminalMissing",
+                    Fault::KeyMediumInvalid => "KeyMediumInvalid",
+                    Fault::ReadbackFailed => "ReadbackFailed",
+                    Fault::PublishUnknown => "PublishUnknown",
+                    Fault::IoFailure => "IoFailure",
+                    Fault::ClosingPending => "ClosingPending",
+                }));
+                let _observed = append_original(
+                    custody,
+                    &operation,
+                    control::ControlStage::ClosingPending,
+                    facts,
+                )
+                .await;
             }
             Err(CaptureClosingPending { fault: first })
         }
@@ -1597,8 +1567,8 @@ fn prepare_original_owned_stream(custody: &mut CaptureJobCustody) -> Result<(), 
     if (tool.plain_len, tool.plain_sha256) != materials.tool_inventory_identity {
         return Err(Fault::SourceChanged);
     }
-    let bounds = operation.profile().carrier_bounds()?;
-    let secret_bounds = operation.profile().secret_bounds()?;
+    let bounds = operation.request.carrier_bounds;
+    let secret_bounds = operation.request.secret_bounds;
     let count = materials
         .files
         .len()
@@ -1846,6 +1816,7 @@ fn prepare_original_owned_stream(custody: &mut CaptureJobCustody) -> Result<(), 
     }
 }
 
+#[allow(clippy::result_large_err)] // Err hands the original owner back by value.
 async fn join_original_stream_worker(custody: &mut CaptureJobCustody) -> Result<(), Fault> {
     use openbot_infra::backup::whole_pg_capture_stream::run_owned_stream;
     let operation = Arc::clone(custody.operation.as_ref().ok_or(Fault::IntentMismatch)?);
@@ -2041,16 +2012,10 @@ impl CaptureStartPermit {
             .as_mut()
             .ok_or(Fault::IntentMismatch)
     }
-    pub(crate) fn vault(&self) -> Result<&crate::desktop_vault::ArmedCaptureVault, Fault> {
-        self.closed
-            .normal
-            .vault
-            .as_ref()
-            .ok_or(Fault::SecretInvalid)
-    }
     pub(crate) fn take_vault(&mut self) -> Result<crate::desktop_vault::ArmedCaptureVault, Fault> {
         self.closed.normal.vault.take().ok_or(Fault::SecretInvalid)
     }
+    #[allow(clippy::result_large_err)] // Err hands the original owner back by value.
     pub(crate) fn restore_vault(
         &mut self,
         vault: crate::desktop_vault::ArmedCaptureVault,
@@ -2099,6 +2064,7 @@ impl CaptureStartPermit {
             .as_mut()
             .ok_or(Fault::MaterialMissing)
     }
+    #[allow(clippy::result_large_err)] // Err hands the original owner back by value.
     pub(crate) fn restore_materials(
         &mut self,
         materials: materials::NormalCaptureMaterials,
@@ -2190,6 +2156,9 @@ pub(crate) fn open_app_data_read_only(
     Ok(Some(file))
 }
 
+// The reviewed by-value entry. The resident job runs the same borrowed step below so that
+// its owner never leaves job custody across an await; this entry has no caller there.
+#[allow(dead_code)]
 pub(crate) async fn close_normal_for_capture(
     mut normal: NormalCaptureClosingOwner,
     operation: &CaptureOperation,
@@ -2341,6 +2310,8 @@ async fn close_normal_originals(
     operation.require_normal_closing()
 }
 
+// The reviewed by-value entry; the resident job uses the borrowed step for the same reason.
+#[allow(dead_code)]
 pub(crate) async fn consume_before_source_start(
     mut closed: NormalClosedToken,
     operation: &CaptureOperation,
