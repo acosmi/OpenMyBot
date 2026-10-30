@@ -136,7 +136,7 @@ pub struct WholePgCarrierBounds {
 }
 impl WholePgCarrierBounds {
     /// Rejects zero or inconsistent format limits and returns the unchanged valid profile.
-    pub fn check(self) -> Result<Self> {
+    pub fn check(self) -> Result<CheckedWholePgCarrierBounds> {
         let values = [
             self.max_material_files,
             self.max_directories,
@@ -171,7 +171,16 @@ impl WholePgCarrierBounds {
         {
             return Err(WholePgCarrierFault::ProfileInvalid);
         }
-        Ok(self)
+        Ok(CheckedWholePgCarrierBounds(self))
+    }
+}
+/// Carrier limits that passed [`WholePgCarrierBounds::check`]; nothing else constructs one.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedWholePgCarrierBounds(WholePgCarrierBounds);
+impl std::ops::Deref for CheckedWholePgCarrierBounds {
+    type Target = WholePgCarrierBounds;
+    fn deref(&self) -> &WholePgCarrierBounds {
+        &self.0
     }
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -229,7 +238,7 @@ pub struct WholePgSecretBounds {
 }
 impl WholePgSecretBounds {
     /// Checks nonzero aggregate limits, mandatory classes and their checked reservation sum.
-    pub fn check(self) -> Result<Self> {
+    pub fn check(self) -> Result<CheckedWholePgSecretBounds> {
         if [
             self.max_source_secret_count,
             self.max_one_source_secret_bytes,
@@ -270,7 +279,16 @@ impl WholePgSecretBounds {
         {
             return Err(WholePgCarrierFault::ProfileInvalid);
         }
-        Ok(self)
+        Ok(CheckedWholePgSecretBounds(self))
+    }
+}
+/// Secret limits that passed [`WholePgSecretBounds::check`]; nothing else constructs one.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckedWholePgSecretBounds(WholePgSecretBounds);
+impl std::ops::Deref for CheckedWholePgSecretBounds {
+    type Target = WholePgSecretBounds;
+    fn deref(&self) -> &WholePgSecretBounds {
+        &self.0
     }
 }
 
@@ -479,7 +497,7 @@ pub struct WholePgManifestClaim {
 /// Checked manifest retaining a shared claim and immutable frame layout, without source authority.
 pub struct FrozenWholePgManifest {
     claim: Arc<WholePgManifestClaim>,
-    bounds: WholePgCarrierBounds,
+    bounds: CheckedWholePgCarrierBounds,
     header: [u8; 80],
     terminal: [u8; 84],
     layout: Arc<Layout>,
@@ -492,9 +510,9 @@ struct Layout {
     lengths: Vec<u64>,
 }
 impl FrozenWholePgManifest {
-    /// Checks claim structure against bounds already validated by [`WholePgCarrierBounds::check`],
-    /// then freezes manifest length/digest and expected frame layout.
-    pub fn check(claim: WholePgManifestClaim, bounds: WholePgCarrierBounds) -> Result<Self> {
+    /// Checks claim structure against checked carrier bounds, then freezes manifest
+    /// length/digest and expected frame layout.
+    pub fn check(claim: WholePgManifestClaim, bounds: CheckedWholePgCarrierBounds) -> Result<Self> {
         if claim.schema != "wrokbot-whole-pg-capture" || claim.version != 1 {
             return Err(WholePgCarrierFault::UnsupportedVersion);
         }
@@ -1306,7 +1324,10 @@ mod hex32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn bounds() -> WholePgCarrierBounds {
+    fn bounds() -> CheckedWholePgCarrierBounds {
+        raw_bounds().check().unwrap()
+    }
+    fn raw_bounds() -> WholePgCarrierBounds {
         WholePgCarrierBounds {
             max_material_files: 128,
             max_directories: 128,
@@ -1435,8 +1456,10 @@ mod tests {
         );
         let bad = WholePgCarrierBounds {
             max_wire_bytes: 1,
-            ..bounds()
-        };
+            ..raw_bounds()
+        }
+        .check()
+        .unwrap();
         assert!(matches!(
             FrozenWholePgManifest::check(claim(), bad),
             Err(WholePgCarrierFault::CapacityExceeded)

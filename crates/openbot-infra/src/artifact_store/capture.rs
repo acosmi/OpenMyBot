@@ -7,7 +7,7 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::Arc;
 use std::task::Poll;
 
-use openbot_domain::backup::whole_pg_carrier::{WholePgCarrierBounds, WholePgCarrierFault};
+use openbot_domain::backup::whole_pg_carrier::{CheckedWholePgCarrierBounds, WholePgCarrierFault};
 use rustix::fs::{Dir, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
@@ -17,8 +17,8 @@ use super::{ArtifactStoreError, DatasetBoundArtifactStore, MARKER_NAME, MAX_MARK
 use crate::artifact_bytes::ArtifactCaptureDirectoryBorrow;
 use crate::backup::whole_pg_capture_stream::CaptureClockCheck;
 
-/// Pure finite configuration; these values do not establish a source capability.
-pub type ArtifactCaptureBounds = WholePgCarrierBounds;
+/// Checked finite configuration; these values do not establish a source capability.
+pub type ArtifactCaptureBounds = CheckedWholePgCarrierBounds;
 
 /// Owned destination descriptor. Construction performs no filesystem effect.
 pub struct OwnedCaptureSpool {
@@ -225,14 +225,15 @@ impl DatasetBoundArtifactStore {
 
 /// The returned original handle must be installed in the outer resident owner before awaiting.
 /// No timeout or task Drop here releases the original Store gate or deletes partial snapshots.
-#[allow(clippy::result_large_err)] // Err hands the original owners back by value.
 pub fn start_capture_snapshot(
     hold: ArtifactCaptureHold,
     spool: OwnedCaptureSpool,
     bounds: ArtifactCaptureBounds,
     clock: Arc<dyn CaptureClockCheck>,
 ) -> JoinHandle<ArtifactSnapshotResult> {
-    tokio::task::spawn_blocking(move || snapshot(hold, spool, bounds, clock.as_ref()))
+    #[allow(clippy::result_large_err)] // The worker's Err returns the original owners by value.
+    let worker = move || snapshot(hold, spool, bounds, clock.as_ref());
+    tokio::task::spawn_blocking(worker)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

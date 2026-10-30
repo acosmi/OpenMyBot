@@ -5,8 +5,8 @@ use openbot_domain::backup::whole_pg_carrier::{
     WholePgOpenCodec, WholePgSealCodec, whole_pg_secret_matches,
 };
 use openbot_domain::backup::{
-    FrozenWholePgManifest, WholePgCarrierBounds, WholePgCarrierFault, WholePgMaterialKind,
-    WholePgSecretBounds,
+    CheckedWholePgCarrierBounds, CheckedWholePgSecretBounds, FrozenWholePgManifest,
+    WholePgCarrierFault, WholePgMaterialKind,
 };
 use openbot_domain::vault::SecretBytes;
 use rustix::fs::{AtFlags, Mode, OFlags};
@@ -58,8 +58,8 @@ pub struct WholePgOwnedStreamParts {
     pub sources: Vec<WholePgOwnedSourceInput>,
     pub output: WholePgOwnedDirectoryInput,
     pub independent_key_medium: WholePgOwnedDirectoryInput,
-    pub carrier_bounds: WholePgCarrierBounds,
-    pub secret_bounds: WholePgSecretBounds,
+    pub carrier_bounds: CheckedWholePgCarrierBounds,
+    pub secret_bounds: CheckedWholePgSecretBounds,
 }
 pub struct OwnedCaptureStreamInputs {
     parts: WholePgOwnedStreamParts,
@@ -231,7 +231,7 @@ fn check_parts(parts: &WholePgOwnedStreamParts) -> Result<u64, WholePgCarrierFau
 
 fn check_manifest_profile(
     m: &FrozenWholePgManifest,
-    b: WholePgCarrierBounds,
+    b: CheckedWholePgCarrierBounds,
     metadata_remaining: u64,
 ) -> Result<u64, WholePgCarrierFault> {
     use WholePgCarrierFault as F;
@@ -1384,7 +1384,9 @@ mod tests {
             max_key_medium_allocation_bytes: 2_097_152,
             key_medium_reserve_bytes: 4096,
             key_medium_free_floor_bytes: 4096,
-        };
+        }
+        .check()
+        .unwrap();
         let c = WholePgSecretClassBounds {
             max_count: 32,
             max_one_bytes: 4096,
@@ -1408,7 +1410,9 @@ mod tests {
                 key_medium_readback: c,
                 decode_crypto_temporary: c,
             },
-        };
+        }
+        .check()
+        .unwrap();
         let mut sources = Vec::new();
         let materials = WholePgMaterialKind::ALL
             .into_iter()
@@ -1931,7 +1935,9 @@ mod tests {
     #[test]
     fn owned_carrier_constructor_rejects_a_manifest_frozen_for_another_profile() {
         let (root, mut parts) = fixture(64);
-        parts.carrier_bounds.max_chunk_plain_bytes = 16;
+        let mut carrier = *parts.carrier_bounds;
+        carrier.max_chunk_plain_bytes = 16;
+        parts.carrier_bounds = carrier.check().unwrap();
         let failure = match OwnedCaptureStreamInputs::from_owned_parts(parts) {
             Err(v) => v,
             Ok(_) => panic!("profile"),
@@ -1944,7 +1950,9 @@ mod tests {
     #[test]
     fn owned_carrier_constructor_counts_two_key_copies_and_resident_class_peak() {
         let (root, mut parts) = fixture(64);
-        parts.secret_bounds.classes.key_medium_readback.max_count = 1;
+        let mut secret = *parts.secret_bounds;
+        secret.classes.key_medium_readback.max_count = 1;
+        parts.secret_bounds = secret.check().unwrap();
         let failure = match OwnedCaptureStreamInputs::from_owned_parts(parts) {
             Err(v) => v,
             Ok(_) => panic!("copies"),
@@ -1954,8 +1962,9 @@ mod tests {
         finish(root);
         let (root, mut parts) = fixture(64);
         // Every class separately fits; their common limit leaves no room for the live frame.
-        parts.secret_bounds.max_secret_memory_bytes = 11 * 32 * 4096;
-        assert!(parts.secret_bounds.check().is_ok());
+        let mut secret = *parts.secret_bounds;
+        secret.max_secret_memory_bytes = 11 * 32 * 4096;
+        parts.secret_bounds = secret.check().unwrap();
         let failure = match OwnedCaptureStreamInputs::from_owned_parts(parts) {
             Err(v) => v,
             Ok(_) => panic!("peak"),
@@ -1967,8 +1976,9 @@ mod tests {
     #[test]
     fn owned_carrier_same_device_key_and_blocks_share_total_allocation_bound() {
         let (root, mut parts) = fixture(64);
-        parts.carrier_bounds.max_total_allocation_bytes =
-            25_000_000 + parts.manifest.wire_bytes().unwrap();
+        let mut carrier = *parts.carrier_bounds;
+        carrier.max_total_allocation_bytes = 25_000_000 + parts.manifest.wire_bytes().unwrap();
+        parts.carrier_bounds = carrier.check().unwrap();
         let input = match OwnedCaptureStreamInputs::from_owned_parts(parts) {
             Ok(v) => v,
             Err(v) => panic!("{}", v.fault),

@@ -170,7 +170,7 @@ impl CaptureProfile {
     pub(crate) fn carrier_bounds(
         &self,
     ) -> Result<
-        openbot_domain::backup::whole_pg_carrier::WholePgCarrierBounds,
+        openbot_domain::backup::whole_pg_carrier::CheckedWholePgCarrierBounds,
         openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
     > {
         let c = &self.carrier;
@@ -204,7 +204,7 @@ impl CaptureProfile {
     pub(crate) fn secret_bounds(
         &self,
     ) -> Result<
-        openbot_domain::backup::whole_pg_carrier::WholePgSecretBounds,
+        openbot_domain::backup::whole_pg_carrier::CheckedWholePgSecretBounds,
         openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
     > {
         use openbot_domain::backup::whole_pg_carrier::{
@@ -662,8 +662,9 @@ pub(crate) struct ReviewedNormalCaptureRequest {
     pub(crate) maintenance: VerifiedMaintenanceBundle,
     pub(crate) profile: CaptureProfile,
     // Checked once from `profile` when this request is verified.
-    pub(crate) carrier_bounds: openbot_domain::backup::whole_pg_carrier::WholePgCarrierBounds,
-    pub(crate) secret_bounds: openbot_domain::backup::whole_pg_carrier::WholePgSecretBounds,
+    pub(crate) carrier_bounds:
+        openbot_domain::backup::whole_pg_carrier::CheckedWholePgCarrierBounds,
+    pub(crate) secret_bounds: openbot_domain::backup::whole_pg_carrier::CheckedWholePgSecretBounds,
     pub(crate) output: TrustedDestination,
     pub(crate) key_medium: TrustedDestination,
     // None exists only inside original open before its final successful release binding.

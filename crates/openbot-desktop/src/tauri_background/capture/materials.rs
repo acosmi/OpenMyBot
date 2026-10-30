@@ -2,8 +2,8 @@
 use super::{CaptureOperation, ControlSourceIdentity, NormalCaptureClosingOwner};
 use crate::postgres_maintenance::capture::{CaptureOwnedMaterialFile, CaptureSourceOwner};
 use openbot_domain::backup::whole_pg_carrier::{
-    WholePgCarrierBounds, WholePgCarrierFault as Fault, WholePgCoverageClaim, WholePgMaterialKind,
-    WholePgPresence, WholePgProvenanceClaim, WholePgSourceClaim,
+    CheckedWholePgCarrierBounds, WholePgCarrierFault as Fault, WholePgCoverageClaim,
+    WholePgMaterialKind, WholePgPresence, WholePgProvenanceClaim, WholePgSourceClaim,
 };
 use openbot_infra::artifact_store::capture::{
     ArtifactCaptureHold, ArtifactSnapshot, ArtifactSnapshotFailure, ArtifactSnapshotFile,
@@ -3672,7 +3672,7 @@ fn original_snapshot_audit_tail() -> Result<u64, Fault> {
 fn original_snapshot_future_tail(
     state: &NormalCaptureMaterials,
     f: u64,
-    bounds: &WholePgCarrierBounds,
+    bounds: &CheckedWholePgCarrierBounds,
     range: &(String, String, u32, u32),
     op: &CaptureOperation,
 ) -> Result<(u64, u64, u64), Fault> {
@@ -3858,7 +3858,7 @@ fn original_snapshot_probe_bytes() -> Result<u64, Fault> {
         original_snapshot_slot::<Option<OriginalSnapshotParts>>()?,
         original_snapshot_slot::<OriginalArtifactLineCount<'_>>()?,
         original_snapshot_slot::<Result<(), CaptureSqlFailure>>()?,
-        original_snapshot_slot::<WholePgCarrierBounds>()?,
+        original_snapshot_slot::<CheckedWholePgCarrierBounds>()?,
         original_snapshot_mul(4, original_snapshot_slot::<std::fs::Metadata>()?)?,
         original_snapshot_mul(
             4,
@@ -4138,7 +4138,8 @@ async fn freeze_original_artifact_snapshot(
     if remaining_fd < tail_fd || remaining_known < tail_known {
         return Err(Fault::CapacityExceeded);
     }
-    let mut worker_bounds = bounds;
+    // Newly derived worker limits pass the same checked construction before the snapshot.
+    let mut worker_bounds = *bounds;
     worker_bounds.max_material_files = f;
     worker_bounds.max_directories = 3;
     worker_bounds.max_path_bytes = 44;

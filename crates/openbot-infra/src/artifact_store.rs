@@ -970,7 +970,7 @@ impl DatasetBoundArtifactStore {
             .ok_or(ArtifactStoreError::Unavailable)
     }
 
-    pub(crate) fn write_text_once_admitted(
+    pub(crate) fn write_text_once(
         &self,
         admitted: &CaptureMutationLease,
         id: Uuid,

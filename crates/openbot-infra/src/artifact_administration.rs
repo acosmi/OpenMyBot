@@ -2015,7 +2015,7 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
                             if let Some(capture) = &worker_diagnostic {
                                 capture.record(SaveProducerDiagnosticEvent::WorkerEntered);
                             }
-                            let observation = worker_store.write_text_once_admitted(
+                            let observation = worker_store.write_text_once(
                                 &worker_capture_operation,
                                 id,
                                 expected,

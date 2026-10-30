@@ -328,7 +328,7 @@ mod capture_projection {
     use super::*;
     use crate::tauri_background::capture::{CaptureResourceTotals, reserve_capture_resources};
     use openbot_domain::backup::whole_pg_carrier::{
-        WholePgCarrierBounds, WholePgCarrierFault as Fault,
+        CheckedWholePgCarrierBounds, WholePgCarrierFault as Fault,
     };
     use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
     use sha2::{Digest, Sha256};
@@ -454,7 +454,7 @@ mod capture_projection {
     pub(super) struct State {
         parent: File,
         parent_identity: DirectoryIdentity,
-        bounds: WholePgCarrierBounds,
+        bounds: CheckedWholePgCarrierBounds,
         resources: Arc<Mutex<CaptureResourceTotals>>,
         limit: usize,
         gate: Mutex<Gate>,
@@ -1199,7 +1199,7 @@ mod capture_projection {
 
         pub(crate) fn prepare_capture_projection(
             self: Arc<Self>,
-            bounds: WholePgCarrierBounds,
+            bounds: CheckedWholePgCarrierBounds,
         ) -> Result<(Arc<Self>, RetainedPreferenceCapture), Fault> {
             if SNAPSHOT_LEAF.len() as u64 > bounds.max_path_bytes {
                 return Err(Fault::CapacityExceeded);

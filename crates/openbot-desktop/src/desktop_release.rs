@@ -917,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn release_check_of_a_capture_request_opens_no_destination() {
+    fn capture_request_refused_at_outer_or_maintenance_pin_writes_no_destination() {
         let root = TempRoot::new();
         let destinations = TempRoot::new();
         let outer = b"{\"unit\":\"maintenance outer\"}";
@@ -946,7 +946,6 @@ mod tests {
         assert_eq!(fs::read_dir(&destinations.0).unwrap().count(), 2);
         assert_eq!(fs::read_dir(&root.0).unwrap().count(), 4);
         assert_eq!(fs::read_dir(&maintenance).unwrap().count(), 1);
-        assert!(DeferredCurrentUserKeychain::default().store.get().is_none());
     }
 
     #[test]

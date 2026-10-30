@@ -43,7 +43,7 @@ use tokio::task::JoinHandle;
     feature = "postgres-maintenance",
     target_os = "macos"
 ))]
-use openbot_domain::backup::{WholePgCarrierBounds, WholePgCarrierFault};
+use openbot_domain::backup::{CheckedWholePgCarrierBounds, WholePgCarrierFault};
 
 #[cfg(all(
     feature = "desktop-launcher",
@@ -335,7 +335,7 @@ impl InProcessTransport {
     /// not a separately spendable allowance. No maximum-size slot Vec is allocated here.
     pub(crate) fn arm_capture_retention(
         &self,
-        bounds: &WholePgCarrierBounds,
+        bounds: &CheckedWholePgCarrierBounds,
     ) -> Result<(), WholePgCarrierFault> {
         let mut registry = match self.pumps.lock() {
             Ok(registry) => registry,
@@ -1705,8 +1705,8 @@ mod tests {
         use super::*;
         use tokio::sync::Notify;
 
-        fn bounds(slots: u64) -> WholePgCarrierBounds {
-            WholePgCarrierBounds {
+        fn bounds(slots: u64) -> CheckedWholePgCarrierBounds {
+            openbot_domain::backup::WholePgCarrierBounds {
                 max_material_files: 16,
                 max_directories: 16,
                 max_path_bytes: 64,
@@ -1731,6 +1731,8 @@ mod tests {
                 key_medium_reserve_bytes: 4096,
                 key_medium_free_floor_bytes: 4096,
             }
+            .check()
+            .unwrap()
         }
 
         fn arm_with_original_resources(

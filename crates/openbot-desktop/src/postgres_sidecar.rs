@@ -4161,8 +4161,8 @@ mod tests {
                 Ok(1)
             }
         }
-        // 534804 (retired fixture) and 2097152 leave F below the 643066-byte frame; the
-        // current fixture value 4194304 (F = 1048575) is above it.
+        // 534804 (retired fixture) and 2097152 leave F below the 643066-byte frame. 4194304
+        // (F = 1048575) is the G2' value ruled for the F03 profile, chosen above that need.
         for (max_one_bytes, starts) in [(534_804, false), (2_097_152, false), (4_194_304, true)] {
             let fixture = MasterJournalPgFixture::new("armed-frame-limit").await;
             let running = PostgresSidecarSupervisor::start(
@@ -4180,7 +4180,7 @@ mod tests {
             )
             .await
             .unwrap();
-            // The fixture profile keeps maxCount 65536 and drivers 64/64/64/17/16 MiB.
+            // The F03 profile keeps the F02 maxCount 65536 and drivers 64/64/64/17/16 MiB.
             let decode = CaptureDecodeBudget::checked(65_536, max_one_bytes).unwrap();
             let custody = DesktopLocalDriverCustody::prepare(
                 DesktopPoolJoinBounds::checked(64, 64, 64, 17, 16 << 20).unwrap(),
@@ -4225,9 +4225,9 @@ mod tests {
             };
             let client = plane.pool().get().await.unwrap();
             // The retired maxRowBytes 44540 refuses one catalog_functions row whose weighted
-            // size is 44594. With the current fixture value 65536, every projection is read
-            // before the missing vault canary is reported, and the decode count still admits
-            // a credit.
+            // size is 44594. With 65536, the G2' value ruled for the F03 profile above that
+            // need, every projection is read before the missing vault canary is reported, and
+            // the decode count still admits a credit.
             for (max_row_bytes, expected) in [
                 (44_540, CaptureSqlFailure::Bounds),
                 (65_536, CaptureSqlFailure::SourceMismatch),

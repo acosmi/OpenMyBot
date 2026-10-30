@@ -2,7 +2,7 @@
 use std::sync::{Arc, Mutex, Weak};
 
 use openbot_domain::backup::whole_pg_carrier::{
-    WholePgCarrierBounds, WholePgCarrierFault as Fault,
+    CheckedWholePgCarrierBounds, WholePgCarrierFault as Fault,
 };
 use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
 use openbot_infra::db::desktop_local::{
@@ -88,7 +88,7 @@ pub(crate) struct CaptureResourceTotals {
 }
 
 pub(super) fn prepare_original_capture_resources(
-    bounds: &WholePgCarrierBounds,
+    bounds: &CheckedWholePgCarrierBounds,
 ) -> Result<Arc<Mutex<CaptureResourceTotals>>, Fault> {
     // Pinned Rust 1.98.0 ArcInner is repr(C): two atomic usize headers followed by T.
     // This accounts for its requested layout and the original startup/Armed/Operation Arc
@@ -138,7 +138,7 @@ pub(super) fn prepare_original_capture_resources(
 
 fn original_capture_resource_identity(
     resources: &Arc<Mutex<CaptureResourceTotals>>,
-    bounds: &WholePgCarrierBounds,
+    bounds: &CheckedWholePgCarrierBounds,
 ) -> Result<[u8; 16], Fault> {
     let totals = resources.lock().map_err(|_| Fault::ClosingPending)?;
     if totals.owner_instance == [0; 16]
@@ -206,7 +206,7 @@ pub(crate) fn remaining_capture_resources(
 // Pure same-owner DATA staging. The empty book header freezes these limits before IO.
 fn prepare_original_control_storage(
     resources: &Arc<Mutex<CaptureResourceTotals>>,
-    bounds: &WholePgCarrierBounds,
+    bounds: &CheckedWholePgCarrierBounds,
     maximum: usize,
 ) -> Result<OriginalControlStorageFacts, Fault> {
     let owner = original_capture_resource_identity(resources, bounds)?;
@@ -1816,7 +1816,6 @@ fn prepare_original_owned_stream(custody: &mut CaptureJobCustody) -> Result<(), 
     }
 }
 
-#[allow(clippy::result_large_err)] // Err hands the original owner back by value.
 async fn join_original_stream_worker(custody: &mut CaptureJobCustody) -> Result<(), Fault> {
     use openbot_infra::backup::whole_pg_capture_stream::run_owned_stream;
     let operation = Arc::clone(custody.operation.as_ref().ok_or(Fault::IntentMismatch)?);
@@ -1826,9 +1825,9 @@ async fn join_original_stream_worker(custody: &mut CaptureJobCustody) -> Result<
     }
     let inputs = custody.stream_inputs.take().ok_or(Fault::MaterialMissing)?;
     let clock = operation.clock_view();
-    custody.stream_task = Some(tokio::task::spawn_blocking(move || {
-        run_owned_stream(inputs, clock)
-    }));
+    #[allow(clippy::result_large_err)] // The worker's Err returns the original owners by value.
+    let worker = move || run_owned_stream(inputs, clock);
+    custody.stream_task = Some(tokio::task::spawn_blocking(worker));
     // Bound only the borrowed wait by the original remaining C. The original
     // worker and inputs stay resident on timeout.
     let waited = match operation.closing_remaining_ns() {
@@ -2431,7 +2430,7 @@ fn actual_stage_facts(original: u64, joined: u64, proxies: u64) -> control::Cont
 
 #[cfg(test)]
 pub(crate) fn original_capture_resources_for_test(
-    bounds: &WholePgCarrierBounds,
+    bounds: &CheckedWholePgCarrierBounds,
 ) -> Result<Arc<Mutex<CaptureResourceTotals>>, Fault> {
     prepare_original_capture_resources(bounds)
 }

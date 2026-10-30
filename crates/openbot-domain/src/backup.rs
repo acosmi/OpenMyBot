@@ -63,9 +63,10 @@ pub use recovery_wrap::{
 };
 
 pub use whole_pg_carrier::{
-    FrozenWholePgManifest, WholePgBarrierClaim, WholePgCarrierBounds, WholePgCarrierFault,
-    WholePgCoverageClaim, WholePgFrameParts, WholePgFrameSpec, WholePgManifestClaim,
-    WholePgMaterialClaim, WholePgMaterialKind, WholePgOpenCodec, WholePgPresence,
-    WholePgProvenanceClaim, WholePgSealCodec, WholePgSecretBounds, WholePgSecretClassBounds,
-    WholePgSecretClasses, WholePgSourceClaim, whole_pg_secret_matches,
+    CheckedWholePgCarrierBounds, CheckedWholePgSecretBounds, FrozenWholePgManifest,
+    WholePgBarrierClaim, WholePgCarrierBounds, WholePgCarrierFault, WholePgCoverageClaim,
+    WholePgFrameParts, WholePgFrameSpec, WholePgManifestClaim, WholePgMaterialClaim,
+    WholePgMaterialKind, WholePgOpenCodec, WholePgPresence, WholePgProvenanceClaim,
+    WholePgSealCodec, WholePgSecretBounds, WholePgSecretClassBounds, WholePgSecretClasses,
+    WholePgSourceClaim, whole_pg_secret_matches,
 };

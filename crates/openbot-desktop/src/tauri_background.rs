@@ -351,14 +351,19 @@ pub(crate) fn checked_self_owned_fixture_metadata_bytes(
             .checked_add(n)
             .ok_or(DesktopLocalRuntimeError::Configuration)?;
     }
-    // The binding's root PathBuf and app-data PathBuf backings plus original trusted-directory
-    // getpath request; the existing path parser's allocator internals retain their original
-    // unproven boundary. rustix1.1.4 getpath uses locked macOS libc PATH_MAX=1024, then shrink
-    // and CString NUL growth; count both old/new requests before linear into_vec.
+    // The binding's exact root PathBuf, the resident app-data PathBuf and the transient one of
+    // the layout check (each one exact root + "/app-data" allocation), plus the original
+    // trusted-directory getpath request; the existing path parser's allocator internals retain
+    // their original unproven boundary. rustix1.1.4 getpath uses locked macOS libc
+    // PATH_MAX=1024, then shrink and CString NUL growth; count both old/new requests before
+    // linear into_vec.
     let root = root.as_os_str().len();
+    let app_data = root
+        .checked_add("/app-data".len())
+        .ok_or(DesktopLocalRuntimeError::Configuration)?;
     total = total
         .checked_add(root)
-        .and_then(|n| n.checked_add(root.checked_add("/app-data".len())?))
+        .and_then(|n| n.checked_add(app_data.checked_mul(2)?))
         .and_then(|n| n.checked_add(1024))
         .and_then(|n| n.checked_add(root.checked_mul(2)?))
         .and_then(|n| n.checked_add(1))
@@ -422,6 +427,16 @@ pub(crate) fn bind_self_owned_capture_fixture(
     }
 }
 
+/// The fixture app-data path in one allocation of exactly root + "/app-data" bytes, the size
+/// charged by [`checked_self_owned_fixture_metadata_bytes`].
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+fn self_owned_fixture_app_data(root: &std::path::Path) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::with_capacity(root.as_os_str().len() + "/app-data".len());
+    path.push(root);
+    path.push("app-data");
+    path
+}
+
 /// Retired outer pins are a closed refusal set; only the single fixed fixture pin selects it.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 fn self_owned_fixture_selected(
@@ -480,7 +495,9 @@ fn verify_self_owned_fixture_layout(
         (output, "capture-output", pin.output_inode),
         (key_medium, "independent-key-medium", pin.key_inode),
     ] {
-        if destination.absolute_path != root.join(leaf)
+        // Compared in place; no joined path is allocated.
+        if destination.absolute_path.parent() != Some(root)
+            || destination.absolute_path.file_name() != Some(std::ffi::OsStr::new(leaf))
             || (destination.device, destination.inode, destination.uid)
                 != (pin.device, inode, pin.uid)
         {
@@ -492,7 +509,7 @@ fn verify_self_owned_fixture_layout(
             return Err(DesktopLocalRuntimeError::Configuration);
         }
     }
-    match std::fs::symlink_metadata(root.join("app-data")) {
+    match std::fs::symlink_metadata(self_owned_fixture_app_data(root)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(root.to_path_buf()),
         _ => Err(DesktopLocalRuntimeError::Configuration),
     }
@@ -501,8 +518,10 @@ fn verify_self_owned_fixture_layout(
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 impl SelfOwnedCaptureFixtureBinding {
     fn app_data_root(&self) -> Result<CurrentOsUserAppDataRoot, DesktopLocalRuntimeError> {
-        CurrentOsUserAppDataRoot::from_current_os_user_app_data(self.root.join("app-data"))
-            .map_err(|_| DesktopLocalRuntimeError::Configuration)
+        CurrentOsUserAppDataRoot::from_current_os_user_app_data(self_owned_fixture_app_data(
+            &self.root,
+        ))
+        .map_err(|_| DesktopLocalRuntimeError::Configuration)
     }
     #[cfg(feature = "postgres-maintenance")]
     fn prepare_new_root_before_startup(
@@ -4559,7 +4578,7 @@ mod tests {
         target_os = "macos"
     ))]
     #[test]
-    fn no_capture_request_keeps_a_fresh_start_ordinary() {
+    fn no_capture_request_binds_no_fixture_and_inspects_without_writing() {
         // No compiled fixture pin and no request: no fixture binding and no secret-store swap.
         assert!(matches!(bind_self_owned_capture_fixture(None), Ok(None)));
         let root = private_fixture_root("fresh-ordinary");

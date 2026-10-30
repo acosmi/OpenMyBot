@@ -2662,7 +2662,7 @@ impl CaptureControlOwner {
     pub(super) fn revalidate_original_storage_owner(
         &self,
         resources: &Arc<std::sync::Mutex<super::CaptureResourceTotals>>,
-        bounds: &openbot_domain::backup::whole_pg_carrier::WholePgCarrierBounds,
+        bounds: &openbot_domain::backup::whole_pg_carrier::CheckedWholePgCarrierBounds,
     ) -> Result<(), Fault> {
         if !Arc::ptr_eq(&self.resources, resources) {
             return Err(Fault::IntentMismatch);
@@ -4809,7 +4809,7 @@ pub(crate) fn inspect_startup_control(app: &File, limits: Option<&Limits>) -> Re
 }
 pub(in crate::tauri_background) fn inspect_startup_control_for_capture(
     app: &File,
-    bounds: Option<&openbot_domain::backup::whole_pg_carrier::WholePgCarrierBounds>,
+    bounds: Option<&openbot_domain::backup::whole_pg_carrier::CheckedWholePgCarrierBounds>,
     limits: Option<&Limits>,
     reviewed_request_id: Option<&str>,
     resources: Option<&Arc<std::sync::Mutex<super::CaptureResourceTotals>>>,
@@ -9866,7 +9866,9 @@ pub(crate) mod tests {
             max_key_medium_allocation_bytes: 4096,
             key_medium_reserve_bytes: 4096,
             key_medium_free_floor_bytes: 4096,
-        };
+        }
+        .check()
+        .unwrap();
         let resources = super::super::original_capture_resources_for_test(&bounds).unwrap();
         let mut refused = None;
         assert!(matches!(
