@@ -160,7 +160,7 @@ expected={
 seen={p["SPDXID"]:(p.get("versionInfo"),p.get("licenseConcluded")) for p in d["packages"] if p["SPDXID"] in expected}
 assert seen==expected,(seen,expected)
 ids=[p["SPDXID"] for p in d["packages"]]
-assert len(d["packages"])==56 and len(ids)==len(set(ids)),(len(d["packages"]),len(set(ids)))
+assert len(d["packages"])==62 and len(ids)==len(set(ids)),(len(d["packages"]),len(set(ids)))
 ' || fail 'SAML/native SPDX package 集合、版本、许可或总数漂移'
 
 case "$(uname -s)" in

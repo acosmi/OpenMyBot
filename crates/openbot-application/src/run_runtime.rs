@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use openbot_contracts::ids::{ActorId, BotId, RunId, ThreadId, ToolCallId};
@@ -50,6 +50,8 @@ pub enum RunRuntimeError {
 pub enum RunFailureCode {
     /// G4 Agent runtime 尚不可用或永久拒绝 dispatch。
     AgentRuntimeUnavailable,
+    /// Current delegated registration or owner authority is no longer valid.
+    DelegationNotCurrent,
     /// 已被 runtime 接受的 run 失去 lease，外部 effect 状态未知。
     RuntimeLeaseExpired,
     /// 内部 outbox payload 与 durable run 不一致。
@@ -64,6 +66,8 @@ pub enum RunFailureCode {
     ProviderUnavailable,
     /// Provider request may have left the process before acknowledgement。
     ProviderCommitUnknown,
+    /// Provider 停止请求的结果未获确认。
+    ProviderStopUnknown,
     /// Provider SSE/schema/sequence invalid。
     ProviderInvalidResponse,
     /// Provider real body read gap exceeded watchdog。
@@ -97,6 +101,7 @@ impl RunFailureCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::DelegationNotCurrent => "delegation_not_current",
             Self::AgentRuntimeUnavailable => "agent_runtime_unavailable",
             Self::RuntimeLeaseExpired => "runtime_lease_expired",
             Self::DispatchPayloadCorrupt => "dispatch_payload_corrupt",
@@ -105,6 +110,7 @@ impl RunFailureCode {
             Self::ProviderRateLimited => "provider_rate_limited",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderCommitUnknown => "provider_commit_unknown",
+            Self::ProviderStopUnknown => "provider_stop_unknown",
             Self::ProviderInvalidResponse => "provider_invalid_response",
             Self::ProviderStreamStalled => "agent_stream_stalled",
             Self::ProviderGenerationFailed => "provider_generation_failed",
@@ -158,7 +164,7 @@ impl RunTerminal {
 }
 
 /// PostgreSQL 已验证的一次 run writer lease；不实现 serde。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct RunExecutionLease {
     run_id: RunId,
     thread_id: ThreadId,
@@ -166,6 +172,9 @@ pub struct RunExecutionLease {
     actor_id: ActorId,
     fencing: FencingToken,
     next_event_sequence: u64,
+    delegation_required: bool,
+    delegation_runtime: Option<Arc<crate::DelegationRuntime>>,
+    absolute_deadline: Option<SystemTime>,
 }
 
 impl RunExecutionLease {
@@ -199,9 +208,63 @@ impl RunExecutionLease {
             actor_id,
             fencing,
             next_event_sequence,
+            delegation_required: false,
+            delegation_runtime: None,
+            absolute_deadline: None,
         })
     }
 
+    /// Frozen delegated deadline, absent on legacy Runs.
+    pub fn absolute_deadline(&self) -> Option<SystemTime> {
+        self.absolute_deadline
+    }
+    #[doc(hidden)]
+    pub fn with_delegated_run_binding(
+        mut self,
+        runtime: Option<Arc<crate::DelegationRuntime>>,
+        absolute_deadline: SystemTime,
+    ) -> Self {
+        self.delegation_required = true;
+        self.delegation_runtime = runtime;
+        self.absolute_deadline = Some(absolute_deadline);
+        self
+    }
+    #[doc(hidden)]
+    pub fn delegation_required(&self) -> bool {
+        self.delegation_required
+    }
+    #[doc(hidden)]
+    pub async fn check_delegated_sampling(&self) -> Result<(), openbot_contracts::error::AppError> {
+        if !self.delegation_required {
+            return Ok(());
+        }
+        self.delegation_runtime
+            .as_ref()
+            .ok_or_else(|| openbot_contracts::error::AppError::PolicyRefused {
+                rule: "delegation_not_current".into(),
+                decision: None,
+            })?
+            .check_sampling(self)
+            .await
+    }
+    #[doc(hidden)]
+    pub async fn remint_delegated_auth(
+        &self,
+    ) -> Result<Option<openbot_contracts::auth::AuthContext>, openbot_contracts::error::AppError>
+    {
+        if !self.delegation_required {
+            return Ok(None);
+        }
+        self.delegation_runtime
+            .as_ref()
+            .ok_or_else(|| openbot_contracts::error::AppError::PolicyRefused {
+                rule: "delegation_not_current".into(),
+                decision: None,
+            })?
+            .remint_lease(self)
+            .await
+            .map(Some)
+    }
     /// Run id。
     #[must_use]
     pub const fn run_id(&self) -> &RunId {
@@ -238,6 +301,36 @@ impl RunExecutionLease {
         self.next_event_sequence
     }
 }
+
+impl core::fmt::Debug for RunExecutionLease {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RunExecutionLease")
+            .field("run_id", &self.run_id)
+            .field("thread_id", &self.thread_id)
+            .field("bot_id", &self.bot_id)
+            .field("actor_id", &self.actor_id)
+            .field("fencing", &self.fencing)
+            .field("next_event_sequence", &self.next_event_sequence)
+            .field("delegation_required", &self.delegation_required)
+            .field("absolute_deadline", &self.absolute_deadline)
+            .finish()
+    }
+}
+// Equality is lease identity. The attached delegation runtime is a process-local handle and
+// `next_event_sequence` is only the read-time cursor, so a cancellation lease read back after the
+// child appended events still matches the dispatched one; the fencing token keeps stale leases out.
+impl PartialEq for RunExecutionLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.run_id == other.run_id
+            && self.thread_id == other.thread_id
+            && self.bot_id == other.bot_id
+            && self.actor_id == other.actor_id
+            && self.fencing == other.fencing
+            && self.delegation_required == other.delegation_required
+            && self.absolute_deadline == other.absolute_deadline
+    }
+}
+impl Eq for RunExecutionLease {}
 
 /// 一个已被 PostgreSQL 原子 claim 的 replay-safe dispatch。
 #[derive(Clone, Debug, PartialEq, Eq)]

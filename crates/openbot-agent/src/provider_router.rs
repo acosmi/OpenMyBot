@@ -9,6 +9,7 @@ use openbot_application::{
 
 /// One Agent runtime dispatches an explicit authoritative route without implicit fallback.
 pub struct ProviderRouter {
+    extensions: openbot_application::ProviderExtensions,
     package_openai: Arc<dyn ProviderAdapter>,
     managed: Option<Arc<dyn ProviderAdapter>>,
     remote_agui: Option<Arc<dyn ProviderAdapter>>,
@@ -23,11 +24,19 @@ impl ProviderRouter {
         managed: Option<Arc<dyn ProviderAdapter>>,
     ) -> Self {
         Self {
+            extensions: Default::default(),
             package_openai,
             managed,
             remote_agui: None,
             custom: None,
         }
+    }
+
+    /// Use the immutable registry returned by this application's assembly.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: openbot_application::ProviderExtensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 
     /// Attach the remote AG-UI semantic adapter. Missing means remote routes fail closed.
@@ -49,6 +58,7 @@ impl core::fmt::Debug for ProviderRouter {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ProviderRouter")
             .field("package_openai", &"configured/[redacted]")
+            .field("extensions", &self.extensions.len())
             .field("managed", &self.managed.is_some())
             .field("remote_agui", &self.remote_agui.is_some())
             .field("custom", &self.custom.is_some())
@@ -63,6 +73,10 @@ impl ProviderAdapter for ProviderRouter {
         request: ProviderRequest,
     ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
         match &request.route {
+            ProviderRoute::Extension(key) => match self.extensions.get(key) {
+                Some(provider) => provider.start(request).await,
+                None => Err(ProviderPortError::Unavailable),
+            },
             ProviderRoute::CustomModel(_) => match &self.custom {
                 Some(provider) => provider.start(request).await,
                 None => Err(ProviderPortError::InvalidRequest {
@@ -176,3 +190,7 @@ mod tests {
         assert_eq!(package.calls.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "provider_extension_tests.rs"]
+mod provider_extension_tests;

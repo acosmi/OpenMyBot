@@ -19,7 +19,8 @@ done
 
 callers=$(rg -l 'IntelligenceBundleDecryptionKey|verify_intelligence_bundle|PostgresIntelligenceImportStore' \
   crates/*/src --glob '*.rs' | sort)
-expected=$'crates/openbot-infra/src/intelligence_bundle.rs\ncrates/openbot-infra/src/intelligence_import.rs\ncrates/openbot-server/src/bin/openbot-migrate.rs'
+# 测试夹具：auth/thread_history_management_tests.rs 只经 auth.rs 的 #[cfg(test)] mod 编入（PR #181）。
+expected=$'crates/openbot-infra/src/intelligence_bundle.rs\ncrates/openbot-infra/src/intelligence_import.rs\ncrates/openbot-server/src/auth/thread_history_management_tests.rs\ncrates/openbot-server/src/bin/openbot-migrate.rs'
 [[ "$callers" == "$expected" ]] || fail "importer 调用面越出 one-shot migration path：[$callers]"
 if rg -n 'intelligence_(bundle|import)|IntelligenceImport' crates/openbot-server/src/main.rs; then
   fail '最终 Server runtime main 不得持有 Intelligence importer/client'

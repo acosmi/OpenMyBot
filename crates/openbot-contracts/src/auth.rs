@@ -11,6 +11,7 @@ use core::fmt;
 use core::str::FromStr;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -232,6 +233,127 @@ impl fmt::Display for AuthGeneration {
     }
 }
 
+/// 已核验委托的来源；诊断输出省略标识符。
+#[derive(Clone, PartialEq, Eq)]
+pub enum DelegationSource {
+    /// 持久自动化定义。
+    AutomationDefinition {
+        /// 已限定形状的来源标识符。
+        definition_id: String,
+    },
+    /// 产品持有的外部绑定。
+    ExternalBinding {
+        /// 已限定形状的来源标识符。
+        binding_id: String,
+    },
+}
+
+impl fmt::Debug for DelegationSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AutomationDefinition { .. } => "AutomationDefinition",
+            Self::ExternalBinding { .. } => "ExternalBinding",
+        })
+    }
+}
+
+/// 保存已核验的委托事实；构造载体不判断当前有效性。
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedDelegation {
+    source: DelegationSource,
+    revision: u64,
+    trigger_id: String,
+    granted_generation: AuthGeneration,
+    expires_at: Option<SystemTime>,
+}
+
+/// 标识符形状不合法；错误不保留被拒绝的输入。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DelegationShapeError {
+    /// 来源标识符不符合允许的 ASCII 形状。
+    #[error("invalid_delegation_source_identifier")]
+    InvalidSourceIdentifier,
+    /// 触发标识符不符合允许的 ASCII 形状。
+    #[error("invalid_delegation_trigger_identifier")]
+    InvalidTriggerIdentifier,
+}
+
+impl VerifiedDelegation {
+    /// 检查标识符形状后接收已核验的委托事实。
+    ///
+    /// 仅供受信 Application 代码调用。调用前须确认委托仍有效，并检查 owner 当前的
+    /// 成员资格、角色、grant 和撤销状态；本载体不授予权限。
+    #[doc(hidden)]
+    #[must_use = "必须检查委托标识符的形状校验结果"]
+    pub fn from_verified_grant(
+        source: DelegationSource,
+        revision: u64,
+        trigger_id: String,
+        granted_generation: AuthGeneration,
+        expires_at: Option<SystemTime>,
+    ) -> Result<Self, DelegationShapeError> {
+        fn valid(value: &str) -> bool {
+            (1..=128).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+        }
+        let identifier = match &source {
+            DelegationSource::AutomationDefinition { definition_id } => definition_id,
+            DelegationSource::ExternalBinding { binding_id } => binding_id,
+        };
+        if !valid(identifier) {
+            return Err(DelegationShapeError::InvalidSourceIdentifier);
+        }
+        if !valid(&trigger_id) {
+            return Err(DelegationShapeError::InvalidTriggerIdentifier);
+        }
+        Ok(Self {
+            source,
+            revision,
+            trigger_id,
+            granted_generation,
+            expires_at,
+        })
+    }
+
+    /// 已核验的来源事实。
+    #[must_use]
+    pub fn source(&self) -> &DelegationSource {
+        &self.source
+    }
+    /// 委托修订号；不据此推断当前有效性。
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    /// 触发标识符。
+    #[must_use]
+    pub fn trigger_id(&self) -> &str {
+        &self.trigger_id
+    }
+    /// 授权事实记录的 owner 代次。
+    #[must_use]
+    pub const fn granted_generation(&self) -> AuthGeneration {
+        self.granted_generation
+    }
+    /// 记录的到期时刻；`None` 表示用户明确选择“持续至撤销”，该授权不按时间到期（Run 绝对期限仍然适用）。
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<SystemTime> {
+        self.expires_at
+    }
+}
+
+impl fmt::Debug for VerifiedDelegation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedDelegation")
+            .field("source", &self.source)
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
 /// 一次已认证调用的权威上下文。
 ///
 /// # 它为什么既不 `Serialize` 也不 `Deserialize`
@@ -246,12 +368,13 @@ impl fmt::Display for AuthGeneration {
 ///   event、普通日志、trace」的同类风险面。需要把身份写进日志时用
 ///   [`crate::telemetry::CorrelationFields`]，那是**投影**，不是上下文本身。
 ///
-/// 字段全部私有，只读 getter，构造入口只有两个：
+/// 字段全部私有，只读 getter，构造入口：
 ///
 /// 1. [`AuthContextBuilder::from_verified_session`]（生产路径，`#[doc(hidden)]`）；
 /// 2. [`AuthContext::for_test`]（`testkit` feature 或 `cfg(test)` 下才存在，默认关）。
 ///
-/// 生产 transport 拿不到第 2 条 —— 它不在默认 feature 图里。
+/// 委托上下文由 [`AuthContextBuilder::from_verified_delegation`] 接收受信核验结果；
+/// 测试另有 feature-gated 委托构造器。生产 transport 拿不到测试入口。
 #[derive(Clone)]
 pub struct AuthContext {
     deployment: DeploymentId,
@@ -261,9 +384,16 @@ pub struct AuthContext {
     auth_generation: AuthGeneration,
     single_user: bool,
     request_binding: Option<Arc<crate::request_binding::VerifiedHostRequestBinding>>,
+    delegation: Option<Arc<VerifiedDelegation>>,
 }
 
 impl AuthContext {
+    /// 委托事实；不证明存在当前已登记的 Run。
+    #[must_use]
+    pub fn delegation(&self) -> Option<&VerifiedDelegation> {
+        self.delegation.as_deref()
+    }
+
     /// 非 Serde 宿主绑定；getter 本身不证明当前权限。
     pub fn request_binding(&self) -> Option<&crate::request_binding::VerifiedHostRequestBinding> {
         self.request_binding.as_deref()
@@ -353,6 +483,30 @@ impl AuthContext {
             auth_generation,
             single_user,
             request_binding: None,
+            delegation: None,
+        }
+    }
+    /// 测试用委托载体，身份和角色均由调用方明确提供。
+    #[cfg(any(test, feature = "testkit"))]
+    #[must_use]
+    pub fn for_test_delegated(
+        deployment: DeploymentId,
+        tenant: TenantId,
+        actor: ActorId,
+        roles: impl IntoIterator<Item = Role>,
+        auth_generation: AuthGeneration,
+        single_user: bool,
+        delegation: VerifiedDelegation,
+    ) -> Self {
+        Self {
+            deployment,
+            tenant,
+            actor,
+            roles: roles.into_iter().collect(),
+            auth_generation,
+            single_user,
+            request_binding: None,
+            delegation: Some(Arc::new(delegation)),
         }
     }
 }
@@ -365,6 +519,7 @@ impl PartialEq for AuthContext {
             && self.roles == other.roles
             && self.auth_generation == other.auth_generation
             && self.single_user == other.single_user
+            && self.delegation == other.delegation
     }
 }
 impl Eq for AuthContext {}
@@ -378,11 +533,12 @@ impl core::fmt::Debug for AuthContext {
             .field("auth_generation", &self.auth_generation)
             .field("single_user", &self.single_user)
             .field("request_binding_present", &self.request_binding.is_some())
+            .field("delegation_present", &self.delegation.is_some())
             .finish()
     }
 }
 
-/// [`AuthContext`] 的唯一生产构造入口。
+/// [`AuthContext`] 的受信生产构造入口。
 ///
 /// Rust 没有 crate 外可见的「友元」，所以受限性由三件事叠加表达，而不是靠单一机制：
 ///
@@ -424,6 +580,36 @@ impl AuthContextBuilder {
                 auth_generation,
                 single_user,
                 request_binding: None,
+                delegation: None,
+            },
+        }
+    }
+
+    /// 从已核验委托和 owner 当前事实开始构造；角色从空集合积累。
+    ///
+    /// 仅供受信 Application 代码调用。调用前须确认当前 `auth_generation` 与
+    /// `delegation.granted_generation()` 相等，追加的角色只能取自当前数据库 ACL；
+    /// 接收委托载体本身不产生授权。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_verified_delegation(
+        deployment: DeploymentId,
+        tenant: TenantId,
+        owner: ActorId,
+        auth_generation: AuthGeneration,
+        single_user: bool,
+        delegation: VerifiedDelegation,
+    ) -> Self {
+        Self {
+            context: AuthContext {
+                deployment,
+                tenant,
+                actor: owner,
+                roles: BTreeSet::new(),
+                auth_generation,
+                single_user,
+                request_binding: None,
+                delegation: Some(Arc::new(delegation)),
             },
         }
     }
@@ -451,6 +637,10 @@ impl AuthContextBuilder {
         self.context
     }
 }
+
+#[cfg(test)]
+#[path = "auth_delegation_tests.rs"]
+mod delegation_tests;
 
 #[cfg(test)]
 mod tests {

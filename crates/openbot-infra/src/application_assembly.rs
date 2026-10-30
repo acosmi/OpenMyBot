@@ -119,6 +119,15 @@ pub struct PostgresApplicationAssemblyInput {
     pub stall_timeout: Option<Duration>,
     pub oauth_public_url: Option<String>,
     pub app_url: Option<String>,
+    /// Explicit immutable extension adapter registrations.
+    pub extra_provider_adapters: Vec<(
+        openbot_application::ProviderExtensionKey,
+        Arc<dyn ProviderAdapter>,
+    )>,
+    /// Optional process-local terminal wakeup consumer.
+    pub run_event_subscriber: Option<Arc<dyn openbot_application::RunTerminalSubscriber>>,
+    /// Optional trusted current delegation resolver; local single-user assembly only.
+    pub delegation_authority: Option<Arc<dyn openbot_application::DelegationAuthority>>,
 }
 
 /// Sealed by the actual fixed tool/ScreenSession assembly, not a caller inventory.
@@ -181,6 +190,12 @@ impl core::fmt::Debug for PostgresApplicationAssemblyInput {
             .field("stall_timeout", &self.stall_timeout)
             .field("oauth_public_url", &self.oauth_public_url.is_some())
             .field("app_url", &self.app_url.is_some())
+            .field(
+                "extra_provider_adapters",
+                &self.extra_provider_adapters.len(),
+            )
+            .field("run_event_subscriber", &self.run_event_subscriber.is_some())
+            .field("delegation_authority", &self.delegation_authority.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -203,6 +218,11 @@ pub struct PostgresApplicationAssembly {
     pub remote_callback_auth: Arc<PostgresRemoteCallbackAuthenticator>,
     pub tool_cancellations: Arc<ToolCancellationRegistry>,
     pub mcp_revocation_reconciler: McpRevocationReconciler,
+    /// Same immutable registrations for context loading and provider dispatch.
+    pub provider_extensions: openbot_application::ProviderExtensions,
+    /// Sole delegated Run admission handle, absent without a trusted authority.
+    pub delegated_entry: Option<openbot_application::DelegatedRunEntry>,
+    terminal_runtime: Option<Arc<PostgresRunRuntime>>,
     capture_facts_closed: bool,
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
     capture_material_layout: CaptureAssemblyMaterialLayout,
@@ -233,6 +253,8 @@ impl core::fmt::Debug for PostgresApplicationAssembly {
             )
             .field("tool_cancellations", &self.tool_cancellations)
             .field("mcp_revocation_reconciler", &"running")
+            .field("provider_extensions", &self.provider_extensions.len())
+            .field("delegated_entry", &self.delegated_entry.is_some())
             .finish()
     }
 }
@@ -262,7 +284,8 @@ impl PostgresApplicationAssembly {
             }
             facts.drain().await;
         }
-        self.mcp_revocation_reconciler
+        let stopped = self
+            .mcp_revocation_reconciler
             .stop_for_capture()
             .await
             .map_err(|error| match error {
@@ -272,7 +295,11 @@ impl PostgresApplicationAssembly {
                 crate::mcp_connections::McpReconcilerStopFailure::Panicked => {
                     CaptureAssemblyStopFailure::ReconcilerPanicked
                 }
-            })
+            });
+        if let Some(runtime) = self.terminal_runtime.take() {
+            runtime.shutdown_terminal_delivery().await;
+        }
+        stopped
     }
 }
 
@@ -310,7 +337,20 @@ pub async fn assemble_postgres_application(
         stall_timeout,
         oauth_public_url,
         app_url,
+        extra_provider_adapters,
+        run_event_subscriber,
+        delegation_authority,
     } = input;
+    if !single_user
+        && (!extra_provider_adapters.is_empty()
+            || run_event_subscriber.is_some()
+            || delegation_authority.is_some())
+    {
+        return Err(fail("delegated_single_user"));
+    }
+    let provider_extensions =
+        openbot_application::ProviderExtensions::try_new(extra_provider_adapters)
+            .map_err(|_| fail("provider_extensions"))?;
     if audit_key.is_empty() || mcp_oauth_state_key.is_empty() {
         return Err(fail("key_material"));
     }
@@ -336,15 +376,13 @@ pub async fn assemble_postgres_application(
         "runtime:{}",
         mint_thread_id(&deployment).map_err(|_| fail("runtime_owner"))?
     );
-    let run_runtime: Arc<dyn RunRuntime> = Arc::new(
-        PostgresRunRuntime::new(
-            pool.clone(),
-            runtime_owner.clone(),
-            DEFAULT_THREAD_LEASE_DURATION,
-            DEFAULT_DISPATCH_CLAIM_DURATION,
-        )
-        .map_err(|_| fail("run_runtime"))?,
-    );
+    let run_runtime = PostgresRunRuntime::new(
+        pool.clone(),
+        runtime_owner.clone(),
+        DEFAULT_THREAD_LEASE_DURATION,
+        DEFAULT_DISPATCH_CLAIM_DURATION,
+    )
+    .map_err(|_| fail("run_runtime"))?;
     let remote_interrupts = Arc::new(
         PostgresRemoteInterruptCoordinator::new(
             pool.clone(),
@@ -368,6 +406,43 @@ pub async fn assemble_postgres_application(
     .map_err(|_| fail("thread_directory"))?
     .with_model_dataset_binding(model_dataset_binding.clone())
     .map_err(|_| fail("thread_directory_model_dataset"))?;
+    let delegation_store = delegation_authority.as_ref().map(|_| {
+        Arc::new(crate::delegation::PostgresDelegatedRunStore::new(
+            pool.clone(),
+            thread_directory.clone(),
+            deployment.clone(),
+            tenant.clone(),
+        ))
+    });
+    let delegation_runtime =
+        delegation_authority
+            .zip(delegation_store.as_ref())
+            .map(|(authority, store)| {
+                Arc::new(openbot_application::DelegationRuntime::new(
+                    deployment.clone(),
+                    tenant.clone(),
+                    single_user,
+                    authority,
+                    store.clone(),
+                ))
+            });
+    let delegated_entry = delegation_runtime
+        .as_ref()
+        .map(|runtime| openbot_application::DelegatedRunEntry::new(runtime.clone()));
+    let run_runtime = match &delegation_runtime {
+        Some(runtime) => run_runtime.with_delegation_runtime(Arc::downgrade(runtime)),
+        None => run_runtime,
+    };
+    let terminal_enabled = run_event_subscriber.is_some();
+    let run_runtime = Arc::new(match run_event_subscriber {
+        Some(subscriber) => run_runtime.with_terminal_subscriber(subscriber),
+        None => run_runtime,
+    });
+    if let Some(store) = &delegation_store {
+        store
+            .bind_callback_runtime(&run_runtime)
+            .map_err(|_| fail("delegated_callback_runtime"))?;
+    }
     let memory = PostgresMemoryAdministration::new(pool.clone())
         .with_effect_audit_key(audit_key.to_vec())
         .map_err(|_| fail("memory_effect_audit"))?;
@@ -475,7 +550,8 @@ pub async fn assemble_postgres_application(
             audit_key.to_vec(),
         )
         .map_err(|_| fail("remote_callback_auth"))?
-        .with_mcp_catalog(mcp_catalog.clone()),
+        .with_mcp_catalog(mcp_catalog.clone())
+        .with_delegation_runtime(delegation_runtime.clone(), run_runtime.clone()),
     );
     let credentials = Arc::new(
         PostgresCredentialAdministration::new(
@@ -597,6 +673,10 @@ pub async fn assemble_postgres_application(
         Some(collector) => application.with_runtime_capabilities(collector),
         None => application,
     };
+    let application = match delegation_runtime {
+        Some(runtime) => application.with_delegation_runtime(runtime),
+        None => application,
+    };
     let application: Arc<dyn ApplicationService> = Arc::new(application);
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
     let capture_material_layout = CaptureAssemblyMaterialLayout {
@@ -610,7 +690,10 @@ pub async fn assemble_postgres_application(
         custom_model_catalog_inventory,
         runtime_capability_facts,
         application,
+        terminal_runtime: terminal_enabled.then(|| run_runtime.clone()),
         run_runtime,
+        provider_extensions,
+        delegated_entry,
         remote_interrupts,
         mcp_catalog,
         components,

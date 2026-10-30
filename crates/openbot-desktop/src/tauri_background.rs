@@ -2550,6 +2550,9 @@ pub(crate) async fn prepare_desktop_local_runtime(
         stall_timeout: budgets.stall_timeout,
         oauth_public_url: None,
         app_url: None,
+        extra_provider_adapters: Vec::new(),
+        run_event_subscriber: None,
+        delegation_authority: None,
     })
     .await
     {

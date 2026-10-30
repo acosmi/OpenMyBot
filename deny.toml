@@ -538,6 +538,10 @@ unmaintained = "all"
 # - 以下任一变化必须先重审并在同 PR 删除或修订豁免：`rsa`/`openidconnect`
 #   版本或 feature 变化；新增反向消费者；引入 private-key JWT/RSA 签名/解密；RustSec 出现
 #   patched 版本；OIDC token endpoint 或动态 provider 能力扩大。
+# - 2026-10-29 V7-COMP-031 重审：反向生产链为五节，新增消费者 `openbot-desktop`（发行入口
+#   `wrok-bot` 的 required-features `desktop-launcher` 经 `desktop-local-runtime` 启用
+#   `openbot-infra/server-runtime`，编入 openidconnect→rsa）；Desktop 源码无 openidconnect/rsa
+#   引用、全仓私钥符号零命中，rsa 仍只用于 RP 公钥验签，豁免维持。
 #
 # RUSTSEC-2024-0436 / RUSTSEC-2026-0173（owner: security，G6 Batch 15 窄裁决）：
 # - 两条均只有 `informational = "unmaintained"` 且 `patched = []`，不是已知漏洞；前者

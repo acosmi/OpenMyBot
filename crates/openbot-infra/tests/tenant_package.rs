@@ -12,11 +12,17 @@ use openbot_application::tenant::package::{
     TenantPackageEnvironment, TenantPackageFiles, TenantPackageStoreError,
     synchronize_tenant_package, validate_tenant_package,
 };
-use openbot_contracts::ids::ActorId;
+use openbot_application::{
+    AgentContextSource, ProviderAdapter, ProviderExtensionKey, ProviderExtensions,
+    ProviderPortError, ProviderRequest, ProviderRoute, ProviderSession, RunExecutionLease,
+};
+use openbot_contracts::ids::{ActorId, BotId, DeploymentId, RunId, TenantId, ThreadId};
 use openbot_domain::identity::groups::{
     GroupClaimPath, GroupNormalization, IdentityProviderId, IdpGroupMapping,
 };
+use openbot_domain::thread::FencingToken;
 use openbot_infra::db::{baseline, native, pool};
+use openbot_infra::provider::context::PostgresAgentContextSource;
 use openbot_infra::tenant::{PostgresTenantPackageSynchronizer, load_tenant_package};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -653,6 +659,139 @@ async fn rejects_a_cross_package_agent_collision_and_rolls_back_both_packages() 
                     != 0
             {
                 return Err("cross-package collision 没有回滚两个 package 的观察面".to_owned());
+            }
+            Ok(())
+        },
+    )
+    .await;
+}
+
+fn extension_package() -> LoadedTenantPackage {
+    let files = TenantPackageFiles {
+        brand: "tenant: { id: tenant-x, product_name: Ledgerline }".to_owned(),
+        agents: "agents:\n  - id: crab-agent\n    name: Crab\n    title: Crab\n    role_description: Host bot.\n    type: built-in\n    system_prompt: Answer carefully.\n    providerSource: extension:crabcode\n".to_owned(),
+        channels: "channels: [{ id: channel-tenant-x, name: Channel, description: Test channel., permitted_agents: [crab-agent], allowed_groups: [all] }]".to_owned(),
+        model: "model: { provider: openai, credential_secret_ref: openai-key, default_model: gpt-4.1 }"
+            .to_owned(),
+        knowledge: "sources: []".to_owned(),
+    };
+    LoadedTenantPackage::new(
+        validate_tenant_package(files).unwrap(),
+        "/packages/tenant-x".to_owned(),
+        "c".repeat(64),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "需要真实 PostgreSQL：设 OPENBOT_TEST_DATABASE_URL 后加 --include-ignored 运行"]
+async fn synchronize_writes_extension_provider_source_verbatim() {
+    with_package_database(
+        "synchronize_writes_extension_provider_source_verbatim",
+        "tenant_extension_write",
+        |pool, synchronizer| async move {
+            synchronize_tenant_package(&synchronizer, &extension_package(), &multi())
+                .await
+                .map_err(|error| error.to_string())?;
+            let source: String = pool
+                .get()
+                .await
+                .map_err(|error| error.to_string())?
+                .query_one(
+                    "SELECT configuration->>'providerSource' FROM public.agents WHERE id='crab-agent'",
+                    &[],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .try_get(0)
+                .map_err(|error| error.to_string())?;
+            if source != "extension:crabcode" {
+                return Err(format!("providerSource 未原样写入：{source}"));
+            }
+            Ok(())
+        },
+    )
+    .await;
+}
+
+struct ContextOnlyAdapter;
+
+#[async_trait::async_trait]
+impl ProviderAdapter for ContextOnlyAdapter {
+    async fn start(
+        &self,
+        _: ProviderRequest,
+    ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
+        panic!("context-only evidence must not start provider")
+    }
+}
+
+#[tokio::test]
+#[ignore = "需要真实 PostgreSQL：设 OPENBOT_TEST_DATABASE_URL 后加 --include-ignored 运行"]
+async fn context_source_routes_extension_provider_source_after_sync() {
+    with_package_database(
+        "context_source_routes_extension_provider_source_after_sync",
+        "tenant_extension_route",
+        |pool, synchronizer| async move {
+            insert_user(&pool, PRINCIPAL, "dev@openbot.local", &[]).await?;
+            synchronize_tenant_package(&synchronizer, &extension_package(), &single())
+                .await
+                .map_err(|error| error.to_string())?;
+            pool.get()
+                .await
+                .map_err(|error| error.to_string())?
+                .batch_execute(
+                    "INSERT INTO public.threads(
+                       thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,status,
+                       next_message_seq,next_event_seq,created_at,updated_at
+                     ) VALUES('thread-x','tenant-x','deployment-x','dev-local-user','direct_bot',
+                              'crab-agent','active',1,0,clock_timestamp(),clock_timestamp());
+                     INSERT INTO public.thread_memberships(thread_id,user_id)
+                       VALUES('thread-x','dev-local-user');
+                     INSERT INTO public.runs(
+                       run_id,thread_id,bot_id,actor_id,foreground,status,fencing_token,
+                       next_event_seq,created_at,started_at
+                     ) VALUES('run-x','thread-x','crab-agent','dev-local-user',true,'running',1,0,
+                              clock_timestamp(),clock_timestamp());
+                     INSERT INTO public.messages(
+                       message_id,thread_id,seq,role,content,search_text,run_id,actor_id,created_at
+                     ) VALUES('message-x','thread-x',0,'user','{\"text\":\"Hello.\"}',
+                              'Hello.','run-x','dev-local-user',clock_timestamp());",
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let key = ProviderExtensionKey::new("crabcode").unwrap();
+            let extensions = ProviderExtensions::try_new(vec![(
+                key.clone(),
+                std::sync::Arc::new(ContextOnlyAdapter) as std::sync::Arc<dyn ProviderAdapter>,
+            )])
+            .map_err(|error| error.to_string())?;
+            let context = PostgresAgentContextSource::new(
+                pool.clone(),
+                DeploymentId::new("deployment-x"),
+                TenantId::new("tenant-x"),
+                None,
+            )
+            .map_err(|error| error.to_string())?
+            .with_extensions(extensions);
+            let lease = RunExecutionLease::new(
+                RunId::new("run-x"),
+                ThreadId::new("thread-x"),
+                BotId::new("crab-agent"),
+                ActorId::new(PRINCIPAL),
+                FencingToken::new(1).map_err(|error| error.to_string())?,
+                0,
+            )
+            .map_err(|error| error.to_string())?;
+            let request = context
+                .load(&lease)
+                .await
+                .map_err(|error| error.to_string())?;
+            if request.route != ProviderRoute::Extension(key) {
+                return Err(format!(
+                    "同步后的 extension 路由不成立：{:?}",
+                    request.route
+                ));
             }
             Ok(())
         },

@@ -1,0 +1,61 @@
+[package]
+name = "omb-hostdriver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+testkit = []
+
+[dependencies]
+omb-store = { path = "../omb-store" }
+openbot-application = { path = "../openbot-application" }
+tokio = { workspace = true, features = ["process"] }
+tokio-postgres.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+uuid.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+rustix.workspace = true
+ryu = "1.0.23"
+
+[dev-dependencies]
+omb-store = { path = "../omb-store", features = ["testkit"] }
+
+[[bin]]
+name = "fake-crabcode"
+path = "src/bin/fake_crabcode.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "driver"
+required-features = ["testkit"]
+
+[[test]]
+name = "permission"
+required-features = ["testkit"]
+
+[[test]]
+name = "limits"
+required-features = ["testkit"]
+
+[[test]]
+name = "stop"
+required-features = ["testkit"]
+
+[[test]]
+name = "resume"
+required-features = ["testkit"]
+
+[[test]]
+name = "real"
+required-features = ["testkit"]

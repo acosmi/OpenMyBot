@@ -25,6 +25,8 @@
 
 Wrok Bot 是一个使用 Rust 构建的 AI 员工 / 数字队友平台，定位为“能独立干活的 AI 同事”。平台包含桌面宿主、服务端、Web 界面和开发中的移动客户端。项目目前处于开发验证阶段，首版优先面向 macOS。
 
+Wrok Bot 与 [OpenMyBot](openmybot/README.zh-CN.md) 是本工作区中基于同一 OpenBot 引擎装配的两种产品。Wrok Bot 提供桌面与服务端产品入口；OpenMyBot 当前提供本地前台守护进程、初始化和经认证的总览命令，渠道、宿主驱动与 MCP 集成仍在开发中。
+
 官方网站：[wrokbot.com](https://wrokbot.com)（主域名）· [grokbot.si](https://grokbot.si)。
 
 ## 当前进度

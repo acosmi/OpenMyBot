@@ -16,6 +16,12 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/omb-store",
+    "crates/omb-daemon",
+    "crates/omb-cli",
+    "crates/omb-channels",
+    "crates/omb-hostdriver",
+    "crates/omb-mcp",
     "crates/openbot-contracts",
     "crates/openbot-domain",
     "crates/openbot-application",
@@ -199,7 +205,8 @@ web-sys = { version = "=0.3.104", features = ["Crypto", "CssStyleDeclaration", "
 
 # Axum transport（v3 §5.2：transport 只做认证 / framing / 大小限制 / 错误映射）
 axum = { version = "0.8.9", features = ["macros", "ws"] }
-# 只给 Server WebSocket 真 socket 测试使用；生产走 axum::extract::ws 的同一 tungstenite 图。
+# Server WebSocket 真 socket 测试使用，生产 Server 走 axum::extract::ws 的同一 tungstenite 图；渠道连接器的
+# WebSocket 客户端只在 SafeDialer::connect_websocket_stream 返回的已验证流上握手与收发帧，TLS 由 SafeDialer 的 rustls 提供，本包不启用 TLS feature。
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "async-await", "std"] }
 tower = { version = "0.5.3", features = ["timeout", "limit"] }

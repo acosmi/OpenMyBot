@@ -13,10 +13,10 @@ spec.loader.exec_module(guard)
 
 class PublicationGuardTests(unittest.TestCase):
     def test_private_paths_and_unreviewed_documents_are_rejected(self):
-        for path in ['docs/notes.md', 'grok-bot/src/index.ts', 'crates/x/implementation.md', 'crates/x/.env', '.local-private/backup.tar.gz', 'artifacts/logo.zip', 'crates/x/node_modules/a.js']:
+        for path in ['docs/notes.md', 'grok-bot/src/index.ts', 'crates/x/implementation.md', 'crates/x/.env', '.local-private/backup.tar.gz', 'artifacts/logo.zip', 'crates/x/node_modules/a.js', 'openmybot/README-copy.md', 'openmybot/README.zh-CN-copy.md', 'openmybot/compat/internal.md', 'openmybot/hosts/internal.md']:
             with self.subTest(path=path):
                 self.assertIsNotNone(guard.forbidden(path))
-        for path in ['README.md', 'IMPLEMENTATION_LEDGER.md', 'Cargo.lock', 'crates/wrokbot-ui/assets/brand/wrok-bot-motion.gif']:
+        for path in ['README.md', 'IMPLEMENTATION_LEDGER.md', 'Cargo.lock', 'crates/wrokbot-ui/assets/brand/wrok-bot-motion.gif', 'openmybot/README.md', 'openmybot/README.zh-CN.md', 'openmybot/compat/README.md', 'openmybot/hosts/README.md']:
             self.assertIsNone(guard.forbidden(path))
 
     def test_implementation_ledger_allowlist_is_exact(self):

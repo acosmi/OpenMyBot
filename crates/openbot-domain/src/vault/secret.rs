@@ -40,7 +40,7 @@ use subtle::ConstantTimeEq;
 /// 回答不了这个问题 —— 它只能回答"某人在某处写了什么"。封闭枚举让新增一类值成为一次
 /// 编译期事件：所有按类别分派的地方当场红，而不是安静地落进 `_ =>` 分支。
 ///
-/// 六个变体与 §6.4 的六项**一一对应**，由 [`SecretClass::ALL`] 与
+/// 八个变体与 §6.4 的八项**一一对应**，由 [`SecretClass::ALL`] 与
 /// `secret_class_covers_exactly_the_plan_list` 双向钉住。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SecretClass {
@@ -80,19 +80,27 @@ pub enum SecretClass {
     ///
     /// 泄漏面最大的一类：它签的是**下一次所有用户会执行的字节**。
     UpdaterKey,
+
+    /// 下游渠道的 bot token、app secret 或 webhook 签名凭据。
+    ExternalChannelCredential,
+
+    /// 下游宿主驱动与外部宿主之间的会话或控制凭据。
+    HostDriverToken,
 }
 
 impl SecretClass {
-    /// 全部六个变体，顺序与 v3 §6.4 原文的列举顺序一致。
+    /// 全部八个变体，顺序与 §6.4 原文的列举顺序一致。
     ///
     /// 用它遍历而不是各处手抄 —— 手抄件会漂。
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::ModelKey,
         Self::McpOAuthRefreshToken,
         Self::SsoProviderSecret,
         Self::ComputerBootstrapSecret,
         Self::RunSigningKey,
         Self::UpdaterKey,
+        Self::ExternalChannelCredential,
+        Self::HostDriverToken,
     ];
 
     /// 稳定标识符。进审计、metrics label 与 `Debug` 输出。
@@ -108,6 +116,8 @@ impl SecretClass {
             Self::ComputerBootstrapSecret => "computer_bootstrap_secret",
             Self::RunSigningKey => "run_signing_key",
             Self::UpdaterKey => "updater_key",
+            Self::ExternalChannelCredential => "external_channel_credential",
+            Self::HostDriverToken => "host_driver_token",
         }
     }
 }
@@ -394,10 +404,10 @@ mod tests {
         assert!(rendered.contains("https://example.invalid"), "{rendered}");
     }
 
-    /// 六个类别与 §6.4 原文一一对应，且标识符两两不同。
+    /// 八个类别与 §6.4 原文一一对应，且标识符两两不同。
     #[test]
     fn secret_class_covers_exactly_the_plan_list() {
-        assert_eq!(SecretClass::ALL.len(), 6);
+        assert_eq!(SecretClass::ALL.len(), 8);
 
         let mut codes: Vec<&'static str> = SecretClass::ALL
             .iter()
@@ -406,7 +416,7 @@ mod tests {
             .collect();
         codes.sort_unstable();
         codes.dedup();
-        assert_eq!(codes.len(), 6, "类别标识符必须两两不同");
+        assert_eq!(codes.len(), 8, "类别标识符必须两两不同");
 
         // 穷举 match：新增变体不改这里就编译不过，于是 ALL 的长度断言不会悄悄过时。
         for class in SecretClass::ALL {
@@ -417,6 +427,8 @@ mod tests {
                 SecretClass::ComputerBootstrapSecret => "computer_bootstrap_secret",
                 SecretClass::RunSigningKey => "run_signing_key",
                 SecretClass::UpdaterKey => "updater_key",
+                SecretClass::ExternalChannelCredential => "external_channel_credential",
+                SecretClass::HostDriverToken => "host_driver_token",
             };
             assert_eq!(class.as_str(), expected);
             assert_eq!(class.to_string(), expected);

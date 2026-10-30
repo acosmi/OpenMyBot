@@ -401,6 +401,31 @@ impl ServerConfig {
             single_user,
         )
     }
+
+    /// Check the transport policy after the actual authentication mode has been resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::transport::SingleUserRemoteTransportRefused`] when single-user mode
+    /// cannot use the loopback single-user policy. The caller must stop startup on this error.
+    pub fn startup_transport_policy(
+        &self,
+        single_user: bool,
+    ) -> Result<
+        super::transport::TrustedTransportPolicy,
+        super::transport::SingleUserRemoteTransportRefused,
+    > {
+        let policy = self.transport_policy(single_user);
+        if single_user
+            && !matches!(
+                policy.mode,
+                super::transport::TrustedTransportMode::LoopbackSingleUser
+            )
+        {
+            return Err(super::transport::SingleUserRemoteTransportRefused);
+        }
+        Ok(policy)
+    }
 }
 
 /// 解析一个可选的绝对 `http`/`https` 地址，失败时记一条问题。

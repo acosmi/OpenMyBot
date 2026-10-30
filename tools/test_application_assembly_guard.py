@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from application_assembly_guard import GuardError, production_owners, repository_sources
 
 
@@ -25,6 +26,21 @@ class ApplicationAssemblyGuardTests(unittest.TestCase):
 
     def test_explicit_test_module_is_excluded(self):
         self.assertEqual(production_owners(self.sources), {"src/assembly.rs"})
+
+    def test_cfg_all_with_test_is_excluded_but_cfg_any_is_not(self):
+        for attribute in [
+            '#[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]',
+            '#[cfg(all(feature = "desktop-local-runtime", test))]',
+        ]:
+            self.sources["src/host.rs"] = attribute + "\nmod tests;"
+            self.assertEqual(production_owners(self.sources), {"src/assembly.rs"})
+        for attribute in [
+            '#[cfg(any(test, feature = "desktop-local-runtime"))]',
+            '#[cfg(all(feature = "desktop-local-runtime", not(test)))]',
+            '#[cfg(all(feature = "desktop-local-runtime", any(test, target_os = "macos")))]',
+        ]:
+            self.sources["src/host.rs"] = attribute + "\nmod tests;"
+            self.assertIn("src/host/tests.rs", production_owners(self.sources))
 
     def test_filename_alone_does_not_exclude_constructor(self):
         self.sources["src/host.rs"] = "mod tests;"
