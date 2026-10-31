@@ -1560,7 +1560,7 @@ async fn real_crabcode_daemon_recheck_with_cli_approve_and_cancel() {
     let thread = ThreadIdentity::new(&deployment).mint_from_entropy(entropy);
     let (write_event, stop_event) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
     let (write_run, stop_run) = (format!("run-{write_event}"), format!("run-{stop_event}"));
-    let write = "Use the Read tool to read notes.txt in the current directory. Then use the Write tool to create approved-by-cli.txt containing the word yes. Finally reply with the word DONE.";
+    let write = "Use the Read tool to read notes.txt in the current directory. Then use the Write tool to create greeting.txt containing the word hello. Finally reply with the word DONE.";
     let count =
         "Count from 1 to 300, writing each number on its own line with a short sentence about it.";
     inspect_stopped(&fixture, &format!("INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status) VALUES ('{write_event}','event','host','crabcode','op:{write_event}',statement_timestamp(),'{binding}','accepted_message','{write}',sha256('{write}'::bytea),'{write_run}','{thread}','pending'),('{stop_event}','event','host','crabcode','op:{stop_event}',statement_timestamp(),'{binding}','accepted_message','{count}',sha256('{count}'::bytea),'{stop_run}','{thread}','pending') RETURNING record_id")).await;
@@ -1577,7 +1577,8 @@ async fn real_crabcode_daemon_recheck_with_cli_approve_and_cancel() {
     );
     assert!(pin_matches, "{status}");
 
-    // (5) The first run starts and asks for Write; read-only calls are recorded as observed.
+    // (5) The first run starts and asks for Write; read-only calls are recorded as observed, and
+    // the owner denies every other request through the release binary while Write is awaited.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     let permission_id = loop {
         let (code, run) = openmybot(
@@ -1590,12 +1591,26 @@ async fn real_crabcode_daemon_recheck_with_cli_approve_and_cancel() {
         assert_eq!(code, 0, "{run}");
         assert!(run["data"]["terminal_kind"].is_null(), "{run}");
         let initialized: i64 = query_own(&fixture, &format!("SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id='{write_run}' AND init_at IS NOT NULL")).await[0].get(0);
-        let asked = run["data"]["permissions"]
+        let pending: Vec<(String, bool)> = run["data"]["permissions"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["tool_name"] == "Write" && p["decision"].is_null())
-            .map(|p| p["permission_id"].as_str().unwrap().to_owned());
+            .filter(|p| p["decision"].is_null())
+            .map(|p| {
+                (
+                    p["permission_id"].as_str().unwrap().to_owned(),
+                    p["tool_name"] == "Write",
+                )
+            })
+            .collect();
+        for (id, _) in pending.iter().filter(|(_, write)| !write) {
+            let (code, denied) = openmybot(&fixture, &binary, &home, &mut report, &["deny", id]);
+            assert_eq!(code, 0, "{denied}");
+        }
+        let asked = pending
+            .iter()
+            .find(|(_, write)| *write)
+            .map(|(id, _)| id.clone());
         if let Some(id) = asked.filter(|_| initialized > 0) {
             break id;
         }
@@ -1632,7 +1647,7 @@ async fn real_crabcode_daemon_recheck_with_cli_approve_and_cancel() {
         assert!(tokio::time::Instant::now() < deadline, "{run}");
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
-    let file_written = workspace.join("approved-by-cli.txt").exists();
+    let file_written = workspace.join("greeting.txt").exists();
     let permissions = finished["data"]["permissions"].as_array().unwrap();
     report.set(
         "step_readonly",

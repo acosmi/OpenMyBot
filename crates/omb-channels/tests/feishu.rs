@@ -43,6 +43,8 @@ const SECRET_2: &str = "SENTINEL-feishu-app-secret-2";
 const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
 const ENDPOINT_PATH: &str = "/callback/ws/endpoint";
 const MESSAGES_PATH: &str = "/open-apis/im/v1/messages";
+/// Client sessions of the cluster other than the asking one.
+const OTHER_SESSIONS: &str = "SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend' AND pid<>pg_backend_pid()";
 const PLAN: [Duration; 5] = [
     Duration::from_millis(60),
     Duration::from_millis(80),
@@ -1380,6 +1382,104 @@ async fn disconnect_racing_the_ack_never_duplicates_the_event() {
         assert_eq!(events(env.client()).await, round as i64, "round {round}");
         assert_eq!(env.counters.event_conflict.load(Ordering::Relaxed), 0);
     }
+    task.stop().await;
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn stop_during_a_stalled_ack_write_ends_the_receiver_without_the_write_timeout() {
+    let mut env = Env::new().await;
+    let task = env.start(quick()).await;
+    env.connected(1).await;
+    // Each unparseable event is acknowledged with its megabyte pad; with the platform reading
+    // nothing, one acknowledgement write blocks once the socket buffers are full.
+    env.fake.set_stalled(true);
+    for _ in 0..24 {
+        assert!(
+            env.fake
+                .push_frame(env.fake.padded_event_frame(&json!({}), 1_000_000))
+        );
+    }
+    let handled = || {
+        env.counters
+            .platform_payload_unparseable
+            .load(Ordering::Relaxed)
+    };
+    until("the first padded event", || handled() > 0).await;
+    let mut seen = 0;
+    while handled() != seen {
+        seen = handled();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(seen < 24, "{seen}");
+    let stopped = Instant::now();
+    task.stop().await;
+    assert!(
+        stopped.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        stopped.elapsed()
+    );
+    assert_eq!(gaps(env.client(), "stream_broken", None).await, 0);
+    rows_reach(env.client(), OTHER_SESSIONS, 0).await;
+    env.fake.disconnect();
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn stop_during_a_stalled_acceptance_ends_the_receiver_and_the_redelivery_is_accepted_once() {
+    let mut env = Env::new().await;
+    let task = env.start(quick()).await;
+    env.connected(1).await;
+    let stalled = text("ev_stall", "hello");
+    let lock = env.hold("ev_stall").await;
+    assert!(env.fake.push_event(&stalled));
+    rows_reach(
+        env.client(),
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted",
+        1,
+    )
+    .await;
+    let stopped = Instant::now();
+    let stopping = tokio::spawn(task.stop());
+    until("the receiver to close its connection", || {
+        !env.fake.connected()
+    })
+    .await;
+    assert!(
+        stopped.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        stopped.elapsed()
+    );
+    // The receiver's database session answers the stalled statement, rolls back and ends.
+    release(lock, "ev_stall").await;
+    tokio::time::timeout(Duration::from_secs(20), stopping)
+        .await
+        .unwrap()
+        .unwrap();
+    rows_reach(env.client(), OTHER_SESSIONS, 0).await;
+    assert_eq!(rows_of(env.client(), "ev_stall").await, 0);
+    assert_eq!(
+        count(
+            env.client(),
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(env.acks_of("ev_stall"), 0);
+    let task = env.start(quick()).await;
+    env.connected(2).await;
+    assert!(env.fake.push_event(&stalled));
+    env.acked("ev_stall", 1).await;
+    assert!(env.fake.push_event(&stalled));
+    env.acked("ev_stall", 2).await;
+    assert_eq!(rows_of(env.client(), "ev_stall").await, 1);
+    assert_eq!(
+        disposition(env.client(), "ev_stall").await,
+        "accepted_message"
+    );
     task.stop().await;
     env.stop().await;
 }

@@ -595,14 +595,11 @@ async fn receive(
                 HashMap::new();
             let mut last_read = Instant::now();
             let mut last_ping = Instant::now();
-            if !matches!(
-                tokio::time::timeout(
-                    FS_WRITE_TIMEOUT,
-                    write.send(Message::binary(ping_frame(service).encode()))
-                )
-                .await,
-                Ok(Ok(()))
-            ) {
+            let sent = tokio::select! {
+                _ = &mut stop => return Ok(()),
+                sent = tokio::time::timeout(FS_WRITE_TIMEOUT, write.send(Message::binary(ping_frame(service).encode()))) => sent,
+            };
+            if !matches!(sent, Ok(Ok(()))) {
                 break 'attempt Some(PollGapReason::StreamBroken);
             }
             loop {
@@ -613,10 +610,11 @@ async fn receive(
                     }
                     () = tokio::time::sleep_until(last_ping + ping) => {
                         last_ping = Instant::now();
-                        if !matches!(
-                            tokio::time::timeout(FS_WRITE_TIMEOUT, write.send(Message::binary(ping_frame(service).encode()))).await,
-                            Ok(Ok(()))
-                        ) {
+                        let sent = tokio::select! {
+                            _ = &mut stop => return Ok(()),
+                            sent = tokio::time::timeout(FS_WRITE_TIMEOUT, write.send(Message::binary(ping_frame(service).encode()))) => sent,
+                        };
+                        if !matches!(sent, Ok(Ok(()))) {
                             break 'attempt Some(PollGapReason::StreamBroken);
                         }
                         continue;
@@ -708,14 +706,14 @@ async fn receive(
                         true
                     }
                     Normalized::Event(event) => {
-                        let accepted = accept_event(
-                            &mut client,
-                            receiver.binding_id,
-                            &event,
-                            &OMB_REPLY_TEXTS_V1,
-                            Instant::now() + ACCEPT_TX_BUDGET,
-                        )
-                        .await;
+                        // Dropped on stop, the acceptance has rolled back or committed; either way
+                        // the redelivery is deduplicated.
+                        // When both are ready, the acceptance and its post-commit steps win.
+                        let accepted = tokio::select! {
+                            biased;
+                            accepted = accept_event(&mut client, receiver.binding_id, &event, &OMB_REPLY_TEXTS_V1, Instant::now() + ACCEPT_TX_BUDGET) => accepted,
+                            _ = &mut stop => return Ok(()),
+                        };
                         // Every outcome wakes, an error too: its commit may have landed.
                         context.wake.notify_one();
                         match accepted {
@@ -740,20 +738,14 @@ async fn receive(
                 };
                 // Past the budget the platform redelivers; deduplication absorbs it.
                 let elapsed = received.elapsed();
-                if committed
-                    && elapsed <= timings.fs_ack_budget
-                    && !matches!(
-                        tokio::time::timeout(
-                            FS_WRITE_TIMEOUT,
-                            write.send(Message::binary(
-                                ack_frame(&frame, elapsed.as_millis()).encode()
-                            ))
-                        )
-                        .await,
-                        Ok(Ok(()))
-                    )
-                {
-                    break 'attempt Some(PollGapReason::StreamBroken);
+                if committed && elapsed <= timings.fs_ack_budget {
+                    let sent = tokio::select! {
+                        _ = &mut stop => return Ok(()),
+                        sent = tokio::time::timeout(FS_WRITE_TIMEOUT, write.send(Message::binary(ack_frame(&frame, elapsed.as_millis()).encode()))) => sent,
+                    };
+                    if !matches!(sent, Ok(Ok(()))) {
+                        break 'attempt Some(PollGapReason::StreamBroken);
+                    }
                 }
             }
         };
