@@ -449,7 +449,9 @@ pub async fn subscribe_channel_activity<D: ThreadDirectory>(
         .map_err(|error| error.into_app_error())
 }
 
-/// 读取 scope-aware durable history；未知/不可见/已删除由 port 统一投影为空列表。
+/// Reads the scope-aware durable history. Unknown, invisible and soft-deleted Threads whose
+/// history clearing has not completed project to an empty list; a member's read of a Thread
+/// whose history clearing completed is `NotVisible` (404), whether or not it is soft deleted yet.
 pub async fn get_thread_history<D: ThreadDirectory>(
     directory: &D,
     auth: &AuthContext,

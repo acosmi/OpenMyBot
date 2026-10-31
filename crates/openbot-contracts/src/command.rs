@@ -444,7 +444,9 @@ pub enum AppCommand {
 
     /// 读取当前 actor 可见的完整 native thread history。
     GetThreadHistory {
-        /// Thread id；未知/空/不可见统一成功空列表，非 UUID 外形仍是 400。
+        /// Thread id. Unknown, new, invisible and soft-deleted Threads whose history clearing has
+        /// not completed succeed with an empty list; a member's read after the clearing completed
+        /// is `NotVisible` (404). A non-UUID shape is still 400.
         thread_id: ThreadId,
     },
 
