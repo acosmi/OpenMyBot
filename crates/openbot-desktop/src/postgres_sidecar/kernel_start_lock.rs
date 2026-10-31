@@ -76,6 +76,14 @@ impl KernelStartLock {
     }
 }
 
+impl Drop for KernelStartLock {
+    fn drop(&mut self) {
+        // Closing the fd alone keeps the flock while a concurrently spawned child that has not
+        // reached exec holds a copy of this open file description; LOCK_UN releases it for all.
+        let _ = self.file.unlock();
+    }
+}
+
 fn publish_or_open(
     root: &Path,
     instance_id: &str,
@@ -523,6 +531,46 @@ mod tests {
         drop(second);
         assert!(path.is_file());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_is_not_delayed_by_a_concurrent_spawn() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let root = private_root("spawn-release");
+        let instance = "e".repeat(64);
+        let stop = AtomicBool::new(false);
+        let mut cycles = 0_u64;
+        let failure = std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        Command::new("/bin/sleep")
+                            .arg("0")
+                            .spawn()
+                            .unwrap()
+                            .wait()
+                            .unwrap();
+                    }
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut lock = KernelStartLock::acquire(&root, &instance);
+            while lock.is_ok() && Instant::now() < deadline {
+                drop(lock);
+                lock = KernelStartLock::acquire(&root, &instance);
+                cycles += 1;
+            }
+            stop.store(true, Ordering::Relaxed);
+            lock.err()
+        });
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            failure.is_none(),
+            "re-acquire after release failed on cycle {cycles}: {failure:?}"
+        );
     }
 
     #[cfg(unix)]
