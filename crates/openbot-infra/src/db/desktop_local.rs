@@ -32,7 +32,8 @@ use super::pool::{DatabasePool, connect_config};
 
 const HOST: &str = "127.0.0.1";
 const ADMIN_DATABASE: &str = "postgres";
-const APPLICATION_DATABASE: &str = "openbot";
+/// The one fixed Desktop Local business database.
+pub const APPLICATION_DATABASE: &str = "openbot";
 const APPLICATION_NAME: &str = "openbot-desktop-local";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const APPLICATION_POOL_SIZE: usize = 16;
