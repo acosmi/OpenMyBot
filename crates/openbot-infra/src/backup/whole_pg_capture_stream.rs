@@ -577,9 +577,6 @@ fn stream(
         return Err(F::PathUnsafe);
     }
     let wire = parts.manifest.wire_bytes()?;
-    if wire > b.max_wire_bytes {
-        return Err(F::CapacityExceeded);
-    }
     // Include both new names of the same sealed inode once, all retained source/spool allocation,
     // old output reserve, journal reserve and explicit capacity margin on the actual device.
     let output_grain = allocation_grain(&parts.output.directory, clock)?;
