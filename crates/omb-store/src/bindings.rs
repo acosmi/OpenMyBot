@@ -1,5 +1,5 @@
 use crate::{
-    Channel, KEY_MAX, RUN_DEADLINE_MAX, StoreError, command, finish, rows, timely, unique_rows,
+    ChannelKind, KEY_MAX, RUN_DEADLINE_MAX, StoreError, command, finish, rows, timely, unique_rows,
 };
 use time::OffsetDateTime;
 use tokio::time::Instant;
@@ -300,7 +300,7 @@ pub async fn list_bindings(
 
 pub struct NewReceiver<'a> {
     pub binding_id: Uuid,
-    pub channel: Channel,
+    pub channel: ChannelKind,
     pub source_key: &'a str,
     pub credential_envelope: &'a str,
 }

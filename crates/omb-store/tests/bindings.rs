@@ -1,7 +1,7 @@
 #[path = "../src/testkit.rs"]
 mod testkit;
 use omb_store::{
-    AcceptedEvent, AuthorityRow, Channel, GrantKind, HostBinding, IdentityKey, PairAttempt,
+    AcceptedEvent, AuthorityRow, ChannelKind, GrantKind, HostBinding, IdentityKey, PairAttempt,
     PairOutcome, PairStart, RunDeadline, StoreError, activate_host, authority_row, migrate,
     pair_attempt, pair_start, reconfirm_binding, revoke_binding,
 };
@@ -31,7 +31,7 @@ async fn pending_sender(client: &mut Client) -> Uuid {
     pair_start(
         client,
         PairStart {
-            channel: Channel::Telegram,
+            channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-1",
             granted_generation: 4,
@@ -48,7 +48,7 @@ async fn active_sender(client: &mut Client) -> Uuid {
     let started = pair_start(
         client,
         PairStart {
-            channel: Channel::Telegram,
+            channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-1",
             granted_generation: 4,
@@ -64,7 +64,7 @@ async fn active_sender(client: &mut Client) -> Uuid {
     let outcome = pair_attempt(
         &tx,
         PairAttempt {
-            channel: Channel::Telegram,
+            channel: ChannelKind::from_static("telegram"),
             receiver_source_key: "1001",
             sender_key: &sender,
             chat_key: &chat,

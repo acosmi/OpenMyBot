@@ -27,7 +27,7 @@ pub use events::*;
 pub use host_sessions::*;
 pub use migration::{MigrationReport, migrate};
 pub use pairing::{
-    AcceptedEvent, Channel, PairAttempt, PairCode, PairOutcome, PairStart, PairStarted,
+    AcceptedEvent, ChannelKind, PairAttempt, PairCode, PairOutcome, PairStart, PairStarted,
     pair_attempt, pair_start,
 };
 pub use sweep::{clear_content, delete_expired};

@@ -1,13 +1,13 @@
 //! Telegram Bot API long polling: boundary parsing, fingerprints, offsets and the receive loop.
 use crate::{
     CancelRequests, ChannelError, Connection, Counters, Endpoints, OMB_REPLY_TEXTS_V1,
-    STORE_BUDGET, TG_HTTP_MARGIN, TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, Task,
+    STORE_BUDGET, TELEGRAM, TG_HTTP_MARGIN, TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, Task,
     TelegramEndpoint, Timings,
 };
 use omb_store::{
-    ACCEPT_TX_BUDGET, AcceptOutcome, Channel, Command, Content, IdentityKey, NormalizedEvent,
-    PollGapReason, ReceiverRow, StoreError, Suspension, accept_event, close_poll_gaps,
-    latest_update_id, open_poll_gap, suspend_receiver,
+    ACCEPT_TX_BUDGET, AcceptOutcome, Command, Content, IdentityKey, NormalizedEvent, PollGapReason,
+    ReceiverRow, StoreError, Suspension, accept_event, close_poll_gaps, latest_event,
+    open_poll_gap, suspend_receiver,
 };
 use openbot_contracts::ids::ActorId;
 use openbot_domain::vault::{SecretBytes, SecretKind, SecretPrincipal, ServiceId};
@@ -85,7 +85,7 @@ pub fn normalize(update: &Value, source_key: &str) -> Normalized {
         (Some(_), None) => Content::Other,
     };
     Normalized::Event(NormalizedEvent {
-        channel: Channel::Telegram,
+        channel: TELEGRAM,
         source_key: source_key.to_owned(),
         event_key: update_id.to_string(),
         event_type: "telegram.message".to_owned(),
@@ -302,9 +302,11 @@ async fn receive(
     let mut memory: Option<u64> = None;
     let mut failures = 0u32;
     loop {
-        let stored = latest_update_id(&client, Channel::Telegram, &receiver.source_key)
+        let stored = latest_event(&client, &TELEGRAM, &receiver.source_key)
             .await
-            .map_err(store)?;
+            .map_err(store)?
+            .map(|(key, at)| Ok((key.parse().map_err(|_| ChannelError::StoreFailed)?, at)))
+            .transpose()?;
         let url = updates_url(
             &context.endpoints.telegram,
             token,
@@ -622,7 +624,7 @@ mod tests {
         assert_eq!(
             normalized,
             NormalizedEvent {
-                channel: Channel::Telegram,
+                channel: TELEGRAM,
                 source_key: "1001".into(),
                 event_key: "500".into(),
                 event_type: "telegram.message".into(),
@@ -948,7 +950,7 @@ mod tests {
         .unwrap();
         let row = ReceiverRow {
             binding_id: uuid::Uuid::now_v7(),
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: sentinel.into(),
         };

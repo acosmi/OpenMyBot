@@ -7,14 +7,15 @@ use crate::{
     pg,
 };
 use omb_channels::{
-    Counters, CredentialProblem, Endpoints, verify_credentials, verify_feishu_credentials,
+    Counters, CredentialProblem, Endpoints, FEISHU, TELEGRAM, verify_credentials,
+    verify_feishu_credentials,
 };
 use omb_hostdriver::WorkspaceRoots;
 use omb_store::{
-    Channel, Decided, Decision, EventCancel, GrantKind, HostAccept, HostBinding, HostBindingState,
-    HostMessage, IdentityKey, KEY_MAX, MCP_LIST_MAX, NewReceiver, OperationId, ReceiverRow,
-    RunDeadline, Settled, StoreError, accept_host_begin, binding_run, binding_runs, cancel_pending,
-    cancel_state, host_binding_state,
+    ChannelKind, Decided, Decision, EventCancel, GrantKind, HostAccept, HostBinding,
+    HostBindingState, HostMessage, IdentityKey, KEY_MAX, MCP_LIST_MAX, NewReceiver, OperationId,
+    ReceiverRow, RunDeadline, Settled, StoreError, accept_host_begin, binding_run, binding_runs,
+    cancel_pending, cancel_state, host_binding_state,
 };
 use openbot_application::ApplicationService;
 use openbot_contracts::{
@@ -158,8 +159,8 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
             let args: PairArgs = decode(args)?;
             Request::PairStart(PairRequest {
                 channel: match args.channel.as_str() {
-                    "telegram" => Channel::Telegram,
-                    "feishu" => Channel::Feishu,
+                    "telegram" => TELEGRAM,
+                    "feishu" => FEISHU,
                     _ => return Err(DaemonError::InvalidRequest),
                 },
                 workspace: args.workspace,
@@ -239,10 +240,10 @@ impl ChannelSecret {
             app_secret: SecretBytes::new(app_secret.into_bytes()),
         })
     }
-    pub(crate) fn channel(&self) -> Channel {
+    pub(crate) fn channel(&self) -> ChannelKind {
         match self {
-            Self::Telegram { .. } => Channel::Telegram,
-            Self::Feishu { .. } => Channel::Feishu,
+            Self::Telegram { .. } => TELEGRAM,
+            Self::Feishu { .. } => FEISHU,
         }
     }
     pub(crate) fn source_key(&self) -> &str {
@@ -259,11 +260,12 @@ impl ChannelSecret {
     }
 }
 /// The vault consumer of a channel's receiver credential.
-fn service(channel: Channel) -> ServiceId {
-    ServiceId::new(match channel {
-        Channel::Telegram => "openmybot.telegram",
-        Channel::Feishu => "openmybot.feishu",
-    })
+fn service(channel: &ChannelKind) -> Result<ServiceId, DaemonError> {
+    Ok(ServiceId::new(match channel.as_str() {
+        "telegram" => "openmybot.telegram",
+        "feishu" => "openmybot.feishu",
+        _ => return Err(DaemonError::InvalidRequest),
+    }))
 }
 
 /// A runtime receiver change the daemon's main loop performs; each carries its receipt.
@@ -425,12 +427,12 @@ impl Ops {
                                 &row.binding_id,
                                 SecretKind::Connector,
                                 SecretPrincipal::Actor(self.owner.clone()),
-                                SecretPrincipal::Service(service(row.channel)),
+                                SecretPrincipal::Service(service(&row.channel)?),
                                 &row.credential_envelope,
                             )
                             .map_err(|_| DaemonError::CredentialRejected)?
                             .into_secret();
-                        self.verify(row.channel, &row.source_key, &secret, deadline)
+                        self.verify(&row.channel, &row.source_key, &secret, deadline)
                             .await?;
                         let generation = self.generation()?;
                         let mut client = self.control.lock().await;
@@ -488,7 +490,7 @@ impl Ops {
             }
             Request::BindingsReceiver(secret) => {
                 self.verify(
-                    secret.channel(),
+                    &secret.channel(),
                     secret.source_key(),
                     secret.secret(),
                     deadline,
@@ -501,7 +503,7 @@ impl Ops {
                         &binding_id,
                         SecretKind::Connector,
                         SecretPrincipal::Actor(self.owner.clone()),
-                        SecretPrincipal::Service(service(secret.channel())),
+                        SecretPrincipal::Service(service(&secret.channel())?),
                         secret.secret(),
                     )
                     .map_err(|_| DaemonError::InternalError)?;
@@ -703,26 +705,27 @@ impl Ops {
     /// Bind-time credential check of the channel within the operation's deadline.
     async fn verify(
         &self,
-        channel: Channel,
+        channel: &ChannelKind,
         source_key: &str,
         secret: &SecretBytes,
         deadline: Instant,
     ) -> Result<(), DaemonError> {
-        let checked = match channel {
-            Channel::Telegram => {
+        let checked = match channel.as_str() {
+            "telegram" => {
                 timeout_at(
                     deadline,
                     verify_credentials(&self.endpoints.telegram, secret, source_key),
                 )
                 .await
             }
-            Channel::Feishu => {
+            "feishu" => {
                 timeout_at(
                     deadline,
                     verify_feishu_credentials(&self.endpoints.feishu, source_key, secret),
                 )
                 .await
             }
+            _ => return Err(DaemonError::InvalidRequest),
         };
         match checked {
             Err(_) => Err(DaemonError::RequestTimeout),
@@ -1279,7 +1282,7 @@ mod tests {
         ) else {
             panic!("not a receiver request");
         };
-        assert_eq!(secret.channel(), Channel::Feishu);
+        assert_eq!(secret.channel(), FEISHU);
         assert_eq!(secret.source_key(), "a");
     }
 
@@ -1323,13 +1326,13 @@ mod tests {
         assert_eq!(format!("{secret:#?}"), "[REDACTED]");
         assert_eq!(secret.source_key(), "123456");
         assert_eq!(secret.secret().expose(), b"123456:SENTINEL-debug");
-        assert_eq!(secret.channel(), Channel::Telegram);
+        assert_eq!(secret.channel(), TELEGRAM);
     }
 
     #[test]
     fn feishu_secret_parses_app_id_once_and_needs_a_secret() {
         let secret = ChannelSecret::feishu("cli_a".into(), "s".into()).unwrap();
-        assert_eq!(secret.channel(), Channel::Feishu);
+        assert_eq!(secret.channel(), FEISHU);
         assert_eq!(secret.source_key(), "cli_a");
         assert_eq!(secret.secret().expose(), b"s");
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
@@ -1348,7 +1351,7 @@ mod tests {
             "cli a"
         );
         let telegram = ChannelSecret::telegram("1:x".into()).unwrap();
-        assert_eq!(telegram.channel(), Channel::Telegram);
+        assert_eq!(telegram.channel(), TELEGRAM);
         assert_eq!(telegram.source_key(), "1");
     }
 

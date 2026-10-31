@@ -16,7 +16,7 @@ pub use telegram::{
     canonical_json, classify, fingerprint, next_offset, normalize, verify_credentials,
 };
 
-use omb_store::{Channel, ReceiverRow, ReplyTexts, StateLabels, touch_heartbeat};
+use omb_store::{ChannelKind, ReceiverRow, ReplyTexts, StateLabels, touch_heartbeat};
 use openbot_infra::net::safe_http::{SafeDialer, SchemePolicy};
 use std::{future::Future, sync::atomic::AtomicU64, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
@@ -113,6 +113,8 @@ pub const OMB_REPLY_TEXTS_V1: ReplyTexts<'static> = ReplyTexts {
 pub const CANCEL_QUEUE: usize = 16;
 /// The narrow handle a receiver holds: it passes only the binding id of a committed `/cancel`.
 pub type CancelRequests = tokio::sync::mpsc::Sender<Uuid>;
+pub const TELEGRAM: ChannelKind = ChannelKind::from_static("telegram");
+pub const FEISHU: ChannelKind = ChannelKind::from_static("feishu");
 /// Status note of each channel.
 pub const TELEGRAM_NOTE: &str = "telegram 长轮询；中断区间内的更新在平台保留期内补回";
 pub const FEISHU_NOTE: &str = "feishu 长连接；断开区间内的事件丢失，不补回";
@@ -261,9 +263,10 @@ pub fn start_receiver(
     receiver: ReceiverRow,
     context: ReceiverContext,
 ) -> Task {
-    match receiver.channel {
-        Channel::Telegram => telegram::start_receiver(connection, receiver, context),
-        Channel::Feishu => feishu::start_receiver(connection, receiver, context),
+    match receiver.channel.as_str() {
+        "telegram" => telegram::start_receiver(connection, receiver, context),
+        "feishu" => feishu::start_receiver(connection, receiver, context),
+        _ => Task::spawn(connection, |_, _| async { Err(ChannelError::StoreFailed) }),
     }
 }
 

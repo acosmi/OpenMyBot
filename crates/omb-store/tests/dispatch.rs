@@ -1,6 +1,6 @@
 //! Dispatch claim, receipt recording and expiry against an own PostgreSQL 17.11 cluster.
 use omb_store::{
-    AcceptOutcome, Channel, Claim, Content, DispatchOutcome, Disposition, IdentityKey,
+    AcceptOutcome, ChannelKind, Claim, Content, DispatchOutcome, Disposition, IdentityKey,
     NormalizedEvent, ReplyTexts, StateLabels, accept_event, claim_dispatch, expire_pending,
     lock_dispatch, migrate, record_dispatch, revoke_binding,
     testkit::{
@@ -82,9 +82,19 @@ impl Env {
     /// Accepts one message for sender `a` (`telegram`) or `b` (`feishu`) and returns its record id.
     async fn message(&mut self, telegram: bool, key: &str) -> Uuid {
         let (channel, source, sender, receiver) = if telegram {
-            (Channel::Telegram, "1001", "telegram:42", self.telegram)
+            (
+                ChannelKind::from_static("telegram"),
+                "1001",
+                "telegram:42",
+                self.telegram,
+            )
         } else {
-            (Channel::Feishu, "cli_app", "feishu:ou_1", self.feishu)
+            (
+                ChannelKind::from_static("feishu"),
+                "cli_app",
+                "feishu:ou_1",
+                self.feishu,
+            )
         };
         let incoming = NormalizedEvent {
             channel,

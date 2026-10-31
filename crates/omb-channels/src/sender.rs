@@ -8,8 +8,8 @@ use crate::{
     feishu::{TokenReply, tenant_token},
 };
 use omb_store::{
-    Channel, Claimed, DeliveryContent, ErrorCode, Finish, RunResultFacts, TerminalKind,
-    claim_delivery, finish_delivery, record_terminal, run_result_facts, send_target,
+    Claimed, DeliveryContent, ErrorCode, Finish, RunResultFacts, TerminalKind, claim_delivery,
+    finish_delivery, record_terminal, run_result_facts, send_target,
 };
 use openbot_application::{RunTerminalKind, RunTerminalNotice, RunTerminalSubscriber};
 use openbot_contracts::ids::ActorId;
@@ -148,7 +148,7 @@ async fn deliver(
     let target = send_target(
         client,
         claimed.binding_id,
-        claimed.channel,
+        claimed.channel.clone(),
         Instant::now() + STORE_BUDGET,
     )
     .await
@@ -160,8 +160,8 @@ async fn deliver(
                 code: ErrorCode::BindingInactive,
             };
         }
-        let verdict = match claimed.channel {
-            Channel::Telegram => {
+        let verdict = match claimed.channel.as_str() {
+            "telegram" => {
                 let secret = target.receiver.as_ref().and_then(|(receiver, _)| {
                     context
                         .vault
@@ -232,7 +232,7 @@ async fn deliver(
                         .map_err(|error| *error),
                 )
             }
-            Channel::Feishu => {
+            "feishu" => {
                 let secret = target.receiver.as_ref().and_then(|(receiver, _)| {
                     context
                         .vault
@@ -334,6 +334,11 @@ async fn deliver(
                         .map(|response| (response.status().as_u16(), response.body()))
                         .map_err(|error| *error),
                 )
+            }
+            _ => {
+                break 'decide Finish::Failed {
+                    code: ErrorCode::ReceiverInactive,
+                };
             }
         };
         match verdict {

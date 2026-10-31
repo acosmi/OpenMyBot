@@ -2,13 +2,13 @@
 //! tokens and the receive loop. Nothing is logged: the connection URL carries a ticket and the
 //! endpoint request the app secret.
 use crate::{
-    ChannelError, Connection, CredentialProblem, FS_FRAME_MAX, FS_WRITE_TIMEOUT, FeishuEndpoint,
-    HTTP_SEND_TIMEOUT, Normalized, OMB_REPLY_TEXTS_V1, ReceiverContext, STORE_BUDGET, Task,
-    backoff, classify, sender::SEND_RESPONSE_MAX,
+    ChannelError, Connection, CredentialProblem, FEISHU, FS_FRAME_MAX, FS_WRITE_TIMEOUT,
+    FeishuEndpoint, HTTP_SEND_TIMEOUT, Normalized, OMB_REPLY_TEXTS_V1, ReceiverContext,
+    STORE_BUDGET, Task, backoff, classify, sender::SEND_RESPONSE_MAX,
 };
 use futures_util::{SinkExt, StreamExt};
 use omb_store::{
-    ACCEPT_TX_BUDGET, AcceptOutcome, Channel, Content, ErrorCode, IdentityKey, NormalizedEvent,
+    ACCEPT_TX_BUDGET, AcceptOutcome, Content, ErrorCode, IdentityKey, NormalizedEvent,
     PollGapReason, ReceiverRow, StoreError, Suspension, accept_event, close_poll_gaps,
     open_poll_gap, suspend_receiver,
 };
@@ -354,7 +354,7 @@ pub(crate) fn normalize(payload: &[u8], source_key: &str) -> Normalized {
         (Some(_), ..) => Content::Other,
     };
     Normalized::Event(NormalizedEvent {
-        channel: Channel::Feishu,
+        channel: FEISHU,
         source_key: source_key.to_owned(),
         event_key: event_id.to_owned(),
         event_type: "feishu.im.message.receive_v1".to_owned(),
@@ -1112,7 +1112,7 @@ mod tests {
     #[test]
     fn private_text_event_normalizes_every_field() {
         let expected = NormalizedEvent {
-            channel: Channel::Feishu,
+            channel: FEISHU,
             source_key: "cli_test".to_owned(),
             event_key: "ev_1".to_owned(),
             event_type: "feishu.im.message.receive_v1".to_owned(),

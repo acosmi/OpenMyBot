@@ -1,7 +1,7 @@
 //! Acceptance transaction against an own PostgreSQL 17.11 cluster.
 use omb_store::{
-    AcceptOutcome, Channel, Command, Content, Disposition, IdentityKey, NormalizedEvent, PairStart,
-    PollGapReason, ReplyTexts, StateLabels, StoreError, accept_event, latest_update_id,
+    AcceptOutcome, ChannelKind, Command, Content, Disposition, IdentityKey, NormalizedEvent,
+    PairStart, PollGapReason, ReplyTexts, StateLabels, StoreError, accept_event, latest_event,
     list_active_receivers, migrate, open_poll_gap, pair_start, receiver_row,
     testkit::{
         Fixture, Session, deadline, insert_receiver, insert_receiver_with, insert_sender,
@@ -82,7 +82,7 @@ fn digest(parts: &[&str]) -> [u8; 32] {
 fn event(key: &str, sender: &str, content: Content) -> NormalizedEvent {
     let seed = format!("{content:?}");
     NormalizedEvent {
-        channel: Channel::Telegram,
+        channel: ChannelKind::from_static("telegram"),
         source_key: "1001".into(),
         event_key: key.into(),
         event_type: "telegram.message".into(),
@@ -494,7 +494,7 @@ async fn pending_pair(client: &mut Client) -> omb_store::PairStarted {
     pair_start(
         client,
         PairStart {
-            channel: Channel::Telegram,
+            channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-P",
             granted_generation: 1,
@@ -1191,12 +1191,16 @@ async fn concurrent_redelivery_accepts_once() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn latest_update_id_ignores_gap_rows_and_orders_by_accepted_at() {
+async fn latest_event_ignores_gap_rows_and_orders_by_accepted_at() {
     let mut env = Env::new().await;
     assert_eq!(
-        latest_update_id(&env.session.client, Channel::Telegram, "1001")
-            .await
-            .unwrap(),
+        latest_event(
+            &env.session.client,
+            &ChannelKind::from_static("telegram"),
+            "1001"
+        )
+        .await
+        .unwrap(),
         None
     );
     env.accept(&text("50", "x")).await;
@@ -1213,11 +1217,15 @@ async fn latest_update_id_ignores_gap_rows_and_orders_by_accepted_at() {
     )
     .await
     .unwrap();
-    let (id, at) = latest_update_id(&env.session.client, Channel::Telegram, "1001")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(id, 30);
+    let (id, at) = latest_event(
+        &env.session.client,
+        &ChannelKind::from_static("telegram"),
+        "1001",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(id, "30");
     let stored: OffsetDateTime = env
         .session
         .client
@@ -1230,15 +1238,23 @@ async fn latest_update_id_ignores_gap_rows_and_orders_by_accepted_at() {
         .get(0);
     assert_eq!(at, stored);
     assert_eq!(
-        latest_update_id(&env.session.client, Channel::Telegram, "2002")
-            .await
-            .unwrap(),
+        latest_event(
+            &env.session.client,
+            &ChannelKind::from_static("telegram"),
+            "2002"
+        )
+        .await
+        .unwrap(),
         None
     );
     assert_eq!(
-        latest_update_id(&env.session.client, Channel::Feishu, "1001")
-            .await
-            .unwrap(),
+        latest_event(
+            &env.session.client,
+            &ChannelKind::from_static("feishu"),
+            "1001"
+        )
+        .await
+        .unwrap(),
         None
     );
     env.stop().await;
@@ -1249,7 +1265,7 @@ async fn latest_update_id_ignores_gap_rows_and_orders_by_accepted_at() {
 async fn list_active_receivers_returns_only_active_rows_of_the_channel() {
     let env = Env::new().await;
     let feishu = insert_receiver(&env.session.client, "feishu", "cli_app").await;
-    let listed = list_active_receivers(&env.session.client, Channel::Telegram)
+    let listed = list_active_receivers(&env.session.client, ChannelKind::from_static("telegram"))
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
@@ -1257,7 +1273,7 @@ async fn list_active_receivers_returns_only_active_rows_of_the_channel() {
     assert_eq!(listed[0].source_key, "1001");
     assert_eq!(listed[0].credential_envelope, "test-envelope");
     assert!(!format!("{:?}", listed[0]).contains("test-envelope"));
-    let listed = list_active_receivers(&env.session.client, Channel::Feishu)
+    let listed = list_active_receivers(&env.session.client, ChannelKind::from_static("feishu"))
         .await
         .unwrap();
     assert_eq!(
@@ -1270,7 +1286,7 @@ async fn list_active_receivers_returns_only_active_rows_of_the_channel() {
     ] {
         env.session.client.execute("UPDATE openmybot.channel_bindings SET status=$2,status_reason=$3,suspended_at=statement_timestamp(),ended_at=CASE WHEN $2='revoked' THEN statement_timestamp() END WHERE binding_id=$1", &[&env.receiver, &status, &reason]).await.unwrap();
         assert!(
-            list_active_receivers(&env.session.client, Channel::Telegram)
+            list_active_receivers(&env.session.client, ChannelKind::from_static("telegram"))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1293,19 +1309,22 @@ async fn receiver_rows_carry_the_channel_of_their_channel_kind() {
         "feishu-envelope",
     )
     .await;
-    let listed = list_active_receivers(&env.session.client, Channel::Feishu)
+    let listed = list_active_receivers(&env.session.client, ChannelKind::from_static("feishu"))
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].binding_id, feishu);
-    assert_eq!(listed[0].channel, Channel::Feishu);
-    let listed = list_active_receivers(&env.session.client, Channel::Telegram)
+    assert_eq!(listed[0].channel, ChannelKind::from_static("feishu"));
+    let listed = list_active_receivers(&env.session.client, ChannelKind::from_static("telegram"))
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].binding_id, env.receiver);
-    assert_eq!(listed[0].channel, Channel::Telegram);
-    for (id, channel) in [(feishu, Channel::Feishu), (env.receiver, Channel::Telegram)] {
+    assert_eq!(listed[0].channel, ChannelKind::from_static("telegram"));
+    for (id, channel) in [
+        (feishu, ChannelKind::from_static("feishu")),
+        (env.receiver, ChannelKind::from_static("telegram")),
+    ] {
         let row = receiver_row(&env.session.client, id, deadline())
             .await
             .unwrap()
@@ -1317,9 +1336,12 @@ async fn receiver_rows_carry_the_channel_of_their_channel_kind() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.channel, Channel::Feishu);
+    assert_eq!(row.channel, ChannelKind::from_static("feishu"));
     let rendered = format!("{row:?}");
-    assert!(rendered.contains("channel: Feishu"), "{rendered}");
+    assert!(
+        rendered.contains(r#"channel: ChannelKind("feishu")"#),
+        "{rendered}"
+    );
     assert!(!rendered.contains("feishu-envelope"), "{rendered}");
     env.stop().await;
 }

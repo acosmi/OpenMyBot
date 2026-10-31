@@ -2,11 +2,11 @@
 use omb_channels::{
     CANCEL_QUEUE, CancelRequests, Connection, Counters, CredentialProblem, Endpoints,
     OMB_REPLY_CANCEL_NONE_V1, OMB_REPLY_CANCEL_REQUESTED_V1, OMB_REPLY_HELP_V1, ReceiverContext,
-    TG_RESPONSE_MAX, Task, Timings, fake_feishu::FakeFeishu, start_receiver, testkit::FakeTelegram,
-    verify_credentials,
+    TELEGRAM, TG_RESPONSE_MAX, Task, Timings, fake_feishu::FakeFeishu, start_receiver,
+    testkit::FakeTelegram, verify_credentials,
 };
 use omb_store::{
-    Channel, PollGapReason, ReceiverRow, migrate, open_poll_gap,
+    PollGapReason, ReceiverRow, migrate, open_poll_gap,
     testkit::{
         Fixture, Session, deadline, insert_event_for_run, insert_permission_row,
         insert_receiver_with, insert_sender, permission_row_json, shift_event,
@@ -126,7 +126,7 @@ impl Env {
             Connection { client, driver },
             ReceiverRow {
                 binding_id: self.receiver,
-                channel: Channel::Telegram,
+                channel: TELEGRAM,
                 source_key: "1001".into(),
                 credential_envelope: self.envelope.clone(),
             },
@@ -948,7 +948,7 @@ async fn token_sentinel_absent_from_rows_errors_and_debug() {
         env.counters,
         ReceiverRow {
             binding_id: env.receiver,
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: TOKEN.into()
         },

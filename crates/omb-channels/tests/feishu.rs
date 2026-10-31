@@ -1,14 +1,14 @@
 //! Feishu receiver and sender end to end: an own PostgreSQL 17.11 cluster, the loopback fake open
 //! platform and a real credential vault.
 use omb_channels::{
-    CANCEL_QUEUE, CancelRequests, Connection, Counters, Endpoints, FS_FRAME_MAX,
+    CANCEL_QUEUE, CancelRequests, Connection, Counters, Endpoints, FEISHU, FS_FRAME_MAX,
     OMB_REPLY_CANCEL_REQUESTED_V1, ReceiverContext, SenderContext, Task, Timings,
     fake_feishu::{FakeFeishu, FeishuSent, Handshake},
     start_receiver, start_sender,
     testkit::{FakeTelegram, Reply},
 };
 use omb_store::{
-    Channel, ReceiverRow, Suspension, channel_status, list_active_receivers, migrate, receiver_row,
+    ReceiverRow, Suspension, channel_status, list_active_receivers, migrate, receiver_row,
     reconfirm_binding, suspend_receiver,
     testkit::{
         Fixture, Session, deadline, insert_delivery, insert_ended_session, insert_event_for_run,
@@ -195,7 +195,7 @@ impl Env {
             Connection { client, driver },
             ReceiverRow {
                 binding_id: self.receiver,
-                channel: Channel::Feishu,
+                channel: FEISHU,
                 source_key: APP_ID.into(),
                 credential_envelope: self.envelope.clone(),
             },
@@ -1228,7 +1228,7 @@ async fn secret_and_connection_url_never_reach_rows_or_debug() {
         .get(0);
     let rendered = format!(
         "{events} {bindings} {:?} {:?} {ended:?}",
-        list_active_receivers(env.client(), Channel::Feishu).await,
+        list_active_receivers(env.client(), FEISHU).await,
         receiver_row(env.client(), env.receiver, deadline()).await,
     );
     assert!(rendered.contains("stream_broken"));
@@ -1268,7 +1268,7 @@ async fn events_during_a_disconnect_are_lost_and_redelivery_adds_no_row() {
         .iter()
         .find(|receiver| receiver.binding_id == env.receiver)
         .unwrap();
-    assert_eq!(receiver.channel, Channel::Feishu);
+    assert_eq!(receiver.channel, FEISHU);
     assert_eq!(receiver.gaps.len(), 1);
     assert_eq!(receiver.gaps[0].reason, "stream_broken");
     assert!(receiver.gaps[0].ended_at.is_some());
