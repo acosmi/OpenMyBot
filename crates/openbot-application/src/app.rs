@@ -50,8 +50,8 @@ use crate::ports::{
     AgentAdministration, AgentDirectory, AuditReader, ChannelAdministration, ChannelReader,
     ChannelRoutingBackend, MemoryAdministration, NoAgentAdministration, NoAgentDirectory,
     NoAuditReader, NoChannelAdministration, NoChannelRoutingBackend, NoMemoryAdministration,
-    NoPeopleAdministration, NoPolicyAdministration, NoThreadDirectory, PeopleAdministration,
-    PolicyAdministration, ThreadDirectory,
+    NoPeopleAdministration, NoPolicyAdministration, NoThreadDirectory, NoThreadHistoryDeletion,
+    PeopleAdministration, PolicyAdministration, ThreadDirectory, ThreadHistoryDeletion,
 };
 use crate::provider::{NoRemoteInterruptCoordinator, RemoteInterruptCoordinator};
 use crate::remote_interrupt::{list_pending_remote_interrupts, resolve_remote_interrupt};
@@ -75,7 +75,7 @@ use crate::ui_preferences::{
     NoUiPreferenceAdministration, UiPreferenceAdministration, get_ui_preferences,
     update_ui_preferences,
 };
-use crate::use_cases::thread::begin_thread_run_v2;
+use crate::use_cases::thread::{begin_thread_run_v2, delete_thread_history};
 use crate::use_cases::{
     DEFAULT_HEARTBEAT_PERIOD, admin_status, begin_thread_run, cancel_thread_run,
     change_person_access, change_person_role, correct_memory, create_agent, create_channel,
@@ -141,6 +141,7 @@ pub struct OpenBotApplication<
     remote_interrupts: std::sync::Arc<dyn RemoteInterruptCoordinator>,
     screen_sessions: std::sync::Arc<dyn ScreenSessionAdministration>,
     artifacts: std::sync::Arc<dyn ArtifactAdministration>,
+    thread_history_deletion: std::sync::Arc<dyn ThreadHistoryDeletion>,
     public_artifact_reads:
         std::sync::Arc<crate::artifact_read_protocol::PublicArtifactReadRegistry>,
     delegation_runtime: Option<std::sync::Arc<crate::DelegationRuntime>>,
@@ -195,6 +196,7 @@ impl<R>
             remote_interrupts: std::sync::Arc::new(NoRemoteInterruptCoordinator),
             screen_sessions: std::sync::Arc::new(NoScreenSessionAdministration),
             artifacts: std::sync::Arc::new(NoArtifactAdministration),
+            thread_history_deletion: std::sync::Arc::new(NoThreadHistoryDeletion),
             public_artifact_reads: std::sync::Arc::new(
                 crate::artifact_read_protocol::PublicArtifactReadRegistry::new(),
             ),
@@ -236,6 +238,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
@@ -273,6 +276,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
@@ -310,6 +314,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
@@ -351,6 +356,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
@@ -388,6 +394,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
@@ -425,6 +432,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
@@ -465,6 +473,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
@@ -623,6 +632,16 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
     #[must_use]
     pub fn with_artifacts(mut self, artifacts: std::sync::Arc<dyn ArtifactAdministration>) -> Self {
         self.artifacts = artifacts;
+        self
+    }
+
+    /// Attach the public Thread history deletion of the shared history authority.
+    #[must_use]
+    pub fn with_thread_history_deletion(
+        mut self,
+        deletion: std::sync::Arc<dyn ThreadHistoryDeletion>,
+    ) -> Self {
+        self.thread_history_deletion = deletion;
         self
     }
 
@@ -941,6 +960,18 @@ where
             )),
             AppCommand::CancelThreadRun(command) => Ok(AppReply::ThreadRunCancellation(
                 cancel_thread_run(&self.threads, auth, command).await?,
+            )),
+            AppCommand::DeleteThreadHistory {
+                thread_id,
+                request_id,
+            } => Ok(AppReply::ThreadHistoryDeletion(
+                delete_thread_history(
+                    std::sync::Arc::clone(&self.thread_history_deletion),
+                    auth,
+                    &thread_id,
+                    &request_id,
+                )
+                .await?,
             )),
             AppCommand::GetThreadHistory { thread_id } => Ok(AppReply::ThreadHistory(
                 get_thread_history(&self.threads, auth, thread_id).await?,

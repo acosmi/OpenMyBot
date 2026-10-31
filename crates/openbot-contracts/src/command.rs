@@ -428,6 +428,20 @@ pub enum AppCommand {
     /// untrusted candidates; deployment, tenant and actor still come only from `AuthContext`.
     CancelThreadRun(CancelThreadRun),
 
+    /// Delete one Thread's history for its current creator: the stop/clear intent, the drain of
+    /// its in-flight Runs, the bounded clearing and the soft delete of the Thread.
+    ///
+    /// The same request id resumes a pending deletion. It is checked once, by the intent
+    /// producer, as exact lowercase UUIDv7 text; deployment, tenant and actor come only from
+    /// `AuthContext`.
+    #[serde(rename_all = "camelCase")]
+    DeleteThreadHistory {
+        /// Native thread bound by the route.
+        thread_id: ThreadId,
+        /// Caller-chosen idempotency key of this deletion.
+        request_id: String,
+    },
+
     /// 读取当前 actor 可见的完整 native thread history。
     GetThreadHistory {
         /// Thread id；未知/空/不可见统一成功空列表，非 UUID 外形仍是 400。
@@ -726,6 +740,8 @@ pub enum AppReply {
     ThreadRunStarted(ThreadRunStarted),
     /// [`AppCommand::CancelThreadRun`] durable acknowledgement.
     ThreadRunCancellation(ThreadRunCancellation),
+    /// [`AppCommand::DeleteThreadHistory`] progress receipt.
+    ThreadHistoryDeletion(ThreadHistoryDeletionReceipt),
     /// [`AppCommand::GetThreadHistory`] 的应答。
     ThreadHistory(ThreadHistory),
     /// Unknown run 的受权只读事实页。
@@ -993,6 +1009,36 @@ pub struct ThreadRunCancellation {
     pub run_id: RunId,
     /// Request persistence outcome, not the eventual terminal state.
     pub state: ThreadRunCancellationState,
+}
+
+/// Closed body of the public history deletion routes of both hosts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteThreadHistoryBody {
+    /// Caller-chosen idempotency key, passed on unchanged.
+    pub request_id: String,
+}
+
+/// How far one deletion call got. Neither state claims physical erasure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadHistoryDeletionState {
+    /// The intent is stored and admission is closed; the same request id resumes the rest.
+    Pending,
+    /// The history was cleared and the Thread soft deleted under this request's operation.
+    Cleared,
+}
+
+/// Deletion progress for one Thread and one request id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadHistoryDeletionReceipt {
+    /// Bound native thread.
+    pub thread_id: ThreadId,
+    /// The caller's request id.
+    pub request_id: String,
+    /// Progress of this request, not a later state.
+    pub state: ThreadHistoryDeletionState,
 }
 
 /// AG-UI history 可观察的 message role 子集。
@@ -1676,6 +1722,38 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ThreadRunCancellation>(&wire).unwrap(),
             cancellation
+        );
+
+        let receipt = ThreadHistoryDeletionReceipt {
+            thread_id: ThreadId::new("550e8400-e29b-81d4-a716-446655440000"),
+            request_id: "019a0300-0000-7000-8000-000000000003".to_owned(),
+            state: ThreadHistoryDeletionState::Pending,
+        };
+        let wire = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"threadId":"550e8400-e29b-81d4-a716-446655440000","requestId":"019a0300-0000-7000-8000-000000000003","state":"pending"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ThreadHistoryDeletionReceipt>(&wire).unwrap(),
+            receipt
+        );
+        assert_eq!(
+            serde_json::to_string(&ThreadHistoryDeletionState::Cleared).unwrap(),
+            r#""cleared""#
+        );
+        assert!(serde_json::from_str::<ThreadHistoryDeletionState>(r#""deleted""#).is_err());
+        assert!(
+            serde_json::from_str::<DeleteThreadHistoryBody>(r#"{"requestId":"r","threadId":"t"}"#)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(AppCommand::DeleteThreadHistory {
+                thread_id: ThreadId::new("t"),
+                request_id: "r".to_owned(),
+            })
+            .unwrap(),
+            serde_json::json!({"kind":"delete_thread_history","threadId":"t","requestId":"r"})
         );
     }
 
