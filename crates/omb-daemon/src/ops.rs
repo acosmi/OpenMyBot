@@ -5238,12 +5238,21 @@ mod tests {
                 env.token,
             );
             tokio::pin!(revoked);
-            assert!(
-                tokio::time::timeout_at(parked + Duration::from_secs(3), &mut revoked)
-                    .await
-                    .is_err(),
-                "round {round}: the revoke waits for the gate"
-            );
+            // Answer the receiver commands while asserting, as `call_until` does: a revoke
+            // that is not held by the gate would otherwise also stall on the missing answer.
+            loop {
+                tokio::select! {
+                    answer = &mut revoked => {
+                        panic!("round {round}: the revoke waits for the gate, but answered {answer:?}")
+                    }
+                    Some(command) = env.commands.recv() => {
+                        if let ReceiverCommand::Stop(_, done) = command {
+                            let _ = done.send(());
+                        }
+                    }
+                    () = tokio::time::sleep_until(parked + Duration::from_secs(3)) => break,
+                }
+            }
             gate.execute(
                 "SELECT pg_advisory_unlock(hashtextextended($1,0))",
                 &[&thread.as_str()],
@@ -5599,12 +5608,24 @@ mod tests {
                 env.token,
             );
             tokio::pin!(replaced);
-            assert!(
-                tokio::time::timeout_at(parked + Duration::from_secs(3), &mut replaced)
-                    .await
-                    .is_err(),
-                "round {round}: the replacement waits for the gate"
-            );
+            // Answer the receiver commands while asserting, as `call_until` does: a replacement
+            // that is not held by the gate would otherwise also stall on the missing answer.
+            loop {
+                tokio::select! {
+                    answer = &mut replaced => {
+                        panic!("round {round}: the replacement waits for the gate, but answered {answer:?}")
+                    }
+                    Some(command) = env.commands.recv() => match command {
+                        ReceiverCommand::Start(_, done) => {
+                            let _ = done.send(Ok(()));
+                        }
+                        ReceiverCommand::Stop(_, done) => {
+                            let _ = done.send(());
+                        }
+                    },
+                    () = tokio::time::sleep_until(parked + Duration::from_secs(3)) => break,
+                }
+            }
             gate.execute(
                 "SELECT pg_advisory_unlock(hashtextextended($1,0))",
                 &[&thread.as_str()],
