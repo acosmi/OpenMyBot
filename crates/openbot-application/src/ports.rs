@@ -9,10 +9,10 @@ use openbot_contracts::agent::{
     AgentMutationRequest, AgentProfile,
 };
 use openbot_contracts::audit::AuditPage;
-use openbot_contracts::auth::{AuthGeneration, Role};
+use openbot_contracts::auth::{AuthContext, AuthGeneration, Role};
 use openbot_contracts::command::{
     BeginThreadRun, BeginThreadRunV2, CancelThreadRun, ChannelDetail, ChannelSummary,
-    ThreadHistory, ThreadRunCancellation, ThreadRunStarted,
+    ThreadHistory, ThreadHistoryDeletionReceipt, ThreadRunCancellation, ThreadRunStarted,
 };
 use openbot_contracts::error::{AppError, IdentityConflictReason};
 use openbot_contracts::ids::{ActorId, BotId, ChannelId, DeploymentId, RunId, TenantId, ThreadId};
@@ -947,6 +947,38 @@ impl ThreadDirectory for NoThreadDirectory {
         _thread: &ThreadId,
     ) -> Result<bool, ThreadDirectoryError> {
         Err(ThreadDirectoryError::Unavailable)
+    }
+}
+
+/// Public deletion of one Thread's history by its current creator.
+#[async_trait]
+pub trait ThreadHistoryDeletion: Send + Sync {
+    /// Record or replay the stop/clear intent of `request_id`, then advance the drain, the
+    /// clearing and the soft delete as far as this one bounded call can. A pending receipt is
+    /// resumed by the same request id; the implementation owns every check of its inputs.
+    async fn delete_thread_history_before(
+        self: std::sync::Arc<Self>,
+        auth: &AuthContext,
+        thread_id: &ThreadId,
+        request_id: &str,
+    ) -> Result<ThreadHistoryDeletionReceipt, AppError>;
+}
+
+/// Genuine unavailable default when no history authority is composed.
+#[derive(Debug, Default)]
+pub struct NoThreadHistoryDeletion;
+
+#[async_trait]
+impl ThreadHistoryDeletion for NoThreadHistoryDeletion {
+    async fn delete_thread_history_before(
+        self: std::sync::Arc<Self>,
+        _auth: &AuthContext,
+        _thread_id: &ThreadId,
+        _request_id: &str,
+    ) -> Result<ThreadHistoryDeletionReceipt, AppError> {
+        Err(AppError::DependencyUnavailable {
+            dependency: "thread_history",
+        })
     }
 }
 

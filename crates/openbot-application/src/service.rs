@@ -226,6 +226,7 @@ pub const fn command_kind(command: &AppCommand) -> &'static str {
         AppCommand::BeginThreadRun(_) => "begin_thread_run",
         AppCommand::BeginThreadRunV2(_) => "begin_thread_run_v2",
         AppCommand::CancelThreadRun(_) => "cancel_thread_run",
+        AppCommand::DeleteThreadHistory { .. } => "delete_thread_history",
         AppCommand::GetThreadHistory { .. } => "get_thread_history",
         AppCommand::GetThreadConversation { .. } => "get_thread_conversation",
         AppCommand::GetRunReconciliation { .. } => "get_run_reconciliation",

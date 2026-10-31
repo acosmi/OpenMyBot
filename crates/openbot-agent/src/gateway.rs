@@ -380,6 +380,7 @@ impl AgentToolGateway {
                 | AppReply::ThreadStatus(_)
                 | AppReply::ThreadRunStarted(_)
                 | AppReply::ThreadRunCancellation(_)
+                | AppReply::ThreadHistoryDeletion(_)
                 | AppReply::RunReconciliation(_)
                 | AppReply::RunEffectReceipts(_)
                 | AppReply::ThreadHistory(_)

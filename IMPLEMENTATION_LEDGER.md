@@ -248,12 +248,13 @@ Phase 8 completion point: V7-IMPL-047 (#233) is merged together with V7-COMP-026
 | FIX-V6-PR-001-1 | PostgreSQL kernel start lock releases its flock explicitly on drop so a concurrent spawn cannot delay it | [#253](https://github.com/acosmi/OpenMyBot/pull/253) | [08b99019bd](https://github.com/acosmi/OpenMyBot/commit/08b99019bdc6ac44c38c5951e2c18715cd278a0d) | 2026-10-31 |
 | FIX-V7-IMPL-004-2 | Artifact store root flock is released explicitly by its last holder so a concurrent spawn cannot delay it | [#254](https://github.com/acosmi/OpenMyBot/pull/254) | [a21e2cf86c](https://github.com/acosmi/OpenMyBot/commit/a21e2cf86cd410d5bbc7a83f0f2f910b5519515b) | 2026-10-31 |
 | FIX-OMB-009-2 | Cancel during an unknown begin answers request_timeout; revoke and receiver replacement wait on the per-event gate (C-009-3 to C-009-5) | [#255](https://github.com/acosmi/OpenMyBot/pull/255) | [3d4d9fc5e0](https://github.com/acosmi/OpenMyBot/commit/3d4d9fc5e0160faeea8daa016e9cee520dd6b6b7) | 2026-10-31 |
+| V7-IMPL-031 | Public thread history deletion command and routes (part 1 of 2): ACK1, drain, clearing and gated soft delete | [#256](https://github.com/acosmi/OpenMyBot/pull/256) | [2a452ed0db](https://github.com/acosmi/OpenMyBot/commit/2a452ed0db15623d1a73f921f7889f86d72a5210) | 2026-10-31 |
 
 ## Open
 
 | Task | Status | PR |
 |---|---|---|
-| V7-IMPL-031 | Part 1 (public thread history deletion) is a draft PR; part 2 not started | [#256](https://github.com/acosmi/OpenMyBot/pull/256) |
+| V7-IMPL-031 | Part 1 merged (#256); part 2 not started | none |
 | V7-IMPL-045 | Draft PR, open: whole-PostgreSQL capture candidate | [#224](https://github.com/acosmi/OpenMyBot/pull/224) |
 | V7-IMPL-046 | Draft PR, open: bounded whole-PostgreSQL restore | [#226](https://github.com/acosmi/OpenMyBot/pull/226) |
 | V6-PR-048 | Closed unmerged 2026-10-12; the naming unification moves to a separate compatibility migration | [#59](https://github.com/acosmi/OpenMyBot/pull/59) |
