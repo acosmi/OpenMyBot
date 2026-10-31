@@ -368,7 +368,7 @@ impl InProcessTransport {
         let slot_limit = usize::try_from(bounds.max_open_files)
             .map_err(|_| WholePgCarrierFault::BoundsOverflow)?;
         let metadata_reserved = registry.capture_fixed_metadata;
-        if metadata_reserved > metadata_limit || slot_limit == 0 {
+        if metadata_reserved > metadata_limit {
             return Err(WholePgCarrierFault::CapacityExceeded);
         }
         registry.capture = Some(CapturePumpRegistry {

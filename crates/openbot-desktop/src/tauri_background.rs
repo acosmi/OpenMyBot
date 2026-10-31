@@ -371,18 +371,17 @@ pub(crate) fn checked_self_owned_fixture_metadata_bytes(
     u64::try_from(total).map_err(|_| DesktopLocalRuntimeError::Configuration)
 }
 
+/// `compiled_outer` is the build's `WROK_BOT_DESKTOP_RELEASE_SHA256`.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 #[allow(clippy::type_complexity)]
 pub(crate) fn bind_self_owned_capture_fixture(
+    compiled_outer: Option<&str>,
     request: Option<&crate::desktop_release::ReviewedNormalCaptureRequest>,
 ) -> Result<
     Option<(SelfOwnedCaptureFixtureBinding, Arc<dyn OsSecretStore>)>,
     DesktopLocalRuntimeError,
 > {
-    if !self_owned_fixture_selected(
-        option_env!("WROK_BOT_DESKTOP_RELEASE_SHA256"),
-        &SELF_OWNED_CAPTURE_FIXTURE,
-    )? {
+    if !self_owned_fixture_selected(compiled_outer, &SELF_OWNED_CAPTURE_FIXTURE)? {
         return Ok(None);
     }
     #[cfg(not(all(feature = "postgres-maintenance", debug_assertions)))]
@@ -4580,7 +4579,10 @@ mod tests {
     #[test]
     fn no_capture_request_binds_no_fixture_and_inspects_without_writing() {
         // No compiled fixture pin and no request: no fixture binding and no secret-store swap.
-        assert!(matches!(bind_self_owned_capture_fixture(None), Ok(None)));
+        assert!(matches!(
+            bind_self_owned_capture_fixture(None, None),
+            Ok(None)
+        ));
         let root = private_fixture_root("fresh-ordinary");
         let app = fs::File::open(&root).unwrap();
         assert!(
@@ -4598,5 +4600,20 @@ mod tests {
             ["capture-output", "independent-key-medium", "release"]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    #[test]
+    fn compiled_fixture_pin_without_a_capture_request_is_a_configuration_error() {
+        // A build carrying the fixture pin refuses a start without a complete request instead
+        // of returning Ok(None), which would fall back to the user Keychain.
+        assert!(matches!(
+            bind_self_owned_capture_fixture(Some(SELF_OWNED_CAPTURE_FIXTURE.outer), None),
+            Err(DesktopLocalRuntimeError::Configuration)
+        ));
     }
 }

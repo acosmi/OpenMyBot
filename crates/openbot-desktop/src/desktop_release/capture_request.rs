@@ -237,34 +237,14 @@ impl CaptureProfile {
         }
         .check()
     }
+    /// Cross-field profile rules. The carrier format limits are [`WholePgCarrierBounds::check`]'s
+    /// alone: the release open (`verify`) and the control history replay both run
+    /// [`Self::carrier_bounds`] before they use the profile.
+    ///
+    /// [`WholePgCarrierBounds::check`]: openbot_domain::backup::whole_pg_carrier::WholePgCarrierBounds::check
     pub(crate) fn validate(&self) -> Result<(), DesktopReleaseError> {
         limits::validate_fields(&self.native).map_err(|_| DesktopReleaseError::Manifest)?;
         let c = &self.carrier;
-        positive(&[
-            c.max_material_files,
-            c.max_directories,
-            c.max_path_bytes,
-            c.max_path_depth,
-            c.max_single_plain_bytes,
-            c.max_material_plain_bytes,
-            c.max_manifest_bytes,
-            c.max_header_bytes,
-            c.max_data_chunks,
-            c.max_chunk_plain_bytes,
-            c.max_wire_bytes,
-            c.max_metadata_bytes,
-            c.max_open_files,
-            c.max_snapshot_bytes,
-            c.max_spool_bytes,
-            c.max_retained_prior_bytes,
-            c.max_journal_bytes,
-            c.max_total_allocation_bytes,
-            c.capacity_reserve_bytes,
-            c.free_floor_bytes,
-            c.max_key_medium_allocation_bytes,
-            c.key_medium_reserve_bytes,
-            c.key_medium_free_floor_bytes,
-        ])?;
         let d = &self.drivers;
         positive(&[
             d.max_live_original_tasks,
@@ -284,12 +264,7 @@ impl CaptureProfile {
             q.max_query_tasks,
             q.phase_ns,
         ])?;
-        if c.max_manifest_bytes > 4 * 1024 * 1024
-            || c.max_chunk_plain_bytes > 4 * 1024 * 1024
-            || c.max_header_bytes < 80
-            || c.max_data_chunks > u64::from(u32::MAX) - 1
-            || c.max_single_plain_bytes > c.max_material_plain_bytes
-            || c.max_snapshot_bytes > c.max_total_allocation_bytes
+        if c.max_snapshot_bytes > c.max_total_allocation_bytes
             || c.max_spool_bytes > c.max_total_allocation_bytes
             || c.max_wire_bytes > c.max_total_allocation_bytes
             || c.max_metadata_bytes > c.max_total_allocation_bytes
@@ -448,13 +423,6 @@ impl CaptureProfile {
     }
     pub(crate) fn validate_master_retention(&self) -> Result<(), DesktopReleaseError> {
         let s = &self.secrets;
-        positive(&[
-            s.max_source_secret_count,
-            s.max_one_source_secret_bytes,
-            s.max_total_source_secret_bytes,
-            s.max_secret_structure_bytes,
-            s.max_secret_memory_bytes,
-        ])?;
         let k = &s.classes;
         let classes = [
             &k.master_source,
@@ -471,7 +439,6 @@ impl CaptureProfile {
         ];
         let mut peak = self.carrier.max_chunk_plain_bytes;
         for class in classes {
-            positive(&[class.max_one_bytes])?;
             let bytes = class
                 .max_count
                 .checked_mul(class.max_one_bytes)

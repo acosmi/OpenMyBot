@@ -6317,6 +6317,10 @@ fn scan_closed_history_observed(
             .profile
             .validate()
             .map_err(|_| Fault::ClosingPending)?;
+        intent
+            .profile
+            .carrier_bounds()
+            .map_err(|_| Fault::ClosingPending)?;
         intent.source_identity.check()?;
         if intent.schema != "wrokbot-capture-control"
             || intent.version != 1

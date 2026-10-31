@@ -63,6 +63,8 @@ pub struct WholePgOwnedStreamParts {
 }
 pub struct OwnedCaptureStreamInputs {
     parts: WholePgOwnedStreamParts,
+    // Metadata bytes check_parts charged for these parts; only from_owned_parts sets it.
+    parts_metadata: u64,
 }
 #[allow(dead_code)] // Fields hold the original owners until this failure drops.
 pub struct OwnedCaptureStreamFailure {
@@ -122,7 +124,10 @@ impl OwnedCaptureStreamInputs {
         parts: WholePgOwnedStreamParts,
     ) -> Result<Self, OwnedCaptureStreamFailure> {
         match check_parts(&parts) {
-            Ok(_) => Ok(Self { parts }),
+            Ok(parts_metadata) => Ok(Self {
+                parts,
+                parts_metadata,
+            }),
             Err(fault) => Err(OwnedCaptureStreamFailure {
                 fault,
                 retained: Some(parts),
@@ -293,13 +298,9 @@ fn check_secret_inventory(
     use WholePgCarrierFault as F;
     let s = parts.secret_bounds;
     let c = s.classes;
-    if c.master_source.max_count < 1
-        || c.master_source.max_one_bytes < 32
-        || c.scram_source.max_count < 1
+    if c.master_source.max_one_bytes < 32
         || c.scram_source.max_one_bytes < 64
-        || c.recovery_key.max_count < 1
         || c.recovery_key.max_one_bytes < 32
-        || c.stream_key.max_count < 1
         || c.stream_key.max_one_bytes < 32
         || c.key_medium_readback.max_count < 2
         || c.key_medium_readback.max_one_bytes < 104
@@ -433,6 +434,7 @@ pub fn run_owned_stream(
     inputs: OwnedCaptureStreamInputs,
     clock: Arc<dyn CaptureClockCheck + Send + Sync>,
 ) -> OwnedCaptureStreamResult {
+    let parts_metadata = inputs.parts_metadata;
     let mut retained = Some(inputs.parts);
     let mut io = RetainedStreamIo::empty();
     let mut release_stage = StreamReleaseStage::Retained;
@@ -443,6 +445,7 @@ pub fn run_owned_stream(
             retained
                 .as_mut()
                 .ok_or(WholePgCarrierFault::ClosingPending)?,
+            parts_metadata,
             &mut io,
             clock.as_ref(),
         )?;
@@ -474,20 +477,18 @@ pub fn run_owned_stream(
 }
 fn stream(
     parts: &mut WholePgOwnedStreamParts,
+    parts_metadata: u64,
     io: &mut RetainedStreamIo,
     clock: &dyn CaptureClockCheck,
 ) -> Result<(u64, [u8; 32]), WholePgCarrierFault> {
     use WholePgCarrierFault as F;
-    let parts_metadata = check_parts(parts)?;
     clock.require_effect()?;
     let b = parts.carrier_bounds;
     let frame_capacity = b.max_manifest_bytes.max(b.max_chunk_plain_bytes).max(84);
-    if frame_capacity > 4 * 1024 * 1024
-        || parts.manifest.metadata_bytes() > b.max_metadata_bytes
-        || checked_add(
-            parts.manifest.metadata_bytes(),
-            checked_mul(parts.sources.len() as u64, 256)?,
-        )? > b.max_metadata_bytes
+    if checked_add(
+        parts.manifest.metadata_bytes(),
+        checked_mul(parts.sources.len() as u64, 256)?,
+    )? > b.max_metadata_bytes
     {
         return Err(F::CapacityExceeded);
     }
@@ -568,7 +569,6 @@ fn stream(
     {
         return Err(F::CapacityExceeded);
     }
-    check_secret_inventory(parts, frame_capacity)?;
     verify_directory(&parts.output, clock)?;
     verify_directory(&parts.independent_key_medium, clock)?;
     if parts.output.expected_device == parts.independent_key_medium.expected_device
@@ -1777,9 +1777,10 @@ mod tests {
         };
         // Exercise the same original kernel while retaining its owned test inputs;
         // the public producer now releases them before a successful receipt exists.
+        let parts_metadata = input.parts_metadata;
         let mut parts = input.parts;
         let mut io = RetainedStreamIo::empty();
-        match stream(&mut parts, &mut io, &Always) {
+        match stream(&mut parts, parts_metadata, &mut io, &Always) {
             Ok(_) => (),
             Err(fault) => panic!("{fault}"),
         };
