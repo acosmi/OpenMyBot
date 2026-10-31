@@ -677,21 +677,29 @@ mod capture_periodic {
     /// Contains only the original acknowledged Periodic checkpoint and bounded actual audit
     /// facts. Its private construction does not assert that pools or the source are closed.
     pub struct CommittedCaptureCheckpoint {
-        checkpoint: AuditCheckpoint,
-        signature: CheckpointSignature,
+        // None only when the same locked read saw no audit event and no checkpoint at all.
+        checkpoint: Option<(AuditCheckpoint, CheckpointSignature)>,
         rows: Vec<CapturedDbRow>,
         unlinked_before: u64,
     }
     impl CommittedCaptureCheckpoint {
-        pub fn sequence(&self) -> u64 {
-            self.checkpoint.sequence
+        pub fn sequence(&self) -> Option<u64> {
+            self.checkpoint
+                .as_ref()
+                .map(|(checkpoint, _)| checkpoint.sequence)
         }
-        pub fn signature(&self) -> &[u8; 32] {
-            self.signature.as_bytes()
+        pub fn signature(&self) -> Option<&[u8; 32]> {
+            self.checkpoint
+                .as_ref()
+                .map(|(_, signature)| signature.as_bytes())
         }
         pub fn event_count(&self) -> u64 {
-            match &self.checkpoint.kind {
-                AuditCheckpointKind::Periodic { segment } => segment.event_count,
+            match self
+                .checkpoint
+                .as_ref()
+                .map(|(checkpoint, _)| &checkpoint.kind)
+            {
+                Some(AuditCheckpointKind::Periodic { segment }) => segment.event_count,
                 _ => 0,
             }
         }
@@ -709,20 +717,38 @@ mod capture_periodic {
                     .write_all(b"\n")
                     .map_err(|_| CaptureSqlFailure::Database)?;
             }
-            let columns = checkpoint_columns(&self.checkpoint.kind)
-                .map_err(|_| CaptureSqlFailure::RowInvalid)?;
+            let Some((checkpoint, signature)) = &self.checkpoint else {
+                // Same arity as a Periodic line; nothing was signed, bounded or created.
+                return serde_json::to_writer(
+                    &mut *output,
+                    &(
+                        None::<u64>,
+                        "empty",
+                        None::<String>,
+                        None::<String>,
+                        None::<String>,
+                        None::<String>,
+                        0_u64,
+                        None::<String>,
+                        None::<i128>,
+                    ),
+                )
+                .map_err(|_| CaptureSqlFailure::Database);
+            };
+            let columns =
+                checkpoint_columns(&checkpoint.kind).map_err(|_| CaptureSqlFailure::RowInvalid)?;
             serde_json::to_writer(
                 &mut *output,
                 &(
-                    self.checkpoint.sequence,
+                    checkpoint.sequence,
                     "periodic",
                     columns.first_event,
                     columns.first_hash,
                     columns.last_event,
                     columns.last_hash,
                     columns.event_count,
-                    signature_hex(&self.signature),
-                    self.checkpoint.created_at.unix_timestamp_nanos(),
+                    signature_hex(signature),
+                    checkpoint.created_at.unix_timestamp_nanos(),
                 ),
             )
             .map_err(|_| CaptureSqlFailure::Database)
@@ -834,42 +860,52 @@ mod capture_periodic {
             .map_err(|_| CaptureSqlFailure::Database)?;
             budget.remaining(clock)?;
             let rows = read_capture_audit(tx, budget, clock).await?;
-            let (segment, unlinked_before) = verify_audit_rows(&rows, key, budget, clock)?;
-            let kind = AuditCheckpointKind::Periodic { segment };
-            // Original segment verification, sequence allocation and signed INSERT remain the
-            // original repository calls. The bounded same-lock facts establish their field caps.
-            budget.reserve_known(3, 3, 512, clock)?;
-            let duration = budget.remaining(clock)?;
-            tokio::time::timeout(duration, verify_checkpoint_segment(tx, &kind))
+            // Under this same lock and snapshot, zero event rows (linked or unlinked) and zero
+            // checkpoints show a never-audited installation: retention removes event rows only
+            // after writing its closure checkpoint. There is no chain to seal, so no Genesis or
+            // checkpoint is made. Every other empty or Genesis-less state is refused below.
+            let (checkpoint, unlinked_before) = if rows.is_empty() {
+                (None, 0)
+            } else {
+                let (segment, unlinked_before) = verify_audit_rows(&rows, key, budget, clock)?;
+                let kind = AuditCheckpointKind::Periodic { segment };
+                // Original segment verification, sequence allocation and signed INSERT remain
+                // the original repository calls. The bounded same-lock facts establish their
+                // field caps.
+                budget.reserve_known(3, 3, 512, clock)?;
+                let duration = budget.remaining(clock)?;
+                tokio::time::timeout(duration, verify_checkpoint_segment(tx, &kind))
+                    .await
+                    .map_err(|_| CaptureSqlFailure::Database)?
+                    .map_err(|_| CaptureSqlFailure::RowInvalid)?;
+                let duration = budget.reserve_query(clock)?;
+                let next: i64 = tokio::time::timeout(
+                    duration,
+                    tx.query_one(
+                        "SELECT coalesce(max(sequence), -1)::bigint + 1 FROM public.audit_checkpoints",
+                        &[],
+                    ),
+                )
                 .await
                 .map_err(|_| CaptureSqlFailure::Database)?
+                .map_err(|_| CaptureSqlFailure::Database)?
+                .try_get(0)
                 .map_err(|_| CaptureSqlFailure::RowInvalid)?;
-            let duration = budget.reserve_query(clock)?;
-            let next: i64 = tokio::time::timeout(
-                duration,
-                tx.query_one(
-                    "SELECT coalesce(max(sequence), -1)::bigint + 1 FROM public.audit_checkpoints",
-                    &[],
-                ),
-            )
-            .await
-            .map_err(|_| CaptureSqlFailure::Database)?
-            .map_err(|_| CaptureSqlFailure::Database)?
-            .try_get(0)
-            .map_err(|_| CaptureSqlFailure::RowInvalid)?;
-            let checkpoint = AuditCheckpoint {
-                sequence: u64::try_from(next).map_err(|_| CaptureSqlFailure::Bounds)?,
-                created_at: OffsetDateTime::now_utc(),
-                kind,
+                let checkpoint = AuditCheckpoint {
+                    sequence: u64::try_from(next).map_err(|_| CaptureSqlFailure::Bounds)?,
+                    created_at: OffsetDateTime::now_utc(),
+                    kind,
+                };
+                let signature = checkpoint
+                    .sign(key)
+                    .map_err(|_| CaptureSqlFailure::RowInvalid)?;
+                let duration = budget.reserve_query(clock)?;
+                tokio::time::timeout(duration, insert_checkpoint(tx, &checkpoint, key))
+                    .await
+                    .map_err(|_| CaptureSqlFailure::Database)?
+                    .map_err(|_| CaptureSqlFailure::Database)?;
+                (Some((checkpoint, signature)), unlinked_before)
             };
-            let signature = checkpoint
-                .sign(key)
-                .map_err(|_| CaptureSqlFailure::RowInvalid)?;
-            let duration = budget.reserve_query(clock)?;
-            tokio::time::timeout(duration, insert_checkpoint(tx, &checkpoint, key))
-                .await
-                .map_err(|_| CaptureSqlFailure::Database)?
-                .map_err(|_| CaptureSqlFailure::Database)?;
             let duration = budget.reserve_query(clock)?;
             let commit_cap = Instant::now()
                 .checked_add(duration)
@@ -884,7 +920,6 @@ mod capture_periodic {
             budget.remaining(clock)?;
             Ok(CommittedCaptureCheckpoint {
                 checkpoint,
-                signature,
                 rows,
                 unlinked_before,
             })
