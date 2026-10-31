@@ -1069,6 +1069,9 @@ impl tracing::Subscriber for Capture {
 #[tokio::test]
 async fn confirmation_timestamp_is_trace_only_and_never_audit_or_terminal_payload() {
     let fields = Arc::new(StdMutex::new(vec![]));
+    // A lone dispatcher lets a parallel thread register the callsite without a default and cache
+    // Interest::never(); a second live dispatcher makes registration poll every dispatcher instead.
+    let _anchor = tracing::Dispatch::new(Capture(fields.clone()));
     let _subscriber = tracing::subscriber::set_default(Capture(fields.clone()));
     let c = case(
         Control::new("trace", Plan::Ready(Ok(StopOutcome::Confirmed { at: AT }))),
