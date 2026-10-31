@@ -1752,6 +1752,8 @@ SELECT oversized,CASE WHEN oversized THEN NULL ELSE jsonb_build_array(f0,f1,f2):
 FROM bounded
 "#,
 };
+// With archive_mode off (f3), PostgreSQL 17 shows archive_command as "(disabled)", so f4
+// requires exactly that value; an empty string is never shown in that state.
 const NORMAL_EXTERNAL_HOOKS: Projection = Projection {
     name: "normal_external_hooks",
     cursor: &[],
@@ -1765,7 +1767,7 @@ WITH cap AS (SELECT $1::text a,$2::text b,$3::text c,$4::bigint field_limit,
   coalesce(pg_catalog.current_setting('session_preload_libraries',true)='',false)::text AS f1,
   coalesce(pg_catalog.current_setting('local_preload_libraries',true)='',false)::text AS f2,
   coalesce(pg_catalog.current_setting('archive_mode',true)='off',false)::text AS f3,
-  coalesce(pg_catalog.current_setting('archive_command',true)='',false)::text AS f4,
+  coalesce(pg_catalog.current_setting('archive_command',true)='(disabled)',false)::text AS f4,
   coalesce(pg_catalog.current_setting('archive_library',true)='',false)::text AS f5,
   coalesce(pg_catalog.current_setting('restore_command',true)='',false)::text AS f6,
   coalesce(pg_catalog.current_setting('archive_cleanup_command',true)='',false)::text AS f7,
