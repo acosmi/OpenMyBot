@@ -62,7 +62,9 @@ fn outcome(
 
 /// Starts the dispatcher; it wakes on `wake`, at the nearest retry or expiry time, or on stop.
 /// Each dispatch holds `gate`, which the daemon's run canceller shares, from before its event lock
-/// until its receipt is committed or rolled back.
+/// until `record_dispatch` returns. A COMMIT already sent can still land after this client gives
+/// up; the canceller asks the engine first, so the begun run is still stopped, and at worst its
+/// store update waits up to 2 s on the event's row lock and answers `internal_error`.
 pub fn start_dispatcher(
     connection: Connection,
     entry: DelegatedRunEntry,
@@ -95,8 +97,8 @@ async fn dispatch(
         match claim_dispatch(&client).await.map_err(store)? {
             Claim::Item(item) => {
                 let (record_id, attempts) = (item.record_id, item.attempts);
-                // Held on every exit of this dispatch: a cancel never sees a begin whose receipt
-                // is still open, even when this connection is lost before its commit.
+                // Held until `record_dispatch` returns, on every exit of this dispatch: a cancel
+                // waits for the begin to settle, also when this connection is lost mid-dispatch.
                 let _gate = gate.lock().await;
                 // The event stays locked from before the begin until its receipt is recorded.
                 let Some(dispatch) =
