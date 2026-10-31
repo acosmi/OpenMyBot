@@ -59,10 +59,12 @@ pub(crate) mod capture;
 
 // Retired fixed fixture outer pins fail closed before any current-user secret-store fallback.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const RETIRED_SELF_OWNED_CAPTURE_OUTERS: [&str; 3] = [
+const RETIRED_SELF_OWNED_CAPTURE_OUTERS: [&str; 5] = [
     "64428c91f9123a42a1220a6cfb0b78dd6f1082a928827b230fca66e1640b4dc1",
     "77ea40dfc06352b5161317beae22a325cfb2b0ef827575d37d5bfef8895ceae2",
     "f9ee6d061d6202b15edd9de72a1560212ccc70e1438625a2559025b21edaaaf6",
+    "f5e855cf553d55c2cd25056c09eadd57842fa4be0a778216d5ffba7ccadcf04a",
+    "4d2eb480df701f03d9732466ad4791946a227a08f8c1de48b64c234c39a78812",
 ];
 
 // The single fixed fixture is a debug-only original launcher input, not a configurable source.
@@ -83,14 +85,14 @@ struct SelfOwnedFixturePin {
 // Bound from the materialized fixture before its only run; until then nothing matches.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 const SELF_OWNED_CAPTURE_FIXTURE: SelfOwnedFixturePin = SelfOwnedFixturePin {
-    outer: "4d2eb480df701f03d9732466ad4791946a227a08f8c1de48b64c234c39a78812",
-    request_id: "c4e6e3ac5c3676ae1cce6dc183ababa205743645dd404ea7cd4c83976fbb4f66",
+    outer: "f2df6afde3730f497c1d6c2accdd6e2907849a16f60d705139b6e49a95b4dfcc",
+    request_id: "9f8b8842c5fc2a4053266a0303e311f74005c1c2d3fef19adda909a7524eae2f",
     device: 16777229,
     uid: 501,
-    root_inode: 181026710,
-    release_inode: 181026711,
-    output_inode: 181026712,
-    key_inode: 181026713,
+    root_inode: 183724857,
+    release_inode: 183724858,
+    output_inode: 183724859,
+    key_inode: 183724860,
 };
 
 // There is no public constructor, Clone, Deserialize, caller flag, path or secret injection.
@@ -4469,17 +4471,22 @@ mod tests {
             output_inode: 3,
             key_inode: 4,
         };
-        // The two first fixture pins and the retired second fixture pin all refuse.
+        // The two first fixture pins and the retired second, third and fourth fixture pins
+        // all refuse; the current pin is not among them.
         for retired in RETIRED_SELF_OWNED_CAPTURE_OUTERS {
             assert!(matches!(
                 self_owned_fixture_selected(Some(retired), &fixture),
                 Err(DesktopLocalRuntimeError::Configuration)
             ));
         }
-        assert!(
-            RETIRED_SELF_OWNED_CAPTURE_OUTERS
-                .contains(&"f9ee6d061d6202b15edd9de72a1560212ccc70e1438625a2559025b21edaaaf6")
-        );
+        for retired in [
+            "f9ee6d061d6202b15edd9de72a1560212ccc70e1438625a2559025b21edaaaf6",
+            "f5e855cf553d55c2cd25056c09eadd57842fa4be0a778216d5ffba7ccadcf04a",
+            "4d2eb480df701f03d9732466ad4791946a227a08f8c1de48b64c234c39a78812",
+        ] {
+            assert!(RETIRED_SELF_OWNED_CAPTURE_OUTERS.contains(&retired));
+        }
+        assert!(!RETIRED_SELF_OWNED_CAPTURE_OUTERS.contains(&SELF_OWNED_CAPTURE_FIXTURE.outer));
         assert!(matches!(
             self_owned_fixture_selected(None, &fixture),
             Ok(false)
