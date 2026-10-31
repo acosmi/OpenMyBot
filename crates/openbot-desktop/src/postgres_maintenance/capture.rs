@@ -2913,26 +2913,8 @@ fn read_exact_metadata(
 const SOURCE_MAIN: &str = "source-postgresql.conf";
 const SOURCE_HBA: &str = "source-pg-hba.conf";
 const SOURCE_IDENT: &str = "source-pg-ident.conf";
-// Only the role's local business database (the source reads compare against it) and
-// replication; everything else is rejected.
-const SOURCE_HBA_BYTES: &[u8] = &{
-    const HEAD: &[u8] = b"local ";
-    const DATABASE: &[u8] = openbot_infra::db::desktop_local::APPLICATION_DATABASE.as_bytes();
-    const TAIL: &[u8] = b" desktop_admin scram-sha-256\nlocal replication desktop_admin scram-sha-256\nlocal all all reject\nlocal replication all reject\n";
-    let mut bytes = [0_u8; HEAD.len() + DATABASE.len() + TAIL.len()];
-    let mut at = 0;
-    while at < bytes.len() {
-        bytes[at] = if at < HEAD.len() {
-            HEAD[at]
-        } else if at < HEAD.len() + DATABASE.len() {
-            DATABASE[at - HEAD.len()]
-        } else {
-            TAIL[at - HEAD.len() - DATABASE.len()]
-        };
-        at += 1;
-    }
-    bytes
-};
+// The role may reach only the business database (APPLICATION_DATABASE) and replication.
+const SOURCE_HBA_BYTES: &[u8] = b"local openbot desktop_admin scram-sha-256\nlocal replication desktop_admin scram-sha-256\nlocal all all reject\nlocal replication all reject\n";
 // Command-line settings override FILE/auto without inventing new memory/WAL defaults.
 const SOURCE_SAFETY_ARGV: &[&str] = &[
     "listen_addresses=",
