@@ -74,8 +74,10 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let (receiver,mut commands)=mpsc::channel(8);
         let dialer=SafeDialer::new(EgressPolicy::default());
         let endpoints=Endpoints{telegram:TelegramEndpoint::production(dialer.clone()),feishu:FeishuEndpoint::production(dialer)};
-        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),endpoints.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary}).await?);
-        let run_canceller=BindingRunCanceller::new(assembled.assembly.application.clone(),assembled.resolver.clone(),Arc::new(canceller_connection.client));
+        // The one dispatch gate of the daemon, shared by the dispatcher and the run canceller.
+        let gate=Arc::new(Mutex::new(()));
+        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),endpoints.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary},Arc::clone(&gate)).await?);
+        let run_canceller=BindingRunCanceller::new(assembled.assembly.application.clone(),assembled.resolver.clone(),Arc::new(canceller_connection.client),gate);
         canceller=Some(CancelQueue::start(run_canceller.clone(),canceller_connection.driver,requests));
         let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,endpoints,receiver,wake:started.wake(),minter:ThreadMinter::new(assembled.assembly.application.clone(),assembled.resolver.clone()),canceller:run_canceller,counters:started.status_source().counters};
         let path=root.join("run/control.sock");

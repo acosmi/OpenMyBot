@@ -3,7 +3,7 @@
 use omb_store::{
     Channel, Claimed, DeliveryContent, DispatchOutcome, ErrorCode, Finish, GrantKind,
     RunResultFacts, StoreError, TerminalKind, TerminalWrite, claim_delivery, finish_delivery,
-    migrate, record_dispatch, record_terminal, run_result_facts, send_target,
+    lock_dispatch, migrate, record_dispatch, record_terminal, run_result_facts, send_target,
     testkit::{
         Fixture, Session, deadline, insert_delivery, insert_ended_session, insert_event_for_run,
         insert_host_binding, insert_receiver_with, insert_sender, read_row, set_terminal,
@@ -168,14 +168,13 @@ async fn record_terminal_does_not_require_dispatched_status_and_dispatch_keeps_t
     let stored = read_row(env.client(), "channel_events", "record_id", event).await;
     assert_eq!(stored["dispatch_status"], "pending");
     assert_eq!(stored["terminal_kind"], "failed");
-    record_dispatch(
-        &mut env.session.client,
-        event,
-        DispatchOutcome::Dispatched,
-        deadline(),
-    )
-    .await
-    .unwrap();
+    let dispatch = lock_dispatch(&mut env.session.client, event, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    record_dispatch(dispatch, event, DispatchOutcome::Dispatched, deadline())
+        .await
+        .unwrap();
     let stored = read_row(env.client(), "channel_events", "record_id", event).await;
     assert_eq!(stored["dispatch_status"], "dispatched");
     assert_eq!(stored["terminal_kind"], "failed");

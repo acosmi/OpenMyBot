@@ -1,7 +1,8 @@
 //! Turns pending accepted messages into delegated runs through the engine's single entry.
 use crate::{ChannelError, Connection, OMB_EXPIRY_NOTICE_V1, STORE_BUDGET, Task, Timings, backoff};
 use omb_store::{
-    Claim, DispatchItem, DispatchOutcome, claim_dispatch, expire_pending, record_dispatch,
+    Claim, DispatchItem, DispatchOutcome, claim_dispatch, expire_pending, lock_dispatch,
+    record_dispatch,
 };
 use openbot_application::{BeginDelegatedThreadRun, DelegatedRunEntry, DelegatedUntrustedMaterial};
 use openbot_contracts::{
@@ -13,7 +14,7 @@ use openbot_contracts::{
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::{
-    sync::{Notify, oneshot},
+    sync::{Mutex, Notify, oneshot},
     time::Instant,
 };
 
@@ -60,14 +61,19 @@ fn outcome(
 }
 
 /// Starts the dispatcher; it wakes on `wake`, at the nearest retry or expiry time, or on stop.
+/// Each dispatch holds `gate`, which the daemon's run canceller shares, from before its event lock
+/// until `record_dispatch` returns. A COMMIT already sent can still land after this client gives
+/// up; the canceller asks the engine first, so the begun run is still stopped, and at worst its
+/// store update waits up to 2 s on the event's row lock and answers `internal_error`.
 pub fn start_dispatcher(
     connection: Connection,
     entry: DelegatedRunEntry,
     timings: Timings,
     wake: Arc<Notify>,
+    gate: Arc<Mutex<()>>,
 ) -> Task {
     Task::spawn(connection, move |client, stop| {
-        dispatch(client, entry, timings, wake, stop)
+        dispatch(client, entry, timings, wake, gate, stop)
     })
 }
 async fn dispatch(
@@ -75,6 +81,7 @@ async fn dispatch(
     entry: DelegatedRunEntry,
     timings: Timings,
     wake: Arc<Notify>,
+    gate: Arc<Mutex<()>>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<(), ChannelError> {
     let store = |_| ChannelError::StoreFailed;
@@ -90,9 +97,20 @@ async fn dispatch(
         match claim_dispatch(&client).await.map_err(store)? {
             Claim::Item(item) => {
                 let (record_id, attempts) = (item.record_id, item.attempts);
+                // Held until `record_dispatch` returns, on every exit of this dispatch: a cancel
+                // waits for the begin to settle, also when this connection is lost mid-dispatch.
+                let _gate = gate.lock().await;
+                // The event stays locked from before the begin until its receipt is recorded.
+                let Some(dispatch) =
+                    lock_dispatch(&mut client, record_id, Instant::now() + STORE_BUDGET)
+                        .await
+                        .map_err(store)?
+                else {
+                    continue;
+                };
                 let receipt = entry.begin(request(item)).await;
                 record_dispatch(
-                    &mut client,
+                    dispatch,
                     record_id,
                     outcome(&receipt, attempts, &timings),
                     Instant::now() + STORE_BUDGET,

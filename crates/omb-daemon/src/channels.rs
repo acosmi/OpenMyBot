@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 use tokio::{
-    sync::{Notify, mpsc},
+    sync::{Mutex, Notify, mpsc},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -112,8 +112,10 @@ pub(crate) struct Channels {
     sweeper: Task,
 }
 impl Channels {
-    /// Records startup gaps, reconciles the store, then starts the heartbeat, the dispatcher, each
-    /// active receiver, the outbound sender and the sweeper, every one on its own connection.
+    /// Records startup gaps, reconciles the store, then starts the heartbeat, the dispatcher on
+    /// `gate`, each active receiver, the outbound sender and the sweeper, every one on its own
+    /// connection.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start(
         postgres: &mut Postgres,
         engine: &Engine,
@@ -122,6 +124,7 @@ impl Channels {
         endpoints: Endpoints,
         cancel: CancelRequests,
         outbound: Outbound,
+        gate: Arc<Mutex<()>>,
     ) -> Result<Self, DaemonError> {
         postgres.record_startup_gaps(token_id).await?;
         let telegram = postgres.list_active_receivers(Channel::Telegram).await?;
@@ -204,7 +207,7 @@ impl Channels {
         };
         Ok(Self {
             heartbeat: start_heartbeat(heartbeat, token_id, timings),
-            dispatcher: start_dispatcher(dispatcher, entry, timings, wake),
+            dispatcher: start_dispatcher(dispatcher, entry, timings, wake, gate),
             telegram: telegram.map(|(row, opened)| {
                 (row.binding_id, start_receiver(opened, row, context.clone()))
             }),
@@ -502,6 +505,7 @@ mod tests {
             entry,
             quick(),
             Arc::clone(&wake),
+            Arc::default(),
         );
         (task, wake)
     }
@@ -906,6 +910,7 @@ mod tests {
             endpoints(refused_endpoint()),
             cancel(),
             outbound(),
+            Arc::default(),
         )
         .await
         .unwrap();
@@ -952,6 +957,7 @@ mod tests {
             endpoints(refused_endpoint()),
             cancel(),
             outbound(),
+            Arc::default(),
         )
         .await
         .unwrap();
@@ -1108,6 +1114,7 @@ mod tests {
             endpoints(fake.endpoint()),
             cancel(),
             outbound(),
+            Arc::default(),
         )
         .await
         .unwrap();
@@ -1143,6 +1150,7 @@ mod tests {
             endpoints(fake.endpoint()),
             cancel(),
             outbound(),
+            Arc::default(),
         )
         .await
         .unwrap();
@@ -1244,6 +1252,7 @@ mod tests {
             endpoints,
             cancel(),
             outbound,
+            Arc::default(),
         )
         .await
         .unwrap()
@@ -1909,6 +1918,7 @@ mod tests {
                 engine.assembly.application.clone(),
                 engine.resolver.clone(),
                 Arc::new(canceller_connection.client),
+                Arc::default(),
             ),
             counters: Arc::new(Counters::default()),
         };
@@ -1952,6 +1962,86 @@ mod tests {
         drop(ops);
         channels.stop().await;
         runtime.stop().await;
+        drop(client);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn duplicate_update_wakes_the_dispatcher_for_an_event_whose_wake_was_lost() {
+        let mut fixture = Fixture::start().await;
+        let token = token(&mut fixture).await;
+        let mut client = fixture.client().await;
+        let fake = FakeTelegram::start().await;
+        let receiver = rt::sealed(&fixture, &client).await;
+        rt::sender(&fixture, &client, "telegram").await;
+        let channels = started(
+            &mut fixture,
+            token,
+            quick(),
+            endpoints(fake.endpoint()),
+            outbound(),
+        )
+        .await;
+        let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name='openmybot-dispatcher' AND state='idle' AND query LIKE 'SELECT e.record_id,%')",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            assert!(tokio::time::Instant::now() < limit, "dispatcher idle deadline");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Written without a wake-up by a commit that takes a second; meanwhile the platform
+        // delivers the update again and the receiver finds it a duplicate.
+        client.batch_execute("CREATE FUNCTION openmybot.fixture_commit_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NULL; END $$; CREATE CONSTRAINT TRIGGER fixture_commit_delay AFTER INSERT ON openmybot.channel_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_commit_delay()").await.unwrap();
+        let watcher = fixture.client().await;
+        let incoming = update(7, "work");
+        let omb_channels::Normalized::Event(event) = omb_channels::normalize(&incoming, "1001")
+        else {
+            panic!("text update");
+        };
+        let (accepted, ()) = tokio::join!(
+            accept_event(
+                &mut client,
+                receiver,
+                &event,
+                &OMB_REPLY_TEXTS_V1,
+                deadline()
+            ),
+            async {
+                let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+                while !watcher
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event='PgSleep')",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, bool>(0)
+                {
+                    assert!(tokio::time::Instant::now() < limit, "commit deadline");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                fake.push_update(incoming.clone());
+            }
+        );
+        assert_eq!(
+            accepted.unwrap(),
+            AcceptOutcome::Recorded(Disposition::AcceptedMessage)
+        );
+        let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+        while event_by_key(&client, "7").await["dispatch_status"] != "dispatched" {
+            assert!(tokio::time::Instant::now() < limit, "dispatch deadline");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let counters = channels.status_source().counters;
+        assert_eq!(counters.event_conflict.load(Ordering::Relaxed), 0);
+        channels.stop().await;
         drop(client);
         fixture.stop().await;
     }
