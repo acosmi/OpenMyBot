@@ -18,6 +18,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus, Stdio};
 use std::time::Duration;
@@ -248,7 +249,8 @@ impl ChannelPlugin for Fake {
     }
 }
 
-/// Relays stdin frames to a copy of this plugin, logging each one first.
+/// Relays stdin frames to a copy of this plugin, logging each one first, and exits as soon as the
+/// copy does: returning would wait for the runtime's blocked stdin read.
 async fn relay(recv_log: PathBuf, args: Vec<String>) -> ExitCode {
     let mut plugin = tokio::process::Command::new(std::env::current_exe().expect("current exe"))
         .args(args)
@@ -262,12 +264,17 @@ async fn relay(recv_log: PathBuf, args: Vec<String>) -> ExitCode {
         .append(true)
         .open(recv_log)
         .expect("recv log");
-    let exit = |status: std::io::Result<ExitStatus>| {
-        ExitCode::from(status.expect("plugin copy").code().unwrap_or(1) as u8)
-    };
+    fn exit(status: std::io::Result<ExitStatus>) -> ! {
+        let status = status.expect("plugin copy");
+        std::process::exit(
+            status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        )
+    }
     loop {
         tokio::select! {
-            status = plugin.wait() => return exit(status),
+            status = plugin.wait() => exit(status),
             frame = read_frame(&mut stdin) => {
                 let Ok(Some(payload)) = frame else { break };
                 log.write_all(&payload).expect("recv log");

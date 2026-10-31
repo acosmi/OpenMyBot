@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 use crate::frame::{FrameError, decode, encode, read_frame, write_frame};
 use crate::protocol::{FromPlugin, Limits, ToPlugin};
@@ -103,24 +103,36 @@ impl Host {
         read?.map(|payload| decode(&payload)).transpose()
     }
 
-    /// Sends TERM to the process group, then KILL after the grace period, and returns the exit code
-    /// (`None` when a signal ended the plugin).
+    /// Sends TERM to the process group, sends KILL once the grace period passes, waits until the
+    /// group is empty and returns the plugin's exit code (`None` when a signal ended it).
     pub async fn kill(mut self) -> Option<i32> {
-        if let Ok(Some(status)) = self.child.try_wait() {
-            return status.code();
-        }
         let group = format!("-{}", self.child.id()?);
-        let _ = Command::new("/bin/kill")
-            .args(["-s", "TERM", "--", &group])
-            .status()
-            .await;
-        if let Ok(status) = timeout(TERM_GRACE, self.child.wait()).await {
-            return status.ok()?.code();
+        let deadline = Instant::now() + TERM_GRACE;
+        signal(&group, "TERM").await;
+        let status = match timeout_at(deadline, self.child.wait()).await {
+            Ok(status) => status,
+            Err(_) => {
+                signal(&group, "KILL").await;
+                self.child.wait().await
+            }
+        };
+        // Other members of the group can outlive the plugin itself.
+        while signal(&group, "0").await {
+            if Instant::now() >= deadline {
+                signal(&group, "KILL").await;
+            }
+            sleep(Duration::from_millis(10)).await;
         }
-        let _ = Command::new("/bin/kill")
-            .args(["-s", "KILL", "--", &group])
-            .status()
-            .await;
-        self.child.wait().await.ok()?.code()
+        status.ok()?.code()
     }
+}
+
+/// Sends `-<name>` to the process group through `/bin/kill`; `false` once the group is gone.
+async fn signal(group: &str, name: &str) -> bool {
+    Command::new("/bin/kill")
+        .args([&format!("-{name}"), "--", group])
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
 }

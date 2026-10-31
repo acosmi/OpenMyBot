@@ -14,6 +14,9 @@ use tokio::time::{Instant, timeout};
 const FAKE: &str = env!("CARGO_BIN_EXE_fake-channel-plugin");
 const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(300);
+/// Well below the plugin's 3 s ack timeout, so an event that follows a receipt within it was released
+/// by that receipt.
+const ACK_PROOF: Duration = Duration::from_secs(1);
 
 async fn spawn(args: &[&str]) -> Host {
     Host::spawn(Path::new(FAKE), args, &[]).await.unwrap()
@@ -77,6 +80,22 @@ fn event_lines(keys: &[&str]) -> String {
     keys.iter()
         .map(|key| serde_json::to_string(&event(key)).unwrap() + "\n")
         .collect()
+}
+
+fn accepted(key: &str) -> ToPlugin {
+    ToPlugin::Accepted {
+        event_key: key.to_owned(),
+    }
+}
+
+/// The next event stays queued while `key` has no receipt and follows at once after `accepted`.
+async fn accept_then_next(host: &mut Host, key: &str, following: &str) {
+    assert!(host.recv(ACK_PROOF).await.unwrap().is_none());
+    host.send(&accepted(key)).await.unwrap();
+    assert_eq!(
+        host.recv(ACK_PROOF).await.unwrap(),
+        Some(FromPlugin::Event(event(following)))
+    );
 }
 
 fn send(delivery_id: &str) -> ToPlugin {
@@ -172,35 +191,22 @@ async fn verify_returns_the_source_key_or_each_failure_code() {
 async fn events_wait_for_accepted_one_by_one_and_follow_appends() {
     let path = events_file("events", &["1", "2", "3"]);
     let mut host = started(&["--events", path.to_str().unwrap()], "secret").await;
-    for key in ["1", "2", "3"] {
-        assert_eq!(next(&mut host).await, FromPlugin::Event(event(key)));
-        // The next event waits for this one's receipt.
-        assert!(host.recv(QUIET).await.unwrap().is_none());
-        host.send(&ToPlugin::Accepted {
-            event_key: key.to_owned(),
-        })
-        .await
-        .unwrap();
-    }
+    assert_eq!(next(&mut host).await, FromPlugin::Event(event("1")));
+    accept_then_next(&mut host, "1", "2").await;
+    accept_then_next(&mut host, "2", "3").await;
+    host.send(&accepted("3")).await.unwrap();
     assert!(host.recv(QUIET).await.unwrap().is_none());
-    // A line appended after start is picked up by the tail.
+    // Lines appended after start are picked up by the tail.
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .unwrap();
-    std::io::Write::write_all(&mut file, event_lines(&["4"]).as_bytes()).unwrap();
+    std::io::Write::write_all(&mut file, event_lines(&["4", "5"]).as_bytes()).unwrap();
     assert_eq!(next(&mut host).await, FromPlugin::Event(event("4")));
-    host.send(&ToPlugin::Accepted {
-        event_key: "4".to_owned(),
-    })
-    .await
-    .unwrap();
+    accept_then_next(&mut host, "4", "5").await;
+    host.send(&accepted("5")).await.unwrap();
     // Unknown and late receipts are ignored.
-    host.send(&ToPlugin::Accepted {
-        event_key: "unknown".to_owned(),
-    })
-    .await
-    .unwrap();
+    host.send(&accepted("unknown")).await.unwrap();
     host.send(&ToPlugin::Stop {}).await.unwrap();
     assert_eq!(exit_code(host).await, Some(0));
 }
