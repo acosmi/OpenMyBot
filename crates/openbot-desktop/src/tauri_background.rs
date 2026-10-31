@@ -83,14 +83,14 @@ struct SelfOwnedFixturePin {
 // Bound from the materialized fixture before its only run; until then nothing matches.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 const SELF_OWNED_CAPTURE_FIXTURE: SelfOwnedFixturePin = SelfOwnedFixturePin {
-    outer: "0000000000000000000000000000000000000000000000000000000000000000",
-    request_id: "0000000000000000000000000000000000000000000000000000000000000000",
-    device: 0,
-    uid: 0,
-    root_inode: 0,
-    release_inode: 0,
-    output_inode: 0,
-    key_inode: 0,
+    outer: "f5e855cf553d55c2cd25056c09eadd57842fa4be0a778216d5ffba7ccadcf04a",
+    request_id: "3fdbfb24c4525e7c5edae78cd44390397b387b2ee0ba64aec4f61423bebe8531",
+    device: 16777229,
+    uid: 501,
+    root_inode: 177999882,
+    release_inode: 177999883,
+    output_inode: 177999884,
+    key_inode: 177999885,
 };
 
 // There is no public constructor, Clone, Deserialize, caller flag, path or secret injection.
