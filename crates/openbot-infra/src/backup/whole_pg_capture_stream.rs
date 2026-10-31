@@ -770,7 +770,16 @@ fn stream(
     }
     synced(output_file, clock)?;
     let temp_identity = FileIdentity::from(&private_regular(output_file, 1, clock)?);
-    if allocated_blocks(&private_regular(output_file, 1, clock)?)? > output_file_limit {
+    // Merge the actual allocation into the one operation ledger. The rounded per-file limit
+    // only admits the write: APFS may allocate past it for a slowly written file.
+    if checked_add(
+        prior_reservation,
+        checked_add(
+            allocated_blocks(&private_regular(output_file, 1, clock)?)?,
+            checked_add(output_parent_limit, key_need)?,
+        )?,
+    )? > b.max_total_allocation_bytes
+    {
         return Err(F::CapacityExceeded);
     }
     if temp_identity.len != wire {
@@ -881,8 +890,6 @@ fn stream(
     let key_actual = allocated_blocks(&private_regular(&io.files[key_final], 1, clock)?)?;
     if out_growth > output_parent_limit
         || key_growth > key_parent_limit
-        || out_actual > output_file_limit
-        || key_actual > key_file_limit
         || checked_add(
             prior_reservation,
             checked_add(
