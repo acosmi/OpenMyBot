@@ -2,9 +2,10 @@
 use omb_store::{
     AcceptOutcome, AcceptedEvent, Channel, Claim, Command, Content, Disposition, IdentityKey,
     NewReceiver, NormalizedEvent, OpenRun, PairAttempt, PairOutcome, PairStart, ReplyTexts,
-    ResetDone, SessionStart, StateLabels, StoreError, Suspension, accept_event, activate_host,
-    activate_receiver, claim_dispatch, list_bindings, migrate, open_run, pair_attempt, pair_start,
-    receiver_row, reset_thread, revoke_binding, run_facts, suspend_receiver,
+    ResetDone, SessionStart, Settled, StateLabels, StoreError, Suspension, accept_event,
+    activate_host, activate_receiver, claim_dispatch, list_bindings, migrate, open_run,
+    pair_attempt, pair_start, receiver_row, reset_thread, revoke_binding, run_facts,
+    suspend_receiver,
     testkit::{
         Fixture, Session, deadline, insert_event_for_run, insert_host_binding,
         insert_permission_row, insert_receiver, insert_receiver_with, insert_sender,
@@ -105,7 +106,7 @@ fn open(thread: &str, run: &str) -> OpenRun {
         run_id: run.into(),
     }
 }
-async fn receive(client: &mut Client, id: Uuid, source_key: &str) -> Vec<OpenRun> {
+async fn receive(client: &mut Client, id: Uuid, source_key: &str) -> Settled {
     activate_receiver(
         client,
         NewReceiver {
@@ -276,10 +277,11 @@ async fn revoke_sender_returns_open_runs_and_cancels_pending_events() {
     let running = dispatched(env.client(), sender, "r1", "thread-T").await;
     let queued = insert_event_for_run(env.client(), sender, "r2", "thread-T", "pending").await;
     let before = event(env.client(), finished).await;
-    let runs = revoke_binding(&mut env.session.client, sender, deadline())
+    let settled = revoke_binding(&mut env.session.client, sender, deadline())
         .await
         .unwrap();
-    assert_eq!(runs, [open("thread-T", "r1")]);
+    assert_eq!(settled.dispatched, [open("thread-T", "r1")]);
+    assert_eq!(settled.pending, [open("thread-T", "r2")]);
     assert_eq!(
         event(env.client(), queued).await["dispatch_status"],
         "cancelled"
@@ -393,10 +395,11 @@ async fn revoke_receiver_cascade_settles_events_permissions_and_open_runs_of_the
     dispatched(env.client(), sender, "r1", "thread-T").await;
     let queued = insert_event_for_run(env.client(), sender, "r2", "thread-T", "pending").await;
     insert_permission_row(env.client(), sender, "r1", "hp-1", 600.0).await;
-    let runs = revoke_binding(&mut env.session.client, receiver, deadline())
+    let settled = revoke_binding(&mut env.session.client, receiver, deadline())
         .await
         .unwrap();
-    assert_eq!(runs, [open("thread-T", "r1")]);
+    assert_eq!(settled.dispatched, [open("thread-T", "r1")]);
+    assert_eq!(settled.pending, [open("thread-T", "r2")]);
     assert_eq!(
         event(env.client(), queued).await["dispatch_status"],
         "cancelled"
@@ -506,10 +509,12 @@ async fn revoke_past_deadline_fails_and_leaves_the_connection_without_open_trans
 async fn activate_receiver_inserts_active_row_revision_1_with_envelope_and_writes_no_gap() {
     let mut env = Env::new().await;
     let id = Uuid::now_v7();
-    assert!(
-        receive(&mut env.session.client, id, "1001")
-            .await
-            .is_empty()
+    assert_eq!(
+        receive(&mut env.session.client, id, "1001").await,
+        Settled {
+            dispatched: Vec::new(),
+            pending: Vec::new(),
+        }
     );
     let row = binding(env.client(), id).await;
     assert_eq!(row["binding_kind"], "receiver");
@@ -631,8 +636,9 @@ async fn activate_receiver_settles_events_permissions_and_returns_open_runs_of_c
     dispatched(env.client(), sender, "r1", "thread-T").await;
     let queued = insert_event_for_run(env.client(), sender, "r2", "thread-T", "pending").await;
     insert_permission_row(env.client(), sender, "r1", "hp-1", 600.0).await;
-    let runs = receive(&mut env.session.client, Uuid::now_v7(), "1001").await;
-    assert_eq!(runs, [open("thread-T", "r1")]);
+    let settled = receive(&mut env.session.client, Uuid::now_v7(), "1001").await;
+    assert_eq!(settled.dispatched, [open("thread-T", "r1")]);
+    assert_eq!(settled.pending, [open("thread-T", "r2")]);
     assert_eq!(
         event(env.client(), queued).await["dispatch_status"],
         "cancelled"

@@ -11,7 +11,7 @@ use openbot_contracts::{
     error::AppError,
     ids::{BotId, RunId, ThreadId},
 };
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use time::OffsetDateTime;
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -64,13 +64,14 @@ fn outcome(
 /// Each dispatch holds `gate`, which the daemon's run canceller shares, from before its event lock
 /// until `record_dispatch` returns. A COMMIT already sent can still land after this client gives
 /// up; the canceller asks the engine first, so the begun run is still stopped, and at worst its
-/// store update waits up to 2 s on the event's row lock and answers `internal_error`.
+/// store update waits up to 2 s on the event's row lock and answers `internal_error`. The gate
+/// also holds the run ids whose begin outcome is unknown.
 pub fn start_dispatcher(
     connection: Connection,
     entry: DelegatedRunEntry,
     timings: Timings,
     wake: Arc<Notify>,
-    gate: Arc<Mutex<()>>,
+    gate: Arc<Mutex<HashSet<String>>>,
 ) -> Task {
     Task::spawn(connection, move |client, stop| {
         dispatch(client, entry, timings, wake, gate, stop)
@@ -81,7 +82,7 @@ async fn dispatch(
     entry: DelegatedRunEntry,
     timings: Timings,
     wake: Arc<Notify>,
-    gate: Arc<Mutex<()>>,
+    gate: Arc<Mutex<HashSet<String>>>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<(), ChannelError> {
     let store = |_| ChannelError::StoreFailed;
@@ -96,10 +97,12 @@ async fn dispatch(
         .map_err(store)?;
         match claim_dispatch(&client).await.map_err(store)? {
             Claim::Item(item) => {
-                let (record_id, attempts) = (item.record_id, item.attempts);
+                let (record_id, attempts, run_id) =
+                    (item.record_id, item.attempts, item.run_id.clone());
                 // Held until `record_dispatch` returns, on every exit of this dispatch: a cancel
                 // waits for the begin to settle, also when this connection is lost mid-dispatch.
-                let _gate = gate.lock().await;
+                // It also holds the run ids whose begin outcome is unknown.
+                let mut unknown = gate.lock().await;
                 // The event stays locked from before the begin until its receipt is recorded.
                 let Some(dispatch) =
                     lock_dispatch(&mut client, record_id, Instant::now() + STORE_BUDGET)
@@ -109,6 +112,16 @@ async fn dispatch(
                     continue;
                 };
                 let receipt = entry.begin(request(item)).await;
+                // A begin whose COMMIT outcome is unknown may still land; a started run settles it.
+                match &receipt {
+                    Err(AppError::ReconciliationRequired { accepted: true }) => {
+                        unknown.insert(run_id);
+                    }
+                    Ok(_) => {
+                        unknown.remove(&run_id);
+                    }
+                    Err(_) => {}
+                }
                 record_dispatch(
                     dispatch,
                     record_id,

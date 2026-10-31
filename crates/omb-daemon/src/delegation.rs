@@ -135,8 +135,20 @@ pub(crate) mod fixture {
         TenantPackageAudienceContext, TenantPackageEnvironment, synchronize_tenant_package,
     };
     use openbot_contracts::ids::ActorId;
-    use std::path::{Path, PathBuf};
-    use tokio::{sync::mpsc, task::JoinHandle};
+    use openbot_infra::db::pool::DatabaseConfig;
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicI32, Ordering::SeqCst},
+        },
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream, tcp::OwnedReadHalf},
+        sync::{Mutex, Notify, mpsc},
+        task::{JoinHandle, JoinSet},
+    };
     use uuid::Uuid;
 
     /// One own PG17.11 data directory with the assembled engine and its host driver.
@@ -149,6 +161,8 @@ pub(crate) mod fixture {
         pub(crate) deployment_id: String,
         /// Receiving end of the engine's terminal-notice queue until a test takes it.
         terminals: Option<mpsc::Receiver<RunTerminalNotice>>,
+        /// The wire proxy the engine pool connects through, when the fixture has one.
+        pub(crate) proxy: Option<CommitHoldProxy>,
     }
     /// Test-only copy of the tenant package's agents: the Bot routed to the package provider
     /// instead of the `crabcode` extension.
@@ -166,17 +180,21 @@ pub(crate) mod fixture {
     }
     impl Fixture {
         pub(crate) async fn start() -> Self {
-            Self::launch(false, idle_host).await
+            Self::launch(false, idle_host, false).await
         }
         /// Like `start`, with the test tenant package that declares Bot `omb-crabcode`.
         pub(crate) async fn start_with_bot() -> Self {
-            Self::launch(true, idle_host).await
+            Self::launch(true, idle_host, false).await
         }
         /// Like `start`, with the host driver configured by `host` from the data directory.
         pub(crate) async fn start_with_host(host: fn(&Path) -> HostDriverConfig) -> Self {
-            Self::launch(false, host).await
+            Self::launch(false, host, false).await
         }
-        async fn launch(bot: bool, host: fn(&Path) -> HostDriverConfig) -> Self {
+        /// Like `start_with_host`, with the engine pool connected through a `CommitHoldProxy`.
+        pub(crate) async fn start_through_proxy(host: fn(&Path) -> HostDriverConfig) -> Self {
+            Self::launch(false, host, true).await
+        }
+        async fn launch(bot: bool, host: fn(&Path) -> HostDriverConfig, proxied: bool) -> Self {
             let pg_bin = PathBuf::from(
                 std::env::var_os("OMB_TEST_PG_BIN_DIR")
                     .expect("explicit own PG17.11 test binary directory required"),
@@ -190,6 +208,11 @@ pub(crate) mod fixture {
             .unwrap();
             let config = config::load(&root).unwrap();
             let mut pg = Postgres::start(&root, &config).await.unwrap();
+            let proxy = if proxied {
+                Some(CommitHoldProxy::start(&pg.database_config()).await)
+            } else {
+                None
+            };
             let prepared = engine::prepare(&root, &config.deployment_id, &mut pg)
                 .await
                 .unwrap();
@@ -217,6 +240,10 @@ pub(crate) mod fixture {
             let resident = pg.open_resident_connection("omb-hostdriver").await.unwrap();
             let driver = HostDriver::new(host(&root), std::sync::Arc::new(resident.client));
             let (queue, terminals) = mpsc::channel(TERMINAL_QUEUE);
+            let prepared = match &proxy {
+                Some(proxy) => prepared.through(&proxy.config).await,
+                None => prepared,
+            };
             let engine = engine::assemble(
                 &root,
                 prepared,
@@ -233,6 +260,7 @@ pub(crate) mod fixture {
                 host_link: Some(resident.driver),
                 deployment_id: config.deployment_id,
                 terminals: Some(terminals),
+                proxy,
             }
         }
         pub(crate) fn engine(&self) -> &Engine {
@@ -257,8 +285,153 @@ pub(crate) mod fixture {
             if let Some(engine) = self.engine.take() {
                 engine.shutdown().await;
             }
+            if let Some(proxy) = self.proxy.take() {
+                proxy.stop().await;
+            }
             self.pg.stop().await.unwrap();
             std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    /// Test-only loopback wire proxy in front of the engine pool. Armed for one backend pid, it
+    /// withholds that connection's next `COMMIT` query and ends the client side, so the client
+    /// sees an unknown outcome while the transaction stays open on the server; `release` then
+    /// sends the `COMMIT` on and waits for its completion.
+    pub(crate) struct CommitHoldProxy {
+        pub(crate) config: DatabaseConfig,
+        hold: Arc<Hold>,
+        task: JoinHandle<()>,
+    }
+    #[derive(Default)]
+    struct Hold {
+        /// The backend pid whose next `COMMIT` is withheld; 0 when none.
+        target: AtomicI32,
+        holding: AtomicBool,
+        release: Notify,
+        landed: Notify,
+    }
+    /// A simple-query `COMMIT` and its `CommandComplete`, as whole frames.
+    const COMMIT_QUERY: &[u8] = b"Q\0\0\0\x0bCOMMIT\0";
+    const COMMIT_DONE: &[u8] = b"C\0\0\0\x0bCOMMIT\0";
+    /// Reads one typed frame whole: kind, length and body.
+    async fn frame(from: &mut OwnedReadHalf) -> std::io::Result<Vec<u8>> {
+        let mut raw = vec![0; 5];
+        from.read_exact(&mut raw).await?;
+        raw.resize(
+            1 + u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]) as usize,
+            0,
+        );
+        from.read_exact(&mut raw[5..]).await?;
+        Ok(raw)
+    }
+    impl CommitHoldProxy {
+        pub(crate) async fn start(backend: &DatabaseConfig) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = backend.clone();
+            config.port = listener.local_addr().unwrap().port();
+            let address = (backend.host.clone(), backend.port);
+            let hold = Arc::new(Hold::default());
+            let shared = Arc::clone(&hold);
+            let task = tokio::spawn(async move {
+                // Dropping the set when the task is aborted ends every link.
+                let mut links = JoinSet::new();
+                while let Ok((client, _)) = listener.accept().await {
+                    let Ok(server) = TcpStream::connect((address.0.as_str(), address.1)).await
+                    else {
+                        return;
+                    };
+                    let hold = Arc::clone(&shared);
+                    // Forwards the connection both ways, records its backend pid and withholds
+                    // the armed `COMMIT`; it ends when either side ends or when the released
+                    // `COMMIT` completed.
+                    links.spawn(async move {
+                        let (mut client_read, client_write) = client.into_split();
+                        let (mut server_read, mut server_write) = server.into_split();
+                        let client_write = Mutex::new(client_write);
+                        let (pid, held) = (AtomicI32::new(0), AtomicBool::new(false));
+                        let frontend = async {
+                            // The untyped StartupMessage comes first.
+                            let mut startup = vec![0; 4];
+                            if client_read.read_exact(&mut startup).await.is_err() {
+                                return;
+                            }
+                            let length = u32::from_be_bytes([
+                                startup[0], startup[1], startup[2], startup[3],
+                            ]);
+                            startup.resize(length as usize, 0);
+                            if client_read.read_exact(&mut startup[4..]).await.is_err()
+                                || server_write.write_all(&startup).await.is_err()
+                            {
+                                return;
+                            }
+                            while let Ok(raw) = frame(&mut client_read).await {
+                                let own = pid.load(SeqCst);
+                                if raw == COMMIT_QUERY
+                                    && own != 0
+                                    && hold.target.compare_exchange(own, 0, SeqCst, SeqCst).is_ok()
+                                {
+                                    held.store(true, SeqCst);
+                                    hold.holding.store(true, SeqCst);
+                                    let _ = client_write.lock().await.shutdown().await;
+                                    hold.release.notified().await;
+                                    let _ = server_write.write_all(&raw).await;
+                                    // The backend side ends the link once the COMMIT completed.
+                                    return std::future::pending().await;
+                                }
+                                if server_write.write_all(&raw).await.is_err() {
+                                    return;
+                                }
+                            }
+                        };
+                        let backend = async {
+                            while let Ok(raw) = frame(&mut server_read).await {
+                                if raw[0] == b'K' {
+                                    pid.store(
+                                        i32::from_be_bytes([raw[5], raw[6], raw[7], raw[8]]),
+                                        SeqCst,
+                                    );
+                                }
+                                if raw == COMMIT_DONE && held.load(SeqCst) {
+                                    hold.landed.notify_one();
+                                    return;
+                                }
+                                // Frames pipelined before the held `COMMIT` (a statement close
+                                // and its ready-for-query) arrive after the client side ended;
+                                // they are dropped and the held transaction stays open.
+                                if client_write.lock().await.write_all(&raw).await.is_err()
+                                    && !held.load(SeqCst)
+                                {
+                                    return;
+                                }
+                            }
+                        };
+                        tokio::select! {
+                            () = frontend => {}
+                            () = backend => {}
+                        }
+                    });
+                }
+            });
+            Self { config, hold, task }
+        }
+        /// Arms the proxy for the next `COMMIT` of the connection whose backend pid is `pid`.
+        pub(crate) fn hold_commit_of(&self, pid: i32) {
+            self.hold.target.store(pid, SeqCst);
+        }
+        /// Whether a `COMMIT` is withheld now.
+        pub(crate) fn holding(&self) -> bool {
+            self.hold.holding.load(SeqCst)
+        }
+        /// Sends the withheld `COMMIT` to the server and returns once it completed.
+        pub(crate) async fn release(&self) {
+            self.hold.holding.store(false, SeqCst);
+            self.hold.release.notify_one();
+            self.hold.landed.notified().await;
+        }
+        /// Ends the proxy and every link; called after the pools that used it closed.
+        pub(crate) async fn stop(self) {
+            self.task.abort();
+            let _ = self.task.await;
         }
     }
     /// Receiver rows are created by a later task; tests insert an active one directly.
