@@ -8,4 +8,4 @@ Provide PostgreSQL 17 binaries, including `postgres` and `initdb`, in the explic
 
 Status reports process, PostgreSQL, version, deployment and authentication-failure facts and a channel segment. The Telegram receiver, the dispatcher, outcome delivery, the CrabCode host driver, `openmybot mcp`, the CrabCode host projection and the Feishu receiver (long-connection intake and Feishu outcome delivery) are delivered. The embedded composition package does not establish model availability. No background launch service is installed.
 
-See [中文说明](README.zh-CN.md), [compatibility evidence](compat/README.md), and [host projections](hosts/README.md). This development surface has not completed product release validation.
+See [中文说明](README.zh-CN.md), [compatibility evidence](compat/README.md), and [host package](plugin/README.md). This development surface has not completed product release validation.
