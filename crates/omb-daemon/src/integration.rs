@@ -215,6 +215,7 @@ impl Rig {
                 engine.assembly.application.clone(),
                 engine.resolver.clone(),
                 Arc::new(canceller.client),
+                Arc::default(),
             ),
             counters: Arc::new(Counters::default()),
         };
@@ -248,6 +249,7 @@ impl Rig {
             .unwrap();
         let (cancel, requests) = mpsc::channel(CANCEL_QUEUE);
         let engine = self.fixture.engine.as_ref().unwrap();
+        let gate = Arc::default();
         let channels = Channels::start(
             &mut self.fixture.pg,
             engine,
@@ -262,6 +264,7 @@ impl Rig {
                 terminals,
                 crabcode: Some(agent::fake()),
             },
+            Arc::clone(&gate),
         )
         .await
         .unwrap();
@@ -269,6 +272,7 @@ impl Rig {
             engine.assembly.application.clone(),
             engine.resolver.clone(),
             Arc::new(connection.client),
+            gate,
         );
         self.canceller = Some(CancelQueue::start(
             canceller.clone(),

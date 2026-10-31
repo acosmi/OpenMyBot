@@ -26,7 +26,7 @@ use tokio::{
 };
 use uuid::Uuid;
 const FRAME_MAX: usize = 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const ENGINE_PIN: &str = env!("OMB_ENGINE_PIN");
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
