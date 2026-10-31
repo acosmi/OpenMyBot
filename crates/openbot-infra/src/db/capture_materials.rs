@@ -1125,7 +1125,7 @@ fn verify_normal_file_settings(rows: &[CapturedDbRow]) -> Result<(), CaptureSqlF
     let mut main = 0_u32;
     let mut auto = 0_u32;
     for row in rows {
-        if row.projection != NORMAL_FILE_SETTINGS.name || row.fields.len() != 4 {
+        if row.projection != NORMAL_FILE_SETTINGS.name || row.fields.len() != 5 {
             return Err(CaptureSqlFailure::RowInvalid);
         }
         let bit = match field(row, 0)? {
@@ -1616,6 +1616,7 @@ mod normal_config_file_settings_tests {
                 Some(source.to_owned()),
                 Some(applied.to_string()),
                 Some("true".to_owned()),
+                Some("1".to_owned()),
             ],
         }
     }
@@ -1813,9 +1814,11 @@ SELECT oversized,CASE WHEN oversized THEN NULL ELSE jsonb_build_array(f0,f1,f2):
 FROM bounded
 "#,
 };
+// Paged by seqno like every other cursor projection, so no page size is implied; the whole
+// result is still checked as one closed set.
 const NORMAL_FILE_SETTINGS: Projection = Projection {
     name: "normal_file_settings",
-    cursor: &[],
+    cursor: &[4],
     catalog: false,
     sensitive: false,
     sql: r#"
@@ -1848,13 +1851,15 @@ WITH cap AS (SELECT $1::text a,$2::text b,$3::text c,$4::bigint field_limit,
    WHEN s.sourcefile=pg_catalog.current_setting('data_directory',true)||'/postgresql.auto.conf' THEN 2
    ELSE 0 END)::text AS f1,
   (s.applied)::text AS f2,
-  (s.error IS NULL)::text AS f3
- FROM pg_catalog.pg_file_settings s
- ORDER BY s.seqno LIMIT least(22,(SELECT page_limit FROM cap))
+  (s.error IS NULL)::text AS f3,
+  (s.seqno)::text AS f4
+ FROM pg_catalog.pg_file_settings s CROSS JOIN cap
+ WHERE (true) AND (cap.a IS NULL OR (s.seqno)>(cap.a::integer))
+ ORDER BY s.seqno LIMIT (SELECT page_limit FROM cap)
  ), bounded AS (
- SELECT page.*,(greatest(coalesce(octet_length(f0),0),coalesce(octet_length(f1),0),coalesce(octet_length(f2),0),coalesce(octet_length(f3),0))>cap.field_limit OR (2::numeric+8+6::numeric*coalesce(octet_length(f0),0)+8+6::numeric*coalesce(octet_length(f1),0)+8+6::numeric*coalesce(octet_length(f2),0)+8+6::numeric*coalesce(octet_length(f3),0))>cap.row_limit) AS oversized
+ SELECT page.*,(greatest(coalesce(octet_length(f0),0),coalesce(octet_length(f1),0),coalesce(octet_length(f2),0),coalesce(octet_length(f3),0),coalesce(octet_length(f4),0))>cap.field_limit OR (2::numeric+8+6::numeric*coalesce(octet_length(f0),0)+8+6::numeric*coalesce(octet_length(f1),0)+8+6::numeric*coalesce(octet_length(f2),0)+8+6::numeric*coalesce(octet_length(f3),0)+8+6::numeric*coalesce(octet_length(f4),0))>cap.row_limit) AS oversized
  FROM page CROSS JOIN cap)
-SELECT oversized,CASE WHEN oversized THEN NULL ELSE jsonb_build_array(f0,f1,f2,f3)::text END AS payload
+SELECT oversized,CASE WHEN oversized THEN NULL ELSE jsonb_build_array(f0,f1,f2,f3,f4)::text END AS payload
 FROM bounded
 "#,
 };
