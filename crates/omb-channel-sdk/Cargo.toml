@@ -1,0 +1,30 @@
+[package]
+name = "omb-channel-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The test host spawns plugin processes, so it alone needs tokio's process support.
+testkit = ["tokio/process"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[[bin]]
+name = "fake-channel-plugin"
+path = "src/bin/fake_channel_plugin.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "plugin_loop"
+required-features = ["testkit"]
