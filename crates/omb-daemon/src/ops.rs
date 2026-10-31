@@ -389,7 +389,7 @@ impl Ops {
                 Ok(json!({ "bindings": bindings }))
             }
             Request::BindingsRevoke(binding_id) => {
-                let settled = {
+                let (settled, stopped) = {
                     let mut client = self.control.lock().await;
                     let settled = {
                         // No dispatch is between its event lock and its receipt while the binding
@@ -401,12 +401,15 @@ impl Ops {
                             .await
                             .map_err(failed)?
                     };
-                    self.command(|done| ReceiverCommand::Stop(binding_id, done), deadline)
-                        .await?;
-                    settled
+                    let stopped = self
+                        .command(|done| ReceiverCommand::Stop(binding_id, done), deadline)
+                        .await;
+                    (settled, stopped)
                 };
-                // Asked after the commit: a run that lands later fails its delegation check.
+                // Asked after the commit, also when the receiver command failed: a run that lands
+                // later fails its delegation check.
                 let cancelled = self.cancel_all(&settled).await?;
+                stopped?;
                 Ok(json!({"binding_id": binding_id.to_string(), "cancelled_runs": cancelled}))
             }
             Request::BindingsReconfirm(binding_id) => {
@@ -502,7 +505,7 @@ impl Ops {
                         secret.secret(),
                     )
                     .map_err(|_| DaemonError::InternalError)?;
-                let settled = {
+                let (settled, started) = {
                     let mut client = self.control.lock().await;
                     let settled = {
                         // No dispatch is between its event lock and its receipt while the replaced
@@ -529,11 +532,15 @@ impl Ops {
                         source_key: secret.source_key().to_owned(),
                         credential_envelope: envelope,
                     };
-                    self.command(|done| ReceiverCommand::Start(row, done), deadline)
-                        .await??;
-                    settled
+                    let started = self
+                        .command(|done| ReceiverCommand::Start(row, done), deadline)
+                        .await;
+                    (settled, started)
                 };
+                // The replaced bindings' runs are asked to stop even when the new receiver did not
+                // start.
                 self.cancel_all(&settled).await?;
+                started??;
                 Ok(json!({"binding_id": binding_id.to_string(), "source_key": secret.source_key()}))
             }
             Request::BindingsHost(workspace, run_deadline) => {
@@ -3111,6 +3118,28 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn receiver_replacement_cancels_the_run_even_when_the_start_command_fails() {
+        let mut env = Env::start().await;
+        fixture::receiver(&env.client, "telegram").await;
+        let (sender, thread) = env.sender().await;
+        let run = env.begun(sender, &thread).await;
+        env.verified(1001);
+        // Nothing receives the command, so sending it fails after the replacement committed.
+        env.commands.close();
+        assert_eq!(
+            env.call(
+                "bindings_receiver",
+                json!({"channel": "telegram", "token": "1001:new-token"}),
+            )
+            .await,
+            Err(DaemonError::InternalError)
+        );
+        assert_eq!(env.cancel_state(&run).await, "already_requested");
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn sealed_envelope_opens_with_the_receivers_principals() {
         let mut env = Env::start().await;
         env.verified(1001);
@@ -3446,6 +3475,23 @@ mod tests {
         assert_eq!(decided["decision"], "deny");
         assert_eq!(decided["decided_via"], "run_stopped");
         assert!(decided["decided_by_token"].is_null());
+        assert_eq!(env.cancel_state(&run).await, "already_requested");
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn revoke_cancels_the_run_even_when_the_stop_command_fails() {
+        let mut env = Env::start().await;
+        let (sender, thread) = env.sender().await;
+        let run = env.begun(sender, &thread).await;
+        // Nothing receives the command, so sending it fails after the revoke committed.
+        env.commands.close();
+        assert_eq!(
+            env.call("bindings_revoke", json!({"binding_id": sender.to_string()}))
+                .await,
+            Err(DaemonError::InternalError)
+        );
         assert_eq!(env.cancel_state(&run).await, "already_requested");
         env.stop().await;
     }
