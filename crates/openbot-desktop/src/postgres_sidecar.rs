@@ -4263,6 +4263,231 @@ mod tests {
         }
     }
 
+    // A fresh installation as the normal-exit capture finds it right after Ready: the
+    // normal read (five safety gates, frozen catalog) succeeds and the Periodic passes the
+    // never-audited chain without a checkpoint. An unlinked row alone is still refused, and
+    // one ordinary event is still sealed by a Periodic checkpoint.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    #[tokio::test]
+    #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+    async fn fresh_database_passes_the_normal_capture_reads_and_the_empty_periodic() {
+        use openbot_contracts::ids::AuditEventId;
+        use openbot_domain::audit::event::{AuditEvent, AuditEventType};
+        use openbot_domain::audit::payload::{AuditFact, AuditLabel, AuditPayload};
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault;
+        use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
+        use openbot_infra::db::capture_materials::{
+            CaptureDbExpectation, CaptureDecodeBudget, CaptureSqlBudget, CaptureSqlFailure,
+            CaptureSqlLimits,
+        };
+        use openbot_infra::repo::audit::AuditEventRepo;
+        struct UnitClock;
+        impl CaptureClockCheck for UnitClock {
+            fn require_effect(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn require_closing(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn effect_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn closing_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn observed_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(1)
+            }
+        }
+        let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+        let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
+        let bundle =
+            VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
+        let app_root = root("capture-reads-app");
+        let dist = materialize_desktop_dist();
+        let os_store: Arc<dyn OsSecretStore> = Arc::new(RuntimeMemorySecretStore::empty());
+        let release = DesktopLocalReleaseInput::new(
+            &dist,
+            "openbot",
+            "main",
+            bundle,
+            ReviewedPostgresKeyStoreService::from_reviewed_release(
+                "com.example.product.postgresql.capture-reads",
+            )
+            .unwrap(),
+            ReviewedDesktopVaultKeyStoreService::from_reviewed_release(
+                "com.example.product.desktop-vault.capture-reads",
+            )
+            .unwrap(),
+            os_store,
+        )
+        .unwrap();
+        let application = DesktopLocalApplicationInput::new(
+            DesktopOpenAiProviderInput::new("https://api.example.test/v1", Vec::new()).unwrap(),
+            DesktopAgentBudgets::new(
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(1_800)),
+                16_384,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let config = DesktopLocalRuntimeConfig::new(release, application, |authority| {
+            Ok(loaded_desktop_package(
+                authority.auth_context().tenant().as_str(),
+            ))
+        });
+        let prepared = prepare_desktop_local_runtime(
+            CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap(),
+            config,
+        )
+        .await
+        .unwrap();
+        let decode = CaptureDecodeBudget::checked(65_536, 4_194_304).unwrap();
+        decode.bind_original_clock(Arc::new(UnitClock)).unwrap();
+        // pageRows 8 also proves the file-settings read no longer needs one 21-row page.
+        let budget = || {
+            let mut budget = CaptureSqlBudget::new(
+                CaptureSqlLimits {
+                    max_rows: 12_288,
+                    max_row_bytes: 65_536,
+                    max_field_bytes: 8_192,
+                    max_pages: 1_024,
+                    page_rows: 8,
+                    max_catalog_objects: 8_192,
+                    max_query_tasks: 1_152,
+                    phase_ns: 30_000_000_000,
+                },
+                256 << 20,
+                0,
+            )
+            .unwrap();
+            budget
+                .bind_sensitive_decode_bound(Arc::clone(&decode))
+                .unwrap();
+            budget
+        };
+        let repo = AuditEventRepo::new(prepared.pool().clone());
+        let key = [7_u8; 32];
+        let client = prepared.pool().get().await.unwrap();
+        // Production order on one budget: identity, Periodic, normal read.
+        let mut reads = budget();
+        let identity = repo
+            .capture_source_identity_before(&mut reads, &UnitClock)
+            .await
+            .unwrap();
+        let empty = repo
+            .append_capture_periodic_before(&key, &mut reads, &UnitClock)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                empty.sequence(),
+                empty.event_count(),
+                empty.unlinked_before()
+            ),
+            (None, 0, 0)
+        );
+        let checkpoints: i64 = client
+            .query_one("SELECT count(*)::bigint FROM public.audit_checkpoints", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(checkpoints, 0);
+        // The identity side comes from the actual bindings; this test is about the gates
+        // and the frozen catalog.
+        let auth = prepared.auth_context();
+        let binding = client
+            .query_one(
+                "SELECT d.dataset_id::text,s.store_id::text,s.root_device::text,\
+                        s.root_inode::text,s.root_uid::text \
+                 FROM openbot_internal.artifact_dataset_bindings d \
+                 JOIN openbot_internal.artifact_store_bindings s \
+                   USING (deployment_id,tenant_id,dataset_id) \
+                 WHERE d.deployment_id=$1 AND d.tenant_id=$2",
+                &[&auth.deployment().as_str(), &auth.tenant().as_str()],
+            )
+            .await
+            .unwrap();
+        let expected = CaptureDbExpectation {
+            deployment_id: auth.deployment().as_str().to_owned(),
+            tenant_id: auth.tenant().as_str().to_owned(),
+            dataset_id: binding.get(0),
+            // Not part of the SQL read.
+            instance_id: String::new(),
+            system_identifier: identity.system_identifier().to_owned(),
+            database_oid: identity.database_oid(),
+            store_id: binding.get(1),
+            root_device: binding.get(2),
+            root_inode: binding.get(3),
+            root_uid: binding.get(4),
+        };
+        assert_eq!(
+            repo.collect_capture_materials_before(&expected, &mut reads, &UnitClock)
+                .await
+                .map(|_| ()),
+            Ok(())
+        );
+        client
+            .batch_execute(
+                "INSERT INTO public.audit_events (event_type,target_type,payload) \
+                 VALUES ('configuration.changed','capture_test','{}')",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.append_capture_periodic_before(&key, &mut budget(), &UnitClock)
+                .await
+                .err(),
+            Some(CaptureSqlFailure::RowInvalid)
+        );
+        let coordinates = client
+            .query_one("SELECT gen_random_uuid()::text,clock_timestamp()", &[])
+            .await
+            .unwrap();
+        let event = AuditEvent {
+            id: AuditEventId::new(coordinates.get::<_, String>(0)),
+            actor: None,
+            event_type: AuditEventType::parse("configuration.changed").unwrap(),
+            target_kind: AuditLabel::new("capture_test"),
+            target_id: None,
+            payload: AuditPayload::from_facts([AuditFact::ConfigurationChange(AuditLabel::new(
+                "capture_test",
+            ))])
+            .unwrap(),
+            created_at: coordinates.get(1),
+        };
+        repo.append(&event, &key).await.unwrap();
+        let sealed = repo
+            .append_capture_periodic_before(&key, &mut budget(), &UnitClock)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                sealed.sequence(),
+                sealed.event_count(),
+                sealed.unlinked_before()
+            ),
+            (Some(1), 1, 1)
+        );
+        let checkpoints: i64 = client
+            .query_one("SELECT count(*)::bigint FROM public.audit_checkpoints", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(checkpoints, 2);
+        drop(client);
+        drop(repo);
+        prepared.shutdown().await.unwrap();
+        fs::remove_dir_all(app_root).unwrap();
+        fs::remove_dir_all(bundle_root).unwrap();
+        fs::remove_dir_all(dist).unwrap();
+    }
+
     #[cfg(all(feature = "desktop-local-runtime", unix))]
     #[tokio::test]
     #[ignore = "需要本机PostgreSQL 17.11 binaries；设置OPENBOT_TEST_POSTGRES_BIN_DIR后运行"]
