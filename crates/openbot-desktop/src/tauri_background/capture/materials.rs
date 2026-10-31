@@ -866,10 +866,6 @@ fn classify_host_root(
         .ok_or(Fault::IntentMismatch)?
         .instance_id
         .clone();
-    let cluster = format!("postgresql-17-{instance}");
-    let scram = format!(".postgresql-17-{instance}.scram-init-v1.json");
-    let master = format!(".desktop-vault-{instance}.master-init-v1.json");
-    let start = format!(".postgresql-17-{instance}.start-lock-v1");
     let mut entries = Vec::new();
     let mut names = std::collections::BTreeSet::new();
     if state.host_directory.is_some() {
@@ -906,17 +902,7 @@ fn classify_host_root(
             continue;
         }
         let text = name.to_str().map_err(|_| Fault::PathUnsafe)?;
-        let (kind, is_directory) = match text {
-            "desktop-instance-v1" => ("installation", false),
-            "artifacts" => ("artifact-store", true),
-            "ui-preferences-v1" => ("preference-projection", false),
-            ".wrokbot-capture-control-v1" => ("original-capture-control", true),
-            name if name == cluster => ("original-postgres", true),
-            name if name == scram => ("scram-journal", false),
-            name if name == master => ("master-journal", false),
-            name if name == start => ("original-kernel-lock", false),
-            _ => return Err(Fault::ExtraMaterial),
-        };
+        let (kind, is_directory) = host_entry_kind(text, &instance).ok_or(Fault::ExtraMaterial)?;
         state
             .budget
             .as_mut()
@@ -936,12 +922,7 @@ fn classify_host_root(
             rustix::fs::statat(original_root, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW);
         op.require_effect()?;
         let st = observed.map_err(|_| Fault::SourceChanged)?;
-        let actual = rustix::fs::FileType::from_raw_mode(st.st_mode);
-        if st.st_uid != before.uid
-            || st.st_mode & 0o077 != 0
-            || is_directory && actual != rustix::fs::FileType::Directory
-            || !is_directory && (actual != rustix::fs::FileType::RegularFile || st.st_nlink != 1)
-        {
+        if !host_entry_attributes_safe(kind, is_directory, &st, before.uid) {
             return Err(Fault::PathUnsafe);
         }
         if !names.insert(text.to_owned()) {
@@ -957,16 +938,18 @@ fn classify_host_root(
             bytes: u64::try_from(st.st_size).map_err(|_| Fault::BoundsOverflow)?,
         });
     }
+    // Each kind names exactly one entry. The dynamic start-lock stays required: the running
+    // original owner removes it only after its confirmed exit, which follows this inventory.
     for required in [
-        "desktop-instance-v1",
-        "artifacts",
-        cluster.as_str(),
-        scram.as_str(),
-        master.as_str(),
-        start.as_str(),
-        ".wrokbot-capture-control-v1",
+        "installation",
+        "artifact-store",
+        "original-postgres",
+        "scram-journal",
+        "master-journal",
+        "original-start-lock",
+        "original-capture-control",
     ] {
-        if !names.contains(required) {
+        if !entries.iter().any(|entry| entry.kind == required) {
             return Err(Fault::MaterialMissing);
         }
     }
@@ -981,6 +964,53 @@ fn classify_host_root(
         uid: before.uid,
         entries,
     })
+}
+
+/// Exact app-data root closed set as `(kind, is_directory)`. The original sidecar owner's
+/// persistent kernel guard and its startup and helper journals are admitted by exact name;
+/// their content stays with that owner, which checks it at its own start.
+fn host_entry_kind(name: &str, instance: &str) -> Option<(&'static str, bool)> {
+    let owned = |prefix: &str, suffix: &str| {
+        name.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(instance))
+            == Some(suffix)
+    };
+    Some(match name {
+        "desktop-instance-v1" => ("installation", false),
+        "artifacts" => ("artifact-store", true),
+        "ui-preferences-v1" => ("preference-projection", false),
+        ".wrokbot-capture-control-v1" => ("original-capture-control", true),
+        _ if owned("postgresql-17-", "") => ("original-postgres", true),
+        _ if owned(".postgresql-17-", ".scram-init-v1.json") => ("scram-journal", false),
+        _ if owned(".desktop-vault-", ".master-init-v1.json") => ("master-journal", false),
+        _ if owned(".postgresql-17-", ".start-lock-v1") => ("original-start-lock", false),
+        _ if owned(".postgresql-17-", ".owner-guard-v1") => ("original-kernel-lock", false),
+        _ if owned(".postgresql-17-", ".startup-v1.json") => ("startup-journal", false),
+        _ if owned(".postgresql-17-", ".helper-v1.json") => ("helper-journal", false),
+        _ => return None,
+    })
+}
+
+// Attributes from the no-follow stat only; nothing is opened or parsed. The sidecar owner's
+// guard and journals are fixed regular, single-link 0600 files of the current user.
+fn host_entry_attributes_safe(
+    kind: &str,
+    is_directory: bool,
+    st: &rustix::fs::Stat,
+    uid: u32,
+) -> bool {
+    let actual = rustix::fs::FileType::from_raw_mode(st.st_mode);
+    st.st_uid == uid
+        && st.st_mode & 0o077 == 0
+        && if is_directory {
+            actual == rustix::fs::FileType::Directory
+        } else {
+            actual == rustix::fs::FileType::RegularFile && st.st_nlink == 1
+        }
+        && (!matches!(
+            kind,
+            "original-kernel-lock" | "startup-journal" | "helper-journal"
+        ) || st.st_mode & 0o777 == 0o600)
 }
 
 /// Observe only original resident identity facts; this never returns a root or source grant.
@@ -4944,6 +4974,46 @@ fn hash_original(
     }
     op.require_effect()?;
     Ok(sha.finalize().into())
+}
+
+#[cfg(test)]
+mod host_root_tests {
+    use super::{host_entry_attributes_safe, host_entry_kind};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn sidecar_owner_files_are_admitted_by_name_and_a_wider_guard_mode_is_refused() {
+        let instance = "a".repeat(64);
+        let root = std::env::temp_dir().join(format!("wrokbot-host-root-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let directory = std::fs::File::open(&root).unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let stat_with_mode = |name: &str, mode: u32| {
+            std::fs::write(root.join(name), b"x").unwrap();
+            std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            rustix::fs::statat(&directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).unwrap()
+        };
+        for (suffix, kind) in [
+            (".owner-guard-v1", "original-kernel-lock"),
+            (".startup-v1.json", "startup-journal"),
+            (".helper-v1.json", "helper-journal"),
+        ] {
+            let name = format!(".postgresql-17-{instance}{suffix}");
+            assert_eq!(host_entry_kind(&name, &instance), Some((kind, false)));
+            let st = stat_with_mode(&name, 0o600);
+            assert!(host_entry_attributes_safe(kind, false, &st, uid));
+        }
+        let guard = format!(".postgresql-17-{instance}.owner-guard-v1");
+        let st = stat_with_mode(&guard, 0o644);
+        assert!(!host_entry_attributes_safe(
+            "original-kernel-lock",
+            false,
+            &st,
+            uid
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
