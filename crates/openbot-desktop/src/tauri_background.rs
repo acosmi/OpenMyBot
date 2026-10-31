@@ -59,13 +59,14 @@ pub(crate) mod capture;
 
 // Retired fixed fixture outer pins fail closed before any current-user secret-store fallback.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-const RETIRED_SELF_OWNED_CAPTURE_OUTERS: [&str; 6] = [
+const RETIRED_SELF_OWNED_CAPTURE_OUTERS: [&str; 7] = [
     "64428c91f9123a42a1220a6cfb0b78dd6f1082a928827b230fca66e1640b4dc1",
     "77ea40dfc06352b5161317beae22a325cfb2b0ef827575d37d5bfef8895ceae2",
     "f9ee6d061d6202b15edd9de72a1560212ccc70e1438625a2559025b21edaaaf6",
     "f5e855cf553d55c2cd25056c09eadd57842fa4be0a778216d5ffba7ccadcf04a",
     "4d2eb480df701f03d9732466ad4791946a227a08f8c1de48b64c234c39a78812",
     "f2df6afde3730f497c1d6c2accdd6e2907849a16f60d705139b6e49a95b4dfcc",
+    "cb4926e31e70efc1c600e6fd9ccd78b9265691334f257ab77d13f84a068e1ba6",
 ];
 
 // The single fixed fixture is a debug-only original launcher input, not a configurable source.
@@ -86,14 +87,14 @@ struct SelfOwnedFixturePin {
 // Bound from the materialized fixture before its only run; until then nothing matches.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 const SELF_OWNED_CAPTURE_FIXTURE: SelfOwnedFixturePin = SelfOwnedFixturePin {
-    outer: "cb4926e31e70efc1c600e6fd9ccd78b9265691334f257ab77d13f84a068e1ba6",
-    request_id: "13eb014e8f14c2aebe334f7cd954a42280848be5f7fb4b13beae990b9ee6e1a1",
+    outer: "02c306937c8238a34d58ddf01f1739f0b7a4a0f8929413932c9a9e8b19013ca2",
+    request_id: "5de13f18e115a176e43b61c0b33fc52820b1b3aed8c7d9cdded401afd5d111f2",
     device: 16777229,
     uid: 501,
-    root_inode: 183858290,
-    release_inode: 183858291,
-    output_inode: 183858292,
-    key_inode: 183858293,
+    root_inode: 184625804,
+    release_inode: 184625805,
+    output_inode: 184625806,
+    key_inode: 184625807,
 };
 
 // There is no public constructor, Clone, Deserialize, caller flag, path or secret injection.
@@ -4472,7 +4473,7 @@ mod tests {
             output_inode: 3,
             key_inode: 4,
         };
-        // The two first fixture pins and the retired second to fifth fixture pins all refuse;
+        // The two first fixture pins and the retired second to sixth fixture pins all refuse;
         // the current pin is not among them.
         for retired in RETIRED_SELF_OWNED_CAPTURE_OUTERS {
             assert!(matches!(
@@ -4485,6 +4486,7 @@ mod tests {
             "f5e855cf553d55c2cd25056c09eadd57842fa4be0a778216d5ffba7ccadcf04a",
             "4d2eb480df701f03d9732466ad4791946a227a08f8c1de48b64c234c39a78812",
             "f2df6afde3730f497c1d6c2accdd6e2907849a16f60d705139b6e49a95b4dfcc",
+            "cb4926e31e70efc1c600e6fd9ccd78b9265691334f257ab77d13f84a068e1ba6",
         ] {
             assert!(RETIRED_SELF_OWNED_CAPTURE_OUTERS.contains(&retired));
         }
