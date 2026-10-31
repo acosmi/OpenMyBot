@@ -16,6 +16,7 @@ use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::ActorId;
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
 };
@@ -124,7 +125,7 @@ impl Channels {
         endpoints: Endpoints,
         cancel: CancelRequests,
         outbound: Outbound,
-        gate: Arc<Mutex<()>>,
+        gate: Arc<Mutex<HashSet<String>>>,
     ) -> Result<Self, DaemonError> {
         postgres.record_startup_gaps(token_id).await?;
         let telegram = postgres.list_active_receivers(Channel::Telegram).await?;

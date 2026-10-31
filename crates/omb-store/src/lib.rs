@@ -12,7 +12,7 @@ pub mod testkit;
 
 pub use bindings::{
     AuthorityRow, BindingView, GrantKind, HostBinding, HostBindingState, IdentityKey, NewReceiver,
-    OpenRun, ResetDone, RunDeadline, activate_host, activate_receiver, authority_row,
+    OpenRun, ResetDone, RunDeadline, Settled, activate_host, activate_receiver, authority_row,
     host_binding_state, list_bindings, reconfirm_binding, reset_thread, revoke_binding,
 };
 pub use control_tokens::{
