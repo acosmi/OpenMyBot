@@ -850,6 +850,13 @@ mod capture_periodic {
                 .await
                 .map_err(|_| CaptureSqlFailure::Database)?;
             let tx = transaction.as_transaction();
+            // Render timestamptz text in UTC, as the material read transactions do, whatever
+            // TimeZone the cluster was initialized with.
+            let duration = budget.reserve_query(clock)?;
+            tokio::time::timeout(duration, tx.batch_execute("SET LOCAL timezone='UTC'"))
+                .await
+                .map_err(|_| CaptureSqlFailure::Database)?
+                .map_err(|_| CaptureSqlFailure::Database)?;
             let duration = budget.reserve_query(clock)?;
             tokio::time::timeout(
                 duration,
