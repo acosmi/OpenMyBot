@@ -1850,7 +1850,7 @@ fn audit_parent_identity(
     parent: &File,
     path: &std::path::Path,
     op: &CaptureOperation,
-) -> Result<(u64, u64, u32, u32, u64), Fault> {
+) -> Result<(u64, u64, u32, u32), Fault> {
     op.require_effect()?;
     let observed = parent.metadata();
     op.require_effect()?;
@@ -1859,29 +1859,17 @@ fn audit_parent_identity(
     let observed = std::fs::symlink_metadata(path);
     op.require_effect()?;
     let named = observed.map_err(|_| Fault::IoFailure)?;
-    let identity = (
-        held.dev(),
-        held.ino(),
-        held.uid(),
-        held.mode(),
-        held.nlink(),
-    );
+    let identity = (held.dev(), held.ino(), held.uid(), held.mode());
     if !held.is_dir()
         || !named.is_dir()
         || held.uid() != rustix::process::geteuid().as_raw()
         || held.mode() & 0o7777 != 0o700
-        || identity
-            != (
-                named.dev(),
-                named.ino(),
-                named.uid(),
-                named.mode(),
-                named.nlink(),
-            )
+        || identity != (named.dev(), named.ino(), named.uid(), named.mode())
     {
         return Err(Fault::PathUnsafe);
     }
-    // Directory mtime is intentionally not frozen across the real leaf creation.
+    // Directory mtime and nlink are intentionally not frozen across the real leaf creation:
+    // creating a leaf changes both (APFS counts every child in a directory's nlink).
     Ok(identity)
 }
 
@@ -2051,8 +2039,7 @@ impl NormalCaptureMaterials {
         op.reserve_original_resources(3, fixed)?;
         self.material_layout_started = true;
         let root_before = audit_parent_identity(parent, parent_path, op)?;
-        self.material_layout_parent =
-            Some((root_before.0, root_before.1, root_before.2, root_before.3));
+        self.material_layout_parent = Some(root_before);
         for (index, name) in ["materials", "artifact-spool", "metadata"]
             .into_iter()
             .enumerate()
@@ -2130,11 +2117,8 @@ impl NormalCaptureMaterials {
             op.require_effect()?;
             synced.map_err(|_| Fault::IoFailure)?;
         }
-        let root_after = audit_parent_identity(parent, parent_path, op)?;
         // Own mkdir legitimately changes parent nlink/mtime; its original identity may not change.
-        if (root_before.0, root_before.1, root_before.2, root_before.3)
-            != (root_after.0, root_after.1, root_after.2, root_after.3)
-        {
+        if audit_parent_identity(parent, parent_path, op)? != root_before {
             return Err(Fault::SourceChanged);
         }
         let materials = self.material_directories[0]
@@ -2205,8 +2189,7 @@ impl NormalCaptureMaterials {
             })
             .ok_or(Fault::BoundsOverflow)?;
         op.reserve_original_resources(0, known)?;
-        let actual = audit_parent_identity(parent, parent_path, op)?;
-        if self.material_layout_parent != Some((actual.0, actual.1, actual.2, actual.3)) {
+        if self.material_layout_parent != Some(audit_parent_identity(parent, parent_path, op)?) {
             return Err(Fault::SourceChanged);
         }
         for (slot, name) in [
