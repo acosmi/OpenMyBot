@@ -130,6 +130,39 @@ pub struct PostgresApplicationAssemblyInput {
     pub delegation_authority: Option<Arc<dyn openbot_application::DelegationAuthority>>,
 }
 
+/// Sealed by the actual fixed tool/ScreenSession assembly, not a caller inventory.
+/// R474 exposes this borrowed DATA getter; only the original assembly constructs it.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub struct CaptureAssemblyMaterialLayout {
+    application: std::sync::Weak<dyn ApplicationService>,
+    screen: std::sync::Weak<dyn ScreenSessionAdministration>,
+}
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl PostgresApplicationAssembly {
+    pub fn capture_material_layout(
+        &self,
+        original_screen: &Arc<dyn ScreenSessionAdministration>,
+    ) -> Result<
+        &CaptureAssemblyMaterialLayout,
+        openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
+    > {
+        if !self
+            .capture_material_layout
+            .application
+            .ptr_eq(&Arc::downgrade(&self.application))
+            || !self
+                .capture_material_layout
+                .screen
+                .ptr_eq(&Arc::downgrade(original_screen))
+        {
+            return Err(
+                openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::SourceChanged,
+            );
+        }
+        Ok(&self.capture_material_layout)
+    }
+}
+
 impl core::fmt::Debug for PostgresApplicationAssemblyInput {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -190,6 +223,9 @@ pub struct PostgresApplicationAssembly {
     /// Sole delegated Run admission handle, absent without a trusted authority.
     pub delegated_entry: Option<openbot_application::DelegatedRunEntry>,
     terminal_runtime: Option<Arc<PostgresRunRuntime>>,
+    capture_facts_closed: bool,
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    capture_material_layout: CaptureAssemblyMaterialLayout,
 }
 
 impl core::fmt::Debug for PostgresApplicationAssembly {
@@ -223,17 +259,47 @@ impl core::fmt::Debug for PostgresApplicationAssembly {
     }
 }
 
+/// Actual original reconciler failure; it never grants a closed normal capture source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureAssemblyStopFailure {
+    /// The original reconciler was cancelled.
+    ReconcilerCancelled,
+    /// The original reconciler panicked.
+    ReconcilerPanicked,
+}
+
 impl PostgresApplicationAssembly {
     /// Stop background reconcilers before dropping database-backed adapter handles.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
+        let _ = self.stop_for_capture().await;
+    }
+
+    /// Keep the entire original assembly outside the cancellable waiter. Actual facts drain
+    /// and the original reconciler join are both mandatory; a cached join sends no new stop.
+    pub async fn stop_for_capture(&mut self) -> Result<(), CaptureAssemblyStopFailure> {
         if let Some(facts) = &self.runtime_capability_facts {
-            facts.close();
+            if !self.capture_facts_closed {
+                facts.close();
+                self.capture_facts_closed = true;
+            }
             facts.drain().await;
         }
-        self.mcp_revocation_reconciler.stop().await;
-        if let Some(runtime) = &self.terminal_runtime {
+        let stopped = self
+            .mcp_revocation_reconciler
+            .stop_for_capture()
+            .await
+            .map_err(|error| match error {
+                crate::mcp_connections::McpReconcilerStopFailure::Cancelled => {
+                    CaptureAssemblyStopFailure::ReconcilerCancelled
+                }
+                crate::mcp_connections::McpReconcilerStopFailure::Panicked => {
+                    CaptureAssemblyStopFailure::ReconcilerPanicked
+                }
+            });
+        if let Some(runtime) = self.terminal_runtime.take() {
             runtime.shutdown_terminal_delivery().await;
         }
+        stopped
     }
 }
 
@@ -572,6 +638,8 @@ pub async fn assemble_postgres_application(
         PostgresSandboxedComponentAdministration::new(pool.clone(), audit_key.to_vec())
             .map_err(|_| fail("sandboxed_components"))?,
     );
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    let capture_screen = Arc::downgrade(&screen_sessions);
     let application = OpenBotApplication::new(channels.clone())
         .with_people(people)
         .with_audit(PostgresAuditReader::new(pool.clone()))
@@ -610,6 +678,11 @@ pub async fn assemble_postgres_application(
         None => application,
     };
     let application: Arc<dyn ApplicationService> = Arc::new(application);
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    let capture_material_layout = CaptureAssemblyMaterialLayout {
+        application: Arc::downgrade(&application),
+        screen: capture_screen,
+    };
     let mcp_revocation_reconciler = McpRevocationReconciler::start(mcp_connections.clone());
     Ok(PostgresApplicationAssembly {
         thread_history_authority,
@@ -629,6 +702,9 @@ pub async fn assemble_postgres_application(
         remote_callback_auth,
         tool_cancellations,
         mcp_revocation_reconciler,
+        capture_facts_closed: false,
+        #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+        capture_material_layout,
     })
 }
 

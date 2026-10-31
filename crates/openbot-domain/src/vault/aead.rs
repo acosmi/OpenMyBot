@@ -33,7 +33,7 @@
 //! 下唯一 —— 这是构造上的降级，不是"我们会小心一点"。
 
 use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, Payload, consts::U12};
+use aes_gcm::aead::{Aead, AeadCore, AeadInPlace, KeyInit, Payload, consts::U12};
 use aes_gcm::{Aes128Gcm, Aes256Gcm, AesGcm};
 
 use super::binding::RecordBinding;
@@ -209,6 +209,39 @@ pub(crate) fn aes_gcm_decrypt(
         32 => decrypt_with::<Aes256Gcm>(key, nonce, aad, ciphertext),
         _ => Err(VaultError::KeyLength),
     }
+}
+
+/// Detached AES-256-GCM for the independent capture codec's single owned frame buffer.
+/// This is crate-private: the codec fixes the purpose, nonce sequence and authenticated headers.
+pub(crate) fn whole_pg_seal_in_place(
+    key: &SecretBytes,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    buffer: &mut [u8],
+) -> Result<[u8; 16], VaultError> {
+    let cipher = Aes256Gcm::new_from_slice(key.expose()).map_err(|_| VaultError::KeyLength)?;
+    let tag = cipher
+        .encrypt_in_place_detached(GenericArray::from_slice(nonce), aad, buffer)
+        .map_err(|_| VaultError::PlaintextTooLarge)?;
+    Ok(tag.into())
+}
+
+pub(crate) fn whole_pg_open_in_place(
+    key: &SecretBytes,
+    nonce: &[u8; 12],
+    aad: &[u8],
+    tag: &[u8; 16],
+    buffer: &mut [u8],
+) -> Result<(), VaultError> {
+    let cipher = Aes256Gcm::new_from_slice(key.expose()).map_err(|_| VaultError::KeyLength)?;
+    cipher
+        .decrypt_in_place_detached(
+            GenericArray::from_slice(nonce),
+            aad,
+            buffer,
+            GenericArray::from_slice(tag),
+        )
+        .map_err(|_| VaultError::Decrypt)
 }
 
 /// 三档共用的加密实现。泛型而不是抄三遍 —— 抄三遍就是三份各自漂移的机会。
@@ -774,5 +807,29 @@ mod tests {
         assert_eq!(envelope.ciphertext().len(), TAG_BYTES);
         let recovered = open_v2(&kek(), &binding, &envelope).expect("解封");
         assert!(recovered.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod whole_pg_capture_tests {
+    use super::*;
+    #[test]
+    fn detached_capture_preserves_legacy_aes256_output_and_authentication() {
+        let key = SecretBytes::new(vec![11; 32]);
+        let nonce = [13u8; 12];
+        let aad = b"capture-bound-headers";
+        let expected = aes_gcm_encrypt(
+            key.expose(),
+            Nonce::from_array(nonce),
+            aad,
+            b"capture-material",
+        )
+        .unwrap();
+        let mut buffer = b"capture-material".to_vec();
+        let tag = whole_pg_seal_in_place(&key, &nonce, aad, &mut buffer).unwrap();
+        assert_eq!(buffer.as_slice(), &expected[..expected.len() - 16]);
+        assert_eq!(tag.as_slice(), &expected[expected.len() - 16..]);
+        whole_pg_open_in_place(&key, &nonce, aad, &tag, &mut buffer).unwrap();
+        assert_eq!(buffer, b"capture-material");
     }
 }

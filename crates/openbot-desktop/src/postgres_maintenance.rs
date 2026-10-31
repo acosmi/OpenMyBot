@@ -2,9 +2,11 @@
 //!
 //! The compiled outer binding authenticates a source toolchain. It is not a platform signature,
 //! production release authorization, an Existing source capability, or a capture receipt.
-mod bundle;
-mod clock;
-mod limits;
+pub(crate) mod bundle;
+#[cfg(feature = "desktop-launcher")]
+pub(crate) mod capture;
+pub(crate) mod clock;
+pub(crate) mod limits;
 mod protocol;
 mod runner;
 

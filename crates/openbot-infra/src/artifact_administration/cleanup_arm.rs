@@ -165,82 +165,94 @@ impl PostgresArtifactAdministration {
         artifact_id: &str,
         original_deadline: Instant,
     ) -> Result<ArmedArtifactCleanupIntent, Error> {
-        let entry_limit = Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .ok_or(Error::Unavailable)?;
-        let deadline = original_deadline.min(entry_limit);
-        remaining(deadline)?;
-        let artifact_id = canonical_artifact_uuid_v7(artifact_id).ok_or(Error::InvalidInput {
-            field: "artifact_id",
-        })?;
-        self.check_namespace(auth).map_err(|_| Error::NotVisible)?;
-        if !self.store.matches_registry_owner(&self.registry) {
-            return Err(corrupt("store_binding"));
-        }
-        let authority = self.read_authority();
-        let target = authority.cleanup_host_target(auth);
-        let binding = auth
-            .request_binding()
-            .ok_or(Error::Host(HostRequestBindingError::Missing))?;
-        let host = binding
-            .borrow_artifact_cleanup_host_before(auth, &target, deadline)
-            .map_err(Error::Host)?;
-        let current = CurrentRequest {
-            administration: self,
-            auth,
-            host,
-        };
-        current.check_attachment(deadline)?;
-        let mut client = self
-            .registry
-            .pool()
-            .get_guarded(deadline)
-            .await
+        let capture_operation = self
+            .store
+            .begin_capture_mutation()
             .map_err(|_| Error::Unavailable)?;
-        // All native/public/0041/0042/0044 observations occur before BEGIN on this original
-        // guarded client. Failure here retires it; no begun-transaction rollback is claimed.
-        let schema = bounded(deadline, async {
-            Ok::<_, core::convert::Infallible>(
-                verify_artifact_read_schema_on(client.as_client()).await,
-            )
-        })
-        .await?;
-        schema.map_err(|error| match error {
-            openbot_application::ArtifactAdministrationError::Unavailable => Error::Unavailable,
-            _ => corrupt("schema"),
-        })?;
-        let transaction = client.begin_read_committed().await.map_err(owner_error)?;
-        let result = current
-            .operate(transaction.as_transaction(), &artifact_id, deadline)
-            .await;
-        let (fence, confirmation, witness) = match result {
-            Ok((fence, true, witness)) => {
-                transaction.commit().await.map_err(owner_error)?;
-                (fence, OriginalConfirmation::CommitAcknowledged, witness)
+        let result = async {
+            let entry_limit = Instant::now()
+                .checked_add(Duration::from_secs(5))
+                .ok_or(Error::Unavailable)?;
+            let deadline = original_deadline.min(entry_limit);
+            remaining(deadline)?;
+            let artifact_id =
+                canonical_artifact_uuid_v7(artifact_id).ok_or(Error::InvalidInput {
+                    field: "artifact_id",
+                })?;
+            self.check_namespace(auth).map_err(|_| Error::NotVisible)?;
+            if !self.store.matches_registry_owner(&self.registry) {
+                return Err(corrupt("store_binding"));
             }
-            result => {
-                // Refusals and exact no-op observations require the real original ROLLBACK ACK.
-                transaction.rollback().await.map_err(owner_error)?;
-                let (fence, inserted, witness) = result?;
-                debug_assert!(!inserted);
-                (
-                    fence,
-                    OriginalConfirmation::NoopRollbackAcknowledged,
-                    witness,
+            let authority = self.read_authority();
+            let target = authority.cleanup_host_target(auth);
+            let binding = auth
+                .request_binding()
+                .ok_or(Error::Host(HostRequestBindingError::Missing))?;
+            let host = binding
+                .borrow_artifact_cleanup_host_before(auth, &target, deadline)
+                .map_err(Error::Host)?;
+            let current = CurrentRequest {
+                administration: self,
+                auth,
+                host,
+            };
+            current.check_attachment(deadline)?;
+            let mut client = self
+                .registry
+                .pool()
+                .get_guarded(deadline)
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            // All native/public/0041/0042/0044 observations occur before BEGIN on this original
+            // guarded client. Failure here retires it; no begun-transaction rollback is claimed.
+            let schema = bounded(deadline, async {
+                Ok::<_, core::convert::Infallible>(
+                    verify_artifact_read_schema_on(client.as_client()).await,
                 )
-            }
-        };
-        // A Host/window may close while the original protocol ACK is in flight. Preserve the
-        // same statement's original witness across that await and recheck before publishing.
-        // Failure after a known COMMIT retains the armed fact; it is never recast as Unknown.
-        witness
-            .verify_current(auth, deadline)
-            .map_err(Error::Host)?;
-        Ok(ArmedArtifactCleanupIntent {
-            store: Arc::clone(&self.store),
-            fence,
-            _confirmation: confirmation,
-        })
+            })
+            .await?;
+            schema.map_err(|error| match error {
+                openbot_application::ArtifactAdministrationError::Unavailable => Error::Unavailable,
+                _ => corrupt("schema"),
+            })?;
+            let transaction = client.begin_read_committed().await.map_err(owner_error)?;
+            let result = current
+                .operate(transaction.as_transaction(), &artifact_id, deadline)
+                .await;
+            let (fence, confirmation, witness) = match result {
+                Ok((fence, true, witness)) => {
+                    transaction.commit().await.map_err(owner_error)?;
+                    (fence, OriginalConfirmation::CommitAcknowledged, witness)
+                }
+                result => {
+                    // Refusals and exact no-op observations require the real original ROLLBACK ACK.
+                    transaction.rollback().await.map_err(owner_error)?;
+                    let (fence, inserted, witness) = result?;
+                    debug_assert!(!inserted);
+                    (
+                        fence,
+                        OriginalConfirmation::NoopRollbackAcknowledged,
+                        witness,
+                    )
+                }
+            };
+            // A Host/window may close while the original protocol ACK is in flight. Preserve the
+            // same statement's original witness across that await and recheck before publishing.
+            // Failure after a known COMMIT retains the armed fact; it is never recast as Unknown.
+            witness
+                .verify_current(auth, deadline)
+                .map_err(Error::Host)?;
+            Ok(ArmedArtifactCleanupIntent {
+                store: Arc::clone(&self.store),
+                fence,
+                _confirmation: confirmation,
+            })
+        }
+        .await;
+        if !matches!(&result, Err(Error::Unavailable | Error::CommitUnknown)) {
+            capture_operation.complete();
+        }
+        result
     }
 
     /// Permanently close this original Store's controlled read inventory for a confirmed arm.

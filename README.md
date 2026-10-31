@@ -1,16 +1,33 @@
 <p align="center">
-  <img src=".github/assets/wrok-bot-banner.png" alt="Wrok Bot">
+  <img src=".github/assets/wrok-bot-banner.png" alt="Wrok Bot" width="100%">
 </p>
 
 <h1 align="center">Wrok Bot</h1>
 
-<p align="center"><strong>English</strong> | <a href="README.zh-CN.md">简体中文</a></p>
+<p align="center">
+  <b>AI employee / digital teammate platform · AI coworkers who can work independently</b><br>
+  Built with Rust · macOS first · In development
+</p>
 
-<p align="center">AI employee / digital teammate platform · AI coworkers who can work independently</p>
+<p align="center">
+  <a href="#source-layout"><img src="https://img.shields.io/badge/core-Rust-007ec6?style=flat-square" alt="Core: Rust"></a>
+  <a href="crates/openbot-desktop/Cargo.toml"><img src="https://img.shields.io/badge/desktop-Tauri-00897b?style=flat-square" alt="Desktop: Tauri"></a>
+  <a href="crates/openbot-infra/src/db"><img src="https://img.shields.io/badge/data-PostgreSQL-149954?style=flat-square" alt="Data: PostgreSQL"></a>
+  <a href="#current-progress"><img src="https://img.shields.io/badge/status-In%20development-68448b?style=flat-square" alt="Status: in development"></a>
+  <br>
+  <a href="IMPLEMENTATION_LEDGER.md"><img src="https://img.shields.io/badge/evidence-implementation%20ledger-e65100?style=flat-square" alt="Implementation ledger"></a>
+  <a href="https://wrokbot.com"><img src="https://img.shields.io/badge/main%20site-wrokbot.com-0052d9?style=flat-square" alt="Official website: wrokbot.com (primary)"></a>
+  <a href="https://grokbot.si"><img src="https://img.shields.io/badge/website-grokbot.si-00897b?style=flat-square" alt="Official website: grokbot.si"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Custom-4c6ef5?style=flat-square" alt="License terms"></a>
+</p>
+
+<p align="center"><strong>English</strong> | <a href="README.zh-CN.md">简体中文</a></p>
 
 Wrok Bot is an AI employee / digital teammate platform built with Rust, designed to provide AI coworkers who can get work done independently. The platform includes a desktop host, server, web interface, and a mobile client under development. The project is currently in development and validation, with macOS as the first release platform.
 
 Wrok Bot and [OpenMyBot](openmybot/README.md) are two products assembled from the same OpenBot engine in this workspace. Wrok Bot provides the desktop and server product surface; OpenMyBot currently provides a local foreground daemon with initialization and authenticated status commands. Its channel, host-driver and MCP integrations remain under development.
+
+Official websites: [wrokbot.com](https://wrokbot.com) (primary) · [grokbot.si](https://grokbot.si).
 
 ## Current progress
 
