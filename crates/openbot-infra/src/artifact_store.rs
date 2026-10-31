@@ -267,8 +267,20 @@ struct StoreMarker {
     store_id: String,
 }
 
+/// The root descriptor once `prepare_root` holds its kernel owner lock.
+struct LockedRoot(File);
+
+impl Drop for LockedRoot {
+    fn drop(&mut self) {
+        // Closing the fd alone keeps the flock while a concurrently spawned child that has not
+        // reached exec holds a copy of this open file description; LOCK_UN releases it for all,
+        // so every other descriptor of this root must already be closed when this runs.
+        let _ = self.0.unlock();
+    }
+}
+
 struct PreparedRoot {
-    root: File,
+    root: LockedRoot,
     marker: StoreMarker,
     marker_bytes: Vec<u8>,
     physical: ArtifactRootPhysicalBinding,
@@ -279,7 +291,6 @@ struct PreparedRoot {
 /// per-request current checks, rather than a marker string, establish this binding.
 pub struct DatasetBoundArtifactStore {
     registry: Arc<ArtifactDatasetRegistry>,
-    root: File,
     marker_bytes: Vec<u8>,
     physical: ArtifactRootPhysicalBinding,
     store_id: Uuid,
@@ -288,6 +299,9 @@ pub struct DatasetBoundArtifactStore {
     io: Mutex<()>,
     reads: Arc<StoreReadGate>,
     capture_mutations: Arc<CaptureMutationGate>,
+    // Declared last, after `bytes`, whose root clone shares this open file description: the
+    // clone closes first, then this field unlocks as the last holder.
+    root: LockedRoot,
 }
 
 // One gate belongs to the original Store Arc. It is armed before host publication. A
@@ -766,14 +780,15 @@ impl DatasetBoundArtifactStore {
         let store_id = Uuid::parse_str(&prepared.marker.store_id)
             .map_err(|_| ArtifactStoreError::BindingMismatch)?;
         tokio::task::spawn_blocking(move || {
-            if ArtifactRootPhysicalBinding::observe(&prepared.root)? != prepared.physical
-                || read_marker(&prepared.root)? != Some(prepared.marker_bytes.clone())
+            if ArtifactRootPhysicalBinding::observe(&prepared.root.0)? != prepared.physical
+                || read_marker(&prepared.root.0)? != Some(prepared.marker_bytes.clone())
             {
                 return Err(ArtifactStoreError::BindingMismatch);
             }
             let bytes = ArtifactByteStore::bind_private_root(
                 prepared
                     .root
+                    .0
                     .try_clone()
                     .map_err(|_| ArtifactStoreError::Unavailable)?,
                 policy.max_artifact_bytes(),
@@ -818,8 +833,8 @@ impl DatasetBoundArtifactStore {
             && std::ptr::eq(self.registry.pool().manager(), registry.pool().manager())
     }
     fn check_current(&self) -> Result<(), ArtifactStoreError> {
-        if ArtifactRootPhysicalBinding::observe(&self.root)? != self.physical
-            || read_marker(&self.root)? != Some(self.marker_bytes.clone())
+        if ArtifactRootPhysicalBinding::observe(&self.root.0)? != self.physical
+            || read_marker(&self.root.0)? != Some(self.marker_bytes.clone())
         {
             return Err(ArtifactStoreError::BindingMismatch);
         }
@@ -963,7 +978,7 @@ impl DatasetBoundArtifactStore {
     pub fn available_bytes(&self) -> Result<u64, ArtifactStoreError> {
         self.check_current()?;
         let space =
-            rustix::fs::fstatvfs(&self.root).map_err(|_| ArtifactStoreError::Unavailable)?;
+            rustix::fs::fstatvfs(&self.root.0).map_err(|_| ArtifactStoreError::Unavailable)?;
         space
             .f_bavail
             .checked_mul(space.f_frsize)
@@ -1113,7 +1128,8 @@ fn prepare_root(
 ) -> Result<PreparedRoot, ArtifactStoreError> {
     let physical = ArtifactRootPhysicalBinding::observe(&root)?;
     root.try_lock().map_err(|_| ArtifactStoreError::Busy)?;
-    let original = read_marker(&root)?;
+    let root = LockedRoot(root);
+    let original = read_marker(&root.0)?;
     let fresh_marker = original.is_none();
     let (marker, marker_bytes) = if let Some(bytes) = original {
         let marker: StoreMarker =
@@ -1121,7 +1137,7 @@ fn prepare_root(
         (marker, bytes)
     } else {
         let directory =
-            rustix::fs::Dir::read_from(&root).map_err(|_| ArtifactStoreError::Unavailable)?;
+            rustix::fs::Dir::read_from(&root.0).map_err(|_| ArtifactStoreError::Unavailable)?;
         for entry in directory {
             let entry = entry.map_err(|_| ArtifactStoreError::Unavailable)?;
             if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
@@ -1138,7 +1154,7 @@ fn prepare_root(
         let bytes = serde_json::to_vec(&marker).map_err(|_| ArtifactStoreError::Unavailable)?;
         let mut file = File::from(
             rustix::fs::openat(
-                &root,
+                &root.0,
                 MARKER_NAME,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
@@ -1150,7 +1166,7 @@ fn prepare_root(
             .map_err(|_| ArtifactStoreError::Unavailable)?;
         rustix::fs::fchmod(&file, Mode::RUSR).map_err(|_| ArtifactStoreError::Unavailable)?;
         file.sync_all()
-            .and_then(|()| root.sync_all())
+            .and_then(|()| root.0.sync_all())
             .map_err(|_| ArtifactStoreError::Unavailable)?;
         (marker, bytes)
     };
@@ -1169,8 +1185,8 @@ fn prepare_root(
         || id.get_variant() != uuid::Variant::RFC4122
         || id.to_string() != marker.store_id
         || serde_json::to_vec(&marker).map_err(|_| ArtifactStoreError::Unavailable)? != marker_bytes
-        || ArtifactRootPhysicalBinding::observe(&root)? != physical
-        || read_marker(&root)? != Some(marker_bytes.clone())
+        || ArtifactRootPhysicalBinding::observe(&root.0)? != physical
+        || read_marker(&root.0)? != Some(marker_bytes.clone())
     {
         return Err(ArtifactStoreError::BindingMismatch);
     }

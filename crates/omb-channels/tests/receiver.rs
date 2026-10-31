@@ -817,7 +817,7 @@ async fn receiver_stops_when_binding_leaves_active() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn accepted_message_wakes_dispatcher_notify() {
+async fn every_accepted_update_wakes_dispatcher_notify() {
     let mut env = Env::new().await;
     let wake = Arc::clone(&env.wake);
     let notified = wake.notified();
@@ -826,11 +826,12 @@ async fn accepted_message_wakes_dispatcher_notify() {
     env.fake.push_update(text(1, "/help"));
     let task = env.start().await;
     events(env.client(), 1).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), notified.as_mut())
-            .await
-            .is_err()
-    );
+    tokio::time::timeout(Duration::from_secs(20), notified)
+        .await
+        .unwrap();
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
     env.fake.push_update(text(2, "real work"));
     tokio::time::timeout(Duration::from_secs(20), notified)
         .await

@@ -664,7 +664,8 @@ pub async fn assemble_postgres_application(
             pool.clone(),
         )))
         .with_remote_interrupts(remote_interrupts.clone())
-        .with_screen_sessions(screen_sessions);
+        .with_screen_sessions(screen_sessions)
+        .with_thread_history_deletion(thread_history_authority.clone());
     let application = match artifacts {
         Some(artifacts) => application.with_artifacts(artifacts),
         None => application,

@@ -1,8 +1,8 @@
 //! Host run acceptance and per-binding cancel against an own PostgreSQL 17.11 cluster.
 use omb_store::{
     Claim, DISPATCH_QUEUE_MAX, DispatchOutcome, EventCancel, HostAccept, HostMessage, HostRun,
-    OperationId, accept_host_begin, cancel_event, claim_dispatch, expire_pending, migrate,
-    reconfirm_binding, record_dispatch, revoke_binding,
+    OperationId, accept_host_begin, cancel_pending, cancel_state, claim_dispatch, expire_pending,
+    lock_dispatch, migrate, reconfirm_binding, record_dispatch, revoke_binding,
     testkit::{
         Fixture, Session, deadline, insert_event_for_run, insert_host_binding, insert_sender,
         set_terminal, shift_event, suspend_binding,
@@ -288,11 +288,10 @@ async fn queue_full_refuses_the_next_pending_but_still_replays() {
         HostAccept::Replayed(runs[3].clone())
     );
     assert_eq!(env.begin("op-3", "other").await, HostAccept::Conflict);
-    assert_eq!(
-        cancel_event(env.client(), host, &runs[0].run_id)
+    assert!(
+        cancel_pending(env.client(), host, &runs[0].run_id)
             .await
-            .unwrap(),
-        EventCancel::Cancelled
+            .unwrap()
     );
     accepted(env.begin("op-over", "work").await);
     assert_eq!(env.count(events).await, DISPATCH_QUEUE_MAX + 1);
@@ -316,14 +315,13 @@ async fn accepted_begins_are_claimed_oldest_first_one_open_run_at_a_time() {
     assert_eq!(item.run_id, first.run_id);
     assert_eq!(item.text, "first");
     assert_eq!(item.attempts, 0);
-    record_dispatch(
-        &mut env.session.client,
-        record,
-        DispatchOutcome::Dispatched,
-        deadline(),
-    )
-    .await
-    .unwrap();
+    let dispatch = lock_dispatch(&mut env.session.client, record, deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    record_dispatch(dispatch, record, DispatchOutcome::Dispatched, deadline())
+        .await
+        .unwrap();
     assert!(matches!(
         claim_dispatch(env.client()).await.unwrap(),
         Claim::Idle { .. }
@@ -462,14 +460,26 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     let pending = accepted(env.begin("op-p", "work").await);
     let p = env.record("op-p").await;
     assert_eq!(
-        cancel_event(env.client(), host, &pending.run_id)
+        cancel_state(env.client(), host, &pending.run_id)
             .await
             .unwrap(),
-        EventCancel::Cancelled
+        EventCancel::Pending {
+            thread_id: pending.thread_id.clone()
+        }
+    );
+    assert!(
+        cancel_pending(env.client(), host, &pending.run_id)
+            .await
+            .unwrap()
     );
     assert_eq!(env.row(p).await["dispatch_status"], "cancelled");
+    assert!(
+        !cancel_pending(env.client(), host, &pending.run_id)
+            .await
+            .unwrap()
+    );
     assert_eq!(
-        cancel_event(env.client(), host, &pending.run_id)
+        cancel_state(env.client(), host, &pending.run_id)
             .await
             .unwrap(),
         EventCancel::Ended
@@ -491,11 +501,12 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     let s = insert_event_for_run(client, sender, "run-s", "T-S", "dispatched").await;
     let before_d = env.row(d).await;
     assert_eq!(
-        cancel_event(env.client(), host, "run-d").await.unwrap(),
+        cancel_state(env.client(), host, "run-d").await.unwrap(),
         EventCancel::Open {
             thread_id: "T-D".into()
         }
     );
+    assert!(!cancel_pending(env.client(), host, "run-d").await.unwrap());
     assert_eq!(env.row(d).await, before_d);
     for (record, run) in [
         (t, "run-t"),
@@ -506,8 +517,12 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     ] {
         let before = env.row(record).await;
         assert_eq!(
-            cancel_event(env.client(), host, run).await.unwrap(),
+            cancel_state(env.client(), host, run).await.unwrap(),
             EventCancel::Ended,
+            "{run}"
+        );
+        assert!(
+            !cancel_pending(env.client(), host, run).await.unwrap(),
             "{run}"
         );
         assert_eq!(env.row(record).await, before, "{run}");
@@ -516,14 +531,18 @@ async fn cancel_acts_only_on_a_pending_run_of_the_binding() {
     let before_s = env.row(s).await;
     for run in ["run-s", "run-missing"] {
         assert_eq!(
-            cancel_event(env.client(), host, run).await.unwrap(),
+            cancel_state(env.client(), host, run).await.unwrap(),
             EventCancel::NotFound,
+            "{run}"
+        );
+        assert!(
+            !cancel_pending(env.client(), host, run).await.unwrap(),
             "{run}"
         );
     }
     assert_eq!(env.row(s).await, before_s);
     assert_eq!(
-        cancel_event(env.client(), sender, "run-s").await.unwrap(),
+        cancel_state(env.client(), sender, "run-s").await.unwrap(),
         EventCancel::Open {
             thread_id: "T-S".into()
         }
@@ -538,36 +557,50 @@ async fn cancel_racing_the_dispatch_receipt_leaves_one_consistent_outcome() {
     let mut env = Env::new().await;
     let host = env.host().await;
     let canceller = env.fixture.connect().await;
-    let mut receipt = env.fixture.connect().await;
-    for round in 0..10 {
+    let mut dispatcher = env.fixture.connect().await;
+    for round in 0..10u64 {
         let id = format!("race-{round}");
         let run = accepted(env.begin(&id, "work").await);
         let record = env.record(&id).await;
-        let (cancelled, dispatched) = tokio::join!(
-            cancel_event(&canceller.client, host, &run.run_id),
-            record_dispatch(
-                &mut receipt.client,
-                record,
-                DispatchOutcome::Dispatched,
-                deadline()
-            ),
+        // The dispatcher's side: the lock, an engine begin of a few milliseconds, the receipt.
+        let dispatch = async {
+            let Some(dispatch) = lock_dispatch(&mut dispatcher.client, record, deadline())
+                .await
+                .unwrap()
+            else {
+                return false;
+            };
+            tokio::time::sleep(Duration::from_millis(round % 3)).await;
+            record_dispatch(dispatch, record, DispatchOutcome::Dispatched, deadline())
+                .await
+                .unwrap();
+            true
+        };
+        let (cancelled, begun) = tokio::join!(
+            cancel_pending(&canceller.client, host, &run.run_id),
+            dispatch
         );
-        dispatched.unwrap();
         let row = env.row(record).await;
-        match cancelled.unwrap() {
-            EventCancel::Cancelled => {
-                assert_eq!(row["dispatch_status"], "cancelled", "round {round}");
-                assert_eq!(row["dispatch_attempts"], 0, "round {round}");
-            }
-            EventCancel::Open { thread_id } => {
-                assert_eq!(thread_id, run.thread_id, "round {round}");
-                assert_eq!(row["dispatch_status"], "dispatched", "round {round}");
-                assert_eq!(row["dispatch_attempts"], 1, "round {round}");
-            }
-            other => panic!("round {round}: {other:?}"),
+        if cancelled.unwrap() {
+            assert!(!begun, "round {round}");
+            assert_eq!(row["dispatch_status"], "cancelled", "round {round}");
+            assert_eq!(row["dispatch_attempts"], 0, "round {round}");
+        } else {
+            assert!(begun, "round {round}");
+            assert_eq!(row["dispatch_status"], "dispatched", "round {round}");
+            assert_eq!(row["dispatch_attempts"], 1, "round {round}");
+            assert_eq!(
+                cancel_state(&canceller.client, host, &run.run_id)
+                    .await
+                    .unwrap(),
+                EventCancel::Open {
+                    thread_id: run.thread_id.clone()
+                },
+                "round {round}"
+            );
         }
     }
     canceller.close().await;
-    receipt.close().await;
+    dispatcher.close().await;
     env.stop().await;
 }

@@ -30,6 +30,7 @@ use crate::db::{InfraError, native, thread_origin_schema};
 use crate::thread_origin;
 
 mod clear;
+mod public_delete;
 mod run_drain;
 mod stop_clear;
 pub use clear::{ThreadHistoryClearProgress, ThreadHistoryClearSource};

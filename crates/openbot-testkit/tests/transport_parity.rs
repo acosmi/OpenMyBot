@@ -523,6 +523,7 @@ fn http_route_of(command: &AppCommand) -> Option<String> {
         | AppCommand::BeginThreadRun(_)
         | AppCommand::BeginThreadRunV2(_)
         | AppCommand::CancelThreadRun(_)
+        | AppCommand::DeleteThreadHistory { .. }
         | AppCommand::GetThreadHistory { .. }
         | AppCommand::GetThreadConversation { .. }
         | AppCommand::GetRunReconciliation { .. }

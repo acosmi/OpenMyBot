@@ -142,7 +142,7 @@ fn subscriptions() -> [SubscriptionRequest; 4] {
 }
 
 // Fixed independent expected inventory; no wildcard in the typed projection below.
-const EXPECTED_COMMANDS: [&str; 98] = [
+const EXPECTED_COMMANDS: [&str; 99] = [
     "GetRuntimeCapabilities",
     "SaveRunMessageTextArtifact",
     "GetArtifactMetadata",
@@ -201,6 +201,7 @@ const EXPECTED_COMMANDS: [&str; 98] = [
     "BeginThreadRun",
     "BeginThreadRunV2",
     "CancelThreadRun",
+    "DeleteThreadHistory",
     "GetThreadHistory",
     "GetThreadConversation",
     "GetRunReconciliation",
@@ -303,6 +304,7 @@ fn variant_name(command: &AppCommand) -> &'static str {
         AppCommand::BeginThreadRun(..) => "BeginThreadRun",
         AppCommand::BeginThreadRunV2(..) => "BeginThreadRunV2",
         AppCommand::CancelThreadRun(..) => "CancelThreadRun",
+        AppCommand::DeleteThreadHistory { .. } => "DeleteThreadHistory",
         AppCommand::GetThreadHistory { .. } => "GetThreadHistory",
         AppCommand::GetThreadConversation { .. } => "GetThreadConversation",
         AppCommand::GetRunReconciliation { .. } => "GetRunReconciliation",
@@ -580,6 +582,10 @@ fn commands() -> Vec<AppCommand> {
             thread_id: ThreadId::new(""),
             run_id: RunId::new(""),
         }),
+        AppCommand::DeleteThreadHistory {
+            thread_id: ThreadId::new(""),
+            request_id: String::new(),
+        },
         AppCommand::GetThreadHistory {
             thread_id: ThreadId::new(""),
         },
@@ -758,6 +764,18 @@ impl Poison {
     }
     fn count(&self) -> usize {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ThreadHistoryDeletion for Poison {
+    async fn delete_thread_history_before(
+        self: Arc<Self>,
+        _auth: &AuthContext,
+        _thread_id: &ThreadId,
+        _request_id: &str,
+    ) -> Result<ThreadHistoryDeletionReceipt, AppError> {
+        self.touched()
     }
 }
 
@@ -1037,7 +1055,8 @@ fn guarded() -> (Guarded, Poison) {
         .with_policy(poison.clone())
         .with_tools(poison.clone(), poison.clone())
         .with_threads(poison.clone())
-        .with_component_administration(Arc::new(poison.clone()));
+        .with_component_administration(Arc::new(poison.clone()))
+        .with_thread_history_deletion(Arc::new(poison.clone()));
     (app, poison)
 }
 fn assert_untouched(app: &Guarded, poison: &Poison) {
@@ -1052,7 +1071,7 @@ fn assert_untouched(app: &Guarded, poison: &Poison) {
 async fn every_command_variant_refuses_unbound_delegation_before_dispatch() {
     let (app, poison) = guarded();
     let inventory = commands();
-    assert_eq!(inventory.len(), 98);
+    assert_eq!(inventory.len(), 99);
     assert_eq!(
         inventory.iter().map(variant_name).collect::<Vec<_>>(),
         EXPECTED_COMMANDS
@@ -1176,6 +1195,20 @@ async fn delegated_execute_and_subscribe_touch_no_backend_ports() {
     );
     assert_eq!(app.channels.call_count(), 1);
     assert_eq!(poison.count(), 0);
+}
+
+#[tokio::test]
+async fn delegated_history_deletion_is_refused_before_the_history_authority() {
+    let (app, poison) = guarded();
+    let command = AppCommand::DeleteThreadHistory {
+        thread_id: ThreadId::new("550e8400-e29b-71d4-a716-446655440000"),
+        request_id: "019a0300-0000-7000-8000-000000000003".to_owned(),
+    };
+    for external in [false, true] {
+        let auth = delegated(external, &[Role::Admin, Role::User], 1, 1, None, false);
+        assert_refused(app.execute(auth, command.clone()).await);
+        assert_untouched(&app, &poison);
+    }
 }
 
 #[tokio::test]

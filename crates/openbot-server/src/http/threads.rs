@@ -22,8 +22,9 @@ use openbot_application::AppEventStream;
 use openbot_contracts::begin_thread_run_wire::DecodedBeginThreadRunBody;
 use openbot_contracts::command::{
     AppCommand, AppEvent, AppReply, BeginThreadRun, BeginThreadRunV2, CancelThreadRun,
-    SubscriptionRequest, ThreadConversationSnapshot, ThreadHistory, ThreadMinted,
-    ThreadRunCancellation, ThreadRunCancellationState, ThreadRunStarted, ThreadStatus,
+    DeleteThreadHistoryBody, SubscriptionRequest, ThreadConversationSnapshot, ThreadHistory,
+    ThreadHistoryDeletionReceipt, ThreadHistoryDeletionState, ThreadMinted, ThreadRunCancellation,
+    ThreadRunCancellationState, ThreadRunStarted, ThreadStatus,
 };
 use openbot_contracts::error::AppError;
 use openbot_contracts::ids::{RunId, ThreadId};
@@ -332,6 +333,40 @@ pub async fn cancel_run(
     }
 }
 
+/// `POST /api/threads/{thread_id}/history/deletions`; one bounded step of the creator's history
+/// deletion. A pending deletion is 202 and resumed by resending the same `requestId`; a cleared
+/// one is 200, after which the Thread is gone and a resend is 404.
+pub async fn delete_history(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    body: Result<Json<DeleteThreadHistoryBody>, JsonRejection>,
+) -> Result<(StatusCode, HeaderMap, Json<ThreadHistoryDeletionReceipt>), HttpError> {
+    let Json(body) = body.map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::DeleteThreadHistory {
+                thread_id: ThreadId::new(thread_id),
+                request_id: body.request_id,
+            },
+        )
+        .await?
+    {
+        AppReply::ThreadHistoryDeletion(receipt) => {
+            let status = match receipt.state {
+                ThreadHistoryDeletionState::Pending => StatusCode::ACCEPTED,
+                ThreadHistoryDeletionState::Cleared => StatusCode::OK,
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok((status, headers, Json(receipt)))
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
 /// 固定上游 compatibility query；`agentId` 只维持 wire，不参与 native ACL/过滤。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -342,8 +377,10 @@ pub struct HistoryQuery {
 
 /// `GET /api/copilotkit/threads/{thread_id}/messages` compatibility history。
 ///
-/// unknown/new/invisible/deleted 全部 200 + `{"messages":[]}`；坏 UUID/query 400，数据库故障
-/// 503。`agentId` 不得覆盖 AuthContext scope。
+/// Unknown, new and invisible Threads, and soft-deleted Threads whose history clearing has not
+/// completed, are 200 with `{"messages":[]}`. A member's read of a Thread whose history clearing
+/// completed is 404, whether or not the Thread is soft deleted yet. A bad UUID or query is 400
+/// and a database failure 503. `agentId` never overrides the AuthContext scope.
 pub async fn history(
     State(state): State<ServerState>,
     Authenticated(auth): Authenticated,

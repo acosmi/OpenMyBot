@@ -363,7 +363,7 @@ fn snapshot(
             .bytes
             .capture_original_directories_before(clock)?;
         {
-            let store_root = metadata(&hold.store.root, clock)?;
+            let store_root = metadata(&hold.store.root.0, clock)?;
             let byte_root = metadata(original_directories.original_fds().0, clock)?;
             if !byte_root.is_dir()
                 || byte_root.mode() & 0o7777 != 0o700
@@ -383,7 +383,7 @@ fn snapshot(
             }
         }
         let destination = metadata(&spool.root, clock)?;
-        let source = metadata(&hold.store.root, clock)?;
+        let source = metadata(&hold.store.root.0, clock)?;
         if !destination.is_dir()
             || destination.uid() != source.uid()
             || destination.mode() & 0o077 != 0
@@ -405,7 +405,7 @@ fn snapshot(
             }
         }
         copy_directory(
-            &hold.store.root,
+            &hold.store.root.0,
             &spool.root,
             &original_directories,
             "",
@@ -839,7 +839,7 @@ fn verify_original_capture_store(
     clock: &dyn CaptureClockCheck,
 ) -> Result<(), WholePgCarrierFault> {
     clock.require_effect()?;
-    let root_before = metadata(&store.root, clock)?;
+    let root_before = metadata(&store.root.0, clock)?;
     clock.require_effect()?;
     let uid = rustix::process::geteuid().as_raw();
     clock.require_effect()?;
@@ -887,7 +887,7 @@ fn verify_original_capture_store(
     let observe_name = || {
         clock.require_effect()?;
         let observed = rustix::fs::statat(
-            &store.root,
+            &store.root.0,
             MARKER_NAME,
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         );
@@ -901,7 +901,7 @@ fn verify_original_capture_store(
         prepare_opened_slot(count, files, bounds)?;
         clock.require_effect()?;
         let opened = rustix::fs::openat(
-            &store.root,
+            &store.root.0,
             MARKER_NAME,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
@@ -981,7 +981,7 @@ fn verify_original_capture_store(
     }
     let after = metadata(&marker, clock)?;
     let named_after = observe_name()?;
-    let root_after = metadata(&store.root, clock)?;
+    let root_after = metadata(&store.root.0, clock)?;
     if offset != store.marker_bytes.len()
         || &count.retained.marker_buffer[..offset] != store.marker_bytes.as_slice()
         || stable(&before) != stable(&after)
