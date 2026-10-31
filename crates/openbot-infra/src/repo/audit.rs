@@ -674,8 +674,9 @@ mod capture_periodic {
     use openbot_domain::audit::payload::AUDIT_FIELD_LEDGER;
     use std::time::Instant;
 
-    /// Contains only the original acknowledged Periodic checkpoint and bounded actual audit
-    /// facts. Its private construction does not assert that pools or the source are closed.
+    /// Contains the original acknowledged Periodic checkpoint, or none when the same locked
+    /// read saw a never-audited installation, and bounded actual audit facts. Its private
+    /// construction does not assert that pools or the source are closed.
     pub struct CommittedCaptureCheckpoint {
         // None only when the same locked read saw no audit event and no checkpoint at all.
         checkpoint: Option<(AuditCheckpoint, CheckpointSignature)>,

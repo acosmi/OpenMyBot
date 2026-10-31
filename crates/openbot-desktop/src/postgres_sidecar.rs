@@ -4392,6 +4392,9 @@ mod tests {
             ),
             (None, 0, 0)
         );
+        let mut line = Vec::new();
+        empty.write_material(&mut line).unwrap();
+        assert_eq!(line, br#"[null,"empty",null,null,null,null,0,null,null]"#);
         let checkpoints: i64 = client
             .query_one("SELECT count(*)::bigint FROM public.audit_checkpoints", &[])
             .await
