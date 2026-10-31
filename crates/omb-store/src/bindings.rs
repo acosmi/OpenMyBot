@@ -76,49 +76,63 @@ async fn refusal(client: &Client, binding_id: Uuid, deadline: Instant) -> StoreE
     }
 }
 
-/// A dispatched run of an ended binding that has no terminal yet; the caller cancels it.
+/// A run of a binding by thread and run id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenRun {
     pub thread_id: String,
     pub run_id: String,
 }
+/// The runs an ended binding may still have: dispatched runs without a terminal, and the runs
+/// of the pending messages it cancelled, which an earlier begin attempt may have started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settled {
+    pub dispatched: Vec<OpenRun>,
+    pub pending: Vec<OpenRun>,
+}
 /// Ends the channel's live sender for `reason` when `senders_of` names a channel, then settles
-/// every ended binding: pending events cancelled, undecided permissions denied as `run_stopped`,
-/// and their dispatched runs without a terminal returned in dispatch order.
+/// every ended binding: pending events cancelled, undecided permissions denied as `run_stopped`;
+/// returns the runs of the cancelled events in acceptance order and the dispatched runs without
+/// a terminal in dispatch order.
 async fn settle(
     client: &Client,
     mut ended: Vec<Uuid>,
     senders_of: Option<&str>,
     reason: &str,
     deadline: Instant,
-) -> Result<Vec<OpenRun>, StoreError> {
+) -> Result<Settled, StoreError> {
     let error = StoreError::BindingFailed;
     if let Some(channel) = senders_of {
         for row in rows(client, "UPDATE openmybot.channel_bindings SET status=CASE WHEN status='pending' THEN 'expired' ELSE 'revoked' END,status_reason=$2,ended_at=statement_timestamp(),pairing_code_hash=NULL WHERE binding_kind='sender' AND channel_kind=$1 AND status IN ('pending','active','suspended') RETURNING binding_id", &[&channel, &reason], deadline, error).await? {
             ended.push(row.try_get(0).map_err(|_| error)?);
         }
     }
-    rows(client, "UPDATE openmybot.channel_events SET dispatch_status='cancelled' WHERE binding_id=ANY($1) AND dispatch_status='pending' RETURNING record_id", &[&ended], deadline, error).await?;
+    let pending = rows(client, "WITH c AS (UPDATE openmybot.channel_events SET dispatch_status='cancelled' WHERE binding_id=ANY($1) AND dispatch_status='pending' RETURNING thread_id,run_id,accepted_at,record_id) SELECT thread_id,run_id FROM c ORDER BY accepted_at,record_id", &[&ended], deadline, error).await?;
     rows(client, "UPDATE openmybot.host_driver_sessions SET decision='deny',decided_via='run_stopped',decided_at=statement_timestamp() WHERE record_kind='permission' AND binding_id=ANY($1) AND decision IS NULL RETURNING record_id", &[&ended], deadline, error).await?;
-    rows(client, "SELECT thread_id,run_id FROM openmybot.channel_events WHERE binding_id=ANY($1) AND dispatch_status='dispatched' AND terminal_kind IS NULL AND run_id IS NOT NULL ORDER BY dispatched_at,record_id", &[&ended], deadline, error)
-        .await?
-        .iter()
-        .map(|row| {
-            Ok(OpenRun {
-                thread_id: row.try_get(0).map_err(|_| error)?,
-                run_id: row.try_get(1).map_err(|_| error)?,
+    let dispatched = rows(client, "SELECT thread_id,run_id FROM openmybot.channel_events WHERE binding_id=ANY($1) AND dispatch_status='dispatched' AND terminal_kind IS NULL AND run_id IS NOT NULL ORDER BY dispatched_at,record_id", &[&ended], deadline, error).await?;
+    let runs = |found: &[tokio_postgres::Row]| {
+        found
+            .iter()
+            .map(|row| {
+                Ok(OpenRun {
+                    thread_id: row.try_get(0).map_err(|_| error)?,
+                    run_id: row.try_get(1).map_err(|_| error)?,
+                })
             })
-        })
-        .collect()
+            .collect::<Result<Vec<_>, StoreError>>()
+    };
+    Ok(Settled {
+        dispatched: runs(&dispatched)?,
+        pending: runs(&pending)?,
+    })
 }
 
 /// Owner revocation: terminal, clears secrets, and settles the binding and, for a receiver, its
-/// channel's sender; returns the runs to cancel.
+/// channel's sender; returns the settled runs to cancel.
 pub async fn revoke_binding(
     client: &mut Client,
     binding_id: Uuid,
     deadline: Instant,
-) -> Result<Vec<OpenRun>, StoreError> {
+) -> Result<Settled, StoreError> {
     let error = StoreError::BindingFailed;
     let result = async {
         command(client, "BEGIN", deadline, error).await?;
@@ -129,8 +143,8 @@ pub async fn revoke_binding(
         };
         let channel: String = row.try_get(1).map_err(|_| error)?;
         let senders_of = row.try_get::<_, bool>(0).map_err(|_| error)?.then_some(channel.as_str());
-        let runs = settle(client, vec![binding_id], senders_of, "owner_revoked", deadline).await?;
-        timely(deadline, Ok(runs), error)
+        let settled = settle(client, vec![binding_id], senders_of, "owner_revoked", deadline).await?;
+        timely(deadline, Ok(settled), error)
     }
     .await;
     finish(client, deadline, result, error).await
@@ -291,12 +305,12 @@ pub struct NewReceiver<'a> {
     pub credential_envelope: &'a str,
 }
 /// Replaces the channel's live receiver, settling it and its sender as `receiver_replaced`, and
-/// inserts the verified receiver as active with revision 1; returns the runs to cancel.
+/// inserts the verified receiver as active with revision 1; returns the settled runs to cancel.
 pub async fn activate_receiver(
     client: &mut Client,
     input: NewReceiver<'_>,
     deadline: Instant,
-) -> Result<Vec<OpenRun>, StoreError> {
+) -> Result<Settled, StoreError> {
     let error = StoreError::BindingFailed;
     let channel = input.channel.as_str();
     let result = async {
@@ -306,9 +320,9 @@ pub async fn activate_receiver(
             .iter()
             .map(|row| row.try_get(0).map_err(|_| error))
             .collect::<Result<Vec<Uuid>, StoreError>>()?;
-        let runs = settle(client, ended, Some(channel), "receiver_replaced", deadline).await?;
+        let settled = settle(client, ended, Some(channel), "receiver_replaced", deadline).await?;
         rows(client, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,revision,created_at,activated_at) VALUES ($1,'receiver',$2,$3,$4,'active',1,statement_timestamp(),statement_timestamp()) RETURNING binding_id", &[&input.binding_id, &channel, &input.source_key, &input.credential_envelope], deadline, error).await?;
-        timely(deadline, Ok(runs), error)
+        timely(deadline, Ok(settled), error)
     }
     .await;
     finish(client, deadline, result, error).await

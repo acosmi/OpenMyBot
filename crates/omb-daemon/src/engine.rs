@@ -97,6 +97,14 @@ pub(crate) async fn prepare(
         authority,
     })
 }
+#[cfg(test)]
+impl Prepared {
+    /// The engine pool connects through `database`, a test wire proxy; the listener stays direct.
+    pub(crate) async fn through(mut self, database: &DatabaseConfig) -> Self {
+        self.pool = pool::connect(database).await.unwrap();
+        self
+    }
+}
 /// The assembled engine, its delegation authority and the single-user owner resolver.
 pub struct Engine {
     pub(crate) assembly: PostgresApplicationAssembly,
