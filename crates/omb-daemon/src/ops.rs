@@ -2,6 +2,7 @@
 use crate::{
     DaemonError,
     channels::rfc3339_utc,
+    control::REQUEST_TIMEOUT,
     pairing::{self, PairRequest},
     pg,
 };
@@ -13,7 +14,7 @@ use omb_store::{
     Channel, Decided, Decision, EventCancel, GrantKind, HostAccept, HostBinding, HostBindingState,
     HostMessage, IdentityKey, KEY_MAX, MCP_LIST_MAX, NewReceiver, OpenRun, OperationId,
     ReceiverRow, RunDeadline, StoreError, accept_host_begin, binding_run, binding_runs,
-    cancel_event, host_binding_state,
+    cancel_pending, cancel_state, host_binding_state,
 };
 use openbot_application::ApplicationService;
 use openbot_contracts::{
@@ -796,70 +797,76 @@ impl ThreadMinter {
 }
 
 /// The narrow handle that cancels one run of one binding, behind channel `/cancel` and
-/// `wrok_run_cancel`; it runs on the canceller's own connection, not under the control lock.
+/// `wrok_run_cancel`; it runs on the canceller's own connection, not under the control lock, and
+/// under the dispatch gate it shares with the dispatcher.
 #[derive(Clone)]
 pub(crate) struct BindingRunCanceller {
     application: Arc<dyn ApplicationService>,
     resolver: SingleUserAuthResolver,
     client: Arc<tokio_postgres::Client>,
+    gate: Arc<Mutex<()>>,
 }
 impl BindingRunCanceller {
     pub(crate) fn new(
         application: Arc<dyn ApplicationService>,
         resolver: SingleUserAuthResolver,
         client: Arc<tokio_postgres::Client>,
+        gate: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             application,
             resolver,
             client,
+            gate,
         }
     }
-    /// A pending message without a begin attempt is cancelled at once; after an attempt its run
-    /// may exist, so the engine cancels the run it has, and the message is cancelled only when the
-    /// engine has none and no later attempt was recorded. A dispatched run without a terminal is
-    /// cancelled in the engine; a run of another binding is not found.
+    /// Holds the dispatch gate for the whole cancel, so no dispatch is between its event lock and
+    /// its receipt. A pending message may have a run from an earlier begin attempt, so the engine
+    /// cancels the run it has, and the message is cancelled only when the engine has none. A
+    /// dispatched run without a terminal is cancelled in the engine; a run of another binding is
+    /// not found.
     pub(crate) async fn cancel(
         &self,
         binding_id: Uuid,
         run_id: &str,
+        deadline: Instant,
     ) -> Result<&'static str, DaemonError> {
-        let mut attempts = 0;
-        loop {
-            match cancel_event(&self.client, binding_id, run_id, attempts)
+        let _gate = timeout_at(deadline, self.gate.lock())
+            .await
+            .map_err(|_| DaemonError::RequestTimeout)?;
+        let mut found = cancel_state(&self.client, binding_id, run_id)
+            .await
+            .map_err(pg::map_store_error)?;
+        if let EventCancel::Pending { thread_id } = &found {
+            if let Some(state) =
+                cancel_run(self.application.as_ref(), &self.resolver, thread_id, run_id).await?
+            {
+                return Ok(state);
+            }
+            if cancel_pending(&self.client, binding_id, run_id)
                 .await
                 .map_err(pg::map_store_error)?
             {
-                EventCancel::NotFound => return Err(DaemonError::RunNotFound),
-                EventCancel::Cancelled => return Ok("requested"),
-                EventCancel::Ended => return Ok("already_terminal"),
-                EventCancel::Open { thread_id } => {
-                    return cancel_run(
-                        self.application.as_ref(),
-                        &self.resolver,
-                        &thread_id,
-                        run_id,
-                    )
-                    .await?
-                    .ok_or(DaemonError::InternalError);
-                }
-                EventCancel::Retrying {
-                    thread_id,
-                    attempts: recorded,
-                } => {
-                    match cancel_run(
-                        self.application.as_ref(),
-                        &self.resolver,
-                        &thread_id,
-                        run_id,
-                    )
-                    .await?
-                    {
-                        Some(state) => return Ok(state),
-                        None => attempts = recorded,
-                    }
-                }
+                return Ok("requested");
             }
+            found = cancel_state(&self.client, binding_id, run_id)
+                .await
+                .map_err(pg::map_store_error)?;
+        }
+        match found {
+            EventCancel::NotFound => Err(DaemonError::RunNotFound),
+            EventCancel::Ended => Ok("already_terminal"),
+            EventCancel::Open { thread_id } => cancel_run(
+                self.application.as_ref(),
+                &self.resolver,
+                &thread_id,
+                run_id,
+            )
+            .await?
+            .ok_or(DaemonError::InternalError),
+            // A message returns to pending only when a dispatch receipt rolls back, which the gate
+            // excludes.
+            EventCancel::Pending { .. } => Err(DaemonError::InternalError),
         }
     }
 }
@@ -879,7 +886,9 @@ impl CancelQueue {
             while let Some(binding_id) = requests.recv().await {
                 // Any failure drops this request; the owner can send `/cancel` again.
                 if let Ok(Some(run)) = omb_store::open_run(&canceller.client, binding_id).await {
-                    let _ = canceller.cancel(binding_id, &run.run_id).await;
+                    let _ = canceller
+                        .cancel(binding_id, &run.run_id, Instant::now() + REQUEST_TIMEOUT)
+                        .await;
                 }
             }
         });
@@ -960,15 +969,13 @@ mod mcp {
                         thread.as_str(),
                         deadline,
                     )
-                    .await
-                    .map_err(failed)?;
-                    match accepted {
-                        HostAccept::Accepted(run) => {
-                            self.wake.notify_one();
-                            Ok(
-                                json!({"run_id": run.run_id, "thread_id": run.thread_id, "state": "accepted"}),
-                            )
-                        }
+                    .await;
+                    // Every outcome wakes, an error too: its commit may have landed.
+                    self.wake.notify_one();
+                    match accepted.map_err(failed)? {
+                        HostAccept::Accepted(run) => Ok(
+                            json!({"run_id": run.run_id, "thread_id": run.thread_id, "state": "accepted"}),
+                        ),
                         HostAccept::Replayed(run) => Ok(
                             json!({"run_id": run.run_id, "thread_id": run.thread_id, "state": "replayed"}),
                         ),
@@ -1041,7 +1048,10 @@ mod mcp {
                 }
                 McpRequest::Cancel(run_id) => {
                     let binding_id = self.host_binding(deadline).await?;
-                    let state = self.canceller.cancel(binding_id, run_id.as_str()).await?;
+                    let state = self
+                        .canceller
+                        .cancel(binding_id, run_id.as_str(), deadline)
+                        .await?;
                     Ok(json!({"run_id": run_id.as_str(), "state": state}))
                 }
             }
@@ -1064,13 +1074,19 @@ mod tests {
         },
     };
     use omb_channels::{
-        CANCEL_QUEUE, Timings,
+        CANCEL_QUEUE, ChannelError, Connection, Timings,
         fake_feishu::FakeFeishu,
+        start_dispatcher,
         testkit::{FakeTelegram, Reply},
     };
     use omb_hostdriver::{HostDriverConfig, Limits, OMB_NOTICE_PERMISSION_V1};
-    use omb_store::{Claim, DispatchOutcome, Suspension, lock_dispatch, record_dispatch, testkit};
-    use openbot_application::{BeginDelegatedThreadRun, DelegatedUntrustedMaterial};
+    use omb_store::{
+        Claim, DispatchOutcome, Suspension, TerminalKind, lock_dispatch, record_dispatch,
+        record_terminal, testkit,
+    };
+    use openbot_application::{
+        BeginDelegatedThreadRun, DelegatedUntrustedMaterial, RunTerminalKind,
+    };
     use openbot_contracts::{
         auth::DelegationSource,
         command::{AppEvent, SubscriptionRequest, ThreadRunEventKind},
@@ -1477,6 +1493,7 @@ mod tests {
                     engine.assembly.application.clone(),
                     engine.resolver.clone(),
                     Arc::new(canceller.client),
+                    Arc::default(),
                 ),
                 counters: Arc::new(Counters::default()),
             };
@@ -1530,6 +1547,7 @@ mod tests {
                     terminals,
                     crabcode: None,
                 },
+                Arc::clone(&self.ops.canceller.gate),
             )
             .await
             .unwrap();
@@ -3519,6 +3537,7 @@ mod tests {
                     env.ops.application.clone(),
                     env.ops.resolver.clone(),
                     Arc::new(connection.client),
+                    Arc::default(),
                 ),
                 connection.driver,
                 requests,
@@ -3781,7 +3800,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "own PG17.11; explicit binary directory; serial"]
-    async fn begin_accepts_then_replays_and_wakes_only_for_the_accepted() {
+    async fn begin_accepts_then_replays_and_every_acceptance_call_wakes() {
         let env = Env::start().await;
         let host = host_binding(&env).await;
         let accepted = mcp_call(&env, McpOp::RunBegin, begin("op-1", "hello"))
@@ -3807,7 +3826,7 @@ mod tests {
         assert_eq!(replayed["run_id"], accepted["run_id"]);
         assert_eq!(replayed["thread_id"], accepted["thread_id"]);
         assert_eq!(events(&env).await, 1);
-        assert!(!woken(&env).await);
+        assert!(woken(&env).await);
         let longest = mcp_call(&env, McpOp::RunBegin, begin(&"a".repeat(125), "m"))
             .await
             .unwrap();
@@ -3823,6 +3842,7 @@ mod tests {
                 Err(DaemonError::InvalidRequest)
             );
         }
+        // Refused at the boundary: no acceptance call, no wake-up.
         assert_eq!(events(&env).await, 2);
         assert!(!woken(&env).await);
         assert_eq!(
@@ -3852,7 +3872,7 @@ mod tests {
         assert_eq!(conflicts(), 1);
         assert_eq!(events(&env).await, 1);
         assert_eq!(host_event(&env, "op-1").await["text"], "a");
-        assert!(!woken(&env).await);
+        assert!(woken(&env).await);
         assert_eq!(
             mcp_call(&env, McpOp::RunBegin, begin("op-1", "b")).await,
             Err(DaemonError::OperationConflict)
@@ -4253,6 +4273,7 @@ mod tests {
                 terminals,
                 crabcode: None,
             },
+            Arc::default(),
         )
         .await
         .unwrap();
@@ -4422,6 +4443,7 @@ mod tests {
             env.ops.application.clone(),
             env.ops.resolver.clone(),
             Arc::new(connection.client),
+            Arc::default(),
         );
         let queue = CancelQueue::start(handle.clone(), connection.driver, requests);
         drop(cancel);
@@ -4429,7 +4451,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            handle.cancel(Uuid::now_v7(), "r").await,
+            handle.cancel(Uuid::now_v7(), "r", later()).await,
             Err(DaemonError::InternalError)
         );
         env.stop().await;
@@ -4516,24 +4538,26 @@ mod tests {
             )
             .await;
             let run = host_event(&env, &first).await["run_id"].clone();
-            let (cancelled, ()) = tokio::join!(
-                mcp_call(&env, McpOp::RunCancel, json!({"run_id": run})),
-                async {
-                    until(
-                        &gate,
-                        "cancel waits on the event",
-                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name='openmybot-canceller' AND wait_event_type='Lock')",
-                    )
-                    .await;
-                    gate.execute(
-                        "SELECT pg_advisory_unlock(hashtextextended($1,0))",
-                        &[&thread.as_str()],
-                    )
+            let cancelled = mcp_call(&env, McpOp::RunCancel, json!({"run_id": run}));
+            tokio::pin!(cancelled);
+            // The dispatch holds the gate inside its begin: the cancel waits for it.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), &mut cancelled)
                     .await
-                    .unwrap();
-                }
+                    .is_err(),
+                "round {round}"
             );
-            assert_eq!(cancelled.unwrap()["state"], "requested", "round {round}");
+            gate.execute(
+                "SELECT pg_advisory_unlock(hashtextextended($1,0))",
+                &[&thread.as_str()],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                cancelled.await.unwrap()["state"],
+                "requested",
+                "round {round}"
+            );
             let key = format!("op:{first}");
             until(
                 &env.client,
@@ -4699,6 +4723,251 @@ mod tests {
             &env.client,
             "dispatch",
             "SELECT dispatch_status='dispatched' FROM openmybot.channel_events WHERE event_key='op:late-1'",
+        )
+        .await;
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn cancel_in_a_backoff_without_an_engine_run_cancels_the_event_and_the_retry_skips_it() {
+        let mut env = Env::running(Fixture::start_with_host(agent::cooperative).await).await;
+        bound(&mut env).await;
+        for (operation, message) in [("a-1", "first"), ("b-1", "second")] {
+            mcp_call(&env, McpOp::RunBegin, begin(operation, message))
+                .await
+                .unwrap();
+        }
+        // The begin created no run, as on a lease conflict or an unavailable dependency, and its
+        // receipt scheduled a retry.
+        let first = host_event(&env, "a-1").await;
+        let record: Uuid = first["record_id"].as_str().unwrap().parse().unwrap();
+        let dispatch = lock_dispatch(&mut env.client, record, later())
+            .await
+            .unwrap()
+            .unwrap();
+        record_dispatch(
+            dispatch,
+            record,
+            DispatchOutcome::RetryAfter(Duration::from_millis(100)),
+            later(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mcp_call(&env, McpOp::RunCancel, json!({"run_id": first["run_id"]}))
+                .await
+                .unwrap()["state"],
+            "requested"
+        );
+        let cancelled = host_event(&env, "a-1").await;
+        assert_eq!(
+            (
+                &cancelled["dispatch_status"],
+                &cancelled["dispatch_attempts"]
+            ),
+            (&json!("cancelled"), &json!(1))
+        );
+        // The retry is due when the dispatcher starts; it passes the cancelled event by.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        env.serve().await;
+        cancelled_after_dispatch(&env, "b-1").await;
+        let skipped = host_event(&env, "a-1").await;
+        assert_eq!(
+            (&skipped["dispatch_status"], &skipped["dispatch_attempts"]),
+            (&json!("cancelled"), &json!(1))
+        );
+        assert!(skipped["dispatched_at"].is_null());
+        assert_eq!(
+            cancel_run(
+                env.ops.application.as_ref(),
+                &env.ops.resolver,
+                first["thread_id"].as_str().unwrap(),
+                first["run_id"].as_str().unwrap(),
+            )
+            .await,
+            Ok(None)
+        );
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn cancel_waits_for_a_dispatch_whose_session_ends_mid_begin_and_stops_the_begun_run() {
+        let mut env = Env::running(Fixture::start_with_host(agent::cooperative).await).await;
+        bound(&mut env).await;
+        let mut terminals = env.fixture.take_terminals();
+        let entry = env
+            .fixture
+            .engine()
+            .assembly
+            .delegated_entry
+            .clone()
+            .unwrap();
+        let gate = env.fixture.client().await;
+        let mut previous: Option<String> = None;
+        for round in 0..10 {
+            let operation = format!("lost-{round}");
+            let thread = env.minted().await;
+            // The engine's begin takes this thread's lock first; holding it parks the begin.
+            gate.execute(
+                "SELECT pg_advisory_lock(hashtextextended($1,0))",
+                &[&thread.as_str()],
+            )
+            .await
+            .unwrap();
+            let HostAccept::Accepted(run) = accept_host_begin(
+                &mut env.client,
+                &OperationId::parse(&operation).unwrap(),
+                &HostMessage::parse("work").unwrap(),
+                thread.as_str(),
+                later(),
+            )
+            .await
+            .unwrap() else {
+                panic!("round {round}: not accepted");
+            };
+            let opened = env
+                .fixture
+                .pg
+                .open_resident_connection("openmybot-dispatcher")
+                .await
+                .unwrap();
+            let wake = Arc::new(Notify::new());
+            let mut dispatcher = start_dispatcher(
+                Connection {
+                    client: opened.client,
+                    driver: opened.driver,
+                },
+                entry.clone(),
+                quick_channels(),
+                Arc::clone(&wake),
+                Arc::clone(&env.ops.canceller.gate),
+            );
+            wake.notify_one();
+            until(
+                &gate,
+                "begin parked",
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted)",
+            )
+            .await;
+            let parked = Instant::now();
+            // The event the previous round left pending was replayed to dispatched first.
+            if let Some(previous) = &previous {
+                assert_eq!(
+                    host_event(&env, previous).await["dispatch_status"],
+                    "dispatched",
+                    "round {round}"
+                );
+            }
+            // The server ends the dispatcher's session between its begin and its commit.
+            let ended: bool = gate
+                .query_one(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='openmybot-dispatcher'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(ended, "round {round}");
+            let cancelled = {
+                let cancelled = mcp_call(&env, McpOp::RunCancel, json!({"run_id": run.run_id}));
+                tokio::pin!(cancelled);
+                assert!(
+                    tokio::time::timeout_at(parked + Duration::from_secs(3), &mut cancelled)
+                        .await
+                        .is_err(),
+                    "round {round}: the cancel waits for the gate"
+                );
+                gate.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended($1,0))",
+                    &[&thread.as_str()],
+                )
+                .await
+                .unwrap();
+                // The begin commits the run; its receipt finds the session gone.
+                assert_eq!(
+                    dispatcher.finished().await,
+                    Err(ChannelError::StoreFailed),
+                    "round {round}"
+                );
+                cancelled.await.unwrap()
+            };
+            assert_eq!(cancelled["state"], "requested", "round {round}");
+            let waiting = host_event(&env, &operation).await;
+            assert_eq!(
+                (&waiting["dispatch_status"], &waiting["dispatch_attempts"]),
+                (&json!("pending"), &json!(0)),
+                "round {round}"
+            );
+            let notice = tokio::time::timeout(Duration::from_secs(30), terminals.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (notice.run_id.as_str(), notice.terminal),
+                (run.run_id.as_str(), RunTerminalKind::Cancelled),
+                "round {round}"
+            );
+            assert_eq!(
+                host_event(&env, &operation).await["dispatch_status"],
+                "pending",
+                "round {round}"
+            );
+            // Recorded as the sender records a notice, so the next dispatch can replay the event.
+            record_terminal(
+                &mut env.client,
+                &run.run_id,
+                TerminalKind::Cancelled,
+                later(),
+            )
+            .await
+            .unwrap();
+            dispatcher.stop().await;
+            previous = Some(operation);
+        }
+        drop(gate);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn replayed_begin_wakes_the_dispatcher_for_an_event_whose_wake_was_lost() {
+        let mut env = Env::with_channels().await;
+        bound(&mut env).await;
+        until(
+            &env.client,
+            "dispatcher idle",
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name='openmybot-dispatcher' AND state='idle' AND query LIKE 'SELECT e.record_id,%')",
+        )
+        .await;
+        // Written without a wake-up, as when the commit outlives the caller's wait.
+        let thread = env.minted().await;
+        let accepted = accept_host_begin(
+            &mut env.client,
+            &OperationId::parse("lost-1").unwrap(),
+            &HostMessage::parse("m").unwrap(),
+            thread.as_str(),
+            later(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(accepted, HostAccept::Accepted(_)));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            host_event(&env, "lost-1").await["dispatch_status"],
+            "pending"
+        );
+        assert_eq!(
+            mcp_call(&env, McpOp::RunBegin, begin("lost-1", "m"))
+                .await
+                .unwrap()["state"],
+            "replayed"
+        );
+        until(
+            &env.client,
+            "dispatch",
+            "SELECT dispatch_status='dispatched' FROM openmybot.channel_events WHERE event_key='op:lost-1'",
         )
         .await;
         env.stop().await;

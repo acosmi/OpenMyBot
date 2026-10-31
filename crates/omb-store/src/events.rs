@@ -6,7 +6,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::time::{Instant, timeout_at};
 use tokio_postgres::{Client, Transaction};
 use uuid::Uuid;
 
@@ -318,11 +318,10 @@ pub async fn accept_event(
         })
     }
     .await?;
-    timeout_at(deadline, tx.commit())
-        .await
-        .map_err(|_| error)?
-        .map_err(|_| error)?;
-    timely(deadline, Ok(outcome), error)
+    // Awaited to its real result, bounded only by the server: a written event is reported even
+    // past the deadline.
+    tx.commit().await.map_err(|_| error)?;
+    Ok(outcome)
 }
 
 /// The newest event row of a source by acceptance time, as `(update_id, accepted_at)`.
@@ -837,63 +836,57 @@ pub async fn accept_host_begin(
         }))
     }
     .await?;
-    // The commit is awaited on its own budget and its outcome returned even past the deadline: a
-    // caller told of a written event can wake the dispatcher for it.
-    timeout(ACCEPT_TX_BUDGET, tx.commit())
-        .await
-        .map_err(|_| error)?
-        .map_err(|_| error)?;
+    // Awaited to its real result, bounded only by the server: a written event is reported even
+    // past the deadline.
+    tx.commit().await.map_err(|_| error)?;
     Ok(outcome)
 }
 
-/// Where one accepted message of a binding stands after a cancel request.
+/// Where one accepted message of a binding stands for a cancel request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventCancel {
     /// No accepted message of the binding carries the run.
     NotFound,
-    /// The message was still pending with the given attempt count and is now cancelled.
-    Cancelled,
-    /// The message is pending after another count of begin attempts, so its run may exist.
-    Retrying { thread_id: String, attempts: u32 },
+    /// The message waits for its dispatch; an earlier begin attempt may have started its run.
+    Pending { thread_id: String },
     /// The run was dispatched and has no terminal yet.
     Open { thread_id: String },
     /// The run has a terminal, or its message never started.
     Ended,
 }
-/// Cancels the binding's accepted message of `run_id` at once while it is pending and has exactly
-/// `attempts` recorded begin attempts; otherwise says where the run stands. A dispatch holds its
-/// event locked until its receipt counts the attempt, so the update waits for a dispatch in
-/// flight. Any binding kind; a dispatched message is left unchanged.
-pub async fn cancel_event(
+/// Where the binding's accepted message of `run_id` stands; any binding kind, nothing changes.
+pub async fn cancel_state(
     client: &Client,
     binding_id: Uuid,
     run_id: &str,
-    attempts: u32,
 ) -> Result<EventCancel, StoreError> {
     let error = StoreError::EventFailed;
-    let deadline = Instant::now() + READ_BUDGET;
-    let attempts = i32::try_from(attempts).map_err(|_| error)?;
-    let cancelled = rows(client, "UPDATE openmybot.channel_events SET dispatch_status='cancelled' WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message' AND dispatch_status='pending' AND dispatch_attempts=$3 AND terminal_kind IS NULL RETURNING record_id", &[&binding_id, &run_id, &attempts], deadline, error).await?;
-    if !cancelled.is_empty() {
-        return Ok(EventCancel::Cancelled);
-    }
-    let found = rows(client, "SELECT dispatch_status,terminal_kind,thread_id,dispatch_attempts FROM openmybot.channel_events WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message'", &[&binding_id, &run_id], deadline, error).await?;
+    let found = rows(client, "SELECT dispatch_status,terminal_kind,thread_id FROM openmybot.channel_events WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message'", &[&binding_id, &run_id], Instant::now() + READ_BUDGET, error).await?;
     let Some(row) = found.first() else {
         return Ok(EventCancel::NotFound);
     };
     let status: &str = row.try_get(0).map_err(|_| error)?;
     let terminal: Option<&str> = row.try_get(1).map_err(|_| error)?;
     Ok(match (status, terminal) {
+        ("pending", None) => EventCancel::Pending {
+            thread_id: row.try_get(2).map_err(|_| error)?,
+        },
         ("dispatched", None) => EventCancel::Open {
             thread_id: row.try_get(2).map_err(|_| error)?,
         },
-        ("pending", None) => EventCancel::Retrying {
-            thread_id: row.try_get(2).map_err(|_| error)?,
-            attempts: u32::try_from(row.try_get::<_, i32>(3).map_err(|_| error)?)
-                .map_err(|_| error)?,
-        },
         _ => EventCancel::Ended,
     })
+}
+/// Cancels the binding's accepted message of `run_id` while it is pending without a terminal;
+/// `false` when no such message was pending.
+pub async fn cancel_pending(
+    client: &Client,
+    binding_id: Uuid,
+    run_id: &str,
+) -> Result<bool, StoreError> {
+    let error = StoreError::EventFailed;
+    let cancelled = rows(client, "UPDATE openmybot.channel_events SET dispatch_status='cancelled' WHERE binding_id=$1 AND run_id=$2 AND disposition='accepted_message' AND dispatch_status='pending' AND terminal_kind IS NULL RETURNING record_id", &[&binding_id, &run_id], Instant::now() + READ_BUDGET, error).await?;
+    Ok(!cancelled.is_empty())
 }
 
 #[cfg(test)]

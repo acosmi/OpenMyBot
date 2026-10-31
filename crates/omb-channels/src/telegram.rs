@@ -5,9 +5,9 @@ use crate::{
     TelegramEndpoint, Timings,
 };
 use omb_store::{
-    ACCEPT_TX_BUDGET, AcceptOutcome, Channel, Command, Content, Disposition, IdentityKey,
-    NormalizedEvent, PollGapReason, ReceiverRow, StoreError, Suspension, accept_event,
-    close_poll_gaps, latest_update_id, open_poll_gap, suspend_receiver,
+    ACCEPT_TX_BUDGET, AcceptOutcome, Channel, Command, Content, IdentityKey, NormalizedEvent,
+    PollGapReason, ReceiverRow, StoreError, Suspension, accept_event, close_poll_gaps,
+    latest_update_id, open_poll_gap, suspend_receiver,
 };
 use openbot_contracts::ids::ActorId;
 use openbot_domain::vault::{SecretBytes, SecretKind, SecretPrincipal, ServiceId};
@@ -369,24 +369,22 @@ async fn receive(
                             true
                         }
                         Normalized::Event(event) => {
-                            match accept_event(
+                            let accepted = accept_event(
                                 &mut client,
                                 receiver.binding_id,
                                 &event,
                                 &OMB_REPLY_TEXTS_V1,
                                 Instant::now() + ACCEPT_TX_BUDGET,
                             )
-                            .await
-                            {
+                            .await;
+                            // Every outcome wakes, an error too: its commit may have landed.
+                            context.wake.notify_one();
+                            match accepted {
                                 Ok(AcceptOutcome::Conflict) => {
                                     context
                                         .counters
                                         .event_conflict
                                         .fetch_add(1, Ordering::Relaxed);
-                                    true
-                                }
-                                Ok(AcceptOutcome::Recorded(Disposition::AcceptedMessage)) => {
-                                    context.wake.notify_one();
                                     true
                                 }
                                 // Sent only after commit; a closed channel means the daemon is stopping.

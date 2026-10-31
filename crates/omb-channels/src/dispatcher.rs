@@ -14,7 +14,7 @@ use openbot_contracts::{
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::{
-    sync::{Notify, oneshot},
+    sync::{Mutex, Notify, oneshot},
     time::Instant,
 };
 
@@ -61,14 +61,17 @@ fn outcome(
 }
 
 /// Starts the dispatcher; it wakes on `wake`, at the nearest retry or expiry time, or on stop.
+/// Each dispatch holds `gate`, which the daemon's run canceller shares, from before its event lock
+/// until its receipt is committed or rolled back.
 pub fn start_dispatcher(
     connection: Connection,
     entry: DelegatedRunEntry,
     timings: Timings,
     wake: Arc<Notify>,
+    gate: Arc<Mutex<()>>,
 ) -> Task {
     Task::spawn(connection, move |client, stop| {
-        dispatch(client, entry, timings, wake, stop)
+        dispatch(client, entry, timings, wake, gate, stop)
     })
 }
 async fn dispatch(
@@ -76,6 +79,7 @@ async fn dispatch(
     entry: DelegatedRunEntry,
     timings: Timings,
     wake: Arc<Notify>,
+    gate: Arc<Mutex<()>>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<(), ChannelError> {
     let store = |_| ChannelError::StoreFailed;
@@ -91,6 +95,9 @@ async fn dispatch(
         match claim_dispatch(&client).await.map_err(store)? {
             Claim::Item(item) => {
                 let (record_id, attempts) = (item.record_id, item.attempts);
+                // Held on every exit of this dispatch: a cancel never sees a begin whose receipt
+                // is still open, even when this connection is lost before its commit.
+                let _gate = gate.lock().await;
                 // The event stays locked from before the begin until its receipt is recorded.
                 let Some(dispatch) =
                     lock_dispatch(&mut client, record_id, Instant::now() + STORE_BUDGET)
