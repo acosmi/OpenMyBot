@@ -38,8 +38,8 @@ use openbot_contracts::budget::RunCostBudgetPreference;
 use openbot_contracts::command::BeginThreadRunBody;
 use openbot_contracts::command::{
     AppCommand, AppReply, BeginThreadRun, BeginThreadRunV2, CancelThreadRun, ChannelDetailResponse,
-    CreateChannelRequest, MAX_THREAD_MESSAGE_BYTES, RouteChannelRequest, SubscriptionRequest,
-    ThreadRunCancellationState,
+    CreateChannelRequest, DeleteThreadHistoryBody, MAX_THREAD_MESSAGE_BYTES, RouteChannelRequest,
+    SubscriptionRequest, ThreadHistoryDeletionState, ThreadRunCancellationState,
 };
 use openbot_contracts::components::{
     ComponentAgentGrantRequest, ComponentCatalogueRequest, ComponentDecisionRequest,
@@ -267,6 +267,9 @@ enum ThreadRoute<'a> {
         raw_run_id: &'a str,
         kind: ReconciliationRead,
     },
+    HistoryDeletion {
+        raw_thread_id: &'a str,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -320,7 +323,8 @@ impl<'a> ThreadRoute<'a> {
             | Self::Conversation { raw_thread_id }
             | Self::Runs { raw_thread_id }
             | Self::Cancel { raw_thread_id, .. }
-            | Self::Reconciliation { raw_thread_id, .. } => raw_thread_id,
+            | Self::Reconciliation { raw_thread_id, .. }
+            | Self::HistoryDeletion { raw_thread_id } => raw_thread_id,
         }
     }
 }
@@ -339,6 +343,9 @@ fn thread_route(path: &str) -> Option<ThreadRoute<'_>> {
         }
         [raw_thread_id, "runs"] if !raw_thread_id.is_empty() => {
             Some(ThreadRoute::Runs { raw_thread_id })
+        }
+        [raw_thread_id, "history", "deletions"] if !raw_thread_id.is_empty() => {
+            Some(ThreadRoute::HistoryDeletion { raw_thread_id })
         }
         [raw_thread_id, "runs", raw_run_id, "cancel"]
             if !raw_thread_id.is_empty() && !raw_run_id.is_empty() =>
@@ -1868,6 +1875,11 @@ impl DesktopTauriProtocol {
                     .run_reconciliation(label, request, authority, raw_thread_id, raw_run_id, kind)
                     .await;
             }
+            if let ThreadRoute::HistoryDeletion { raw_thread_id } = route {
+                return self
+                    .thread_history_deletion(label, request, authority, raw_thread_id)
+                    .await;
+            }
             return self.thread_unary(request, authority, route).await;
         }
         if path == "/api/agents/test-connection" {
@@ -2775,6 +2787,58 @@ impl DesktopTauriProtocol {
                 response(StatusCode::OK, "application/json", body, true)
             }
             _ => dependency_response(),
+        }
+    }
+
+    /// One bounded step of the creator's history deletion. The original window binding is
+    /// rechecked before and after the Application await, as for the reconciliation reads.
+    async fn thread_history_deletion(
+        &self,
+        label: &str,
+        mut request: Request<Vec<u8>>,
+        authority: WindowAuthority,
+        raw_thread_id: &str,
+    ) -> Response<Vec<u8>> {
+        if request.method() != Method::POST {
+            request.body_mut().fill(0);
+            return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+        }
+        let body =
+            match parse_sensitive_body::<DeleteThreadHistoryBody>(&mut request, API_BODY_MAX_BYTES)
+            {
+                Ok(body) => body,
+                Err(error) => return sensitive_body_error_response(error),
+            };
+        let Some(thread_id) = percent_decode_segment(raw_thread_id) else {
+            return error_response(AppError::MalformedPayload { field: "thread_id" });
+        };
+        if let Err(error) = self.reconciliation_binding_current(label, &authority) {
+            return error_response(error);
+        }
+        let outcome = self
+            .transport
+            .execute(
+                authority.auth.clone(),
+                AppCommand::DeleteThreadHistory {
+                    thread_id: ThreadId::new(thread_id),
+                    request_id: body.request_id,
+                },
+            )
+            .await;
+        // Never deliver the outcome to a window that was closed or rebound meanwhile.
+        if let Err(error) = self.reconciliation_binding_current(label, &authority) {
+            return error_response(error);
+        }
+        match outcome {
+            Ok(AppReply::ThreadHistoryDeletion(receipt)) => {
+                let status = match receipt.state {
+                    ThreadHistoryDeletionState::Pending => StatusCode::ACCEPTED,
+                    ThreadHistoryDeletionState::Cleared => StatusCode::OK,
+                };
+                json_response_with_status(&receipt, status)
+            }
+            Ok(_) => dependency_response(),
+            Err(error) => error_response(error),
         }
     }
 
@@ -9008,3 +9072,7 @@ mod thread_history_management_local_tests;
 #[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
 #[path = "tauri_host/thread_history_stop_clear_local_tests.rs"]
 mod thread_history_stop_clear_local_tests;
+
+#[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
+#[path = "tauri_host/thread_history_deletion_local_tests.rs"]
+mod thread_history_deletion_local_tests;

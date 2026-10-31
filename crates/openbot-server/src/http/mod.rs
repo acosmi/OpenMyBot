@@ -803,6 +803,10 @@ pub fn router(state: ServerState) -> Router {
             get(threads::effect_receipts)
                 .head(|| async { axum::http::StatusCode::METHOD_NOT_ALLOWED }),
         )
+        .route(
+            "/api/threads/{thread_id}/history/deletions",
+            post(threads::delete_history),
+        )
         .route("/api/threads/{thread_id}/ws", get(threads::websocket))
         .route("/api/threads/{thread_id}/events", get(threads::events))
         .route("/api/threads/{thread_id}", get(threads::status))

@@ -9,8 +9,8 @@ use openbot_contracts::artifacts::{
 use openbot_contracts::auth::AuthContext;
 use openbot_contracts::command::{
     BeginThreadRun, BeginThreadRunV2, CancelThreadRun, MAX_THREAD_MESSAGE_BYTES,
-    ThreadConversationSnapshot, ThreadHistory, ThreadMinted, ThreadRunAnchor,
-    ThreadRunCancellation, ThreadRunStarted, ThreadStatus,
+    ThreadConversationSnapshot, ThreadHistory, ThreadHistoryDeletionReceipt, ThreadMinted,
+    ThreadRunAnchor, ThreadRunCancellation, ThreadRunStarted, ThreadStatus,
 };
 use openbot_contracts::error::AppError;
 use openbot_contracts::ids::ThreadId;
@@ -22,7 +22,7 @@ use crate::artifacts::{ArtifactAdministration, require_current_request_binding};
 use crate::ports::{
     BeginThreadRunRequest, BeginThreadRunV2Request, CancelThreadRunRequest,
     ChannelActivitySubscription, RunInputArtifactMaterial, ThreadConversationRequest,
-    ThreadDirectory, ThreadEventSubscription, ThreadHistoryRequest,
+    ThreadDirectory, ThreadEventSubscription, ThreadHistoryDeletion, ThreadHistoryRequest,
 };
 use crate::service::AppEventStream;
 
@@ -391,6 +391,22 @@ pub async fn cancel_thread_run<D: ThreadDirectory>(
         .map_err(|error| error.into_app_error())
 }
 
+/// Validate the Thread identity, then hand one bounded deletion step to the history authority.
+/// The request id is checked once, by the authority's intent producer.
+pub async fn delete_thread_history(
+    deletion: std::sync::Arc<dyn ThreadHistoryDeletion>,
+    auth: &AuthContext,
+    thread_id: &ThreadId,
+    request_id: &str,
+) -> Result<ThreadHistoryDeletionReceipt, AppError> {
+    if !ThreadIdentity::is_plausible(thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    deletion
+        .delete_thread_history_before(auth, thread_id, request_id)
+        .await
+}
+
 /// 建立 scope-aware durable thread event stream。
 pub async fn subscribe_thread_events<D: ThreadDirectory>(
     directory: &D,
@@ -433,7 +449,9 @@ pub async fn subscribe_channel_activity<D: ThreadDirectory>(
         .map_err(|error| error.into_app_error())
 }
 
-/// 读取 scope-aware durable history；未知/不可见/已删除由 port 统一投影为空列表。
+/// Reads the scope-aware durable history. Unknown, invisible and soft-deleted Threads whose
+/// history clearing has not completed project to an empty list; a member's read of a Thread
+/// whose history clearing completed is `NotVisible` (404), whether or not it is soft deleted yet.
 pub async fn get_thread_history<D: ThreadDirectory>(
     directory: &D,
     auth: &AuthContext,
