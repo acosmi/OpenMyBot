@@ -376,11 +376,9 @@ impl VerifiedDesktopRelease {
     /// Reuse the existing authority → real PG/SCRAM → current PG actor → OS Vault → Agent → window
     /// assembly. The lazy real Keychain adapter is first touched by that background assembly.
     pub fn into_runtime_config(self) -> Result<DesktopLocalRuntimeConfig, DesktopReleaseError> {
-        let fixture = crate::tauri_background::bind_self_owned_capture_fixture(
-            option_env!("WROK_BOT_DESKTOP_RELEASE_SHA256"),
-            self.capture.as_ref(),
-        )
-        .map_err(|_| DesktopReleaseError::Application)?;
+        let fixture =
+            crate::tauri_background::bind_self_owned_capture_fixture(self.capture.as_ref())
+                .map_err(|_| DesktopReleaseError::Application)?;
         let (fixture_binding, secret_store): (_, Arc<dyn OsSecretStore>) = match fixture {
             Some((binding, store)) => (Some(binding), store),
             None => (None, Arc::new(DeferredCurrentUserKeychain::default())),

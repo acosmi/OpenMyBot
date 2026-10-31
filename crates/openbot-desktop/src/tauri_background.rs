@@ -371,10 +371,21 @@ pub(crate) fn checked_self_owned_fixture_metadata_bytes(
     u64::try_from(total).map_err(|_| DesktopLocalRuntimeError::Configuration)
 }
 
-/// `compiled_outer` is the build's `WROK_BOT_DESKTOP_RELEASE_SHA256`.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 #[allow(clippy::type_complexity)]
 pub(crate) fn bind_self_owned_capture_fixture(
+    request: Option<&crate::desktop_release::ReviewedNormalCaptureRequest>,
+) -> Result<
+    Option<(SelfOwnedCaptureFixtureBinding, Arc<dyn OsSecretStore>)>,
+    DesktopLocalRuntimeError,
+> {
+    bind_self_owned_capture_fixture_for(option_env!("WROK_BOT_DESKTOP_RELEASE_SHA256"), request)
+}
+
+/// The binding for a given compiled release outer; tests pass the fixture pin directly.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[allow(clippy::type_complexity)]
+fn bind_self_owned_capture_fixture_for(
     compiled_outer: Option<&str>,
     request: Option<&crate::desktop_release::ReviewedNormalCaptureRequest>,
 ) -> Result<
@@ -4579,10 +4590,7 @@ mod tests {
     #[test]
     fn no_capture_request_binds_no_fixture_and_inspects_without_writing() {
         // No compiled fixture pin and no request: no fixture binding and no secret-store swap.
-        assert!(matches!(
-            bind_self_owned_capture_fixture(None, None),
-            Ok(None)
-        ));
+        assert!(matches!(bind_self_owned_capture_fixture(None), Ok(None)));
         let root = private_fixture_root("fresh-ordinary");
         let app = fs::File::open(&root).unwrap();
         assert!(
@@ -4612,7 +4620,7 @@ mod tests {
         // A build carrying the fixture pin refuses a start without a complete request instead
         // of returning Ok(None), which would fall back to the user Keychain.
         assert!(matches!(
-            bind_self_owned_capture_fixture(Some(SELF_OWNED_CAPTURE_FIXTURE.outer), None),
+            bind_self_owned_capture_fixture_for(Some(SELF_OWNED_CAPTURE_FIXTURE.outer), None),
             Err(DesktopLocalRuntimeError::Configuration)
         ));
     }
