@@ -131,6 +131,18 @@ pub enum AppCommand {
     SaveRunMessageTextArtifact(crate::artifacts::SaveRunMessageTextArtifact),
     /// Current-source-authorized metadata selector, never byte access.
     GetArtifactMetadata(crate::artifacts::GetArtifactMetadata),
+    /// Delete one explicitly saved artifact for its current saving owner: arm the deletion,
+    /// remove the stored bytes and complete the tombstone with its refund, as far as one bounded
+    /// call can.
+    ///
+    /// Resending the same command resumes a pending deletion; once it completed, the owner gets
+    /// a conflict. The artifact id is canonicalized once, by the deletion itself; deployment,
+    /// tenant and actor come only from `AuthContext`.
+    #[serde(rename_all = "camelCase")]
+    DeleteArtifact {
+        /// Artifact bound by the route.
+        artifact_id: String,
+    },
     /// Observe current materialized identities for the exact source Run.
     GetSourceRunArtifactIds(crate::artifacts::GetSourceRunArtifactIds),
     /// Observe the original positive save receipt without retrying the save operation.
@@ -665,6 +677,8 @@ pub enum AppReply {
     ArtifactRegistrationReceipt(crate::artifacts::ArtifactRegistrationReceipt),
     /// Current-authorized artifact metadata with distinct live/tombstone shapes.
     ArtifactMetadata(crate::artifacts::ArtifactMetadata),
+    /// [`AppCommand::DeleteArtifact`] progress receipt.
+    ArtifactDeletion(crate::artifacts::ArtifactDeletionReceipt),
     /// Current IDs-only source observation; no body or read handle.
     SourceRunArtifactIds(crate::artifacts::SourceRunArtifactIds),
     /// Actual prepared artifact facts and a bound memory locator.
@@ -1757,6 +1771,59 @@ mod tests {
             .unwrap(),
             serde_json::json!({"kind":"delete_thread_history","threadId":"t","requestId":"r"})
         );
+    }
+
+    #[test]
+    fn artifact_deletion_command_and_receipt_have_closed_wire_shapes() {
+        use crate::artifacts::{
+            ArtifactDeletionReceipt, ArtifactDeletionState, ArtifactInjectedCopies,
+        };
+        let receipt = ArtifactDeletionReceipt {
+            artifact_id: "019a0300-0000-7000-8000-000000000002".to_owned(),
+            state: ArtifactDeletionState::Pending,
+            injected_copies: ArtifactInjectedCopies::RetainedUntilThreadHistoryClear,
+        };
+        let wire = serde_json::to_string(&receipt).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"artifactId":"019a0300-0000-7000-8000-000000000002","state":"pending","injectedCopies":"retained_until_thread_history_clear"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ArtifactDeletionReceipt>(&wire).unwrap(),
+            receipt
+        );
+        assert_eq!(
+            serde_json::to_string(&ArtifactDeletionState::Deleted).unwrap(),
+            r#""deleted""#
+        );
+        assert!(serde_json::from_str::<ArtifactDeletionState>(r#""cleared""#).is_err());
+        assert!(serde_json::from_str::<ArtifactInjectedCopies>(r#""erased""#).is_err());
+        assert!(
+            serde_json::from_str::<ArtifactDeletionReceipt>(
+                r#"{"artifactId":"a","state":"deleted","injectedCopies":"retained_until_thread_history_clear","requestId":"r"}"#
+            )
+            .is_err()
+        );
+        let command = AppCommand::DeleteArtifact {
+            artifact_id: "a".to_owned(),
+        };
+        let value = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind":"delete_artifact","artifactId":"a"})
+        );
+        assert_eq!(
+            serde_json::from_value::<AppCommand>(value).unwrap(),
+            command
+        );
+        assert!(
+            serde_json::from_value::<AppCommand>(
+                serde_json::json!({"kind":"delete_artifact","artifactId":"a","requestId":"r"})
+            )
+            .is_err()
+        );
+        let reply = serde_json::to_value(AppReply::ArtifactDeletion(receipt)).unwrap();
+        assert_eq!(reply["kind"], "artifact_deletion");
     }
 
     /// 正向对照：同一个类型在**非空**时确实序列化出条目 —— 证明上一条不是靠

@@ -167,6 +167,19 @@ pub trait ArtifactAdministration: Send + Sync {
         auth: &AuthContext,
         artifact_id: &str,
     ) -> Result<ArtifactMetadata, ArtifactAdministrationError>;
+
+    /// Advance one bounded deletion of an explicitly saved artifact for its current saving
+    /// owner. A pending receipt is resumed by sending the same deletion again. The implementation
+    /// canonicalizes the id once and owns every other check; without one this stays unavailable.
+    async fn delete_explicit_saved_artifact(
+        self: std::sync::Arc<Self>,
+        _auth: &AuthContext,
+        _artifact_id: &str,
+    ) -> Result<openbot_contracts::artifacts::ArtifactDeletionReceipt, AppError> {
+        Err(AppError::DependencyUnavailable {
+            dependency: "artifacts",
+        })
+    }
 }
 
 /// 原 FD/current witness 保留到真正同步移交的封闭首块；不是公开流或票据。
