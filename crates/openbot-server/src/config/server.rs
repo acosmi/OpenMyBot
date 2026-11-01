@@ -1036,7 +1036,13 @@ mod tests {
     fn startup_recovery_host_requires_one_owner_file() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-        let scratch = std::env::temp_dir().join(format!(
+        // The process environment is read only through the env.rs boundary;
+        // the per-user TMPDIR is private, unlike a shared sticky /tmp.
+        let process = crate::config::env::env_map_from_process();
+        let scratch = std::path::Path::new(
+            crate::config::env::optional(&process, "TMPDIR").expect("per-user TMPDIR"),
+        )
+        .join(format!(
             "wrok-recovery-config-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

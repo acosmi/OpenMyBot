@@ -48,6 +48,8 @@ use openbot_infra::auth::single_user::{initialize_single_user, load_single_user_
 use openbot_infra::auth::sso::DynamicSsoService;
 use openbot_infra::component_catalogue::PostgresComponentAdministration;
 use openbot_infra::db::native;
+#[cfg(test)]
+use openbot_infra::db::pool;
 use openbot_infra::db::pool::DatabaseConfig;
 use openbot_infra::mcp_catalog::PostgresMcpCatalog;
 use openbot_infra::net::safe_http::{
