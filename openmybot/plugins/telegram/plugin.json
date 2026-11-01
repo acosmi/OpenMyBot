@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openmybot-channel-telegram",
+  "version": "0.0.0",
+  "description": "Telegram channel plugin for the local OpenMyBot daemon.",
+  "extensions": {
+    "org.openmybot": {
+      "channels": {
+        "telegram": {
+          "protocol": "openmybot-channel/1",
+          "command": "./bin/openmybot-channel-telegram",
+          "args": [],
+          "credential_fields": [
+            {
+              "name": "token",
+              "secret": true
+            }
+          ],
+          "status_note": "telegram 长轮询；中断区间内的更新在平台保留期内补回"
+        }
+      }
+    }
+  }
+}
