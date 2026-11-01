@@ -361,6 +361,7 @@ async fn production_http_issues_hash_only_token_and_refuses_ungranted_callback()
                     false,
                     signer.clone(),
                     AUDIT_KEY.to_vec(),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -607,6 +608,11 @@ async fn production_callback_http_reaches_governed_real_rmcp_with_durable_sequen
             let credential_broker = Arc::new(PostgresMcpCredentialBroker::new(
                 pool.clone(),
                 credential_vault,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             ));
             let catalog = Arc::new(
                 PostgresMcpCatalog::new(pool.clone(), rmcp.clone(), AUDIT_KEY.to_vec())
@@ -728,6 +734,11 @@ async fn production_callback_http_reaches_governed_real_rmcp_with_durable_sequen
                 tenant.clone(),
                 policy.clone(),
                 Arc::new(memory.clone()),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .with_mcp(catalog.clone(), rmcp)
             .with_mcp_credentials(credential_broker.clone());
@@ -765,6 +776,11 @@ async fn production_callback_http_reaches_governed_real_rmcp_with_durable_sequen
                     false,
                     signer.clone(),
                     AUDIT_KEY.to_vec(),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?
                 .with_mcp_catalog(catalog.clone()),

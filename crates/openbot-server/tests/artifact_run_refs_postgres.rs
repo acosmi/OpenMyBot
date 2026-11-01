@@ -472,6 +472,11 @@ impl Fixture {
                     config.clone(),
                     "owned-artifact-refs".into(),
                     DEFAULT_THREAD_LEASE_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(text)?,
             ),
@@ -609,6 +614,11 @@ impl Fixture {
             "owned-artifact-refs".into(),
             DEFAULT_THREAD_LEASE_DURATION,
             openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?;
         // All dispatches belong to this isolated fixture. Settle earlier real source dispatches
@@ -1181,6 +1191,7 @@ async fn artifact_refs_v2_custom_selection_follows_same_rules() {
         let policy = openbot_infra::policy::PolicyStore::postgres(f.pool.clone(), None);
         policy.load().await.map_err(text)?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &DeploymentId::new(DEP), &TenantId::new(TENANT)),
             pool: f.pool.clone(), listener_database: f.config.clone().into(),
             deployment: DeploymentId::new(DEP), tenant: TenantId::new(TENANT), single_user: false,
             admin_floor: None, model: "owned-model".into(), credential_key_id: "owned-key".into(),
@@ -1203,7 +1214,7 @@ async fn artifact_refs_v2_custom_selection_follows_same_rules() {
             let binding = assembly.model_dataset_binding.clone();
             binding.enroll_original_registry(&f.registry).map_err(text)?;
             let directory = ActualDirectory {
-                actual: Arc::new(PostgresThreadDirectory::with_runtime(f.pool.clone(), f.config.clone(), "owned-artifact-refs".into(), DEFAULT_THREAD_LEASE_DURATION).map_err(text)?
+                actual: Arc::new(PostgresThreadDirectory::with_runtime(f.pool.clone(), f.config.clone(), "owned-artifact-refs".into(), DEFAULT_THREAD_LEASE_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(text)?
                     .with_model_dataset_binding(binding.clone()).map_err(text)?),
                 calls: Arc::new(AtomicUsize::new(0)), before_write: Arc::new(Mutex::new(None)),
             };
@@ -1273,6 +1284,11 @@ async fn artifact_refs_same_thread_source_does_not_self_block() {
             "owned-artifact-refs".into(),
             DEFAULT_THREAD_LEASE_DURATION,
             openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &f.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?;
         let claim = runtime

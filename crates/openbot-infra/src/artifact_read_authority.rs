@@ -469,6 +469,16 @@ impl PostgresArtifactReadAuthority {
         auth: &AuthContext,
         artifact_id: &str,
     ) -> Result<CurrentArtifactReadChunk, AppError> {
+        // The recovery admission is held while the collected first chunk is read
+        // and published: its host phase plus its final 5 s phase.
+        let admission_deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .ok_or(ArtifactReadCurrentError::Unavailable)?;
+        let original = auth.request_binding().ok_or_else(host_unavailable)?;
+        let admission = original
+            .borrow_recovery_admission_before(auth, admission_deadline)
+            .await
+            .map_err(ArtifactReadCurrentError::Host)?;
         let state = ReadOperationState::new(Arc::clone(self), auth.clone(), artifact_id.to_owned());
         state.enroll_store(self.read_store()?, None)?;
         self.lifecycle.register(&state)?;
@@ -524,6 +534,9 @@ impl PostgresArtifactReadAuthority {
             .await
             .map_err(|_| ArtifactReadCurrentError::Unavailable)?;
         attempt.completed = true;
+        admission
+            .verify_current_before(original, auth, admission_deadline)
+            .map_err(ArtifactReadCurrentError::Host)?;
         result
     }
 
@@ -668,6 +681,19 @@ impl PostgresArtifactReadAuthority {
                 .checked_add(Duration::from_secs(5))
                 .ok_or(ArtifactReadCurrentError::Unavailable)?
         };
+        // One recovery admission per block, held from the host check through the
+        // body read to this block's publication: the original deadline, else the
+        // host phase plus the final 5 s phase.
+        let admission_deadline = match state.original_deadline {
+            Some(original) => original,
+            None => host_deadline
+                .checked_add(Duration::from_secs(5))
+                .ok_or(ArtifactReadCurrentError::Unavailable)?,
+        };
+        let admission = original
+            .borrow_recovery_admission_before(auth, admission_deadline)
+            .await
+            .map_err(ArtifactReadCurrentError::Host)?;
         let target = RequestedArtifactReadTarget {
             id: state.artifact_id.clone(),
             auth: auth.clone(),
@@ -703,6 +729,9 @@ impl PostgresArtifactReadAuthority {
                 .await
                 .map(|record| ReadInput::Fresh(Box::new(record))),
         };
+        admission
+            .verify_current_before(original, auth, admission_deadline)
+            .map_err(ArtifactReadCurrentError::Host)?;
         let worker = match input {
             Ok(input) => {
                 {
@@ -830,6 +859,9 @@ impl PostgresArtifactReadAuthority {
         query.complete();
         let witness = observed?;
         owned.1?;
+        admission
+            .verify_current_before(original, auth, admission_deadline)
+            .map_err(ArtifactReadCurrentError::Host)?;
         let owner = owned
             .0
             .as_mut()

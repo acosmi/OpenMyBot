@@ -280,6 +280,7 @@ async fn callback_pair_binds_active_run_bot_actor_and_empty_authoritative_tool_s
                 false,
                 signer.clone(),
                 vec![0x55; 32],
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let owner = auth("owner-a", Role::User, 0);

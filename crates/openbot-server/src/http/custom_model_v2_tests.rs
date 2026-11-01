@@ -113,6 +113,12 @@ impl ServerFixture {
             "custom-V2 policy must load from database",
         )?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &deployment,
+                    &tenant,
+                ),
             pool: pool.clone(),
             listener_database: config.into(),
             deployment: deployment.clone(),

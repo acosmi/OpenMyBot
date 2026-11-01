@@ -3499,6 +3499,11 @@ async fn assemble_approval_fixture(
         auth.deployment().clone(),
         auth.tenant().clone(),
         FIXTURE_APPROVAL_AUDIT_KEY.to_vec(),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &database,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )?);
     let auth_resolver: Arc<dyn AuthResolver> = Arc::new(PostgresSessionAuthResolver::new(
         database.clone(),
@@ -3525,6 +3530,11 @@ async fn assemble_approval_fixture(
         ],
         SafeDialer::new(EgressPolicy::default()),
         FIXTURE_SSO_PUBLIC_URL.to_owned(),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &database,
+            auth.deployment(),
+            auth.tenant(),
+        ),
     )?);
     let people = FixturePeoplePort::Postgres(PostgresPeopleAdministration::new(
         database.clone(),

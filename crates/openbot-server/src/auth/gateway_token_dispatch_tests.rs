@@ -1646,13 +1646,18 @@ mod fixture {
                 return Err("enrollment mode was not explicitly enabled".into());
             }
             openbot_infra::gateway_authority::PostgresGatewayAccounts::new(
-                pool,
+                pool.clone(),
                 vault,
                 DeploymentId::new(DEP),
                 TenantId::new(TENANT),
                 SecretBytes::new(vec![0x28; 32]),
                 tls.dialer()?,
                 &tls.endpoint(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             )
             .map_err(|error| error.to_string())
         }

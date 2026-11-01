@@ -814,6 +814,7 @@ async fn drive_oauth_catalog_grant_agent_retry_disconnect_and_revoke_are_one_rea
                 Some(&origin),
                 Some("http://app.example.test"),
                 SchemePolicy::HttpOrHttps,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?
             .with_google_drive_oauth(google_oauth.clone());
@@ -974,7 +975,7 @@ async fn drive_oauth_catalog_grant_agent_retry_disconnect_and_revoke_are_one_rea
             drop(pg);
 
             let broker = Arc::new(
-                PostgresMcpCredentialBroker::new(pool.clone(), vault.clone())
+                PostgresMcpCredentialBroker::new(pool.clone(), vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                     .with_user_oauth(
                         SafeDialer::new(EgressPolicy::new(
                             CidrAllowlist::parse_exact(["127.0.0.1/32"]).unwrap(),
@@ -1030,6 +1031,7 @@ async fn drive_oauth_catalog_grant_agent_retry_disconnect_and_revoke_are_one_rea
                 TenantId::new("drive-tenant"),
                 policy.clone(),
                 Arc::new(memory.clone()),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .with_mcp(catalog.clone(), rmcp)
             .with_google_drive(drive_transport)

@@ -14,6 +14,7 @@ use crate::mcp::McpBearerToken;
 use crate::mcp_catalog::VendorTransportKind;
 use crate::mcp_oauth::McpOAuthClient;
 use crate::net::safe_http::{SafeDialer, SchemePolicy};
+use crate::recovery_control::RecoveryWorkerLease;
 use crate::store::plugin_user_credential::{
     OAuthTokenExchangeError, PluginUserCredentialStore, RotatingOAuthTokenExchanger,
     UserCredentialSelectionError, UserOAuthAccessError,
@@ -50,6 +51,7 @@ pub struct PostgresMcpCredentialBroker {
     vault: CredentialRecordVault,
     user_oauth: Option<UserOAuthRuntime>,
     drive_oauth: Option<GoogleDriveOAuthClient>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 #[derive(Clone)]
@@ -61,12 +63,17 @@ struct UserOAuthRuntime {
 impl PostgresMcpCredentialBroker {
     /// Bind the same tenant vault and PostgreSQL pool used by production credentials.
     #[must_use]
-    pub fn new(pool: crate::db::pool::DatabasePool, vault: CredentialRecordVault) -> Self {
+    pub fn new(
+        pool: crate::db::pool::DatabasePool,
+        vault: CredentialRecordVault,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
+    ) -> Self {
         Self {
             pool,
             vault,
             user_oauth: None,
             drive_oauth: None,
+            recovery_gate,
         }
     }
 
@@ -80,9 +87,13 @@ impl PostgresMcpCredentialBroker {
         scheme_policy: SchemePolicy,
         audit_checkpoint_key: Vec<u8>,
     ) -> Result<Self, McpCredentialError> {
-        let store = PluginUserCredentialStore::new(self.pool.clone(), self.vault.clone())
-            .with_rotation_audit_key(audit_checkpoint_key)
-            .map_err(map_selection_error)?;
+        let store = PluginUserCredentialStore::new(
+            self.pool.clone(),
+            self.vault.clone(),
+            self.recovery_gate.clone(),
+        )
+        .with_rotation_audit_key(audit_checkpoint_key)
+        .map_err(map_selection_error)?;
         self.user_oauth = Some(UserOAuthRuntime {
             store,
             exchanger: McpOAuthClient::new(dialer, scheme_policy),
@@ -105,6 +116,27 @@ impl PostgresMcpCredentialBroker {
         &self,
         server_id: &str,
         actor: &ActorId,
+    ) -> Result<Option<McpBearerToken>, McpCredentialError> {
+        // A standalone resolution: the 5 s SQL precedent plus one OAuth round
+        // for a refresh.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(5)
+            + crate::mcp_oauth::MCP_OAUTH_ROUND_BUDGET;
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| McpCredentialError::Unavailable)?;
+        self.bearer_for_admitted(server_id, actor, &admission).await
+    }
+
+    /// Same resolution under the caller's held worker admission, which this
+    /// rechecks before the Vault-open and the refresh.
+    pub(crate) async fn bearer_for_admitted(
+        &self,
+        server_id: &str,
+        actor: &ActorId,
+        admission: &RecoveryWorkerLease<'_>,
     ) -> Result<Option<McpBearerToken>, McpCredentialError> {
         if server_id.is_empty() || server_id.len() > 64 || server_id.as_bytes().contains(&0) {
             return Err(McpCredentialError::Corrupt { field: "server_id" });
@@ -171,7 +203,31 @@ impl PostgresMcpCredentialBroker {
         if provider.as_deref() != Some(server_id) {
             return Err(McpCredentialError::Corrupt { field: "provider" });
         }
+        if kind == CredentialKind::Mcp {
+            // The deployment bearer is opened below; the user-OAuth path gates its own opens.
+            crate::restore_reconfirmation::require_confirmed_before(
+                &**client,
+                crate::restore_reconfirmation::RequirementSource {
+                    cohort: admission.restore_cohort(),
+                    kind: crate::restore_reconfirmation::RequirementKind::Credential,
+                    source_ref: &pointer.to_string(),
+                },
+                admission.deadline(),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+                    McpCredentialError::AuthRequired
+                }
+                crate::restore_reconfirmation::RestoreReconfirmationError::Unavailable => {
+                    McpCredentialError::Unavailable
+                }
+            })?;
+        }
         drop(client);
+        admission
+            .verify_current_before(admission.deadline())
+            .map_err(|_| McpCredentialError::Unavailable)?;
         match kind {
             CredentialKind::Mcp => {
                 if transport != VendorTransportKind::Mcp {
@@ -202,7 +258,7 @@ impl PostgresMcpCredentialBroker {
                 })
             }
             CredentialKind::McpOauthClient => self
-                .user_oauth_bearer(server_id, actor, transport)
+                .user_oauth_bearer(server_id, actor, transport, admission)
                 .await
                 .map(Some),
             CredentialKind::McpUserToken => Err(McpCredentialError::Corrupt {
@@ -221,6 +277,7 @@ impl PostgresMcpCredentialBroker {
         server_id: &str,
         actor: &ActorId,
         transport: VendorTransportKind,
+        admission: &RecoveryWorkerLease<'_>,
     ) -> Result<McpBearerToken, McpCredentialError> {
         let runtime = self
             .user_oauth
@@ -228,14 +285,21 @@ impl PostgresMcpCredentialBroker {
             .ok_or(McpCredentialError::AuthRequired)?;
         match transport {
             VendorTransportKind::Mcp => {
-                refresh_actor_bearer(&runtime.store, &runtime.exchanger, server_id, actor).await
+                refresh_actor_bearer(
+                    &runtime.store,
+                    &runtime.exchanger,
+                    server_id,
+                    actor,
+                    admission,
+                )
+                .await
             }
             VendorTransportKind::GoogleDriveRest => {
                 let exchanger = self
                     .drive_oauth
                     .as_ref()
                     .ok_or(McpCredentialError::AuthRequired)?;
-                refresh_actor_bearer(&runtime.store, exchanger, server_id, actor).await
+                refresh_actor_bearer(&runtime.store, exchanger, server_id, actor, admission).await
             }
         }
     }
@@ -246,9 +310,10 @@ async fn refresh_actor_bearer<E: RotatingOAuthTokenExchanger + ?Sized>(
     exchanger: &E,
     server_id: &str,
     actor: &ActorId,
+    admission: &RecoveryWorkerLease<'_>,
 ) -> Result<McpBearerToken, McpCredentialError> {
     let token = store
-        .fresh_user_access_token(server_id, actor, exchanger)
+        .fresh_user_access_token_admitted(server_id, actor, exchanger, admission)
         .await
         .map_err(map_user_oauth_error)?;
     McpBearerToken::from_secret(token.into_secret()).map_err(|_| McpCredentialError::Corrupt {

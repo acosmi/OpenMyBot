@@ -201,6 +201,15 @@ impl AgentCallbackTokenAdministration for PostgresAgentCallbackTokens {
         auth: &AuthContext,
         agent: &BotId,
     ) -> Result<CallbackTokenIssued, AgentCallbackTokenError> {
+        // No step here has its own bound, so the 5 s precedent.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let binding = auth
+            .request_binding()
+            .ok_or(AgentCallbackTokenError::Unavailable)?;
+        let admission = binding
+            .borrow_recovery_admission_before(auth, deadline)
+            .await
+            .map_err(|_| AgentCallbackTokenError::Unavailable)?;
         let mut client = self.pool.get().await.map_err(|error| {
             tracing::error!(error = %error, "callback token 获取连接失败");
             AgentCallbackTokenError::Unavailable
@@ -230,6 +239,9 @@ impl AgentCallbackTokenAdministration for PostgresAgentCallbackTokens {
             .map_err(|error| unavailable("callback token hash update", error))?;
         self.append_audit(&transaction, auth, agent, "bot.callback_token_issued")
             .await?;
+        admission
+            .verify_current_before(binding, auth, deadline)
+            .map_err(|_| AgentCallbackTokenError::Unavailable)?;
         transaction.commit().await.map_err(|error| {
             tracing::error!(error = %error, "callback token issue commit 结果未知");
             AgentCallbackTokenError::CommitUnknown
@@ -289,6 +301,7 @@ pub struct PostgresRemoteCallbackAuthenticator {
     mcp_catalog: Option<Arc<PostgresMcpCatalog>>,
     delegation: Option<Arc<openbot_application::DelegationRuntime>>,
     run_runtime: Option<Arc<crate::run_runtime::PostgresRunRuntime>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl PostgresRemoteCallbackAuthenticator {
@@ -300,6 +313,7 @@ impl PostgresRemoteCallbackAuthenticator {
         single_user: bool,
         signer: Arc<RemoteRunAssertionSigner>,
         checkpoint_key: Vec<u8>,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, RemoteCallbackAuthError> {
         if checkpoint_key.is_empty() {
             return Err(RemoteCallbackAuthError::Corrupt {
@@ -316,6 +330,7 @@ impl PostgresRemoteCallbackAuthenticator {
             mcp_catalog: None,
             delegation: None,
             run_runtime: None,
+            recovery_gate,
         })
     }
 
@@ -394,6 +409,14 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
         run: &serde_json::Value,
         requested_tool: &str,
     ) -> Result<RemoteCallbackAuthorization, RemoteCallbackAuthError> {
+        // No step here has its own bound, so the 5 s precedent. The worker
+        // admission is held through the refusal audit or the returned grant.
+        let admitted_until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(admitted_until)
+            .await
+            .map_err(|_| RemoteCallbackAuthError::Unavailable)?;
         let mut client = self.pool.get().await.map_err(|source| {
             tracing::error!(error = %source, "remote callback 获取连接失败");
             RemoteCallbackAuthError::Unavailable
@@ -677,6 +700,9 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
                 .rollback()
                 .await
                 .map_err(|_| RemoteCallbackAuthError::Unavailable)?;
+            admission
+                .verify_current_before(admitted_until)
+                .map_err(|_| RemoteCallbackAuthError::Unavailable)?;
             let result = match &self.delegation {
                 Some(runtime) => runtime.remint_callback(&original, &lease).await,
                 None => Err(openbot_contracts::error::AppError::PolicyRefused {
@@ -707,6 +733,9 @@ impl RemoteCallbackAuthenticator for PostgresRemoteCallbackAuthenticator {
                 },
             }
         } else {
+            admission
+                .verify_current_before(admitted_until)
+                .map_err(|_| RemoteCallbackAuthError::Unavailable)?;
             Ok(original)
         }
     }

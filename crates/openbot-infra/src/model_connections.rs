@@ -13,6 +13,8 @@ use openbot_contracts::{
     auth::{AuthContext, Role},
     ids::{DeploymentId, TenantId},
     model_connections::*,
+    recovery::RecoveryAdmissionLease,
+    request_binding::VerifiedHostRequestBinding,
 };
 use openbot_domain::{
     audit::{
@@ -279,6 +281,7 @@ impl ModelConnectionAdministration for PostgresModelConnections {
             &input.model,
             input.enabled,
         )?;
+        let (binding, admission, deadline) = admitted(auth).await?;
         let mut client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
         let tx = client
             .build_transaction()
@@ -295,6 +298,7 @@ impl ModelConnectionAdministration for PostgresModelConnections {
         self.audit(&tx, auth, id, "model_connection_created")
             .await?;
         let result = project(&self.row(&tx, auth, id, false).await?)?;
+        current(&admission, binding, auth, deadline)?;
         tx.commit().await.map_err(|_| Error::CommitUnknown)?;
         Ok(result)
     }
@@ -315,6 +319,7 @@ impl ModelConnectionAdministration for PostgresModelConnections {
             &input.model,
             input.enabled,
         )?;
+        let (binding, admission, deadline) = admitted(auth).await?;
         let mut client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
         let tx = client
             .build_transaction()
@@ -336,6 +341,26 @@ impl ModelConnectionAdministration for PostgresModelConnections {
         let old_secret: Uuid = old
             .try_get("current_secret_id")
             .map_err(|_| Error::Corrupt)?;
+        // The restored logical connection, not its rotating secret row, is the source.
+        crate::restore_reconfirmation::require_confirmed_before(
+            &*tx,
+            crate::restore_reconfirmation::RequirementSource {
+                cohort: admission.restore_cohort(),
+                kind: crate::restore_reconfirmation::RequirementKind::ModelSecret,
+                source_ref: &id.to_string(),
+            },
+            deadline,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+                Error::NotVisible
+            }
+            crate::restore_reconfirmation::RestoreReconfirmationError::Unavailable => {
+                Error::Unavailable
+            }
+        })?;
+        current(&admission, binding, auth, deadline)?;
         self.check_current_secret(&tx, auth, id, old_secret).await?;
         let now = now(&tx).await?;
         let secret = match &input.api_key {
@@ -355,6 +380,7 @@ impl ModelConnectionAdministration for PostgresModelConnections {
         };
         self.audit(&tx, auth, id, change).await?;
         let result = project(&self.row(&tx, auth, id, false).await?)?;
+        current(&admission, binding, auth, deadline)?;
         tx.commit().await.map_err(|_| Error::CommitUnknown)?;
         Ok(result)
     }
@@ -368,6 +394,7 @@ impl ModelConnectionAdministration for PostgresModelConnections {
         self.scope(auth)?;
         let id = parse_id(id)?;
         revision(input.expected_revision)?;
+        let (binding, admission, deadline) = admitted(auth).await?;
         let mut client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
         let tx = client
             .build_transaction()
@@ -387,6 +414,7 @@ impl ModelConnectionAdministration for PostgresModelConnections {
         tx.execute("UPDATE public.model_connection_secrets SET retired_at=coalesce(retired_at,$2) WHERE connection_id=$1", &[&id,&now]).await.map_err(unavailable)?;
         self.audit(&tx, auth, id, "model_connection_deleted")
             .await?;
+        current(&admission, binding, auth, deadline)?;
         tx.commit().await.map_err(|_| Error::CommitUnknown)?;
         Ok(ModelConnectionDeleted {
             id: id.to_string(),
@@ -394,6 +422,39 @@ impl ModelConnectionAdministration for PostgresModelConnections {
             deleted_at: now,
         })
     }
+}
+
+/// Each writer takes its one deadline at entry (no per-step bound,
+/// so the 5 s precedent) and borrows the original request's recovery admission.
+async fn admitted(
+    auth: &AuthContext,
+) -> Result<
+    (
+        &VerifiedHostRequestBinding,
+        RecoveryAdmissionLease<'_>,
+        std::time::Instant,
+    ),
+    Error,
+> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let binding = auth.request_binding().ok_or(Error::Unavailable)?;
+    let admission = binding
+        .borrow_recovery_admission_before(auth, deadline)
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    Ok((binding, admission, deadline))
+}
+
+/// The same admission, rechecked before a Vault-open and before COMMIT.
+fn current(
+    admission: &RecoveryAdmissionLease<'_>,
+    binding: &VerifiedHostRequestBinding,
+    auth: &AuthContext,
+    deadline: std::time::Instant,
+) -> Result<(), Error> {
+    admission
+        .verify_current_before(binding, auth, deadline)
+        .map_err(|_| Error::Unavailable)
 }
 
 async fn lock_actor(tx: &Transaction<'_>, auth: &AuthContext) -> Result<(), Error> {

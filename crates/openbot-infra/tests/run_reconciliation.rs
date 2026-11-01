@@ -91,6 +91,11 @@ impl Fixture {
             config,
             "readback-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?;
         directory
@@ -114,6 +119,11 @@ impl Fixture {
             "readback-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?;
         let claim = runtime
@@ -386,10 +396,17 @@ async fn reconciliation_read_preserves_unknown_and_all_original_records() {
                 && !serialized.contains("argsHash"),
             "business content escaped the safe projection",
         )?;
-        let reloaded = PostgresThreadDirectory::new(fixture.pool.clone())
-            .run_reconciliation(fixture.request())
-            .await
-            .map_err(|error| error.to_string())?;
+        let reloaded = PostgresThreadDirectory::new(
+            fixture.pool.clone(),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &fixture.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
+        )
+        .run_reconciliation(fixture.request())
+        .await
+        .map_err(|error| error.to_string())?;
         require(
             reloaded.attempts == page.attempts && reloaded.foreground_blocked,
             "new directory instance must read the same durable Unknown",

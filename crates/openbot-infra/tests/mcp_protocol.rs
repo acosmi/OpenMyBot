@@ -1089,6 +1089,7 @@ async fn custom_admin_private_egress_is_db_bound_refreshes_and_retires_atomicall
             let broker = Arc::new(PostgresMcpCredentialBroker::new(
                 pool.clone(),
                 vault.clone(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             ));
             let connections = PostgresMcpConnections::new(
                 pool.clone(),
@@ -1102,6 +1103,7 @@ async fn custom_admin_private_egress_is_db_bound_refreshes_and_retires_atomicall
                 None,
                 None,
                 SchemePolicy::HttpsOnly,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?
             .with_mcp_credentials(broker);
@@ -1774,6 +1776,7 @@ async fn server_side_tools_cover_no_grant_vendor_schema_real_rmcp_audit_and_poli
                     DeploymentId::new("deployment-mcp"),
                     TenantId::new("tenant-mcp"),
                     vec![0x71; 32],
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -1785,6 +1788,7 @@ async fn server_side_tools_cover_no_grant_vendor_schema_real_rmcp_audit_and_poli
                 TenantId::new("tenant-mcp"),
                 policy.clone(),
                 Arc::new(memory.clone()),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .with_mcp(catalog.clone(), rmcp)
             .with_tool_cancellations(tool_cancellations.clone())

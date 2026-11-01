@@ -36,6 +36,7 @@ pub(super) struct AuthorityInner {
     active: Mutex<Option<ActiveState>>,
     transport: OnceLock<Weak<dyn HttpTransport>>,
     self_ref: OnceLock<Weak<AuthorityInner>>,
+    pub(super) recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl AuthorityInner {
@@ -44,6 +45,7 @@ impl AuthorityInner {
         vault: crate::vault::CredentialRecordVault,
         audit_key: SecretBytes,
         scope: Scope,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Arc<Self> {
         let inner = Arc::new(Self {
             pool,
@@ -54,6 +56,7 @@ impl AuthorityInner {
             active: Mutex::new(None),
             transport: OnceLock::new(),
             self_ref: OnceLock::new(),
+            recovery_gate,
         });
         let _ = inner.self_ref.set(Arc::downgrade(&inner));
         inner
@@ -129,6 +132,17 @@ impl AuthorityInner {
         Ok(())
     }
 
+    /// One worker admission under this operation's original deadline, held by
+    /// the caller through its Vault-open or write (the borrow verifies it once).
+    pub(super) async fn admission(
+        &self,
+    ) -> Result<crate::recovery_control::RecoveryWorkerLease<'static>, GatewayAuthorityError> {
+        self.recovery_gate
+            .borrow_worker_before(self.scope.deadline.into_std())
+            .await
+            .map_err(|_| GatewayAuthorityError::Unavailable)
+    }
+
     async fn load_inner(&self) -> Result<AuthorityState, GatewayAuthorityError> {
         enum LoadedState {
             Ready(store::SensitiveTokens),
@@ -136,6 +150,7 @@ impl AuthorityInner {
         }
 
         let active = self.active()?;
+        let admission = self.admission().await?;
         active
             .session
             .begin(&self.scope.cancel, self.scope.deadline)
@@ -157,6 +172,9 @@ impl AuthorityInner {
                         connection.credential_generation,
                     )
                     .await?;
+                    admission
+                        .verify_current_before(self.scope.deadline.into_std())
+                        .map_err(|_| GatewayAuthorityError::Unavailable)?;
                     let tokens = store::open_tokens(
                         &self.vault,
                         secret_id,
@@ -401,6 +419,7 @@ impl StrictTokenAuthority for AuthorityInner {
         if active.operation_id.is_some() {
             return Err(TokenAuthorityError::RotationPending);
         }
+        let _admission = self.admission().await.map_err(map)?;
         let operation =
             store::begin_rotation(&active.session, &self.scope, self.audit_key.expose())
                 .await
@@ -409,11 +428,13 @@ impl StrictTokenAuthority for AuthorityInner {
     }
 
     async fn commit_rotation(&self, tokens: &acosmi::TokenSet) -> AuthorityResult<()> {
+        let _admission = self.admission().await.map_err(map)?;
         self.commit_inner(tokens).await.map_err(map)
     }
 
     async fn clear(&self) -> AuthorityResult<()> {
         let active = self.active().map_err(map)?;
+        let _admission = self.admission().await.map_err(map)?;
         store::clear_credentials(&active.session, &self.scope, self.audit_key.expose())
             .await
             .map_err(map)

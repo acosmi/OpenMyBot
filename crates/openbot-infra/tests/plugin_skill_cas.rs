@@ -143,6 +143,11 @@ async fn setup(p: &Pool) -> PostgresMcpConnections {
         None,
         None,
         SchemePolicy::HttpsOnly,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .unwrap()
 }
@@ -801,7 +806,7 @@ async fn accepted_instruction_snapshot_survives_cas_edit_and_revocation_without_
         let slug = "selected-skill";
         let original = selected(port.save_skill(&actor, &mutation(slug, None, "accepted instruction")).await.unwrap(), slug);
         port.set_grant(&actor, &grant(slug), true).await.unwrap();
-        let directory = PostgresThreadDirectory::with_runtime(p.clone(), config.clone(), "skill-cas-runtime".to_owned(), time::Duration::seconds(30)).unwrap();
+        let directory = PostgresThreadDirectory::with_runtime(p.clone(), config.clone(), "skill-cas-runtime".to_owned(), time::Duration::seconds(30), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap();
         let request = begin(slug, 1, "skill-cas-run");
         let first = directory.begin_thread_run(request.clone()).await.unwrap();
         port.save_skill(&actor, &mutation(slug, Some(1), "later instruction")).await.unwrap();

@@ -442,6 +442,12 @@ impl Host {
         policy.load().await.map_err(|_| "production_policy_load")?;
         self.assembly = Some(
             assemble_postgres_application(PostgresApplicationAssemblyInput {
+                recovery_gate:
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &self.pool,
+                        &deployment,
+                        &tenant,
+                    ),
                 pool: self.pool.clone(),
                 listener_database: config.into(),
                 deployment: deployment.clone(),
@@ -642,6 +648,11 @@ impl Host {
                 auth.tenant().clone(),
                 policy.clone(),
                 memory.clone(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             );
             let inject_after_effect = index + 1 == count;
             let journal = OutcomeUnavailableJournal {

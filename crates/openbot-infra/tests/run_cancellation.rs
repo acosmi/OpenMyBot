@@ -69,6 +69,7 @@ async fn durable_cancel_is_scoped_idempotent_and_poll_terminalizes_when_no_child
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             directory
@@ -200,6 +201,7 @@ async fn durable_cancel_is_scoped_idempotent_and_poll_terminalizes_when_no_child
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );

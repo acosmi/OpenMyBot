@@ -139,6 +139,7 @@ async fn detail_is_member_only_and_projects_only_the_matching_native_thread() {
                 config,
                 "runtime-channel-detail".to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             if !directory

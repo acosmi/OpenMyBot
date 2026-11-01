@@ -589,7 +589,7 @@ mod v2_vault_tests {
             let registry=Arc::new(ArtifactDatasetRegistry::from_server(p.clone(),&DeploymentId::new(DEP),&TenantId::new(TENANT)).await.unwrap());
             let binding=Arc::new(PostgresModelDatasetBinding::unbound(p.clone(),DeploymentId::new(DEP),TenantId::new(TENANT)).unwrap());
             binding.enroll_original_registry(&registry).unwrap();
-            let directory=PostgresThreadDirectory::with_runtime(p.clone(),config.clone(),"owned-vault-runtime".into(),time::Duration::seconds(30)).unwrap()
+            let directory=PostgresThreadDirectory::with_runtime(p.clone(),config.clone(),"owned-vault-runtime".into(),time::Duration::seconds(30), crate::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap()
                 .with_model_dataset_binding(binding.clone()).unwrap();
             let context=PostgresAgentContextSource::new(p.clone(),DeploymentId::new(DEP),TenantId::new(TENANT),Some(32)).unwrap()
                 .with_model_dataset_binding(binding.clone()).unwrap();
@@ -723,6 +723,11 @@ mod v2_vault_tests {
                 config,
                 "owned-concurrent-runtime".into(),
                 time::Duration::seconds(30),
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &p,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .unwrap()
             .with_model_dataset_binding(binding.clone())

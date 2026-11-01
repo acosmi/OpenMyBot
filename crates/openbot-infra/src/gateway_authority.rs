@@ -158,6 +158,7 @@ pub struct PostgresGatewayAccounts {
     audit_key: SecretBytes,
     dialer: SafeDialer,
     origin: String,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl PostgresGatewayAccounts {
@@ -170,6 +171,7 @@ impl PostgresGatewayAccounts {
         audit_key: SecretBytes,
         dialer: SafeDialer,
         origin: &str,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, GatewayAuthorityError> {
         let origin = normalize_origin(origin)?;
         if deployment.as_str().is_empty()
@@ -186,7 +188,13 @@ impl PostgresGatewayAccounts {
             audit_key,
             dialer,
             origin,
+            recovery_gate,
         })
+    }
+
+    /// The same gate for the enrollment header fences built outside this owner.
+    pub(crate) fn recovery_gate(&self) -> crate::recovery_control::RecoveryReadGate {
+        self.recovery_gate.clone()
     }
 
     pub fn prepare_enrollment(
@@ -230,6 +238,7 @@ impl PostgresGatewayAccounts {
             self.deployment.clone(),
             self.tenant.clone(),
             deadline,
+            self.recovery_gate.clone(),
         ));
         let transport = self.transport(fence, outcomes, deadline)?;
         let account = GatewayAccountClient::new(&self.origin, transport).map_err(map_account)?;
@@ -381,6 +390,7 @@ impl PostgresGatewayAccounts {
             self.vault.clone(),
             SecretBytes::new(self.audit_key.expose().to_vec()),
             scope,
+            self.recovery_gate.clone(),
         );
         let http_authority: Arc<dyn crate::gateway_transport::GatewayHttpAuthority> = inner.clone();
         let transport = self.transport(http_authority, outcomes, deadline)?;

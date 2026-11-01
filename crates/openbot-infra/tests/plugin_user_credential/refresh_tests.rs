@@ -54,7 +54,7 @@ async fn only_one_replica_sends_and_reusable_success_also_commits() {
         exchanger.started.notified().await;
         assert_eq!(operation_state(&fixture).await?, ("pending".to_owned(), true, 1));
         // A separately constructed broker represents another replica, with no shared mutex.
-        let replica = PluginUserCredentialStore::new(fixture.pool.clone(), fixture.vault.clone()).with_rotation_audit_key(AUDIT_KEY.to_vec()).unwrap();
+        let replica = PluginUserCredentialStore::new(fixture.pool.clone(), fixture.vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&fixture.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).with_rotation_audit_key(AUDIT_KEY.to_vec()).unwrap();
         assert!(matches!(replica.fresh_user_access_token(DRIVE, &ActorId::new(ASKER), &*exchanger).await,
             Err(UserOAuthAccessError::Selection(UserCredentialSelectionError::RotationPending))));
         assert_eq!(exchanger.calls.load(Ordering::SeqCst), 1);
@@ -100,7 +100,7 @@ async fn lost_response_restart_and_old_timestamp_never_resend_but_reconnect_reco
         let pg = fixture.pool.get().await.map_err(|e| e.to_string())?;
         pg.execute("UPDATE public.oauth_refresh_operations SET created_at=clock_timestamp()-interval '30 days' WHERE credential_id=$1", &[&original]).await.map_err(|e| e.to_string())?;
         drop(pg);
-        let restarted = PluginUserCredentialStore::new(fixture.pool.clone(), fixture.vault.clone()).with_rotation_audit_key(AUDIT_KEY.to_vec()).unwrap();
+        let restarted = PluginUserCredentialStore::new(fixture.pool.clone(), fixture.vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&fixture.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).with_rotation_audit_key(AUDIT_KEY.to_vec()).unwrap();
         assert!(matches!(restarted.fresh_user_access_token(DRIVE, &ActorId::new(ASKER), &exchanger).await,
             Err(UserOAuthAccessError::Selection(UserCredentialSelectionError::RotationPending))));
         assert_eq!(exchanger.calls.load(Ordering::SeqCst), 1);

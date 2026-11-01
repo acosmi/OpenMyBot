@@ -246,6 +246,11 @@ pub(super) async fn run(config: pool::DatabaseConfig) -> Result<(), String> {
     policies.load().await.map_err(|_| "owned_policy_load")?;
     let remote_calls = Arc::new(AtomicU64::new(0));
     let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+        recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &application_pool,
+            &DeploymentId::new(DEPLOYMENT),
+            &tenant,
+        ),
         pool: application_pool.clone(),
         listener_database: config.clone().into(),
         deployment: DeploymentId::new(DEPLOYMENT),
