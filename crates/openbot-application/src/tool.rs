@@ -935,6 +935,17 @@ pub async fn invoke_tool<C: ToolControlPlane, J: ToolJournal>(
     auth: &AuthContext,
     invocation: ToolInvocation,
 ) -> Result<ToolResult, AppError> {
+    invoke_tool_guarded(control, journal, auth, invocation, None).await
+}
+
+/// Same pipeline; a delegated Run passes its effect guard.
+pub(crate) async fn invoke_tool_guarded<C: ToolControlPlane, J: ToolJournal>(
+    control: &C,
+    journal: &J,
+    auth: &AuthContext,
+    invocation: ToolInvocation,
+    guard: Option<&crate::delegation::DelegatedEffectGuard>,
+) -> Result<ToolResult, AppError> {
     let tool = ToolName::new(invocation.tool_name.clone())
         .map_err(|_| AppError::MalformedPayload { field: "toolName" })?;
     let arguments = ToolArguments::new(invocation.arguments.clone()).map_err(
@@ -1079,6 +1090,13 @@ pub async fn invoke_tool<C: ToolControlPlane, J: ToolJournal>(
         }
     };
 
+    // Admission verified the delegation once; only a human approval wait can separate that
+    // check from the effect, so verify again exactly when one was awaited.
+    if let Some(guard) = guard
+        && metadata.approval_class.requires_human_approval()
+    {
+        guard.recheck().await?;
+    }
     let mut decision = base_draft;
     decision.approval_id = settled.approval_id().map(str::to_owned);
 

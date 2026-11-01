@@ -260,6 +260,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if local && !single_user {
         return Err(openbot_server::config::launch::LaunchError::LocalModeConflict.into());
     }
+    let transport_policy = server.startup_transport_policy(single_user)?;
     let environment_provider_ids = auth_config
         .as_ref()
         .map(|config| {
@@ -544,6 +545,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stall_timeout: server.agent_budgets.stall_timeout,
         oauth_public_url: oauth_public_url.map(|url| url.as_str().to_owned()),
         app_url: server.app_url.clone(),
+        extra_provider_adapters: Vec::new(),
+        run_event_subscriber: None,
+        delegation_authority: None,
     })
     .await?;
     if application_assembly
@@ -701,7 +705,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let auth_owner = Arc::clone(&auth);
     let artifact_read_application = Arc::clone(&application);
     let mut builder = ServerBuilder::new(application, auth)
-        .with_transport_policy(server.transport_policy(single_user))
+        .with_transport_policy(transport_policy)
         .with_sensitive_write_security(sensitive)
         .with_metrics_handle(metrics)
         .with_insecure_transport(server.public_transport().insecure_transport())
@@ -1247,6 +1251,10 @@ async fn shutdown_signal() {
 fn startup_error(code: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, code)
 }
+
+#[cfg(test)]
+#[path = "single_user_transport_startup_tests.rs"]
+mod single_user_transport_startup_tests;
 
 #[cfg(test)]
 #[path = "http/custom_model_v2_tests.rs"]

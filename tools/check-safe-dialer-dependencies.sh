@@ -51,7 +51,33 @@ grep -qF 'openidconnect = { version = "4.0.1", default-features = false }' Cargo
   || fail 'openidconnect 必须继续关闭自带 reqwest/rustls'
 
 network_callers=$(rg -l 'TcpStream::connect|lookup_host\(|TlsConnector|http1::handshake|reqwest::|hyper::client|tokio_rustls' crates/*/src --glob '*.rs' | sort)
-expected_callers=$'crates/openbot-computer/src/engine/process.rs\ncrates/openbot-desktop/src/postgres_sidecar.rs\ncrates/openbot-infra/src/net/safe_http.rs\ncrates/openbot-server/src/http/approvals.rs\ncrates/openbot-server/src/http/channels.rs\ncrates/openbot-server/src/http/screen.rs\ncrates/openbot-server/src/http/threads.rs\ncrates/openbot-server/src/http/transport_gate.rs'
+# 测试夹具：标注的文件只经 #[cfg(test)] 或 #[cfg(all(test, …))] 模块编入，其回环探针不是生产出网调用方；
+# provider/custom.rs 是生产文件，命中行在其 #[cfg(test)] mod v2_vault_tests 内。
+expected_callers_list=(
+  crates/omb-channels/src/testkit.rs # 测试夹具 PR #243（testkit feature 模块，命中在其 #[cfg(test)] mod tests 内）
+  crates/openbot-computer/src/engine/process.rs
+  crates/openbot-desktop/src/postgres_sidecar.rs
+  crates/openbot-desktop/src/tauri_host/approval_preference_local_tests.rs # 测试夹具 PR #147
+  crates/openbot-infra/src/artifact_read_authority/save_receipt_tests.rs # 测试夹具 PR #141
+  crates/openbot-infra/src/artifact_read_authority/tests.rs # 测试夹具 PR #131
+  crates/openbot-infra/src/db/pool/owner.rs # V7-IMPL-045 R475-B：mod capture_io 只惰性连接原 127.0.0.1:port 本机 socket
+  crates/openbot-infra/src/mcp/selected_target_tests.rs # 测试夹具 PR #118
+  crates/openbot-infra/src/net/safe_http.rs
+  crates/openbot-infra/src/provider/custom.rs # 测试夹具 mod v2_vault_tests，PR #171
+  crates/openbot-server/src/auth/gateway_authorization_journal_tests/support.rs # 测试夹具 PR #174
+  crates/openbot-server/src/auth/gateway_callback_rendezvous_tests.rs # 测试夹具 PR #178
+  crates/openbot-server/src/auth/gateway_registration_dispatch_tests.rs # 测试夹具 PR #175
+  crates/openbot-server/src/auth/gateway_token_dispatch_tests.rs # 测试夹具 PR #179
+  crates/openbot-server/src/auth/thread_history_management_tests.rs # 测试夹具 PR #181
+  crates/openbot-server/src/config/single_user_transport_tests.rs # 测试夹具 PR #232
+  crates/openbot-server/src/http/approvals.rs
+  crates/openbot-server/src/http/artifact_save_receipt_tests.rs # 测试夹具 PR #141
+  crates/openbot-server/src/http/channels.rs
+  crates/openbot-server/src/http/screen.rs
+  crates/openbot-server/src/http/threads.rs
+  crates/openbot-server/src/http/transport_gate.rs
+)
+expected_callers=$(printf '%s\n' "${expected_callers_list[@]}")
 [[ "$network_callers" == "$expected_callers" ]] \
   || fail "socket/DNS/TLS/HTTP client 调用面不再唯一：[$network_callers]"
 
@@ -61,6 +87,12 @@ proxy_hop_callers=$(rg -l 'connect_proxy_hop\(|\.into_tunnel\(' crates/*/src --g
 expected_proxy_hop_callers=$'crates/openbot-infra/src/net/safe_http.rs\ncrates/openbot-infra/src/net/scope_gateway.rs'
 [[ "$proxy_hop_callers" == "$expected_proxy_hop_callers" ]] \
   || fail "scope proxy hop escaped its two owning modules: [$proxy_hop_callers]"
+
+# §10.5 第 7 项：WebSocket 客户端只在 SafeDialer::connect_websocket_stream 返回的已验证流上握手；
+# tokio-tungstenite 的自拨号（connect_async 族）与自带 TLS（client_async_tls 族）入口不得出现在第一方源码。
+if rg -n '\b(connect_async|client_async_tls)' crates/*/src --glob '*.rs'; then
+  fail 'tokio-tungstenite 自拨号/自带 TLS 入口绕过 SafeDialer'
+fi
 
 # Seven test modules own these loopback probes. Desktop has two existing exit-observation
 # probes (unclean Drop and owned orphan shutdown); every other module has exactly one.
@@ -88,6 +120,14 @@ for file in "${test_only_network_files[@]}"; do
       || fail "loopback client 越出 cfg(test)：file=$file cfg=$test_module_line caller=$client_line"
   done <<< "$client_lines"
 done
+
+# provider/custom.rs 的唯一回环探针在其 #[cfg(test)] mod v2_vault_tests 内；生产段再出现出网调用即红。
+custom_file=crates/openbot-infra/src/provider/custom.rs
+custom_test_module_line=$(awk 'previous == "#[cfg(test)]" && $0 == "mod v2_vault_tests {" { print NR - 1 } { previous = $0 }' "$custom_file")
+custom_client_lines=$(rg -n 'TcpStream::connect|lookup_host\(|TlsConnector|http1::handshake|reqwest::|hyper::client|tokio_rustls' "$custom_file" | cut -d: -f1)
+[[ "$custom_test_module_line" =~ ^[0-9]+$ && "$custom_client_lines" =~ ^[0-9]+$ ]] \
+  && (( custom_client_lines > custom_test_module_line )) \
+  || fail "custom provider loopback client 越出 cfg(test)：cfg=[$custom_test_module_line] callers=[$custom_client_lines]"
 
 metadata=$(cargo metadata --format-version 1 --locked)
 ring_manifest=$(printf '%s' "$metadata" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=[p["manifest_path"] for p in d["packages"] if p["name"]=="ring" and p["version"]=="0.17.14"];assert len(m)==1,m;print(m[0])')

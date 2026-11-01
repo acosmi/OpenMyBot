@@ -1,0 +1,87 @@
+[package]
+name = "omb-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+testkit = []
+
+[dependencies]
+tokio-postgres.workspace = true
+tokio = { workspace = true, features = ["process"] }
+sha2.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+time.workspace = true
+getrandom.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+sha1 = "0.10.7"
+
+[[test]]
+name = "migrations"
+required-features = ["testkit"]
+
+[[test]]
+name = "schema"
+required-features = ["testkit"]
+
+[[test]]
+name = "control_tokens"
+required-features = ["testkit"]
+
+[[test]]
+name = "pairing"
+required-features = ["testkit"]
+
+[[test]]
+name = "bindings"
+required-features = ["testkit"]
+
+[[test]]
+name = "events"
+required-features = ["testkit"]
+
+[[test]]
+name = "dispatch"
+required-features = ["testkit"]
+
+[[test]]
+name = "gaps"
+required-features = ["testkit"]
+
+[[test]]
+name = "host_sessions"
+required-features = ["testkit"]
+
+[[test]]
+name = "control_ops"
+required-features = ["testkit"]
+
+[[test]]
+name = "deliveries"
+required-features = ["testkit"]
+
+[[test]]
+name = "reconcile_rows"
+required-features = ["testkit"]
+
+[[test]]
+name = "sweep"
+required-features = ["testkit"]
+
+[[test]]
+name = "host_accept"
+required-features = ["testkit"]
+
+[[test]]
+name = "host_reads"
+required-features = ["testkit"]

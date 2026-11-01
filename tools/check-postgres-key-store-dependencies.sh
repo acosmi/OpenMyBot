@@ -80,7 +80,7 @@ keychain_consumers=$(
     fi
   done < <(rg -l 'security_framework(::|_sys::)' crates --glob '*.rs' | sort || true)
 )
-[[ "$keychain_consumers" == "crates/openbot-desktop/src/os_secret_store.rs" ]] || fail "Security.framework consumer set drift: ${keychain_consumers:-none}"
+[[ "$keychain_consumers" == $'crates/openbot-desktop/src/os_secret_store.rs\ncrates/openbot-desktop/src/os_secret_store/macos_interaction.rs' ]] || fail "Security.framework consumer set drift: ${keychain_consumers:-none}"
 
 credential_consumers=$(rg -l 'Cred(ReadW|WriteW|Free|DeleteW)' crates --glob '*.rs' | sort || true)
 [[ "$credential_consumers" == "crates/openbot-windows-sandbox/src/windows.rs" ]] || fail "Credential Manager FFI consumer set drift: ${credential_consumers:-none}"
@@ -89,7 +89,13 @@ application_key_label_consumers=$(rg -l 'openbot:(audit-checkpoint|mcp-oauth-sta
 [[ "$application_key_label_consumers" == "crates/openbot-domain/src/vault/derivation.rs" ]] || fail "application key derivation labels drift: ${application_key_label_consumers:-none}"
 
 production_source=$(awk '/^mod tests \{/{exit} {print}' crates/openbot-desktop/src/postgres_sidecar.rs)
-if rg -n 'std::env::(var|var_os|vars|vars_os)|std::process::Command|PGPASSWORD|--pwfile' <<<"$production_source" >/dev/null; then
+# macOS Fresh initdb reads exactly one password line from its private stdin pipe; only this exact
+# line is exempt from the --pwfile ban, and it must stay a single production occurrence.
+initdb_stdin_password='const INITDB_PASSWORD_INPUT: &str = "--pwfile=/dev/stdin";'
+[[ $(grep -cxF "$initdb_stdin_password" <<<"$production_source") == 1 ]] \
+  || fail "macOS initdb stdin password channel count drift"
+if grep -vxF "$initdb_stdin_password" <<<"$production_source" \
+  | rg -n 'std::env::(var|var_os|vars|vars_os)|std::process::Command|PGPASSWORD|--pwfile' >/dev/null; then
   fail "PostgreSQL secret path gained environment or command fallback"
 fi
 

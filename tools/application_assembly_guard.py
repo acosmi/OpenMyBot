@@ -16,9 +16,30 @@ MODULE = re.compile(
     r"(?P<attrs>(?:#\s*\[[^\]]*\]\s*)*)"
     r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<end>[;{])"
 )
-TEST_CFG = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+CFG = re.compile(r"#\s*\[\s*cfg\s*\((?P<predicate>[^\]]*)\)\s*\]")
+ALL = re.compile(r"all\s*\((?P<members>.*)\)", re.DOTALL)
 PATH_ATTRIBUTE = re.compile(r'#\s*\[\s*path\s*=\s*"([^"\\]+)"\s*\]')
 CONSTRUCTOR = re.compile(r"\bOpenBotApplication\s*::\s*new\b")
+
+
+def _test_only(attrs: str) -> bool:
+    """`#[cfg(test)]` or `#[cfg(all(…, test, …))]`; `any(…)` and `not(…)` never qualify."""
+
+    for attribute in CFG.finditer(attrs):
+        predicate = attribute.group("predicate").strip()
+        if predicate == "test":
+            return True
+        members = ALL.fullmatch(predicate)
+        if not members:
+            continue
+        depth, start, text = 0, 0, members.group("members") + ","
+        for index, char in enumerate(text):
+            depth += {"(": 1, ")": -1}.get(char, 0)
+            if char == "," and depth == 0:
+                if text[start:index].strip() == "test":
+                    return True
+                start = index + 1
+    return False
 
 
 def _block_end(clean: str, opening: int) -> int:
@@ -55,7 +76,7 @@ def _module_facts(path: PurePosixPath, source: str):
     test_ranges = [
         (match.start(), _block_end(clean, match.end() - 1))
         for match in modules
-        if match.group("end") == "{" and TEST_CFG.search(match.group("attrs"))
+        if match.group("end") == "{" and _test_only(match.group("attrs"))
     ]
     in_test = lambda offset: any(start <= offset < end for start, end in test_ranges)
     base = path.parent if path.name in {"lib.rs", "main.rs", "mod.rs"} else path.with_suffix("")
@@ -74,7 +95,7 @@ def _module_facts(path: PurePosixPath, source: str):
         else:
             directory = base.joinpath(*parents, match.group("name"))
             candidates = [directory.with_suffix(".rs"), directory / "mod.rs"]
-        test_only = bool(TEST_CFG.search(match.group("attrs"))) or in_test(match.start())
+        test_only = _test_only(match.group("attrs")) or in_test(match.start())
         edges.extend((target, test_only) for target in candidates)
 
     # A second include!/#[path] production reference cancels a test-only exclusion.

@@ -3056,6 +3056,11 @@ impl core::fmt::Debug for SingleUserAuthResolver {
 }
 
 impl SingleUserAuthResolver {
+    /// Resolve the same verified local context without an HTTP request.
+    pub fn local_context(&self) -> Result<AuthContext, AppError> {
+        self.resolved().map(ResolvedAuth::into_context)
+    }
+
     /// Attach the original runtime's weak recovery gate once to this verified principal.
     /// Require a live issuer, the same actual pool and namespace, and no earlier attachment.
     pub fn install_recovery_read_gate(&self, pool: &openbot_infra::db::pool::DatabasePool, gate: openbot_infra::recovery_control::RecoveryReadGate) -> Result<(), HostRequestBindingError> {
@@ -3733,3 +3738,7 @@ mod gateway_token_dispatch_tests;
 #[cfg(test)]
 #[path = "auth/thread_history_management_tests.rs"]
 mod thread_history_management_tests;
+
+#[cfg(test)]
+#[path = "auth/delegation_local_context_tests.rs"]
+mod delegation_local_context_tests;

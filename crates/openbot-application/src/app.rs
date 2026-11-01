@@ -50,8 +50,8 @@ use crate::ports::{
     AgentAdministration, AgentDirectory, AuditReader, ChannelAdministration, ChannelReader,
     ChannelRoutingBackend, MemoryAdministration, NoAgentAdministration, NoAgentDirectory,
     NoAuditReader, NoChannelAdministration, NoChannelRoutingBackend, NoMemoryAdministration,
-    NoPeopleAdministration, NoPolicyAdministration, NoThreadDirectory, PeopleAdministration,
-    PolicyAdministration, ThreadDirectory,
+    NoPeopleAdministration, NoPolicyAdministration, NoThreadDirectory, NoThreadHistoryDeletion,
+    PeopleAdministration, PolicyAdministration, ThreadDirectory, ThreadHistoryDeletion,
 };
 use crate::provider::{NoRemoteInterruptCoordinator, RemoteInterruptCoordinator};
 use crate::remote_interrupt::{list_pending_remote_interrupts, resolve_remote_interrupt};
@@ -68,12 +68,14 @@ use crate::screen_sessions::{
     NoScreenSessionAdministration, ScreenSessionAdministration, issue_screen_session,
 };
 use crate::service::{AppEventStream, ApplicationService, command_kind, subscription_kind};
-use crate::tool::{NoToolControlPlane, NoToolJournal, ToolControlPlane, ToolJournal, invoke_tool};
+use crate::tool::{
+    NoToolControlPlane, NoToolJournal, ToolControlPlane, ToolJournal, invoke_tool_guarded,
+};
 use crate::ui_preferences::{
     NoUiPreferenceAdministration, UiPreferenceAdministration, get_ui_preferences,
     update_ui_preferences,
 };
-use crate::use_cases::thread::begin_thread_run_v2;
+use crate::use_cases::thread::{begin_thread_run_v2, delete_thread_history};
 use crate::use_cases::{
     DEFAULT_HEARTBEAT_PERIOD, admin_status, begin_thread_run, cancel_thread_run,
     change_person_access, change_person_role, correct_memory, create_agent, create_channel,
@@ -85,6 +87,16 @@ use crate::use_cases::{
     subscribe_channel_activity, subscribe_thread_events, test_agent_connection, update_agent,
     update_memory_control,
 };
+
+fn refuse_unbound_delegation(auth: &AuthContext) -> Result<(), AppError> {
+    if auth.delegation().is_some() {
+        return Err(AppError::PolicyRefused {
+            rule: "delegated_authority_refused".into(),
+            decision: None,
+        });
+    }
+    Ok(())
+}
 
 /// [`ApplicationService`] 的生产实现。
 ///
@@ -129,8 +141,10 @@ pub struct OpenBotApplication<
     remote_interrupts: std::sync::Arc<dyn RemoteInterruptCoordinator>,
     screen_sessions: std::sync::Arc<dyn ScreenSessionAdministration>,
     artifacts: std::sync::Arc<dyn ArtifactAdministration>,
+    thread_history_deletion: std::sync::Arc<dyn ThreadHistoryDeletion>,
     public_artifact_reads:
         std::sync::Arc<crate::artifact_read_protocol::PublicArtifactReadRegistry>,
+    delegation_runtime: Option<std::sync::Arc<crate::DelegationRuntime>>,
     runtime_capabilities:
         Option<std::sync::Arc<dyn crate::runtime_capabilities::RuntimeCapabilitiesCollector>>,
     heartbeat_period: Duration,
@@ -182,9 +196,11 @@ impl<R>
             remote_interrupts: std::sync::Arc::new(NoRemoteInterruptCoordinator),
             screen_sessions: std::sync::Arc::new(NoScreenSessionAdministration),
             artifacts: std::sync::Arc::new(NoArtifactAdministration),
+            thread_history_deletion: std::sync::Arc::new(NoThreadHistoryDeletion),
             public_artifact_reads: std::sync::Arc::new(
                 crate::artifact_read_protocol::PublicArtifactReadRegistry::new(),
             ),
+            delegation_runtime: None,
             runtime_capabilities: None,
             heartbeat_period: DEFAULT_HEARTBEAT_PERIOD,
         }
@@ -222,7 +238,9 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -258,7 +276,9 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -294,7 +314,9 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -334,7 +356,9 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -370,7 +394,9 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -406,7 +432,9 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -445,7 +473,9 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             remote_interrupts: self.remote_interrupts,
             screen_sessions: self.screen_sessions,
             artifacts: self.artifacts,
+            thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
+            delegation_runtime: self.delegation_runtime,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -605,6 +635,25 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
         self
     }
 
+    /// Attach the public Thread history deletion of the shared history authority.
+    #[must_use]
+    pub fn with_thread_history_deletion(
+        mut self,
+        deletion: std::sync::Arc<dyn ThreadHistoryDeletion>,
+    ) -> Self {
+        self.thread_history_deletion = deletion;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_delegation_runtime(
+        mut self,
+        runtime: std::sync::Arc<crate::DelegationRuntime>,
+    ) -> Self {
+        self.delegation_runtime = Some(runtime);
+        self
+    }
+
     /// Attach the real current host's non-Serde capability collector.
     #[must_use]
     pub fn with_runtime_capabilities(
@@ -645,6 +694,7 @@ where
         &self,
         auth: &AuthContext,
         command: AppCommand,
+        delegated_guard: Option<&crate::delegation::DelegatedEffectGuard>,
     ) -> Result<AppReply, AppError> {
         match command {
             AppCommand::ListCustomModelCatalog(input) => Ok(AppReply::CustomModelCatalog(
@@ -887,7 +937,14 @@ where
                 policy: Some(set_action_policy(&self.policies, auth, policy).await?),
             }),
             AppCommand::InvokeTool(invocation) => Ok(AppReply::Tool(
-                invoke_tool(&self.tool_control, &self.tool_journal, auth, invocation).await?,
+                invoke_tool_guarded(
+                    &self.tool_control,
+                    &self.tool_journal,
+                    auth,
+                    invocation,
+                    delegated_guard,
+                )
+                .await?,
             )),
             AppCommand::MintThreadId => Ok(AppReply::ThreadMinted(
                 mint_thread_id(&self.threads, auth).await?,
@@ -903,6 +960,18 @@ where
             )),
             AppCommand::CancelThreadRun(command) => Ok(AppReply::ThreadRunCancellation(
                 cancel_thread_run(&self.threads, auth, command).await?,
+            )),
+            AppCommand::DeleteThreadHistory {
+                thread_id,
+                request_id,
+            } => Ok(AppReply::ThreadHistoryDeletion(
+                delete_thread_history(
+                    std::sync::Arc::clone(&self.thread_history_deletion),
+                    auth,
+                    &thread_id,
+                    &request_id,
+                )
+                .await?,
             )),
             AppCommand::GetThreadHistory { thread_id } => Ok(AppReply::ThreadHistory(
                 get_thread_history(&self.threads, auth, thread_id).await?,
@@ -1298,7 +1367,20 @@ where
         )
     )]
     async fn execute(&self, auth: AuthContext, command: AppCommand) -> Result<AppReply, AppError> {
-        let result = self.dispatch(&auth, command).await;
+        let result = if auth.delegation().is_some() {
+            match &self.delegation_runtime {
+                Some(runtime) => match runtime.admit_command(&auth, &command).await {
+                    Ok(guard) => self.dispatch(&auth, command, Some(&guard)).await,
+                    Err(error) => Err(error),
+                },
+                None => Err(AppError::PolicyRefused {
+                    rule: "delegated_authority_refused".into(),
+                    decision: None,
+                }),
+            }
+        } else {
+            self.dispatch(&auth, command, None).await
+        };
         if let Err(error) = &result {
             // 只记**稳定码**，不记 `Display`：`AppError` 的 Display 会带上 policy rule id
             // 与 lease holder 这类上下文，那些属于受控诊断，不该由一条恒开的 span 字段
@@ -1324,6 +1406,7 @@ where
         auth: AuthContext,
         request: SubscriptionRequest,
     ) -> Result<AppEventStream, AppError> {
+        refuse_unbound_delegation(&auth)?;
         // 穷举 match，理由同 `dispatch`。
         match request {
             SubscriptionRequest::Health => Ok(health_stream(self.heartbeat_period)),
@@ -1342,6 +1425,10 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "delegated_authority_tests.rs"]
+mod delegated_authority_tests;
 
 #[cfg(test)]
 mod tests {

@@ -4567,6 +4567,128 @@ dependencies = [
 ]
 
 [[package]]
+name = "omb-channel-sdk"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "omb-channels"
+version = "0.0.0"
+dependencies = [
+ "futures-util",
+ "getrandom 0.4.3",
+ "http",
+ "omb-store",
+ "openbot-application",
+ "openbot-contracts",
+ "openbot-domain",
+ "openbot-infra",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "tokio-tungstenite",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "omb-cli"
+version = "0.0.0"
+dependencies = [
+ "omb-daemon",
+ "omb-mcp",
+ "rustix",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "omb-daemon"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "getrandom 0.4.3",
+ "omb-channel-sdk",
+ "omb-hostdriver",
+ "omb-store",
+ "openbot-agent",
+ "openbot-application",
+ "openbot-computer",
+ "openbot-contracts",
+ "openbot-domain",
+ "openbot-infra",
+ "openbot-server",
+ "rustix",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "toml 0.9.8",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "omb-hostdriver"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "getrandom 0.4.3",
+ "omb-store",
+ "openbot-application",
+ "rustix",
+ "ryu",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
+]
+
+[[package]]
+name = "omb-mcp"
+version = "0.0.0"
+dependencies = [
+ "omb-daemon",
+ "rmcp",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "omb-store"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "rustix",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

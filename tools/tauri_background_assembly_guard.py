@@ -196,21 +196,72 @@ def _block_after(tokens: list[str], marker: tuple[str, ...], label: str) -> list
     return tokens[opening + 1:closing]
 
 
-def _impl_shutdown(tokens: list[str]) -> list[str]:
-    implementation = _block_after(
-        tokens,
-        ("impl", "RuntimeShutdownOwner", "for", "DesktopLocalBackgroundOwner"),
-        "production DesktopLocalBackgroundOwner RuntimeShutdownOwner impl",
-    )
-    return _block_after(
-        implementation,
-        ("async", "fn", "shutdown"),
-        "production DesktopLocalBackgroundOwner::shutdown",
-    )
+def _binding(tokens: list[str], at: int) -> tuple[str, int] | None:
+    """Name and `let` position of the `let NAME = …;` statement that contains token `at`."""
+
+    for index in range(at - 1, -1, -1):
+        if tokens[index] == ";":
+            return None
+        if tokens[index] == "let":
+            cursor = index + 1
+            if cursor < at and tokens[cursor] == "mut":
+                cursor += 1
+            if cursor < at and tokens[cursor].isidentifier() and "=" in tokens[cursor + 1:at]:
+                return tokens[cursor], index
+            return None
+    return None
+
+
+def _origin(tokens: list[str], name: str, before: int) -> tuple[str, int | None]:
+    """Follow visible `let name = other;` aliases back to the `let` that introduced the value.
+
+    Only bindings in the scope enclosing `before` count; a `let` inside an already closed block
+    (dead or not) is invisible there. A macro call group (`name! { … }`, `name!( … )`,
+    `name![ … ]`) is not a block: a macro may expand its tokens, nested braces included, into the
+    enclosing scope, so every brace inside the group stays transparent. The position, not the
+    name, identifies the value.
+    """
+
+    transparent = set()
+    for index in range(1, before):
+        if tokens[index - 1] == "!" and tokens[index] in {"(", "[", "{"}:
+            closing = {"(": ")", "[": "]", "{": "}"}[tokens[index]]
+            close = _paired(tokens, index, tokens[index], closing)
+            transparent.update(i for i in range(index, close + 1) if tokens[i] in {"{", "}"})
+    nested = 0
+    for index in range(before - 1, -1, -1):
+        if index in transparent:
+            continue
+        if tokens[index] == "}":
+            nested += 1
+            continue
+        if tokens[index] == "{":
+            nested = max(nested - 1, 0)
+            continue
+        cursor = index + 2 if tokens[index + 1:index + 2] == ["mut"] else index + 1
+        if nested or tokens[index] != "let" or tokens[cursor:cursor + 1] != [name]:
+            continue
+        rhs = tokens[cursor + 1:cursor + 4]
+        if len(rhs) == 3 and rhs[0] == "=" and rhs[1].isidentifier() and rhs[2] == ";":
+            name = rhs[1]
+            continue
+        return name, index
+    return name, None
+
+
+def _conjunction(tokens: list[str]) -> list[str] | None:
+    """Identifiers of a pure `a && b && …` expression, otherwise None."""
+
+    terms = tokens[0::2]
+    if not tokens or any(token != "&&" for token in tokens[1::2]):
+        return None
+    if len(tokens) % 2 == 0 or not all(term.isidentifier() for term in terms):
+        return None
+    return terms
 
 
 def _simple_aliases(
-    tokens: list[str], seeds: dict[str, str] | None = None
+    tokens: list[str], seeds: dict[str, str] | None = None, receiver: str = "self"
 ) -> dict[str, str]:
     aliases: dict[str, str] = dict(seeds or {})
     fields = {"lifecycle", "transport", "agent_host", "assembly", "data_plane"}
@@ -232,7 +283,7 @@ def _simple_aliases(
             resources = {
                 rhs[pos + 2]
                 for pos in range(len(rhs) - 2)
-                if rhs[pos:pos + 2] == ["self", "."] and rhs[pos + 2] in fields
+                if rhs[pos:pos + 2] == [receiver, "."] and rhs[pos + 2] in fields
             }
             if rhs == ["crate", "::", "cancel", "::", "SHUTDOWN_DEADLINE"]:
                 resources.add("shared_shutdown_deadline")
@@ -279,54 +330,11 @@ def _value_aliases(tokens: list[str], seeds: dict[str, str]) -> dict[str, str]:
     return aliases
 
 
-def _stage_aliases(tokens: list[str]) -> dict[str, str]:
-    """Track async stage bindings and simple aliases with lexical shadowing."""
-
-    aliases: dict[str, str] = {}
-    index = 0
-    while index < len(tokens):
-        if tokens[index] != "let":
-            index += 1
-            continue
-        cursor = index + 1
-        if cursor < len(tokens) and tokens[cursor] == "mut":
-            cursor += 1
-        if cursor >= len(tokens) or not tokens[cursor].isidentifier():
-            index += 1
-            continue
-        name = tokens[cursor]
-        try:
-            equals = tokens.index("=", cursor + 1)
-        except ValueError:
-            aliases.pop(name, None)
-            break
-        rhs = equals + 1
-        if rhs < len(tokens) and tokens[rhs] == "async":
-            opening = rhs + 1
-            if opening < len(tokens) and tokens[opening] == "move":
-                opening += 1
-            if opening < len(tokens) and tokens[opening] == "{":
-                closing = _paired(tokens, opening, "{", "}")
-                aliases[name] = name
-                index = closing + 1
-                continue
-        try:
-            end = tokens.index(";", rhs)
-        except ValueError:
-            aliases.pop(name, None)
-            break
-        expression = tokens[rhs:end]
-        if len(expression) == 1 and expression[0] in aliases:
-            aliases[name] = aliases[expression[0]]
-        else:
-            aliases.pop(name, None)
-        index = end + 1
-    return aliases
-
-
-def _receiver_resource(tokens: list[str], method_at: int, aliases: dict[str, str]) -> str | None:
+def _receiver_resource(
+    tokens: list[str], method_at: int, aliases: dict[str, str], receiver: str
+) -> str | None:
     if method_at >= 4 and tokens[method_at - 4:method_at] == [
-        "self",
+        receiver,
         ".",
         tokens[method_at - 2],
         ".",
@@ -338,33 +346,13 @@ def _receiver_resource(tokens: list[str], method_at: int, aliases: dict[str, str
 
 
 def _method_calls(
-    tokens: list[str], method: str, aliases: dict[str, str]
+    tokens: list[str], method: str, aliases: dict[str, str], receiver: str
 ) -> list[tuple[int, str | None]]:
     return [
-        (index, _receiver_resource(tokens, index, aliases))
+        (index, _receiver_resource(tokens, index, aliases, receiver))
         for index, token in enumerate(tokens)
         if token == method and index + 1 < len(tokens) and tokens[index + 1] == "("
     ]
-
-
-def _assigned_async_blocks(tokens: list[str]) -> dict[str, list[str]]:
-    blocks: dict[str, list[str]] = {}
-    for index in range(len(tokens) - 4):
-        if tokens[index] != "let":
-            continue
-        cursor = index + 1
-        if tokens[cursor] == "mut":
-            cursor += 1
-        if not tokens[cursor].isidentifier() or tokens[cursor + 1:cursor + 3] != ["=", "async"]:
-            continue
-        opening = cursor + 3
-        if tokens[opening] == "move":
-            opening += 1
-        if tokens[opening] != "{":
-            continue
-        closing = _paired(tokens, opening, "{", "}")
-        blocks[tokens[cursor]] = tokens[opening + 1:closing]
-    return blocks
 
 
 def _call_arguments(tokens: list[str], marker: tuple[str, ...], label: str) -> list[list[str]]:
@@ -397,25 +385,8 @@ def _strip_parentheses(tokens: list[str]) -> list[str]:
     return result
 
 
-def _check_database_future(tokens: list[str], aliases: dict[str, str]) -> None:
-    depths = _brace_depths(tokens)
-    matches = [
-        index for index, token in enumerate(tokens) if token == "match" and depths[index] == 0
-    ]
-    if len(matches) != 1:
-        raise GuardError("database stage must retain one top-level owner match")
-    match_at = matches[0]
-    try:
-        match_open = tokens.index("{", match_at + 1)
-    except ValueError as error:
-        raise GuardError("database owner match has no body") from error
-    scrutinee = _strip_parentheses(tokens[match_at + 1:match_open])
-    if len(scrutinee) != 1 or aliases.get(scrutinee[0]) != "data_plane":
-        raise GuardError("database match no longer consumes the trusted data-plane owner")
-    match_close = _paired(tokens, match_open, "{", "}")
-    if match_close != len(tokens) - 1:
-        raise GuardError("database owner match is not the stage's final result expression")
-    arms = _split_arguments(tokens[match_open + 1:match_close])
+def _check_database_arms(arm_tokens: list[str]) -> None:
+    arms = _split_arguments(arm_tokens)
     if len(arms) != 2:
         raise GuardError("database owner match must retain exactly Some and None branches")
 
@@ -629,44 +600,9 @@ def _check_helper(tokens: list[str]) -> HelperShape:
     return shape
 
 
-def check_source(source: str) -> None:
-    tokens = _tokens(source)
-    helper = _check_helper(tokens)
-    shutdown = _impl_shutdown(tokens)
-    blocks = _assigned_async_blocks(shutdown)
-    resource_aliases = _simple_aliases(shutdown)
-    stage_aliases = _stage_aliases(shutdown)
-    helper_arguments = _call_arguments(
-        shutdown,
-        ("finish_shutdown_stages", "("),
-        "production owner finish_shutdown_stages call",
-    )
-    if len(helper_arguments) != 3:
-        raise GuardError("production owner must pass two stages and one shared deadline")
-    if len(helper_arguments[0]) != 1 or len(helper_arguments[1]) != 1:
-        raise GuardError("production owner stage futures must remain explicit local owners")
-    non_database_name = stage_aliases.get(helper_arguments[0][0])
-    database_name = stage_aliases.get(helper_arguments[1][0])
-    if non_database_name not in blocks or database_name not in blocks:
-        raise GuardError("production owner no longer passes its local stage futures")
-    deadline_is_direct = helper_arguments[2] == [
-        "crate",
-        "::",
-        "cancel",
-        "::",
-        "SHUTDOWN_DEADLINE",
-    ]
-    deadline_is_alias = (
-        len(helper_arguments[2]) == 1
-        and resource_aliases.get(helper_arguments[2][0]) == "shared_shutdown_deadline"
-    )
-    if not deadline_is_direct and not deadline_is_alias:
-        raise GuardError("production owner lost the shared shutdown deadline")
-    if helper.non_database_parameter == helper.database_parameter:
-        raise GuardError("finish_shutdown_stages stage parameters collapsed")
+def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) -> None:
+    """Four concurrent stops; the stage result is the transport deadline result."""
 
-    non_database = blocks[non_database_name]
-    database = blocks[database_name]
     join_at = _unique(
         non_database,
         ("tokio", "::", "join", "!", "("),
@@ -685,30 +621,8 @@ def check_source(source: str) -> None:
         or "||" in non_database[:join_close]
     ):
         raise GuardError("a concurrent stop branch is statically unreachable")
-
-    authority_calls = [
-        index
-        for index, resource in _method_calls(
-            non_database[:join_at], "shutdown_authority", resource_aliases
-        )
-        if resource == "lifecycle"
-    ]
-    if len(authority_calls) != 1:
-        raise GuardError("authority must be revoked exactly once before concurrent shutdown")
-    authority_call = authority_calls[0]
-    if _brace_depths(non_database[:join_at])[authority_call] != 0:
-        raise GuardError("authority revocation became conditional")
-    authority_close = _paired(non_database, authority_call + 1, "(", ")")
-    if non_database[authority_close + 1:authority_close + 5] != [".", "is_ok", "(", ")"]:
-        raise GuardError("authority revocation result is no longer checked")
-    authority_result = None
-    for index in range(authority_call - 1, -1, -1):
-        if non_database[index] == "let" and non_database[index + 1].isidentifier():
-            if "=" in non_database[index + 2:authority_call]:
-                authority_result = non_database[index + 1]
-                break
-    if authority_result is None:
-        raise GuardError("authority revocation result binding is missing")
+    if "data_plane" in non_database:
+        raise GuardError("the data-plane owner moved into the deadline-limited non-database stage")
 
     expected = {
         ("transport", "shutdown"),
@@ -720,7 +634,7 @@ def check_source(source: str) -> None:
     resource_arms: dict[tuple[str, str], int] = {}
     for arm_index, argument in enumerate(join_arguments):
         for method in {"shutdown", "stop", "wait_local_confirmation_stopped"}:
-            for call_at, resource in _method_calls(argument, method, resource_aliases):
+            for call_at, resource in _method_calls(argument, method, aliases, "owner"):
                 pair = (resource or "", method)
                 if pair in expected:
                     if pair in observed:
@@ -773,67 +687,313 @@ def check_source(source: str) -> None:
     result_patterns = _split_arguments(non_database[let_at + 2:pattern_close])
     if len(result_patterns) != len(join_arguments):
         raise GuardError("tokio::join result tuple no longer matches its branches")
-    transport_arm = resource_arms[("transport", "shutdown")]
-    transport_pattern = result_patterns[transport_arm]
+    transport_pattern = result_patterns[resource_arms[("transport", "shutdown")]]
     if len(transport_pattern) != 1 or not transport_pattern[0].isidentifier():
         raise GuardError("transport shutdown result is no longer retained")
     transport_result = transport_pattern[0]
     after_join = non_database[join_close + 1:]
-    result_aliases = {authority_result: "authority_result"}
-    for index, token in enumerate(after_join):
-        if token != "let" or index + 3 >= len(after_join):
-            continue
-        name = after_join[index + 1]
-        if not name.isidentifier():
-            continue
-        try:
-            equals = after_join.index("=", index + 2)
-            end = after_join.index(";", equals + 1)
-        except ValueError:
-            continue
-        rhs = after_join[equals + 1:end]
-        if rhs == [transport_result, ".", "within_deadline"]:
-            result_aliases[name] = "transport_result"
-        elif len(rhs) == 1 and rhs[0] in result_aliases:
-            result_aliases[name] = result_aliases[rhs[0]]
     final_start = max(
         (index + 1 for index, token in enumerate(after_join) if token == ";"),
         default=0,
     )
-    final_expression = after_join[final_start:]
-    final_expression = _strip_parentheses(final_expression)
-    normalized_final = [
-        result_aliases.get(token, token) if token.isidentifier() else token
-        for token in final_expression
-    ]
-    direct_transport = [transport_result, ".", "within_deadline"]
-    collapsed: list[str] = []
-    index = 0
-    while index < len(normalized_final):
-        if normalized_final[index:index + 3] == direct_transport:
-            collapsed.append("transport_result")
-            index += 3
-        else:
-            collapsed.append(normalized_final[index])
-            index += 1
-    normalized_final = collapsed
-    if normalized_final not in [
-        ["authority_result", "&&", "transport_result"],
-        ["transport_result", "&&", "authority_result"],
-    ]:
-        raise GuardError("authority and transport results no longer gate non-database success")
+    transport_value = [transport_result, ".", "within_deadline"]
+    final = _strip_parentheses(after_join[final_start:])
+    used_at = final_start
+    if len(final) == 1:
+        origin, let_at = _origin(after_join, final[0], final_start)
+        if let_at is not None and _matches(
+            after_join, let_at, ("let", origin, "=", *transport_value, ";")
+        ):
+            final, used_at = transport_value, let_at
+    if final != transport_value or _origin(after_join, transport_result, used_at) != (
+        transport_result,
+        None,
+    ):
+        raise GuardError("the transport deadline result no longer gates non-database success")
 
-    _check_database_future(database, resource_aliases)
 
-    helper_call_at = _unique(
-        shutdown,
-        ("finish_shutdown_stages", "("),
-        "production owner finish_shutdown_stages call",
+# `#[cfg(all(feature = "…", feature = "…", target_os = "…"))]` after literal blanking: the
+# armed normal-exit capture gate (desktop-launcher, postgres-maintenance, macOS).
+CAPTURE_CFG = (
+    "#", "[", "cfg", "(", "all", "(", "feature", "=", ",", "feature", "=", ",",
+    "target_os", "=", ")", ")", "]",
+)
+CAPTURE_BRANCH = (
+    *CAPTURE_CFG, "if", "let", "Some", "(", "ready", ")", "=",
+    "job", ".", "normal_ready", ".", "take", "(", ")", "{",
+)
+
+
+def _without_capture_branch(run: list[str]) -> list[str]:
+    """Remove the one cfg-gated armed capture branch that precedes the ordinary staged path.
+
+    The branch must be the first statement, hand the original job to the reviewed capture entry
+    exactly once and end the job itself; the ordinary path after it is checked unchanged.
+    """
+
+    if not _matches(run, 0, CAPTURE_BRANCH):
+        raise GuardError("armed capture branch is not the first cfg-gated job statement")
+    close = _paired(run, len(CAPTURE_BRANCH) - 1, "{", "}")
+    branch = run[len(CAPTURE_BRANCH):close]
+    entry = (
+        "capture", "::", "run_normal_exit_capture", "(", "&", "mut", "job", ",", "ready", ")",
     )
-    helper_call_open = helper_call_at + 1
-    helper_call_close = _paired(shutdown, helper_call_open, "(", ")")
-    if shutdown[helper_call_close + 1:helper_call_close + 3] != [".", "await"]:
-        raise GuardError("production owner does not await the staged shutdown helper")
+    if len(_find_all(branch, entry)) != 1 or branch[-2:] != ["return", ";"]:
+        raise GuardError("armed capture branch no longer owns the job through one capture entry")
+    return run[close + 1:]
+
+
+def _check_owner_closing(tokens: list[str]) -> None:
+    """The production owner hands itself to one spawned, staged closing job."""
+
+    implementation = _block_after(
+        tokens,
+        ("impl", "RuntimeShutdownOwner", "for", "DesktopLocalBackgroundOwner"),
+        "production DesktopLocalBackgroundOwner RuntimeShutdownOwner impl",
+    )
+    start_closing = _block_after(
+        implementation,
+        ("fn", "start_closing", "("),
+        "production DesktopLocalBackgroundOwner::start_closing",
+    )
+    if (
+        start_closing[:2] != ["start_owned_local_closing_job", "("]
+        or _paired(start_closing, 1, "(", ")") != len(start_closing) - 1
+        or [argument[:1] for argument in _split_arguments(start_closing[2:-1])]
+        != [["self"], ["completion"]]
+    ):
+        raise GuardError("production owner no longer hands itself to the owned closing job")
+
+    # Starter: shared deadline, unconditional checked authority revocation, then one spawn.
+    start = _block_after(
+        tokens, ("fn", "start_owned_local_closing_job", "("), "owned closing job starter"
+    )
+    start_depths = _brace_depths(start)
+    started_at = _unique(
+        start, ("let", "started", "=", "Instant", "::", "now", "(", ")", ";"), "closing start"
+    )
+    deadline_at = _unique(
+        start,
+        ("let", "deadline", "=", "started", "+", "crate", "::", "cancel", "::",
+         "SHUTDOWN_DEADLINE", ";"),
+        "shared shutdown deadline",
+    )
+    if (
+        start_depths[started_at] != 0
+        or start_depths[deadline_at] != 0
+        or _origin(start, "started", deadline_at) != ("started", started_at)
+    ):
+        raise GuardError("owned closing job lost the shared shutdown deadline")
+    authority_calls = [
+        index
+        for index, resource in _method_calls(
+            start, "shutdown_authority", _simple_aliases(start, receiver="owner"), "owner"
+        )
+        if resource == "lifecycle"
+    ]
+    if len(authority_calls) != 1:
+        raise GuardError("authority must be revoked exactly once before concurrent shutdown")
+    authority_call = authority_calls[0]
+    if start_depths[authority_call] != 0:
+        raise GuardError("authority revocation became conditional")
+    authority_close = _paired(start, authority_call + 1, "(", ")")
+    if start[authority_close + 1:authority_close + 5] != [".", "is_ok", "(", ")"]:
+        raise GuardError("authority revocation result is no longer checked")
+    authority_binding = _binding(start, authority_call)
+    if authority_binding is None:
+        raise GuardError("authority revocation result binding is missing")
+    # Only an armed normal-exit capture skips revocation; it persists Intent first and its own
+    # job revokes nothing else. Without the capture gate the flag is the literal false.
+    authority_statement = start[authority_binding[1]:start.index(";", authority_call) + 1]
+    capturing_flags = [
+        start[max(at for at in range(index) if start[at] == "#"):start.index(";", index) + 1]
+        for index in _find_all(start, ("let", "capturing", "="))
+    ]
+    if authority_statement[3:5] != ["capturing", "||"] or capturing_flags != [
+        [*CAPTURE_CFG, "let", "capturing", "=", "normal_ready", ".", "is_some", "(", ")", "&&",
+         "owner", ".", "capture_armed", ".", "is_some", "(", ")", ";"],
+        ["#", "[", "cfg", "(", "not", *CAPTURE_CFG[3:-1], ")", "]",
+         "let", "capturing", "=", "false", ";"],
+    ]:
+        raise GuardError("authority revocation is skipped outside the armed capture gate")
+    spawn_at = _unique(
+        start, ("spawn", "(", "run_owned_local_closing_job", "("), "owned closing job spawn"
+    )
+    if start_depths[spawn_at] != 0 or spawn_at < authority_call:
+        raise GuardError("owned closing job is not spawned once after authority revocation")
+    spawned = _call_arguments(
+        start, ("run_owned_local_closing_job", "("), "owned closing job spawn argument"
+    )
+    literal_at = _unique(start, ("DesktopLocalClosingJob", "{"), "owned closing job literal")
+    job_binding = _binding(start, literal_at)
+    if len(spawned) != 1 or job_binding is None or spawned[0] != [job_binding[0]]:
+        raise GuardError("spawned closing job is not the reviewed owner literal")
+    literal_close = _paired(start, literal_at + 1, "{", "}")
+    fields = {
+        (field[0] if len(field) > 1 and field[1] == ":" else field[-1]): (
+            field[2:] if len(field) > 1 and field[1] == ":" else field
+        )
+        for field in _split_arguments(start[literal_at + 2:literal_close])
+    }
+    deadline_field = fields.get("deadline", [])
+    if (
+        fields.get("owner") != ["Some", "(", "owner", ")"]
+        or len(deadline_field) != 1
+        or _origin(start, deadline_field[0], literal_at) != ("deadline", deadline_at)
+    ):
+        raise GuardError("owned closing job no longer carries the owner and shared deadline")
+    if authority_binding not in {
+        _origin(start, term, literal_at)
+        for term in _conjunction(fields.get("startup_ok", [])) or []
+    }:
+        raise GuardError("authority revocation result no longer gates shutdown success")
+
+    # Job: deadline-bounded non-database stage, then the independent database stage.
+    run = _without_capture_branch(
+        _block_after(
+            tokens, ("async", "fn", "run_owned_local_closing_job", "("), "owned closing job"
+        )
+    )
+    depths = _brace_depths(run)
+    pattern_at = _unique(run, ("let", "DesktopLocalClosingJob", "{"), "owned job destructuring")
+    pattern_close = _paired(run, pattern_at + 2, "{", "}")
+    bound = {field[-1] for field in _split_arguments(run[pattern_at + 3:pattern_close])}
+    if not {"owner", "deadline", "startup_ok", "completion", "reply"} <= bound:
+        raise GuardError("owned closing job no longer destructures its reviewed fields")
+    aliases = _simple_aliases(run, receiver="owner")
+
+    timeout_at = _unique(
+        run, ("tokio", "::", "time", "::", "timeout_at", "("), "non-database timeout"
+    )
+    timeout_close = _paired(run, timeout_at + 5, "(", ")")
+    timeout_arguments = _split_arguments(run[timeout_at + 6:timeout_close])
+    if (
+        len(timeout_arguments) != 2
+        or timeout_arguments[0][:8]
+        != ["tokio", "::", "time", "::", "Instant", "::", "from_std", "("]
+        or len(timeout_arguments[0]) != 10
+        or timeout_arguments[0][9] != ")"
+        or _origin(run, timeout_arguments[0][8], timeout_at) != ("deadline", None)
+    ):
+        raise GuardError("non-database timeout no longer uses the shared closing deadline")
+    stage, stage_at = (
+        _origin(run, timeout_arguments[1][0], timeout_at)
+        if len(timeout_arguments[1]) == 1
+        else ("", None)
+    )
+    if stage_at is None or depths[stage_at] != 0 or run[stage_at + 1:stage_at + 4] != [
+        stage, "=", "async",
+    ]:
+        raise GuardError("non-database stage no longer runs inside the reviewed timeout")
+    stage_open = stage_at + 5 if run[stage_at + 4] == "move" else stage_at + 4
+    if run[stage_open] != "{":
+        raise GuardError("non-database stage no longer runs inside the reviewed timeout")
+    _check_non_database_stage(
+        run[stage_open + 1:_paired(run, stage_open, "{", "}")], aliases
+    )
+
+    joins = [
+        index
+        for index in _find_all(run, ("tokio", "::", "join", "!", "("))
+        if depths[index] == 0
+    ]
+    if len(joins) != 1:
+        raise GuardError("non-database timeout must be polled by one top-level join")
+    join_open = joins[0] + 4
+    join_close = _paired(run, join_open, "(", ")")
+    if _split_arguments(run[join_open + 1:join_close])[0] != run[timeout_at:timeout_close + 1]:
+        raise GuardError("non-database timeout is not polled by the top-level join")
+    let_at = max(index for index in range(joins[0]) if run[index] == "let")
+    if run[let_at + 1] != "(" or not run[let_at + 2].isidentifier() or run[let_at + 3] != ",":
+        raise GuardError("non-database timeout result is not retained")
+    timeout_result = run[let_at + 2]
+    match_at = _unique(run, ("match", timeout_result, "{"), "non-database timeout match")
+    if depths[match_at] != 0:
+        raise GuardError("non-database timeout projection left the top-level scope")
+    if any(
+        run[index] == "let"
+        and run[index + 2 if run[index + 1] == "mut" else index + 1] == timeout_result
+        for index in range(let_at + 1, match_at)
+    ):
+        raise GuardError("non-database timeout result is rebound before its projection")
+    match_close = _paired(run, match_at + 2, "{", "}")
+    observed_arms: dict[tuple[str, ...], str] = {}
+    for pattern, arm_body in _match_arms(run[match_at + 3:match_close]):
+        if not arm_body or pattern in observed_arms:
+            raise GuardError("non-database timeout match arm shape drift")
+        observed_arms[pattern] = arm_body[-1]
+    if observed_arms != {
+        ("Ok", "(", "true", ")"): "true",
+        ("Ok", "(", "false", ")"): "false",
+        ("Err", "(", "_", ")"): "false",
+    }:
+        raise GuardError("non-database timeout success/failure projection drift")
+    non_database_ok = _binding(run, match_at)
+
+    plane = ("owner", ".", "data_plane", ".", "take", "(", ")")
+    database_matches = []
+    for index, token in enumerate(run):
+        if token != "match" or depths[index] != 0:
+            continue
+        scrutinee = _strip_parentheses(run[index + 1:run.index("{", index + 1)])
+        if len(scrutinee) == 1:
+            origin, let_at = _origin(run, scrutinee[0], index)
+            if let_at is None or not _matches(run, let_at, ("let", origin, "=", *plane, ";")):
+                continue
+        elif tuple(scrutinee) != plane:
+            continue
+        database_matches.append(index)
+    if len(database_matches) != 1:
+        raise GuardError("database stage must retain one top-level data-plane owner match")
+    database_at = database_matches[0]
+    if database_at <= join_close:
+        raise GuardError("database shutdown ran before the non-database stage completed")
+    if depths[database_at] != 0:
+        raise GuardError("database shutdown became conditional on a prior stage")
+    if any(token in {"return", "break", "continue", "?", "panic"} for token in run[:database_at]):
+        raise GuardError("an early exit can skip the independent database shutdown stage")
+    database_open = run.index("{", database_at + 1)
+    database_close = _paired(run, database_open, "{", "}")
+    _check_database_arms(run[database_open + 1:database_close])
+    database_ok = _binding(run, database_at)
+
+    finish_at = _unique(run, ("completion", ".", "finish", "("), "shutdown completion")
+    finish = _call_arguments(run, ("completion", ".", "finish", "("), "shutdown completion")
+    terms = _conjunction(finish[0]) if len(finish) == 1 else None
+    if terms is None or not {("startup_ok", None), non_database_ok, database_ok} <= {
+        _origin(run, term, finish_at) for term in terms
+    }:
+        raise GuardError("shutdown success must require every stage result")
+    succeeded = (_binding(run, finish_at) or ("", 0))[0]
+    reply = _call_arguments(run, ("reply", ".", "send", "("), "shutdown reply")
+    if not succeeded or reply != [[
+        "if", succeeded, "{", "Ok", "(", "(", ")", ")", "}",
+        "else", "{", "Err", "(", "DesktopLocalRuntimeError", "::", "Shutdown", ")", "}",
+    ]]:
+        raise GuardError("stage failure no longer returns DesktopLocalRuntimeError::Shutdown")
+
+    completion_impl = _block_after(
+        tokens, ("impl", "ShutdownCompletion"), "ShutdownCompletion impl"
+    )
+    completion_finish = _block_after(
+        completion_impl, ("fn", "finish", "("), "ShutdownCompletion::finish"
+    )
+    if completion_finish[-1:] != ["succeeded"] or any(
+        completion_finish[index + 3:completion_finish.index(";", index)][:2]
+        != ["succeeded", "&&"]
+        or len(completion_finish[index + 3:completion_finish.index(";", index)]) != 3
+        for index in _find_all(completion_finish, ("let", "succeeded", "="))
+    ):
+        raise GuardError("shutdown completion can widen a failed stage result")
+
+
+def check_source(source: str) -> None:
+    tokens = _tokens(source)
+    # Startup-failure cleanup still stages through the reviewed helper.
+    helper = _check_helper(tokens)
+    if helper.non_database_parameter == helper.database_parameter:
+        raise GuardError("finish_shutdown_stages stage parameters collapsed")
+    _check_owner_closing(tokens)
 
 
 def main(argv: list[str]) -> int:

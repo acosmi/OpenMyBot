@@ -1491,7 +1491,7 @@ notes = "owner=security; G4 Batch 11 RMCP delta reviewed, not a full source audi
 [[exemptions.tokio-tungstenite]]
 version = "0.29.0"
 criteria = "safe-to-deploy"
-notes = "owner=security; G3 R67 Axum WebSocket delta reviewed, not a full source audit; authenticated same-origin read-only thread stream with 1KiB inbound cap; exact version only; external security audit remains required"
+notes = "owner=security; G3 R67 Axum WebSocket delta reviewed, not a full source audit; authenticated same-origin read-only thread stream with 1KiB inbound cap; channel-connector client handshake and framing run only over SafeDialer::connect_websocket_stream verified streams with TLS from SafeDialer rustls, no tokio-tungstenite TLS feature; exact version only; external security audit remains required"
 
 [[exemptions.tokio-util]]
 version = "0.7.19"
@@ -1545,7 +1545,7 @@ notes = "owner=security; W-7 R29 delta reviewed, not a full source audit; exact 
 [[exemptions.tungstenite]]
 version = "0.29.0"
 criteria = "safe-to-deploy"
-notes = "owner=security; G3 R67 Axum WebSocket delta reviewed, not a full source audit; no TLS/client credential path in production handler; exact version only; external security audit remains required"
+notes = "owner=security; G3 R67 Axum WebSocket delta reviewed, not a full source audit; no TLS/client credential path in production handler; channel-connector client handshake and framing run only over SafeDialer::connect_websocket_stream verified streams with TLS from SafeDialer rustls, no tokio-tungstenite TLS feature; exact version only; external security audit remains required"
 
 [[exemptions.typed-arena]]
 version = "2.0.2"

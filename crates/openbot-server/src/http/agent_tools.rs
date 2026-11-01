@@ -84,6 +84,10 @@ pub async fn call(
         .invoke_callback(authorization, tool_name, arguments)
         .await
         .map_err(|error| match error {
+            AgentToolInvokeError::DelegationNotCurrent => AppError::PolicyRefused {
+                rule: "delegation_not_current".to_owned(),
+                decision: None,
+            },
             AgentToolInvokeError::Unavailable => AppError::DependencyUnavailable {
                 dependency: "remote_callback_executor",
             },

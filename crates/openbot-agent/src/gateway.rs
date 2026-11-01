@@ -86,6 +86,9 @@ impl core::fmt::Debug for AgentToolReply {
 /// Tool invocation cannot safely become another provider sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AgentToolInvokeError {
+    /// Delegated authority was revoked before this effect began.
+    #[error("delegation_not_current")]
+    DelegationNotCurrent,
     /// Auth/application/tool dependency is unavailable or the current scope was revoked.
     #[error("agent_tool_unavailable")]
     Unavailable,
@@ -377,6 +380,7 @@ impl AgentToolGateway {
                 | AppReply::ThreadStatus(_)
                 | AppReply::ThreadRunStarted(_)
                 | AppReply::ThreadRunCancellation(_)
+                | AppReply::ThreadHistoryDeletion(_)
                 | AppReply::RunReconciliation(_)
                 | AppReply::RunEffectReceipts(_)
                 | AppReply::ThreadHistory(_)
@@ -498,11 +502,12 @@ impl AuthorizedAgentToolGateway {
         arguments: Value,
         cancellation: Option<ToolExecutionCancellation>,
     ) -> Result<AgentToolReply, AgentToolInvokeError> {
-        let auth = self
-            .authorization
-            .load(lease)
-            .await
-            .map_err(|_| AgentToolInvokeError::Unavailable)?;
+        let auth = self.authorization.load(lease).await.map_err(|e| match e {
+            openbot_application::AgentAuthorizationError::DelegationNotCurrent => {
+                AgentToolInvokeError::DelegationNotCurrent
+            }
+            _ => AgentToolInvokeError::Unavailable,
+        })?;
         if let Some(result) = self
             .invoke_human_component(auth.clone(), lease, provider_call_id, tool_name, &arguments)
             .await
@@ -581,6 +586,9 @@ impl AuthorizedAgentToolGateway {
                 None => Err(AgentToolInvokeError::Unavailable),
             },
             Ok(_) => Err(AgentToolInvokeError::Unavailable),
+            Err(AppError::PolicyRefused { rule, .. }) if rule == "delegation_not_current" => {
+                Err(AgentToolInvokeError::DelegationNotCurrent)
+            }
             Err(AppError::MalformedPayload { .. }) => Ok(normalized_error_reply(
                 call_id,
                 "invalid_arguments",
@@ -659,6 +667,9 @@ impl AuthorizedAgentToolGateway {
                 }
             }
             Ok(_) => Err(AgentToolInvokeError::Unavailable),
+            Err(AppError::PolicyRefused { rule, .. }) if rule == "delegation_not_current" => {
+                Err(AgentToolInvokeError::DelegationNotCurrent)
+            }
             Err(AppError::MalformedPayload { .. }) => Ok(normalized_error_reply(
                 call_id,
                 "invalid_arguments",
@@ -725,6 +736,9 @@ impl AuthorizedAgentToolGateway {
                 None => Err(AgentToolInvokeError::Unavailable),
             },
             Ok(_) => Err(AgentToolInvokeError::Unavailable),
+            Err(AppError::PolicyRefused { rule, .. }) if rule == "delegation_not_current" => {
+                Err(AgentToolInvokeError::DelegationNotCurrent)
+            }
             Err(AppError::MalformedPayload { .. }) => Ok(normalized_error_reply(
                 call_id,
                 "invalid_arguments",
@@ -842,6 +856,9 @@ fn map_application_reply(
                     .then(|| "tool_not_committed".to_owned())
             }),
         }),
+        Err(AppError::PolicyRefused { rule, .. }) if rule == "delegation_not_current" => {
+            Err(AgentToolInvokeError::DelegationNotCurrent)
+        }
         Err(AppError::PolicyRefused { .. }) => Ok(normalized_error_reply(
             call_id,
             "policy_refused",

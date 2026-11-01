@@ -25,8 +25,10 @@ source=$(awk '/^mod tests \{/{exit} {print}' crates/openbot-desktop/src/tauri_ba
   || fail "Desktop app-data preference adapter count drift"
 [[ $(rg -c 'start_desktop_agent_host\(' <<<"$source") == 1 ]] \
   || fail "Desktop Agent host start count drift"
+[[ $(rg -c 'PostgresUiPreferenceAdministration::new\(' <<<"$source") == 1 ]] \
+  || fail "Desktop PostgreSQL preference authority count drift"
 
-for forbidden in 'std::env' 'PostgresUiPreferenceAdministration' 'server-sso' 'axum::' 'TcpListener' 'ServerBuilder'; do
+for forbidden in 'std::env' 'server-sso' 'axum::' 'TcpListener' 'ServerBuilder'; do
   if rg -n "$forbidden" <<<"$source" >/dev/null; then
     fail "background owner gained forbidden dependency: $forbidden"
   fi
@@ -40,7 +42,7 @@ line_of() {
 
 prepared_line=$(line_of 'prepare_desktop_local_runtime\(app_data_root, config\)\.await')
 slot_line=$(line_of 'setup_slot\.install')
-owner_line=$(line_of '\.install_owner\(')
+owner_line=$(line_of '\.install_owner\(&mut owner, Arc::clone\(&lifecycle\)\)')
 window_line=$(line_of 'let window = lifecycle\.create_verified_window')
 [[ $prepared_line -lt $slot_line && $slot_line -lt $owner_line && $owner_line -lt $window_line ]] \
   || fail "prepare→protocol→owner→window order drift"

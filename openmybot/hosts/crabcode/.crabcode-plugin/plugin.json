@@ -1,0 +1,13 @@
+{
+  "name": "openmybot",
+  "version": "0.0.0",
+  "description": "Start, inspect, cancel and fetch background runs of the local OpenMyBot daemon.",
+  "mcpServers": {
+    "openmybot": {
+      "command": "openmybot",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

@@ -26,6 +26,9 @@ use crate::artifact_bytes::{
 use crate::artifact_read_lifecycle::ReadOperationState;
 use crate::artifact_registry::ArtifactDatasetRegistry;
 
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub mod capture;
+
 mod read_barrier;
 pub use read_barrier::{ArtifactReadControlledBarrier, ArtifactReadControlledDrainAck};
 pub(crate) use read_barrier::{
@@ -264,8 +267,20 @@ struct StoreMarker {
     store_id: String,
 }
 
+/// The root descriptor once `prepare_root` holds its kernel owner lock.
+struct LockedRoot(File);
+
+impl Drop for LockedRoot {
+    fn drop(&mut self) {
+        // Closing the fd alone keeps the flock while a concurrently spawned child that has not
+        // reached exec holds a copy of this open file description; LOCK_UN releases it for all,
+        // so every other descriptor of this root must already be closed when this runs.
+        let _ = self.0.unlock();
+    }
+}
+
 struct PreparedRoot {
-    root: File,
+    root: LockedRoot,
     marker: StoreMarker,
     marker_bytes: Vec<u8>,
     physical: ArtifactRootPhysicalBinding,
@@ -276,7 +291,6 @@ struct PreparedRoot {
 /// per-request current checks, rather than a marker string, establish this binding.
 pub struct DatasetBoundArtifactStore {
     registry: Arc<ArtifactDatasetRegistry>,
-    root: File,
     marker_bytes: Vec<u8>,
     physical: ArtifactRootPhysicalBinding,
     store_id: Uuid,
@@ -284,6 +298,151 @@ pub struct DatasetBoundArtifactStore {
     owner: Arc<()>,
     io: Mutex<()>,
     reads: Arc<StoreReadGate>,
+    capture_mutations: Arc<CaptureMutationGate>,
+    // Declared last, after `bytes`, whose root clone shares this open file description: the
+    // clone closes first, then this field unlocks as the last holder.
+    root: LockedRoot,
+}
+
+// One gate belongs to the original Store Arc. It is armed before host publication. A
+// cancelled operation is not an ACK: its original tasks remain here and uncertainty poisons
+// capture instead of reopening the gate or silently refunding an unfinished operation.
+struct CaptureMutationGate {
+    state: Mutex<CaptureMutationState>,
+    changed: tokio::sync::Notify,
+}
+
+struct CaptureMutationState {
+    bound: Option<u64>,
+    closed: bool,
+    active: u64,
+    poisoned: bool,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+pub(crate) struct CaptureMutationLease {
+    operation: Arc<CaptureMutationOperation>,
+    completed: bool,
+}
+
+struct CaptureMutationOperation {
+    gate: Arc<CaptureMutationGate>,
+    armed: bool,
+    uncertain: std::sync::atomic::AtomicBool,
+}
+
+/// One original blocking task: Legacy holds its original JoinHandle; armed capture keeps
+/// that actual handle in its Store JoinSet and gives the caller only the result receiver.
+pub(crate) struct CaptureBlockingWorker<T> {
+    original: Option<tokio::task::JoinHandle<T>>,
+    receiver: Option<tokio::sync::oneshot::Receiver<T>>,
+    refused: bool,
+}
+impl<T> Unpin for CaptureBlockingWorker<T> {}
+impl<T> std::future::Future for CaptureBlockingWorker<T> {
+    type Output = Result<T, ArtifactStoreError>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.refused {
+            return std::task::Poll::Ready(Err(ArtifactStoreError::Busy));
+        }
+        if let Some(original) = this.original.as_mut() {
+            return std::pin::Pin::new(original)
+                .poll(cx)
+                .map(|r| r.map_err(|_| ArtifactStoreError::Unavailable));
+        }
+        match this.receiver.as_mut() {
+            Some(receiver) => std::pin::Pin::new(receiver)
+                .poll(cx)
+                .map(|r| r.map_err(|_| ArtifactStoreError::Unavailable)),
+            None => std::task::Poll::Ready(Err(ArtifactStoreError::Unavailable)),
+        }
+    }
+}
+
+impl CaptureMutationGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(CaptureMutationState {
+                bound: None,
+                closed: false,
+                active: 0,
+                poisoned: false,
+                tasks: tokio::task::JoinSet::new(),
+            }),
+            changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn enter(self: &Arc<Self>) -> Result<CaptureMutationLease, ArtifactStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ArtifactStoreError::Unavailable)?;
+        if state.closed || state.poisoned {
+            return Err(ArtifactStoreError::Busy);
+        }
+        let next = state
+            .active
+            .checked_add(1)
+            .ok_or(ArtifactStoreError::Unavailable)?;
+        if state.bound.is_some_and(|bound| next > bound) {
+            return Err(ArtifactStoreError::Busy);
+        }
+        state.active = next;
+        Ok(CaptureMutationLease {
+            operation: Arc::new(CaptureMutationOperation {
+                gate: Arc::clone(self),
+                armed: state.bound.is_some(),
+                uncertain: std::sync::atomic::AtomicBool::new(false),
+            }),
+            completed: false,
+        })
+    }
+}
+
+impl CaptureMutationLease {
+    pub(crate) fn complete(mut self) {
+        self.completed = true;
+    }
+    pub(crate) fn delegated(&self) -> Self {
+        Self {
+            operation: Arc::clone(&self.operation),
+            completed: false,
+        }
+    }
+    pub(crate) fn record_returned(&mut self) {
+        self.completed = true;
+    }
+    fn belongs_to(&self, store: &DatasetBoundArtifactStore) -> bool {
+        Arc::ptr_eq(&self.operation.gate, &store.capture_mutations) && !self.completed
+    }
+}
+impl Drop for CaptureMutationLease {
+    fn drop(&mut self) {
+        if self.operation.armed && !self.completed {
+            self.operation
+                .uncertain
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+impl Drop for CaptureMutationOperation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            if self.uncertain.load(std::sync::atomic::Ordering::Acquire) {
+                state.poisoned = true;
+            }
+            match state.active.checked_sub(1) {
+                Some(active) => state.active = active,
+                None => state.poisoned = true,
+            }
+        }
+        self.gate.changed.notify_waiters();
+    }
 }
 
 /// Borrowed only inside the original blocking worker. The std guard is deliberately !Send;
@@ -292,6 +451,17 @@ pub(crate) struct OriginalStorePhysicalIo<'store> {
     original_store: &'store DatasetBoundArtifactStore,
     original_io_guard: std::sync::MutexGuard<'store, ()>,
     original_deadline: Instant,
+    capture_lease: Option<CaptureMutationLease>,
+}
+
+impl Drop for OriginalStorePhysicalIo<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking()
+            && let Some(lease) = self.capture_lease.take()
+        {
+            lease.complete();
+        }
+    }
 }
 
 pub(crate) enum ArtifactPhysicalUnlinkError<E> {
@@ -404,18 +574,106 @@ impl core::fmt::Debug for DatasetBoundArtifactStore {
 }
 
 impl DatasetBoundArtifactStore {
-    pub(crate) fn try_physical_io_before(
+    pub(crate) fn begin_capture_mutation(
+        &self,
+    ) -> Result<CaptureMutationLease, ArtifactStoreError> {
+        self.capture_mutations.enter()
+    }
+
+    // Retain the actual original supervisor in the armed Store; Legacy keeps the original
+    // lifecycle. The caller still observes its original oneshot outcome, not a synthetic join.
+    pub(crate) fn spawn_capture_mutation(
+        &self,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ArtifactStoreError> {
+        let mut state = self
+            .capture_mutations
+            .state
+            .lock()
+            .map_err(|_| ArtifactStoreError::Unavailable)?;
+        if state.bound.is_some() {
+            while let Some(result) = state.tasks.try_join_next() {
+                if result.is_err() {
+                    state.poisoned = true;
+                }
+            }
+            if state.poisoned
+                || state
+                    .bound
+                    .is_some_and(|bound| state.tasks.len() as u64 >= bound)
+            {
+                return Err(ArtifactStoreError::Busy);
+            }
+            state.tasks.spawn(work);
+        } else {
+            tokio::spawn(work);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capture_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> CaptureBlockingWorker<T> {
+        let Ok(mut state) = self.capture_mutations.state.lock() else {
+            return CaptureBlockingWorker {
+                original: None,
+                receiver: None,
+                refused: true,
+            };
+        };
+        if state.bound.is_none() {
+            return CaptureBlockingWorker {
+                original: Some(tokio::task::spawn_blocking(work)),
+                receiver: None,
+                refused: false,
+            };
+        }
+        while let Some(result) = state.tasks.try_join_next() {
+            if result.is_err() {
+                state.poisoned = true;
+            }
+        }
+        if state.poisoned
+            || state
+                .bound
+                .is_some_and(|bound| state.tasks.len() as u64 >= bound)
+        {
+            return CaptureBlockingWorker {
+                original: None,
+                receiver: None,
+                refused: true,
+            };
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        state.tasks.spawn_blocking(move || {
+            let _ = sender.send(work());
+        });
+        CaptureBlockingWorker {
+            original: None,
+            receiver: Some(receiver),
+            refused: false,
+        }
+    }
+
+    pub(crate) fn try_physical_io_before_admitted(
         &self,
         original_deadline: Instant,
+        admitted: &CaptureMutationLease,
     ) -> Result<OriginalStorePhysicalIo<'_>, ArtifactStoreError> {
         if Instant::now() >= original_deadline {
             return Err(ArtifactStoreError::Unavailable);
         }
+        if !admitted.belongs_to(self) {
+            return Err(ArtifactStoreError::BindingMismatch);
+        }
+        let capture_lease = admitted.delegated();
         let original_io_guard = self.io.try_lock().map_err(|_| ArtifactStoreError::Busy)?;
         let original = OriginalStorePhysicalIo {
             original_store: self,
             original_io_guard,
             original_deadline,
+            capture_lease: Some(capture_lease),
         };
         original.check_original_before()?;
         Ok(original)
@@ -522,14 +780,15 @@ impl DatasetBoundArtifactStore {
         let store_id = Uuid::parse_str(&prepared.marker.store_id)
             .map_err(|_| ArtifactStoreError::BindingMismatch)?;
         tokio::task::spawn_blocking(move || {
-            if ArtifactRootPhysicalBinding::observe(&prepared.root)? != prepared.physical
-                || read_marker(&prepared.root)? != Some(prepared.marker_bytes.clone())
+            if ArtifactRootPhysicalBinding::observe(&prepared.root.0)? != prepared.physical
+                || read_marker(&prepared.root.0)? != Some(prepared.marker_bytes.clone())
             {
                 return Err(ArtifactStoreError::BindingMismatch);
             }
             let bytes = ArtifactByteStore::bind_private_root(
                 prepared
                     .root
+                    .0
                     .try_clone()
                     .map_err(|_| ArtifactStoreError::Unavailable)?,
                 policy.max_artifact_bytes(),
@@ -551,6 +810,7 @@ impl DatasetBoundArtifactStore {
                 owner: Arc::new(()),
                 io: Mutex::new(()),
                 reads,
+                capture_mutations: CaptureMutationGate::new(),
             })
         })
         .await
@@ -573,8 +833,8 @@ impl DatasetBoundArtifactStore {
             && std::ptr::eq(self.registry.pool().manager(), registry.pool().manager())
     }
     fn check_current(&self) -> Result<(), ArtifactStoreError> {
-        if ArtifactRootPhysicalBinding::observe(&self.root)? != self.physical
-            || read_marker(&self.root)? != Some(self.marker_bytes.clone())
+        if ArtifactRootPhysicalBinding::observe(&self.root.0)? != self.physical
+            || read_marker(&self.root.0)? != Some(self.marker_bytes.clone())
         {
             return Err(ArtifactStoreError::BindingMismatch);
         }
@@ -718,7 +978,7 @@ impl DatasetBoundArtifactStore {
     pub fn available_bytes(&self) -> Result<u64, ArtifactStoreError> {
         self.check_current()?;
         let space =
-            rustix::fs::fstatvfs(&self.root).map_err(|_| ArtifactStoreError::Unavailable)?;
+            rustix::fs::fstatvfs(&self.root.0).map_err(|_| ArtifactStoreError::Unavailable)?;
         space
             .f_bavail
             .checked_mul(space.f_frsize)
@@ -727,10 +987,19 @@ impl DatasetBoundArtifactStore {
 
     pub(crate) fn write_text_once(
         &self,
+        admitted: &CaptureMutationLease,
         id: Uuid,
         expected: [u8; 32],
         text: &[u8],
     ) -> VerifiedArtifactByteObservation {
+        if !admitted.belongs_to(self) {
+            return self.observation(
+                id,
+                ArtifactByteWritePhase::BeforeWrite,
+                ArtifactByteObservationState::Indeterminate,
+            );
+        }
+
         let mut phase = ArtifactByteWritePhase::BeforeWrite;
         let Ok(_guard) = self.io.lock() else {
             return self.observation(id, phase, ArtifactByteObservationState::Indeterminate);
@@ -859,7 +1128,8 @@ fn prepare_root(
 ) -> Result<PreparedRoot, ArtifactStoreError> {
     let physical = ArtifactRootPhysicalBinding::observe(&root)?;
     root.try_lock().map_err(|_| ArtifactStoreError::Busy)?;
-    let original = read_marker(&root)?;
+    let root = LockedRoot(root);
+    let original = read_marker(&root.0)?;
     let fresh_marker = original.is_none();
     let (marker, marker_bytes) = if let Some(bytes) = original {
         let marker: StoreMarker =
@@ -867,7 +1137,7 @@ fn prepare_root(
         (marker, bytes)
     } else {
         let directory =
-            rustix::fs::Dir::read_from(&root).map_err(|_| ArtifactStoreError::Unavailable)?;
+            rustix::fs::Dir::read_from(&root.0).map_err(|_| ArtifactStoreError::Unavailable)?;
         for entry in directory {
             let entry = entry.map_err(|_| ArtifactStoreError::Unavailable)?;
             if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
@@ -884,7 +1154,7 @@ fn prepare_root(
         let bytes = serde_json::to_vec(&marker).map_err(|_| ArtifactStoreError::Unavailable)?;
         let mut file = File::from(
             rustix::fs::openat(
-                &root,
+                &root.0,
                 MARKER_NAME,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
@@ -896,7 +1166,7 @@ fn prepare_root(
             .map_err(|_| ArtifactStoreError::Unavailable)?;
         rustix::fs::fchmod(&file, Mode::RUSR).map_err(|_| ArtifactStoreError::Unavailable)?;
         file.sync_all()
-            .and_then(|()| root.sync_all())
+            .and_then(|()| root.0.sync_all())
             .map_err(|_| ArtifactStoreError::Unavailable)?;
         (marker, bytes)
     };
@@ -915,8 +1185,8 @@ fn prepare_root(
         || id.get_variant() != uuid::Variant::RFC4122
         || id.to_string() != marker.store_id
         || serde_json::to_vec(&marker).map_err(|_| ArtifactStoreError::Unavailable)? != marker_bytes
-        || ArtifactRootPhysicalBinding::observe(&root)? != physical
-        || read_marker(&root)? != Some(marker_bytes.clone())
+        || ArtifactRootPhysicalBinding::observe(&root.0)? != physical
+        || read_marker(&root.0)? != Some(marker_bytes.clone())
     {
         return Err(ArtifactStoreError::BindingMismatch);
     }

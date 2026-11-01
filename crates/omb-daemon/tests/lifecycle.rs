@@ -1,0 +1,1835 @@
+//! Own disposable clusters only. Run ignored cases serially with OMB_TEST_PG_BIN_DIR set explicitly.
+use omb_daemon::{
+    CallOptions, DaemonError, DaemonOptions, ErrorClass, InitOptions, StatusOptions,
+    StatusSnapshot, call, daemon, init, status,
+};
+use rustix::process::{Pid, Signal};
+use std::{
+    cell::Cell,
+    fs,
+    io::Write,
+    os::unix::{
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        process::CommandExt,
+    },
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+
+fn private_file(path: &Path, bytes: &[u8]) {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+}
+struct Fixture {
+    root: PathBuf,
+    pg_bin: PathBuf,
+    last_pg_pid: Cell<Option<u32>>,
+}
+impl Fixture {
+    fn new() -> Self {
+        let pg_bin = std::env::var_os("OMB_TEST_PG_BIN_DIR")
+            .map(PathBuf::from)
+            .expect("explicit own PG17.11 test binary directory required");
+        assert!(pg_bin.is_absolute());
+        let mut bytes = [0; 5];
+        getrandom::fill(&mut bytes).unwrap();
+        let suffix: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let root = std::env::temp_dir().join(format!("omb{suffix}"));
+        assert!(
+            root.join("run/control.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                <= 103
+        );
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        Self {
+            root,
+            pg_bin,
+            last_pg_pid: Cell::new(None),
+        }
+    }
+    async fn initialize(&self) {
+        init(InitOptions {
+            data_dir: self.root.clone(),
+            pg_bin_dir: self.pg_bin.clone(),
+        })
+        .await
+        .unwrap();
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(self.root.join("pg/data/postgresql.conf"))
+            .unwrap();
+        config
+            .write_all(b"\ntimezone='America/Los_Angeles'\ntrack_activity_query_size=16384\n")
+            .unwrap();
+    }
+    fn spawn(&self, name: &str) -> OwnedDaemon {
+        let mut random = [0; 4];
+        getrandom::fill(&mut random).unwrap();
+        let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let out = self.root.join(format!("{suffix}.out"));
+        let err = self.root.join(format!("{suffix}.err"));
+        private_file(&out, b"");
+        private_file(&err, b"");
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--include-ignored", "--nocapture"])
+            .env_clear()
+            .env("OMB_TEST_CHILD_DATA", &self.root)
+            .env("OMB_TEST_CHILD", "daemon")
+            .env("HOME", &self.root)
+            .stdin(Stdio::null())
+            .stdout(fs::OpenOptions::new().append(true).open(&out).unwrap())
+            .stderr(fs::OpenOptions::new().append(true).open(&err).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        println!(
+            "spawn own test daemon pid={}; command=isolated lifecycle test child",
+            child.id()
+        );
+        OwnedDaemon {
+            child: Some(child),
+            out,
+            err,
+        }
+    }
+    async fn ready(&self) -> StatusSnapshot {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Ok(snapshot) = status(StatusOptions {
+                data_dir: self.root.clone(),
+            })
+            .await
+            {
+                self.last_pg_pid.set(Some(snapshot.pg_pid));
+                return snapshot;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "own daemon readiness deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    fn no_pg(&self) {
+        if let Some(pid) = self.last_pg_pid.get().and_then(|p| Pid::from_raw(p as i32)) {
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH)
+            );
+            assert_eq!(
+                rustix::process::test_kill_process_group(pid),
+                Err(rustix::io::Errno::SRCH)
+            );
+        }
+        if let Ok(text) = fs::read_to_string(self.root.join("pg/data/postmaster.pid"))
+            && let Some(pid) = text
+                .lines()
+                .next()
+                .and_then(|s| s.parse::<i32>().ok())
+                .and_then(Pid::from_raw)
+        {
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "own PostgreSQL remains alive"
+            );
+        }
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("failed owned fixture retained: {}", self.root.display());
+            return;
+        }
+        // Keep a failed fixture when a process remains, so evidence/data cannot be erased underneath it.
+        let running = fs::read_to_string(self.root.join("pg/data/postmaster.pid"))
+            .ok()
+            .and_then(|s| s.lines().next()?.parse::<i32>().ok())
+            .and_then(Pid::from_raw)
+            .is_some_and(|p| rustix::process::test_kill_process(p).is_ok());
+        if !running {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+struct OwnedDaemon {
+    child: Option<Child>,
+    out: PathBuf,
+    err: PathBuf,
+}
+impl OwnedDaemon {
+    fn pid(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+    fn signal(&self, signal: Signal) {
+        rustix::process::kill_process(Pid::from_raw(self.pid() as i32).unwrap(), signal).unwrap();
+    }
+    async fn wait(&mut self) -> i32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                let code = status.code().unwrap_or(-1);
+                self.child.take();
+                println!("own daemon exit={code}; child reaped");
+                return code;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "own daemon stop deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    async fn stop(&mut self, signal: Signal) {
+        self.signal(signal);
+        assert_eq!(self.wait().await, 0);
+    }
+    fn output(&self) -> String {
+        format!(
+            "{}{}",
+            fs::read_to_string(&self.out).unwrap(),
+            fs::read_to_string(&self.err).unwrap()
+        )
+    }
+}
+impl Drop for OwnedDaemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = rustix::process::kill_process(
+                Pid::from_raw(child.id() as i32).unwrap(),
+                Signal::TERM,
+            );
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+async fn child_entry() -> bool {
+    if std::env::var_os("OMB_TEST_CHILD").as_deref() != Some(std::ffi::OsStr::new("daemon")) {
+        return false;
+    }
+    let result = daemon(DaemonOptions {
+        data_dir: PathBuf::from(std::env::var_os("OMB_TEST_CHILD_DATA").unwrap()),
+    })
+    .await;
+    let code = match result {
+        Ok(()) => 0,
+        Err(error) => {
+            println!("{}", error.code());
+            match error.class() {
+                ErrorClass::Usage => 2,
+                ErrorClass::NotRunning => 3,
+                ErrorClass::Rejected => 4,
+                ErrorClass::Internal => 5,
+            }
+        }
+    };
+    std::process::exit(code)
+}
+async fn connect_own(
+    fixture: &Fixture,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
+    let pid = fs::read_to_string(fixture.root.join("pg/data/postmaster.pid")).unwrap();
+    let port: u16 = pid.lines().nth(3).unwrap().parse().unwrap();
+    let password = fs::read_to_string(fixture.root.join("pg/password")).unwrap();
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host("127.0.0.1")
+        .port(port)
+        .user("openmybot")
+        .password(password)
+        .dbname("openmybot")
+        .connect_timeout(Duration::from_secs(1));
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(2),
+        config.connect(tokio_postgres::NoTls),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (client, tokio::spawn(connection))
+}
+async fn close_own(
+    client: tokio_postgres::Client,
+    mut driver: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
+    drop(client);
+    match tokio::time::timeout(Duration::from_secs(5), &mut driver).await {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => {
+            driver.abort();
+            let _ = driver.await;
+            panic!("own test driver close timeout; cancelled and joined");
+        }
+    }
+}
+async fn query_own(fixture: &Fixture, query: &str) -> Vec<tokio_postgres::Row> {
+    let (client, driver) = connect_own(fixture).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), client.query(query, &[])).await;
+    close_own(client, driver).await;
+    result.unwrap().unwrap()
+}
+fn assert_private(path: &Path, mode: u32) {
+    let meta = fs::symlink_metadata(path).unwrap();
+    assert!(!meta.file_type().is_symlink());
+    assert_eq!(meta.mode() & 0o7777, mode);
+    assert_eq!(meta.uid(), rustix::process::geteuid().as_raw());
+}
+
+#[tokio::test]
+#[ignore = "requires explicit own PG17.11 binaries; run serially"]
+async fn init_creates_private_independent_pg_cluster() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    let result = init(InitOptions {
+        data_dir: fixture.root.clone(),
+        pg_bin_dir: fixture.pg_bin.clone(),
+    })
+    .await
+    .unwrap();
+    assert!(result.deployment_id.starts_with("omb-local-"));
+    assert_eq!(result.deployment_id.len(), 42);
+    for dir in [
+        "",
+        "keys",
+        "pg",
+        "pg/data",
+        "run",
+        "tenant",
+        "hosts",
+        "hosts/crabcode",
+        "hosts/crabcode/tmp",
+        "logs",
+    ] {
+        assert_private(&fixture.root.join(dir), 0o700);
+    }
+    for file in [
+        "config.toml",
+        "keys/vault-kek.key",
+        "keys/app-master.key",
+        "pg/password",
+        "pg/data/pg_hba.conf",
+    ] {
+        assert_private(&fixture.root.join(file), 0o600);
+    }
+    let vault = fs::read(fixture.root.join("keys/vault-kek.key")).unwrap();
+    let master = fs::read(fixture.root.join("keys/app-master.key")).unwrap();
+    assert_eq!(vault.len(), 32);
+    assert_eq!(master.len(), 32);
+    assert_ne!(vault, master);
+    let password = fs::read(fixture.root.join("pg/password")).unwrap();
+    assert_eq!(password.len(), 64);
+    assert!(
+        password
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("pg/data/pg_hba.conf")).unwrap(),
+        b"host all openmybot 127.0.0.1/32 scram-sha-256"
+    );
+    assert!(!fixture.root.join("pg/initdb-password").exists());
+    fixture.no_pg();
+    let status = Command::new(fixture.pg_bin.join("postgres"))
+        .args(["--single", "-D"])
+        .arg(fixture.root.join("pg/data"))
+        .arg("openmybot")
+        .env_clear()
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "initialized database must exist");
+    fixture.no_pg();
+}
+#[tokio::test]
+#[ignore = "requires explicit own PG17.11 binaries; run serially"]
+async fn init_refuses_nonempty_directory_without_mutation() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    private_file(&fixture.root.join("sentinel"), b"preserve bytes");
+    let before = fs::read(fixture.root.join("sentinel")).unwrap();
+    assert_eq!(
+        init(InitOptions {
+            data_dir: fixture.root.clone(),
+            pg_bin_dir: fixture.pg_bin.clone()
+        })
+        .await
+        .unwrap_err(),
+        DaemonError::DataDirNotEmpty
+    );
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 1);
+    assert_eq!(fs::read(fixture.root.join("sentinel")).unwrap(), before);
+}
+#[tokio::test]
+#[ignore = "requires explicit own PG17.11 binaries; run serially"]
+async fn daemon_assembles_existing_engine_and_serves_status() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture.spawn("daemon_assembles_existing_engine_and_serves_status");
+    let snapshot = fixture.ready().await;
+    assert_eq!(snapshot.daemon_pid, process.pid());
+    assert_eq!(snapshot.pg_server_version_num, 170011);
+    assert_eq!(snapshot.engine_pin, env!("OMB_ENGINE_PIN"));
+    assert!(snapshot.pg_pid > 0);
+    let rows=query_own(&fixture,"SELECT current_setting('server_version_num'),current_setting('TimeZone'),current_setting('track_activity_query_size'),(SELECT count(*)::bigint FROM pg_namespace WHERE nspname='openmybot')").await;
+    assert_eq!(rows[0].get::<_, String>(0), "170011");
+    assert_eq!(rows[0].get::<_, String>(1), "America/Los_Angeles");
+    assert_eq!(rows[0].get::<_, String>(2), "16kB");
+    assert_eq!(rows[0].get::<_, i64>(3), 1);
+    #[cfg(target_os = "macos")]
+    {
+        for protocol in ["tcp-listeners", "udp-bindings"] {
+            let mut command = Command::new("/usr/sbin/lsof");
+            command.args(["-nP", "-a", "-p", &snapshot.daemon_pid.to_string()]);
+            if protocol == "tcp-listeners" {
+                command.args(["-iTCP", "-sTCP:LISTEN"]);
+            } else {
+                command.arg("-iUDP");
+            }
+            let observed = command.output().unwrap();
+            println!(
+                "daemon {protocol} lsof exit={:?}; stderr_bytes={}",
+                observed.status.code(),
+                observed.stderr.len()
+            );
+            assert_eq!(observed.status.code(), Some(1));
+            assert!(observed.stdout.is_empty());
+            assert!(observed.stderr.is_empty());
+        }
+        let pg = Command::new("/usr/sbin/lsof")
+            .args([
+                "-nP",
+                "-a",
+                "-p",
+                &snapshot.pg_pid.to_string(),
+                "-iTCP",
+                "-sTCP:LISTEN",
+            ])
+            .output()
+            .unwrap();
+        println!(
+            "PG listener lsof exit={:?}; stderr_bytes={}",
+            pg.status.code(),
+            pg.stderr.len()
+        );
+        assert!(pg.status.success());
+        assert!(pg.stderr.is_empty());
+        let output = String::from_utf8(pg.stdout).unwrap();
+        assert!(output.contains("127.0.0.1:"));
+        assert!(!output.contains("*:"));
+        assert_eq!(output.lines().skip(1).count(), 1);
+    }
+    process.stop(Signal::TERM).await;
+    fixture.no_pg();
+    for secret in [
+        fs::read(fixture.root.join("pg/password")).unwrap(),
+        fs::read(fixture.root.join("keys/app-master.key")).unwrap(),
+        fs::read(fixture.root.join("keys/vault-kek.key")).unwrap(),
+    ] {
+        assert!(
+            !process
+                .output()
+                .as_bytes()
+                .windows(secret.len())
+                .any(|bytes| bytes == secret)
+        );
+        let log = fs::read(fixture.root.join("logs/postgres.log")).unwrap();
+        assert!(!log.windows(secret.len()).any(|bytes| bytes == secret));
+    }
+}
+async fn old_token_rejected(root: &Path, token: &[u8]) {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixStream,
+    };
+    let mut stream = UnixStream::connect(root.join("run/control.sock"))
+        .await
+        .unwrap();
+    let text=serde_json::to_vec(&serde_json::json!({"type":"hello","token":std::str::from_utf8(token).unwrap(),"client":"cli","client_version":"0.0.0"})).unwrap();
+    stream
+        .write_all(&(text.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&text).await.unwrap();
+    let mut bytes = Vec::new();
+    let _ = stream.read_to_end(&mut bytes).await;
+    assert!(bytes.is_empty());
+}
+#[tokio::test]
+#[ignore = "requires explicit own PG17.11 binaries; ten isolated repetitions"]
+async fn t10_restart_rotates_token_and_rejects_previous_token() {
+    if child_entry().await {
+        return;
+    }
+    for _ in 0..10 {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut first = fixture.spawn("t10_restart_rotates_token_and_rejects_previous_token");
+        fixture.ready().await;
+        let token = fs::read(fixture.root.join("run/control.token")).unwrap();
+        first.stop(Signal::TERM).await;
+        fixture.no_pg();
+        let mut second = fixture.spawn("t10_restart_rotates_token_and_rejects_previous_token");
+        fixture.ready().await;
+        let next = fs::read(fixture.root.join("run/control.token")).unwrap();
+        assert_ne!(token, next);
+        assert_eq!(next.len(), 64);
+        assert_private(&fixture.root.join("run/control.token"), 0o600);
+        old_token_rejected(&fixture.root, &token).await;
+        let snapshot = status(StatusOptions {
+            data_dir: fixture.root.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(snapshot.authentication_failures, 1);
+        second.stop(Signal::TERM).await;
+        fixture.no_pg();
+    }
+}
+#[tokio::test]
+#[ignore = "requires explicit own PG17.11 binaries; ten isolated repetitions"]
+async fn daemon_lock_excludes_concurrent_start() {
+    if child_entry().await {
+        return;
+    }
+    for _ in 0..10 {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut a = fixture.spawn("daemon_lock_excludes_concurrent_start");
+        let mut b = fixture.spawn("daemon_lock_excludes_concurrent_start");
+        let winner = fixture.ready().await;
+        let (winner, loser) = if winner.daemon_pid == a.pid() {
+            (&mut a, &mut b)
+        } else {
+            assert_eq!(winner.daemon_pid, b.pid());
+            (&mut b, &mut a)
+        };
+        assert_eq!(loser.wait().await, 4);
+        assert!(loser.output().contains("daemon_already_running"));
+        let still = status(StatusOptions {
+            data_dir: fixture.root.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(still.daemon_pid, winner.pid());
+        winner.stop(Signal::TERM).await;
+        fixture.no_pg();
+    }
+}
+#[tokio::test]
+#[ignore = "requires explicit own PG17.11 binaries; ten isolated repetitions per signal"]
+async fn signal_shutdown_removes_runtime_files_and_stops_pg() {
+    if child_entry().await {
+        return;
+    }
+    for signal in [Signal::INT, Signal::TERM] {
+        for _ in 0..10 {
+            let fixture = Fixture::new();
+            fixture.initialize().await;
+            let mut process = fixture.spawn("signal_shutdown_removes_runtime_files_and_stops_pg");
+            fixture.ready().await;
+            let requests = tokio::spawn({
+                let root = fixture.root.clone();
+                async move {
+                    for _ in 0..10 {
+                        let _ = status(StatusOptions {
+                            data_dir: root.clone(),
+                        })
+                        .await;
+                    }
+                }
+            });
+            process.stop(signal).await;
+            requests.await.unwrap();
+            fixture.no_pg();
+            assert!(!fixture.root.join("run/control.sock").exists());
+            assert!(!fixture.root.join("run/control.token").exists());
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(fixture.root.join("run/daemon.lock"))
+                .unwrap();
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        }
+    }
+}
+#[tokio::test]
+#[ignore = "requires explicit own PG17.11 binaries; run serially"]
+async fn startup_failure_releases_owned_pg_and_lock() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    // A package write failure occurs after this daemon has started its own PostgreSQL.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture.root.join("tenant/brand.yaml"))
+        .unwrap();
+    let mut process = fixture.spawn("startup_failure_releases_owned_pg_and_lock");
+    assert_eq!(process.wait().await, 5);
+    assert!(process.output().contains("tenant_package_failed"));
+    fixture.no_pg();
+    assert!(!fixture.root.join("run/control.sock").exists());
+    assert!(!fixture.root.join("run/control.token").exists());
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.root.join("run/daemon.lock"))
+        .unwrap();
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+}
+
+async fn wait_for_token(fixture: &Fixture) {
+    let limit = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !fixture.root.join("run/control.token").exists() {
+        assert!(
+            tokio::time::Instant::now() < limit,
+            "own token publication deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+async fn inspect_stopped(fixture: &Fixture, query: &str) -> Vec<tokio_postgres::Row> {
+    let password = fs::read_to_string(fixture.root.join("pg/password")).unwrap();
+    let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+    for _ in 0..16 {
+        let mut bytes = [0; 2];
+        getrandom::fill(&mut bytes).unwrap();
+        let port = 49152 + u16::from_le_bytes(bytes) % 16384;
+        let out = fixture.root.join(format!("inspect-{port}.out"));
+        let err = fixture.root.join(format!("inspect-{port}.err"));
+        private_file(&out, b"");
+        private_file(&err, b"");
+        let child = Command::new(fixture.pg_bin.join("postgres"))
+            .arg("-D")
+            .arg(fixture.root.join("pg/data"))
+            .args([
+                "-c",
+                "listen_addresses=127.0.0.1",
+                "-c",
+                &format!("port={port}"),
+                "-c",
+                "unix_socket_directories=",
+            ])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(fs::OpenOptions::new().append(true).open(&out).unwrap())
+            .stderr(fs::OpenOptions::new().append(true).open(&err).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut owner = OwnedDaemon {
+            child: Some(child),
+            out,
+            err,
+        };
+        let pid = owner.pid();
+        let mut ready = false;
+        while tokio::time::Instant::now() < limit {
+            if owner.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                break;
+            }
+            let record =
+                fs::read_to_string(fixture.root.join("pg/data/postmaster.pid")).unwrap_or_default();
+            let lines: Vec<_> = record.lines().collect();
+            if lines.len() >= 8
+                && lines[0].parse::<u32>().ok() == Some(pid)
+                && lines[3].parse::<u16>().ok() == Some(port)
+                && lines[7].trim() == "ready"
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !ready {
+            if owner.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+                owner.signal(Signal::INT);
+            }
+            let _ = owner.wait().await;
+            continue;
+        }
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(port)
+            .user("openmybot")
+            .password(&password)
+            .dbname("openmybot")
+            .connect_timeout(Duration::from_secs(1));
+        let connected = tokio::time::timeout(
+            Duration::from_secs(2),
+            config.connect(tokio_postgres::NoTls),
+        )
+        .await;
+        let result = match connected {
+            Ok(Ok((client, connection))) => {
+                let driver = tokio::spawn(connection);
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    if query.starts_with("CREATE ") {
+                        client.batch_execute(query).await.map(|()| Vec::new())
+                    } else {
+                        client.query(query, &[]).await
+                    }
+                })
+                .await;
+                close_own(client, driver).await;
+                result
+                    .map_err(|_| "inspection query timeout")
+                    .and_then(|r| r.map_err(|_| "inspection query failed"))
+            }
+            _ => Err("inspection connection failed"),
+        };
+        owner.stop(Signal::INT).await;
+        return result.expect("own inspection result after child reaped");
+    }
+    panic!("own inspection PostgreSQL unavailable")
+}
+fn assert_runtime_released(fixture: &Fixture) {
+    fixture.no_pg();
+    assert!(!fixture.root.join("run/control.sock").exists());
+    assert!(!fixture.root.join("run/control.token").exists());
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.root.join("run/daemon.lock"))
+        .unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_runs_store_migrations_before_control_token_publication() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process =
+        fixture.spawn("daemon_runs_store_migrations_before_control_token_publication");
+    wait_for_token(&fixture).await;
+    let rows=query_own(&fixture,"SELECT (SELECT count(*)::bigint FROM openmybot.omb_migrations),(SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='openmybot')").await;
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
+    assert_eq!(rows[0].get::<_, i64>(1), 6);
+    fixture.ready().await;
+    let token = fs::read(fixture.root.join("run/control.token")).unwrap();
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(&token).to_vec();
+    let rows=query_own(&fixture,"SELECT token_sha256,engine_pin,daemon_pid FROM openmybot.control_tokens WHERE revoked_at IS NULL").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, Vec<u8>>(0), digest);
+    assert_eq!(rows[0].get::<_, String>(1), env!("OMB_ENGINE_PIN"));
+    assert_eq!(rows[0].get::<_, i32>(2), process.pid() as i32);
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+#[tokio::test]
+#[ignore = "own PG17.11; ten fresh clusters; serial"]
+async fn daemon_restart_rotates_digest_and_records_restart_reason() {
+    if child_entry().await {
+        return;
+    }
+    for _ in 0..10 {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut first = fixture.spawn("daemon_restart_rotates_digest_and_records_restart_reason");
+        fixture.ready().await;
+        let old = fs::read(fixture.root.join("run/control.token")).unwrap();
+        let old_id = query_own(
+            &fixture,
+            "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+        )
+        .await[0]
+            .get::<_, uuid::Uuid>(0);
+        first.signal(Signal::KILL);
+        assert_eq!(first.wait().await, -1);
+        let mut second = fixture.spawn("daemon_restart_rotates_digest_and_records_restart_reason");
+        fixture.ready().await;
+        let next = fs::read(fixture.root.join("run/control.token")).unwrap();
+        assert_ne!(old, next);
+        let rows=query_own(&fixture,&format!("SELECT revoke_reason,revoked_at IS NOT NULL FROM openmybot.control_tokens WHERE token_id='{old_id}'")).await;
+        assert_eq!(rows[0].get::<_, String>(0), "daemon_restart");
+        assert!(rows[0].get::<_, bool>(1));
+        assert_eq!(
+            query_own(
+                &fixture,
+                "SELECT count(*)::bigint FROM openmybot.control_tokens WHERE revoked_at IS NULL"
+            )
+            .await[0]
+                .get::<_, i64>(0),
+            1
+        );
+        second.stop(Signal::TERM).await;
+        assert_runtime_released(&fixture);
+    }
+}
+#[tokio::test]
+#[ignore = "own PG17.11; ten repetitions for each signal; serial"]
+async fn daemon_stop_records_revocation_before_owned_pg_shutdown() {
+    if child_entry().await {
+        return;
+    }
+    for signal in [Signal::INT, Signal::TERM] {
+        for _ in 0..10 {
+            let fixture = Fixture::new();
+            fixture.initialize().await;
+            let mut process =
+                fixture.spawn("daemon_stop_records_revocation_before_owned_pg_shutdown");
+            fixture.ready().await;
+            let id = query_own(
+                &fixture,
+                "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+            )
+            .await[0]
+                .get::<_, uuid::Uuid>(0);
+            process.stop(signal).await;
+            assert_runtime_released(&fixture);
+            let rows=inspect_stopped(&fixture,&format!("SELECT revoke_reason,revoked_at IS NOT NULL FROM openmybot.control_tokens WHERE token_id='{id}'")).await;
+            assert_eq!(rows[0].get::<_, String>(0), "daemon_stop");
+            assert!(rows[0].get::<_, bool>(1));
+        }
+    }
+    for signal in [Signal::INT, Signal::TERM] {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut process = fixture.spawn("daemon_stop_records_revocation_before_owned_pg_shutdown");
+        fixture.ready().await;
+        let id = query_own(
+            &fixture,
+            "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+        )
+        .await[0]
+            .get::<_, uuid::Uuid>(0);
+        let (client, driver) = connect_own(&fixture).await;
+        let injected=tokio::time::timeout(Duration::from_secs(10),client.batch_execute("CREATE FUNCTION openmybot.fixture_stop_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.revoke_reason='daemon_stop' THEN RAISE EXCEPTION 'owned fixture stop failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_stop_failure BEFORE UPDATE ON openmybot.control_tokens FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_stop_failure()")).await;
+        close_own(client, driver).await;
+        injected.unwrap().unwrap();
+        process.signal(signal);
+        assert_eq!(process.wait().await, 5);
+        assert!(process.output().contains("control_token_failed"));
+        assert_runtime_released(&fixture);
+        let rows=inspect_stopped(&fixture,&format!("SELECT revoked_at IS NULL AND revoke_reason IS NULL FROM openmybot.control_tokens WHERE token_id='{id}'")).await;
+        assert!(rows[0].get::<_, bool>(0));
+    }
+}
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn migration_refusal_cleans_owned_pg_runtime_files_and_lock() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut first = fixture.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    fixture.ready().await;
+    first.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+    inspect_stopped(&fixture,"UPDATE openmybot.omb_migrations SET sha256=decode(repeat('00',32),'hex') RETURNING version").await;
+    let mut second = fixture.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    assert_eq!(second.wait().await, 4);
+    assert!(second.output().contains("omb_migration_drift"));
+    assert_runtime_released(&fixture);
+    let delayed = Fixture::new();
+    delayed.initialize().await;
+    let mut seed = delayed.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    delayed.ready().await;
+    seed.stop(Signal::TERM).await;
+    assert_runtime_released(&delayed);
+    inspect_stopped(&delayed,"CREATE FUNCTION openmybot.fixture_migration_delay() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF current_query() LIKE '%CREATE SCHEMA IF NOT EXISTS openmybot%' THEN PERFORM pg_sleep(35); END IF; END $$; CREATE EVENT TRIGGER fixture_migration_delay ON ddl_command_start EXECUTE FUNCTION openmybot.fixture_migration_delay(); SELECT true").await;
+    let mut failing = delayed.spawn("migration_refusal_cleans_owned_pg_runtime_files_and_lock");
+    assert_eq!(failing.wait().await, 5);
+    assert!(failing.output().contains("omb_migration_failed"));
+    assert_runtime_released(&delayed);
+}
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn assembly_failure_after_token_insert_records_controlled_stop() {
+    if child_entry().await {
+        return;
+    }
+    for _ in 0..10 {
+        let fixture = Fixture::new();
+        fixture.initialize().await;
+        let mut setup =
+            fixture.spawn("assembly_failure_after_token_insert_records_controlled_stop");
+        fixture.ready().await;
+        setup.stop(Signal::TERM).await;
+        assert_runtime_released(&fixture);
+        // Test-only trigger establishes an observed barrier before insertion: the daemon holds
+        // marker and waits for the parent's gate lock. No timing assumption or product knob.
+        inspect_stopped(&fixture,"CREATE FUNCTION openmybot.fixture_insert_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(77881234); WHILE NOT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=77881235 AND granted AND pid<>pg_backend_pid()) LOOP PERFORM pg_sleep(0.01); END LOOP; PERFORM pg_advisory_xact_lock(77881235); RETURN NEW; END $$; CREATE TRIGGER fixture_gate BEFORE INSERT ON openmybot.control_tokens FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_insert_gate(); SELECT true").await;
+        let mut process =
+            fixture.spawn("assembly_failure_after_token_insert_records_controlled_stop");
+        let daemon_pid = process.pid();
+        wait_for_token(&fixture).await;
+        let limit = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let row=query_own(&fixture,"SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=77881234 AND granted)").await;
+            if row[0].get::<_, bool>(0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "insert marker deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (client, driver) = connect_own(&fixture).await;
+        client
+            .query_one("SELECT pg_advisory_lock(77881235)", &[])
+            .await
+            .unwrap();
+        loop {
+            let row=query_own(&fixture,"SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=77881235 AND NOT granted)").await;
+            if row[0].get::<_, bool>(0) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < limit, "insert gate deadline");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(fixture.root.join("keys/vault-kek.key"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        client
+            .query_one("SELECT pg_advisory_unlock(77881235)", &[])
+            .await
+            .unwrap();
+        close_own(client, driver).await;
+        assert_eq!(process.wait().await, 5);
+        assert!(process.output().contains("engine_assembly_failed"));
+        assert_runtime_released(&fixture);
+        let rows=inspect_stopped(&fixture,&format!("SELECT token_id,revoke_reason,revoked_at IS NOT NULL FROM openmybot.control_tokens WHERE daemon_pid={daemon_pid}")).await;
+        assert_eq!(rows.len(), 1);
+        let _: uuid::Uuid = rows[0].get(0);
+        assert_eq!(rows[0].get::<_, String>(1), "daemon_stop");
+        assert!(rows[0].get::<_, bool>(2));
+    }
+}
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_status_reports_channel_segment_over_control_socket() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture.spawn("daemon_status_reports_channel_segment_over_control_socket");
+    let snapshot = fixture.ready().await;
+    assert!(snapshot.channels.is_empty());
+    let rows = query_own(&fixture, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,status_reason,revision,created_at,activated_at,suspended_at) VALUES (gen_random_uuid(),'receiver','telegram','1001','test-envelope','suspended','credential_rejected',1,statement_timestamp(),statement_timestamp(),statement_timestamp()) RETURNING binding_id").await;
+    let receiver: uuid::Uuid = rows[0].get(0);
+    let snapshot = fixture.ready().await;
+    assert_eq!(snapshot.channels.len(), 1);
+    let channel = &snapshot.channels[0];
+    assert_eq!(channel.channel, "telegram");
+    assert_eq!(channel.binding_id, receiver.to_string());
+    assert_eq!(channel.status, "suspended");
+    assert_eq!(
+        channel.status_reason.as_deref(),
+        Some("credential_rejected")
+    );
+    assert_eq!(channel.pending_dispatch, 0);
+    assert!(channel.gaps.is_empty());
+    assert_eq!(channel.note, "no plugin installed for this channel");
+    assert!(snapshot.plugins.is_empty());
+    assert_eq!(
+        (
+            channel.counters.platform_payload_unparseable,
+            channel.counters.event_conflict,
+            channel.counters.unsupported_update
+        ),
+        (0, 0, 0)
+    );
+    // Installed through the daemon, the plugin supplies the note; a suspended receiver runs no
+    // process.
+    install_fake(&fixture, "telegram", "normal").await;
+    let snapshot = fixture.ready().await;
+    assert_eq!(snapshot.channels[0].note, "telegram fake note");
+    assert_eq!(snapshot.plugins.len(), 1);
+    let plugin = serde_json::to_value(&snapshot.plugins[0]).unwrap();
+    assert_eq!(
+        plugin,
+        serde_json::json!({"name": "fake-telegram", "version": "0.1.0", "channels": ["telegram"], "process": "stopped", "last_exit_code": null})
+    );
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_restart_records_daemon_down_gap() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut first = fixture.spawn("daemon_restart_records_daemon_down_gap");
+    fixture.ready().await;
+    let rows = query_own(&fixture, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,revision,created_at,activated_at) VALUES (gen_random_uuid(),'receiver','telegram','1001','test-envelope','active',1,statement_timestamp(),statement_timestamp()) RETURNING binding_id").await;
+    let receiver: uuid::Uuid = rows[0].get(0);
+    let old = query_own(
+        &fixture,
+        "SELECT token_id FROM openmybot.control_tokens WHERE revoked_at IS NULL",
+    )
+    .await[0]
+        .get::<_, uuid::Uuid>(0);
+    first.signal(Signal::KILL);
+    assert_eq!(first.wait().await, -1);
+    let mut second = fixture.spawn("daemon_restart_records_daemon_down_gap");
+    let snapshot = fixture.ready().await;
+    let rows = query_own(&fixture, &format!("SELECT g.binding_id,g.gap_started_at=t.last_heartbeat_at,g.gap_ended_at>=n.created_at AND g.gap_ended_at<=statement_timestamp(),t.revoke_reason FROM openmybot.channel_events g CROSS JOIN openmybot.control_tokens t CROSS JOIN openmybot.control_tokens n WHERE g.gap_reason='daemon_down' AND t.token_id='{old}' AND n.revoked_at IS NULL")).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, uuid::Uuid>(0), receiver);
+    assert!(rows[0].get::<_, bool>(1));
+    assert!(rows[0].get::<_, bool>(2));
+    assert_eq!(rows[0].get::<_, String>(3), "daemon_restart");
+    let channel = &snapshot.channels[0];
+    assert_eq!(channel.binding_id, receiver.to_string());
+    assert!(
+        channel
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "daemon_down" && gap.ended_at.is_some())
+    );
+    second.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+/// Rewrites the `hosts.crabcode` section of the initialized `config.toml`.
+fn configure_crabcode(fixture: &Fixture, binary: &str, roots: &[PathBuf]) {
+    let path = fixture.root.join("config.toml");
+    let mut config: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut section = toml::Table::new();
+    section.insert("binary".into(), toml::Value::String(binary.into()));
+    section.insert(
+        "workspace_roots".into(),
+        toml::Value::Array(
+            roots
+                .iter()
+                .map(|root| toml::Value::String(root.to_str().unwrap().into()))
+                .collect(),
+        ),
+    );
+    config
+        .get_mut("hosts")
+        .and_then(toml::Value::as_table_mut)
+        .unwrap()
+        .insert("crabcode".into(), toml::Value::Table(section));
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_start_refuses_workspace_root_outside_home() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    // The child's HOME is the fixture root; its parent directory is outside it.
+    configure_crabcode(&fixture, "/usr/bin/false", &[std::env::temp_dir()]);
+    let mut process = fixture.spawn("daemon_start_refuses_workspace_root_outside_home");
+    assert_eq!(process.wait().await, 4);
+    assert!(process.output().contains("workspace_root_invalid"));
+    assert!(!fixture.root.join("pg/data/postmaster.pid").exists());
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_with_crabcode_configured_serves_status_and_stops_clean() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    configure_crabcode(&fixture, "/usr/bin/false", &[workspace]);
+    let mut process =
+        fixture.spawn("daemon_with_crabcode_configured_serves_status_and_stops_clean");
+    let snapshot = fixture.ready().await;
+    assert_eq!(snapshot.daemon_pid, process.pid());
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+async fn op(
+    fixture: &Fixture,
+    name: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, DaemonError> {
+    call(CallOptions {
+        data_dir: fixture.root.clone(),
+        op: name.into(),
+        args,
+    })
+    .await
+}
+
+/// Installs the fake channel plugin for `kind` through the running daemon's `plugins_add`: the
+/// binary is copied into a package directory, since the daemon refuses commands outside it.
+async fn install_fake(fixture: &Fixture, kind: &str, scenario: &str) {
+    let fake = PathBuf::from(
+        std::env::var_os("OMB_TEST_CHANNEL_PLUGIN")
+            .expect("OMB_TEST_CHANNEL_PLUGIN: absolute path of the fake channel plugin"),
+    );
+    let package = fixture.root.join(format!("package-{kind}"));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(package.join("bin"))
+        .unwrap();
+    fs::copy(&fake, package.join("bin/fake-channel-plugin")).unwrap();
+    let manifest = serde_json::json!({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": format!("fake-{kind}"),
+        "version": "0.1.0",
+        "extensions": {"org.openmybot": {"channels": {kind: {
+            "protocol": "openmybot-channel/1",
+            "command": "./bin/fake-channel-plugin",
+            "args": ["--channel-kind", kind, "--scenario", scenario],
+            "credential_fields": [{"name": "token", "secret": true}],
+            "status_note": format!("{kind} fake note"),
+        }}}},
+    });
+    fs::write(package.join("plugin.json"), manifest.to_string()).unwrap();
+    let installed = op(
+        fixture,
+        "plugins_add",
+        serde_json::json!({"dir": package.to_str().unwrap()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed["name"], format!("fake-{kind}"));
+    fs::remove_dir_all(package).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_serves_status_run_and_refusals_for_approve_deny_cancel_over_the_control_socket() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture.spawn(
+        "daemon_serves_status_run_and_refusals_for_approve_deny_cancel_over_the_control_socket",
+    );
+    fixture.ready().await;
+    for name in ["status_run", "cancel"] {
+        assert_eq!(
+            op(&fixture, name, serde_json::json!({"run_id": "run-unknown"})).await,
+            Err(DaemonError::RunNotFound),
+            "{name}"
+        );
+    }
+    for name in ["approve", "deny"] {
+        assert_eq!(
+            op(
+                &fixture,
+                name,
+                serde_json::json!({"permission_id": "hp-unknown"})
+            )
+            .await,
+            Err(DaemonError::PermissionNotPending),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_revoke",
+            serde_json::json!({"binding_id": uuid::Uuid::now_v7().to_string()})
+        )
+        .await,
+        Err(DaemonError::BindingNotFound)
+    );
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_revoke",
+            serde_json::json!({"binding_id": "not-a-uuid"})
+        )
+        .await,
+        Err(DaemonError::InvalidRequest)
+    );
+    // The status op keeps working beside the refusals.
+    fixture.ready().await;
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    configure_crabcode(&fixture, "/usr/bin/false", std::slice::from_ref(&workspace));
+    let mut process =
+        fixture.spawn("daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket");
+    fixture.ready().await;
+    let workspace = workspace.to_str().unwrap();
+    let pair = || {
+        op(
+            &fixture,
+            "pair_start",
+            serde_json::json!({"channel": "telegram", "workspace": workspace}),
+        )
+    };
+    assert_eq!(pair().await, Err(DaemonError::PluginNotInstalled));
+    install_fake(&fixture, "telegram", "normal").await;
+    assert_eq!(pair().await, Err(DaemonError::ReceiverNotActive));
+    let host = op(
+        &fixture,
+        "bindings_host",
+        serde_json::json!({"workspace": workspace}),
+    )
+    .await
+    .unwrap();
+    let listed = op(&fixture, "bindings_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    let bindings = listed["bindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0]["binding_id"], host["binding_id"]);
+    assert_eq!(bindings[0]["binding_kind"], "host");
+    assert_eq!(bindings[0]["status"], "active");
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_host",
+            serde_json::json!({"workspace": workspace})
+        )
+        .await,
+        Err(DaemonError::ChannelAlreadyBound)
+    );
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_refuses_malformed_receiver_credentials_without_leaking_the_secret() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process =
+        fixture.spawn("daemon_refuses_malformed_receiver_credentials_without_leaking_the_secret");
+    fixture.ready().await;
+    // The plugin reports every credential malformed.
+    install_fake(&fixture, "telegram", "verify_fail:malformed").await;
+    let mut seen = Vec::new();
+    for (args, expected) in [
+        (
+            serde_json::json!({"channel": "telegram", "fields": {"app_id": "", "app_secret": "SENTINEL-undeclared"}}),
+            DaemonError::InvalidRequest,
+        ),
+        (
+            serde_json::json!({"channel": "telegram", "fields": {"token": "SENTINEL-without-bot-id"}}),
+            DaemonError::InvalidRequest,
+        ),
+        (
+            serde_json::json!({"channel": "feishu", "fields": {"token": "SENTINEL-no-plugin"}}),
+            DaemonError::PluginNotInstalled,
+        ),
+    ] {
+        let error = op(&fixture, "bindings_receiver", args).await.unwrap_err();
+        assert_eq!(error, expected);
+        seen.push(format!("{error} {error:?} {}", error.code()));
+    }
+    fixture.ready().await;
+    process.stop(Signal::TERM).await;
+    seen.push(process.output());
+    for text in &seen {
+        assert!(!text.contains("SENTINEL"), "{text}");
+    }
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_lists_plugins_and_removes_one_only_without_a_live_binding() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process =
+        fixture.spawn("daemon_lists_plugins_and_removes_one_only_without_a_live_binding");
+    fixture.ready().await;
+    install_fake(&fixture, "telegram", "normal").await;
+    let list = || op(&fixture, "plugins_list", serde_json::json!({}));
+    let remove = || {
+        op(
+            &fixture,
+            "plugins_remove",
+            serde_json::json!({"name": "fake-telegram"}),
+        )
+    };
+    assert_eq!(
+        list().await.unwrap(),
+        serde_json::json!({"plugins": [{
+            "name": "fake-telegram",
+            "version": "0.1.0",
+            "channels": [{
+                "channel_kind": "telegram",
+                "credential_fields": [{"name": "token", "secret": true}],
+                "status_note": "telegram fake note",
+            }],
+            "process": "stopped",
+            "last_exit_code": null,
+        }]})
+    );
+    let bound = op(
+        &fixture,
+        "bindings_receiver",
+        serde_json::json!({"channel": "telegram", "fields": {"token": "1001:listed-token"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(list().await.unwrap()["plugins"][0]["process"], "running");
+    assert_eq!(remove().await, Err(DaemonError::PluginInUse));
+    op(
+        &fixture,
+        "bindings_revoke",
+        serde_json::json!({"binding_id": bound["binding_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        remove().await.unwrap(),
+        serde_json::json!({"name": "fake-telegram"})
+    );
+    assert_eq!(list().await.unwrap(), serde_json::json!({"plugins": []}));
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_restore_detected_suspends_bindings_and_expires_pending_events_until_reconfirmed() {
+    if child_entry().await {
+        return;
+    }
+    let name =
+        "daemon_restore_detected_suspends_bindings_and_expires_pending_events_until_reconfirmed";
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    configure_crabcode(&fixture, "/usr/bin/false", std::slice::from_ref(&workspace));
+    let mut first = fixture.spawn(name);
+    fixture.ready().await;
+    let host = op(
+        &fixture,
+        "bindings_host",
+        serde_json::json!({"workspace": workspace}),
+    )
+    .await
+    .unwrap();
+    let binding = host["binding_id"].as_str().unwrap().to_owned();
+    first.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+    // The cluster now looks restored: the latest token row names another system identifier.
+    inspect_stopped(&fixture, "UPDATE openmybot.control_tokens SET pg_system_identifier='different' WHERE token_id=(SELECT token_id FROM openmybot.control_tokens ORDER BY created_at DESC,token_id DESC LIMIT 1) RETURNING token_id").await;
+    inspect_stopped(&fixture, &format!("INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status) VALUES (gen_random_uuid(),'event','host','crabcode','op:restore',statement_timestamp(),'{binding}','accepted_message','do the work',sha256('do the work'::bytea),'run-restore','thread-restore','pending') RETURNING record_id")).await;
+    let mut second = fixture.spawn(name);
+    fixture.ready().await;
+    let listed = op(&fixture, "bindings_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    let row = &listed["bindings"][0];
+    assert_eq!(row["binding_id"], binding.as_str());
+    assert_eq!(row["status"], "suspended");
+    assert_eq!(row["status_reason"], "restore_detected");
+    let revision = row["revision"].as_i64().unwrap();
+    let rows = query_own(&fixture, "SELECT (SELECT dispatch_status FROM openmybot.channel_events WHERE event_key='op:restore'),(SELECT restore_detected FROM openmybot.control_tokens ORDER BY created_at DESC,token_id DESC LIMIT 1),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions)").await;
+    assert_eq!(rows[0].get::<_, String>(0), "expired");
+    assert!(rows[0].get::<_, bool>(1));
+    assert_eq!(rows[0].get::<_, i64>(2), 0);
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_reconfirm",
+            serde_json::json!({"binding_id": binding})
+        )
+        .await
+        .unwrap(),
+        serde_json::json!({"binding_id": binding, "revision": revision + 1})
+    );
+    let listed = op(&fixture, "bindings_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(listed["bindings"][0]["status"], "active");
+    assert!(listed["bindings"][0]["reconfirmed_at"].is_string());
+    assert_eq!(
+        op(
+            &fixture,
+            "bindings_reconfirm",
+            serde_json::json!({"binding_id": binding})
+        )
+        .await,
+        Err(DaemonError::BindingStateInvalid)
+    );
+    second.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_resumed_after_sigstop_records_daemon_suspended_gap_and_resumes_heartbeat() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process = fixture
+        .spawn("daemon_resumed_after_sigstop_records_daemon_suspended_gap_and_resumes_heartbeat");
+    fixture.ready().await;
+    // An active receiver row the running daemon does not poll for.
+    let rows = query_own(&fixture, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,revision,created_at,activated_at) VALUES (gen_random_uuid(),'receiver','telegram','1001','test-envelope','active',1,statement_timestamp(),statement_timestamp()) RETURNING binding_id").await;
+    let receiver: uuid::Uuid = rows[0].get(0);
+    let heartbeat = "SELECT (extract(epoch FROM last_heartbeat_at)*1000000)::bigint FROM openmybot.control_tokens WHERE revoked_at IS NULL";
+    let gaps = format!(
+        "SELECT (extract(epoch FROM gap_started_at)*1000000)::bigint,(extract(epoch FROM gap_ended_at)*1000000)::bigint FROM openmybot.channel_events WHERE gap_reason='daemon_suspended' AND binding_id='{receiver}'"
+    );
+    process.signal(Signal::STOP);
+    // HEARTBEAT_GAP is 90 s; the stopped daemon cannot move its heartbeat meanwhile.
+    tokio::time::sleep(Duration::from_secs(95)).await;
+    let before: i64 = query_own(&fixture, heartbeat).await[0].get(0);
+    process.signal(Signal::CONT);
+    let limit = tokio::time::Instant::now() + Duration::from_secs(60);
+    let rows = loop {
+        let rows = query_own(&fixture, &gaps).await;
+        if !rows.is_empty() {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < limit,
+            "suspension gap deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), before);
+    assert!(rows[0].get::<_, i64>(1) > before + 90_000_000);
+    let snapshot = fixture.ready().await;
+    let channel = &snapshot.channels[0];
+    assert_eq!(channel.binding_id, receiver.to_string());
+    assert!(
+        channel
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "daemon_suspended" && gap.ended_at.is_some())
+    );
+    assert_eq!(channel.note, "no plugin installed for this channel");
+    let resumed: i64 = query_own(&fixture, heartbeat).await[0].get(0);
+    tokio::time::sleep(Duration::from_secs(35)).await;
+    let later: i64 = query_own(&fixture, heartbeat).await[0].get(0);
+    assert!(later > resumed);
+    assert_eq!(query_own(&fixture, &gaps).await.len(), 1);
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+// ---- Layer 2: the real CrabCode host under the release binary ---------------------------------
+
+use openbot_contracts::ids::{DeploymentId, thread::ThreadIdentity};
+use sha2::Digest as _;
+
+/// The release binary's daemon in a process group of its own, with only `HOME` (the real home:
+/// `home` isolation) and `PATH` set; output goes to private files as in `spawn`.
+fn spawn_real(fixture: &Fixture, binary: &Path, home: &Path) -> OwnedDaemon {
+    let mut random = [0; 4];
+    getrandom::fill(&mut random).unwrap();
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let out = fixture.root.join(format!("{suffix}.out"));
+    let err = fixture.root.join(format!("{suffix}.err"));
+    private_file(&out, b"");
+    private_file(&err, b"");
+    let child = Command::new(binary)
+        .arg("--data-dir")
+        .arg(&fixture.root)
+        .args(["--json", "daemon"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .stdin(Stdio::null())
+        .stdout(fs::OpenOptions::new().append(true).open(&out).unwrap())
+        .stderr(fs::OpenOptions::new().append(true).open(&err).unwrap())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    OwnedDaemon {
+        child: Some(child),
+        out,
+        err,
+    }
+}
+/// The layer-2 report, rewritten after every change so a failed step still leaves it behind. The
+/// sandbox, home and data directory prefixes become placeholders.
+struct RealReport {
+    path: PathBuf,
+    hidden: Vec<(String, &'static str)>,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+impl RealReport {
+    fn set(&mut self, key: &str, value: serde_json::Value) {
+        self.fields.insert(key.into(), value);
+        let mut text = serde_json::to_string_pretty(&self.fields).unwrap();
+        for (prefix, placeholder) in &self.hidden {
+            text = text.replace(prefix.as_str(), placeholder);
+        }
+        fs::write(&self.path, text).unwrap();
+    }
+}
+/// One `<binary> --data-dir <data directory> --json <args>` run; its exit code and JSON output
+/// are appended to the report's call log.
+fn openmybot(
+    fixture: &Fixture,
+    binary: &Path,
+    home: &Path,
+    report: &mut RealReport,
+    args: &[&str],
+) -> (i32, serde_json::Value) {
+    let output = Command::new(binary)
+        .arg("--data-dir")
+        .arg(&fixture.root)
+        .arg("--json")
+        .args(args)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let code = output.status.code().unwrap_or(-1);
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+    let mut calls = report
+        .fields
+        .remove("calls")
+        .unwrap_or_else(|| serde_json::json!([]));
+    calls
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"command": args, "exit_code": code, "output": value}));
+    report.set("calls", calls);
+    (code, value)
+}
+
+#[tokio::test]
+#[ignore = "real CrabCode on this machine; run by the controller"]
+async fn real_crabcode_daemon_recheck_with_cli_approve_and_cancel() {
+    let required = |name: &str| {
+        PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is required")))
+    };
+    let crabcode = required("OMB_REAL_CRABCODE_BIN");
+    let binary = required("OMB_REAL_OPENMYBOT_BIN");
+    assert!(crabcode.is_absolute() && binary.is_absolute());
+    let sandbox = fs::canonicalize(required("OMB_REAL_RECHECK_SANDBOX")).unwrap();
+    let report_path = required("OMB_REAL_RECHECK_REPORT");
+    assert!(
+        report_path.starts_with(&sandbox),
+        "the report stays in the sandbox"
+    );
+    let home = fs::canonicalize(required("HOME")).unwrap();
+    assert!(
+        sandbox.starts_with(&home) && sandbox != home && !sandbox.starts_with(home.join("Library"))
+    );
+    let fixture = Fixture::new();
+    let mut report = RealReport {
+        path: report_path,
+        hidden: vec![
+            (sandbox.to_str().unwrap().to_owned(), "<sandbox>"),
+            (home.to_str().unwrap().to_owned(), "<home>"),
+            (fixture.root.to_str().unwrap().to_owned(), "<data-dir>"),
+        ],
+        fields: serde_json::Map::new(),
+    };
+    let digest = |path: &Path| -> String {
+        sha2::Sha256::digest(fs::read(path).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let probe = Command::new(&crabcode)
+        .arg("--version")
+        .current_dir(&sandbox)
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    report.set(
+        "version_line",
+        serde_json::json!(
+            String::from_utf8_lossy(&probe.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+        ),
+    );
+    report.set("binary_sha256", serde_json::json!(digest(&crabcode)));
+    report.set("openmybot_sha256", serde_json::json!(digest(&binary)));
+    report.set(
+        "build_id",
+        serde_json::json!(
+            fs::read_to_string(crabcode.parent().unwrap().join("build-id"))
+                .ok()
+                .map(|text| text.trim().to_owned())
+        ),
+    );
+    report.set("engine_pin", serde_json::json!(env!("OMB_ENGINE_PIN")));
+
+    // (1) The sandbox workspace and the real host configured on it.
+    let workspace = sandbox.join("ws");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(workspace.join("notes.txt"), "pineapple\n").unwrap();
+    fixture.initialize().await;
+    configure_crabcode(
+        &fixture,
+        crabcode.to_str().unwrap(),
+        std::slice::from_ref(&sandbox),
+    );
+
+    // (2) The host binding through the release binary, then a stop.
+    let mut first = spawn_real(&fixture, &binary, &home);
+    fixture.ready().await;
+    let workspace_arg = workspace.to_str().unwrap();
+    let (code, bound) = openmybot(
+        &fixture,
+        &binary,
+        &home,
+        &mut report,
+        &["bindings", "host", "crabcode", "--workspace", workspace_arg],
+    );
+    assert_eq!(code, 0, "{bound}");
+    let binding = bound["data"]["binding_id"].as_str().unwrap().to_owned();
+    first.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+
+    // (3) Two pending messages of the host binding in one statement, on a thread minted from the
+    // deployment fingerprint.
+    let config: toml::Table =
+        toml::from_str(&fs::read_to_string(fixture.root.join("config.toml")).unwrap()).unwrap();
+    let deployment = DeploymentId::new(config["deployment_id"].as_str().unwrap());
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let thread = ThreadIdentity::new(&deployment).mint_from_entropy(entropy);
+    let (write_event, stop_event) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let (write_run, stop_run) = (format!("run-{write_event}"), format!("run-{stop_event}"));
+    let write = "Use the Read tool to read notes.txt in the current directory. Then use the Write tool to create greeting.txt containing the word hello. Finally reply with the word DONE.";
+    let count =
+        "Count from 1 to 300, writing each number on its own line with a short sentence about it.";
+    inspect_stopped(&fixture, &format!("INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status) VALUES ('{write_event}','event','host','crabcode','op:{write_event}',statement_timestamp(),'{binding}','accepted_message','{write}',sha256('{write}'::bytea),'{write_run}','{thread}','pending'),('{stop_event}','event','host','crabcode','op:{stop_event}',statement_timestamp(),'{binding}','accepted_message','{count}',sha256('{count}'::bytea),'{stop_run}','{thread}','pending') RETURNING record_id")).await;
+
+    // (4) The daemon again; its engine pin is this build's.
+    let mut second = spawn_real(&fixture, &binary, &home);
+    fixture.ready().await;
+    let (code, status) = openmybot(&fixture, &binary, &home, &mut report, &["status"]);
+    assert_eq!(code, 0, "{status}");
+    let pin_matches = status["data"]["engine_pin"] == env!("OMB_ENGINE_PIN");
+    report.set(
+        "step_daemon_engine_pin",
+        serde_json::json!({"result": if pin_matches { "pass" } else { "fail" }}),
+    );
+    assert!(pin_matches, "{status}");
+
+    // (5) The first run starts and asks for Write; read-only calls are recorded as observed, and
+    // the owner denies every other request through the release binary while Write is awaited.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let permission_id = loop {
+        let (code, run) = openmybot(
+            &fixture,
+            &binary,
+            &home,
+            &mut report,
+            &["status", "--run", &write_run],
+        );
+        assert_eq!(code, 0, "{run}");
+        assert!(run["data"]["terminal_kind"].is_null(), "{run}");
+        let initialized: i64 = query_own(&fixture, &format!("SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id='{write_run}' AND init_at IS NOT NULL")).await[0].get(0);
+        let pending: Vec<(String, bool)> = run["data"]["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["decision"].is_null())
+            .map(|p| {
+                (
+                    p["permission_id"].as_str().unwrap().to_owned(),
+                    p["tool_name"] == "Write",
+                )
+            })
+            .collect();
+        for (id, _) in pending.iter().filter(|(_, write)| !write) {
+            let (code, denied) = openmybot(&fixture, &binary, &home, &mut report, &["deny", id]);
+            assert_eq!(code, 0, "{denied}");
+        }
+        let asked = pending
+            .iter()
+            .find(|(_, write)| *write)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = asked.filter(|_| initialized > 0) {
+            break id;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{run}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    report.set(
+        "step_start_and_write_blocked",
+        serde_json::json!({"result": "pass", "observation": "system/init seen; Write waits for the owner"}),
+    );
+
+    // (6) The owner allows it through the release binary; the run ends succeeded.
+    let (code, approved) = openmybot(
+        &fixture,
+        &binary,
+        &home,
+        &mut report,
+        &["approve", &permission_id],
+    );
+    assert_eq!(code, 0, "{approved}");
+    assert_eq!(approved["data"]["decision"], "allow");
+    let finished = loop {
+        let (code, run) = openmybot(
+            &fixture,
+            &binary,
+            &home,
+            &mut report,
+            &["status", "--run", &write_run],
+        );
+        assert_eq!(code, 0, "{run}");
+        if !run["data"]["terminal_kind"].is_null() {
+            break run;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{run}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let file_written = workspace.join("greeting.txt").exists();
+    let permissions = finished["data"]["permissions"].as_array().unwrap();
+    report.set(
+        "step_readonly",
+        serde_json::json!({"result": "observed", "readonly_rule_rows": permissions.iter().filter(|p| p["decided_via"] == "readonly_rule").count(), "read_requested": permissions.iter().any(|p| p["tool_name"] == "Read")}),
+    );
+    report.set(
+        "step_allow_and_terminal",
+        serde_json::json!({"file_written": file_written, "terminal_kind": finished["data"]["terminal_kind"], "end_reason": finished["data"]["session"]["end_reason"]}),
+    );
+    assert!(file_written);
+    assert_eq!(finished["data"]["terminal_kind"], "succeeded");
+    assert_eq!(finished["data"]["session"]["end_reason"], "result_success");
+
+    // (7) The second run, cancelled mid-way through the release binary.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let initialized: i64 = query_own(&fixture, &format!("SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id='{stop_run}' AND init_at IS NOT NULL")).await[0].get(0);
+        if initialized > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second run init deadline"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (code, cancelled) = openmybot(
+        &fixture,
+        &binary,
+        &home,
+        &mut report,
+        &["cancel", &stop_run],
+    );
+    assert_eq!(code, 0, "{cancelled}");
+    assert_eq!(cancelled["data"]["state"], "requested");
+    let stopped = loop {
+        let (code, run) = openmybot(
+            &fixture,
+            &binary,
+            &home,
+            &mut report,
+            &["status", "--run", &stop_run],
+        );
+        assert_eq!(code, 0, "{run}");
+        if !run["data"]["terminal_kind"].is_null()
+            && !run["data"]["session"]["stop_outcome"].is_null()
+        {
+            break run;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{run}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    let pgid: i32 = query_own(&fixture, &format!("SELECT pgid FROM openmybot.host_driver_sessions WHERE record_kind='session' AND run_id='{stop_run}'")).await[0].get(0);
+    let group_empty = rustix::process::test_kill_process_group(Pid::from_raw(pgid).unwrap())
+        == Err(rustix::io::Errno::SRCH);
+    report.set(
+        "step_cancel",
+        serde_json::json!({"terminal_kind": stopped["data"]["terminal_kind"], "end_reason": stopped["data"]["session"]["end_reason"], "stop_outcome": stopped["data"]["session"]["stop_outcome"], "process_group_empty": group_empty}),
+    );
+    assert_eq!(stopped["data"]["terminal_kind"], "cancelled");
+    assert_eq!(stopped["data"]["session"]["end_reason"], "stop_requested");
+    assert_eq!(stopped["data"]["session"]["stop_outcome"], "confirmed");
+    assert!(group_empty);
+    let counts = query_own(&fixture, "SELECT (SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='session' AND init_at IS NOT NULL),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission' AND decision='allow'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission' AND decision='deny'),(SELECT count(*)::bigint FROM openmybot.host_driver_sessions WHERE record_kind='permission' AND decided_via='readonly_rule')").await;
+    let count_at = |index: usize| counts[0].get::<_, i64>(index);
+    report.set(
+        "event_counts",
+        serde_json::json!({"sessions": count_at(0), "system_init": count_at(1), "permission_requests": count_at(2), "allow": count_at(3), "deny": count_at(4), "readonly_allow": count_at(5)}),
+    );
+
+    // (8) The daemon stops and releases everything it owned.
+    second.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}

@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use openbot_application::{
     ProviderAdapter, ProviderEvent, ProviderFailure, ProviderPortError, ProviderRequest,
-    ProviderSession,
+    ProviderSession, StopOutcome,
 };
 
 /// Fixed upstream LangChain AsyncCaller parity defaults：6 retries, 1s factor-2 backoff。
@@ -173,6 +173,10 @@ struct PrefetchedSession {
 
 #[async_trait]
 impl ProviderSession for PrefetchedSession {
+    async fn request_stop(&mut self) -> Result<StopOutcome, ProviderPortError> {
+        self.inner.request_stop().await
+    }
+
     async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderPortError> {
         match self.first.take() {
             Some(first) => first,
@@ -180,6 +184,10 @@ impl ProviderSession for PrefetchedSession {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "retry_stop_tests.rs"]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {

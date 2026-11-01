@@ -19,7 +19,7 @@ use openbot_application::tenant::package::{
 };
 use openbot_contracts::engine::ENGINE_RELEASE_EPOCH;
 use openbot_domain::vault::SecretBytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::postgres_sidecar::{
@@ -51,6 +51,12 @@ pub const RELEASE_MANIFEST_FILE: &str = "wrok-bot-release.json";
 /// The sole installation-bound variable in the release's first-party brand template.
 pub const INSTANCE_BRAND_TEMPLATE: &str =
     "tenant:\n  id: ${WROK_BOT_INSTANCE_TENANT}\n  product_name: Wrok Bot\n";
+
+mod capture_request;
+use capture_request::CaptureField;
+pub(crate) use capture_request::{
+    CaptureProfile, ReviewedNormalCaptureRequest, TrustedDestination,
+};
 
 const MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const TENANT_FILE_MAX_BYTES: u64 = 1024 * 1024;
@@ -129,16 +135,18 @@ struct ReleaseManifest {
     vault_key_store_service: String,
     provider: ProviderInput,
     agent_budgets: AgentBudgets,
+    #[serde(default)]
+    normal_capture: CaptureField,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ResourceTree {
     root: String,
     files: Vec<ResourceFile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ResourceFile {
     path: String,
@@ -162,7 +170,7 @@ struct ProviderInput {
     egress_allow_cidrs: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AgentBudgets {
     stall_timeout_ms: Option<u64>,
@@ -178,7 +186,10 @@ impl ReleaseManifest {
         let manifest: Self =
             serde_json::from_slice(bytes).map_err(|_| DesktopReleaseError::Manifest)?;
         if manifest.schema != "wrok-bot-desktop-release"
-            || manifest.schema_version != 1
+            || !matches!(
+                (&manifest.schema_version, &manifest.normal_capture),
+                (1, CaptureField::Missing) | (2, CaptureField::Null | CaptureField::Request(_))
+            )
             || manifest.product_name != PRODUCT_NAME
             || manifest.bundle_identifier != BUNDLE_IDENTIFIER
             || manifest.scheme != PROTOCOL_SCHEME
@@ -195,6 +206,9 @@ impl ReleaseManifest {
             || decode_digest(&manifest.postgres.manifest_sha256).is_none()
         {
             return Err(DesktopReleaseError::Manifest);
+        }
+        if let CaptureField::Request(request) = &manifest.normal_capture {
+            request.validate()?;
         }
         manifest.ui.inventory(static_asset_max_bytes)?;
         let tenant_inventory = manifest.tenant.inventory(|_| TENANT_FILE_MAX_BYTES)?;
@@ -284,6 +298,7 @@ pub struct VerifiedDesktopRelease {
     postgres: VerifiedPostgresBundle,
     application: DesktopLocalApplicationInput,
     tenant: VerifiedTenantTemplate,
+    capture: Option<ReviewedNormalCaptureRequest>,
 }
 
 impl core::fmt::Debug for VerifiedDesktopRelease {
@@ -311,6 +326,10 @@ impl VerifiedDesktopRelease {
         }
         let manifest = ReleaseManifest::parse(&bytes)?;
         let application = manifest.application_input()?;
+        let mut capture = match manifest.normal_capture {
+            CaptureField::Request(request) => Some(request.verify(root, expected.0)?),
+            CaptureField::Missing | CaptureField::Null => None,
+        };
         let ui_files = verify_tree(root, &manifest.ui, static_asset_max_bytes)?;
         let ui = VerifiedUiAssets::from_verified_release(ui_files)
             .map_err(|_| DesktopReleaseError::Resource)?;
@@ -325,17 +344,45 @@ impl VerifiedDesktopRelease {
         let postgres =
             VerifiedPostgresBundle::open(root.join(&manifest.postgres.root), expected_pg, &signer)
                 .map_err(|_| DesktopReleaseError::Postgres)?;
+        // Only these already verified release inputs are sealed. The original maintenance
+        // verify/FD/error order above is unchanged; nothing is published while DATA is absent.
+        if let Some(capture) = capture.as_mut() {
+            capture.bind_original_release_compatibility(
+                (
+                    manifest.schema_version,
+                    manifest.core_version,
+                    manifest.release_epoch,
+                    manifest.platform,
+                    manifest.arch,
+                ),
+                (manifest.ui, manifest.tenant),
+                (
+                    manifest.postgres.root,
+                    manifest.postgres.manifest_sha256,
+                    manifest.postgres.key_store_service,
+                ),
+                manifest.agent_budgets,
+            )?;
+        }
         Ok(Self {
             ui,
             postgres,
             application,
             tenant,
+            capture,
         })
     }
 
     /// Reuse the existing authority → real PG/SCRAM → current PG actor → OS Vault → Agent → window
     /// assembly. The lazy real Keychain adapter is first touched by that background assembly.
     pub fn into_runtime_config(self) -> Result<DesktopLocalRuntimeConfig, DesktopReleaseError> {
+        let fixture =
+            crate::tauri_background::bind_self_owned_capture_fixture(self.capture.as_ref())
+                .map_err(|_| DesktopReleaseError::Application)?;
+        let (fixture_binding, secret_store): (_, Arc<dyn OsSecretStore>) = match fixture {
+            Some((binding, store)) => (Some(binding), store),
+            None => (None, Arc::new(DeferredCurrentUserKeychain::default())),
+        };
         let pg_service = ReviewedPostgresKeyStoreService::from_reviewed_release(
             POSTGRES_KEY_STORE_SERVICE.to_owned(),
         )
@@ -351,15 +398,18 @@ impl VerifiedDesktopRelease {
             self.postgres,
             pg_service,
             vault_service,
-            Arc::new(DeferredCurrentUserKeychain::default()),
+            secret_store,
         )
         .map_err(|_| DesktopReleaseError::Application)?;
         let tenant = self.tenant;
-        Ok(DesktopLocalRuntimeConfig::new(
-            release,
-            self.application,
-            move |authority| tenant.bind(authority.auth_context().tenant().as_str()),
-        ))
+        let runtime = DesktopLocalRuntimeConfig::new(release, self.application, move |authority| {
+            tenant.bind(authority.auth_context().tenant().as_str())
+        })
+        .with_reviewed_normal_capture(self.capture);
+        Ok(match fixture_binding {
+            Some(binding) => runtime.with_self_owned_capture_fixture(binding),
+            None => runtime,
+        })
     }
 }
 
@@ -478,7 +528,7 @@ pub fn validate_product_context(
     Ok(())
 }
 
-fn decode_digest(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_digest(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64
         || !value
             .bytes()
@@ -662,7 +712,7 @@ mod tests {
     fn parse(value: &Value) -> Result<ReleaseManifest, DesktopReleaseError> {
         ReleaseManifest::parse(&serde_json::to_vec(value).unwrap())
     }
-    fn write_fixture(root: &Path) -> TrustedDesktopReleaseDigest {
+    fn write_fixture(root: &Path, manifest: &Value) -> TrustedDesktopReleaseDigest {
         fs::create_dir(root.join("ui")).unwrap();
         fs::create_dir(root.join("tenant")).unwrap();
         fs::write(root.join("ui/index.html"), VALID_INDEX.as_bytes()).unwrap();
@@ -670,7 +720,7 @@ mod tests {
         for (filename, text) in TENANT_PACKAGE_FILENAMES.into_iter().zip(tenant_texts()) {
             fs::write(root.join("tenant").join(filename), text).unwrap();
         }
-        let bytes = serde_json::to_vec(&fixture()).unwrap();
+        let bytes = serde_json::to_vec(manifest).unwrap();
         fs::write(root.join(RELEASE_MANIFEST_FILE), &bytes).unwrap();
         // Tests deliberately create their own fixture trust anchor; the product binary only
         // accepts its compile-time reviewed value and has no such self-hash fallback.
@@ -775,6 +825,129 @@ mod tests {
         }
     }
 
+    // One closed v2 request whose destinations name real directories under `parent`.
+    fn capture_request(parent: &Path, outer: &[u8]) -> Value {
+        use std::os::unix::fs::MetadataExt as _;
+        let destination = |leaf: &str| {
+            let path = parent.join(leaf);
+            fs::create_dir(&path).unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            json!({"absolute_path":path, "device":metadata.dev(), "inode":metadata.ino(), "uid":metadata.uid()})
+        };
+        let profile: Value = serde_json::from_str(
+            crate::tauri_background::capture::control::tests::ORDINARY_STARTUP_HISTORY_PROFILE_JSON,
+        )
+        .unwrap();
+        json!({
+            "request_id":"1".repeat(64), "trigger":"once_on_normal_ready_exit", "profile":profile,
+            "maintenance_outer_sha256":format!("{:x}", Sha256::digest(outer)),
+            "maintenance_root":"maintenance",
+            "output_root":destination("output"), "independent_key_medium":destination("key")
+        })
+    }
+
+    #[test]
+    fn normal_capture_field_follows_the_release_schema_version() {
+        let destinations = TempRoot::new();
+        let request = capture_request(&destinations.0, b"outer");
+        // v1 keeps the original manifest: the field stays absent.
+        assert!(parse(&fixture()).is_ok());
+        for field in [Value::Null, request.clone()] {
+            let mut v1 = fixture();
+            v1["normal_capture"] = field;
+            assert!(parse(&v1).is_err());
+        }
+        // v2 always carries the field: null, or exactly one closed request.
+        let mut v2 = fixture();
+        v2["schema_version"] = json!(2);
+        assert!(parse(&v2).is_err());
+        v2["normal_capture"] = Value::Null;
+        assert!(parse(&v2).is_ok());
+        v2["normal_capture"] = request.clone();
+        assert!(parse(&v2).is_ok());
+        for key in request.as_object().unwrap().keys() {
+            let mut missing = v2.clone();
+            missing["normal_capture"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(parse(&missing).is_err(), "{key}");
+        }
+        let mut unknown = v2.clone();
+        unknown["normal_capture"]["unreviewed"] = json!(true);
+        assert!(parse(&unknown).is_err());
+        // A repeated key is refused instead of resolving to either copy.
+        let text = String::from_utf8(serde_json::to_vec(&v2).unwrap()).unwrap();
+        for (key, first) in [
+            ("\"normal_capture\":", "null"),
+            ("\"trigger\":", "\"once_on_normal_ready_exit\""),
+        ] {
+            let repeated = text.replacen(key, &format!("{key}{first},{key}"), 1);
+            assert_ne!(repeated, text);
+            assert!(
+                ReleaseManifest::parse(repeated.as_bytes()).is_err(),
+                "{key}"
+            );
+        }
+        // Each wrong binding inside the one request is refused at parse.
+        let output = request["output_root"]["absolute_path"].clone();
+        for (pointer, wrong) in [
+            ("/normal_capture/request_id", json!("A".repeat(64))),
+            ("/normal_capture/trigger", json!("every_exit")),
+            (
+                "/normal_capture/maintenance_outer_sha256",
+                json!("0".repeat(63)),
+            ),
+            (
+                "/normal_capture/maintenance_root",
+                json!("postgres/maintenance"),
+            ),
+            ("/normal_capture/maintenance_root", json!("../maintenance")),
+            ("/normal_capture/output_root/device", json!(0)),
+            (
+                "/normal_capture/independent_key_medium/absolute_path",
+                output,
+            ),
+            ("/normal_capture/profile/drivers/maxLiveProxies", json!(0)),
+        ] {
+            let mut value = v2.clone();
+            *value.pointer_mut(pointer).unwrap() = wrong;
+            assert!(parse(&value).is_err(), "{pointer}");
+        }
+    }
+
+    #[test]
+    fn capture_request_refused_at_outer_or_maintenance_pin_writes_no_destination() {
+        let root = TempRoot::new();
+        let destinations = TempRoot::new();
+        let outer = b"{\"unit\":\"maintenance outer\"}";
+        let mut manifest = fixture();
+        manifest["schema_version"] = json!(2);
+        manifest["normal_capture"] = capture_request(&destinations.0, outer);
+        let expected = write_fixture(&root.0, &manifest);
+        let maintenance = root.0.join("maintenance");
+        fs::create_dir(&maintenance).unwrap();
+        let outer_path = maintenance.join("wrokbot-pg-maintenance-release.json");
+        // A wrong outer binding stops before the maintenance bundle is read.
+        fs::write(&outer_path, b"tampered").unwrap();
+        assert_eq!(
+            VerifiedDesktopRelease::open(&root.0, expected).err(),
+            Some(DesktopReleaseError::Digest)
+        );
+        // The matching outer reaches the compiled maintenance pin, which unit builds lack.
+        fs::write(&outer_path, outer).unwrap();
+        assert_eq!(
+            VerifiedDesktopRelease::open(&root.0, expected).err(),
+            Some(DesktopReleaseError::Postgres)
+        );
+        for leaf in ["output", "key"] {
+            assert_eq!(fs::read_dir(destinations.0.join(leaf)).unwrap().count(), 0);
+        }
+        assert_eq!(fs::read_dir(&destinations.0).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 4);
+        assert_eq!(fs::read_dir(&maintenance).unwrap().count(), 1);
+    }
+
     #[test]
     fn build_trust_is_required_and_digest_precedes_json_or_postgres() {
         assert_eq!(
@@ -796,7 +969,7 @@ mod tests {
     #[test]
     fn full_preflight_refuses_missing_trusted_postgres_without_touching_os_store() {
         let root = TempRoot::new();
-        let expected = write_fixture(&root.0);
+        let expected = write_fixture(&root.0, &fixture());
         assert_eq!(
             VerifiedDesktopRelease::open(&root.0, expected).err(),
             Some(DesktopReleaseError::Postgres)
@@ -810,7 +983,7 @@ mod tests {
     fn resource_tamper_extra_missing_and_empty_subtree_are_rejected() {
         for case in 0..4 {
             let root = TempRoot::new();
-            let expected = write_fixture(&root.0);
+            let expected = write_fixture(&root.0, &fixture());
             match case {
                 0 => fs::write(root.0.join("ui/index.html"), "tampered").unwrap(),
                 1 => fs::write(root.0.join("ui/unreviewed.js"), "unexpected").unwrap(),
@@ -827,7 +1000,7 @@ mod tests {
     #[test]
     fn symlinks_and_hardlinks_cannot_be_release_resources() {
         let root = TempRoot::new();
-        let expected = write_fixture(&root.0);
+        let expected = write_fixture(&root.0, &fixture());
         let original = root.0.join("ui/index.html");
         let target = root.0.join("original.html");
         fs::rename(&original, &target).unwrap();

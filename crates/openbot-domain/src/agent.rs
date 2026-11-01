@@ -187,6 +187,8 @@ impl AgentPhase {
 /// Stable terminal reason；vendor 原文不进入 domain。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFailure {
+    /// The current delegated authority check refused new sampling or effects.
+    DelegationNotCurrent,
     /// Provider authentication。
     ProviderAuthentication,
     /// Provider rate limit exhausted for this run。
@@ -195,6 +197,8 @@ pub enum AgentFailure {
     ProviderUnavailable,
     /// Provider request may have been sent but no response headers became knowable。
     ProviderCommitUnknown,
+    /// Provider 停止请求的结果未获确认。
+    ProviderStopUnknown,
     /// Provider schema/sequence invalid。
     ProviderInvalidResponse,
     /// Real read gap exceeded watchdog。
@@ -460,6 +464,13 @@ pub fn reduce(
         (AgentPhase::Preparing, AgentEvent::ContextFailed(failure)) => {
             begin_terminal(&mut next, failure_terminal(failure))
         }
+        (
+            AgentPhase::ExecutingTools,
+            AgentEvent::ContextFailed(AgentFailure::DelegationNotCurrent),
+        ) => begin_terminal(
+            &mut next,
+            failure_terminal(AgentFailure::DelegationNotCurrent),
+        ),
         (AgentPhase::Sampling, AgentEvent::ProviderTextDelta(delta)) if !delta.is_empty() => {
             vec![AgentEffect::PersistText(delta)]
         }
@@ -599,11 +610,16 @@ fn begin_terminal(state: &mut AgentState, terminal: AgentTerminal) -> Vec<AgentE
 const fn failure_terminal(failure: AgentFailure) -> AgentTerminal {
     match failure {
         AgentFailure::ProviderCommitUnknown
+        | AgentFailure::ProviderStopUnknown
         | AgentFailure::RuntimeLeaseLost
         | AgentFailure::JournalCommitUnknown => AgentTerminal::ReconciliationRequired(failure),
         _ => AgentTerminal::Failed(failure),
     }
 }
+
+#[cfg(test)]
+#[path = "agent_stop_tests.rs"]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {

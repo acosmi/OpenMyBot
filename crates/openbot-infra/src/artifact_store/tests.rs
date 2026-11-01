@@ -96,7 +96,7 @@ fn actual_file(path: &Path, bytes: &[u8], mode: u32) {
 fn empty_private_root_gets_a_sealed_canonical_marker_and_reopens_without_minting_identity() {
     let owned = OwnedRoot::new();
     let prepared = prepare_root(owned.open(), namespace()).unwrap();
-    let actual = prepared.root.metadata().unwrap();
+    let actual = prepared.root.0.metadata().unwrap();
     assert!(prepared.fresh_marker);
     assert_eq!(actual.mode() & 0o7777, 0o700);
     assert_eq!(actual.uid(), rustix::process::geteuid().as_raw());
@@ -140,6 +140,42 @@ fn actual_independently_opened_descriptor_cannot_acquire_a_live_kernel_owner_loc
     ));
     drop(first);
     assert!(prepare_root(owned.open(), namespace()).is_ok());
+}
+
+#[test]
+fn release_is_not_delayed_by_a_concurrent_spawn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let owned = OwnedRoot::new();
+    let stop = AtomicBool::new(false);
+    let mut cycles = 0_u64;
+    let failure = std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    std::process::Command::new("/bin/sleep")
+                        .arg("0")
+                        .spawn()
+                        .unwrap()
+                        .wait()
+                        .unwrap();
+                }
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut prepared = prepare_root(owned.open(), namespace());
+        while prepared.is_ok() && Instant::now() < deadline {
+            drop(prepared);
+            prepared = prepare_root(owned.open(), namespace());
+            cycles += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        prepared.err()
+    });
+    assert!(
+        failure.is_none(),
+        "re-prepare after release failed on cycle {cycles}: {failure:?}"
+    );
 }
 
 #[test]
@@ -586,8 +622,8 @@ fn guarded_root_owned_inode_fds(identities: &[(u64, u64)]) -> BTreeSet<(u64, u64
 }
 
 fn guarded_prepared_root_is_current(prepared: &super::PreparedRoot) -> bool {
-    ArtifactRootPhysicalBinding::observe(&prepared.root) == Ok(prepared.physical.clone())
-        && read_marker(&prepared.root) == Ok(Some(prepared.marker_bytes.clone()))
+    ArtifactRootPhysicalBinding::observe(&prepared.root.0) == Ok(prepared.physical.clone())
+        && read_marker(&prepared.root.0) == Ok(Some(prepared.marker_bytes.clone()))
 }
 
 // Genuine PreparedRoot/kernel and ByteStore on the original root. No PG-installed Store,
@@ -606,14 +642,14 @@ fn prepared_root_kernel_marker_and_bound_byte_directory_currentness_are_rechecke
         let owned = OwnedRoot::new();
         let prepared = prepare_root(owned.open(), namespace()).unwrap();
         assert!(guarded_prepared_root_is_current(&prepared));
-        let original_root = prepared.root.metadata().unwrap();
+        let original_root = prepared.root.0.metadata().unwrap();
         let root_identity = (original_root.dev(), original_root.ino());
-        let root_fd = u32::try_from(prepared.root.as_raw_fd()).unwrap();
+        let root_fd = u32::try_from(prepared.root.0.as_raw_fd()).unwrap();
         assert!(matches!(
             prepare_root(owned.open(), namespace()),
             Err(ArtifactStoreError::Busy)
         ));
-        let byte_root = prepared.root.try_clone().unwrap();
+        let byte_root = prepared.root.0.try_clone().unwrap();
         let byte_root_fd = u32::try_from(byte_root.as_raw_fd()).unwrap();
         let bytes =
             crate::artifact_bytes::ArtifactByteStore::bind_private_root(byte_root, 4096).unwrap();

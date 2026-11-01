@@ -10,6 +10,7 @@ use openbot_domain::vault::SecretBytes;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::SystemTime;
 use time::OffsetDateTime;
 use url::Url;
 
@@ -18,6 +19,9 @@ use crate::RunExecutionLease;
 /// Loading a fresh authoritative actor context for an asynchronous Agent effect failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AgentAuthorizationError {
+    /// Delegated registration failed its current authority check.
+    #[error("delegation_not_current")]
+    DelegationNotCurrent,
     /// Database/ACL source unavailable.
     #[error("agent_authorization_unavailable")]
     Unavailable,
@@ -260,6 +264,8 @@ impl Eq for RemoteAguiAuthorization {}
 /// Provider routing loaded from authoritative Bot configuration or an explicit run snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderRoute {
+    /// Assembly-registered provider with no built-in fallback.
+    Extension(crate::ProviderExtensionKey),
     /// Package `model.yaml` 固定 OpenAI。
     PackageOpenAi,
     /// Managed slot 读取 deployment `BOT_PROVIDER/BOT_MODEL` config。
@@ -2157,11 +2163,30 @@ pub enum ProviderPortError {
     CommitUnknown,
 }
 
+/// Provider 对本次停止请求的观察结果；不承诺停止前没有外部副作用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// 已观察到远端在该时刻停止产生新工作。
+    Confirmed {
+        /// Adapter 观察到的停止时刻，仅用于诊断。
+        at: SystemTime,
+    },
+    /// 无法确认远端已停止。
+    Unknown,
+    /// 没有远端停止能力，保留丢弃本地流的原行为。
+    Unsupported,
+}
+
 /// 一条已打开的 provider stream。
 #[async_trait]
 pub trait ProviderSession: Send {
     /// 下一 normalized event；`None` 只允许发生在 terminal event 之后。
     async fn next_event(&mut self) -> Result<Option<ProviderEvent>, ProviderPortError>;
+
+    /// 请求停止；调用方限制等待期限。默认实现没有 I/O 或等待。
+    async fn request_stop(&mut self) -> Result<StopOutcome, ProviderPortError> {
+        Ok(StopOutcome::Unsupported)
+    }
 }
 
 /// Built-in Agent sampling port。
@@ -2177,6 +2202,9 @@ pub trait ProviderAdapter: Send + Sync {
 /// Authoritative thread/Bot context load failure。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AgentContextError {
+    /// Delegated authority is no longer current.
+    #[error("delegation_not_current")]
+    DelegationNotCurrent,
     /// PostgreSQL unavailable。
     #[error("agent_context_unavailable")]
     Unavailable,
@@ -2452,6 +2480,10 @@ mod remote_projection_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "provider_stop_tests.rs"]
+mod stop_tests;
 
 #[cfg(test)]
 mod rate_card_tests {
