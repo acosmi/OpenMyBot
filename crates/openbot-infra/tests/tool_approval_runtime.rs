@@ -1,5 +1,7 @@
 //! Durable human proof-of-intent: actor isolation, wait/wake, reuse, denial, expiry and revocation.
 
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 mod harness {
     include!("../../../test-support/postgres_harness.rs");
 }
@@ -34,15 +36,17 @@ const THREAD: &str = "approval-thread";
 const AUDIT_KEY: &[u8] = b"approval-runtime-audit-key-at-least-32";
 
 fn auth(actor: &str, generation: u64) -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new("approval-deployment"),
-        TenantId::new("approval-tenant"),
-        ActorId::new(actor),
-        AuthGeneration::new(generation),
-        false,
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new("approval-deployment"),
+            TenantId::new("approval-tenant"),
+            ActorId::new(actor),
+            AuthGeneration::new(generation),
+            false,
+        )
+        .with_role(Role::User)
+        .build(),
     )
-    .with_role(Role::User)
-    .build()
 }
 
 fn request(call: &str, class: ApprovalClass) -> ToolApprovalRequest {

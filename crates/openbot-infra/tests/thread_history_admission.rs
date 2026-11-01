@@ -1,6 +1,8 @@
 //! Finite native0050 storage admission on owned synthetic PostgreSQL17.11.
 //! Internal metadata and permanent IDs; this suite grants no current Host or ACK.
 #![cfg(feature = "server-runtime")]
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 mod harness;
 use async_trait::async_trait;
 use openbot_application::model_connections::ModelConnectionAdministration;

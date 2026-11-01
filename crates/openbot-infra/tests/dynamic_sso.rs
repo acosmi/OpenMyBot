@@ -344,7 +344,7 @@ async fn legacy_plaintext_saml_config_is_read_verified_and_resealed_as_v2() {
                 .execute(
                     "INSERT INTO public.sso_providers( \
                        id,issuer,oidc_config,saml_config,user_id,provider_id,organization_id,domain) \
-                     VALUES('legacy','urn:example:idp:directory',NULL,$1,'admin','legacy-saml',NULL,' Legacy.Example ')",
+                     VALUES('0190d3a1-7c2e-7a4b-9f3e-5d6c7b8a9e01','urn:example:idp:directory',NULL,$1,'admin','legacy-saml',NULL,' Legacy.Example ')",
                     &[&legacy],
                 )
                 .await

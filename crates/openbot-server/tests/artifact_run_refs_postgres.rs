@@ -458,6 +458,15 @@ impl Fixture {
         resolver
             .install_thread_history_authority(&history)
             .map_err(text)?;
+        resolver
+            .install_recovery_read_gate(
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
+            )
+            .map_err(text)?;
         let artifacts = Arc::new(ActualArtifacts {
             actual,
             metadata: AtomicUsize::new(0),

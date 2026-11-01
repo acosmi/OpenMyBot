@@ -1,5 +1,7 @@
 //! PostgreSQL callback-token rotation/revocation/audit boundary.
 
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 mod harness {
     include!("../../../test-support/postgres_harness.rs");
 }
@@ -21,15 +23,17 @@ use openbot_infra::agent_callback::{
 use openbot_infra::db::{baseline, native, pool};
 
 fn auth(actor: &str, role: Role, generation: u64) -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new("deployment-a"),
-        TenantId::new("tenant-a"),
-        ActorId::new(actor),
-        AuthGeneration::new(generation),
-        false,
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new("deployment-a"),
+            TenantId::new("tenant-a"),
+            ActorId::new(actor),
+            AuthGeneration::new(generation),
+            false,
+        )
+        .with_role(role)
+        .build(),
     )
-    .with_role(role)
-    .build()
 }
 
 async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), String> {

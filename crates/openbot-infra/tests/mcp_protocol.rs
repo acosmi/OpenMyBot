@@ -1,5 +1,7 @@
 //! Pinned RMCP client over SafeDialer against a real pinned RMCP Streamable HTTP server.
 
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 mod harness {
     include!("../../../test-support/postgres_harness.rs");
 }
@@ -1107,7 +1109,7 @@ async fn custom_admin_private_egress_is_db_bound_refreshes_and_retires_atomicall
             )
             .map_err(|error| error.to_string())?
             .with_mcp_credentials(broker);
-            let auth = AuthContextBuilder::from_verified_session(
+            let auth = recovery_admission::outside_domain(AuthContextBuilder::from_verified_session(
                 DeploymentId::new("mcp-admin-deployment"),
                 TenantId::new("mcp-admin-tenant"),
                 ActorId::new("mcp-admin"),
@@ -1115,7 +1117,7 @@ async fn custom_admin_private_egress_is_db_bound_refreshes_and_retires_atomicall
                 false,
             )
             .with_roles([Role::Admin])
-            .build();
+            .build());
             let mut registration = McpCustomServerRegistration {
                 id: "private-notes".to_owned(),
                 title: "Private notes".to_owned(),

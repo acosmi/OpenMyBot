@@ -180,15 +180,15 @@ where
 }
 async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     let mut c = p.get().await.map_err(|e| e.to_string())?;
-    if version == 52 {
+    if version == 53 {
         require(
             fresh::apply(&mut c).await.map_err(|e| e.to_string())?
                 == fresh::FreshApplyOutcome::Applied(native::ApplyOutcome::Applied),
-            "fresh52 not applied",
+            "fresh53 not applied",
         )?;
     } else {
         require(
-            matches!(version, 47..=51),
+            matches!(version, 47..=52),
             "unregistered historical fixture",
         )?;
         baseline::apply(&c).await.map_err(|e| e.to_string())?;
@@ -301,15 +301,17 @@ impl RemoteAguiTransport for ClosedProbe {
 }
 
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct ModelFixture {
     assembly: PostgresApplicationAssembly,
