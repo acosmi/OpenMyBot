@@ -8,4 +8,4 @@ OpenMyBot 是基于共享 OpenBot 引擎装配的本地前台产品。Wrok Bot �
 
 总览报告进程、PostgreSQL、版本、部署、认证失败计数、渠道段与已安装的渠道插件。渠道以进程外渠道插件运行，由 `openmybot plugins add` 安装到数据目录，守护进程监管其进程。派发器、经渠道插件的成果外发、CrabCode 宿主驱动、`openmybot mcp` 与 CrabCode 宿主投影已交付。嵌入的装配包不代表模型可用。不会安装后台启动服务。
 
-另见 [English](README.md)、[兼容性证据](compat/README.md) 与 [宿主投影](hosts/README.md)。该开发入口尚未完成产品发布验收。
+另见 [English](README.md)、[兼容性证据](compat/README.md) 与 [宿主包](plugin/README.md)。该开发入口尚未完成产品发布验收。
