@@ -199,6 +199,11 @@ async fn admin_routes_require_fresh_origin_and_never_project_saml_material() {
                 ],
                 SafeDialer::new(EgressPolicy::default()),
                 "https://app.example".to_owned(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new("dep-1"),
+                    &TenantId::new("tenant-1"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let app = Arc::new(OpenBotApplication::new(ChannelRepo::new(pool.clone())));

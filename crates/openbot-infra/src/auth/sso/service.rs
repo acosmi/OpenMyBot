@@ -5,7 +5,7 @@ use openbot_contracts::ids::{ActorId, TenantId};
 use openbot_domain::identity::groups::{IdentityProviderId, IdpGroupMapping};
 use openbot_domain::identity::roles::AdminFloor;
 use openbot_domain::identity::session::SessionLifetimePolicy;
-use openbot_domain::vault::{KeyVersion, SecretBytes, WrappingKey};
+use openbot_domain::vault::{KeyVersion, WrappingKey};
 use openidconnect::ClientId;
 use time::{Duration, OffsetDateTime};
 use url::Url;
@@ -17,10 +17,15 @@ use super::config::{
 };
 use super::ephemeral::{PostgresSamlAttemptStore, PostgresSsoRouteTicketStore, SsoEphemeralError};
 use super::saml::{SamlError, SamlRuntime, SamlStart};
-use super::store::{DynamicSsoStore, DynamicSsoStoreError, LoadedDynamicProvider};
+use super::store::{
+    CurrentProviderAdmission, DynamicSsoStore, DynamicSsoStoreError, LoadedDynamicProvider,
+};
 use super::vault::SsoConfigVault;
 use crate::auth::oidc::attempt::ProviderIncarnationBinding;
-use crate::auth::oidc::coordinator::{DEFAULT_IDP_TIMEOUT, DEFAULT_METADATA_MAX_BYTES};
+use crate::auth::oidc::attempt_postgres::PostgresAttemptError;
+use crate::auth::oidc::coordinator::{
+    DEFAULT_IDP_TIMEOUT, DEFAULT_METADATA_MAX_BYTES, DYNAMIC_SSO_LOGIN_BUDGET,
+};
 use crate::auth::oidc::redirect::HTTPS_OR_HTTP;
 use crate::auth::oidc::{
     CanonicalRedirectUri, FetchBudget, OidcLoginCoordinator, OidcLoginError, OidcProviderConfig,
@@ -28,6 +33,8 @@ use crate::auth::oidc::{
     PostgresOidcSessionIssuer, ProviderId, ProviderKind, ProviderOrigin, RateLimitPolicy,
 };
 use crate::net::safe_http::SafeDialer;
+use crate::recovery_control::RecoveryReadGate;
+use std::time::Instant;
 
 const ROUTE_TTL: Duration = Duration::minutes(2);
 const SAML_ATTEMPT_TTL: Duration = Duration::minutes(10);
@@ -157,6 +164,7 @@ pub struct DynamicSsoService {
     rate_limiter: PostgresOidcRateLimiter,
     dialer: SafeDialer,
     public_url: String,
+    recovery_gate: RecoveryReadGate,
 }
 
 impl DynamicSsoService {
@@ -182,6 +190,7 @@ impl DynamicSsoService {
         environment_provider_ids: impl IntoIterator<Item = String>,
         dialer: SafeDialer,
         public_url: String,
+        recovery_gate: RecoveryReadGate,
     ) -> Result<Self, DynamicSsoError> {
         let ephemeral_key = ephemeral_key.into();
         let session_key = session_key.into();
@@ -228,6 +237,7 @@ impl DynamicSsoService {
             store,
             dialer,
             public_url,
+            recovery_gate,
         })
     }
 
@@ -240,18 +250,27 @@ impl DynamicSsoService {
         for provider in self.store.list().await? {
             let id = ProviderId::parse(&provider.provider_id)
                 .map_err(|_| DynamicSsoError::ProviderUnknown)?;
+            let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
+            let admission = self.admission(deadline).await?;
+            let mut client = self.guarded(deadline).await?;
+            let tx = client
+                .begin_read_committed()
+                .await
+                .map_err(|_| unavailable())?;
+            let loaded = self
+                .store
+                .load_current_in_transaction(tx.as_transaction(), &id, &admission)
+                .await?
+                .ok_or(DynamicSsoError::ProviderUnknown)?;
             match provider.protocol {
                 SsoProtocol::Oidc => {
-                    self.load_oidc_runtime(&id)
-                        .await?
-                        .ok_or(DynamicSsoError::ProviderUnknown)?;
+                    self.discover_loaded_oidc(loaded).await?;
                 }
                 SsoProtocol::Saml => {
-                    self.load_saml_runtime(&id, now)
-                        .await?
-                        .ok_or(DynamicSsoError::ProviderUnknown)?;
+                    self.saml_runtime(loaded, now)?;
                 }
             }
+            tx.commit().await.map_err(|_| unavailable())?;
         }
         Ok(())
     }
@@ -269,11 +288,19 @@ impl DynamicSsoService {
         for provider in self.store.list().await? {
             let id = ProviderId::parse(&provider.provider_id)
                 .map_err(|_| DynamicSsoError::ProviderUnknown)?;
+            let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
+            let admission = self.admission(deadline).await?;
+            let mut client = self.guarded(deadline).await?;
+            let tx = client
+                .begin_read_committed()
+                .await
+                .map_err(|_| unavailable())?;
             let loaded = self
                 .store
-                .load(&id)
+                .load_current_in_transaction(tx.as_transaction(), &id, &admission)
                 .await?
                 .ok_or(DynamicSsoError::ProviderUnknown)?;
+            tx.commit().await.map_err(|_| unavailable())?;
             let mapping = match loaded.config {
                 DecodedSecretConfig::Oidc(config) => config.mapping(&id)?,
                 DecodedSecretConfig::Saml(config) => config.mapping(&id)?,
@@ -325,6 +352,7 @@ impl DynamicSsoService {
         peer_ip: &str,
         now: OffsetDateTime,
     ) -> Result<SsoRouteReceipt, DynamicSsoError> {
+        let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
         let normalized_email = (email.len() <= 512)
             .then(|| openbot_domain::identity::email::NormalizedEmail::normalize(email).ok())
             .flatten();
@@ -353,36 +381,44 @@ impl DynamicSsoService {
             .await
             .map_err(OidcLoginError::from)?
             .allowed();
-        let routed = if ip_allowed && email_allowed {
-            if let Some(domain) = normalized_email
+        let target = if ip_allowed && email_allowed {
+            match normalized_email
                 .as_ref()
                 .and_then(|email| crate::auth::oidc::email::domain_of(email.as_str()))
             {
-                match self.store.find_provider_for_domain(&domain).await? {
-                    Some(provider) => self
-                        .store
-                        .load(&provider)
-                        .await?
-                        .map(|loaded| {
-                            (provider, protocol_of(&loaded.config), loaded.internal_id)
-                        }),
-                    None => None,
-                }
-            } else {
-                None
+                Some(domain) => self.store.find_provider_for_domain(&domain).await?,
+                None => None,
             }
         } else {
             None
         };
-        let ticket = self
-            .routes
-            .issue(
-                routed
-                    .as_ref()
-                    .map(|(provider, protocol, internal_id)| (provider, *protocol, *internal_id)),
-                now,
-            )
-            .await?;
+        let ticket = match target {
+            Some(provider) => {
+                // The issued binding is this transaction's locked, admitted row.
+                let admission = self.admission(deadline).await?;
+                let mut client = self.guarded(deadline).await?;
+                let tx = client
+                    .begin_read_committed()
+                    .await
+                    .map_err(|_| unavailable())?;
+                let loaded = self
+                    .store
+                    .load_current_in_transaction(tx.as_transaction(), &provider, &admission)
+                    .await?;
+                let ticket = self
+                    .routes
+                    .issue(
+                        loaded.as_ref().map(|loaded| {
+                            (&provider, protocol_of(&loaded.config), loaded.internal_id)
+                        }),
+                        now,
+                    )
+                    .await?;
+                tx.commit().await.map_err(|_| unavailable())?;
+                ticket
+            }
+            None => self.routes.issue(None, now).await?,
+        };
         Ok(SsoRouteReceipt {
             ticket,
             expires_at: now + ROUTE_TTL,
@@ -395,32 +431,43 @@ impl DynamicSsoService {
         peer_ip: &str,
         now: OffsetDateTime,
     ) -> Result<DynamicSsoStart, DynamicSsoError> {
+        let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
         let routed = self
             .routes
             .consume(ticket, now)
             .await?
             .ok_or(DynamicSsoError::RouteNotFound)?;
-        match routed.protocol {
+        let admission = self.admission(deadline).await?;
+        let mut client = self.guarded(deadline).await?;
+        let tx = client
+            .begin_read_committed()
+            .await
+            .map_err(|_| unavailable())?;
+        let binding = ProviderIncarnationBinding::Dynamic {
+            provider_internal_id: routed.internal_id,
+        };
+        // Row lock and admission stay held through discovery and the attempt write.
+        let loaded = self
+            .store
+            .load_bound_in_transaction(
+                tx.as_transaction(),
+                &routed.provider_id,
+                &binding,
+                &admission,
+            )
+            .await?
+            .ok_or(DynamicSsoError::ProviderUnknown)?;
+        let started = match routed.protocol {
             SsoProtocol::Oidc => {
-                let runtime = self
-                    .load_oidc_runtime_bound(&routed.provider_id, routed.internal_id)
-                    .await?
-                    .ok_or(DynamicSsoError::ProviderUnknown)?;
+                let runtime = self.discover_loaded_oidc(loaded).await?;
                 let coordinator = self.oidc_coordinator([runtime])?;
                 coordinator
                     .start(&routed.provider_id, now, peer_ip)
                     .await
-                    .map(DynamicSsoStart::Oidc)
-                    .map_err(Into::into)
+                    .map(DynamicSsoStart::Oidc)?
             }
             SsoProtocol::Saml => {
-                let runtime = self
-                    .load_saml_runtime(&routed.provider_id, now)
-                    .await?
-                    .ok_or(DynamicSsoError::ProviderUnknown)?;
-                if runtime.internal_id != routed.internal_id {
-                    return Err(SsoEphemeralError::Mismatch.into());
-                }
+                let runtime = self.saml_runtime(loaded, now)?;
                 let request_id = SamlRuntime::fresh_request_id();
                 let relay_state = self
                     .saml_attempts
@@ -435,10 +482,14 @@ impl DynamicSsoService {
                 runtime
                     .runtime
                     .begin(request_id, relay_state, now)
-                    .map(DynamicSsoStart::Saml)
-                    .map_err(Into::into)
+                    .map(DynamicSsoStart::Saml)?
             }
-        }
+        };
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
+        tx.commit().await.map_err(|_| unavailable())?;
+        Ok(started)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -451,22 +502,47 @@ impl DynamicSsoService {
         peer_ip: &str,
         user_agent: Option<&str>,
     ) -> Result<crate::auth::oidc::IssuedSession, DynamicSsoError> {
+        let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
         let coordinator = self.oidc_coordinator([])?;
         let attempt = coordinator
             .begin_callback(provider, state, now, peer_ip)
             .await?;
-        let ProviderIncarnationBinding::Dynamic {
-            provider_internal_id,
-        } = attempt.incarnation()
-        else {
-            return Err(SsoEphemeralError::Mismatch.into());
-        };
-        let runtime = self
-            .load_oidc_runtime_bound(provider, provider_internal_id)
+        let binding = attempt.incarnation();
+        let admission = self.admission(deadline).await?;
+        let mut client = self.guarded(deadline).await?;
+        let tx = client
+            .begin_read_committed()
+            .await
+            .map_err(|_| unavailable())?;
+        let loaded = self
+            .store
+            .load_bound_in_transaction(tx.as_transaction(), provider, &binding, &admission)
             .await?
             .ok_or(DynamicSsoError::ProviderUnknown)?;
+        let expected = loaded.internal_id;
+        let runtime = self.discover_loaded_oidc(loaded).await?;
         let callback = dynamic_oidc_callback(&self.public_url, provider)?;
-        coordinator
+        // After the token/JWKS responses and before the session: the same
+        // admission and the locked row's id must still be current.
+        let recheck = async {
+            if admission.verify_current_before(deadline).is_err() {
+                return Err(OidcLoginError::from(
+                    PostgresAttemptError::DependencyUnavailable,
+                ));
+            }
+            match self
+                .store
+                .current_id_in_transaction(tx.as_transaction(), provider)
+                .await
+            {
+                Ok(Some(current)) if current == expected => Ok(()),
+                Ok(_) => Err(OidcLoginError::from(PostgresAttemptError::ProviderMismatch)),
+                Err(_) => Err(OidcLoginError::from(
+                    PostgresAttemptError::DependencyUnavailable,
+                )),
+            }
+        };
+        let issued = coordinator
             .finish_callback(
                 &runtime,
                 attempt,
@@ -475,9 +551,11 @@ impl DynamicSsoService {
                 now,
                 peer_ip,
                 user_agent,
+                recheck,
             )
-            .await
-            .map_err(Into::into)
+            .await?;
+        tx.commit().await.map_err(|_| unavailable())?;
+        Ok(issued)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -490,6 +568,7 @@ impl DynamicSsoService {
         peer_ip: &str,
         user_agent: Option<&str>,
     ) -> Result<crate::auth::oidc::IssuedSession, DynamicSsoError> {
+        let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
         if !self
             .rate_limiter
             .evaluate(
@@ -509,13 +588,22 @@ impl DynamicSsoService {
             .saml_attempts
             .consume(relay_state, provider, now)
             .await?;
-        let runtime = self
-            .load_saml_runtime(provider, now)
+        let admission = self.admission(deadline).await?;
+        let mut client = self.guarded(deadline).await?;
+        let tx = client
+            .begin_read_committed()
+            .await
+            .map_err(|_| unavailable())?;
+        let binding = ProviderIncarnationBinding::Dynamic {
+            provider_internal_id: attempt.internal_id,
+        };
+        // The burned binding is compared under the row lock, before the runtime loads.
+        let loaded = self
+            .store
+            .load_bound_in_transaction(tx.as_transaction(), provider, &binding, &admission)
             .await?
             .ok_or(DynamicSsoError::ProviderUnknown)?;
-        if runtime.internal_id != attempt.internal_id {
-            return Err(SsoEphemeralError::Mismatch.into());
-        }
+        let runtime = self.saml_runtime(loaded, now)?;
         let verified = runtime.runtime.verify_response(
             encoded_response,
             &attempt.request_id,
@@ -531,7 +619,11 @@ impl DynamicSsoService {
                 now,
             )
             .await?;
-        self.sessions
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
+        let issued = self
+            .sessions
             .issue_federated(
                 &verified.identity,
                 &verified.provider,
@@ -540,8 +632,9 @@ impl DynamicSsoService {
                 user_agent,
             )
             .await
-            .map_err(OidcLoginError::from)
-            .map_err(Into::into)
+            .map_err(OidcLoginError::from)?;
+        tx.commit().await.map_err(|_| unavailable())?;
+        Ok(issued)
     }
 
     pub async fn saml_metadata(
@@ -549,12 +642,21 @@ impl DynamicSsoService {
         provider: &ProviderId,
         now: OffsetDateTime,
     ) -> Result<String, DynamicSsoError> {
-        self.load_saml_runtime(provider, now)
+        let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
+        let admission = self.admission(deadline).await?;
+        let mut client = self.guarded(deadline).await?;
+        let tx = client
+            .begin_read_committed()
+            .await
+            .map_err(|_| unavailable())?;
+        let loaded = self
+            .store
+            .load_current_in_transaction(tx.as_transaction(), provider, &admission)
             .await?
-            .ok_or(DynamicSsoError::ProviderUnknown)?
-            .runtime
-            .metadata_xml()
-            .map_err(Into::into)
+            .ok_or(DynamicSsoError::ProviderUnknown)?;
+        let metadata = self.saml_runtime(loaded, now)?.runtime.metadata_xml()?;
+        tx.commit().await.map_err(|_| unavailable())?;
+        Ok(metadata)
     }
 
     async fn preflight(
@@ -610,32 +712,25 @@ impl DynamicSsoService {
         Ok(())
     }
 
-    async fn load_oidc_runtime(
+    async fn admission(
         &self,
-        provider: &ProviderId,
-    ) -> Result<Option<OidcProviderRuntime>, DynamicSsoError> {
-        let Some(loaded) = self.store.load(provider).await? else {
-            return Ok(None);
-        };
-        self.discover_loaded_oidc(loaded).await.map(Some)
+        deadline: Instant,
+    ) -> Result<CurrentProviderAdmission<'_>, DynamicSsoError> {
+        self.recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| unavailable())
     }
 
-    async fn load_oidc_runtime_bound(
+    async fn guarded(
         &self,
-        provider: &ProviderId,
-        expected_incarnation: Uuid,
-    ) -> Result<Option<OidcProviderRuntime>, DynamicSsoError> {
-        if expected_incarnation.is_nil() {
-            return Err(SsoEphemeralError::Mismatch.into());
-        }
-        let Some(loaded) = self.store.load(provider).await? else {
-            return Ok(None);
-        };
-        // This DATA comparison precedes discovery; the same-transaction Current gate is separate.
-        if loaded.internal_id != expected_incarnation {
-            return Err(SsoEphemeralError::Mismatch.into());
-        }
-        self.discover_loaded_oidc(loaded).await.map(Some)
+        deadline: Instant,
+    ) -> Result<crate::db::pool::GuardedClient, DynamicSsoError> {
+        self.store
+            .pool()
+            .get_guarded(deadline)
+            .await
+            .map_err(|_| unavailable())
     }
 
     async fn discover_loaded_oidc(
@@ -669,14 +764,11 @@ impl DynamicSsoService {
         .map_err(Into::into)
     }
 
-    async fn load_saml_runtime(
+    fn saml_runtime(
         &self,
-        provider: &ProviderId,
+        loaded: LoadedDynamicProvider,
         now: OffsetDateTime,
-    ) -> Result<Option<LoadedSamlRuntime>, DynamicSsoError> {
-        let Some(loaded) = self.store.load(provider).await? else {
-            return Ok(None);
-        };
+    ) -> Result<LoadedSamlRuntime, DynamicSsoError> {
         let DecodedSecretConfig::Saml(config) = loaded.config else {
             return Err(DynamicSsoError::ProtocolMismatch);
         };
@@ -689,11 +781,9 @@ impl DynamicSsoService {
             &self.public_url,
             now,
         )
-        .map(|runtime| {
-            Some(LoadedSamlRuntime {
-                runtime,
-                internal_id,
-            })
+        .map(|runtime| LoadedSamlRuntime {
+            runtime,
+            internal_id,
         })
         .map_err(|_| DynamicSsoStoreError::Corrupt.into())
     }
@@ -766,4 +856,8 @@ impl SamlSecretConfigCopy {
             group_normalization: config.group_normalization,
         }
     }
+}
+
+fn unavailable() -> DynamicSsoError {
+    DynamicSsoStoreError::DependencyUnavailable.into()
 }

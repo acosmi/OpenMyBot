@@ -42,6 +42,10 @@ pub const DEFAULT_JWKS_COOLDOWN: Duration = Duration::minutes(1);
 pub const DEFAULT_METADATA_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TOKEN_MAX_BYTES: usize = 64 * 1024;
 pub const DEFAULT_IDP_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+/// One dynamic SSO login flow's single absolute deadline: the sum of
+/// its three steps, discovery or JWKS, token exchange, and DB plus session
+/// issuance. Each step's own budget is unchanged; expiry is closed.
+pub const DYNAMIC_SSO_LOGIN_BUDGET: core::time::Duration = DEFAULT_IDP_TIMEOUT.saturating_mul(3);
 const MAX_AUTHORIZATION_CODE_BYTES: usize = 8 * 1024;
 const LOGIN_START_RATE: RateLimitPolicy = RateLimitPolicy::new(20, Duration::minutes(1));
 const CALLBACK_RATE: RateLimitPolicy = RateLimitPolicy::new(60, Duration::minutes(1));
@@ -150,7 +154,8 @@ impl OidcProviderRuntime {
         dialer: &SafeDialer,
         budget: FetchBudget,
     ) -> Result<Self, OidcError> {
-        if config.origin() != ProviderOrigin::DynamicallyRegistered || provider_internal_id.is_nil() {
+        if config.origin() != ProviderOrigin::DynamicallyRegistered || provider_internal_id.is_nil()
+        {
             return Err(OidcError::ProviderUnknown);
         }
         Self::discover_with_binding(
@@ -346,6 +351,7 @@ impl OidcLoginCoordinator {
             now,
             peer_ip,
             user_agent,
+            std::future::ready(Ok(())),
         )
         .await
     }
@@ -374,6 +380,8 @@ impl OidcLoginCoordinator {
     }
 
     /// 已烧 state 后完成 redirect/code/token/JWKS/claims/session；动态 IdP 复用这一半。
+    /// `before_issue` is a lazy future awaited after every network response and
+    /// before the session: the dynamic caller re-checks its current id (spec 8.4).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_callback(
         &self,
@@ -384,8 +392,10 @@ impl OidcLoginCoordinator {
         now: OffsetDateTime,
         peer_ip: &str,
         user_agent: Option<&str>,
+        before_issue: impl Future<Output = Result<(), OidcLoginError>> + Send,
     ) -> Result<IssuedSession, OidcLoginError> {
-        if attempt.provider() != runtime.config.id() || attempt.incarnation() != runtime.incarnation {
+        if attempt.provider() != runtime.config.id() || attempt.incarnation() != runtime.incarnation
+        {
             return Err(PostgresAttemptError::ProviderMismatch.into());
         }
         attempt
@@ -452,6 +462,7 @@ impl OidcLoginCoordinator {
             &nonce,
             runtime.group_mapping.as_ref(),
         )?;
+        before_issue.await?;
         self.sessions
             .issue(
                 &identity,

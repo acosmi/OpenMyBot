@@ -17,6 +17,7 @@ use super::config::{
     validate_saml_entity_id, validated_issuer,
 };
 use super::vault::{SsoConfigVault, SsoSecretColumn, SsoVaultError};
+use crate::auth::oidc::attempt::ProviderIncarnationBinding;
 use crate::auth::oidc::{EmailDomain, ProviderId};
 use crate::repo::audit::{append_event_in_transaction, next_event_coordinates};
 use crate::repo::people_admin::{advance_generation, lock_people};
@@ -74,6 +75,9 @@ impl core::fmt::Debug for LoadedDynamicProvider {
             .finish()
     }
 }
+
+/// The current admission a dynamic SSO callback or request holds.
+pub(crate) type CurrentProviderAdmission<'a> = crate::recovery_control::RecoveryWorkerLease<'a>;
 
 #[derive(Clone)]
 pub(crate) struct DynamicSsoStore {
@@ -268,18 +272,19 @@ impl DynamicSsoStore {
         Ok(matched)
     }
 
-    pub(crate) async fn load(
+    /// Lock the row under the caller's GuardedRC transaction and still-current
+    /// admission; when `expected` is given, a different current id is `None`.
+    /// The provider's confirmed requirement is checked before its secret opens.
+    async fn load_admitted(
         &self,
+        transaction: &Transaction<'_>,
         provider: &ProviderId,
+        expected: Option<Uuid>,
+        admission: &CurrentProviderAdmission<'_>,
     ) -> Result<Option<LoadedDynamicProvider>, DynamicSsoStoreError> {
-        let mut client = self
-            .pool
-            .get()
-            .await
-            .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
-        let transaction = client
-            .transaction()
-            .await
+        let deadline = admission.deadline();
+        admission
+            .verify_current_before(deadline)
             .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
         let row = transaction
             .query_opt(
@@ -289,19 +294,80 @@ impl DynamicSsoStore {
             )
             .await
             .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
-        let Some(row) = row else {
-            transaction
-                .commit()
-                .await
-                .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
+        let Some(row) = row else { return Ok(None) };
+        let current: String = get(&row, "id")?;
+        if expected.is_some_and(|expected| expected.to_string() != current) {
+            return Ok(None);
+        }
+        crate::restore_reconfirmation::require_confirmed_before(
+            transaction,
+            crate::restore_reconfirmation::RequirementSource {
+                cohort: admission.restore_cohort(),
+                kind: crate::restore_reconfirmation::RequirementKind::SsoProvider,
+                source_ref: &current,
+            },
+            deadline,
+        )
+        .await
+        .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
+        self.load_locked(transaction, &row).await.map(Some)
+    }
+
+    /// Spec 8.4: the burned attempt/route/SAML binding names the dynamic row
+    /// incarnation that must still be current inside this transaction.
+    pub(crate) async fn load_bound_in_transaction(
+        &self,
+        tx: &Transaction<'_>,
+        provider: &ProviderId,
+        expected: &ProviderIncarnationBinding,
+        admission: &CurrentProviderAdmission<'_>,
+    ) -> Result<Option<LoadedDynamicProvider>, DynamicSsoStoreError> {
+        let ProviderIncarnationBinding::Dynamic {
+            provider_internal_id,
+        } = expected
+        else {
             return Ok(None);
         };
-        let loaded = self.load_locked(&transaction, &row).await?;
-        transaction
-            .commit()
+        self.load_admitted(tx, provider, Some(*provider_internal_id), admission)
+            .await
+    }
+
+    /// The current row when no burned binding exists yet (email routing,
+    /// metadata, startup preflight); its own id becomes the issued binding.
+    pub(crate) async fn load_current_in_transaction(
+        &self,
+        tx: &Transaction<'_>,
+        provider: &ProviderId,
+        admission: &CurrentProviderAdmission<'_>,
+    ) -> Result<Option<LoadedDynamicProvider>, DynamicSsoStoreError> {
+        self.load_admitted(tx, provider, None, admission).await
+    }
+
+    /// Re-read the locked row's id after a network response (spec 8.4 X4).
+    pub(crate) async fn current_id_in_transaction(
+        &self,
+        tx: &Transaction<'_>,
+        provider: &ProviderId,
+    ) -> Result<Option<Uuid>, DynamicSsoStoreError> {
+        let row = tx
+            .query_opt(
+                "SELECT id FROM public.sso_providers WHERE provider_id=$1",
+                &[&provider.as_str()],
+            )
             .await
             .map_err(|_| DynamicSsoStoreError::DependencyUnavailable)?;
-        Ok(Some(loaded))
+        row.map(|row| {
+            let raw: String = get(&row, "id")?;
+            Uuid::parse_str(&raw).map_err(|_| DynamicSsoStoreError::Corrupt)
+        })
+        .transpose()
+    }
+
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
     }
 
     pub(crate) async fn register(
@@ -385,7 +451,9 @@ impl DynamicSsoStore {
         };
         if update {
             let prior_id: String = get(
-                existing.as_ref().ok_or(DynamicSsoStoreError::ProviderUnknown)?,
+                existing
+                    .as_ref()
+                    .ok_or(DynamicSsoStoreError::ProviderUnknown)?,
                 "id",
             )?;
             let replacement_id = Uuid::now_v7().to_string();
@@ -518,8 +586,8 @@ impl DynamicSsoStore {
         row: &Row,
     ) -> Result<LoadedDynamicProvider, DynamicSsoStoreError> {
         let internal_raw: String = get(row, "id")?;
-        let internal_id = Uuid::parse_str(&internal_raw)
-            .map_err(|_| DynamicSsoStoreError::Corrupt)?;
+        let internal_id =
+            Uuid::parse_str(&internal_raw).map_err(|_| DynamicSsoStoreError::Corrupt)?;
         if internal_id.is_nil() || internal_id.to_string() != internal_raw {
             return Err(DynamicSsoStoreError::Corrupt);
         }
