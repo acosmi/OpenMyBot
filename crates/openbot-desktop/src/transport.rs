@@ -917,10 +917,16 @@ impl InProcessTransport {
     /// then its upstream pump is cancelled. Returning `true` therefore proves that the route is no
     /// longer eligible for delivery; callers do not need to wait for another upstream event.
     pub fn close_session(&self, label: &WindowLabel) -> bool {
-        let (mut pumps, poisoned) = match self.pumps.lock() {
+        let (pumps, poisoned) = match self.pumps.lock() {
             Ok(pumps) => (pumps, false),
             Err(poisoned) => (poisoned.into_inner(), true),
         };
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        let mut pumps = pumps;
         #[cfg(all(
             feature = "desktop-launcher",
             feature = "postgres-maintenance",
