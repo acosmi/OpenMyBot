@@ -47,7 +47,7 @@ grep -qxF 'tauri = { version = "=2.11.5", default-features = false, features = [
 grep -qxF 'sys-locale = "=0.3.2"' Cargo.toml || fail 'sys-locale exact pin drifted'
 grep -qxF 'tauri-build = { version = "=2.6.3", default-features = false, features = ["config-json"] }' Cargo.toml \
   || fail 'macOS launcher context generator exact pin drifted'
-grep -qxF 'desktop-launcher = ["desktop-local-runtime", "dep:tauri-build"]' \
+grep -qxF 'desktop-launcher = ["desktop-local-runtime", "postgres-maintenance", "dep:tauri-build"]' \
   crates/openbot-desktop/Cargo.toml || fail 'macOS launcher feature boundary drifted'
 grep -qxF 'tauri-build = { workspace = true, optional = true }' \
   crates/openbot-desktop/Cargo.toml || fail 'macOS context generator must be optional and inherited'

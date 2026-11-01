@@ -60,6 +60,7 @@ expected_callers_list=(
   crates/openbot-desktop/src/tauri_host/approval_preference_local_tests.rs # 测试夹具 PR #147
   crates/openbot-infra/src/artifact_read_authority/save_receipt_tests.rs # 测试夹具 PR #141
   crates/openbot-infra/src/artifact_read_authority/tests.rs # 测试夹具 PR #131
+  crates/openbot-infra/src/db/pool/owner.rs # V7-IMPL-045 R475-B：mod capture_io 只惰性连接原 127.0.0.1:port 本机 socket
   crates/openbot-infra/src/mcp/selected_target_tests.rs # 测试夹具 PR #118
   crates/openbot-infra/src/net/safe_http.rs
   crates/openbot-infra/src/provider/custom.rs # 测试夹具 mod v2_vault_tests，PR #171

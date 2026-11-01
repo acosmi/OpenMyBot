@@ -22,6 +22,9 @@
 pub mod archive_bundle;
 pub mod checked_fs;
 pub mod staging;
+/// Original-owner bounded whole-PG carrier transport, separate from legacy archive/staging.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub mod whole_pg_capture_stream;
 
 #[cfg(test)]
 mod tests;

@@ -712,6 +712,37 @@ def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) 
         raise GuardError("the transport deadline result no longer gates non-database success")
 
 
+# `#[cfg(all(feature = "…", feature = "…", target_os = "…"))]` after literal blanking: the
+# armed normal-exit capture gate (desktop-launcher, postgres-maintenance, macOS).
+CAPTURE_CFG = (
+    "#", "[", "cfg", "(", "all", "(", "feature", "=", ",", "feature", "=", ",",
+    "target_os", "=", ")", ")", "]",
+)
+CAPTURE_BRANCH = (
+    *CAPTURE_CFG, "if", "let", "Some", "(", "ready", ")", "=",
+    "job", ".", "normal_ready", ".", "take", "(", ")", "{",
+)
+
+
+def _without_capture_branch(run: list[str]) -> list[str]:
+    """Remove the one cfg-gated armed capture branch that precedes the ordinary staged path.
+
+    The branch must be the first statement, hand the original job to the reviewed capture entry
+    exactly once and end the job itself; the ordinary path after it is checked unchanged.
+    """
+
+    if not _matches(run, 0, CAPTURE_BRANCH):
+        raise GuardError("armed capture branch is not the first cfg-gated job statement")
+    close = _paired(run, len(CAPTURE_BRANCH) - 1, "{", "}")
+    branch = run[len(CAPTURE_BRANCH):close]
+    entry = (
+        "capture", "::", "run_normal_exit_capture", "(", "&", "mut", "job", ",", "ready", ")",
+    )
+    if len(_find_all(branch, entry)) != 1 or branch[-2:] != ["return", ";"]:
+        raise GuardError("armed capture branch no longer owns the job through one capture entry")
+    return run[close + 1:]
+
+
 def _check_owner_closing(tokens: list[str]) -> None:
     """The production owner hands itself to one spawned, staged closing job."""
 
@@ -771,6 +802,20 @@ def _check_owner_closing(tokens: list[str]) -> None:
     authority_binding = _binding(start, authority_call)
     if authority_binding is None:
         raise GuardError("authority revocation result binding is missing")
+    # Only an armed normal-exit capture skips revocation; it persists Intent first and its own
+    # job revokes nothing else. Without the capture gate the flag is the literal false.
+    authority_statement = start[authority_binding[1]:start.index(";", authority_call) + 1]
+    capturing_flags = [
+        start[max(at for at in range(index) if start[at] == "#"):start.index(";", index) + 1]
+        for index in _find_all(start, ("let", "capturing", "="))
+    ]
+    if authority_statement[3:5] != ["capturing", "||"] or capturing_flags != [
+        [*CAPTURE_CFG, "let", "capturing", "=", "normal_ready", ".", "is_some", "(", ")", "&&",
+         "owner", ".", "capture_armed", ".", "is_some", "(", ")", ";"],
+        ["#", "[", "cfg", "(", "not", *CAPTURE_CFG[3:-1], ")", "]",
+         "let", "capturing", "=", "false", ";"],
+    ]:
+        raise GuardError("authority revocation is skipped outside the armed capture gate")
     spawn_at = _unique(
         start, ("spawn", "(", "run_owned_local_closing_job", "("), "owned closing job spawn"
     )
@@ -792,7 +837,7 @@ def _check_owner_closing(tokens: list[str]) -> None:
     }
     deadline_field = fields.get("deadline", [])
     if (
-        fields.get("owner") != ["owner"]
+        fields.get("owner") != ["Some", "(", "owner", ")"]
         or len(deadline_field) != 1
         or _origin(start, deadline_field[0], literal_at) != ("deadline", deadline_at)
     ):
@@ -804,8 +849,10 @@ def _check_owner_closing(tokens: list[str]) -> None:
         raise GuardError("authority revocation result no longer gates shutdown success")
 
     # Job: deadline-bounded non-database stage, then the independent database stage.
-    run = _block_after(
-        tokens, ("async", "fn", "run_owned_local_closing_job", "("), "owned closing job"
+    run = _without_capture_branch(
+        _block_after(
+            tokens, ("async", "fn", "run_owned_local_closing_job", "("), "owned closing job"
+        )
     )
     depths = _brace_depths(run)
     pattern_at = _unique(run, ("let", "DesktopLocalClosingJob", "{"), "owned job destructuring")
