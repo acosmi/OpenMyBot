@@ -530,6 +530,7 @@ fn http_route_of(command: &AppCommand) -> Option<String> {
         | AppCommand::GetRunEffectReceipts { .. }
         | AppCommand::SaveRunMessageTextArtifact(_)
         | AppCommand::GetArtifactMetadata(_)
+        | AppCommand::DeleteArtifact { .. }
         | AppCommand::GetSourceRunArtifactIds(_)
         | AppCommand::GetArtifactSaveReceipt(_)
         | AppCommand::OpenArtifactRead(_)

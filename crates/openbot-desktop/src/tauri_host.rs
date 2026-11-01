@@ -9076,3 +9076,7 @@ mod thread_history_stop_clear_local_tests;
 #[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
 #[path = "tauri_host/thread_history_deletion_local_tests.rs"]
 mod thread_history_deletion_local_tests;
+
+#[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
+#[path = "tauri_host/artifact_deletion_local_tests.rs"]
+mod artifact_deletion_local_tests;

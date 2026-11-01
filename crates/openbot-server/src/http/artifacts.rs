@@ -1,13 +1,14 @@
-//! Explicit user-message saves and current metadata through the one ApplicationService.
+//! Explicit user-message saves, current metadata and saved-owner deletions through the one
+//! ApplicationService.
 
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
-use http::{HeaderMap, HeaderValue, Uri, header::CACHE_CONTROL};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri, header::CACHE_CONTROL};
 use openbot_contracts::artifacts::{
-    ArtifactMetadata, ArtifactRegistrationReceipt, GetArtifactMetadata, GetSourceRunArtifactIds,
-    SaveRunMessageTextArtifact, SourceRunArtifactIds,
+    ArtifactDeletionReceipt, ArtifactDeletionState, ArtifactMetadata, ArtifactRegistrationReceipt,
+    GetArtifactMetadata, GetSourceRunArtifactIds, SaveRunMessageTextArtifact, SourceRunArtifactIds,
 };
 use openbot_contracts::command::{AppCommand, AppReply};
 use openbot_contracts::error::AppError;
@@ -63,6 +64,42 @@ pub async fn metadata(
         .await?
     {
         AppReply::ArtifactMetadata(metadata) => Ok((no_store(), Json(metadata))),
+        _ => Err(AppError::DependencyUnavailable {
+            dependency: "application",
+        }
+        .into()),
+    }
+}
+
+/// `DELETE /api/artifacts/{artifact_id}`: one bounded step of the saving owner's deletion, a
+/// sensitive write like the save. A pending deletion is 202 and resumed by resending the same
+/// request; a deleted one is 200, after which a resend is 409 for the owner.
+pub async fn delete(
+    State(state): State<ServerState>,
+    FreshOriginAuthenticated(auth): FreshOriginAuthenticated,
+    id: Result<Path<String>, PathRejection>,
+    uri: Uri,
+    body: Bytes,
+) -> Result<(StatusCode, HeaderMap, Json<ArtifactDeletionReceipt>), HttpError> {
+    closed_query(&uri)?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    let Path(artifact_id) = id.map_err(|_| AppError::MalformedPayload {
+        field: "artifact_id",
+    })?;
+    match state
+        .application()
+        .execute(auth, AppCommand::DeleteArtifact { artifact_id })
+        .await?
+    {
+        AppReply::ArtifactDeletion(receipt) => {
+            let status = match receipt.state {
+                ArtifactDeletionState::Pending => StatusCode::ACCEPTED,
+                ArtifactDeletionState::Deleted => StatusCode::OK,
+            };
+            Ok((status, no_store(), Json(receipt)))
+        }
         _ => Err(AppError::DependencyUnavailable {
             dependency: "application",
         }
