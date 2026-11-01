@@ -50,6 +50,10 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), S
     native::apply(&mut client)
         .await
         .map_err(|error| error.to_string())?;
+    seed(&client).await
+}
+
+async fn seed(client: &tokio_postgres::Client) -> Result<(), String> {
     let now = OffsetDateTime::from_unix_timestamp(NOW).unwrap();
     client
         .execute(
@@ -315,6 +319,68 @@ async fn dynamic_saml_is_encrypted_replay_safe_and_delete_cleans_account_anchors
                 return Err("删除 provider 未原子清 provider/account/session/audit".to_owned());
             }
             Ok(())
+        }
+        .await;
+        pool.close();
+        outcome
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires real PostgreSQL and xmlsec1; set OPENBOT_TEST_DATABASE_URL and pass --include-ignored"]
+async fn native_0053_gives_legacy_provider_ids_a_uuid_without_touching_configuration() {
+    let admin =
+        admin_config("native_0053_gives_legacy_provider_ids_a_uuid_without_touching_configuration");
+    with_temp_database(&admin, "dynamic_sso_0053", |config| async move {
+        let pool = pool::connect(&config).await.map_err(|error| error.to_string())?;
+        let outcome = async {
+            let mut client = pool.get().await.map_err(|error| error.to_string())?;
+            baseline::apply(&client)
+                .await
+                .map_err(|error| error.to_string())?;
+            native::apply_through(&mut client, native::NATIVE_0052_VERSION)
+                .await
+                .map_err(|error| error.to_string())?;
+            let legacy = serde_json::json!({
+                "entryPoint": "https://idp.example/sso",
+                "idpMetadata": {"metadata": metadata()},
+                "emailAttribute": "email",
+                "groupAttribute": "groups",
+                "groupNormalization": "trim_lowercase"
+            })
+            .to_string();
+            client
+                .execute(
+                    "INSERT INTO public.sso_providers( \
+                       id,issuer,oidc_config,saml_config,user_id,provider_id,organization_id,domain) \
+                     VALUES('legacy','urn:example:idp:directory',NULL,$1,NULL,'legacy-saml',NULL,'legacy.example')",
+                    &[&legacy],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            native::apply(&mut client)
+                .await
+                .map_err(|error| error.to_string())?;
+            let row = client
+                .query_one(
+                    "SELECT id,saml_config FROM public.sso_providers WHERE provider_id='legacy-saml'",
+                    &[],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let id: String = row.try_get(0).map_err(|error| error.to_string())?;
+            let saml: String = row.try_get(1).map_err(|error| error.to_string())?;
+            let parsed = uuid::Uuid::parse_str(&id).map_err(|error| error.to_string())?;
+            if parsed.is_nil() || parsed.hyphenated().to_string() != id || saml != legacy {
+                return Err(format!("0053 did not give one non-nil UUID id: {id}"));
+            }
+            seed(&client).await?;
+            drop(client);
+            service(&pool)
+                .preflight_all(OffsetDateTime::from_unix_timestamp(NOW).unwrap())
+                .await
+                .map_err(|error| error.to_string())
         }
         .await;
         pool.close();

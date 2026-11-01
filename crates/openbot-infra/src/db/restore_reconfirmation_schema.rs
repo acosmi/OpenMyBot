@@ -24,8 +24,8 @@ original_owner AS (
  WHERE n.nspname='public' AND c.relname='threads' AND c.relkind='r'
 ), relations AS (
  SELECT c.* FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
- WHERE n.nspname='openbot_internal' AND pg_catalog.left(c.relname,8)='restore_'
-  AND c.relkind NOT IN('i','I','S','t')
+ WHERE n.nspname='openbot_internal' AND (pg_catalog.left(c.relname,8)='restore_'
+   OR c.relname='server_kek_canaries') AND c.relkind NOT IN('i','I','S','t')
 ), functions AS (
  SELECT p.* FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
  WHERE n.nspname='openbot_internal' AND pg_catalog.left(p.proname,10)='restore53_'
@@ -74,7 +74,7 @@ original_owner AS (
    WHERE n.nspname='openbot_internal' AND n.nspowner=o.owner) AND
   pg_catalog.getdatabaseencoding()='UTF8' AND
   pg_catalog.current_setting('server_version_num')::integer BETWEEN 170000 AND 179999 AND
-  (SELECT pg_catalog.count(*)=5 FROM relations) AND
+  (SELECT pg_catalog.count(*)=6 FROM relations) AND
   NOT EXISTS(SELECT 1 FROM relations c,original_owner o WHERE
    c.relowner<>o.owner OR c.relkind<>'r' OR c.relpersistence<>'p' OR
    c.relam<>(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap' AND amtype='t') OR c.relrowsecurity OR c.relforcerowsecurity OR
@@ -172,7 +172,7 @@ fn expected() -> Result<Value, InfraError> {
             .is_none_or(|object| object.len() != 2)
         || value["schema"]["tables"]
             .as_array()
-            .is_none_or(|rows| rows.len() != 5)
+            .is_none_or(|rows| rows.len() != 6)
         || value["schema"]["functions"]
             .as_array()
             .is_none_or(|rows| rows.len() != 2)

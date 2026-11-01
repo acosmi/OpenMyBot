@@ -1,9 +1,9 @@
 //! Native0051 body writers on current0052, with explicit historical0051 PostgreSQL17.11 checks.
 //! Internal metadata and permanent IDs; this suite grants no current Host or ACK.
 #![cfg(feature = "server-runtime")]
+mod harness;
 #[path = "support/recovery_admission.rs"]
 mod recovery_admission;
-mod harness;
 use async_trait::async_trait;
 use openbot_application::model_connections::ModelConnectionAdministration;
 use openbot_application::provider::{
@@ -89,7 +89,7 @@ include!("support/thread_history_writer_schema_fixture.rs");
 async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
     // The delivered function identity is retained; this candidate runs its compatibility
     // assertions on current52 and explicitly proves the unchanged historical51 branch first.
-    for prior in [50, 51, 52] {
+    for prior in [50, 51, native::NATIVE_LATEST_VERSION] {
         owned(&format!("writer51graph{prior}"),move|p,_|async move {
             initialize(&p,prior).await?;
             let mut c=p.get().await.map_err(|e|e.to_string())?;
@@ -99,7 +99,7 @@ async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
                 require(pure["schema"]["relations"]==old["schema"]["relations"],"explicit0050 relations altered before upgrade")?;
             }
             if prior==51 { writer_check_legacy51(&mut c).await?; }
-            if prior<52 {
+            if prior<native::NATIVE_LATEST_VERSION {
                 require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"real historical to52 upgrade was not applied")?;
             }
             writer_check(&c).await?;

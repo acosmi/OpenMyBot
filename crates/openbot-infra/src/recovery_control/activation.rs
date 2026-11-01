@@ -86,17 +86,41 @@ enum ActivationSiteBinding {
 
 /// Fixed-length lowercase hexadecimal text, checked once when decoded.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct HexText<const N: usize, const NONZERO: bool>([u8; N]);
+pub(crate) struct HexText<const N: usize, const NONZERO: bool>([u8; N]);
 /// 32 hex digits, never all zero: operation, control and generation IDs.
-pub(super) type Hex32 = HexText<32, true>;
+pub(crate) type Hex32 = HexText<32, true>;
 /// 64 hex digits: SHA-256 digests.
 pub(super) type Hex64 = HexText<64, false>;
 
 impl<const N: usize, const NONZERO: bool> HexText<N, NONZERO> {
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         std::str::from_utf8(&self.0).expect("decoded lowercase hex is ASCII")
     }
+
+    /// Check text once where it enters; afterwards only the type flows.
+    pub(crate) fn parse(text: &str) -> Result<Self, RecoveryControlError> {
+        hex(text, N, NONZERO)?;
+        let mut bytes = [0; N];
+        bytes.copy_from_slice(text.as_bytes());
+        Ok(Self(bytes))
+    }
 }
+impl<const N: usize, const NONZERO: bool> HexText<N, NONZERO> {
+    /// Encode freshly minted entropy; all-zero bytes are rejected.
+    pub(crate) fn mint(bytes: &[u8]) -> Result<Self, RecoveryControlError> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        if bytes.len() * 2 != N || bytes.iter().all(|b| *b == 0) {
+            return Err(invalid());
+        }
+        let mut text = [0u8; N];
+        for (pair, byte) in text.chunks_exact_mut(2).zip(bytes) {
+            pair[0] = DIGITS[usize::from(byte >> 4)];
+            pair[1] = DIGITS[usize::from(byte & 15)];
+        }
+        Ok(Self(text))
+    }
+}
+
 impl Hex64 {
     pub(super) fn of(bytes: &[u8; 32]) -> Self {
         let mut text = [0; 64];
@@ -123,11 +147,7 @@ impl<'de, const N: usize, const NONZERO: bool> Deserialize<'de> for HexText<N, N
                 write!(f, "exactly {N} lowercase hexadecimal characters")
             }
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                hex(value, N, NONZERO)
-                    .map_err(|_| E::custom("invalid lowercase hexadecimal text"))?;
-                let mut bytes = [0; N];
-                bytes.copy_from_slice(value.as_bytes());
-                Ok(HexText(bytes))
+                HexText::parse(value).map_err(|_| E::custom("invalid lowercase hexadecimal text"))
             }
         }
         deserializer.deserialize_str(Visitor::<N, NONZERO>)
@@ -197,12 +217,12 @@ pub(super) struct OrdinaryStartupBounds {
 // connection. Its actual producer and Current consumer remain separate gates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct ServerDatabaseSite {
-    pub(super) pg_system_id: u64,
-    pub(super) database_oid: u32,
-    pub(super) pg_major: u32,
-    pub(super) authenticated_principal: String,
-    pub(super) database_owner: String,
+pub(crate) struct ServerDatabaseSite {
+    pub(crate) pg_system_id: u64,
+    pub(crate) database_oid: u32,
+    pub(crate) pg_major: u32,
+    pub(crate) authenticated_principal: String,
+    pub(crate) database_owner: String,
 }
 impl ServerDatabaseSite {
     fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
@@ -225,6 +245,18 @@ fn invalid() -> RecoveryControlError {
     RecoveryControlError::new(RecoveryControlFault::ControlInvalid)
 }
 
+/// Bound native versions: the strict-prior version this binary upgrades from
+/// through the latest version it knows.
+pub(super) fn supported_native_version(version: u32) -> Result<(), RecoveryControlError> {
+    let floor = crate::db::native::NATIVE_0052_VERSION.unsigned_abs();
+    let latest = crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs();
+    if (floor..=latest).contains(&version) {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
 pub(super) struct OrdinaryServerBinding<'a> {
     pub(super) dataset_id: &'a str,
     pub(super) deployment_id: &'a str,
@@ -233,8 +265,6 @@ pub(super) struct OrdinaryServerBinding<'a> {
     pub(super) target_installation_id: &'a str,
     pub(super) service_config: &'a ServiceConfigRef,
     pub(super) server_database: &'a ServerDatabaseSite,
-    pub(super) native_version: u32,
-    pub(super) migration_digest: &'a str,
     pub(super) master: &'a KeyReference,
     pub(super) postgres: &'a KeyReference,
 }
@@ -306,8 +336,6 @@ impl ActivationBinding {
                 target_installation_id,
                 service_config,
                 server_database,
-                native_version,
-                migration_digest,
                 key_refs,
                 ..
             } => Ok(OrdinaryServerBinding {
@@ -318,16 +346,92 @@ impl ActivationBinding {
                 target_installation_id,
                 service_config,
                 server_database,
-                native_version: *native_version,
-                migration_digest,
                 master: &key_refs[0],
                 postgres: &key_refs[1],
             }),
             _ => Err(invalid()),
         }
     }
-    fn is_local(&self) -> bool {
+    pub(super) fn is_local(&self) -> bool {
         matches!(self.site, ActivationSiteBinding::LocalPhysical { .. })
+    }
+
+    /// Server binding of a sealed ordinary operation: keyRefs[0] is the KEK
+    /// canary key, keyRefs[1] the database principal (spec 7920, 8335).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn server(
+        dataset: &Hex32,
+        ids: &[String; 4],
+        service_config: &ServiceConfigRef,
+        server_database: ServerDatabaseSite,
+        native_version: u32,
+        migration_digest: &str,
+        authorization_epoch: &str,
+        master_key_id: &str,
+        operation_id: &str,
+    ) -> Self {
+        let key = |kind, reviewed_service: &str, key_id: &str| KeyReference {
+            kind,
+            reviewed_service: reviewed_service.to_owned(),
+            account: "configured-current".to_owned(),
+            key_id: key_id.to_owned(),
+            key_version: 1,
+            target_installation_id: ids[3].clone(),
+            operation_id: operation_id.to_owned(),
+        };
+        let key_refs = vec![
+            key(
+                KeyKind::HistoricalMaster,
+                "server.KEY_ENCRYPTION_KEY",
+                master_key_id,
+            ),
+            key(
+                KeyKind::PostgresScram,
+                "server.DATABASE_URL",
+                &server_database.authenticated_principal,
+            ),
+        ];
+        Self {
+            site: ActivationSiteBinding::ServerDatabase {
+                dataset_id: dataset.as_str().to_owned(),
+                deployment_id: ids[0].clone(),
+                tenant_id: ids[1].clone(),
+                source_installation_id: ids[2].clone(),
+                target_installation_id: ids[3].clone(),
+                service_config: service_config.clone(),
+                server_database,
+                native_version,
+                migration_digest: migration_digest.to_owned(),
+                authorization_epoch: authorization_epoch.to_owned(),
+                key_refs,
+            },
+        }
+    }
+
+    pub(super) fn migration_digest(&self) -> &str {
+        self.common().migration_digest
+    }
+
+    /// The same binding after a native schema upgrade: only the version and
+    /// its ledger checksum change (spec 8338).
+    pub(super) fn upgraded(&self, version: u32, digest: &str) -> Self {
+        let mut binding = self.clone();
+        match &mut binding.site {
+            ActivationSiteBinding::LocalPhysical {
+                native_version,
+                migration_digest,
+                ..
+            }
+            | ActivationSiteBinding::ServerDatabase {
+                native_version,
+                migration_digest,
+                ..
+            } => {
+                *native_version = version;
+                digest.clone_into(migration_digest);
+            }
+        }
+        binding
     }
 
     pub(super) fn validate(
@@ -344,8 +448,8 @@ impl ActivationBinding {
         }
         hex(common.migration_digest, 64, false)?;
         hex(common.authorization_epoch, 64, true)?;
-        if !matches!(common.native_version, 52 | 53)
-            || common.key_refs.len() != 2
+        supported_native_version(common.native_version)?;
+        if common.key_refs.len() != 2
             || common.key_refs[0].kind != KeyKind::HistoricalMaster
             || common.key_refs[1].kind != KeyKind::PostgresScram
         {
@@ -614,7 +718,7 @@ impl CandidatePlan {
         hex(&self.generation_id, 32, true)
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum OrdinaryMode {
     Fresh,
@@ -624,19 +728,19 @@ pub(super) enum OrdinaryMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Initializing {
-    intent_id: String,
-    mode: OrdinaryMode,
-    host_binding: HostBinding,
-    planned_installation: PlannedInstallation,
-    initial_epoch: String,
-    limits_digest: String,
+    pub(super) intent_id: String,
+    pub(super) mode: OrdinaryMode,
+    pub(super) host_binding: HostBinding,
+    pub(super) planned_installation: PlannedInstallation,
+    pub(super) initial_epoch: String,
+    pub(super) limits_digest: String,
     pub(super) init_journal_prefix: JournalPositionRef,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Active {
     pub(super) binding: ActivationBinding,
-    initialization_evidence: Vec<JournalReference>,
+    pub(super) initialization_evidence: Vec<JournalReference>,
     pub(super) publish_intent: JournalPositionRef,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -664,12 +768,12 @@ pub(super) struct Switched {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Current {
-    operation_id: String,
-    epoch: String,
+    pub(super) operation_id: String,
+    pub(super) epoch: String,
     profile_digest: String,
     pub(super) binding: ActivationBinding,
-    closure_evidence: Vec<JournalReference>,
-    switch_readback: JournalReference,
+    pub(super) closure_evidence: Vec<JournalReference>,
+    pub(super) switch_readback: JournalReference,
     pub(super) publish_intent: JournalPositionRef,
 }
 
@@ -710,6 +814,59 @@ pub(super) struct PublishedActivation {
 }
 
 impl ActivationRecord {
+    /// Revision 1 of a new control root.
+    pub(super) fn first(control_id: &str, initializing: Initializing) -> Self {
+        Self {
+            record_type: "wrokbot-recovery-activation".to_owned(),
+            version: 1,
+            control_id: control_id.to_owned(),
+            revision: 1,
+            previous_digest: RequiredNullable::Null(()),
+            phase: ActivationPhase::OrdinaryInitializing,
+            data: ActivationPayload::Initializing(initializing),
+        }
+    }
+
+    /// The next revision after the descriptor whose digest is `previous`.
+    pub(super) fn successor(
+        &self,
+        previous: &str,
+        phase: ActivationPhase,
+        data: ActivationPayload,
+    ) -> Result<Self, RecoveryControlError> {
+        Ok(Self {
+            record_type: self.record_type.clone(),
+            version: self.version,
+            control_id: self.control_id.clone(),
+            revision: self.revision.checked_add(1).ok_or_else(invalid)?,
+            previous_digest: RequiredNullable::Value(previous.to_owned()),
+            phase,
+            data,
+        })
+    }
+
+    /// Canonical bytes and their activation digest.
+    pub(super) fn encoded(&self) -> Result<(Vec<u8>, String), RecoveryControlError> {
+        let bytes = serde_json::to_vec(self).map_err(RecoveryControlError::from_json)?;
+        let digest: [u8; 32] = Sha256::new()
+            .chain_update(b"wrokbot.restore.activation.v1\0")
+            .chain_update(&bytes)
+            .finalize()
+            .into();
+        Ok((bytes, super::journal::digest_hex(&digest)))
+    }
+
+    pub(super) fn previous_digest(&self) -> Option<&str> {
+        match &self.previous_digest {
+            RequiredNullable::Value(digest) => Some(digest),
+            RequiredNullable::Null(()) => None,
+        }
+    }
+
+    pub(super) fn data(&self) -> &ActivationPayload {
+        &self.data
+    }
+
     fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
         if self.record_type != "wrokbot-recovery-activation"
             || self.version != 1
@@ -774,7 +931,7 @@ impl ActivationRecord {
                 hex(&d.profile_digest, 64, false)?;
                 d.binding.validate(l)?;
                 evidence(&d.closure_evidence)?;
-                if !d.binding.is_local() || d.binding.native_version() != 53 {
+                if !d.binding.is_local() {
                     return Err(invalid());
                 }
             }
@@ -783,7 +940,7 @@ impl ActivationRecord {
                 hex(&d.epoch, 64, true)?;
                 hex(&d.profile_digest, 64, false)?;
                 d.binding.validate(l)?;
-                if !d.binding.is_local() || d.binding.native_version() != 53 {
+                if !d.binding.is_local() {
                     return Err(invalid());
                 }
                 evidence(&d.closure_evidence)?;
@@ -889,6 +1046,10 @@ pub(super) fn observe(
 }
 
 impl PublishedActivation {
+    pub(super) fn observation(&self) -> &ActivationObservation {
+        &self.observation
+    }
+
     pub(super) fn bind(
         observation: std::sync::Arc<ActivationObservation>,
         publication: super::journal::VerifiedPublication,

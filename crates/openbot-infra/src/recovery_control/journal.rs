@@ -102,7 +102,7 @@ struct FreshIntent {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-enum SiteSelection {
+pub(super) enum SiteSelection {
     LocalPhysical {
         trusted_parent: RecoveryFileIdentity,
         entry_component: String,
@@ -168,12 +168,12 @@ impl SiteSelection {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BusinessAndInstallation {
-    deployment_id: String,
-    tenant_id: String,
-    dataset_id: String,
-    source_installation_id: String,
-    target_installation_id: String,
+pub(super) struct BusinessAndInstallation {
+    pub(super) deployment_id: String,
+    pub(super) tenant_id: String,
+    pub(super) dataset_id: String,
+    pub(super) source_installation_id: String,
+    pub(super) target_installation_id: String,
 }
 impl BusinessAndInstallation {
     fn validate(&self, l: &TrustedHostRecoveryLimits) -> Result<(), RecoveryControlError> {
@@ -201,17 +201,28 @@ struct LegacyIntent {
     initializing_descriptor_digest: String,
     original_clock_relation: OwnerClockRecord,
 }
+/// Native schema upgrade of an already published ordinary or restored site.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpgradeIntent {
+    prior_activation_digest: String,
+    from_native_version: u32,
+    to_native_version: u32,
+    ordinary_startup_bounds: OrdinaryStartupBounds,
+    original_clock_relation: OwnerClockRecord,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum OperationIntent {
     Restore(RestoreIntent),
     FreshInit(FreshIntent),
     LegacyAdoption(LegacyIntent),
+    OrdinaryUpgrade(UpgradeIntent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Stage {
+pub(super) enum Stage {
     Import,
     Isolation,
     PgUpgrade,
@@ -546,6 +557,181 @@ struct Record {
     data: Data,
 }
 
+/// One typed journal entry to append (S5). The envelope is completed by the
+/// writer from the held operation tail, never by the caller.
+pub(super) struct JournalData {
+    kind: Kind,
+    data: Data,
+}
+
+/// One encoded frame: `WBRCJ001 || L u32BE || JSON || SHA256(domain || NUL || magic || L || JSON)`.
+pub(super) struct JournalFrame {
+    pub(super) bytes: Vec<u8>,
+    pub(super) digest: [u8; 32],
+}
+
+impl JournalData {
+    pub(super) fn fresh_init(
+        host_binding: HostBinding,
+        original_startup_intent: &str,
+        planned_installation: PlannedInstallation,
+        ordinary_startup_bounds: OrdinaryStartupBounds,
+        initializing_descriptor_digest: &str,
+        original_clock_relation: OwnerClockRecord,
+    ) -> Self {
+        Self {
+            kind: Kind::OperationIntent,
+            data: Data::Operation(OperationIntent::FreshInit(FreshIntent {
+                host_binding,
+                original_startup_intent: original_startup_intent.to_owned(),
+                planned_installation,
+                ordinary_startup_bounds,
+                initializing_descriptor_digest: initializing_descriptor_digest.to_owned(),
+                original_clock_relation,
+            })),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn legacy_adoption(
+        host_binding: HostBinding,
+        original_startup_intent: &str,
+        owned_intent_file_identity: RecoveryFileIdentity,
+        original_site_selection: SiteSelection,
+        expected_original_business_and_installation: BusinessAndInstallation,
+        ordinary_startup_bounds: OrdinaryStartupBounds,
+        initializing_descriptor_digest: &str,
+        original_clock_relation: OwnerClockRecord,
+    ) -> Self {
+        Self {
+            kind: Kind::OperationIntent,
+            data: Data::Operation(OperationIntent::LegacyAdoption(LegacyIntent {
+                host_binding,
+                original_startup_intent: original_startup_intent.to_owned(),
+                owned_intent_file_identity,
+                original_site_selection,
+                expected_original_business_and_installation,
+                ordinary_startup_bounds,
+                initializing_descriptor_digest: initializing_descriptor_digest.to_owned(),
+                original_clock_relation,
+            })),
+        }
+    }
+
+    pub(super) fn ordinary_upgrade(
+        prior_activation_digest: &str,
+        from_native_version: u32,
+        to_native_version: u32,
+        ordinary_startup_bounds: OrdinaryStartupBounds,
+        original_clock_relation: OwnerClockRecord,
+    ) -> Self {
+        Self {
+            kind: Kind::OperationIntent,
+            data: Data::Operation(OperationIntent::OrdinaryUpgrade(UpgradeIntent {
+                prior_activation_digest: prior_activation_digest.to_owned(),
+                from_native_version,
+                to_native_version,
+                ordinary_startup_bounds,
+                original_clock_relation,
+            })),
+        }
+    }
+
+    pub(super) fn stage_intent(stage: Stage, original_effect_id: &str) -> Self {
+        Self {
+            kind: Kind::StageIntent,
+            data: Data::StageIntent(StageIntent {
+                stage,
+                original_effect_id: original_effect_id.to_owned(),
+                expected_binding: RequiredNullable::Null(()),
+            }),
+        }
+    }
+
+    pub(super) fn stage_observed(intent_sequence: u64, typed_disposition: Disposition) -> Self {
+        Self {
+            kind: Kind::StageObserved,
+            data: Data::StageObserved(StageObserved {
+                intent_sequence,
+                typed_disposition,
+                actual_binding: RequiredNullable::Null(()),
+                receipt_refs: Vec::new(),
+            }),
+        }
+    }
+
+    pub(super) fn publish_intent(expected_phase: ActivationPhase, descriptor_digest: &str) -> Self {
+        Self {
+            kind: Kind::PublishIntent,
+            data: Data::PublishIntent(PublishIntent {
+                expected_phase,
+                descriptor_digest: descriptor_digest.to_owned(),
+                receipt_refs: Vec::new(),
+            }),
+        }
+    }
+
+    pub(super) fn publish_observed(
+        intent_sequence: u64,
+        descriptor_digest: &str,
+        actual_file_identity: RecoveryFileIdentity,
+    ) -> Self {
+        Self {
+            kind: Kind::PublishObserved,
+            data: Data::PublishObserved(PublishObserved {
+                intent_sequence,
+                descriptor_digest: descriptor_digest.to_owned(),
+                actual_file_identity: RequiredNullable::Value(actual_file_identity),
+                disposition: PublicationDisposition::FileAndParentSyncedReadback,
+            }),
+        }
+    }
+
+    /// Whether this entry is a stage observation that confirms its effect.
+    pub(super) fn confirms_effect(&self) -> bool {
+        matches!(&self.data, Data::StageObserved(v) if v.typed_disposition.confirms_effect())
+    }
+
+    /// Encode this entry with the exact ordered envelope the reader re-encodes.
+    pub(super) fn frame(
+        &self,
+        control_id: &str,
+        operation_id: &str,
+        epoch: &str,
+        sequence: u64,
+        previous: Option<&[u8; 32]>,
+        limits: &TrustedHostRecoveryLimits,
+    ) -> Result<JournalFrame, RecoveryControlError> {
+        let record = Record {
+            record_type: "wrokbot-recovery-journal".to_owned(),
+            version: 1,
+            control_id: control_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            epoch: epoch.to_owned(),
+            sequence,
+            previous_digest: previous.map_or_else(|| "0".repeat(64), digest_hex),
+            kind: self.kind,
+            data: self.data.clone(),
+        };
+        let json = serde_json::to_vec(&record).map_err(RecoveryControlError::from_json)?;
+        let length = u32::try_from(json.len())
+            .ok()
+            .filter(|n| *n != 0 && u64::from(*n) <= limits.max_journal_frame_bytes)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        let mut bytes = Vec::with_capacity(json.len() + 44);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(&json);
+        let digest: [u8; 32] = Sha256::new()
+            .chain_update(b"wrokbot.restore.journal.v1\0")
+            .chain_update(&bytes)
+            .finalize()
+            .into();
+        bytes.extend_from_slice(&digest);
+        Ok(JournalFrame { bytes, digest })
+    }
+}
+
 pub(super) fn digest_hex(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(64);
@@ -648,6 +834,17 @@ impl Record {
                         ));
                     }
                     v.expected_original_business_and_installation.validate(l)?;
+                    v.original_clock_relation.validate(l)?;
+                }
+                OperationIntent::OrdinaryUpgrade(v) => {
+                    hex(&v.prior_activation_digest, 64, false)?;
+                    super::activation::supported_native_version(v.from_native_version)?;
+                    super::activation::supported_native_version(v.to_native_version)?;
+                    if v.from_native_version >= v.to_native_version {
+                        return Err(RecoveryControlError::new(
+                            RecoveryControlFault::ControlInvalid,
+                        ));
+                    }
                     v.original_clock_relation.validate(l)?;
                 }
             },
@@ -825,6 +1022,10 @@ pub(super) fn observe_chain(
                             | Stage::Publish
                             | Stage::ResourceClose
                     ),
+                    Data::Operation(OperationIntent::OrdinaryUpgrade(_)) => matches!(
+                        stage.stage,
+                        Stage::PgUpgrade | Stage::Publish | Stage::ResourceClose
+                    ),
                     _ => false,
                 };
                 if !allowed {
@@ -909,32 +1110,129 @@ pub(super) fn read_metadata_reservation(
     Ok(total)
 }
 
+fn unproven() -> RecoveryControlError {
+    RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)
+}
+
+/// An upgrade operation names its descriptor's predecessor and new version.
+fn upgrade_names(
+    upgrade: &UpgradeIntent,
+    observation: &super::activation::ActivationObservation,
+    binding: &ActivationBinding,
+) -> Result<(), RecoveryControlError> {
+    if observation.record.previous_digest() != Some(upgrade.prior_activation_digest.as_str())
+        || upgrade.to_native_version != binding.native_version()
+    {
+        return Err(unproven());
+    }
+    Ok(())
+}
+
 impl JournalObservation {
+    /// Whether this operation is a restore (its first record's mode).
+    pub(super) fn is_restore(&self) -> bool {
+        matches!(
+            self.records.first(),
+            Some(Record {
+                data: Data::Operation(OperationIntent::Restore(_)),
+                ..
+            })
+        )
+    }
+
     /// Check the original ordinary operation and actual full-digest evidence
-    /// references. Unknown / other-context evidence remains closed.
+    /// references. Unknown / other-context evidence remains closed. An
+    /// `ordinary_upgrade` operation must name this descriptor's predecessor,
+    /// its version and its epoch.
     pub(super) fn verify_ordinary_evidence(
         &self,
         observation: &super::activation::ActivationObservation,
     ) -> Result<(), RecoveryControlError> {
-        let invalid = || RecoveryControlError::new(RecoveryControlFault::ClosureUnproven);
         let (binding, evidence) = observation.ordinary_active()?;
-        let first = self.records.first().ok_or_else(invalid)?;
-        if first.epoch != binding.authorization_epoch()
-            || !matches!(
-                first.data,
-                Data::Operation(OperationIntent::FreshInit(_) | OperationIntent::LegacyAdoption(_))
-            )
-        {
-            return Err(invalid());
+        let first = self.records.first().ok_or_else(unproven)?;
+        if first.epoch != binding.authorization_epoch() {
+            return Err(unproven());
         }
-        for reference in evidence {
+        match &first.data {
+            Data::Operation(OperationIntent::FreshInit(_) | OperationIntent::LegacyAdoption(_)) => {
+            }
+            Data::Operation(OperationIntent::OrdinaryUpgrade(v)) => {
+                upgrade_names(v, observation, binding)?;
+            }
+            _ => return Err(unproven()),
+        }
+        self.confirmed(evidence, &first.operation_id)
+    }
+
+    /// RestoreCurrent evidence. `self` is the journal its publishIntent names.
+    /// When that is the restore operation itself, closure and switch readback
+    /// are checked here; otherwise `self` is an `ordinary_upgrade` of this
+    /// descriptor and `restore` is the original restore operation's journal.
+    pub(super) fn verify_current_evidence(
+        &self,
+        observation: &super::activation::ActivationObservation,
+        restore: Option<&JournalObservation>,
+    ) -> Result<(), RecoveryControlError> {
+        let super::activation::ActivationPayload::Current(current) = observation.record.data()
+        else {
+            return Err(unproven());
+        };
+        let first = self.records.first().ok_or_else(unproven)?;
+        if first.epoch != current.epoch {
+            return Err(unproven());
+        }
+        let restore = if first.operation_id == current.operation_id {
+            self
+        } else {
+            let Data::Operation(OperationIntent::OrdinaryUpgrade(v)) = &first.data else {
+                return Err(unproven());
+            };
+            upgrade_names(v, observation, &current.binding)?;
+            let published = usize::try_from(current.publish_intent.sequence.get() - 1)
+                .map_err(|_| unproven())?;
+            let upgraded = self.records.get(..published).ok_or_else(unproven)?.iter().any(|r| {
+                matches!(&r.data, Data::StageObserved(o)
+                    if o.typed_disposition.confirms_effect()
+                        && matches!(usize::try_from(o.intent_sequence - 1).ok().and_then(|i| self.records.get(i)),
+                            Some(Record { data: Data::StageIntent(StageIntent { stage: Stage::PgUpgrade, .. }), .. })))
+            });
+            if !upgraded {
+                return Err(unproven());
+            }
+            restore.ok_or_else(unproven)?
+        };
+        let original = restore.records.first().ok_or_else(unproven)?;
+        if original.operation_id != current.operation_id
+            || original.epoch != current.epoch
+            || !matches!(original.data, Data::Operation(OperationIntent::Restore(_)))
+        {
+            return Err(unproven());
+        }
+        restore.confirmed(&current.closure_evidence, &current.operation_id)?;
+        let readback = &current.switch_readback;
+        let index = usize::try_from(readback.sequence - 1).map_err(|_| unproven())?;
+        if readback.context_id != current.operation_id
+            || restore.digests.get(index).map(digest_hex).as_ref() != Some(&readback.digest)
+        {
+            return Err(unproven());
+        }
+        Ok(())
+    }
+
+    /// Every reference names a confirming StageObserved of `context` by digest.
+    fn confirmed(
+        &self,
+        references: &[JournalReference],
+        context: &str,
+    ) -> Result<(), RecoveryControlError> {
+        for reference in references {
             reference.validate()?;
-            let index = usize::try_from(reference.sequence - 1).map_err(|_| invalid())?;
-            if reference.context_id != first.operation_id
+            let index = usize::try_from(reference.sequence - 1).map_err(|_| unproven())?;
+            if reference.context_id != context
                 || self.digests.get(index).map(digest_hex).as_ref() != Some(&reference.digest)
                 || !matches!(self.records.get(index), Some(Record { data: Data::StageObserved(stage), .. }) if stage.typed_disposition.confirms_effect())
             {
-                return Err(invalid());
+                return Err(unproven());
             }
         }
         Ok(())

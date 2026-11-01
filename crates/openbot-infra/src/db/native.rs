@@ -2172,7 +2172,7 @@ mod tests {
         assert_ne!(native_0052_checksum(), native_0053_checksum());
         assert_eq!(
             native_0053_checksum(),
-            "865c13ccbae7e53f642df010221c29e648c775c3aa26e1014e130e53778c8988",
+            "6b55f76cc52b0b9e34af1afb278691b1c9abea4d7ac77225855a724cf5a7c24a",
         );
         assert_eq!(NATIVE_MIGRATION_COUNT, 41);
         assert_eq!(MIGRATIONS[40].version, NATIVE_LATEST_VERSION);
@@ -2190,7 +2190,7 @@ mod tests {
         assert_eq!(native_0053_checksum(), hex(NATIVE_0053_SQL.as_bytes()));
         assert_eq!(
             native_0053_checksum(),
-            "865c13ccbae7e53f642df010221c29e648c775c3aa26e1014e130e53778c8988"
+            "6b55f76cc52b0b9e34af1afb278691b1c9abea4d7ac77225855a724cf5a7c24a"
         );
         assert_eq!(MIGRATIONS.len(), 41);
         assert_eq!(MIGRATIONS[40].name, NATIVE_0053_NAME);

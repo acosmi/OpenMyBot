@@ -19,7 +19,7 @@ use rustix::fs::FlockOperation;
 use serde::Serialize;
 
 use super::activation::ActivationBinding;
-use super::entry::{self, ControlFiles, ControlOwner, OwnedRecord, VerifiedOrdinaryStartupIntent};
+use super::entry::{self, ControlFiles, ControlOwner, OwnedRecord, RuntimeEntry};
 use super::journal::ProcessStart;
 use super::{
     RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, hex_array, id,
@@ -28,13 +28,29 @@ use std::ops::{Deref, DerefMut};
 
 /// Private original startup input, not a parser, public constructor or proof
 /// inferred from a caller's process identifiers. The actual host producer owns
-/// the enclosing VerifiedOrdinaryStartupIntent.
+/// the enclosing RuntimeEntry.
 pub(super) struct OriginalRuntimeEnrollment {
     pub(super) boot_identity: String,
     pub(super) pid: u32,
     pub(super) process_start: ProcessStart,
     pub(super) resource_model: ResourceModel,
-    pub(super) original_owner_set: Vec<String>,
+    pub(super) original_owner_set: Vec<RuntimeOwner>,
+}
+
+/// The closed set of original runtime owners that may produce an effect;
+/// each has one fixed id in the enrollment (spec 8364).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeOwner {
+    PostgresSidecar,
+    SqlDriver,
+    ApplicationAssembly,
+    DesktopAgentRelay,
+    DesktopAgent,
+    RunRelay,
+    BuiltInAgent,
+    McpRevocationReconciler,
+    ScreenHub,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -66,11 +82,11 @@ struct Enrollment<'a> {
     business_install_binding: &'a ActivationBinding,
     root_and_lock_identities: RootAndLockIdentities,
     resource_model: ResourceModel,
-    original_owner_set: &'a [String],
+    original_owner_set: &'a [RuntimeOwner],
 }
 
 fn enrollment<'a>(
-    original: &'a VerifiedOrdinaryStartupIntent,
+    original: &'a RuntimeEntry,
     root: RecoveryFileIdentity,
     admission: RecoveryFileIdentity,
     runtime: RecoveryFileIdentity,
@@ -108,7 +124,7 @@ pub(super) struct RuntimeState {
     runtime_lock: File,
     runtime_directory: File,
     enrollment_file: OwnedRecord,
-    original: VerifiedOrdinaryStartupIntent,
+    original: RuntimeEntry,
     root: RecoveryFileIdentity,
     runtime_identity: RecoveryFileIdentity,
     handle_alive: Arc<AtomicBool>,
@@ -414,17 +430,18 @@ fn enqueue_enrollment(
 
 pub(super) fn enter_runtime(
     control: &ControlOwner,
-    intent: VerifiedOrdinaryStartupIntent,
+    intent: RuntimeEntry,
     deadline: Instant,
 ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
     let mut registration_effect_may_have_started = false;
     let result = (|| {
         let mut files = entry::lock(control)?;
-        let existing_read_locks = files.holds_existing_read_locks();
+        // The caller's branch already holds admission and runtime: SH from a
+        // shared-lock head read, or the writer's admissionEX and downgraded SH.
+        let writer = files.holds_writer();
         if files.retained_runtime.is_some()
             || files.pending_startup.is_some()
-            || (!existing_read_locks
-                && (files.pending_admission.is_some() || files.pending_runtime.is_some()))
+            || !(writer || files.holds_existing_read_locks())
         {
             return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
         }
@@ -467,56 +484,23 @@ pub(super) fn enter_runtime(
         files.verify_enrollment_before(&intent.enrollment, deadline)?;
         if intent.enrollment.pid != std::process::id()
             || intent.enrollment.process_start.nanos >= 1_000_000_000
-            || intent.enrollment.original_owner_set.is_empty()
-            || u64::try_from(intent.enrollment.original_owner_set.len())
-                .map_or(true, |n| n > files.limits.max_runtime_resource_facts)
         {
             return Err(RecoveryControlError::new(
                 RecoveryControlFault::EntryInvalid,
             ));
         }
-        for (i, original) in intent.enrollment.original_owner_set.iter().enumerate() {
-            id(original, files.limits.max_id_bytes)?;
-            if intent.enrollment.original_owner_set[..i].contains(original) {
-                return Err(RecoveryControlError::new(
-                    RecoveryControlFault::EntryInvalid,
-                ));
-            }
-        }
         files.pending_startup = Some(intent);
-        if !existing_read_locks {
-            let admission = files.acquire(
-                "admission.lock",
-                b"WBRCADM1",
-                FlockOperation::NonBlockingLockShared,
-                deadline,
-            )?;
-            files.pending_admission = Some(admission);
-        }
         let admission_identity = files.held_lock_identity(true, deadline)?;
-        if !existing_read_locks {
-            let runtime = match files.acquire(
-                "runtime.lock",
-                b"WBRCRUN1",
-                FlockOperation::NonBlockingLockShared,
-                deadline,
-            ) {
-                Ok(file) => file,
-                Err(error) => {
-                    files.pending_admission = None;
-                    return Err(error);
-                }
-            };
-            files.pending_runtime = Some(runtime);
-        }
         // This is the original short registration writer, not a new lock or
         // restore session. Never wait for it while holding either SH.
-        files.pending_owner = Some(files.acquire(
-            "owner.lock",
-            b"WBRCOWN1",
-            FlockOperation::NonBlockingLockExclusive,
-            deadline,
-        )?);
+        if !writer {
+            files.pending_owner = Some(files.acquire(
+                "owner.lock",
+                b"WBRCOWN1",
+                FlockOperation::NonBlockingLockExclusive,
+                deadline,
+            )?);
+        }
         if files
             .pending_startup
             .as_ref()
@@ -604,6 +588,7 @@ pub(super) fn enter_runtime(
         files.retained_runtime = Some(Arc::clone(&owner.state));
         files.pending_owner = None;
         files.pending_admission = None;
+        files.existing_read_locks_retired();
         Ok(owner)
     })();
     result.map_err(|error: RecoveryControlError| {

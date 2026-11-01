@@ -67,6 +67,7 @@ use openbot_infra::provider::openai::{
     OpenAiApiKey, OpenAiProtocol, OpenAiProvider, OpenAiProviderConfig,
 };
 use openbot_infra::recovery_control::AuthorizationPurpose;
+use openbot_infra::recovery_control::{RecoveryControl, RecoveryControlConfig, RuntimeOwner};
 use openbot_infra::remote_agui::SafeRemoteAguiTransport;
 use openbot_infra::run_runtime::RunRelay;
 use openbot_infra::sandboxed_components::PostgresSandboxedComponentAdministration;
@@ -179,37 +180,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
         DeploymentEnvironment::Production => ExampleKeyPolicy::Reject,
         DeploymentEnvironment::Development => ExampleKeyPolicy::Allow,
     };
-    // Apply the original canonical / strength / example policy once and retain
-    // that same original wrapping key. The existing Infra production base64
-    // dependency decodes this exact canonical encoding after the publication
-    // gate; Server has no new production dependency or raw material accessor.
     let key_encryption = KeyEncryptionKey::from_env_map(&env, key_policy)?;
-    let recovery_master_encoding = SecretBytes::new(
-        openbot_server::config::env::optional(&env, "KEY_ENCRYPTION_KEY")
-            .ok_or_else(|| startup_error("key_encryption_key_missing"))?
-            .as_bytes()
-            .to_vec(),
-    );
     let deployment = deployment_id_for_startup(
         server.deployment_id.as_deref(),
         &tenant_package.package.tenant_id,
     );
     let tenant = TenantId::new(&tenant_package.package.tenant_id);
-    let host = server.load_recovery_host()?;
-    let limits = host.host_limits().clone();
-    let startup_deadline = std::time::Instant::now()
-        .checked_add(Duration::from_nanos(limits.admission_ns))
-        .ok_or_else(|| startup_error("recovery_startup_bounds_invalid"))?;
-    let mut recovery_control = openbot_infra::recovery_control::RecoveryControl::open(
-        openbot_infra::recovery_control::RecoveryControlConfig::server(host, limits)?,
-    )?;
+    let recovery_host = server.load_recovery_host()?;
+    let limits = recovery_host.host_limits().clone();
+    let mut recovery_control =
+        RecoveryControl::open(RecoveryControlConfig::server(recovery_host, limits)?)?;
+    let mut runtime_owners = vec![
+        RuntimeOwner::RunRelay,
+        RuntimeOwner::McpRevocationReconciler,
+        RuntimeOwner::ScreenHub,
+        RuntimeOwner::SqlDriver,
+    ];
+    if requires_agent_runtime {
+        runtime_owners.push(RuntimeOwner::BuiltInAgent);
+    }
     let (pool, recovery_runtime_owner) = recovery_control
-        .open_existing_server_before(
+        .open_server_before(
             &database,
-            recovery_master_encoding,
-            deployment.as_str(),
-            tenant.as_str(),
-            startup_deadline,
+            &key_encryption,
+            &deployment,
+            &tenant,
+            &runtime_owners,
         )
         .await?;
     let recovery_read_gate = recovery_runtime_owner.read_gate();

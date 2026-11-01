@@ -13,18 +13,24 @@ mod activation;
 mod clock;
 mod entry;
 mod journal;
+mod ordinary;
 mod runtime;
 
 pub use activation::{ActivationBinding, ActivationPhase};
+pub(crate) use activation::{Hex32, ServerDatabaseSite};
 pub use entry::{
-    OwnedRecoveryRequestFile, VerifiedOrdinaryStartupIntent, VerifiedRecoveryHost,
-    VerifiedRecoveryHostIntent, VerifiedServiceRecoveryHost,
-    load_service_recovery_host_from_config,
+    OwnedRecoveryRequestFile, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
+    VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
+};
+pub(crate) use ordinary::OrdinaryStage;
+pub use ordinary::{
+    OrdinaryActivationProof, OrdinaryDatabaseInitializationProof, OrdinaryInitializationSession,
+    VerifiedOrdinaryLegacyProof, VerifiedOrdinaryStartupIntent,
 };
 #[cfg(feature = "server-runtime")]
 pub use runtime::AuthorizationPurpose;
 pub(crate) use runtime::RecoveryWorkerLease;
-pub use runtime::{RecoveryReadGate, RecoveryRuntimeOwner};
+pub use runtime::{RecoveryReadGate, RecoveryRuntimeOwner, RuntimeOwner};
 
 /// Redacted closed failure class; original IO stays with its original owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +47,7 @@ pub enum RecoveryControlFault {
     OwnerLost,
     ClosureUnproven,
     IoFailure,
+    KeyUnverified,
 }
 
 /// Error retaining the same original control owner, never a success receipt.
@@ -48,6 +55,7 @@ pub struct RecoveryControlError {
     fault: RecoveryControlFault,
     retained: Option<entry::ControlOwner>,
     original_json_error: Option<serde_json::Error>,
+    unconsumed: Option<Box<VerifiedOrdinaryStartupIntent>>,
 }
 
 impl RecoveryControlError {
@@ -56,6 +64,7 @@ impl RecoveryControlError {
             fault,
             retained: None,
             original_json_error: None,
+            unconsumed: None,
         }
     }
 
@@ -64,6 +73,7 @@ impl RecoveryControlError {
             fault,
             retained: Some(Arc::clone(owner)),
             original_json_error: None,
+            unconsumed: None,
         }
     }
 
@@ -77,6 +87,7 @@ impl RecoveryControlError {
             fault: RecoveryControlFault::ControlInvalid,
             retained: None,
             original_json_error: Some(error),
+            unconsumed: None,
         }
     }
 
@@ -84,6 +95,13 @@ impl RecoveryControlError {
     #[must_use]
     pub const fn fault(&self) -> RecoveryControlFault {
         self.fault
+    }
+
+    /// The entry intent handed back by a shared-lock branch whose next step is
+    /// the exclusive ordinary writer; it can be taken once.
+    #[must_use]
+    pub fn into_unconsumed_intent(self) -> Option<VerifiedOrdinaryStartupIntent> {
+        self.unconsumed.map(|intent| *intent)
     }
 }
 
@@ -350,11 +368,6 @@ impl RecoveryControlConfig {
         mut actual: VerifiedServiceRecoveryHost,
         limits: TrustedHostRecoveryLimits,
     ) -> Result<Self, RecoveryControlError> {
-        if !actual.matches_limits(&limits) {
-            return Err(RecoveryControlError::new(
-                RecoveryControlFault::ProfileInvalid,
-            ));
-        }
         let deadline = Instant::now()
             .checked_add(std::time::Duration::from_nanos(limits.admission_ns))
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ProfileInvalid))?;
@@ -437,41 +450,114 @@ impl RecoveryControl {
         entry::verify_intent(&self.shared, request, host, deadline)
     }
 
-    /// Existing ordinary Server startup only. It retains original SH before
-    /// connecting and performs no initialization DDL, adoption or restoration.
-    /// Missing/Pending/RestoreCurrent stays closed before any pool probe.
-    pub async fn open_existing_server_before(
+    /// Ordinary Server startup (S8). One clock read seals the entry intent;
+    /// an existing latest head is checked under SH, otherwise the handed-back
+    /// intent takes the exclusive writer for Fresh, legacy adoption or a
+    /// native upgrade. The returned Pool is the bootstrap Pool of this site.
+    #[cfg(feature = "server-runtime")]
+    pub async fn open_server_before(
         &mut self,
         database: &crate::db::pool::DatabaseConfig,
-        configured_master_encoding: openbot_domain::vault::SecretBytes,
-        deployment: &str,
-        tenant: &str,
-        deadline: Instant,
+        configured: &crate::auth::config::KeyEncryptionKey,
+        deployment: &openbot_contracts::ids::DeploymentId,
+        tenant: &openbot_contracts::ids::TenantId,
+        owners: &[RuntimeOwner],
     ) -> Result<(crate::db::pool::DatabasePool, RecoveryRuntimeOwner), RecoveryControlError> {
-        let intent = entry::observe_existing_server_before(
-            &self.shared,
-            database,
-            configured_master_encoding,
-            deployment,
-            tenant,
-            deadline,
-        )
-        .await?;
-        let runtime = runtime::enter_runtime(&self.shared, intent, deadline)?;
-        let files = entry::lock(&self.shared)?;
-        files
-            .existing_server_pool()
-            .map(|pool| (pool.clone(), runtime))
+        let intent = entry::server_intent(&self.shared, deployment, tenant, owners)?;
+        let admission = intent.admission_deadline();
+        let dataset = intent.server_dataset()?;
+        let effect = intent.effect_deadline();
+        let intent = match ordinary::shared_head(&self.shared, intent, admission) {
+            Ok((published, intent)) => {
+                let pool = entry::verify_existing_server_before(
+                    &self.shared,
+                    &published,
+                    database,
+                    configured,
+                    &dataset,
+                    effect,
+                )
+                .await?;
+                let owner = ordinary::enroll(&self.shared, published, &intent)?;
+                return Ok((pool, owner));
+            }
+            Err(error) if error.fault() == RecoveryControlFault::InitializationRequired => {
+                error.into_unconsumed_intent().ok_or_else(|| {
+                    RecoveryControlError::new(RecoveryControlFault::InitializationRequired)
+                })?
+            }
+            Err(error) => return Err(error),
+        };
+        let mut session = self.begin_ordinary_initialization_before(intent, admission)?;
+        let pool = entry::connect_server_before(&self.shared, database, effect).await?;
+        match session.initialization_source() {
+            Some(ordinary::OrdinaryInitializationSource::ServerDatabaseFresh) => {
+                let initialized = crate::db::initialization::initialize_owned_before(
+                    &pool,
+                    session.original_initialization_request(configured),
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::db::initialization::DatabaseInitializationError::Recovery(error) => {
+                        error
+                    }
+                    _ => RecoveryControlError::new(RecoveryControlFault::IoFailure),
+                })?;
+                session.publish_active(OrdinaryActivationProof::ServerFresh(
+                    initialized.into_proof()?,
+                ))?;
+            }
+            Some(ordinary::OrdinaryInitializationSource::LegacyAdoption {
+                site: ordinary::OrdinarySite::ServerDatabase,
+            }) => {
+                entry::adopt_server_legacy_before(&self.shared, &mut session, &pool, configured)
+                    .await?;
+            }
+            Some(_) => {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::EntryInvalid,
+                ));
+            }
+            None => {
+                let binding = session
+                    .held_binding()
+                    .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?
+                    .clone();
+                let client = pool
+                    .get()
+                    .await
+                    .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+                entry::compare_server_site_before(
+                    &client, &binding, database, configured, &dataset, effect,
+                )
+                .await?;
+                drop(client);
+                session.upgrade_native_before(&pool).await?;
+            }
+        }
+        let owner = session.into_runtime_before()?;
+        Ok((pool, owner))
     }
 
-    /// Retain the original runtime lock only after a truly published head and
-    /// the original sealed ordinary-startup observation.
+    /// Shared-lock ordinary startup: a published head at the latest native
+    /// version enrolls this runtime; otherwise `InitializationRequired`, with
+    /// the intent handed back where the exclusive writer is the next step.
     pub fn enter_runtime_before(
         &self,
         intent: VerifiedOrdinaryStartupIntent,
         deadline: Instant,
     ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
-        runtime::enter_runtime(&self.shared, intent, deadline)
+        ordinary::enter_runtime(&self.shared, intent, deadline)
+    }
+
+    /// Exclusive ordinary writer for a handed-back intent; busy, or a head
+    /// another writer changed, is `OwnerBusy` before any file is written.
+    pub fn begin_ordinary_initialization_before(
+        &mut self,
+        intent: VerifiedOrdinaryStartupIntent,
+        deadline: Instant,
+    ) -> Result<OrdinaryInitializationSession, RecoveryControlError> {
+        ordinary::begin(&self.shared, intent, deadline)
     }
 }
 

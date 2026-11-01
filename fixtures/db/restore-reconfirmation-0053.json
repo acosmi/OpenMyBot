@@ -1,7 +1,7 @@
 {
   "format": "restore-reconfirmation-oracle-v1",
   "nativeVersion": 53,
-  "migrationSha256": "865c13ccbae7e53f642df010221c29e648c775c3aa26e1014e130e53778c8988",
+  "migrationSha256": "6b55f76cc52b0b9e34af1afb278691b1c9abea4d7ac77225855a724cf5a7c24a",
   "schema": {
     "functions": [
       ["restore53_guard_insert", "6800894e870698cd10cd40bf064b7ad961c4514ff30997f997b5d1f71cd4929c"],
@@ -197,6 +197,29 @@
           ["restore_reconfirm_requirements_insert", 7, "openbot_internal", "restore53_guard_insert"],
           ["restore_reconfirm_requirements_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
         ]
+      },
+      {
+        "name": "server_kek_canaries",
+        "columns": [
+          ["deployment_id", "text", true, "pg_catalog.default", null],
+          ["tenant_id", "text", true, "pg_catalog.default", null],
+          ["dataset_id", "text", true, "pg_catalog.default", null],
+          ["key_id", "text", true, "pg_catalog.default", null],
+          ["encrypted_canary", "text", true, "pg_catalog.default", null],
+          ["created_at", "timestamp with time zone", true, null, "now()"]
+        ],
+        "constraints": [
+          ["server_kek_canaries_dataset_id_check", "c", "CHECK ((dataset_id ~ '^[0-9a-f]{32}$'::text))"],
+          ["server_kek_canaries_deployment_id_check", "c", "CHECK (((octet_length(deployment_id) >= 1) AND (octet_length(deployment_id) <= 256)))"],
+          ["server_kek_canaries_encrypted_canary_check", "c", "CHECK (((octet_length(encrypted_canary) >= 1) AND (octet_length(encrypted_canary) <= 4096)))"],
+          ["server_kek_canaries_key_id_check", "c", "CHECK ((key_id ~ '^[0-9a-f]{32}$'::text))"],
+          ["server_kek_canaries_pkey", "p", "PRIMARY KEY (deployment_id, tenant_id)"],
+          ["server_kek_canaries_tenant_id_check", "c", "CHECK (((octet_length(tenant_id) >= 1) AND (octet_length(tenant_id) <= 256)))"]
+        ],
+        "indexes": [
+          "CREATE UNIQUE INDEX server_kek_canaries_pkey ON openbot_internal.server_kek_canaries USING btree (deployment_id, tenant_id)"
+        ],
+        "triggers": []
       }
     ]
   }

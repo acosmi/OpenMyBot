@@ -184,6 +184,16 @@ CREATE TABLE openbot_internal.restore_pg_seals (
  CONSTRAINT restore_pg_seals_time_check CHECK(pg_catalog.isfinite(recorded_at))
 );
 
+CREATE TABLE openbot_internal.server_kek_canaries (
+    deployment_id text NOT NULL CHECK (octet_length(deployment_id) BETWEEN 1 AND 256),
+    tenant_id text NOT NULL CHECK (octet_length(tenant_id) BETWEEN 1 AND 256),
+    dataset_id text NOT NULL CHECK (dataset_id ~ '^[0-9a-f]{32}$'),
+    key_id text NOT NULL CHECK (key_id ~ '^[0-9a-f]{32}$'),
+    encrypted_canary text NOT NULL CHECK (octet_length(encrypted_canary) BETWEEN 1 AND 4096),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (deployment_id, tenant_id)
+);
+
 CREATE FUNCTION openbot_internal.restore53_reject_mutation() RETURNS trigger
  LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT PARALLEL UNSAFE SECURITY INVOKER
  COST 100 SET search_path=pg_catalog AS $restore53_immutable$
@@ -502,5 +512,11 @@ CREATE TRIGGER restore_pg_seals_no_truncate BEFORE TRUNCATE ON openbot_internal.
 
 REVOKE ALL ON TABLE openbot_internal.restore_pg_operations,openbot_internal.restore_pg_batches,
  openbot_internal.restore_reconfirm_requirements,openbot_internal.restore_reconfirm_receipts,
- openbot_internal.restore_pg_seals FROM PUBLIC;
+ openbot_internal.restore_pg_seals,openbot_internal.server_kek_canaries FROM PUBLIC;
 REVOKE ALL ON FUNCTION openbot_internal.restore53_guard_insert(),openbot_internal.restore53_reject_mutation() FROM PUBLIC;
+
+-- Dynamic SSO provider ids become the non-nil UUIDs the provider store
+-- requires; only the id changes, never provider_id or configuration bytes.
+UPDATE public.sso_providers SET id = gen_random_uuid()::text
+ WHERE id !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    OR id = '00000000-0000-0000-0000-000000000000';

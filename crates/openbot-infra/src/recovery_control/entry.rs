@@ -26,6 +26,15 @@ use super::{
     RecoveryFileIdentity, TrustedHostRecoveryLimits, before, component, hex,
 };
 
+mod head;
+#[cfg(feature = "server-runtime")]
+mod legacy;
+mod write;
+
+pub(super) use head::Head;
+#[cfg(feature = "server-runtime")]
+pub(super) use legacy::adopt_server_legacy_before;
+
 /// Sealed original service configuration. This source seal alone grants no
 /// ordinary startup, database, fresh actor, restore operation or Current owner.
 pub struct VerifiedServiceRecoveryHost {
@@ -66,7 +75,7 @@ struct ExpectedServiceOwner {
 struct ServiceInstallationExpectation {
     deployment_id: String,
     tenant_id: String,
-    dataset_id: String,
+    dataset_id: Hex32,
     source_installation_id: String,
     target_installation_id: String,
 }
@@ -660,7 +669,6 @@ fn service_configuration_backing(
         configuration.expected_service_owner.service.capacity(),
         ids.deployment_id.capacity(),
         ids.tenant_id.capacity(),
-        ids.dataset_id.capacity(),
         ids.source_installation_id.capacity(),
         ids.target_installation_id.capacity(),
     ] {
@@ -688,29 +696,6 @@ impl VerifiedServiceRecoveryHost {
     pub fn ordinary_startup_bounds(&self) -> (u64, u64) {
         let bounds = self.configuration.ordinary_startup_bounds;
         (bounds.effect_ns.get(), bounds.convergence_ns.get())
-    }
-
-    pub(super) fn matches_limits(&self, limits: &TrustedHostRecoveryLimits) -> bool {
-        let own = self.host_limits();
-        own.max_request_bytes == limits.max_request_bytes
-            && own.max_activation_bytes == limits.max_activation_bytes
-            && own.max_journal_frame_bytes == limits.max_journal_frame_bytes
-            && own.max_journal_bytes == limits.max_journal_bytes
-            && own.max_journal_records == limits.max_journal_records
-            && own.max_runtime_record_bytes == limits.max_runtime_record_bytes
-            && own.max_registered_runtimes == limits.max_registered_runtimes
-            && own.max_retained_operations == limits.max_retained_operations
-            && own.max_root_entries == limits.max_root_entries
-            && own.max_temp_entries == limits.max_temp_entries
-            && own.max_evidence_refs == limits.max_evidence_refs
-            && own.max_runtime_resource_facts == limits.max_runtime_resource_facts
-            && own.max_id_bytes == limits.max_id_bytes
-            && own.max_component_bytes == limits.max_component_bytes
-            && own.max_relative_path_bytes == limits.max_relative_path_bytes
-            && own.max_path_depth == limits.max_path_depth
-            && own.max_open_files == limits.max_open_files
-            && own.max_metadata_bytes == limits.max_metadata_bytes
-            && own.admission_ns == limits.admission_ns
     }
 
     pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
@@ -820,7 +805,6 @@ pub fn load_service_recovery_host_from_config(
     for id in [
         &ids.deployment_id,
         &ids.tenant_id,
-        &ids.dataset_id,
         &ids.source_installation_id,
         &ids.target_installation_id,
     ] {
@@ -1020,9 +1004,9 @@ pub struct VerifiedRecoveryHostIntent {
     original_deadline: Instant,
 }
 
-/// Original ordinary producer's complete seal. In particular a parsed phase,
-/// absent head or user-supplied Fresh enum cannot construct this value.
-pub struct VerifiedOrdinaryStartupIntent {
+/// A verified published head with this process's enrollment input; only an
+/// ordinary startup branch builds it, after its own head read.
+pub(super) struct RuntimeEntry {
     pub(super) published: PublishedActivation,
     pub(super) control_root: RecoveryFileIdentity,
     pub(super) runtime_nonce: String,
@@ -1092,10 +1076,7 @@ pub(super) struct ControlFiles {
     publication_operation: Option<([u8; 32], RecoveryFileIdentity)>,
     publication_chain: Option<Result<super::journal::JournalObservation, RecoveryControlError>>,
     publication_seal: Option<Result<super::journal::VerifiedPublication, RecoveryControlError>>,
-    existing_publication: Option<Result<PublishedActivation, RecoveryControlError>>,
     existing_server: Option<crate::db::initialization::OwnedExistingServerDatabase>,
-    existing_configured_master_encoding: Option<openbot_domain::vault::SecretBytes>,
-    raw_master_decode: Option<Result<openbot_domain::vault::SecretBytes, base64::DecodeError>>,
     existing_read_locks: bool,
     runtime_entropy: [u8; 16],
     raw_random: Option<Result<(), getrandom::Error>>,
@@ -1106,10 +1087,14 @@ pub(super) struct ControlFiles {
     pending_host: Option<VerifiedRecoveryHost>,
     service_source: Option<VerifiedServiceRecoveryHost>,
     pub(super) runtime_record: Option<OwnedRecord>,
-    pub(super) pending_startup: Option<VerifiedOrdinaryStartupIntent>,
+    pub(super) pending_startup: Option<RuntimeEntry>,
     pub(super) runtime_input: Vec<u8>,
     pub(super) raw_encoding: Option<Result<(), serde_json::Error>>,
     pub(super) retained_runtime: Option<super::runtime::RuntimeOwnerBook>,
+    journal_tail: Option<write::JournalTail>,
+    writer_held: bool,
+    restore_journal: Option<Arc<OwnedRecord>>,
+    restore_chain: Option<Result<super::journal::JournalObservation, RecoveryControlError>>,
 }
 
 pub(super) struct ControlBook {
@@ -1283,6 +1268,210 @@ impl ControlFiles {
             && self
                 .existing_server_pool()
                 .is_ok_and(|actual| std::ptr::eq(actual.manager(), pool.manager()))
+    }
+
+    fn registration_free(&self) -> Result<(), RecoveryControlError> {
+        if self.retained_runtime.is_some()
+            || self.pending_startup.is_some()
+            || self.pending_owner.is_some()
+            || self.pending_admission.is_some()
+            || self.pending_runtime.is_some()
+        {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+        }
+        Ok(())
+    }
+
+    /// admissionSH → NONBLOCK runtimeSH; busy releases both.
+    pub(super) fn acquire_shared_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.registration_free()?;
+        let held = self
+            .acquire(
+                "admission.lock",
+                b"WBRCADM1",
+                FlockOperation::NonBlockingLockShared,
+                deadline,
+            )
+            .and_then(|admission| {
+                self.pending_admission = Some(admission);
+                self.acquire(
+                    "runtime.lock",
+                    b"WBRCRUN1",
+                    FlockOperation::NonBlockingLockShared,
+                    deadline,
+                )
+            });
+        match held {
+            Ok(runtime) => {
+                self.pending_runtime = Some(runtime);
+                self.existing_read_locks = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.release_registration_attempt();
+                Err(error)
+            }
+        }
+    }
+
+    /// ownerEX → admissionEX → NONBLOCK runtimeEX; busy releases all three
+    /// before any nonce, epoch, head read or effect.
+    pub(super) fn acquire_writer_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.registration_free()?;
+        let exclusive = FlockOperation::NonBlockingLockExclusive;
+        let held = self
+            .acquire("owner.lock", b"WBRCOWN1", exclusive, deadline)
+            .and_then(|owner| {
+                self.pending_owner = Some(owner);
+                self.acquire("admission.lock", b"WBRCADM1", exclusive, deadline)
+            })
+            .and_then(|admission| {
+                self.pending_admission = Some(admission);
+                self.acquire("runtime.lock", b"WBRCRUN1", exclusive, deadline)
+            });
+        match held {
+            Ok(runtime) => {
+                self.pending_runtime = Some(runtime);
+                self.writer_held = true;
+                Ok(())
+            }
+            Err(error) => {
+                self.release_writer();
+                Err(error)
+            }
+        }
+    }
+
+    /// The registration consumed the held locks; no branch still owns them.
+    pub(super) fn existing_read_locks_retired(&mut self) {
+        self.existing_read_locks = false;
+        self.writer_held = false;
+    }
+
+    pub(super) fn holds_writer(&self) -> bool {
+        self.writer_held
+            && self.pending_owner.is_some()
+            && self.pending_admission.is_some()
+            && self.pending_runtime.is_some()
+    }
+
+    /// Drop the writer's locks and open journal; written files stay.
+    pub(super) fn release_writer(&mut self) {
+        self.writer_held = false;
+        self.journal_tail = None;
+        self.raw.file = None;
+        self.pending_owner = None;
+        self.pending_runtime = None;
+        self.pending_admission = None;
+    }
+
+    /// The same runtime lock FD goes from EX to SH.
+    pub(super) fn downgrade_runtime_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        if !self.holds_writer() {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::EntryInvalid,
+            ));
+        }
+        self.reserve_io(0)?;
+        before(deadline)?;
+        self.raw.unit = Some(match self.pending_runtime.as_ref() {
+            Some(file) => rustix::fs::flock(file, FlockOperation::NonBlockingLockShared)
+                .map_err(io::Error::from),
+            None => {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::EntryInvalid,
+                ));
+            }
+        });
+        self.post(deadline)?;
+        if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) {
+            return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
+        }
+        Ok(())
+    }
+
+    /// Boot identity, pid and start of this process from its one native
+    /// observation; no configured identity substitutes for it.
+    fn process_record(
+        &self,
+    ) -> Result<(String, u32, super::journal::ProcessStart), RecoveryControlError> {
+        let raw = self
+            .original_process_evidence
+            .as_ref()
+            .ok_or_else(service_invalid)?;
+        let mut boot = String::with_capacity(32);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in &raw[16..] {
+            boot.push(HEX[usize::from(byte >> 4)] as char);
+            boot.push(HEX[usize::from(byte & 15)] as char);
+        }
+        let pid = u32::from_be_bytes(raw[..4].try_into().map_err(|_| service_invalid())?);
+        let start = super::journal::ProcessStart {
+            seconds: u64::from_be_bytes(raw[4..12].try_into().map_err(|_| service_invalid())?),
+            nanos: u32::from_be_bytes(raw[12..16].try_into().map_err(|_| service_invalid())?)
+                .checked_mul(1000)
+                .ok_or_else(service_invalid)?,
+        };
+        Ok((boot, pid, start))
+    }
+
+    /// Enrollment input of a verified head for this process; the owner set and
+    /// resource model come from the sealed intent unchanged.
+    pub(super) fn runtime_entry(
+        &mut self,
+        published: PublishedActivation,
+        intent: &super::ordinary::VerifiedOrdinaryStartupIntent,
+    ) -> Result<RuntimeEntry, RecoveryControlError> {
+        let deadline = intent.effect_deadline();
+        let control_root = self.root_identity(deadline)?;
+        let (boot_identity, pid, process_start) = self.process_record()?;
+        Ok(RuntimeEntry {
+            published,
+            control_root,
+            runtime_nonce: String::with_capacity(32),
+            original_deadline: deadline,
+            enrollment: super::runtime::OriginalRuntimeEnrollment {
+                boot_identity,
+                pid,
+                process_start,
+                resource_model: intent.resource_model(),
+                original_owner_set: intent.owners().to_vec(),
+            },
+        })
+    }
+
+    /// The operation owner's clock relation for an ordinary OperationIntent.
+    pub(super) fn owner_clock(
+        &self,
+        owner_nonce: Hex32,
+        t0_ns: u64,
+        bounds: &super::activation::OrdinaryStartupBounds,
+    ) -> Result<super::journal::OwnerClockRecord, RecoveryControlError> {
+        let (boot_identity, pid, process_start) = self.process_record()?;
+        let effect_deadline_ns = t0_ns
+            .checked_add(bounds.effect_ns.get())
+            .ok_or_else(service_invalid)?;
+        Ok(super::journal::OwnerClockRecord {
+            clock_kind: "CLOCK_MONOTONIC".to_owned(),
+            boot_identity,
+            pid,
+            process_start,
+            owner_nonce: owner_nonce.as_str().to_owned(),
+            t0_ns,
+            effect_deadline_ns,
+            convergence_deadline_ns: effect_deadline_ns
+                .checked_add(bounds.convergence_ns.get())
+                .ok_or_else(service_invalid)?,
+        })
     }
 
     pub(super) fn holds_existing_read_locks(&self) -> bool {
@@ -1968,6 +2157,7 @@ impl ControlFiles {
         &mut self,
         dir: Directory,
         maximum: u64,
+        mut names: Option<&mut Vec<Hex32>>,
         deadline: Instant,
     ) -> Result<u64, RecoveryControlError> {
         if !matches!(
@@ -2075,15 +2265,23 @@ impl ControlFiles {
                 ));
             }
             if matches!(dir, Directory::Root) {
-                if !matches!(
-                    name,
-                    b"owner.lock"
-                        | b"admission.lock"
-                        | b"runtime.lock"
-                        | b"activation-v1"
-                        | b"operations"
-                        | b"runtimes"
-                ) {
+                // A descriptor temp names its PublishIntent digest; it is
+                // preserved, never repaired or reused.
+                let descriptor_temp = name
+                    .strip_prefix(b"activation-v1.pending-")
+                    .and_then(|digest| std::str::from_utf8(digest).ok())
+                    .is_some_and(|digest| hex(digest, 64, false).is_ok());
+                if !descriptor_temp
+                    && !matches!(
+                        name,
+                        b"owner.lock"
+                            | b"admission.lock"
+                            | b"runtime.lock"
+                            | b"activation-v1"
+                            | b"operations"
+                            | b"runtimes"
+                    )
+                {
                     return Err(RecoveryControlError::new(
                         RecoveryControlFault::ControlInvalid,
                     ));
@@ -2098,7 +2296,10 @@ impl ControlFiles {
                 nonce.copy_from_slice(name);
                 let nonce = std::str::from_utf8(&nonce)
                     .map_err(|_| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
-                hex(nonce, 32, true)?;
+                let entry_name = Hex32::parse(nonce)?;
+                if let Some(names) = names.as_deref_mut() {
+                    names.push(entry_name);
+                }
                 self.reserve_io(0)?;
                 before(deadline)?;
                 self.raw.named = Some(rustix::fs::statat(
@@ -2134,8 +2335,13 @@ impl ControlFiles {
     }
 
     fn check_root_namespace(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
-        self.inventory_count(Directory::Root, self.limits.max_root_entries, deadline)
-            .map(|_| ())
+        self.inventory_count(
+            Directory::Root,
+            self.limits.max_root_entries,
+            None,
+            deadline,
+        )
+        .map(|_| ())
     }
 
     pub(super) fn verify_registration_capacity(
@@ -2150,11 +2356,13 @@ impl ControlFiles {
         self.inventory_count(
             Directory::Operations,
             self.limits.max_retained_operations,
+            None,
             deadline,
         )?;
         let count = self.inventory_count(
             Directory::Runtimes,
             self.limits.max_registered_runtimes,
+            None,
             deadline,
         )?;
         if count >= self.limits.max_registered_runtimes {
@@ -2811,268 +3019,209 @@ impl ControlFiles {
 
 /// Existing ordinary Server DATA is never allowed to mint a head. The same
 /// actual read locks precede every bootstrap probe and survive into enrollment.
-pub(super) async fn observe_existing_server_before(
+/// Seal the Server entry intent from the one ordinary intent loaded with the
+/// service configuration (S1); the intent file is not opened again.
+#[cfg(feature = "server-runtime")]
+pub(super) fn server_intent(
+    owner: &ControlOwner,
+    deployment: &openbot_contracts::ids::DeploymentId,
+    tenant: &openbot_contracts::ids::TenantId,
+    owners: &[super::runtime::RuntimeOwner],
+) -> Result<super::ordinary::VerifiedOrdinaryStartupIntent, RecoveryControlError> {
+    use super::ordinary::{
+        OrdinaryInitializationSource, OrdinarySite, SiteExpectation, VerifiedOrdinaryStartupIntent,
+    };
+    let files = lock(owner)?;
+    let source = files.service_source.as_ref().ok_or_else(service_invalid)?;
+    let configuration = &source.configuration;
+    let expected = &configuration.expected_installation_binding;
+    if expected.deployment_id != deployment.as_str() || expected.tenant_id != tenant.as_str() {
+        return Err(RecoveryControlError::new(
+            RecoveryControlFault::EntryInvalid,
+        ));
+    }
+    let origin = source.original_ordinary_input.as_ref().map(|input| {
+        let kind = match input.intent.mode {
+            ServiceOrdinaryMode::FreshInit => OrdinaryInitializationSource::ServerDatabaseFresh,
+            ServiceOrdinaryMode::LegacyAdoption => OrdinaryInitializationSource::LegacyAdoption {
+                site: OrdinarySite::ServerDatabase,
+            },
+        };
+        (kind, input.intent.request_id, input.input.stamp.identity)
+    });
+    let config = &source.original_config;
+    let site = SiteExpectation::Server {
+        dataset: expected.dataset_id,
+        ids: [
+            expected.deployment_id.clone(),
+            expected.tenant_id.clone(),
+            expected.source_installation_id.clone(),
+            expected.target_installation_id.clone(),
+        ],
+        database: configuration.expected_server_database,
+        service_config: ServiceConfigRef {
+            file: config.stamp.identity,
+            length: config.stamp.length,
+            digest: Hex64::of(&Sha256::digest(&config.bytes).into()),
+        },
+        owner: super::activation::ActualOsOwner::ConfiguredService {
+            uid: source.uid,
+            service: configuration.expected_service_owner.service.clone(),
+        },
+    };
+    VerifiedOrdinaryStartupIntent::seal(
+        origin,
+        site,
+        configuration.ordinary_startup_bounds,
+        configuration.host_limits.admission_ns,
+        owners,
+    )
+}
+
+/// Connect the bootstrap Pool for this Server site and keep it, with its first
+/// client, in the control owner for the runtime read gate.
+#[cfg(feature = "server-runtime")]
+pub(super) async fn connect_server_before(
     owner: &ControlOwner,
     database: &crate::db::pool::DatabaseConfig,
-    configured_master_encoding: openbot_domain::vault::SecretBytes,
-    deployment: &str,
-    tenant: &str,
     deadline: Instant,
-) -> Result<VerifiedOrdinaryStartupIntent, RecoveryControlError> {
-    let result = async {
-        let mut files = lock(owner)?;
-        if files.existing_server.is_some() || files.pending_admission.is_some()
-            || files.pending_runtime.is_some() || files.retained_runtime.is_some()
-        { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy)); }
-        let fixed = std::mem::size_of::<crate::db::initialization::OwnedExistingServerDatabase>()
-            .checked_add(2 * std::mem::size_of::<VerifiedOrdinaryStartupIntent>())
-            .and_then(|n| n.checked_add(2 * std::mem::size_of::<super::activation::PublishedActivation>()))
-            .and_then(|n| n.checked_add(2 * std::mem::size_of::<super::journal::VerifiedPublication>()))
-            .and_then(|n| n.checked_add(2 * std::mem::size_of::<super::runtime::OriginalRuntimeEnrollment>()))
-            .and_then(|n| n.checked_add(8 * std::mem::size_of::<String>()))
-            .and_then(|n| n.checked_add(4 * std::mem::size_of::<Vec<String>>()))
-            .and_then(|n| n.checked_add(16 * 4096 + 2 * 32 + 2 * 64))
-            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-        let typed = files.limits.max_id_bytes.checked_mul(24).and_then(|n| n.checked_add(fixed as u64))
-            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-        files.prepay(typed, 0)?;
-        let source = files.service_source.as_mut().ok_or_else(service_invalid)?;
-        source.recheck_original(deadline)?;
-        if source.configuration.expected_installation_binding.deployment_id != deployment
-            || source.configuration.expected_installation_binding.tenant_id != tenant
-        { return Err(service_invalid()); }
-        files.pending_admission = Some(files.acquire("admission.lock", b"WBRCADM1", FlockOperation::NonBlockingLockShared, deadline)?);
-        files.pending_runtime = Some(files.acquire("runtime.lock", b"WBRCRUN1", FlockOperation::NonBlockingLockShared, deadline)?);
-        files.existing_read_locks = true;
-        let root = files.root_identity(deadline)?;
-        files.reserve_io(0)?;
-        files.raw.named = Some(rustix::fs::statat(files.directory(Directory::Root)?, "activation-v1", AtFlags::SYMLINK_NOFOLLOW));
-        files.post(deadline)?;
-        if matches!(files.raw.named, Some(Err(rustix::io::Errno::NOENT))) {
-            return Err(RecoveryControlError::new(RecoveryControlFault::InitializationRequired));
-        }
-        files.prepay((std::mem::size_of::<OwnedRecord>() + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
-            + 2 * std::mem::align_of::<OwnedRecord>()) as u64, 0)?;
-        let cap = files.limits.max_activation_bytes;
-        let actual = files.read_record(Directory::Root, "activation-v1", cap, deadline)?;
-        files.activation_source = Some(Arc::new(actual));
-        let actual = Arc::clone(files.activation_source.as_ref().ok_or_else(service_invalid)?);
-        files.prepay(super::activation::read_metadata_reservation(&actual.bytes)?
-            .checked_add((2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>() + 2 * std::mem::align_of::<super::activation::ActivationObservation>()) as u64)
-            .ok_or_else(service_invalid)?, 0)?;
-        files.activation_observation = Some(super::activation::observe(&actual.bytes, &files.limits).map(Arc::new));
-        files.post(deadline)?;
-        let observation = Arc::clone(files.activation_observation.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?);
-        let (binding, _) = observation.ordinary_active()?;
-        let binding = binding.ordinary_server()?;
-        let source = files.service_source.as_ref().ok_or_else(service_invalid)?;
-        let expected = &source.configuration.expected_installation_binding;
-        let original_config = &source.original_config;
-        if [binding.dataset_id, binding.deployment_id, binding.tenant_id, binding.source_installation_id, binding.target_installation_id]
-            != [expected.dataset_id.as_str(), expected.deployment_id.as_str(), expected.tenant_id.as_str(), expected.source_installation_id.as_str(), expected.target_installation_id.as_str()]
-            || binding.service_config.file != original_config.stamp.identity
-            || binding.service_config.length != original_config.stamp.length
-            || binding.service_config.digest != Hex64::of(&Sha256::digest(&original_config.bytes).into())
-            || !source.configuration.expected_server_database.matches(binding.server_database)
-        { return Err(service_invalid()); }
-        let reference = observation.publication_reference()?;
-        let context = reference.context_id;
-        let context = context.as_str();
-        files.reserve_io(1)?;
-        files.raw.file = Some(rustix::fs::openat(files.directory(Directory::Operations)?, context,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty()).map(File::from).map_err(io::Error::from));
-        files.post(deadline)?;
-        let operation_identity = files.check_opened(true, deadline)?;
-        files.named_matches(Directory::Operations, context, operation_identity, deadline)?;
-        let mut operation_context = [0u8; 32]; operation_context.copy_from_slice(context.as_bytes());
-        files.publication_operation = Some((operation_context, operation_identity));
-        files.operation_work = Some(files.take_opened()?);
-        files.prepay((std::mem::size_of::<OwnedRecord>() + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
-            + 2 * std::mem::align_of::<OwnedRecord>()) as u64, 0)?;
-        let cap = files.limits.max_journal_bytes;
-        let journal = files.read_record(Directory::OperationWork, "journal-v1", cap, deadline)?;
-        files.publication_journal = Some(Arc::new(journal));
-        let journal = Arc::clone(files.publication_journal.as_ref().ok_or_else(service_invalid)?);
-        let journal_fee = super::journal::read_metadata_reservation(&journal.bytes, &files.limits)?;
-        files.prepay(journal_fee, 0)?;
-        files.publication_chain = Some(super::journal::observe_chain(&journal.bytes, &files.limits));
-        files.post(deadline)?;
-        let chain = files.publication_chain.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-        chain.verify_ordinary_evidence(&observation)?;
-        files.publication_seal = Some(chain.publication_for(&observation.record.control_id, &observation.digest,
-            reference, actual.identity, super::ActivationPhase::OrdinaryActive));
-        files.post(deadline)?;
-        let publication = match files.publication_seal.take() {
-            Some(Ok(publication)) => publication,
-            other => {
-                let fault = other.as_ref().and_then(|result| result.as_ref().err()).map_or(RecoveryControlFault::ControlInvalid, RecoveryControlError::fault);
-                files.publication_seal = other;
-                return Err(RecoveryControlError::new(fault));
-            }
-        };
-        files.existing_publication = Some(PublishedActivation::bind(Arc::clone(&observation), publication));
-        files.post(deadline)?;
-        match files.existing_publication.as_ref() {
-            Some(Ok(_)) => (),
-            Some(Err(error)) => return Err(RecoveryControlError::new(error.fault())),
-            None => return Err(service_invalid()),
-        }
+) -> Result<crate::db::pool::DatabasePool, RecoveryControlError> {
+    let mut packet = crate::db::initialization::OwnedExistingServerDatabase::new();
+    packet.pool = Some(crate::db::pool::connect(database).await);
+    let pool = packet.pool()?.clone();
+    packet.client = Some(pool.get().await);
+    let mut files = lock(owner)?;
+    if files.existing_server.is_some() {
+        return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+    }
+    files.existing_server = Some(packet);
+    files.post(deadline)?;
+    Ok(pool)
+}
 
-        // This original packet is resident before the first real connect poll.
-        // It is retained on every subsequent error; no timeout/dropped future
-        // becomes a driver/PG close observation.
-        files.existing_configured_master_encoding = Some(configured_master_encoding);
-        files.post(deadline)?;
+/// Site checks against a sealed Server binding on one connection: identity,
+/// principals and database owner, no known restore, and the KEK canary whose
+/// key id is keyRefs[0] (R83 P2-2).
+#[cfg(feature = "server-runtime")]
+pub(super) async fn compare_server_site_before(
+    client: &tokio_postgres::Client,
+    binding: &super::activation::ActivationBinding,
+    database: &crate::db::pool::DatabaseConfig,
+    configured: &crate::auth::config::KeyEncryptionKey,
+    dataset: &Hex32,
+    deadline: Instant,
+) -> Result<(), RecoveryControlError> {
+    let binding = binding.ordinary_server()?;
+    let row = client
+        .query_one(crate::db::initialization::EXISTING_SERVER_IDENTITY_SQL, &[])
+        .await
+        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+    let text = |column: &str| row.try_get::<_, String>(column).ok();
+    let principal = text("authenticated_principal").ok_or_else(service_invalid)?;
+    if text("system_identifier").and_then(|v| v.parse::<u64>().ok())
+        != Some(binding.server_database.pg_system_id)
+        || row.try_get::<_, u32>("database_oid").ok() != Some(binding.server_database.database_oid)
+        || row.try_get::<_, i32>("pg_major").ok() != Some(17)
+        || principal != binding.server_database.authenticated_principal
+        || text("current_principal").as_ref() != Some(&principal)
+        || principal != database.user
+        || text("database_owner").as_deref()
+            != Some(binding.server_database.database_owner.as_str())
+        || binding.postgres.key_id != principal
+        || binding.postgres.key_version != 1
+    {
+        return Err(service_invalid());
+    }
+    let known_restore: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM openbot_internal.restore_pg_operations)",
+            &[],
+        )
+        .await
+        .and_then(|row| row.try_get(0))
+        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+    if known_restore {
+        return Err(service_invalid());
+    }
+    let deployment = openbot_contracts::ids::DeploymentId::new(binding.deployment_id);
+    let tenant = openbot_contracts::ids::TenantId::new(binding.tenant_id);
+    let key_id = crate::db::initialization::verify_server_canary(
+        client,
+        configured,
+        &deployment,
+        &tenant,
+        dataset,
+    )
+    .await?;
+    if key_id.as_ref().map(Hex32::as_str) != Some(binding.master.key_id.as_str())
+        || binding.master.key_version != 1
+    {
+        return Err(RecoveryControlError::new(
+            RecoveryControlFault::KeyUnverified,
+        ));
+    }
+    before(deadline)
+}
+
+/// Existing latest-version Server head under SH (S8 step 2): connect in SH,
+/// compare the site, then the current schema on the same connection, and
+/// recheck the head digest and service source.
+#[cfg(feature = "server-runtime")]
+pub(super) async fn verify_existing_server_before(
+    owner: &ControlOwner,
+    published: &PublishedActivation,
+    database: &crate::db::pool::DatabaseConfig,
+    configured: &crate::auth::config::KeyEncryptionKey,
+    dataset: &Hex32,
+    deadline: Instant,
+) -> Result<crate::db::pool::DatabasePool, RecoveryControlError> {
+    let result = async {
+        let pool = connect_server_before(owner, database, deadline).await?;
+        let client = pool
+            .get()
+            .await
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        let binding = published.binding();
+        compare_server_site_before(&client, binding, database, configured, dataset, deadline)
+            .await?;
+        let latest = crate::db::native::NATIVE_LATEST_VERSION;
+        crate::db::native::validate_current(&client)
+            .await
+            .map_err(|_| service_invalid())?;
+        let layout = crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(&client)
+            .await
+            .map_err(|_| service_invalid())?;
+        crate::db::thread_history_writer_schema::verify(&client)
+            .await
+            .map_err(|_| service_invalid())?;
+        let checksum: String = client
+            .query_one(
+                "SELECT checksum FROM openbot_internal.schema_migrations WHERE version = $1",
+                &[&latest],
+            )
+            .await
+            .and_then(|row| row.try_get(0))
+            .map_err(|_| service_invalid())?;
+        if layout.native_version() != latest
+            || i64::from(binding.native_version()) != i64::from(latest)
+            || binding.migration_digest() != checksum
         {
-            use base64::Engine as _;
-            let encoded = files.existing_configured_master_encoding.as_ref().ok_or_else(service_invalid)?;
-            // The actual Server main has already applied the original key policy
-            // and canonical loader to this same value. Only its 32-byte master
-            // encoding is supported by the existing canary; never truncate or
-            // reinterpret the original raw-text audit/MCP derivation key.
-            if encoded.len() != 44 { return Err(service_invalid()); }
-            files.raw_master_decode = Some(base64::engine::general_purpose::STANDARD.decode(encoded.expose())
-                .map(openbot_domain::vault::SecretBytes::new));
-        }
-        files.post(deadline)?;
-        if !matches!(files.raw_master_decode.as_ref(), Some(Ok(master)) if master.len() == 32) {
             return Err(service_invalid());
         }
-        let decoded_master = match files.raw_master_decode.take() {
-            Some(Ok(master)) => master,
-            other => { files.raw_master_decode = other; return Err(service_invalid()); }
-        };
-        files.existing_server = Some(crate::db::initialization::OwnedExistingServerDatabase::new(decoded_master));
+        let mut files = lock(owner)?;
+        files.verify_head_digest(published.digest(), deadline)?;
+        files
+            .service_source
+            .as_mut()
+            .ok_or_else(service_invalid)?
+            .recheck_original(deadline)?;
         files.post(deadline)?;
-        files.existing_server.as_mut().ok_or_else(service_invalid)?.pool = Some(crate::db::pool::connect(database).await);
-        files.post(deadline)?;
-        let pool = files.existing_server_pool()?.clone();
-        files.existing_server.as_mut().ok_or_else(service_invalid)?.client = Some(pool.get().await);
-        files.post(deadline)?;
-        {
-            let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
-            let client = packet.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            packet.identity = Some(client.query_one(crate::db::initialization::EXISTING_SERVER_IDENTITY_SQL, &[]).await);
-        }
-        files.post(deadline)?;
-        {
-            let packet = files.existing_server.as_ref().ok_or_else(service_invalid)?;
-            let row = packet.identity.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            let system: String = row.try_get("system_identifier").map_err(|_| service_invalid())?;
-            let oid: u32 = row.try_get("database_oid").map_err(|_| service_invalid())?;
-            let major: i32 = row.try_get("pg_major").map_err(|_| service_invalid())?;
-            let principal: String = row.try_get("authenticated_principal").map_err(|_| service_invalid())?;
-            let current: String = row.try_get("current_principal").map_err(|_| service_invalid())?;
-            let database_owner: String = row.try_get("database_owner").map_err(|_| service_invalid())?;
-            if system.parse::<u64>().ok() != Some(binding.server_database.pg_system_id)
-                || oid != binding.server_database.database_oid || major != 17
-                || principal != binding.server_database.authenticated_principal || current != principal
-                || principal != database.user || database_owner != binding.server_database.database_owner
-                || binding.postgres.key_id != principal || binding.postgres.key_version != 1
-                || packet.master.expose().len() != 32
-            { return Err(service_invalid()); }
-        }
-        files.post(deadline)?;
-        {
-            let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
-            let client = packet.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            packet.native = Some(crate::db::native::validate_current(client).await);
-        }
-        files.post(deadline)?;
-        if !matches!(files.existing_server.as_ref().ok_or_else(service_invalid)?.native, Some(Ok(())))
-            || binding.native_version != 53
-            || binding.migration_digest != crate::db::native::native_0053_checksum()
-        { return Err(service_invalid()); }
-        // Preserve the original complete validator, not a migration count.
-        {
-            let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
-            let client = packet.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            packet.layout = Some(crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client).await
-                .map_err(crate::db::desktop_vault_canary::DesktopVaultCanaryError::from));
-        }
-        files.post(deadline)?;
-        if !matches!(files.existing_server.as_ref().ok_or_else(service_invalid)?.layout, Some(Ok(ref layout)) if layout.native_version() == 53) {
-            return Err(service_invalid());
-        }
-        {
-            let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
-            let client = packet.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            packet.writer_schema = Some(crate::db::thread_history_writer_schema::verify(client).await);
-        }
-        files.post(deadline)?;
-        if !matches!(files.existing_server.as_ref().ok_or_else(service_invalid)?.writer_schema, Some(Ok(()))) {
-            return Err(service_invalid());
-        }
-        {
-            let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
-            let client = packet.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            packet.known_restore = Some(client.query_one("SELECT EXISTS(SELECT 1 FROM openbot_internal.restore_pg_operations) AS known_restore", &[]).await);
-        }
-        files.post(deadline)?;
-        if files.existing_server.as_ref().ok_or_else(service_invalid)?.known_restore.as_ref()
-            .and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?.try_get::<_, bool>("known_restore").map_err(|_| service_invalid())?
-        { return Err(service_invalid()); }
-        let id_limit = i64::try_from(files.limits.max_id_bytes).map_err(|_| service_invalid())?;
-        {
-            let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
-            let client = packet.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            packet.canary = Some(client.query_one(crate::db::initialization::EXISTING_SERVER_CANARY_SQL,
-                &[&deployment, &tenant, &id_limit]).await);
-        }
-        files.post(deadline)?;
-        {
-            let packet = files.existing_server.as_mut().ok_or_else(service_invalid)?;
-            let row = packet.canary.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(service_invalid)?;
-            let dataset: String = row.try_get("dataset_id").map_err(|_| service_invalid())?;
-            let row_deployment: String = row.try_get("deployment_id").map_err(|_| service_invalid())?;
-            let row_tenant: String = row.try_get("tenant_id").map_err(|_| service_invalid())?;
-            let key_id: String = row.try_get("key_id").map_err(|_| service_invalid())?;
-            let key_version: i32 = row.try_get("key_version").map_err(|_| service_invalid())?;
-            let canary_schema: i16 = row.try_get("canary_schema").map_err(|_| service_invalid())?;
-            let encrypted: String = row.try_get("encrypted_canary").map_err(|_| service_invalid())?;
-            if dataset != binding.dataset_id || row_deployment != deployment || row_tenant != tenant
-                || key_id != binding.master.key_id || key_version != 1 || binding.master.key_version != 1
-                || canary_schema != 1
-            { return Err(service_invalid()); }
-            let aad = openbot_domain::vault::DesktopVaultCanaryBinding::new(dataset, row_deployment, row_tenant,
-                key_id, openbot_domain::vault::KeyVersion::new(1)).map_err(|_| service_invalid())?;
-            let envelope = openbot_domain::vault::DesktopVaultCanaryEnvelope::parse(&encrypted).map_err(|_| service_invalid())?;
-            packet.crypto = Some(openbot_domain::vault::open_desktop_vault_canary(&packet.master, &aad, &envelope));
-        }
-        files.post(deadline)?;
-        if !matches!(files.existing_server.as_ref().ok_or_else(service_invalid)?.crypto, Some(Ok(()))) { return Err(service_invalid()); }
-        files.verify_head_digest(&observation.digest, deadline)?;
-        files.service_source.as_mut().ok_or_else(service_invalid)?.recheck_original(deadline)?;
-        files.post(deadline)?;
-        let raw = files.original_process_evidence.as_ref().ok_or_else(service_invalid)?;
-        // Only the existing native 16-byte boot value is encoded; no digest,
-        // configured identity or second ProcessIdentity is used as a substitute.
-        let mut boot = String::with_capacity(32);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in &raw[16..] { boot.push(HEX[usize::from(byte >> 4)] as char); boot.push(HEX[usize::from(byte & 15)] as char); }
-        let enrollment = super::runtime::OriginalRuntimeEnrollment {
-            boot_identity: boot, pid: u32::from_be_bytes(raw[..4].try_into().map_err(|_| service_invalid())?),
-            process_start: super::journal::ProcessStart { seconds: u64::from_be_bytes(raw[4..12].try_into().map_err(|_| service_invalid())?),
-                nanos: u32::from_be_bytes(raw[12..16].try_into().map_err(|_| service_invalid())?).checked_mul(1000).ok_or_else(service_invalid)? },
-            resource_model: super::runtime::ResourceModel::Server,
-            original_owner_set: vec!["server-config-original".into(), "server-database-original".into()],
-        };
-        files.verify_enrollment_before(&enrollment, deadline)?;
-        let published = match files.existing_publication.take() {
-            Some(Ok(published)) => published,
-            other => { files.existing_publication = other; return Err(service_invalid()); }
-        };
-        Ok(VerifiedOrdinaryStartupIntent { published, control_root: root,
-            runtime_nonce: String::with_capacity(32), original_deadline: deadline, enrollment })
-    }.await;
+        Ok(pool)
+    }
+    .await;
     result.map_err(|error: RecoveryControlError| {
         if let Ok(mut files) = lock(owner) {
-            if error.fault() == RecoveryControlFault::OwnerBusy && files.existing_server.is_none() {
-                files.release_registration_attempt();
-            } else {
-                files.latch(error.fault());
-            }
+            files.latch(error.fault());
         }
         error.retain(owner)
     })
@@ -3177,10 +3326,7 @@ pub(super) fn open_control(
             publication_operation: None,
             publication_chain: None,
             publication_seal: None,
-            existing_publication: None,
             existing_server: None,
-            existing_configured_master_encoding: None,
-            raw_master_decode: None,
             existing_read_locks: false,
             runtime_entropy: [0; 16],
             raw_random: None,
@@ -3195,6 +3341,10 @@ pub(super) fn open_control(
             runtime_input: Vec::new(),
             raw_encoding: None,
             retained_runtime: None,
+            journal_tail: None,
+            writer_held: false,
+            restore_journal: None,
+            restore_chain: None,
         }),
         retired_metadata: 0,
         retired_files: 0,

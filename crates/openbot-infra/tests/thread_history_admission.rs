@@ -1,9 +1,9 @@
 //! Finite native0050 storage admission on owned synthetic PostgreSQL17.11.
 //! Internal metadata and permanent IDs; this suite grants no current Host or ACK.
 #![cfg(feature = "server-runtime")]
+mod harness;
 #[path = "support/recovery_admission.rs"]
 mod recovery_admission;
-mod harness;
 use async_trait::async_trait;
 use openbot_application::model_connections::ModelConnectionAdministration;
 use openbot_application::provider::{
@@ -995,8 +995,9 @@ async fn s12_explicit49_historical_canary_and_current50_admission_are_distinct()
         native::apply(&mut c).await.map_err(|e|e.to_string())?;
         drop(c);desktop_vault_canary::verify_current_layout(&p).await.map_err(|e|e.to_string())?;
         let c=p.get().await.map_err(|e|e.to_string())?;
+        let unknown=format!("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES({0},'unknown{0}',repeat('b',64))",native::NATIVE_LATEST_VERSION+1);
         for sql in ["DELETE FROM openbot_internal.schema_migrations WHERE version=46","UPDATE openbot_internal.schema_migrations SET name='wrong50' WHERE version=50",
-            "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=50","INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(53,'unknown53',repeat('b',64))",
+            "UPDATE openbot_internal.schema_migrations SET checksum=repeat('a',64) WHERE version=50",unknown.as_str(),
             "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(12,'unexpected12',repeat('c',64))"] {
             c.batch_execute("BEGIN").await.map_err(|e|e.to_string())?;c.batch_execute(sql).await.map_err(|e|e.to_string())?;
             let result=admission_schema::verify(&c).await;

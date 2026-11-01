@@ -99,7 +99,11 @@ impl HostRequestBindingGuard for OutsideDomainGuard {
         auth: &'a AuthContext,
         deadline: Instant,
     ) -> Pin<
-        Box<dyn Future<Output = Result<RecoveryAdmissionLease<'a>, HostRequestBindingError>> + Send + 'a>,
+        Box<
+            dyn Future<Output = Result<RecoveryAdmissionLease<'a>, HostRequestBindingError>>
+                + Send
+                + 'a,
+        >,
     > {
         Box::pin(async move {
             let admission = OutsideDomainAdmission(self.auth.clone());

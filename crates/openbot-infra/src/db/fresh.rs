@@ -49,12 +49,19 @@ pub async fn apply(
         })?;
         return Ok(FreshApplyOutcome::AlreadyInitialized);
     }
-    super::baseline::apply_in_transaction(&transaction).await?;
-    let outcome =
-        native::apply_through_in_transaction(&transaction, native::NATIVE_LATEST_VERSION).await?;
+    let outcome = apply_in_transaction(&transaction).await?;
     transaction
         .commit()
         .await
         .map_err(|source| InfraError::query("提交 fresh database bootstrap", source))?;
     Ok(FreshApplyOutcome::Applied(outcome))
+}
+
+/// Baseline plus every native migration inside the caller's transaction; the
+/// caller owns BEGIN, the empty-schema recheck, ROLLBACK and COMMIT.
+pub(crate) async fn apply_in_transaction(
+    transaction: &tokio_postgres::Transaction<'_>,
+) -> Result<ApplyOutcome, InfraError> {
+    super::baseline::apply_in_transaction(transaction).await?;
+    native::apply_through_in_transaction(transaction, native::NATIVE_LATEST_VERSION).await
 }
