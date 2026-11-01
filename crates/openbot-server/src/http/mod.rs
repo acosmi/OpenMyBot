@@ -776,12 +776,14 @@ pub fn router(state: ServerState) -> Router {
         )
         .route(
             "/api/artifacts/{artifact_id}",
-            get(artifacts::metadata).head(|| async {
-                (
-                    axum::http::StatusCode::METHOD_NOT_ALLOWED,
-                    [(axum::http::header::CACHE_CONTROL, "no-store")],
-                )
-            }),
+            get(artifacts::metadata)
+                .head(|| async {
+                    (
+                        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                        [(axum::http::header::CACHE_CONTROL, "no-store")],
+                    )
+                })
+                .delete(artifacts::delete),
         )
         .route("/api/threads/mint", post(threads::mint))
         .route(

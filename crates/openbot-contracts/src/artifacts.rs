@@ -207,6 +207,40 @@ impl core::fmt::Display for ArtifactGoneStatus {
     }
 }
 
+/// How far one deletion call of an explicitly saved artifact got. `Deleted` means the stored
+/// object is durably absent and the record is a tombstone; neither state claims erasure of
+/// database WAL, backups or any copy outside this artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactDeletionState {
+    /// The deletion is armed; resending the same deletion resumes the rest.
+    Pending,
+    /// The bytes are absent, the record is a tombstone and its charge was refunded once.
+    Deleted,
+}
+
+/// The fixed disclosure of every deletion receipt: artifact text already injected into Run
+/// history is not removed with the artifact. It is cleared only when the history of the Thread
+/// it was injected into is cleared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactInjectedCopies {
+    /// Injected copies remain until their own Thread history is cleared.
+    RetainedUntilThreadHistoryClear,
+}
+
+/// Progress of one deletion of an explicitly saved artifact by its saving owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactDeletionReceipt {
+    /// Canonical lowercase UUIDv7 artifact id.
+    pub artifact_id: String,
+    /// Progress of this call, not a later state.
+    pub state: ArtifactDeletionState,
+    /// Always given, whatever the state.
+    pub injected_copies: ArtifactInjectedCopies,
+}
+
 /// R414 单成果冻结大小上限：64 MiB。
 pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 /// R414 单个读取块冻结大小上限：4 MiB。
