@@ -4,13 +4,15 @@
 //!   --source-key <key>      returned by a successful verify, default `fake-source`
 //!   --events <path>         newline-terminated JSON lines of events; after `start` the existing lines
 //!                           are emitted in order, then the file is polled every 100 ms for appended
-//!                           lines; each event awaits its `accepted`; a missing file counts as empty
+//!                           lines; each event awaits its `accepted`; a missing file counts as empty;
+//!                           `{source}` in the path stands for the `start` frame's source key
 //!   --sent-log <path>       one JSON line per `send`
 //!   --recv-log <path>       every received frame as one JSON line, in arrival order
 //!   --scenario <name>       normal | verify_fail:<code> | send_fail:<class>:<code>[:<retry_after_ms>] |
 //!                           send_fail_once:<class>:<code>[:<retry_after_ms>] | send_hang |
 //!                           crash_after_hello | slow_hello | oversize_frame | unknown_field | no_ack_wait |
-//!                           gap_then_closed | suspend:<reason> | skip_both | stderr_secret
+//!                           gap_then_closed | suspend:<reason> | skip_both | stderr_secret |
+//!                           verify_slow:<ms>
 //! A scenario only adds behaviour; hello_ok, verify, start with events, send and stop always work.
 //!
 //! With `--recv-log` the process relays its stdin to a copy of itself (same arguments without
@@ -49,6 +51,7 @@ enum Scenario {
     Suspend(SuspendReason),
     SkipBoth,
     StderrSecret,
+    VerifySlow(u64),
 }
 
 struct Fake {
@@ -95,6 +98,7 @@ fn scenario(name: &str) -> Scenario {
         ["suspend", reason] => Scenario::Suspend(code(reason)),
         ["skip_both"] => Scenario::SkipBoth,
         ["stderr_secret"] => Scenario::StderrSecret,
+        ["verify_slow", ms] => Scenario::VerifySlow(ms.parse().expect("verify_slow ms")),
         _ => panic!("unknown scenario {name}"),
     }
 }
@@ -137,6 +141,10 @@ impl ChannelPlugin for Fake {
     ) -> Result<String, VerifyFailure> {
         match &self.scenario {
             Scenario::VerifyFail(failure) => Err(failure.clone()),
+            Scenario::VerifySlow(ms) => {
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+                Ok(self.source_key.clone())
+            }
             _ => Ok(self.source_key.clone()),
         }
     }
@@ -191,7 +199,12 @@ impl ChannelPlugin for Fake {
             Scenario::StderrSecret => eprintln!("{}", start.credential),
             _ => {}
         }
-        if let Some(path) = self.events.clone() {
+        if let Some(path) = &self.events {
+            let path = PathBuf::from(
+                path.to_str()
+                    .expect("events path")
+                    .replace("{source}", &start.source_key),
+            );
             self.tail = Some(tokio::spawn(async move {
                 let mut from = 0;
                 loop {

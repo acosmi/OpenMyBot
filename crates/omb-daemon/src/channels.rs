@@ -290,7 +290,7 @@ pub(crate) struct Channels {
     processes: Processes,
     supervisors: JoinSet<Result<(), ChannelError>>,
     receivers: HashMap<ChannelKind, Uuid>,
-    context: Arc<Context>,
+    pub(crate) context: Arc<Context>,
     dispatcher: Task,
     heartbeat: Task,
     outbound: Task,
@@ -498,6 +498,31 @@ impl Channels {
                 let _ = done.send(());
             }
         }
+    }
+    /// Ends the processes of `kinds` through the stop ladder before their package is removed or
+    /// replaced; `done` answers once every process group is empty.
+    pub(crate) async fn retire(&mut self, kinds: Vec<String>, done: oneshot::Sender<()>) {
+        let processes: Vec<PluginProcess> = self
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| kinds.iter().any(|retired| retired == kind.as_str()))
+            .map(|(_, process)| process.clone())
+            .collect();
+        let mut receipts = Vec::new();
+        for process in processes {
+            let (ended, receipt) = oneshot::channel();
+            process.retire(ended).await;
+            receipts.push(receipt);
+        }
+        // The main loop keeps serving while the ladders run.
+        tokio::spawn(async move {
+            for receipt in receipts {
+                let _ = receipt.await;
+            }
+            let _ = done.send(());
+        });
     }
     /// Hands a credential check to the channel's plugin; the reply is dropped when no plugin
     /// provides the channel.
@@ -1411,20 +1436,20 @@ mod tests {
         let (done, _) = oneshot::channel();
         channels.start_receiver(&mut fixture.pg, second, done).await;
         starts_with(&logs, "1001:token-b").await;
-        // The old receiver stopped before the new one started, in the same process.
+        // The old process ended through the stop ladder before a new one started the receiver.
         let kinds: Vec<Value> = logs
             .received()
             .into_iter()
             .map(|frame| frame["type"].clone())
             .collect();
-        assert_eq!(kinds, ["hello", "start", "stop", "start"]);
+        assert_eq!(kinds, ["hello", "start", "hello", "start"]);
         receivers_reach(&client, 1).await;
         // A receiver that stopped itself, on an event of a binding no longer active, can be
         // started again.
         client.execute("UPDATE openmybot.channel_bindings SET status='suspended',status_reason='credential_rejected' WHERE binding_id=$1", &[&binding]).await.unwrap();
         logs.push(&message("telegram", "5", "while suspended"));
         receivers_reach(&client, 0).await;
-        assert_eq!(logs.received_of("stop").len(), 2);
+        assert!(logs.received_of("stop").is_empty());
         client.execute("UPDATE openmybot.channel_bindings SET status='active',status_reason=NULL WHERE binding_id=$1", &[&binding]).await.unwrap();
         let third = ReceiverRow {
             binding_id: binding,
@@ -2417,14 +2442,15 @@ mod tests {
         stopped.await.unwrap();
         receivers_reach(&client, 1).await;
         assert_eq!(telegram_logs.received_of("stop").len(), 1);
-        assert_eq!(feishu.received_of("stop").len(), 1);
+        assert!(feishu.received_of("stop").is_empty());
         let (done, stopped) = oneshot::channel();
         channels.stop_receiver(Uuid::now_v7(), done).await;
         stopped.await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(receivers(&client).await, 1);
-        assert_eq!(feishu.received_of("stop").len(), 1);
-        assert_eq!(feishu.received_of("hello").len(), 1);
+        // The replaced Feishu process ended through the stop ladder and a new one started.
+        assert!(feishu.received_of("stop").is_empty());
+        assert_eq!(feishu.received_of("hello").len(), 2);
         channels.stop().await;
         fixture.stop().await;
     }

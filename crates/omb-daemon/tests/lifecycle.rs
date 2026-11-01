@@ -1295,6 +1295,65 @@ async fn daemon_refuses_malformed_receiver_credentials_without_leaking_the_secre
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_lists_plugins_and_removes_one_only_without_a_live_binding() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process =
+        fixture.spawn("daemon_lists_plugins_and_removes_one_only_without_a_live_binding");
+    fixture.ready().await;
+    install_fake(&fixture, "telegram", "normal").await;
+    let list = || op(&fixture, "plugins_list", serde_json::json!({}));
+    let remove = || {
+        op(
+            &fixture,
+            "plugins_remove",
+            serde_json::json!({"name": "fake-telegram"}),
+        )
+    };
+    assert_eq!(
+        list().await.unwrap(),
+        serde_json::json!({"plugins": [{
+            "name": "fake-telegram",
+            "version": "0.1.0",
+            "channels": [{
+                "channel_kind": "telegram",
+                "credential_fields": [{"name": "token", "secret": true}],
+                "status_note": "telegram fake note",
+            }],
+            "process": "stopped",
+            "last_exit_code": null,
+        }]})
+    );
+    let bound = op(
+        &fixture,
+        "bindings_receiver",
+        serde_json::json!({"channel": "telegram", "fields": {"token": "1001:listed-token"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(list().await.unwrap()["plugins"][0]["process"], "running");
+    assert_eq!(remove().await, Err(DaemonError::PluginInUse));
+    op(
+        &fixture,
+        "bindings_revoke",
+        serde_json::json!({"binding_id": bound["binding_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        remove().await.unwrap(),
+        serde_json::json!({"name": "fake-telegram"})
+    );
+    assert_eq!(list().await.unwrap(), serde_json::json!({"plugins": []}));
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn daemon_restore_detected_suspends_bindings_and_expires_pending_events_until_reconfirmed() {
     if child_entry().await {
         return;

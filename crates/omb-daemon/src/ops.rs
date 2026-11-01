@@ -239,6 +239,8 @@ pub(crate) fn service(kind: &ChannelKind) -> ServiceId {
 pub(crate) enum ReceiverCommand {
     Start(ReceiverRow, oneshot::Sender<Result<(), DaemonError>>),
     Stop(Uuid, oneshot::Sender<()>),
+    /// Ends the processes of these channels before their package is removed or replaced.
+    Retire(Vec<String>, oneshot::Sender<()>),
     /// The reply is dropped when the plugin cannot be started or breaks off.
     Verify {
         kind: ChannelKind,
@@ -654,9 +656,13 @@ impl Ops {
             }
             Request::PluginsAdd(dir) => {
                 let client = self.control.lock().await;
-                let installed = self
+                let staged = self
                     .plugins
-                    .install(&dir, &self.live(&client, deadline).await?)?;
+                    .stage(&dir, &self.live(&client, deadline).await?)?;
+                let replaces = staged.replaces.clone();
+                self.command(|done| ReceiverCommand::Retire(replaces, done), deadline)
+                    .await?;
+                let installed = self.plugins.commit(staged)?;
                 let channels: Vec<&String> = installed.channels.keys().collect();
                 Ok(
                     json!({"name": installed.name, "version": installed.version, "channels": channels}),
@@ -664,8 +670,12 @@ impl Ops {
             }
             Request::PluginsRemove(name) => {
                 let client = self.control.lock().await;
-                self.plugins
-                    .remove(&name, &self.live(&client, deadline).await?)?;
+                let kinds = self
+                    .plugins
+                    .removable(&name, &self.live(&client, deadline).await?)?;
+                self.command(|done| ReceiverCommand::Retire(kinds, done), deadline)
+                    .await?;
+                self.plugins.remove(&name)?;
                 Ok(json!({ "name": name }))
             }
         }
@@ -1702,6 +1712,12 @@ mod tests {
                         },
                         ReceiverCommand::Stop(binding_id, done) => match self.channels.as_mut() {
                             Some(channels) => channels.stop_receiver(binding_id, done).await,
+                            None => {
+                                let _ = done.send(());
+                            }
+                        },
+                        ReceiverCommand::Retire(kinds, done) => match self.channels.as_mut() {
+                            Some(channels) => channels.retire(kinds, done).await,
                             None => {
                                 let _ = done.send(());
                             }
@@ -3135,22 +3151,21 @@ mod tests {
                 env.telegram.received_of("start").len() == round + 1
             })
             .await;
-            // Each replacement stops receiving with the old token before the new one starts.
+            // Each replacement ends the old process before a new one starts with the new token.
             let frames: Vec<Value> = env
                 .telegram
                 .received()
                 .into_iter()
-                .filter(|frame| frame["type"] == "start" || frame["type"] == "stop")
+                .filter(|frame| frame["type"] == "start" || frame["type"] == "hello")
                 .map(|frame| json!([frame["type"], frame["credential"]]))
                 .collect();
             let expected: Vec<Value> = (0..=round)
                 .flat_map(|at| {
                     [
-                        json!(["stop", null]),
+                        json!(["hello", null]),
                         json!(["start", format!("1001:token-{at}")]),
                     ]
                 })
-                .skip(1)
                 .collect();
             assert_eq!(frames, expected, "round {round}");
             // The replaced receiver's store connection is closed.
@@ -3163,6 +3178,68 @@ mod tests {
         }
         let live: i64 = env.client.query_one("SELECT count(*) FROM openmybot.channel_bindings WHERE binding_kind='receiver' AND status='active'", &[]).await.unwrap().get(0);
         assert_eq!(live, 1);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn plugins_add_and_remove_end_the_running_process_and_free_its_slot() {
+        let mut env = Env::with_channels().await;
+        let telegram = ChannelKind::from_static("telegram");
+        // A refused credential check leaves the plugin running without a binding.
+        env.install("telegram", "verify_fail:credential_rejected", "1001");
+        for op in ["plugins_add", "plugins_remove"] {
+            assert_eq!(
+                env.call(
+                    "bindings_receiver",
+                    json!({"channel": "telegram", "fields": {"token": "1001:token"}}),
+                )
+                .await,
+                Err(DaemonError::CredentialRejected)
+            );
+            let plugin = env.ops.plugins.provider(&telegram).unwrap();
+            let slots = |env: &Env| {
+                env.channels
+                    .as_ref()
+                    .unwrap()
+                    .context
+                    .slots
+                    .available_permits()
+            };
+            assert_eq!(
+                env.ops.plugins.process(&plugin).0,
+                crate::ProcessState::Running
+            );
+            assert_eq!(slots(&env), PLUGIN_MAX - 1);
+            let replacement = (op == "plugins_add").then(|| {
+                let mut channel = fake_channel(
+                    "telegram",
+                    &env.telegram,
+                    "verify_fail:credential_rejected",
+                    json!([{"name": "token", "secret": true}]),
+                );
+                channel["args"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend([json!("--source-key"), json!("1001")]);
+                package("fake-telegram", json!({ "telegram": channel }))
+            });
+            let args = match &replacement {
+                Some(dir) => json!({ "dir": dir }),
+                None => json!({"name": "fake-telegram"}),
+            };
+            env.call(op, args).await.unwrap();
+            // The process went through the stop ladder before the package changed.
+            assert_eq!(
+                env.ops.plugins.process(&plugin).0,
+                crate::ProcessState::Stopped
+            );
+            assert_eq!(slots(&env), PLUGIN_MAX);
+            if let Some(dir) = replacement {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        assert!(env.ops.plugins.provider(&telegram).is_none());
         env.stop().await;
     }
 
@@ -3228,7 +3305,9 @@ mod tests {
                         }
                         // The start receipt is dropped unanswered after the replacement
                         // committed.
-                        ReceiverCommand::Start(..) | ReceiverCommand::Stop(..) => {}
+                        ReceiverCommand::Start(..)
+                        | ReceiverCommand::Stop(..)
+                        | ReceiverCommand::Retire(..) => {}
                     },
                 }
             }
@@ -5753,7 +5832,7 @@ mod tests {
                         ReceiverCommand::Start(_, done) => {
                             let _ = done.send(Ok(()));
                         }
-                        ReceiverCommand::Stop(_, done) => {
+                        ReceiverCommand::Stop(_, done) | ReceiverCommand::Retire(_, done) => {
                             let _ = done.send(());
                         }
                         ReceiverCommand::Verify { reply, .. } => {
@@ -5784,7 +5863,7 @@ mod tests {
                         ReceiverCommand::Start(_, done) => {
                             let _ = done.send(Ok(()));
                         }
-                        ReceiverCommand::Stop(_, done) => {
+                        ReceiverCommand::Stop(_, done) | ReceiverCommand::Retire(_, done) => {
                             let _ = done.send(());
                         }
                         ReceiverCommand::Verify { reply, .. } => {

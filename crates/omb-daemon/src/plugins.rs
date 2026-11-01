@@ -43,6 +43,13 @@ pub(crate) struct Installed {
     pub(crate) installed_at: String,
     pub(crate) channels: BTreeMap<String, ChannelEntry>,
 }
+/// A checked package copied to its staging directory; `commit` puts it in place.
+pub(crate) struct Staged {
+    installed: Installed,
+    staging: PathBuf,
+    /// The channels of the installed plugin of the same name, whose process must end first.
+    pub(crate) replaces: Vec<String>,
+}
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Lock {
@@ -238,14 +245,10 @@ impl Plugins {
         let bytes = serde_json::to_vec_pretty(lock).map_err(|_| DaemonError::InternalError)?;
         config::write_private(&path, &bytes, !path.exists())
     }
-    /// Installs the package at `dir`: the manifest is checked, the package is copied and the lock
-    /// records it. A plugin of the same name is replaced unless one of its channels has a binding
-    /// in `live`.
-    pub(crate) fn install(
-        &self,
-        dir: &Path,
-        live: &HashSet<String>,
-    ) -> Result<Installed, DaemonError> {
+    /// Stages the package at `dir`: the manifest is checked and the package is copied next to the
+    /// installed ones. A plugin of the same name is replaced unless one of its channels has a
+    /// binding in `live`.
+    pub(crate) fn stage(&self, dir: &Path, live: &HashSet<String>) -> Result<Staged, DaemonError> {
         let invalid = DaemonError::PluginInvalid;
         let package = fs::canonicalize(dir).map_err(|_| invalid)?;
         let manifest: Manifest =
@@ -272,13 +275,17 @@ impl Plugins {
                 },
             );
         }
+        let mut replaces = Vec::new();
         for plugin in &self.lock.lock().unwrap().plugins {
             let provides = |kind: &String| plugin.channels.contains_key(kind);
             if plugin.name != manifest.name && channels.keys().any(provides) {
                 return Err(DaemonError::ChannelKindTaken);
             }
-            if plugin.name == manifest.name && live.iter().any(provides) {
-                return Err(DaemonError::PluginInUse);
+            if plugin.name == manifest.name {
+                if live.iter().any(provides) {
+                    return Err(DaemonError::PluginInUse);
+                }
+                replaces = plugin.channels.keys().cloned().collect();
             }
         }
         let plugins = self.root.join("plugins");
@@ -291,46 +298,71 @@ impl Plugins {
             fs::remove_dir_all(&staging).map_err(|_| DaemonError::InternalError)?;
         }
         copy_tree(&package, &package, &staging)?;
-        let target = self.package(&manifest.name);
-        if target.exists() {
-            fs::remove_dir_all(&target).map_err(|_| DaemonError::InternalError)?;
-        }
-        fs::rename(&staging, &target).map_err(|_| DaemonError::InternalError)?;
         let installed_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|_| DaemonError::InternalError)?
             .as_nanos();
-        let installed = Installed {
-            name: manifest.name,
-            version: manifest.version.unwrap_or_default(),
-            installed_at: rfc3339_utc(installed_at as i128)?,
-            channels,
-        };
+        Ok(Staged {
+            installed: Installed {
+                name: manifest.name,
+                version: manifest.version.unwrap_or_default(),
+                installed_at: rfc3339_utc(installed_at as i128)?,
+                channels,
+            },
+            staging,
+            replaces,
+        })
+    }
+    /// Puts a staged package in place of the installed one and records it in the lock.
+    pub(crate) fn commit(&self, staged: Staged) -> Result<Installed, DaemonError> {
+        let Staged {
+            installed, staging, ..
+        } = staged;
+        let target = self.package(&installed.name);
+        if target.exists() {
+            fs::remove_dir_all(&target).map_err(|_| DaemonError::InternalError)?;
+        }
+        fs::rename(&staging, &target).map_err(|_| DaemonError::InternalError)?;
         let mut lock = self.lock.lock().unwrap();
         lock.plugins.retain(|plugin| plugin.name != installed.name);
         lock.plugins.push(installed.clone());
         self.write(&lock)?;
         Ok(installed)
     }
-    /// Removes the plugin and its package unless one of its channels has a binding in `live`; the
-    /// plugin's data directory stays.
-    pub(crate) fn remove(&self, name: &str, live: &HashSet<String>) -> Result<(), DaemonError> {
-        let mut lock = self.lock.lock().unwrap();
-        let index = lock
+    /// The channels of the plugin `name`, which may be removed unless one of them has a binding in
+    /// `live`.
+    pub(crate) fn removable(
+        &self,
+        name: &str,
+        live: &HashSet<String>,
+    ) -> Result<Vec<String>, DaemonError> {
+        let lock = self.lock.lock().unwrap();
+        let plugin = lock
             .plugins
             .iter()
-            .position(|plugin| plugin.name == name)
+            .find(|plugin| plugin.name == name)
             .ok_or(DaemonError::PluginNotInstalled)?;
-        if lock.plugins[index]
-            .channels
-            .keys()
-            .any(|kind| live.contains(kind))
-        {
+        if plugin.channels.keys().any(|kind| live.contains(kind)) {
             return Err(DaemonError::PluginInUse);
         }
+        Ok(plugin.channels.keys().cloned().collect())
+    }
+    /// Removes a plugin `removable` allowed and its package; its data directory stays.
+    pub(crate) fn remove(&self, name: &str) -> Result<(), DaemonError> {
+        let mut lock = self.lock.lock().unwrap();
         fs::remove_dir_all(self.package(name)).map_err(|_| DaemonError::InternalError)?;
-        lock.plugins.remove(index);
+        lock.plugins.retain(|plugin| plugin.name != name);
         self.write(&lock)
+    }
+    /// Stages and commits at once, as tests install packages.
+    #[cfg(test)]
+    pub(crate) fn install(
+        &self,
+        dir: &Path,
+        live: &HashSet<String>,
+    ) -> Result<Installed, DaemonError> {
+        let staged = self.stage(dir, live)?;
+        self.commit(staged)
     }
 }
 
@@ -675,7 +707,7 @@ pub(crate) mod tests {
         fs::create_dir_all(root.join("plugins-data/fake-fake")).unwrap();
         let live = HashSet::from(["fake".to_owned()]);
         assert_eq!(
-            plugins.remove("fake-fake", &live),
+            plugins.removable("fake-fake", &live),
             Err(DaemonError::PluginInUse)
         );
         // Replacing the same name is refused too while its channel has a live binding.
@@ -688,13 +720,14 @@ pub(crate) mod tests {
             Some(DaemonError::PluginInUse)
         );
         assert_eq!(
-            plugins.remove("missing", &HashSet::new()),
+            plugins.removable("missing", &HashSet::new()),
             Err(DaemonError::PluginNotInstalled)
         );
         assert_eq!(
-            plugins.remove("fake-fake", &HashSet::from(["telegram".to_owned()])),
-            Ok(())
+            plugins.removable("fake-fake", &HashSet::from(["telegram".to_owned()])),
+            Ok(vec!["fake".to_owned()])
         );
+        assert_eq!(plugins.remove("fake-fake"), Ok(()));
         assert!(plugins.list().is_empty());
         assert!(!root.join("plugins/fake-fake").exists());
         // The plugin's data stays.

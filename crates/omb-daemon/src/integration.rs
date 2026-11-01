@@ -354,6 +354,9 @@ impl Rig {
                         ReceiverCommand::Stop(binding_id, done) => {
                             channels.stop_receiver(binding_id, done).await;
                         }
+                        ReceiverCommand::Retire(kinds, done) => {
+                            channels.retire(kinds, done).await;
+                        }
                         ReceiverCommand::Verify { kind, credential, source_key, reply } => {
                             channels.verify(kind, credential, source_key, reply).await;
                         }

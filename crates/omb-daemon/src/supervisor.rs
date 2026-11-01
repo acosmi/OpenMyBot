@@ -99,6 +99,11 @@ enum Command {
         args: SendArgs,
         reply: oneshot::Sender<SendResult>,
     },
+    /// Ends the process through the stop ladder and keeps the supervisor; answered once the
+    /// process group is empty.
+    Retire {
+        done: oneshot::Sender<()>,
+    },
     Terminate,
 }
 
@@ -176,6 +181,11 @@ impl PluginProcess {
             Ok(Ok(result)) => result,
             _ => SendResult::Unknown,
         }
+    }
+    /// Ends the process of a removed or replaced installation; `done` answers once its group is
+    /// empty.
+    pub(crate) async fn retire(&self, done: oneshot::Sender<()>) {
+        let _ = self.0.send(Command::Retire { done }).await;
     }
     /// Ends the process through the stop ladder, then the supervisor.
     pub(crate) async fn terminate(&self) {
@@ -402,9 +412,11 @@ impl Supervisor {
                     connection,
                     done,
                 })) => {
+                    // Frames the old stream already queued must never reach the new receiver: the
+                    // process ends and `begin` starts a fresh one.
                     if let Some(replaced) = self.receiver.take() {
-                        write(&mut self.process, &ToPlugin::Stop {}).await;
                         close(replaced).await;
+                        self.end_process().await;
                     }
                     self.receiver = Some(Receiver { row, connection });
                     self.failures = 0;
@@ -421,6 +433,10 @@ impl Supervisor {
                         self.restart = None;
                         close(receiver).await;
                     }
+                    let _ = done.send(());
+                }
+                Next::Command(Some(Command::Retire { done })) => {
+                    self.end_process().await;
                     let _ = done.send(());
                 }
                 Next::Command(Some(Command::Send { args, reply })) => {
@@ -761,12 +777,13 @@ impl Supervisor {
                 true
             }
             Ok(_) => true,
-            // The binding left `active`: receiving stops, the process keeps serving sends.
+            // The binding left `active`: receiving stops, and the process ends so that frames of
+            // its stream never reach a later receiver; a later use starts a fresh one.
             Err(StoreError::ReceiverNotActive) => {
-                write(&mut self.process, &ToPlugin::Stop {}).await;
                 if let Some(receiver) = self.receiver.take() {
                     close(receiver).await;
                 }
+                self.end_process().await;
                 false
             }
             // Not committed: without a receipt the plugin delivers the event again.
@@ -1452,7 +1469,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn verify_during_start_is_serialized() {
-        let mut rig = Rig::start("normal", false, quick()).await;
+        let mut rig = Rig::start("verify_slow:500", false, quick()).await;
         let binding = rig.sealed_receiver().await;
         let envelope: String = rig
             .client
@@ -1463,15 +1480,17 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .get(0);
-        let mut verified = Vec::new();
-        let mut started = Vec::new();
         for _ in 0..RACE_REPEAT_MIN {
-            let (reply, receipt) = oneshot::channel();
-            let (done, receipt_start) = oneshot::channel();
             let channels = rig.channels.as_mut().unwrap();
-            channels
-                .verify(kind(), "credential".into(), Some("1001".into()), reply)
-                .await;
+            let mut verified = Vec::new();
+            for _ in 0..2 {
+                let (reply, receipt) = oneshot::channel();
+                channels
+                    .verify(kind(), "credential".into(), Some("1001".into()), reply)
+                    .await;
+                verified.push(receipt);
+            }
+            let (done, started) = oneshot::channel();
             channels
                 .start_receiver(
                     &mut rig.fixture.pg,
@@ -1484,22 +1503,122 @@ pub(crate) mod tests {
                     done,
                 )
                 .await;
-            verified.push(receipt);
-            started.push(receipt_start);
+            assert_eq!(started.await.unwrap(), Ok(()));
+            for receipt in verified {
+                assert_eq!(receipt.await.unwrap(), Ok("fake-source".to_owned()));
+            }
+            let (done, stopped) = oneshot::channel();
+            channels.stop_receiver(binding, done).await;
+            stopped.await.unwrap();
         }
-        for receipt in verified {
-            assert_eq!(receipt.await.unwrap(), Ok("fake-source".to_owned()));
-        }
-        for receipt in started {
-            assert_eq!(receipt.await.unwrap(), Ok(()));
-        }
-        // One process served every request; a start never waits behind the queued verifies.
+        // One process served every round. Each `start` went out while the first slow `verify`
+        // was in flight, ahead of the queued second one: one `verify` in flight at a time, and a
+        // `start` never waits behind the queue.
         until("frames", async || {
-            rig.logs.received_of("start").len() == RACE_REPEAT_MIN
+            rig.logs.received_of("stop").len() == RACE_REPEAT_MIN
         })
         .await;
-        assert_eq!(rig.logs.received_of("hello").len(), 1);
-        assert_eq!(rig.logs.received_of("verify").len(), RACE_REPEAT_MIN);
+        let kinds: Vec<Value> = rig
+            .logs
+            .received()
+            .into_iter()
+            .map(|frame| frame["type"].clone())
+            .collect();
+        let expected: Vec<Value> = std::iter::once(json!("hello"))
+            .chain(
+                (0..RACE_REPEAT_MIN)
+                    .flat_map(|_| ["verify", "start", "verify", "stop"].map(|kind| json!(kind))),
+            )
+            .collect();
+        assert_eq!(kinds, expected);
+        rig.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn replaced_receiver_never_accepts_an_event_of_the_old_stream() {
+        use crate::plugins::tests::{fake_channel, package};
+        use std::io::Write;
+        let mut rig = Rig::start("normal", false, quick()).await;
+        // The fake tails one events file per source: a new `start` cannot replay the old stream.
+        let mut channel = fake_channel(
+            "fake",
+            &rig.logs,
+            "normal",
+            json!([{"name": "token", "secret": true}]),
+        );
+        channel["args"][3] = json!(rig.logs.dir.join("events-{source}.jsonl"));
+        let dir = package("fake-fake", json!({ "fake": channel }));
+        rig.plugins
+            .install(&dir, &std::collections::HashSet::new())
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let binding = rig.sealed_receiver().await;
+        let envelope: String = rig
+            .client
+            .query_one(
+                "SELECT credential_envelope FROM openmybot.channel_bindings WHERE binding_id=$1",
+                &[&binding],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let row = |source_key: &str| ReceiverRow {
+            binding_id: binding,
+            channel: kind(),
+            source_key: source_key.into(),
+            credential_envelope: envelope.clone(),
+        };
+        let (done, started) = oneshot::channel();
+        rig.channels
+            .as_mut()
+            .unwrap()
+            .start_receiver(&mut rig.fixture.pg, row("1001"), done)
+            .await;
+        assert_eq!(started.await.unwrap(), Ok(()));
+        // The old stream is busy when the receiver is replaced.
+        let mut old = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(rig.logs.dir.join("events-1001.jsonl"))
+            .unwrap();
+        for at in 0..50 {
+            writeln!(old, "{}", event(&format!("old-{at}"))).unwrap();
+        }
+        until("old stream flowing", async || rig.accepted("old-0")).await;
+        rig.client
+            .execute(
+                "UPDATE openmybot.channel_bindings SET source_key='2002' WHERE binding_id=$1",
+                &[&binding],
+            )
+            .await
+            .unwrap();
+        let (done, started) = oneshot::channel();
+        rig.channels
+            .as_mut()
+            .unwrap()
+            .start_receiver(&mut rig.fixture.pg, row("2002"), done)
+            .await;
+        assert_eq!(started.await.unwrap(), Ok(()));
+        sleep(Duration::from_millis(500)).await;
+        let leaked: i64 = rig
+            .client
+            .query_one(
+                "SELECT count(*) FROM openmybot.channel_events WHERE record_kind='event' AND source_key='2002'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(leaked, 0);
+        // A new process started the new receiver, without a cursor from the old stream.
+        assert_eq!(rig.logs.received_of("hello").len(), 2);
+        let starts = rig.logs.received_of("start");
+        let last = starts.last().unwrap();
+        assert_eq!(
+            (&last["source_key"], &last["last_event_key"]),
+            (&json!("2002"), &Value::Null)
+        );
         rig.stop().await;
     }
 }

@@ -108,6 +108,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
                 Some(command)=commands.recv()=>match command {
                     ReceiverCommand::Start(row,done)=>started.start_receiver(&mut postgres,row,done).await,
                     ReceiverCommand::Stop(binding_id,done)=>started.stop_receiver(binding_id,done).await,
+                    ReceiverCommand::Retire(kinds,done)=>started.retire(kinds,done).await,
                     ReceiverCommand::Verify{kind,credential,source_key,reply}=>started.verify(kind,credential,source_key,reply).await,
                 },
             }
