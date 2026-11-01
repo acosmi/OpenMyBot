@@ -5,35 +5,35 @@ use super::MaintenanceError;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct ProfileFields {
-    pub(super) effect_ns: u64,
-    pub(super) convergence_ns: u64,
-    pub(super) max_source_secret_bytes: u64,
-    pub(super) max_secret_memory_bytes: u64,
-    pub(super) max_native_secret_copies: u64,
-    pub(super) max_control_bytes: u64,
-    pub(super) max_status_bytes: u64,
-    pub(super) max_status_records: u64,
-    pub(super) max_stderr_bytes: u64,
-    pub(super) max_material_files: u64,
-    pub(super) max_directories: u64,
-    pub(super) max_path_bytes: u64,
-    pub(super) max_depth: u64,
-    pub(super) max_single_file_bytes: u64,
-    pub(super) max_material_plain_bytes: u64,
-    pub(super) max_wal_bytes: u64,
-    pub(super) max_wal_segments: u64,
-    pub(super) max_wal_span_bytes: u64,
-    pub(super) max_wal_timelines: u64,
-    pub(super) max_backup_manifest_bytes: u64,
-    pub(super) max_total_copy_blocks: u64,
-    pub(super) copy_block_bytes: u64,
-    pub(super) max_spool_bytes: u64,
-    pub(super) max_restore_check_bytes: u64,
-    pub(super) max_open_files: u64,
-    pub(super) max_journal_bytes: u64,
-    pub(super) capacity_reserve_bytes: u64,
-    pub(super) free_floor_bytes: u64,
+pub(crate) struct ProfileFields {
+    pub(crate) effect_ns: u64,
+    pub(crate) convergence_ns: u64,
+    pub(crate) max_source_secret_bytes: u64,
+    pub(crate) max_secret_memory_bytes: u64,
+    pub(crate) max_native_secret_copies: u64,
+    pub(crate) max_control_bytes: u64,
+    pub(crate) max_status_bytes: u64,
+    pub(crate) max_status_records: u64,
+    pub(crate) max_stderr_bytes: u64,
+    pub(crate) max_material_files: u64,
+    pub(crate) max_directories: u64,
+    pub(crate) max_path_bytes: u64,
+    pub(crate) max_depth: u64,
+    pub(crate) max_single_file_bytes: u64,
+    pub(crate) max_material_plain_bytes: u64,
+    pub(crate) max_wal_bytes: u64,
+    pub(crate) max_wal_segments: u64,
+    pub(crate) max_wal_span_bytes: u64,
+    pub(crate) max_wal_timelines: u64,
+    pub(crate) max_backup_manifest_bytes: u64,
+    pub(crate) max_total_copy_blocks: u64,
+    pub(crate) copy_block_bytes: u64,
+    pub(crate) max_spool_bytes: u64,
+    pub(crate) max_restore_check_bytes: u64,
+    pub(crate) max_open_files: u64,
+    pub(crate) max_journal_bytes: u64,
+    pub(crate) capacity_reserve_bytes: u64,
+    pub(crate) free_floor_bytes: u64,
 }
 
 /// Parsed only through the closed decoder; no deserializer or free constructor on this type.
@@ -51,14 +51,14 @@ pub(crate) fn parse_profile(bytes: &[u8]) -> Result<MaintenanceProfile, Maintena
     Ok(MaintenanceProfile { fields })
 }
 impl MaintenanceProfile {
-    pub(super) fn fields(&self) -> &ProfileFields {
+    pub(crate) fn fields(&self) -> &ProfileFields {
         &self.fields
     }
-    pub(super) fn encoded(&self) -> Result<Vec<u8>, MaintenanceError> {
+    pub(crate) fn encoded(&self) -> Result<Vec<u8>, MaintenanceError> {
         serde_json::to_vec(&self.fields).map_err(|_| MaintenanceError::ProfileInvalid)
     }
 }
-fn validate_fields(p: &ProfileFields) -> Result<(), MaintenanceError> {
+pub(crate) fn validate_fields(p: &ProfileFields) -> Result<(), MaintenanceError> {
     let values = [
         p.effect_ns,
         p.convergence_ns,
@@ -120,7 +120,7 @@ fn validate_fields(p: &ProfileFields) -> Result<(), MaintenanceError> {
     Ok(())
 }
 impl ProfileFields {
-    pub(super) fn native_fields(&self) -> [(&'static str, u64); 26] {
+    pub(crate) fn native_fields(&self) -> [(&'static str, u64); 26] {
         [
             ("max-source-secret-bytes", self.max_source_secret_bytes),
             ("max-secret-memory-bytes", self.max_secret_memory_bytes),
@@ -153,17 +153,17 @@ impl ProfileFields {
 }
 
 #[derive(Default, Debug, Serialize)]
-pub(super) struct MaterialCounters {
-    pub(super) files: u64,
-    pub(super) directories: u64,
-    pub(super) bytes: u64,
-    pub(super) blocks: u64,
-    pub(super) wal_bytes: u64,
-    pub(super) wal_segments: u64,
-    pub(super) allocated_bytes: u64,
+pub(crate) struct MaterialCounters {
+    pub(crate) files: u64,
+    pub(crate) directories: u64,
+    pub(crate) bytes: u64,
+    pub(crate) blocks: u64,
+    pub(crate) wal_bytes: u64,
+    pub(crate) wal_segments: u64,
+    pub(crate) allocated_bytes: u64,
 }
 impl MaterialCounters {
-    pub(super) fn directory(&mut self, p: &ProfileFields) -> Result<(), MaintenanceError> {
+    pub(crate) fn directory(&mut self, p: &ProfileFields) -> Result<(), MaintenanceError> {
         let n = self
             .directories
             .checked_add(1)
@@ -174,7 +174,7 @@ impl MaterialCounters {
         self.directories = n;
         Ok(())
     }
-    pub(super) fn file(
+    pub(crate) fn file(
         &mut self,
         p: &ProfileFields,
         len: u64,
@@ -232,18 +232,18 @@ impl MaterialCounters {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct CapacityObservation {
-    pub(super) free_bytes: u64,
-    pub(super) retained_allocated_bytes: u64,
-    pub(super) remaining_source_bytes: u64,
-    pub(super) remaining_spool_bytes: u64,
-    pub(super) remaining_restore_bytes: u64,
-    pub(super) remaining_journal_bytes: u64,
-    pub(super) reserve_bytes: u64,
-    pub(super) free_floor_bytes: u64,
+pub(crate) struct CapacityObservation {
+    pub(crate) free_bytes: u64,
+    pub(crate) retained_allocated_bytes: u64,
+    pub(crate) remaining_source_bytes: u64,
+    pub(crate) remaining_spool_bytes: u64,
+    pub(crate) remaining_restore_bytes: u64,
+    pub(crate) remaining_journal_bytes: u64,
+    pub(crate) reserve_bytes: u64,
+    pub(crate) free_floor_bytes: u64,
 }
 impl CapacityObservation {
-    pub(super) fn validate(&self) -> Result<(), MaintenanceError> {
+    pub(crate) fn validate(&self) -> Result<(), MaintenanceError> {
         let additional = self
             .remaining_source_bytes
             .checked_add(self.remaining_spool_bytes)
@@ -263,7 +263,7 @@ impl CapacityObservation {
         Ok(())
     }
 }
-pub(super) fn validate_wal_range(
+pub(crate) fn validate_wal_range(
     p: &ProfileFields,
     timeline: u32,
     segment: u32,

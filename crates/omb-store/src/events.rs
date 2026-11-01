@@ -1,5 +1,5 @@
 use crate::{
-    ACCEPT_TX_BUDGET, AcceptedEvent, Channel, DISPATCH_QUEUE_MAX, EVENT_FUTURE_WINDOW,
+    ACCEPT_TX_BUDGET, AcceptedEvent, ChannelKind, DISPATCH_QUEUE_MAX, EVENT_FUTURE_WINDOW,
     EVENT_PAST_WINDOW, GAP_DISPLAY, GrantKind, IdentityKey, KEY_MAX, MSG_TEXT_MAX, OpenRun,
     PairAttempt, PairOutcome, READ_BUDGET, StoreError, command, finish, pair_attempt, rows, timely,
 };
@@ -38,7 +38,7 @@ fn count(row: &tokio_postgres::Row, index: usize, error: StoreError) -> Result<u
 /// One platform event after boundary parsing; the receiver owns every value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizedEvent {
-    pub channel: Channel,
+    pub channel: ChannelKind,
     pub source_key: String,
     pub event_key: String,
     pub event_type: String,
@@ -218,7 +218,7 @@ pub async fn accept_event(
                 let Content::Text { pair_code: Some(code), .. } = content else {
                     break 'decide bare(Disposition::DroppedUnbound);
                 };
-                let outcome = pair_attempt(&tx, PairAttempt { channel: event.channel, receiver_source_key: &receiver_source_key, sender_key: sender, chat_key: chat, code_text: code, event: AcceptedEvent { event_key: &event.event_key, source_key: &event.source_key, fingerprint, occurred_at: event.occurred_at, event_type: Some(&event.event_type) } }, deadline).await?;
+                let outcome = pair_attempt(&tx, PairAttempt { channel: event.channel.clone(), receiver_source_key: &receiver_source_key, sender_key: sender, chat_key: chat, code_text: code, event: AcceptedEvent { event_key: &event.event_key, source_key: &event.source_key, fingerprint, occurred_at: event.occurred_at, event_type: Some(&event.event_type) } }, deadline).await?;
                 return Ok(AcceptOutcome::Recorded(match outcome {
                     PairOutcome::Succeeded { .. } => Disposition::PairingSucceeded,
                     PairOutcome::Failed => Disposition::PairingFailed,
@@ -324,20 +324,19 @@ pub async fn accept_event(
     Ok(outcome)
 }
 
-/// The newest event row of a source by acceptance time, as `(update_id, accepted_at)`.
-pub async fn latest_update_id(
+/// The newest event row of a source by acceptance time, as `(event_key, accepted_at)`.
+pub async fn latest_event(
     client: &Client,
-    channel: Channel,
+    kind: &ChannelKind,
     source_key: &str,
-) -> Result<Option<(u64, OffsetDateTime)>, StoreError> {
+) -> Result<Option<(String, OffsetDateTime)>, StoreError> {
     let error = StoreError::EventFailed;
-    let found = rows(client, "SELECT event_key,accepted_at FROM openmybot.channel_events WHERE record_kind='event' AND channel_kind=$1 AND source_key=$2 ORDER BY accepted_at DESC,record_id DESC LIMIT 1", &[&channel.as_str(), &source_key], Instant::now() + READ_BUDGET, error).await?;
+    let found = rows(client, "SELECT event_key,accepted_at FROM openmybot.channel_events WHERE record_kind='event' AND channel_kind=$1 AND source_key=$2 ORDER BY accepted_at DESC,record_id DESC LIMIT 1", &[&kind.as_str(), &source_key], Instant::now() + READ_BUDGET, error).await?;
     found
         .first()
         .map(|row| {
-            let key: String = row.try_get(0).map_err(|_| error)?;
             Ok((
-                key.parse().map_err(|_| error)?,
+                row.try_get(0).map_err(|_| error)?,
                 row.try_get(1).map_err(|_| error)?,
             ))
         })
@@ -346,7 +345,7 @@ pub async fn latest_update_id(
 
 pub struct ReceiverRow {
     pub binding_id: Uuid,
-    pub channel: Channel,
+    pub channel: ChannelKind,
     pub source_key: String,
     pub credential_envelope: String,
 }
@@ -362,7 +361,7 @@ impl core::fmt::Debug for ReceiverRow {
 }
 pub async fn list_active_receivers(
     client: &Client,
-    channel: Channel,
+    channel: ChannelKind,
 ) -> Result<Vec<ReceiverRow>, StoreError> {
     let error = StoreError::EventFailed;
     rows(client, "SELECT binding_id,source_key,credential_envelope FROM openmybot.channel_bindings WHERE binding_kind='receiver' AND channel_kind=$1 AND status='active' ORDER BY created_at,binding_id", &[&channel.as_str()], Instant::now() + READ_BUDGET, error)
@@ -371,7 +370,7 @@ pub async fn list_active_receivers(
         .map(|row| {
             Ok(ReceiverRow {
                 binding_id: row.try_get(0).map_err(|_| error)?,
-                channel,
+                channel: channel.clone(),
                 source_key: row.try_get(1).map_err(|_| error)?,
                 credential_envelope: row.try_get(2).map_err(|_| error)?,
             })
@@ -392,7 +391,7 @@ pub async fn receiver_row(
         .map(|row| {
             Ok(ReceiverRow {
                 binding_id: row.try_get(0).map_err(|_| error)?,
-                channel: Channel::parse(row.try_get::<_, &str>(1).map_err(|_| error)?)
+                channel: ChannelKind::parse(row.try_get::<_, &str>(1).map_err(|_| error)?)
                     .ok_or(error)?,
                 source_key: row.try_get(2).map_err(|_| error)?,
                 credential_envelope: row.try_get(3).map_err(|_| error)?,
@@ -517,7 +516,7 @@ pub async fn expire_pending(
     deadline: Instant,
 ) -> Result<Expired, StoreError> {
     let error = StoreError::DispatchFailed;
-    let found = rows(client, "WITH x AS (UPDATE openmybot.channel_events SET dispatch_status='expired' WHERE dispatch_status='pending' AND accepted_at<=statement_timestamp()-make_interval(secs=>$1) RETURNING record_id,binding_id,channel_kind), d AS (INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,created_at) SELECT gen_random_uuid(),x.binding_id,x.channel_kind,b.chat_key,'expiry_notice','expiry_notice:'||x.record_id,$2,'pending',statement_timestamp() FROM x JOIN openmybot.channel_bindings b ON b.binding_id=x.binding_id WHERE x.channel_kind IN ('telegram','feishu') RETURNING 1) SELECT (SELECT count(*) FROM x),(SELECT min(accepted_at)+make_interval(secs=>$1) FROM openmybot.channel_events WHERE dispatch_status='pending' AND accepted_at>statement_timestamp()-make_interval(secs=>$1))", &[&ttl.as_secs_f64(), &notice], deadline, error).await?;
+    let found = rows(client, "WITH x AS (UPDATE openmybot.channel_events SET dispatch_status='expired' WHERE dispatch_status='pending' AND accepted_at<=statement_timestamp()-make_interval(secs=>$1) RETURNING record_id,binding_id,channel_kind), d AS (INSERT INTO openmybot.deliveries(delivery_id,binding_id,channel_kind,chat_key,kind,idempotency_key,body,status,created_at) SELECT gen_random_uuid(),x.binding_id,x.channel_kind,b.chat_key,'expiry_notice','expiry_notice:'||x.record_id,$2,'pending',statement_timestamp() FROM x JOIN openmybot.channel_bindings b ON b.binding_id=x.binding_id WHERE x.channel_kind<>'host' RETURNING 1) SELECT (SELECT count(*) FROM x),(SELECT min(accepted_at)+make_interval(secs=>$1) FROM openmybot.channel_events WHERE dispatch_status='pending' AND accepted_at>statement_timestamp()-make_interval(secs=>$1))", &[&ttl.as_secs_f64(), &notice], deadline, error).await?;
     let row = found.first().ok_or(error)?;
     Ok(Expired {
         count: count(row, 0, error)?,
@@ -544,13 +543,22 @@ pub async fn open_poll_gap(
     let record_id = Uuid::now_v7();
     rows(client, "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,gap_started_at,gap_reason) SELECT $1,'gap',b.channel_kind,b.source_key,$2,statement_timestamp(),b.binding_id,'gap',statement_timestamp(),$4 FROM openmybot.channel_bindings b WHERE b.binding_id=$3 AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events g WHERE g.binding_id=b.binding_id AND g.record_kind='gap' AND g.gap_reason IN ('connect_failed','stream_broken') AND g.gap_ended_at IS NULL) RETURNING record_id", &[&record_id, &format!("gap:{record_id}"), &receiver, &reason], deadline, StoreError::GapFailed).await.map(drop)
 }
-/// Closes the receiver's open polling gaps; other gap reasons stay open.
+/// Opens a `plugin_missing` gap unless one is already open for the receiver.
+pub async fn open_plugin_missing_gap(
+    client: &Client,
+    receiver_binding_id: Uuid,
+    deadline: Instant,
+) -> Result<(), StoreError> {
+    let record_id = Uuid::now_v7();
+    rows(client, "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,gap_started_at,gap_reason) SELECT $1,'gap',b.channel_kind,b.source_key,$2,statement_timestamp(),b.binding_id,'gap',statement_timestamp(),'plugin_missing' FROM openmybot.channel_bindings b WHERE b.binding_id=$3 AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events g WHERE g.binding_id=b.binding_id AND g.record_kind='gap' AND g.gap_reason='plugin_missing' AND g.gap_ended_at IS NULL) RETURNING record_id", &[&record_id, &format!("gap:{record_id}"), &receiver_binding_id], deadline, StoreError::GapFailed).await.map(drop)
+}
+/// Closes the receiver's open polling and `plugin_missing` gaps; other gap reasons stay open.
 pub async fn close_poll_gaps(
     client: &mut Client,
     receiver: Uuid,
     deadline: Instant,
 ) -> Result<u64, StoreError> {
-    rows(client, "UPDATE openmybot.channel_events SET gap_ended_at=statement_timestamp() WHERE binding_id=$1 AND record_kind='gap' AND gap_reason IN ('connect_failed','stream_broken') AND gap_ended_at IS NULL RETURNING record_id", &[&receiver], deadline, StoreError::GapFailed).await.map(|closed| closed.len() as u64)
+    rows(client, "UPDATE openmybot.channel_events SET gap_ended_at=statement_timestamp() WHERE binding_id=$1 AND record_kind='gap' AND gap_reason IN ('connect_failed','stream_broken','plugin_missing') AND gap_ended_at IS NULL RETURNING record_id", &[&receiver], deadline, StoreError::GapFailed).await.map(|closed| closed.len() as u64)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -602,7 +610,7 @@ pub struct GapView {
     pub ended_at: Option<OffsetDateTime>,
 }
 pub struct ReceiverStatus {
-    pub channel: Channel,
+    pub channel: ChannelKind,
     pub binding_id: Uuid,
     pub status: String,
     pub status_reason: Option<String>,
@@ -621,7 +629,7 @@ pub async fn channel_status(client: &Client) -> Result<Vec<ReceiverStatus>, Stor
         .map(|row| {
             let binding_id: Uuid = row.try_get(0).map_err(|_| error)?;
             let channel =
-                Channel::parse(row.try_get::<_, &str>(1).map_err(|_| error)?).ok_or(error)?;
+                ChannelKind::parse(row.try_get::<_, &str>(1).map_err(|_| error)?).ok_or(error)?;
             Ok(ReceiverStatus {
                 channel,
                 binding_id,

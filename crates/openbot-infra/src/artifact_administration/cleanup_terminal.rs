@@ -21,7 +21,6 @@ use openbot_domain::audit::event::{AuditEvent, AuditEventType};
 use openbot_domain::audit::payload::{AuditFact, AuditIdentifier, AuditLabel, AuditPayload};
 use serde_json::Value;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tokio_postgres::types::FromSql;
 use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
@@ -182,7 +181,7 @@ impl WorkFailure {
 struct MainQueryOwner {
     permission: Arc<WorkerPermission>,
     query: Option<TerminalInvocationQueryOwner>,
-    worker: Option<JoinHandle<Result<(), Error>>>,
+    worker: Option<crate::artifact_store::CaptureBlockingWorker<Result<(), Error>>>,
     claim: Arc<TerminalInvocationClaim>,
     deadline: Instant,
     original_main_handled: bool,
@@ -249,59 +248,79 @@ impl PostgresArtifactAdministration {
         original_deadline: Instant,
         observer: Option<Arc<dyn ArtifactCleanupTerminalObserver>>,
     ) -> Result<ArtifactCleanupTerminalObservation, Error> {
-        let deadline = original_deadline.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .ok_or(Error::Unavailable)?,
-        );
-        remaining(deadline)?;
-        let (store, key) = intent
-            .validated_terminal_binding(self)
-            .map_err(|_| Error::Conflict)?
-            .into_original_parts();
-        let authority = self.read_authority();
-        let target = authority.cleanup_host_target(auth);
-        let _current = TerminalCurrentRequest::borrow_before(self, auth, &target, deadline)
-            .map_err(arm_error)?;
-        // This separate exact-key query owner is registered before the first real PG await.
-        let (claim, query) =
-            TerminalInvocationClaim::register(Arc::clone(&store), key.clone(), deadline)
-                .map_err(|_| Error::ReadsUnproven)?;
-        let permission = WorkerPermission::new();
-        let mut waiter = CallerWaiter {
-            permission: Arc::clone(&permission),
-            claim: Arc::clone(&claim),
-            deadline,
-            completed: false,
-        };
-        let (sender, receiver) = oneshot::channel();
-        let administration = Arc::clone(self);
-        let original_auth = auth.clone();
-        // Losing only this caller does not drop the actual original query supervisor.
-        tokio::spawn(async move {
-            let result = supervise(
-                administration,
-                original_auth,
-                store,
-                key,
-                claim,
-                query,
-                permission,
+        let capture_operation = self
+            .store
+            .begin_capture_mutation()
+            .map_err(|_| Error::Unavailable)?;
+        let result = async {
+            let deadline = original_deadline.min(
+                Instant::now()
+                    .checked_add(Duration::from_secs(5))
+                    .ok_or(Error::Unavailable)?,
+            );
+            remaining(deadline)?;
+            let (store, key) = intent
+                .validated_terminal_binding(self)
+                .map_err(|_| Error::Conflict)?
+                .into_original_parts();
+            let authority = self.read_authority();
+            let target = authority.cleanup_host_target(auth);
+            let _current = TerminalCurrentRequest::borrow_before(self, auth, &target, deadline)
+                .map_err(arm_error)?;
+            // This separate exact-key query owner is registered before the first real PG await.
+            let (claim, query) =
+                TerminalInvocationClaim::register(Arc::clone(&store), key.clone(), deadline)
+                    .map_err(|_| Error::ReadsUnproven)?;
+            let permission = WorkerPermission::new(capture_operation.delegated());
+            let mut waiter = CallerWaiter {
+                permission: Arc::clone(&permission),
+                claim: Arc::clone(&claim),
                 deadline,
-                observer,
-            )
-            .await;
-            let _ = sender.send(result);
-        });
-        let received = before(deadline, receiver).await;
-        registered_remaining(&waiter.claim, deadline)?;
-        let observation = received
-            .map_err(|failure| failure.error)?
-            .map_err(|_| Error::ReadsUnproven)??;
-        observation.verify_delivery(auth)?;
-        registered_remaining(&waiter.claim, deadline)?;
-        waiter.completed = true;
-        Ok(observation)
+                completed: false,
+            };
+            let (sender, receiver) = oneshot::channel();
+            let administration = Arc::clone(self);
+            let original_auth = auth.clone();
+            // Losing only this caller does not drop the actual original query supervisor.
+            self.store
+                .spawn_capture_mutation(async move {
+                    let result = supervise(
+                        administration,
+                        original_auth,
+                        store,
+                        key,
+                        claim,
+                        query,
+                        permission,
+                        deadline,
+                        observer,
+                    )
+                    .await;
+                    let _ = sender.send(result);
+                })
+                .map_err(|_| Error::Unavailable)?;
+            let received = before(deadline, receiver).await;
+            registered_remaining(&waiter.claim, deadline)?;
+            let observation = received
+                .map_err(|failure| failure.error)?
+                .map_err(|_| Error::ReadsUnproven)??;
+            observation.verify_delivery(auth)?;
+            registered_remaining(&waiter.claim, deadline)?;
+            waiter.completed = true;
+            Ok(observation)
+        }
+        .await;
+        if !matches!(
+            &result,
+            Err(Error::Unavailable
+                | Error::DeadlineExpired
+                | Error::ReadsUnproven
+                | Error::PhysicalUnproven
+                | Error::CommitUnknown)
+        ) {
+            capture_operation.complete();
+        }
+        result
     }
 }
 
@@ -825,7 +844,7 @@ async fn work_before(
     permission: &Arc<WorkerPermission>,
     current: &TerminalCurrentRequest<'_>,
     tx: &Transaction<'_>,
-    worker: &mut Option<JoinHandle<Result<(), Error>>>,
+    worker: &mut Option<crate::artifact_store::CaptureBlockingWorker<Result<(), Error>>>,
     deadline: Instant,
     observer: &Option<Arc<dyn ArtifactCleanupTerminalObserver>>,
 ) -> Result<WorkOutcome, WorkFailure> {
@@ -913,7 +932,7 @@ async fn work_before(
     let worker_auth = auth.clone();
     let worker_observer = observer.as_ref().map(Arc::clone);
     let artifact_id = artifact_uuid(key).map_err(WorkFailure::known)?;
-    *worker = Some(tokio::task::spawn_blocking(move || {
+    *worker = Some(store.capture_blocking(move || {
         run_worker(
             worker_store,
             worker_claim,
@@ -1218,13 +1237,23 @@ struct PermissionState {
 }
 
 struct WorkerPermission {
+    capture_operation: crate::artifact_store::CaptureMutationLease,
     state: Mutex<PermissionState>,
     changed: Condvar,
 }
 
+impl Drop for WorkerPermission {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.capture_operation.record_returned();
+        }
+    }
+}
+
 impl WorkerPermission {
-    fn new() -> Arc<Self> {
+    fn new(capture_operation: crate::artifact_store::CaptureMutationLease) -> Arc<Self> {
         Arc::new(Self {
+            capture_operation,
             state: Mutex::new(PermissionState {
                 phase: CommitPermission::Pending,
                 disposition_released: false,
@@ -1380,7 +1409,7 @@ fn run_worker(
             .mark_started()
             .map_err(|_| Error::ReadsUnproven)?;
         let io = store
-            .try_physical_io_before(deadline)
+            .try_physical_io_before_admitted(deadline, &permission.capture_operation)
             .map_err(store_error)?;
         let precommit = (|| {
             let mut stop = |_| permission.should_stop_precommit(deadline);

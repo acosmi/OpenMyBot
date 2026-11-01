@@ -1,6 +1,6 @@
 //! Outbound delivery rows: the atomic claim, the send target, the run result facts and the end of
 //! one attempt.
-use crate::{Channel, ReceiverRow, StoreError, TerminalKind, rows};
+use crate::{ChannelKind, ReceiverRow, StoreError, TerminalKind, rows};
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_postgres::Client;
@@ -58,7 +58,7 @@ pub enum DeliveryContent {
 pub struct Claimed {
     pub delivery_id: Uuid,
     pub binding_id: Uuid,
-    pub channel: Channel,
+    pub channel: ChannelKind,
     pub chat_key: String,
     pub idempotency_key: String,
     /// The count after this claim; the first claim is 1.
@@ -70,7 +70,7 @@ pub async fn claim_delivery(
     client: &Client,
     deadline: Instant,
 ) -> Result<Option<Claimed>, StoreError> {
-    let claimed = rows(client, "UPDATE openmybot.deliveries SET status='sending', attempts=attempts+1, first_attempt_at=COALESCE(first_attempt_at, now()) WHERE delivery_id = (SELECT delivery_id FROM openmybot.deliveries WHERE status='pending' AND channel_kind IN ('telegram','feishu') AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING delivery_id, binding_id, chat_key, kind, idempotency_key, body, attempts, channel_kind", &[], deadline, ERROR).await?;
+    let claimed = rows(client, "UPDATE openmybot.deliveries SET status='sending', attempts=attempts+1, first_attempt_at=COALESCE(first_attempt_at, now()) WHERE delivery_id = (SELECT delivery_id FROM openmybot.deliveries WHERE status='pending' AND channel_kind <> 'host' AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING delivery_id, binding_id, chat_key, kind, idempotency_key, body, attempts, channel_kind", &[], deadline, ERROR).await?;
     let Some(row) = claimed.first() else {
         return Ok(None);
     };
@@ -92,7 +92,7 @@ pub async fn claim_delivery(
     Ok(Some(Claimed {
         delivery_id: row.try_get(0).map_err(|_| ERROR)?,
         binding_id: row.try_get(1).map_err(|_| ERROR)?,
-        channel: Channel::parse(row.try_get::<_, &str>(7).map_err(|_| ERROR)?).ok_or(ERROR)?,
+        channel: ChannelKind::parse(row.try_get::<_, &str>(7).map_err(|_| ERROR)?).ok_or(ERROR)?,
         chat_key: row.try_get(2).map_err(|_| ERROR)?,
         idempotency_key: row.try_get(4).map_err(|_| ERROR)?,
         attempts: u32::try_from(row.try_get::<_, i32>(6).map_err(|_| ERROR)?).map_err(|_| ERROR)?,
@@ -109,7 +109,7 @@ pub struct SendTarget {
 pub async fn send_target(
     client: &Client,
     binding_id: Uuid,
-    channel: Channel,
+    channel: ChannelKind,
     deadline: Instant,
 ) -> Result<SendTarget, StoreError> {
     let found = rows(client, "SELECT (SELECT status='active' FROM openmybot.channel_bindings WHERE binding_id=$1),r.binding_id,r.source_key,r.credential_envelope,r.revision FROM (SELECT 1) one LEFT JOIN openmybot.channel_bindings r ON r.binding_kind='receiver' AND r.channel_kind=$2 AND r.status='active'", &[&binding_id, &channel.as_str()], deadline, ERROR).await?;

@@ -2,8 +2,19 @@ use crate::{StoreError, command, finish, rows, timely};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tokio_postgres::Client;
-const INITIAL: &[u8] = include_bytes!("../migrations/omb_0001_initial.sql");
-const NAME: &str = "omb_0001_initial.sql";
+/// Embedded migrations in ascending version order, numbered from 1 without gaps.
+const MIGRATIONS: &[(i32, &str, &[u8])] = &[
+    (
+        1,
+        "omb_0001_initial.sql",
+        include_bytes!("../migrations/omb_0001_initial.sql"),
+    ),
+    (
+        2,
+        "omb_0002_open_channel_kind.sql",
+        include_bytes!("../migrations/omb_0002_open_channel_kind.sql"),
+    ),
+];
 const BOOTSTRAP: &str = "CREATE SCHEMA IF NOT EXISTS openmybot; CREATE TABLE IF NOT EXISTS openmybot.omb_migrations(version integer PRIMARY KEY,name text NOT NULL,sha256 bytea NOT NULL CHECK(octet_length(sha256)=32),applied_at timestamptz NOT NULL)";
 #[derive(Debug, PartialEq, Eq)]
 pub struct MigrationReport {
@@ -40,28 +51,63 @@ pub async fn migrate(
     }
     .await;
     finish(client, deadline, bootstrap, error).await?;
-    let result=async {
-        command(client,"BEGIN",deadline,error).await?;
-        lock(client,deadline).await?;
-        let history=rows(client,"SELECT version,name,sha256 FROM openmybot.omb_migrations ORDER BY version",&[],deadline,error).await?;
-        let digest=Sha256::digest(INITIAL).to_vec();let mut applied=false;
-        for row in history {
-            let version:i32=row.try_get(0).map_err(|_|error)?;
-            if version!=1 {return Err(StoreError::SchemaNewer);}
-            let name:String=row.try_get(1).map_err(|_|error)?;
-            let stored:Vec<u8>=row.try_get(2).map_err(|_|error)?;
-            if name!=NAME || stored!=digest {return Err(StoreError::MigrationDrift);}
-            applied=true;
+    let history = async {
+        command(client, "BEGIN", deadline, error).await?;
+        lock(client, deadline).await?;
+        let history = rows(
+            client,
+            "SELECT version,name,sha256 FROM openmybot.omb_migrations ORDER BY version",
+            &[],
+            deadline,
+            error,
+        )
+        .await?;
+        for (index, row) in history.iter().enumerate() {
+            let version: i32 = row.try_get(0).map_err(|_| error)?;
+            let Some(&(_, name, sql)) = MIGRATIONS.iter().find(|m| m.0 == version) else {
+                return Err(StoreError::SchemaNewer);
+            };
+            let stored_name: String = row.try_get(1).map_err(|_| error)?;
+            let stored: Vec<u8> = row.try_get(2).map_err(|_| error)?;
+            if MIGRATIONS[index].0 != version
+                || stored_name != name
+                || stored != Sha256::digest(sql).as_slice()
+            {
+                return Err(StoreError::MigrationDrift);
+            }
         }
-        let applied_count=if applied {0} else {
-            let sql=std::str::from_utf8(INITIAL).map_err(|_|error)?;
-            command(client,sql,deadline,error).await?;
-            rows(client,"INSERT INTO openmybot.omb_migrations(version,name,sha256,applied_at) VALUES (1,$1,$2,statement_timestamp()) RETURNING version",&[&NAME,&digest],deadline,error).await?;
-            1
-        };
-        timely(deadline,Ok(MigrationReport{applied_count,current_version:1}),error)
-    }.await;
-    finish(client, deadline, result, error).await
+        Ok(history.len())
+    }
+    .await;
+    let applied = finish(client, deadline, history, error).await?;
+    let mut applied_count = 0;
+    for &(version, name, sql) in &MIGRATIONS[applied..] {
+        let result = async {
+            command(client, "BEGIN", deadline, error).await?;
+            lock(client, deadline).await?;
+            // A concurrent migrator may have applied this file after the history was read.
+            let done = rows(
+                client,
+                "SELECT 1 FROM openmybot.omb_migrations WHERE version=$1",
+                &[&version],
+                deadline,
+                error,
+            )
+            .await?;
+            if !done.is_empty() {
+                return Ok(0);
+            }
+            command(client, std::str::from_utf8(sql).map_err(|_| error)?, deadline, error).await?;
+            rows(client, "INSERT INTO openmybot.omb_migrations(version,name,sha256,applied_at) VALUES ($1,$2,$3,statement_timestamp()) RETURNING version", &[&version, &name, &Sha256::digest(sql).to_vec()], deadline, error).await?;
+            timely(deadline, Ok(1), error)
+        }
+        .await;
+        applied_count += finish(client, deadline, result, error).await?;
+    }
+    Ok(MigrationReport {
+        applied_count,
+        current_version: MIGRATIONS[MIGRATIONS.len() - 1].0,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -72,12 +118,15 @@ mod tests {
     }
     #[test]
     fn embedded_initial_migration_hash_is_exact_file_bytes() {
-        let file = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("migrations/omb_0001_initial.sql"),
-        )
-        .unwrap();
-        assert_eq!(INITIAL, file);
-        assert_eq!(Sha256::digest(INITIAL), Sha256::digest(file));
+        for &(_, name, sql) in MIGRATIONS {
+            let file = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(name),
+            )
+            .unwrap();
+            assert_eq!(sql, file);
+            assert_eq!(Sha256::digest(sql), Sha256::digest(file));
+        }
     }
 }

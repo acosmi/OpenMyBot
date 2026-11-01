@@ -186,6 +186,7 @@ impl ControlState {
         data.authentication_failures = self.failures.load(Ordering::Relaxed);
         if let Some(channels) = &self.channels {
             data.channels = channels.read().await?;
+            data.plugins = channels.plugins();
         }
         Ok(data)
     }
@@ -455,6 +456,7 @@ mod tests {
                 engine_pin: ENGINE_PIN.into(),
                 authentication_failures: 0,
                 channels: Vec::new(),
+                plugins: Vec::new(),
             },
             None,
             None,
@@ -689,7 +691,7 @@ mod tests {
         }
         assert!(!rendered.contains("data_dir"));
     }
-    const OPS: [&str; 11] = [
+    const OPS: [&str; 14] = [
         "status_run",
         "pair_start",
         "bindings_list",
@@ -701,6 +703,9 @@ mod tests {
         "approve",
         "deny",
         "cancel",
+        "plugins_list",
+        "plugins_add",
+        "plugins_remove",
     ];
     const MCP_OPS: [&str; 5] = [
         "mcp_run_begin",
@@ -722,11 +727,11 @@ mod tests {
     #[test]
     fn op_names_are_exactly_the_section_9_2_set() {
         let parsed: Vec<Op> = OPS.iter().filter_map(|name| Op::parse(name)).collect();
-        assert_eq!(parsed.len(), 11);
+        assert_eq!(parsed.len(), 14);
         for (index, op) in parsed.iter().enumerate() {
             assert!(!parsed[..index].contains(op), "{op:?}");
         }
-        // `status` keeps its own snapshot path; together the names are the twelve operations.
+        // `status` keeps its own snapshot path; together the names are the fifteen operations.
         assert_eq!(Op::parse("status"), None);
         for name in MCP_OPS.iter().chain(&[
             "",
@@ -1048,7 +1053,7 @@ mod tests {
             serde_json::json!({"type": "response", "ok": true, "data": {
                 "deployment_id": "omb-local-test", "daemon_pid": 1, "pg_pid": 2,
                 "pg_server_version_num": 170011, "daemon_version": version, "engine_pin": pin,
-                "authentication_failures": 0, "channels": []
+                "authentication_failures": 0, "channels": [], "plugins": []
             }})
         };
         let other_pin = "0".repeat(40);

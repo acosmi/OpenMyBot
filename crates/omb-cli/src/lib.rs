@@ -1,4 +1,5 @@
-//! Closed local command parsing; credentials never enter arguments.
+//! Closed local command parsing; credentials never enter arguments. Channel kinds are free words
+//! the daemon checks.
 use omb_daemon::{DaemonError, ErrorClass};
 use serde_json::{Value, json};
 use std::{
@@ -17,7 +18,7 @@ pub enum Command {
         run: Option<String>,
     },
     Pair {
-        channel: PairChannel,
+        channel: String,
         workspace: PathBuf,
         run_deadline: Option<u32>,
     },
@@ -32,9 +33,9 @@ pub enum Command {
         binding_id: String,
         ack_unknown: String,
     },
-    BindingsReceiverTelegram,
-    BindingsReceiverFeishu {
-        app_id: String,
+    /// Reads one line of standard input per credential field the channel's plugin declares.
+    BindingsReceiver {
+        channel: String,
     },
     BindingsHost {
         workspace: PathBuf,
@@ -49,12 +50,18 @@ pub enum Command {
     Cancel {
         run_id: String,
     },
+    PluginsList,
+    PluginsAdd {
+        dir: PathBuf,
+    },
+    /// Installs a first-party plugin from the binaries shipped beside `openmybot`.
+    PluginsAddBuiltIn {
+        kind: String,
+    },
+    PluginsRemove {
+        name: String,
+    },
     Mcp,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PairChannel {
-    Telegram,
-    Feishu,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
@@ -106,7 +113,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["status"] => &["--run"],
         ["pair", _] | ["bindings", "host", "crabcode"] => &["--workspace", "--run-deadline"],
         ["bindings", "reset-thread", _] => &["--ack-unknown"],
-        ["bindings", "receiver", "feishu"] => &["--app-id"],
+        ["plugins", "add"] => &["--built-in"],
         _ => &[],
     };
     // Subcommand flags are legal only after all command words.
@@ -145,12 +152,8 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["status"] => Command::Status {
             run: text("--run")?,
         },
-        ["pair", channel] => Command::Pair {
-            channel: match *channel {
-                "telegram" => PairChannel::Telegram,
-                "feishu" => PairChannel::Feishu,
-                _ => return Err(UsageError),
-            },
+        ["pair", channel] if !channel.is_empty() => Command::Pair {
+            channel: (*channel).into(),
             workspace: workspace()?,
             run_deadline: run_deadline()?,
         },
@@ -165,9 +168,8 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
             binding_id: (*id).into(),
             ack_unknown: text("--ack-unknown")?.ok_or(UsageError)?,
         },
-        ["bindings", "receiver", "telegram"] => Command::BindingsReceiverTelegram,
-        ["bindings", "receiver", "feishu"] => Command::BindingsReceiverFeishu {
-            app_id: text("--app-id")?.ok_or(UsageError)?,
+        ["bindings", "receiver", channel] if !channel.is_empty() => Command::BindingsReceiver {
+            channel: (*channel).into(),
         },
         ["bindings", "host", "crabcode"] => Command::BindingsHost {
             workspace: workspace()?,
@@ -182,6 +184,16 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["cancel", id] => Command::Cancel {
             run_id: (*id).into(),
         },
+        ["plugins", "list"] => Command::PluginsList,
+        ["plugins", "add", dir] => Command::PluginsAdd {
+            dir: absolute(&OsString::from(dir))?,
+        },
+        ["plugins", "add"] => Command::PluginsAddBuiltIn {
+            kind: text("--built-in")?.ok_or(UsageError)?,
+        },
+        ["plugins", "remove", name] => Command::PluginsRemove {
+            name: (*name).into(),
+        },
         ["mcp"] if !json => Command::Mcp,
         _ => return Err(UsageError),
     };
@@ -192,15 +204,9 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
     })
 }
 impl Command {
-    /// The receiver commands take their secret from standard input.
-    pub fn reads_secret(&self) -> bool {
-        matches!(
-            self,
-            Self::BindingsReceiverTelegram | Self::BindingsReceiverFeishu { .. }
-        )
-    }
-    /// The control operation and its arguments; `init`, `daemon` and `mcp` run locally.
-    pub fn control_request(&self, secret: Option<SecretLine>) -> Option<(&'static str, Value)> {
+    /// The control operation and its arguments; `init`, `daemon` and `mcp` run locally, and the
+    /// receiver command asks for its credential fields first.
+    pub fn control_request(&self) -> Option<(&'static str, Value)> {
         let with_deadline = |mut args: Value, run_deadline: &Option<u32>| {
             if let Some(seconds) = run_deadline {
                 args["run_deadline"] = json!(seconds);
@@ -208,7 +214,9 @@ impl Command {
             args
         };
         Some(match self {
-            Self::Init { .. } | Self::Daemon | Self::Mcp => return None,
+            Self::Init { .. } | Self::Daemon | Self::Mcp | Self::BindingsReceiver { .. } => {
+                return None;
+            }
             Self::Status { run: None } => ("status", json!({})),
             Self::Status { run: Some(run_id) } => ("status_run", json!({"run_id": run_id})),
             Self::Pair {
@@ -218,13 +226,7 @@ impl Command {
             } => (
                 "pair_start",
                 with_deadline(
-                    json!({
-                        "channel": match channel {
-                            PairChannel::Telegram => "telegram",
-                            PairChannel::Feishu => "feishu",
-                        },
-                        "workspace": workspace,
-                    }),
+                    json!({"channel": channel, "workspace": workspace}),
                     run_deadline,
                 ),
             ),
@@ -242,14 +244,6 @@ impl Command {
                 "bindings_reset_thread",
                 json!({"binding_id": binding_id, "ack_unknown": ack_unknown}),
             ),
-            Self::BindingsReceiverTelegram => (
-                "bindings_receiver",
-                json!({"channel": "telegram", "token": secret?.expose()}),
-            ),
-            Self::BindingsReceiverFeishu { app_id } => (
-                "bindings_receiver",
-                json!({"channel": "feishu", "app_id": app_id, "app_secret": secret?.expose()}),
-            ),
             Self::BindingsHost {
                 workspace,
                 run_deadline,
@@ -260,10 +254,14 @@ impl Command {
             Self::Approve { permission_id } => ("approve", json!({"permission_id": permission_id})),
             Self::Deny { permission_id } => ("deny", json!({"permission_id": permission_id})),
             Self::Cancel { run_id } => ("cancel", json!({"run_id": run_id})),
+            Self::PluginsList => ("plugins_list", json!({})),
+            Self::PluginsAdd { dir } => ("plugins_add", json!({"dir": dir})),
+            Self::PluginsAddBuiltIn { kind } => ("plugins_add", json!({"built_in": kind})),
+            Self::PluginsRemove { name } => ("plugins_remove", json!({"name": name})),
         })
     }
 }
-/// A secret read from the first line of standard input.
+/// One credential field value read from a line of standard input.
 pub struct SecretLine(String);
 impl fmt::Debug for SecretLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -282,10 +280,10 @@ impl Drop for EchoOff {
     }
 }
 impl SecretLine {
-    /// Reads the first line without echo on a terminal; one `\n` or `\r\n` is removed and the
-    /// rest must be 1–512 bytes of UTF-8.
-    pub fn read(reader: &mut impl BufRead, is_terminal: bool) -> Result<SecretLine, UsageError> {
-        let _echo = if is_terminal {
+    /// Reads the next line, without echo when `hidden` (a secret on a terminal); one `\n` or
+    /// `\r\n` is removed and the rest must be 1–512 bytes of UTF-8.
+    pub fn read(reader: &mut impl BufRead, hidden: bool) -> Result<SecretLine, UsageError> {
+        let _echo = if hidden {
             let saved = rustix::termios::tcgetattr(std::io::stdin()).map_err(|_| UsageError)?;
             let mut quiet = saved.clone();
             quiet.local_modes.remove(rustix::termios::LocalModes::ECHO);
@@ -387,7 +385,7 @@ mod tests {
         assert_eq!(
             command(&["pair", "telegram", "--workspace", "/ws"]),
             Ok(Command::Pair {
-                channel: PairChannel::Telegram,
+                channel: "telegram".into(),
                 workspace: "/ws".into(),
                 run_deadline: None
             })
@@ -402,13 +400,22 @@ mod tests {
                 "/ws"
             ]),
             Ok(Command::Pair {
-                channel: PairChannel::Feishu,
+                channel: "feishu".into(),
                 workspace: "/ws".into(),
                 run_deadline: Some(900)
             })
         );
+        // Any channel word goes to the daemon, which answers `plugin_not_installed`.
+        assert_eq!(
+            command(&["pair", "slack", "--workspace", "/ws"]),
+            Ok(Command::Pair {
+                channel: "slack".into(),
+                workspace: "/ws".into(),
+                run_deadline: None
+            })
+        );
         for values in [
-            vec!["pair", "slack", "--workspace", "/ws"],
+            vec!["pair", "", "--workspace", "/ws"],
             vec!["pair", "telegram"],
             vec!["pair", "telegram", "--workspace", "ws"],
             vec!["pair", "telegram", "--workspace"],
@@ -475,12 +482,14 @@ mod tests {
             ),
             (
                 vec!["bindings", "receiver", "telegram"],
-                Command::BindingsReceiverTelegram,
+                Command::BindingsReceiver {
+                    channel: "telegram".into(),
+                },
             ),
             (
-                vec!["bindings", "receiver", "feishu", "--app-id", "cli_a"],
-                Command::BindingsReceiverFeishu {
-                    app_id: "cli_a".into(),
+                vec!["bindings", "receiver", "slack"],
+                Command::BindingsReceiver {
+                    channel: "slack".into(),
                 },
             ),
             (
@@ -503,8 +512,9 @@ mod tests {
         }
         for values in [
             vec!["bindings", "reset-thread", "b1"],
-            vec!["bindings", "receiver", "feishu"],
-            vec!["bindings", "receiver", "slack"],
+            vec!["bindings", "receiver"],
+            vec!["bindings", "receiver", ""],
+            vec!["bindings", "receiver", "feishu", "--app-id", "cli_a"],
             vec!["bindings", "host", "claude", "--workspace", "/ws"],
             vec!["bindings", "host", "crabcode"],
             vec!["bindings", "list", "extra"],
@@ -542,10 +552,8 @@ mod tests {
     #[test]
     fn rejects_unknown_channel_duplicate_flags_missing_values_relative_paths_and_extra_arguments() {
         for values in [
-            vec!["pair", "matrix", "--workspace", "/ws"],
-            vec![
-                "bindings", "receiver", "feishu", "--app-id", "a", "--app-id", "b",
-            ],
+            vec!["pair", "matrix", "extra", "--workspace", "/ws"],
+            vec!["bindings", "receiver", "feishu", "--app-id", "a"],
             vec!["bindings", "reset-thread", "b1", "--ack-unknown"],
             vec!["bindings", "host", "crabcode", "--workspace", "relative"],
             vec!["init", "--pg-bin-dir", "relative"],
@@ -589,6 +597,41 @@ mod tests {
         }
     }
     #[test]
+    fn parses_plugins_list_add_and_remove() {
+        assert_eq!(command(&["plugins", "list"]), Ok(Command::PluginsList));
+        assert_eq!(
+            command(&["plugins", "add", "/pkg"]),
+            Ok(Command::PluginsAdd { dir: "/pkg".into() })
+        );
+        assert_eq!(
+            command(&["plugins", "add", "--built-in", "telegram"]),
+            Ok(Command::PluginsAddBuiltIn {
+                kind: "telegram".into()
+            })
+        );
+        assert_eq!(
+            command(&["plugins", "remove", "fake"]),
+            Ok(Command::PluginsRemove {
+                name: "fake".into()
+            })
+        );
+        for values in [
+            vec!["plugins"],
+            vec!["plugins", "add"],
+            vec!["plugins", "add", "pkg"],
+            vec!["plugins", "add", "/pkg", "--built-in", "telegram"],
+            vec!["plugins", "add", "--built-in", "telegram", "/pkg"],
+            vec!["plugins", "add", "--built-in"],
+            vec!["plugins", "add", "/pkg", "--built-in"],
+            vec!["plugins", "add", "/a", "/b"],
+            vec!["plugins", "remove"],
+            vec!["plugins", "list", "extra"],
+            vec!["plugins", "install", "/pkg"],
+        ] {
+            assert_eq!(command(&values), Err(UsageError), "{values:?}");
+        }
+    }
+    #[test]
     fn mcp_takes_no_words_flags_or_json() {
         assert_eq!(command(&["mcp"]), Ok(Command::Mcp));
         for values in [["--data-dir", "/d", "mcp"], ["mcp", "--data-dir", "/d"]] {
@@ -613,9 +656,7 @@ mod tests {
     }
     #[test]
     fn control_request_builds_op_and_args_for_every_command() {
-        let request = |values: &[&str], secret_line: Option<SecretLine>| {
-            command(values).unwrap().control_request(secret_line)
-        };
+        let request = |values: &[&str]| command(values).unwrap().control_request();
         for (values, op, expected) in [
             (vec!["status"], "status", json!({})),
             (
@@ -681,52 +722,39 @@ mod tests {
             ),
             (vec!["deny", "hp1"], "deny", json!({"permission_id": "hp1"})),
             (vec!["cancel", "r1"], "cancel", json!({"run_id": "r1"})),
+            (vec!["plugins", "list"], "plugins_list", json!({})),
+            (
+                vec!["plugins", "add", "/pkg"],
+                "plugins_add",
+                json!({"dir": "/pkg"}),
+            ),
+            (
+                vec!["plugins", "add", "--built-in", "feishu"],
+                "plugins_add",
+                json!({"built_in": "feishu"}),
+            ),
+            (
+                vec!["plugins", "remove", "fake"],
+                "plugins_remove",
+                json!({"name": "fake"}),
+            ),
         ] {
-            assert_eq!(request(&values, None), Some((op, expected)), "{values:?}");
+            assert_eq!(request(&values), Some((op, expected)), "{values:?}");
         }
-        assert_eq!(
-            request(
-                &["bindings", "receiver", "telegram"],
-                Some(secret("123:abc\n"))
-            ),
-            Some((
-                "bindings_receiver",
-                json!({"channel": "telegram", "token": "123:abc"})
-            ))
-        );
-        assert_eq!(
-            request(
-                &["bindings", "receiver", "feishu", "--app-id", "cli_a"],
-                Some(secret("s3cret"))
-            ),
-            Some((
-                "bindings_receiver",
-                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "s3cret"})
-            ))
-        );
-        assert!(
-            command(&["bindings", "receiver", "telegram"])
-                .unwrap()
-                .reads_secret()
-        );
-        assert!(
-            command(&["bindings", "receiver", "feishu", "--app-id", "a"])
-                .unwrap()
-                .reads_secret()
-        );
-        assert!(!command(&["approve", "hp1"]).unwrap().reads_secret());
-        assert_eq!(request(&["daemon"], None), None);
-        assert_eq!(request(&["init", "--pg-bin-dir", "/pg"], None), None);
-        assert_eq!(request(&["mcp"], None), None);
-        assert!(!command(&["mcp"]).unwrap().reads_secret());
+        // The receiver command first reads the declared fields, then sends its own request.
+        for values in [
+            vec!["bindings", "receiver", "telegram"],
+            vec!["daemon"],
+            vec!["init", "--pg-bin-dir", "/pg"],
+            vec!["mcp"],
+        ] {
+            assert_eq!(request(&values), None, "{values:?}");
+        }
     }
     #[test]
     fn control_op_names_equal_the_cli_command_words() {
         for word in ["approve", "deny", "cancel"] {
-            let (op, _) = command(&[word, "x"])
-                .unwrap()
-                .control_request(None)
-                .unwrap();
+            let (op, _) = command(&[word, "x"]).unwrap().control_request().unwrap();
             assert_eq!(op, word);
         }
     }

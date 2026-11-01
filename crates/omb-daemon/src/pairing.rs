@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tokio::time::Instant;
 
 pub struct PairRequest {
-    pub channel: omb_store::Channel,
+    pub channel: omb_store::ChannelKind,
     pub workspace: PathBuf,
     pub run_deadline: Option<omb_store::RunDeadline>,
 }
@@ -87,7 +87,7 @@ mod tests {
     }
     fn request(workspace: PathBuf) -> PairRequest {
         PairRequest {
-            channel: omb_store::Channel::Telegram,
+            channel: omb_store::ChannelKind::from_static("telegram"),
             workspace,
             run_deadline: omb_store::RunDeadline::parse(300),
         }

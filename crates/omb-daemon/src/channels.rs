@@ -1,35 +1,55 @@
-//! Daemon wiring of the channel receivers, the dispatcher, the heartbeat and the status segment.
+//! Daemon wiring of the channel plugins and the receivers they serve, the dispatcher, the heartbeat,
+//! the outbound task, the sweeper and the status segment; the one boundary mapping of plugin events.
 use crate::reconcile::{self, REPLAY_DEADLINE, Reconciler};
 use crate::{
-    ChannelCounters, ChannelStatus, DaemonError, GapStatus,
+    CancelRequests, ChannelCounters, ChannelError, ChannelStatus, Connection, Counters,
+    DaemonError, GapStatus, PluginStatus, STORE_BUDGET, Task, Timings,
+    dispatch::start_dispatcher,
     engine::Engine,
+    outbound::{OutboundContext, start_outbound},
     pg::{AuthorityConnection, Postgres, map_store_error},
+    plugins::Plugins,
+    supervisor::{Context, PluginProcess},
 };
-use omb_channels::{
-    CancelRequests, Connection, Counters, Endpoints, FEISHU_NOTE, ReceiverContext, TELEGRAM_NOTE,
-    Task, Timings, start_dispatcher, start_heartbeat, start_receiver,
+use omb_channel_sdk::{
+    PLUGIN_MAX,
+    protocol::{EventFrame, EventKind, VerifyFailure},
 };
-use omb_channels::{SenderContext, start_sender};
 use omb_hostdriver::{CC_KILL_GRACE, CC_TERM_GRACE};
-use omb_store::{Channel, ReceiverRow};
+use omb_store::{
+    ChannelKind, Command, Content, IdentityKey, KEY_MAX, NormalizedEvent, ReceiverRow,
+    touch_heartbeat,
+};
 use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::ActorId;
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
 };
+use time::{
+    OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339, macros::format_description,
+};
 use tokio::{
-    sync::{Mutex, Notify, mpsc},
-    task::JoinHandle,
+    sync::{Mutex, Notify, Semaphore, mpsc, oneshot},
+    task::{JoinHandle, JoinSet},
+    time::Instant,
 };
 use uuid::Uuid;
 
-/// Read side of the status channel segment: its own connection plus the receivers' counters.
+/// Status note of a channel without an installed plugin.
+pub(crate) const NO_PLUGIN_NOTE: &str = "no plugin installed for this channel";
+/// The supervisors' handles by channel kind, shared with the outbound task.
+pub(crate) type Processes = Arc<std::sync::Mutex<HashMap<ChannelKind, PluginProcess>>>;
+
+/// Read side of the status channel and plugin segments: its own connection, the counters and the
+/// installed plugins.
 pub(crate) struct StatusSource {
     pub(crate) client: Arc<tokio_postgres::Client>,
     pub(crate) counters: Arc<Counters>,
+    pub(crate) plugins: Plugins,
 }
 /// RFC 3339 in UTC with `Z` and only the fractional digits the instant needs.
 pub(crate) fn rfc3339_utc(unix_nanos: i128) -> Result<String, DaemonError> {
@@ -39,6 +59,15 @@ pub(crate) fn rfc3339_utc(unix_nanos: i128) -> Result<String, DaemonError> {
                 .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
         })
         .map_err(|_| DaemonError::InternalError)
+}
+/// RFC 3339 in UTC with exactly three fractional digits, truncated: the fingerprint's
+/// `occurredAt` and `start.last_accepted_at`.
+pub(crate) fn utc_millis(at: OffsetDateTime) -> String {
+    at.to_offset(UtcOffset::UTC)
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .unwrap_or_default()
 }
 impl StatusSource {
     pub(crate) async fn read(&self) -> Result<Vec<ChannelStatus>, DaemonError> {
@@ -57,11 +86,7 @@ impl StatusSource {
             .into_iter()
             .map(|receiver| {
                 Ok(ChannelStatus {
-                    channel: match receiver.channel {
-                        Channel::Telegram => "telegram",
-                        Channel::Feishu => "feishu",
-                    }
-                    .to_owned(),
+                    channel: receiver.channel.as_str().to_owned(),
                     binding_id: receiver.binding_id.to_string(),
                     status: receiver.status,
                     status_reason: receiver.status_reason,
@@ -80,16 +105,161 @@ impl StatusSource {
                             })
                         })
                         .collect::<Result<_, DaemonError>>()?,
-                    note: match receiver.channel {
-                        Channel::Telegram => TELEGRAM_NOTE,
-                        Channel::Feishu => FEISHU_NOTE,
-                    }
-                    .to_owned(),
+                    note: self.plugins.provider(&receiver.channel).map_or_else(
+                        || NO_PLUGIN_NOTE.to_owned(),
+                        |plugin| {
+                            plugin.channels[receiver.channel.as_str()]
+                                .status_note
+                                .clone()
+                        },
+                    ),
                     counters: counters.clone(),
                 })
             })
             .collect()
     }
+    /// Every installed plugin with the state of its processes.
+    pub(crate) fn plugins(&self) -> Vec<PluginStatus> {
+        self.plugins
+            .list()
+            .into_iter()
+            .map(|plugin| {
+                let (process, last_exit_code) = self.plugins.process(&plugin);
+                PluginStatus {
+                    channels: plugin.channels.keys().cloned().collect(),
+                    name: plugin.name,
+                    version: plugin.version,
+                    process,
+                    last_exit_code,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Control command of the first word, and the `/pair` code when the whole text is `/pair <code>`.
+pub(crate) fn classify(text: &str) -> (Option<Command>, Option<String>) {
+    let pair_code = text.strip_prefix("/pair").and_then(|rest| {
+        let code = rest.trim_start();
+        (code.len() < rest.len() && !code.is_empty() && !code.contains(char::is_whitespace))
+            .then(|| code.to_owned())
+    });
+    let word = text.split_whitespace().next().unwrap_or_default();
+    let command = word.starts_with('/').then(|| {
+        let name = word.split('@').next().unwrap_or_default().to_lowercase();
+        match name.as_str() {
+            "/help" => Command::Help,
+            "/start" => Command::Start,
+            "/status" => Command::Status,
+            "/cancel" => Command::Cancel,
+            "/pair" => Command::Pair,
+            _ => Command::Unknown,
+        }
+    });
+    (command, pair_code)
+}
+/// The boundary mapping of one event of a `kind` plugin; `None` breaks the protocol. Missing or
+/// foreign identity keys, an unparseable time, a text with NUL or the plugin's own `malformed`
+/// make the event malformed, which keeps the obtainable identity and has no fingerprint. The
+/// fingerprint is SHA-256 of the RFC 8785 form of `{eventType, occurredAt?, data}`.
+pub(crate) fn normalize(
+    kind: &ChannelKind,
+    source_key: &str,
+    frame: EventFrame,
+) -> Option<NormalizedEvent> {
+    let ours = |text: &str, separator: char| {
+        text.strip_prefix(kind.as_str())
+            .is_some_and(|rest| rest.starts_with(separator))
+    };
+    if !(1..=KEY_MAX).contains(&frame.event_key.len())
+        || frame.event_key.contains('\0')
+        || !ours(&frame.event_type, '.')
+    {
+        return None;
+    }
+    let identity = |key: Option<&str>| {
+        key.filter(|key| ours(key, ':'))
+            .and_then(IdentityKey::parse)
+    };
+    let sender = identity(frame.sender_key.as_deref());
+    let chat = identity(frame.chat_key.as_deref());
+    let parsed = frame
+        .occurred_at
+        .as_deref()
+        .map(|at| OffsetDateTime::parse(at, &Rfc3339));
+    let malformed = sender.is_none()
+        || chat.is_none()
+        || matches!(parsed, Some(Err(_)))
+        || match frame.kind {
+            EventKind::Text => frame.text.contains('\0'),
+            EventKind::Other => false,
+            EventKind::Malformed => true,
+        };
+    let occurred_at = parsed.and_then(Result::ok);
+    let (fingerprint, content) = if malformed {
+        (None, Content::Malformed)
+    } else {
+        // Keys sort by UTF-16 code units; serde_json escapes strings the way RFC 8785 does.
+        let string = |value: &str| serde_json::to_string(value).unwrap_or_default();
+        let mut data: Vec<(&String, &String)> = frame.data.iter().collect();
+        data.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+        let data: Vec<String> = data
+            .into_iter()
+            .map(|(key, value)| format!("{}:{}", string(key), string(value)))
+            .collect();
+        let occurred = occurred_at
+            .map(|at| format!(r#","occurredAt":{}"#, string(&utc_millis(at))))
+            .unwrap_or_default();
+        let canonical = format!(
+            r#"{{"data":{{{}}},"eventType":{}{occurred}}}"#,
+            data.join(","),
+            string(&frame.event_type),
+        );
+        let content = match frame.kind {
+            EventKind::Text => {
+                let (command, pair_code) = classify(&frame.text);
+                Content::Text {
+                    text: frame.text,
+                    command,
+                    pair_code,
+                }
+            }
+            _ => Content::Other,
+        };
+        (Some(Sha256::digest(canonical.as_bytes()).into()), content)
+    };
+    Some(NormalizedEvent {
+        channel: kind.clone(),
+        source_key: source_key.to_owned(),
+        event_key: frame.event_key,
+        event_type: frame.event_type,
+        occurred_at,
+        private: frame.private,
+        sender,
+        chat,
+        fingerprint,
+        content,
+    })
+}
+
+/// Advances `last_heartbeat_at` every `heartbeat`; a store failure ends the task.
+pub(crate) fn start_heartbeat(connection: Connection, token_id: Uuid, timings: Timings) -> Task {
+    Task::spawn(connection, move |mut client, mut stop| async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop => return Ok(()),
+                () = tokio::time::sleep(timings.heartbeat) => {}
+            }
+            touch_heartbeat(
+                &mut client,
+                token_id,
+                timings.heartbeat_gap,
+                Instant::now() + STORE_BUDGET,
+            )
+            .await
+            .map_err(|_| ChannelError::StoreFailed)?;
+        }
+    })
 }
 
 /// What the outbound side starts from: the engine's terminal notices and the configured host
@@ -99,37 +269,52 @@ pub(crate) struct Outbound {
     pub(crate) crabcode: Option<PathBuf>,
 }
 
-/// The running receiver of each channel with its binding, the dispatcher and heartbeat, the
-/// context every receiver starts with, the status connection, the outbound sender and the sweeper.
+/// The kind's supervisor, started on first use.
+fn supervisor(
+    processes: &Processes,
+    supervisors: &mut JoinSet<Result<(), ChannelError>>,
+    context: &Arc<Context>,
+    kind: &ChannelKind,
+) -> PluginProcess {
+    processes
+        .lock()
+        .unwrap()
+        .entry(kind.clone())
+        .or_insert_with(|| PluginProcess::spawn(kind.clone(), Arc::clone(context), supervisors))
+        .clone()
+}
+
+/// One plugin supervisor per channel kind in use with the binding of its receiver, the dispatcher,
+/// the heartbeat, the outbound task, the sweeper and the status connection.
 pub(crate) struct Channels {
-    telegram: Option<(Uuid, Task)>,
-    feishu: Option<(Uuid, Task)>,
-    context: ReceiverContext,
+    processes: Processes,
+    supervisors: JoinSet<Result<(), ChannelError>>,
+    receivers: HashMap<ChannelKind, Uuid>,
+    pub(crate) context: Arc<Context>,
     dispatcher: Task,
     heartbeat: Task,
+    outbound: Task,
+    sweeper: Task,
     status: Arc<tokio_postgres::Client>,
     status_driver: JoinHandle<Result<(), tokio_postgres::Error>>,
-    sender: Task,
-    sweeper: Task,
 }
 impl Channels {
-    /// Records startup gaps, reconciles the store, then starts the heartbeat, the dispatcher on
-    /// `gate`, each active receiver, the outbound sender and the sweeper, every one on its own
-    /// connection.
+    /// Records startup gaps and reconciles the store, then starts the heartbeat, the dispatcher on
+    /// `gate`, the plugin of every active receiver, the outbound task and the sweeper, each on its
+    /// own connection. An active receiver whose channel has no installed plugin only gets a
+    /// `plugin_missing` gap.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start(
         postgres: &mut Postgres,
         engine: &Engine,
         token_id: Uuid,
         timings: Timings,
-        endpoints: Endpoints,
+        plugins: Plugins,
         cancel: CancelRequests,
         outbound: Outbound,
         gate: Arc<Mutex<HashSet<String>>>,
     ) -> Result<Self, DaemonError> {
         postgres.record_startup_gaps(token_id).await?;
-        let telegram = postgres.list_active_receivers(Channel::Telegram).await?;
-        let feishu = postgres.list_active_receivers(Channel::Feishu).await?;
         let entry = engine
             .assembly
             .delegated_entry
@@ -152,21 +337,33 @@ impl Channels {
         let status = postgres
             .open_resident_connection("openmybot-status")
             .await?;
-        // The live-binding index allows one receiver per channel; Telegram's connection opens first.
-        let mut receivers = [None, None];
-        for (slot, rows) in receivers.iter_mut().zip([telegram, feishu]) {
-            if let Some(row) = rows.into_iter().next() {
-                *slot = Some((
-                    row,
-                    connection(
-                        postgres
-                            .open_resident_connection("openmybot-receiver")
-                            .await?,
-                    ),
-                ));
+        let mut receivers = Vec::new();
+        for view in omb_store::list_bindings(&status.client, Instant::now() + STORE_BUDGET)
+            .await
+            .map_err(map_store_error)?
+        {
+            if view.binding_kind != "receiver" || view.status != "active" {
+                continue;
+            }
+            let kind = ChannelKind::parse(&view.channel_kind).ok_or(DaemonError::InternalError)?;
+            if plugins.provider(&kind).is_none() {
+                omb_store::open_plugin_missing_gap(
+                    &status.client,
+                    view.binding_id,
+                    Instant::now() + STORE_BUDGET,
+                )
+                .await
+                .map_err(map_store_error)?;
+                continue;
+            }
+            // The live-binding index allows one active receiver per channel.
+            if let Some(row) = postgres.list_active_receivers(kind).await?.pop() {
+                let opened = postgres
+                    .open_resident_connection("openmybot-receiver")
+                    .await?;
+                receivers.push((row, connection(opened)));
             }
         }
-        let [telegram, feishu] = receivers;
         let delivery = connection(
             postgres
                 .open_resident_connection("openmybot-delivery")
@@ -178,15 +375,6 @@ impl Channels {
                 .await?,
         );
         let wake = Arc::new(Notify::new());
-        let context = ReceiverContext {
-            vault: engine.vault.clone(),
-            owner: ActorId::new(SINGLE_USER_ACTOR_ID),
-            endpoints,
-            timings,
-            counters: Arc::new(Counters::default()),
-            wake: Arc::clone(&wake),
-            cancel,
-        };
         let reconciler = Reconciler {
             application: engine.assembly.application.clone(),
             resolver: engine.resolver.clone(),
@@ -199,25 +387,46 @@ impl Channels {
         reconcile::startup(&mut dispatcher.client, &reconciler)
             .await
             .map_err(map_store_error)?;
-        let sender = SenderContext {
+        let context = Arc::new(Context {
+            plugins,
             vault: engine.vault.clone(),
             owner: ActorId::new(SINGLE_USER_ACTOR_ID),
-            endpoints: context.endpoints.clone(),
             timings,
+            counters: Arc::new(Counters::default()),
             wake: Arc::clone(&wake),
-        };
+            cancel,
+            slots: Arc::new(Semaphore::new(PLUGIN_MAX)),
+        });
+        let heartbeat = start_heartbeat(heartbeat, token_id, timings);
+        let dispatcher = start_dispatcher(dispatcher, entry, timings, Arc::clone(&wake), gate);
+        let processes = Processes::default();
+        let mut supervisors = JoinSet::new();
+        let mut running = HashMap::new();
+        for (row, opened) in receivers {
+            let process = supervisor(&processes, &mut supervisors, &context, &row.channel);
+            running.insert(row.channel.clone(), row.binding_id);
+            // Startup has no one waiting for the receipt.
+            let (done, _) = oneshot::channel();
+            process.start(row, opened, done).await;
+        }
+        let outbound = start_outbound(
+            delivery,
+            OutboundContext {
+                processes: Arc::clone(&processes),
+                timings,
+                wake,
+            },
+            outbound.terminals,
+        );
         Ok(Self {
-            heartbeat: start_heartbeat(heartbeat, token_id, timings),
-            dispatcher: start_dispatcher(dispatcher, entry, timings, wake, gate),
-            telegram: telegram.map(|(row, opened)| {
-                (row.binding_id, start_receiver(opened, row, context.clone()))
-            }),
-            feishu: feishu.map(|(row, opened)| {
-                (row.binding_id, start_receiver(opened, row, context.clone()))
-            }),
-            sender: start_sender(delivery, sender, outbound.terminals),
-            sweeper: reconcile::start_sweeper(sweeper, reconciler, timings),
+            processes,
+            supervisors,
+            receivers: running,
             context,
+            dispatcher,
+            heartbeat,
+            outbound,
+            sweeper: reconcile::start_sweeper(sweeper, reconciler, timings),
             status: Arc::new(status.client),
             status_driver: status.driver,
         })
@@ -226,99 +435,138 @@ impl Channels {
         StatusSource {
             client: Arc::clone(&self.status),
             counters: Arc::clone(&self.context.counters),
+            plugins: self.context.plugins.clone(),
         }
     }
-    /// The dispatcher's wake-up, shared with the receiver, the sender and the reconciler.
+    /// The dispatcher's wake-up, shared with the supervisors, the outbound task and the reconciler.
     pub(crate) fn wake(&self) -> Arc<Notify> {
         Arc::clone(&self.context.wake)
     }
-    /// Stops the running receiver of the row's channel, then starts `row` on a new resident
-    /// connection; the other channel's receiver keeps running.
+    /// The supervisor of `kind`, when a plugin provides it.
+    fn process(&mut self, kind: &ChannelKind) -> Option<PluginProcess> {
+        self.context.plugins.provider(kind)?;
+        Some(supervisor(
+            &self.processes,
+            &mut self.supervisors,
+            &self.context,
+            kind,
+        ))
+    }
+    /// Makes `row` its channel's receiver on a new resident connection; the plugin of the channel
+    /// replaces the running receiver and answers `done` once `start` is sent.
     pub(crate) async fn start_receiver(
         &mut self,
         postgres: &mut Postgres,
         row: ReceiverRow,
-    ) -> Result<(), DaemonError> {
-        let slot = match row.channel {
-            Channel::Telegram => &mut self.telegram,
-            Channel::Feishu => &mut self.feishu,
+        done: oneshot::Sender<Result<(), DaemonError>>,
+    ) {
+        let Some(process) = self.process(&row.channel) else {
+            let _ = done.send(Err(DaemonError::PluginNotInstalled));
+            return;
         };
-        if let Some((_, task)) = slot.take() {
-            task.stop().await;
-        }
-        let opened = postgres
+        match postgres
             .open_resident_connection("openmybot-receiver")
-            .await?;
-        let connection = Connection {
-            client: opened.client,
-            driver: opened.driver,
-        };
-        *slot = Some((
-            row.binding_id,
-            start_receiver(connection, row, self.context.clone()),
-        ));
-        Ok(())
-    }
-    /// Stops the running receiver that serves `binding_id`, if any.
-    pub(crate) async fn stop_receiver(&mut self, binding_id: Uuid) {
-        for slot in [&mut self.telegram, &mut self.feishu] {
-            if slot
-                .as_ref()
-                .is_some_and(|(running, _)| *running == binding_id)
-                && let Some((_, task)) = slot.take()
-            {
-                task.stop().await;
+            .await
+        {
+            Ok(opened) => {
+                self.receivers.insert(row.channel.clone(), row.binding_id);
+                let connection = Connection {
+                    client: opened.client,
+                    driver: opened.driver,
+                };
+                process.start(row, connection, done).await;
+            }
+            Err(error) => {
+                let _ = done.send(Err(error));
             }
         }
     }
-    /// Resolves with `internal_error` when the heartbeat, the dispatcher, the sender or the
-    /// sweeper ends, or a receiver fails; a receiver that stopped itself after suspension or
-    /// deactivation is only removed.
+    /// Stops receiving for `binding_id`, if a plugin receives for it.
+    pub(crate) async fn stop_receiver(&mut self, binding_id: Uuid, done: oneshot::Sender<()>) {
+        let kind = self
+            .receivers
+            .iter()
+            .find(|(_, running)| **running == binding_id)
+            .map(|(kind, _)| kind.clone());
+        let process = kind.and_then(|kind| {
+            self.receivers.remove(&kind);
+            self.processes.lock().unwrap().get(&kind).cloned()
+        });
+        match process {
+            Some(process) => process.stop(Some(binding_id), done).await,
+            None => {
+                let _ = done.send(());
+            }
+        }
+    }
+    /// Ends the processes of `kinds` through the stop ladder before their package is removed or
+    /// replaced; `done` answers once every process group is empty.
+    pub(crate) async fn retire(&mut self, kinds: Vec<String>, done: oneshot::Sender<()>) {
+        let processes: Vec<PluginProcess> = self
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| kinds.iter().any(|retired| retired == kind.as_str()))
+            .map(|(_, process)| process.clone())
+            .collect();
+        let mut receipts = Vec::new();
+        for process in processes {
+            let (ended, receipt) = oneshot::channel();
+            process.retire(ended).await;
+            receipts.push(receipt);
+        }
+        // The main loop keeps serving while the ladders run.
+        tokio::spawn(async move {
+            for receipt in receipts {
+                let _ = receipt.await;
+            }
+            let _ = done.send(());
+        });
+    }
+    /// Hands a credential check to the channel's plugin; the reply is dropped when no plugin
+    /// provides the channel.
+    pub(crate) async fn verify(
+        &mut self,
+        kind: ChannelKind,
+        credential: String,
+        source_key: Option<String>,
+        reply: oneshot::Sender<Result<String, VerifyFailure>>,
+    ) {
+        if let Some(process) = self.process(&kind) {
+            process.verify(credential, source_key, reply).await;
+        }
+    }
+    /// Resolves with `internal_error` when the heartbeat, the dispatcher, the outbound task, the
+    /// sweeper or a plugin supervisor ends; a supervisor ends only on a store failure.
     pub(crate) async fn finished(&mut self) -> DaemonError {
-        let Self {
-            telegram,
-            feishu,
-            dispatcher,
-            heartbeat,
-            sender,
-            sweeper,
-            ..
-        } = self;
-        loop {
-            let (ended, slot) = tokio::select! {
-                _ = heartbeat.finished() => return DaemonError::InternalError,
-                _ = dispatcher.finished() => return DaemonError::InternalError,
-                _ = sender.finished() => return DaemonError::InternalError,
-                _ = sweeper.finished() => return DaemonError::InternalError,
-                ended = async {
-                    match telegram.as_mut() {
-                        Some((_, task)) => task.finished().await,
-                        None => std::future::pending().await,
-                    }
-                } => (ended, &mut *telegram),
-                ended = async {
-                    match feishu.as_mut() {
-                        Some((_, task)) => task.finished().await,
-                        None => std::future::pending().await,
-                    }
-                } => (ended, &mut *feishu),
-            };
-            if ended.is_err() {
-                return DaemonError::InternalError;
-            }
-            *slot = None;
+        tokio::select! {
+            _ = self.heartbeat.finished() => {}
+            _ = self.dispatcher.finished() => {}
+            _ = self.outbound.finished() => {}
+            _ = self.sweeper.finished() => {}
+            Some(_) = self.supervisors.join_next(), if !self.supervisors.is_empty() => {}
         }
+        DaemonError::InternalError
     }
-    /// Stops the Telegram and the Feishu receiver, the sender, the sweeper, the dispatcher and the
-    /// heartbeat in that order, then ends the status connection that request handlers may still
-    /// share.
-    pub(crate) async fn stop(self) {
-        for (_, receiver) in [self.telegram, self.feishu].into_iter().flatten() {
-            receiver.stop().await;
+    /// Receiving stops first; then the outbound task, the sweeper and the dispatcher; then every
+    /// plugin process goes through the stop ladder; the heartbeat and the status connection that
+    /// request handlers may still share end last.
+    pub(crate) async fn stop(mut self) {
+        let processes: Vec<PluginProcess> =
+            self.processes.lock().unwrap().values().cloned().collect();
+        for process in &processes {
+            let (done, stopped) = oneshot::channel();
+            process.stop(None, done).await;
+            let _ = stopped.await;
         }
-        self.sender.stop().await;
+        self.outbound.stop().await;
         self.sweeper.stop().await;
         self.dispatcher.stop().await;
+        for process in &processes {
+            process.terminate().await;
+        }
+        while self.supervisors.join_next().await.is_some() {}
         self.heartbeat.stop().await;
         self.status_driver.abort();
         let _ = self.status_driver.await;
@@ -330,8 +578,9 @@ mod tests {
     use super::*;
     use crate::ops::{Op, Ops};
     use crate::{
-        StatusSnapshot,
+        CANCEL_QUEUE, OMB_REPLY_TEXTS_V1, StatusSnapshot, TERMINAL_QUEUE,
         delegation::fixture::{self, Fixture},
+        plugins::tests::{Logs, fake_channel, installed, package},
     };
     use crate::{
         agent::{
@@ -340,17 +589,11 @@ mod tests {
         },
         reconcile::tests as rt,
     };
-    use omb_channels::OMB_REPLY_TEXTS_V1;
-    use omb_channels::{
-        CANCEL_QUEUE, TERMINAL_QUEUE, TelegramEndpoint,
-        fake_feishu::{FakeFeishu, Handshake},
-        testkit::{FakeTelegram, Reply},
-    };
     use omb_hostdriver::WorkspaceRoots;
     use omb_store::testkit;
     use omb_store::{
-        AcceptOutcome, Command, Content, Disposition, IdentityKey, NormalizedEvent, PairStart,
-        PollGapReason, accept_event, open_poll_gap, pair_start,
+        AcceptOutcome, Disposition, PairStart, PollGapReason, accept_event, open_poll_gap,
+        pair_start,
     };
     use openbot_application::RunTerminalKind;
     use openbot_application::{BeginDelegatedThreadRun, DelegatedUntrustedMaterial};
@@ -360,10 +603,13 @@ mod tests {
         command::{AppCommand, AppReply},
         ids::{BotId, RunId, ThreadId},
     };
-    use openbot_domain::vault::{SecretBytes, SecretKind, SecretPrincipal, ServiceId};
-    use openbot_infra::net::safe_http::{CidrAllowlist, EgressPolicy, SafeDialer, SchemePolicy};
+    use openbot_domain::vault::{SecretBytes, SecretKind, SecretPrincipal};
+    use serde_json::{Value, json};
     use std::time::Duration;
     use tokio_postgres::Client;
+
+    const TELEGRAM: ChannelKind = ChannelKind::from_static("telegram");
+    const FEISHU: ChannelKind = ChannelKind::from_static("feishu");
 
     fn cancel() -> CancelRequests {
         tokio::sync::mpsc::channel(CANCEL_QUEUE).0
@@ -385,6 +631,7 @@ mod tests {
             backoff_min: Duration::from_millis(10),
             backoff_max: Duration::from_millis(100),
             dispatch_retry: Duration::from_millis(100),
+            plugin_restart: Duration::from_millis(50),
             ..Timings::default()
         }
     }
@@ -393,6 +640,59 @@ mod tests {
         Connection {
             client: opened.client,
             driver: opened.driver,
+        }
+    }
+    /// No installed plugin: a data directory of its own under the fixture's.
+    fn none(fixture: &Fixture) -> Plugins {
+        Plugins::load(
+            &fixture.root.join("no-plugins"),
+            Vec::new(),
+            fixture.root.clone(),
+        )
+        .unwrap()
+    }
+    /// The fake installed for `telegram` and, as a second plugin, for `feishu` with its scenario.
+    fn both(fixture: &Fixture, telegram: &Logs, feishu: &Logs, scenario: &str) -> Plugins {
+        let plugins = installed(&fixture.root, "telegram", telegram, "normal");
+        let dir = package(
+            "fake-feishu",
+            json!({"feishu": fake_channel("feishu", feishu, scenario, json!([{"name": "token", "secret": true}]))}),
+        );
+        plugins.install(&dir, &HashSet::new()).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        plugins
+    }
+    /// A private text event of `kind`'s chat `42`, occurred now.
+    fn message(kind: &str, key: &str, text: &str) -> Value {
+        json!({
+            "event_key": key,
+            "event_type": format!("{kind}.message"),
+            "occurred_at": utc_millis(OffsetDateTime::now_utc()),
+            "private": true,
+            "sender_key": format!("{kind}:42"),
+            "chat_key": format!("{kind}:42"),
+            "kind": "text",
+            "text": text,
+            "data": {"text": text},
+        })
+    }
+    /// The `start` frames the fake received with `credential`, once there is one.
+    async fn starts_with(logs: &Logs, credential: &str) -> usize {
+        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = logs
+                .received_of("start")
+                .iter()
+                .filter(|frame| frame["credential"] == credential)
+                .count();
+            if seen > 0 {
+                return seen;
+            }
+            assert!(
+                tokio::time::Instant::now() < limit,
+                "no start with {credential}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
     /// A Telegram sender paired on a freshly minted thread at the owner's current generation,
@@ -422,7 +722,7 @@ mod tests {
         let started = pair_start(
             &mut client,
             PairStart {
-                channel: Channel::Telegram,
+                channel: TELEGRAM,
                 workspace_dir: "/workspaces/project",
                 thread_id: minted.thread_id.as_str(),
                 granted_generation: generation,
@@ -438,7 +738,7 @@ mod tests {
             .unwrap()
             .get(0);
         let event = |key: &str, text: String, pair_code: Option<String>| NormalizedEvent {
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             event_key: key.into(),
             event_type: "telegram.message".into(),
@@ -536,27 +836,6 @@ mod tests {
             .await
             .unwrap();
         (row.get(0), row.get(1))
-    }
-    fn refused_endpoint() -> TelegramEndpoint {
-        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        TelegramEndpoint {
-            api_base: url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
-            dialer: SafeDialer::new(EgressPolicy::new(
-                CidrAllowlist::parse_exact(["127.0.0.1/32"]).unwrap(),
-            )),
-            scheme: SchemePolicy::HttpOrHttps,
-        }
-    }
-    /// The given Telegram endpoint and a Feishu endpoint nothing listens on.
-    fn endpoints(telegram: TelegramEndpoint) -> Endpoints {
-        Endpoints {
-            telegram,
-            feishu: FakeFeishu::endpoint_at(FakeTelegram::unused_port()),
-        }
     }
     async fn token(fixture: &mut Fixture) -> Uuid {
         let token_id = Uuid::now_v7();
@@ -687,6 +966,7 @@ mod tests {
 
     async fn status_source(
         fixture: &mut Fixture,
+        plugins: Plugins,
     ) -> (StatusSource, JoinHandle<Result<(), tokio_postgres::Error>>) {
         let opened = fixture
             .pg
@@ -697,6 +977,7 @@ mod tests {
             StatusSource {
                 client: Arc::new(opened.client),
                 counters: Arc::new(Counters::default()),
+                plugins,
             },
             opened.driver,
         )
@@ -716,7 +997,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let (source, driver) = status_source(&mut fixture).await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
+        let (source, driver) = status_source(&mut fixture, plugins).await;
         source
             .counters
             .platform_payload_unparseable
@@ -739,6 +1022,7 @@ mod tests {
             engine_pin: "0".repeat(40),
             authentication_failures: 0,
             channels,
+            plugins: source.plugins(),
         };
         let value = serde_json::to_value(&snapshot).unwrap();
         let segment = value["channels"].as_array().unwrap();
@@ -772,12 +1056,19 @@ mod tests {
         let mut gap_keys: Vec<&str> = gap.keys().map(String::as_str).collect();
         gap_keys.sort_unstable();
         assert_eq!(gap_keys, ["ended_at", "reason", "started_at"]);
+        assert_eq!(
+            value["plugins"],
+            json!([{"name": "fake-telegram", "version": "0.1.0", "channels": ["telegram"], "process": "stopped", "last_exit_code": null}])
+        );
         assert!(serde_json::from_value::<StatusSnapshot>(value.clone()).is_ok());
         let mut extra = value.clone();
         extra["channels"][0]["unknown"] = serde_json::json!(1);
         assert!(serde_json::from_value::<StatusSnapshot>(extra).is_err());
-        let mut extra = value;
+        let mut extra = value.clone();
         extra["channels"][0]["gaps"][0]["unknown"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<StatusSnapshot>(extra).is_err());
+        let mut extra = value;
+        extra["plugins"][0]["unknown"] = serde_json::json!(1);
         assert!(serde_json::from_value::<StatusSnapshot>(extra).is_err());
         driver.abort();
         fixture.stop().await;
@@ -808,12 +1099,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let (source, driver) = status_source(&mut fixture).await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
+        let (source, driver) = status_source(&mut fixture, plugins).await;
         let channels = source.read().await.unwrap();
-        assert_eq!(
-            channels[0].note,
-            "telegram 长轮询；中断区间内的更新在平台保留期内补回"
-        );
+        // The note is the installed plugin's, or fixed without one.
+        assert_eq!(channels[0].note, "telegram fake note");
+        let plugins = none(&fixture);
+        let (bare, bare_driver) = status_source(&mut fixture, plugins).await;
+        assert_eq!(bare.read().await.unwrap()[0].note, NO_PLUGIN_NOTE);
+        bare_driver.abort();
         let gaps = &channels[0].gaps;
         assert_eq!(gaps.len(), 2);
         assert_eq!(
@@ -888,7 +1183,7 @@ mod tests {
         let ended = tokio::time::timeout(Duration::from_secs(10), task.finished())
             .await
             .unwrap();
-        assert_eq!(ended, Err(omb_channels::ChannelError::StoreFailed));
+        assert_eq!(ended, Err(ChannelError::StoreFailed));
         task.stop().await;
         fixture.stop().await;
     }
@@ -902,13 +1197,14 @@ mod tests {
         client.execute("UPDATE openmybot.control_tokens SET last_heartbeat_at=statement_timestamp()-interval '10 minutes' WHERE token_id=$1", &[&first]).await.unwrap();
         let receiver = fixture::receiver(&client, "telegram").await;
         let second = token(&mut fixture).await;
+        let plugins = none(&fixture);
         let engine = fixture.engine.as_ref().unwrap();
         let channels = Channels::start(
             &mut fixture.pg,
             engine,
             second,
             quick(),
-            endpoints(refused_endpoint()),
+            plugins,
             cancel(),
             outbound(),
             Arc::default(),
@@ -938,7 +1234,7 @@ mod tests {
                 &receiver,
                 SecretKind::Connector,
                 SecretPrincipal::Actor(ActorId::new(SINGLE_USER_ACTOR_ID)),
-                SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
+                SecretPrincipal::Service(crate::ops::service(&TELEGRAM)),
                 &SecretBytes::new(b"1001:stop-sequence-token".to_vec()),
             )
             .unwrap();
@@ -949,13 +1245,15 @@ mod tests {
             )
             .await
             .unwrap();
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         let engine = fixture.engine.as_ref().unwrap();
         let channels = Channels::start(
             &mut fixture.pg,
             engine,
             token,
             quick(),
-            endpoints(refused_endpoint()),
+            plugins.clone(),
             cancel(),
             outbound(),
             Arc::default(),
@@ -968,26 +1266,19 @@ mod tests {
             assert!(tokio::time::Instant::now() < limit, "connections deadline");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        while client
-            .query_one(
-                "SELECT count(*) FROM openmybot.channel_events WHERE gap_reason='connect_failed'",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get::<_, i64>(0)
-            < 1
-        {
-            assert!(
-                tokio::time::Instant::now() < limit,
-                "receiver poll deadline"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        starts_with(&logs, "1001:stop-sequence-token").await;
         tokio::time::timeout(Duration::from_secs(10), channels.stop())
             .await
             .unwrap();
+        // Receiving stopped before the process went through the stop ladder.
+        let kinds: Vec<Value> = logs
+            .received()
+            .into_iter()
+            .map(|frame| frame["type"].clone())
+            .collect();
+        assert_eq!(kinds, ["hello", "start", "stop"]);
+        let plugin = plugins.provider(&TELEGRAM).unwrap();
+        assert_eq!(plugins.process(&plugin).0, crate::ProcessState::Stopped);
         let limit = tokio::time::Instant::now() + Duration::from_secs(10);
         while client.query_one(live, &[]).await.unwrap().get::<_, i64>(0) > 0 {
             assert!(
@@ -1039,7 +1330,7 @@ mod tests {
         let binding_id = fixture::receiver(client, "telegram").await;
         ReceiverRow {
             binding_id,
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: resealed(fixture, client, binding_id, token).await,
         }
@@ -1052,7 +1343,7 @@ mod tests {
                 &binding_id,
                 SecretKind::Connector,
                 SecretPrincipal::Actor(ActorId::new(SINGLE_USER_ACTOR_ID)),
-                SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
+                SecretPrincipal::Service(crate::ops::service(&TELEGRAM)),
                 &SecretBytes::new(token.as_bytes().to_vec()),
             )
             .unwrap();
@@ -1082,54 +1373,34 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    async fn polls_with(fake: &FakeTelegram, token: &str) -> usize {
-        let path = format!("/bot{token}/getUpdates");
-        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let seen = fake
-                .calls("getUpdates")
-                .iter()
-                .filter(|request| request.path == path)
-                .count();
-            if seen > 0 {
-                return seen;
-            }
-            assert!(tokio::time::Instant::now() < limit, "no poll with {token}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
     #[tokio::test]
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn runtime_receiver_start_and_stop_through_commands_with_fake_telegram() {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
-        let engine = fixture.engine.as_ref().unwrap();
-        let mut channels = Channels::start(
-            &mut fixture.pg,
-            engine,
-            token,
-            quick(),
-            endpoints(fake.endpoint()),
-            cancel(),
-            outbound(),
-            Arc::default(),
-        )
-        .await
-        .unwrap();
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
+        let mut channels = started(&mut fixture, token, quick(), plugins, outbound()).await;
         assert_eq!(receivers(&client).await, 0);
         let row = sealed_receiver(&fixture, &client, "1001:runtime-token").await;
         let binding = row.binding_id;
-        channels.start_receiver(&mut fixture.pg, row).await.unwrap();
-        polls_with(&fake, "1001:runtime-token").await;
+        let (done, started) = oneshot::channel();
+        channels.start_receiver(&mut fixture.pg, row, done).await;
+        assert_eq!(started.await.unwrap(), Ok(()));
+        starts_with(&logs, "1001:runtime-token").await;
         receivers_reach(&client, 1).await;
-        channels.stop_receiver(binding).await;
-        let seen = fake.requests().len();
+        let (done, stopped) = oneshot::channel();
+        channels.stop_receiver(binding, done).await;
+        stopped.await.unwrap();
         receivers_reach(&client, 0).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(fake.requests().len(), seen);
+        let kinds: Vec<Value> = logs
+            .received()
+            .into_iter()
+            .map(|frame| frame["type"].clone())
+            .collect();
+        assert_eq!(kinds, ["hello", "start", "stop"]);
         channels.stop().await;
         fixture.stop().await;
     }
@@ -1141,91 +1412,58 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
-        let engine = fixture.engine.as_ref().unwrap();
-        let mut channels = Channels::start(
-            &mut fixture.pg,
-            engine,
-            token,
-            quick(),
-            endpoints(fake.endpoint()),
-            cancel(),
-            outbound(),
-            Arc::default(),
-        )
-        .await
-        .unwrap();
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
+        let mut channels = started(&mut fixture, token, quick(), plugins, outbound()).await;
         let first = sealed_receiver(&fixture, &client, "1001:token-a").await;
         let binding = first.binding_id;
-        channels
-            .start_receiver(&mut fixture.pg, first)
-            .await
-            .unwrap();
-        let before = polls_with(&fake, "1001:token-a").await;
-        channels.stop_receiver(Uuid::now_v7()).await;
-        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        while polls_with(&fake, "1001:token-a").await <= before {
-            assert!(tokio::time::Instant::now() < limit, "receiver stopped");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let (done, _) = oneshot::channel();
+        channels.start_receiver(&mut fixture.pg, first, done).await;
+        starts_with(&logs, "1001:token-a").await;
+        let (done, stopped) = oneshot::channel();
+        channels.stop_receiver(Uuid::now_v7(), done).await;
+        stopped.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(logs.received_of("stop").is_empty());
+        receivers_reach(&client, 1).await;
         let envelope = resealed(&fixture, &client, binding, "1001:token-b").await;
         let second = ReceiverRow {
             binding_id: binding,
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: envelope.clone(),
         };
-        channels
-            .start_receiver(&mut fixture.pg, second)
-            .await
-            .unwrap();
-        polls_with(&fake, "1001:token-b").await;
-        let requests = fake.calls("getUpdates");
-        let last_old = requests
-            .iter()
-            .filter(|r| r.path.contains("token-a"))
-            .map(|r| r.at)
-            .max()
-            .unwrap();
-        let first_new = requests
-            .iter()
-            .filter(|r| r.path.contains("token-b"))
-            .map(|r| r.at)
-            .min()
-            .unwrap();
-        assert!(last_old < first_new);
+        let (done, _) = oneshot::channel();
+        channels.start_receiver(&mut fixture.pg, second, done).await;
+        starts_with(&logs, "1001:token-b").await;
+        // The old process ended through the stop ladder before a new one started the receiver.
+        let kinds: Vec<Value> = logs
+            .received()
+            .into_iter()
+            .map(|frame| frame["type"].clone())
+            .collect();
+        assert_eq!(kinds, ["hello", "start", "hello", "start"]);
         receivers_reach(&client, 1).await;
-        // A receiver that suspended itself can be started again.
-        fake.script(
-            "getUpdates",
-            401,
-            br#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#.to_vec(),
-        );
-        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        while binding_state(&client, binding).await.0 != "suspended" {
-            assert!(
-                tokio::time::Instant::now() < limit,
-                "receiver did not suspend"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // A receiver that stopped itself, on an event of a binding no longer active, can be
+        // started again.
+        client.execute("UPDATE openmybot.channel_bindings SET status='suspended',status_reason='credential_rejected' WHERE binding_id=$1", &[&binding]).await.unwrap();
+        logs.push(&message("telegram", "5", "while suspended"));
+        receivers_reach(&client, 0).await;
+        assert!(logs.received_of("stop").is_empty());
         client.execute("UPDATE openmybot.channel_bindings SET status='active',status_reason=NULL WHERE binding_id=$1", &[&binding]).await.unwrap();
-        let seen = fake.calls("getUpdates").len();
         let third = ReceiverRow {
             binding_id: binding,
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: envelope,
         };
-        channels
-            .start_receiver(&mut fixture.pg, third)
-            .await
-            .unwrap();
+        let (done, _) = oneshot::channel();
+        channels.start_receiver(&mut fixture.pg, third, done).await;
         let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        while fake.calls("getUpdates").len() <= seen {
+        while logs.received_of("start").len() < 3 {
             assert!(
                 tokio::time::Instant::now() < limit,
-                "restarted receiver did not poll"
+                "restarted receiver did not start"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1241,7 +1479,7 @@ mod tests {
         fixture: &mut Fixture,
         token: Uuid,
         timings: Timings,
-        endpoints: Endpoints,
+        plugins: Plugins,
         outbound: Outbound,
     ) -> Channels {
         let engine = fixture.engine.as_ref().unwrap();
@@ -1250,7 +1488,7 @@ mod tests {
             engine,
             token,
             timings,
-            endpoints,
+            plugins,
             cancel(),
             outbound,
             Arc::default(),
@@ -1340,10 +1578,6 @@ mod tests {
         let pgid = rustix::process::Pid::from_raw(row["pgid"].as_i64().unwrap() as i32).unwrap();
         let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
     }
-    /// A private Telegram text message from the paired chat `42`.
-    fn update(id: u64, text: &str) -> serde_json::Value {
-        serde_json::json!({"update_id": id, "message": {"message_id": id, "date": chrono::Utc::now().timestamp(), "from": {"id": 42, "is_bot": false}, "chat": {"id": 42, "type": "private"}, "text": text}})
-    }
     async fn event_by_key(client: &Client, key: &str) -> serde_json::Value {
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -1381,7 +1615,8 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         rt::sealed(&fixture, &client).await;
         let binding =
             testkit::insert_sender(&client, "telegram", "1001", "telegram:42", "T1").await;
@@ -1396,20 +1631,13 @@ mod tests {
         )
         .await;
         let timings = outbound_timings();
-        let channels = started(
-            &mut fixture,
-            token,
-            timings,
-            endpoints(fake.endpoint()),
-            outbound(),
-        )
-        .await;
+        let channels = started(&mut fixture, token, timings, plugins, outbound()).await;
         let stored = testkit::read_row(&client, "deliveries", "delivery_id", row).await;
         assert_eq!(stored["status"], "unknown");
         assert_eq!(stored["last_error_code"], "daemon_restart");
         assert!(stored["finished_at"].is_string());
         tokio::time::sleep(timings.delivery_poll * 4).await;
-        assert!(fake.calls("sendMessage").is_empty());
+        assert!(logs.sent().is_empty());
         assert_eq!(
             testkit::read_row(&client, "deliveries", "delivery_id", row).await,
             stored
@@ -1439,14 +1667,8 @@ mod tests {
         for run in [&done, &stopped] {
             assert!(rt::event(&client, &run.run).await["terminal_kind"].is_null());
         }
-        let channels = started(
-            &mut fixture,
-            token,
-            outbound_timings(),
-            endpoints(refused_endpoint()),
-            outbound(),
-        )
-        .await;
+        let plugins = none(&fixture);
+        let channels = started(&mut fixture, token, outbound_timings(), plugins, outbound()).await;
         for (run, kind) in [(&done, "succeeded"), (&stopped, "cancelled")] {
             assert_eq!(rt::event(&client, &run.run).await["terminal_kind"], kind);
             assert_eq!(rt::results(&client, &run.run).await.len(), 1);
@@ -1563,16 +1785,10 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         rt::sealed(&fixture, &client).await;
-        let channels = started(
-            &mut fixture,
-            token,
-            outbound_timings(),
-            endpoints(fake.endpoint()),
-            outbound(),
-        )
-        .await;
+        let channels = started(&mut fixture, token, outbound_timings(), plugins, outbound()).await;
         let six = [
             "openmybot-heartbeat",
             "openmybot-dispatcher",
@@ -1628,14 +1844,9 @@ mod tests {
         client.batch_execute(FAIL_ROW).await.unwrap();
         // The sender fails on its claim update.
         let first = token(&mut fixture).await;
-        let mut channels = started(
-            &mut fixture,
-            first,
-            outbound_timings(),
-            endpoints(refused_endpoint()),
-            outbound(),
-        )
-        .await;
+        let plugins = none(&fixture);
+        let mut channels =
+            started(&mut fixture, first, outbound_timings(), plugins, outbound()).await;
         client.batch_execute("CREATE TRIGGER fail_update BEFORE UPDATE ON openmybot.deliveries FOR EACH ROW EXECUTE FUNCTION openmybot.fail_row()").await.unwrap();
         testkit::insert_delivery(
             &client,
@@ -1660,6 +1871,7 @@ mod tests {
             .unwrap();
         // The sweeper fails on its first deletion.
         let second = token(&mut fixture).await;
+        let plugins = none(&fixture);
         let mut channels = started(
             &mut fixture,
             second,
@@ -1668,7 +1880,7 @@ mod tests {
                 tombstone_retention: Duration::from_secs(20),
                 ..outbound_timings()
             },
-            endpoints(refused_endpoint()),
+            plugins,
             outbound(),
         )
         .await;
@@ -1692,7 +1904,8 @@ mod tests {
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
@@ -1700,7 +1913,7 @@ mod tests {
             &mut fixture,
             token,
             outbound_timings(),
-            endpoints(fake.endpoint()),
+            plugins,
             Outbound {
                 terminals,
                 crabcode: None,
@@ -1708,21 +1921,21 @@ mod tests {
         )
         .await;
         let run = rt::begun(&fixture, &client, binding, &thread).await;
-        rt::messages(&fake, 1).await;
+        rt::messages(&logs, 1).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let sent = fake.sent_messages();
+        let sent = logs.sent();
         assert_eq!(sent.len(), 1, "{sent:?}");
-        assert_eq!(sent[0].chat_id, 42);
-        assert_eq!(sent[0].path, format!("/bot{}/sendMessage", rt::TOKEN));
-        assert!(!sent[0].has_parse_mode);
+        assert_eq!(sent[0]["chat_key"], "telegram:42");
         assert_eq!(
-            sent[0].text,
+            sent[0]["body"],
             format!(
                 "[OpenMyBot] 已完成 · run {}\nhello from fake",
                 &run.run.as_str()[..8]
             )
         );
-        assert!(!fake.calls("getUpdates").is_empty());
+        // The process that sent is the one receiving with the bound credential.
+        assert_eq!(logs.received_of("hello").len(), 1);
+        starts_with(&logs, rt::TOKEN).await;
         let rows = rt::results(&client, &run.run).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["status"], "sent");
@@ -1743,7 +1956,8 @@ mod tests {
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
@@ -1751,7 +1965,7 @@ mod tests {
             &mut fixture,
             token,
             outbound_timings(),
-            endpoints(fake.endpoint()),
+            plugins,
             Outbound {
                 terminals,
                 crabcode: None,
@@ -1760,15 +1974,15 @@ mod tests {
         .await;
         let run = rt::begun(&fixture, &client, binding, &thread).await;
         let id = rt::permission_of(&client, &run.run).await;
-        let notice = rt::messages(&fake, 1).await;
+        let notice = rt::messages(&logs, 1).await;
         assert!(notice[0].contains(&id), "{notice:?}");
         assert_eq!(
             testkit::decide(&client, &id, omb_store::Decision::Allow).await,
             omb_store::Decided::Decided
         );
-        let sent = rt::messages(&fake, 2).await;
+        let sent = rt::messages(&logs, 2).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(fake.sent_messages().len(), 2);
+        assert_eq!(logs.sent().len(), 2);
         let result = &sent[1];
         assert!(
             result.starts_with(&format!(
@@ -1793,7 +2007,8 @@ mod tests {
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let run = rt::begun(&fixture, &client, binding, &thread).await;
@@ -1812,7 +2027,7 @@ mod tests {
             &mut fixture,
             token,
             outbound_timings(),
-            endpoints(fake.endpoint()),
+            plugins,
             Outbound {
                 terminals,
                 crabcode: None,
@@ -1823,7 +2038,7 @@ mod tests {
             testkit::permission_row_json(&client, &id).await["decided_via"],
             "run_stopped"
         );
-        let sent = rt::messages(&fake, 1).await;
+        let sent = rt::messages(&logs, 1).await;
         assert_eq!(sent[0], body);
         assert_eq!(
             testkit::decide(&client, &id, omb_store::Decision::Allow).await,
@@ -1844,7 +2059,8 @@ mod tests {
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         rt::sealed(&fixture, &client).await;
         let (binding, thread) = rt::sender(&fixture, &client, "telegram").await;
         let terminals = fixture.take_terminals();
@@ -1852,7 +2068,7 @@ mod tests {
             &mut fixture,
             token,
             outbound_timings(),
-            endpoints(fake.endpoint()),
+            plugins,
             Outbound {
                 terminals,
                 crabcode: None,
@@ -1862,7 +2078,7 @@ mod tests {
         let run = rt::begun(&fixture, &client, binding, &thread).await;
         agent::initialized(&client, &run.run).await;
         cancel_run(&fixture, &run).await;
-        let sent = rt::messages(&fake, 1).await;
+        let sent = rt::messages(&logs, 1).await;
         assert!(
             sent[0].starts_with(&format!(
                 "[OpenMyBot] 结果未知，在本机执行 openmybot status --run {} 核对 · run {}",
@@ -1876,7 +2092,7 @@ mod tests {
             "reconciliation_required"
         );
         // A later message of the same sender stays pending on the paused thread.
-        fake.push_update(update(2, "after the unknown stop"));
+        logs.push(&message("telegram", "2", "after the unknown stop"));
         let later = event_by_key(&client, "2").await;
         assert_eq!(later["thread_id"], thread.as_str());
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1908,7 +2124,7 @@ mod tests {
                 &[fixture.root.join("home/ws")],
             )
             .unwrap(),
-            endpoints: endpoints(fake.endpoint()),
+            plugins: none(&fixture),
             receiver: mpsc::channel(8).0,
             wake: channels.wake(),
             minter: crate::ops::ThreadMinter::new(
@@ -1973,17 +2189,11 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let mut client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
         let receiver = rt::sealed(&fixture, &client).await;
         rt::sender(&fixture, &client, "telegram").await;
-        let channels = started(
-            &mut fixture,
-            token,
-            quick(),
-            endpoints(fake.endpoint()),
-            outbound(),
-        )
-        .await;
+        let channels = started(&mut fixture, token, quick(), plugins, outbound()).await;
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
         while !client
             .query_one(
@@ -2001,11 +2211,13 @@ mod tests {
         // delivers the update again and the receiver finds it a duplicate.
         client.batch_execute("CREATE FUNCTION openmybot.fixture_commit_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NULL; END $$; CREATE CONSTRAINT TRIGGER fixture_commit_delay AFTER INSERT ON openmybot.channel_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_commit_delay()").await.unwrap();
         let watcher = fixture.client().await;
-        let incoming = update(7, "work");
-        let omb_channels::Normalized::Event(event) = omb_channels::normalize(&incoming, "1001")
-        else {
-            panic!("text update");
-        };
+        let incoming = message("telegram", "7", "work");
+        let event = normalize(
+            &TELEGRAM,
+            "1001",
+            serde_json::from_value(incoming.clone()).unwrap(),
+        )
+        .unwrap();
         let (accepted, ()) = tokio::join!(
             accept_event(
                 &mut client,
@@ -2028,7 +2240,7 @@ mod tests {
                     assert!(tokio::time::Instant::now() < limit, "commit deadline");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                fake.push_update(incoming.clone());
+                logs.push(&incoming);
             }
         );
         assert_eq!(
@@ -2068,7 +2280,7 @@ mod tests {
             .unwrap()
             .get(0);
         let status = NormalizedEvent {
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             event_key: "20".into(),
             event_type: "telegram.message".into(),
@@ -2095,15 +2307,9 @@ mod tests {
             .unwrap(),
             AcceptOutcome::Recorded(Disposition::ControlCommand)
         );
-        let fake = FakeTelegram::start().await;
-        let channels = started(
-            &mut fixture,
-            token,
-            outbound_timings(),
-            endpoints(fake.endpoint()),
-            outbound(),
-        )
-        .await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "telegram", &logs, "normal");
+        let channels = started(&mut fixture, token, outbound_timings(), plugins, outbound()).await;
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
         let rows = loop {
             let rows: Vec<(String, String, String)> = client
@@ -2124,17 +2330,20 @@ mod tests {
         };
         assert_eq!(rows[0].0, "pairing_reply");
         assert_eq!(rows[1].0, "control_reply");
-        let sent = fake.sent_messages();
+        let sent = logs.sent();
         for (_, body, _) in &rows {
-            let message = sent.iter().find(|sent| &sent.text == body).unwrap();
-            assert_eq!(message.chat_id, 42);
+            let message = sent
+                .iter()
+                .find(|sent| sent["body"] == body.as_str())
+                .unwrap();
+            assert_eq!(message["chat_key"], "telegram:42");
         }
         channels.stop().await;
         drop(client);
         fixture.stop().await;
     }
 
-    // ---- Feishu receiver slot --------------------------------------------------------------
+    // ---- One plugin process per channel ----------------------------------------------------
 
     /// A Feishu receiver row of `binding_id` whose envelope seals the app secret for the owner.
     fn feishu_row(fixture: &Fixture, binding_id: Uuid) -> ReceiverRow {
@@ -2145,13 +2354,13 @@ mod tests {
                 &binding_id,
                 SecretKind::Connector,
                 SecretPrincipal::Actor(ActorId::new(SINGLE_USER_ACTOR_ID)),
-                SecretPrincipal::Service(ServiceId::new("openmybot.feishu")),
+                SecretPrincipal::Service(crate::ops::service(&FEISHU)),
                 &SecretBytes::new(b"feishu-secret".to_vec()),
             )
             .unwrap();
         ReceiverRow {
             binding_id,
-            channel: Channel::Feishu,
+            channel: FEISHU,
             source_key: "cli_a".into(),
             credential_envelope,
         }
@@ -2168,24 +2377,6 @@ mod tests {
             .unwrap();
         row
     }
-    async fn handshakes_reach(feishu: &FakeFeishu, expected: usize) {
-        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        while feishu.handshakes().len() < expected {
-            assert!(tokio::time::Instant::now() < limit, "no Feishu connection");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    /// A private Feishu text of `ou_p` in chat `oc_p`, created now.
-    fn feishu_text(event_id: &str, text: &str) -> serde_json::Value {
-        serde_json::json!({
-            "schema": "2.0",
-            "header": {"event_id": event_id, "event_type": "im.message.receive_v1", "create_time": chrono::Utc::now().timestamp_millis().to_string()},
-            "event": {
-                "sender": {"sender_id": {"open_id": "ou_p"}, "sender_type": "user"},
-                "message": {"message_id": format!("om_{event_id}"), "chat_id": "oc_p", "chat_type": "p2p", "message_type": "text", "content": serde_json::json!({"text": text}).to_string()}
-            }
-        })
-    }
 
     #[tokio::test]
     #[ignore = "own PG17.11; explicit binary directory; serial"]
@@ -2193,17 +2384,13 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
-        let feishu = FakeFeishu::start().await;
+        let (telegram, feishu) = (Logs::new(), Logs::new());
+        let plugins = both(&fixture, &telegram, &feishu, "normal");
         sealed_receiver(&fixture, &client, "1001:both-token").await;
         sealed_feishu(&fixture, &client).await;
-        let endpoints = Endpoints {
-            telegram: fake.endpoint(),
-            feishu: feishu.endpoint(),
-        };
-        let channels = started(&mut fixture, token, quick(), endpoints, outbound()).await;
-        polls_with(&fake, "1001:both-token").await;
-        handshakes_reach(&feishu, 1).await;
+        let channels = started(&mut fixture, token, quick(), plugins, outbound()).await;
+        starts_with(&telegram, "1001:both-token").await;
+        starts_with(&feishu, "feishu-secret").await;
         receivers_reach(&client, 2).await;
         let statuses = channels.status_source().read().await.unwrap();
         let notes: Vec<(&str, &str)> = statuses
@@ -2212,7 +2399,10 @@ mod tests {
             .collect();
         assert_eq!(
             notes,
-            [("feishu", FEISHU_NOTE), ("telegram", TELEGRAM_NOTE)]
+            [
+                ("feishu", "feishu fake note"),
+                ("telegram", "telegram fake note")
+            ]
         );
         channels.stop().await;
         fixture.stop().await;
@@ -2224,44 +2414,43 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
-        let feishu = FakeFeishu::start().await;
+        let (telegram_logs, feishu) = (Logs::new(), Logs::new());
+        let plugins = both(&fixture, &telegram_logs, &feishu, "normal");
         let telegram = sealed_receiver(&fixture, &client, "1001:slot-token").await;
         sealed_feishu(&fixture, &client).await;
-        let endpoints = Endpoints {
-            telegram: fake.endpoint(),
-            feishu: feishu.endpoint(),
-        };
-        let mut channels = started(&mut fixture, token, quick(), endpoints, outbound()).await;
-        let polls = polls_with(&fake, "1001:slot-token").await;
-        handshakes_reach(&feishu, 1).await;
+        let mut channels = started(&mut fixture, token, quick(), plugins, outbound()).await;
+        starts_with(&telegram_logs, "1001:slot-token").await;
+        starts_with(&feishu, "feishu-secret").await;
         receivers_reach(&client, 2).await;
         let replacement = feishu_row(&fixture, Uuid::now_v7());
+        let (done, _) = oneshot::channel();
         channels
-            .start_receiver(&mut fixture.pg, replacement)
-            .await
-            .unwrap();
-        handshakes_reach(&feishu, 2).await;
-        receivers_reach(&client, 2).await;
+            .start_receiver(&mut fixture.pg, replacement, done)
+            .await;
         let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        while polls_with(&fake, "1001:slot-token").await <= polls {
+        while feishu.received_of("start").len() < 2 {
             assert!(
                 tokio::time::Instant::now() < limit,
-                "Telegram stopped polling"
+                "no second Feishu start"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        channels.stop_receiver(telegram.binding_id).await;
+        receivers_reach(&client, 2).await;
+        assert!(telegram_logs.received_of("stop").is_empty());
+        let (done, stopped) = oneshot::channel();
+        channels.stop_receiver(telegram.binding_id, done).await;
+        stopped.await.unwrap();
         receivers_reach(&client, 1).await;
-        let seen = fake.calls("getUpdates").len();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(fake.calls("getUpdates").len(), seen);
-        assert!(feishu.connected());
-        channels.stop_receiver(Uuid::now_v7()).await;
+        assert_eq!(telegram_logs.received_of("stop").len(), 1);
+        assert!(feishu.received_of("stop").is_empty());
+        let (done, stopped) = oneshot::channel();
+        channels.stop_receiver(Uuid::now_v7(), done).await;
+        stopped.await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(receivers(&client).await, 1);
-        assert!(feishu.connected());
-        assert_eq!(feishu.handshakes().len(), 2);
+        // The replaced Feishu process ended through the stop ladder and a new one started.
+        assert!(feishu.received_of("stop").is_empty());
+        assert_eq!(feishu.received_of("hello").len(), 2);
         channels.stop().await;
         fixture.stop().await;
     }
@@ -2272,22 +2461,11 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
-        let feishu = FakeFeishu::start().await;
-        feishu.script(
-            "/callback/ws/endpoint",
-            Reply::Respond {
-                status: 200,
-                body: br#"{"code":10014}"#.to_vec(),
-            },
-        );
+        let (telegram, feishu) = (Logs::new(), Logs::new());
+        let plugins = both(&fixture, &telegram, &feishu, "suspend:credential_rejected");
         sealed_receiver(&fixture, &client, "1001:kept-token").await;
         let row = sealed_feishu(&fixture, &client).await;
-        let endpoints = Endpoints {
-            telegram: fake.endpoint(),
-            feishu: feishu.endpoint(),
-        };
-        let mut channels = started(&mut fixture, token, quick(), endpoints, outbound()).await;
+        let mut channels = started(&mut fixture, token, quick(), plugins, outbound()).await;
         let limit = tokio::time::Instant::now() + Duration::from_secs(10);
         while binding_state(&client, row.binding_id).await.0 != "suspended" {
             assert!(
@@ -2300,14 +2478,15 @@ mod tests {
             binding_state(&client, row.binding_id).await.1.as_deref(),
             Some("credential_rejected")
         );
-        let polls = polls_with(&fake, "1001:kept-token").await;
+        starts_with(&telegram, "1001:kept-token").await;
         assert!(
             tokio::time::timeout(Duration::from_secs(2), channels.finished())
                 .await
                 .is_err()
         );
-        assert!(polls_with(&fake, "1001:kept-token").await > polls);
-        assert!(feishu.handshakes().is_empty());
+        receivers_reach(&client, 1).await;
+        assert!(telegram.received_of("stop").is_empty());
+        assert_eq!(feishu.received_of("hello").len(), 1);
         channels.stop().await;
         fixture.stop().await;
     }
@@ -2318,24 +2497,20 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
-        let feishu = FakeFeishu::start().await;
+        let (telegram, feishu) = (Logs::new(), Logs::new());
+        let plugins = both(&fixture, &telegram, &feishu, "normal");
         sealed_receiver(&fixture, &client, "1001:stop-token").await;
         sealed_feishu(&fixture, &client).await;
-        let endpoints = Endpoints {
-            telegram: fake.endpoint(),
-            feishu: feishu.endpoint(),
-        };
         let channels = started(
             &mut fixture,
             token,
             outbound_timings(),
-            endpoints,
+            plugins.clone(),
             outbound(),
         )
         .await;
-        polls_with(&fake, "1001:stop-token").await;
-        handshakes_reach(&feishu, 1).await;
+        starts_with(&telegram, "1001:stop-token").await;
+        starts_with(&feishu, "feishu-secret").await;
         receivers_reach(&client, 2).await;
         let stopping = tokio::spawn(channels.stop());
         // The poll at which the receivers' and the delivery connection were first seen gone.
@@ -2359,13 +2534,9 @@ mod tests {
         stopping.await.unwrap();
         let [receivers, delivery] = gone.map(Option::unwrap);
         assert!(receivers <= delivery, "{gone:?}");
-        let limit = tokio::time::Instant::now() + Duration::from_secs(10);
-        while feishu.connected() {
-            assert!(
-                tokio::time::Instant::now() < limit,
-                "Feishu still connected"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // Both processes went through the stop ladder.
+        for plugin in plugins.list() {
+            assert_eq!(plugins.process(&plugin).0, crate::ProcessState::Stopped);
         }
         drop(client);
         fixture.stop().await;
@@ -2380,14 +2551,8 @@ mod tests {
         client.execute("UPDATE openmybot.control_tokens SET last_heartbeat_at=statement_timestamp()-interval '10 minutes' WHERE token_id=$1", &[&first]).await.unwrap();
         let receiver = fixture::receiver(&client, "feishu").await;
         let second = token(&mut fixture).await;
-        let channels = started(
-            &mut fixture,
-            second,
-            quick(),
-            endpoints(refused_endpoint()),
-            outbound(),
-        )
-        .await;
+        let plugins = none(&fixture);
+        let channels = started(&mut fixture, second, quick(), plugins, outbound()).await;
         let rows = client.query("SELECT binding_id,gap_started_at=(SELECT last_heartbeat_at FROM openmybot.control_tokens WHERE token_id=$1),gap_ended_at>=(SELECT created_at FROM openmybot.control_tokens WHERE token_id=$2) FROM openmybot.channel_events WHERE gap_reason='daemon_down'", &[&first, &second]).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, Uuid>(0), receiver);
@@ -2403,28 +2568,11 @@ mod tests {
         let mut fixture = Fixture::start().await;
         let token = token(&mut fixture).await;
         let client = fixture.client().await;
-        let feishu = FakeFeishu::start().await;
+        let logs = Logs::new();
+        // The plugin reports a broken stream and closes the gap a second later.
+        let plugins = installed(&fixture.root, "feishu", &logs, "gap_then_closed");
         let row = sealed_feishu(&fixture, &client).await;
-        // Equal backoff bounds keep each refused attempt, and so the open gap, observable.
-        let timings = Timings {
-            backoff_min: Duration::from_millis(300),
-            backoff_max: Duration::from_millis(300),
-            ..quick()
-        };
-        let endpoints = Endpoints {
-            telegram: refused_endpoint(),
-            feishu: feishu.endpoint(),
-        };
-        let channels = started(&mut fixture, token, timings, endpoints, outbound()).await;
-        handshakes_reach(&feishu, 1).await;
-        for _ in 0..3 {
-            feishu.script_handshake(Handshake::Reject {
-                status: 500,
-                handshake_status: None,
-                autherrcode: None,
-            });
-        }
-        feishu.disconnect();
+        let channels = started(&mut fixture, token, quick(), plugins, outbound()).await;
         let source = channels.status_source();
         let limit = tokio::time::Instant::now() + Duration::from_secs(10);
         let entry = loop {
@@ -2438,9 +2586,7 @@ mod tests {
         assert_eq!(entry.binding_id, row.binding_id.to_string());
         assert_eq!(entry.gaps[0].reason, "stream_broken");
         assert_eq!(entry.gaps[0].ended_at, None);
-        assert_eq!(entry.note, FEISHU_NOTE);
-        assert!(!feishu.push_event(&feishu_text("ev_lost", "lost")));
-        handshakes_reach(&feishu, 2).await;
+        assert_eq!(entry.note, "feishu fake note");
         let limit = tokio::time::Instant::now() + Duration::from_secs(10);
         while source.read().await.unwrap()[0].gaps[0].ended_at.is_none() {
             assert!(tokio::time::Instant::now() < limit, "gap still open");
@@ -2488,7 +2634,7 @@ mod tests {
         let started_pair = pair_start(
             &mut client,
             PairStart {
-                channel: Channel::Feishu,
+                channel: FEISHU,
                 workspace_dir: "/workspaces/project",
                 thread_id: minted.thread_id.as_str(),
                 granted_generation: generation,
@@ -2498,24 +2644,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let feishu = FakeFeishu::start().await;
-        let endpoints = Endpoints {
-            telegram: refused_endpoint(),
-            feishu: feishu.endpoint(),
-        };
-        let channels = started(
-            &mut fixture,
-            token,
-            outbound_timings(),
-            endpoints,
-            outbound(),
-        )
-        .await;
-        handshakes_reach(&feishu, 1).await;
+        let logs = Logs::new();
+        let plugins = installed(&fixture.root, "feishu", &logs, "normal");
+        let channels = started(&mut fixture, token, outbound_timings(), plugins, outbound()).await;
+        starts_with(&logs, "feishu-secret").await;
         let code = started_pair.code.display();
-        assert!(feishu.push_event(&feishu_text("ev_pair", &format!("/pair {code}"))));
+        logs.push(&message("feishu", "ev_pair", &format!("/pair {code}")));
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
-        while feishu.sent_messages().is_empty() {
+        while logs.sent().is_empty() {
             assert!(tokio::time::Instant::now() < limit, "no pairing reply");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2528,9 +2664,9 @@ mod tests {
         .await;
         assert_eq!(
             [&sender["status"], &sender["chat_key"]],
-            ["active", "feishu:oc_p"]
+            ["active", "feishu:42"]
         );
-        assert!(feishu.push_event(&feishu_text("ev_status", "/status")));
+        logs.push(&message("feishu", "ev_status", "/status"));
         let limit = tokio::time::Instant::now() + Duration::from_secs(30);
         let rows = loop {
             let rows: Vec<(String, String, String)> = client
@@ -2551,26 +2687,20 @@ mod tests {
         };
         assert_eq!(rows[0].0, "pairing_reply");
         assert_eq!(rows[1].0, "control_reply");
-        let sent = feishu.sent_messages();
+        let sent = logs.sent();
         for (_, body, _) in &rows {
-            let content = serde_json::json!({ "text": body }).to_string();
-            let message = sent.iter().find(|sent| sent.content == content).unwrap();
-            assert_eq!(message.receive_id, "oc_p");
-            assert_eq!(message.authorization.as_deref(), Some("Bearer t-fake-1"));
+            let message = sent
+                .iter()
+                .find(|sent| sent["body"] == body.as_str())
+                .unwrap();
+            assert_eq!(message["chat_key"], "feishu:42");
         }
-        let acked: Vec<String> = feishu
-            .acks()
+        let accepted: Vec<Value> = logs
+            .received_of("accepted")
             .into_iter()
-            .filter(|ack| ack.valid)
-            .map(|ack| ack.message_id)
+            .map(|frame| frame["event_key"].clone())
             .collect();
-        assert_eq!(acked, ["ev_pair", "ev_status"]);
-        assert_eq!(
-            feishu
-                .calls("/open-apis/auth/v3/tenant_access_token/internal")
-                .len(),
-            1
-        );
+        assert_eq!(accepted, ["ev_pair", "ev_status"]);
         channels.stop().await;
         drop(client);
         fixture.stop().await;

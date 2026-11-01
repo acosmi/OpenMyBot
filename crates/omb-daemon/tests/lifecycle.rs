@@ -739,7 +739,7 @@ async fn daemon_runs_store_migrations_before_control_token_publication() {
         fixture.spawn("daemon_runs_store_migrations_before_control_token_publication");
     wait_for_token(&fixture).await;
     let rows=query_own(&fixture,"SELECT (SELECT count(*)::bigint FROM openmybot.omb_migrations),(SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='openmybot')").await;
-    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
     assert_eq!(rows[0].get::<_, i64>(1), 6);
     fixture.ready().await;
     let token = fs::read(fixture.root.join("run/control.token")).unwrap();
@@ -964,10 +964,8 @@ async fn daemon_status_reports_channel_segment_over_control_socket() {
     );
     assert_eq!(channel.pending_dispatch, 0);
     assert!(channel.gaps.is_empty());
-    assert_eq!(
-        channel.note,
-        "telegram 长轮询；中断区间内的更新在平台保留期内补回"
-    );
+    assert_eq!(channel.note, "no plugin installed for this channel");
+    assert!(snapshot.plugins.is_empty());
     assert_eq!(
         (
             channel.counters.platform_payload_unparseable,
@@ -975,6 +973,17 @@ async fn daemon_status_reports_channel_segment_over_control_socket() {
             channel.counters.unsupported_update
         ),
         (0, 0, 0)
+    );
+    // Installed through the daemon, the plugin supplies the note; a suspended receiver runs no
+    // process.
+    install_fake(&fixture, "telegram", "normal").await;
+    let snapshot = fixture.ready().await;
+    assert_eq!(snapshot.channels[0].note, "telegram fake note");
+    assert_eq!(snapshot.plugins.len(), 1);
+    let plugin = serde_json::to_value(&snapshot.plugins[0]).unwrap();
+    assert_eq!(
+        plugin,
+        serde_json::json!({"name": "fake-telegram", "version": "0.1.0", "channels": ["telegram"], "process": "stopped", "last_exit_code": null})
     );
     process.stop(Signal::TERM).await;
     assert_runtime_released(&fixture);
@@ -1094,6 +1103,44 @@ async fn op(
     .await
 }
 
+/// Installs the fake channel plugin for `kind` through the running daemon's `plugins_add`: the
+/// binary is copied into a package directory, since the daemon refuses commands outside it.
+async fn install_fake(fixture: &Fixture, kind: &str, scenario: &str) {
+    let fake = PathBuf::from(
+        std::env::var_os("OMB_TEST_CHANNEL_PLUGIN")
+            .expect("OMB_TEST_CHANNEL_PLUGIN: absolute path of the fake channel plugin"),
+    );
+    let package = fixture.root.join(format!("package-{kind}"));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(package.join("bin"))
+        .unwrap();
+    fs::copy(&fake, package.join("bin/fake-channel-plugin")).unwrap();
+    let manifest = serde_json::json!({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        "name": format!("fake-{kind}"),
+        "version": "0.1.0",
+        "extensions": {"org.openmybot": {"channels": {kind: {
+            "protocol": "openmybot-channel/1",
+            "command": "./bin/fake-channel-plugin",
+            "args": ["--channel-kind", kind, "--scenario", scenario],
+            "credential_fields": [{"name": "token", "secret": true}],
+            "status_note": format!("{kind} fake note"),
+        }}}},
+    });
+    fs::write(package.join("plugin.json"), manifest.to_string()).unwrap();
+    let installed = op(
+        fixture,
+        "plugins_add",
+        serde_json::json!({"dir": package.to_str().unwrap()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed["name"], format!("fake-{kind}"));
+    fs::remove_dir_all(package).unwrap();
+}
+
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn daemon_serves_status_run_and_refusals_for_approve_deny_cancel_over_the_control_socket() {
@@ -1167,15 +1214,16 @@ async fn daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket
         fixture.spawn("daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket");
     fixture.ready().await;
     let workspace = workspace.to_str().unwrap();
-    assert_eq!(
+    let pair = || {
         op(
             &fixture,
             "pair_start",
-            serde_json::json!({"channel": "telegram", "workspace": workspace})
+            serde_json::json!({"channel": "telegram", "workspace": workspace}),
         )
-        .await,
-        Err(DaemonError::ReceiverNotActive)
-    );
+    };
+    assert_eq!(pair().await, Err(DaemonError::PluginNotInstalled));
+    install_fake(&fixture, "telegram", "normal").await;
+    assert_eq!(pair().await, Err(DaemonError::ReceiverNotActive));
     let host = op(
         &fixture,
         "bindings_host",
@@ -1215,15 +1263,21 @@ async fn daemon_refuses_malformed_receiver_credentials_without_leaking_the_secre
     let mut process =
         fixture.spawn("daemon_refuses_malformed_receiver_credentials_without_leaking_the_secret");
     fixture.ready().await;
+    // The plugin reports every credential malformed.
+    install_fake(&fixture, "telegram", "verify_fail:malformed").await;
     let mut seen = Vec::new();
     for (args, expected) in [
         (
-            serde_json::json!({"channel": "feishu", "app_id": "", "app_secret": "feishu-SENTINEL"}),
+            serde_json::json!({"channel": "telegram", "fields": {"app_id": "", "app_secret": "SENTINEL-undeclared"}}),
             DaemonError::InvalidRequest,
         ),
         (
-            serde_json::json!({"channel": "telegram", "token": "SENTINEL-without-bot-id"}),
+            serde_json::json!({"channel": "telegram", "fields": {"token": "SENTINEL-without-bot-id"}}),
             DaemonError::InvalidRequest,
+        ),
+        (
+            serde_json::json!({"channel": "feishu", "fields": {"token": "SENTINEL-no-plugin"}}),
+            DaemonError::PluginNotInstalled,
         ),
     ] {
         let error = op(&fixture, "bindings_receiver", args).await.unwrap_err();
@@ -1236,6 +1290,242 @@ async fn daemon_refuses_malformed_receiver_credentials_without_leaking_the_secre
     for text in &seen {
         assert!(!text.contains("SENTINEL"), "{text}");
     }
+    assert_runtime_released(&fixture);
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_lists_plugins_and_removes_one_only_without_a_live_binding() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let mut process =
+        fixture.spawn("daemon_lists_plugins_and_removes_one_only_without_a_live_binding");
+    fixture.ready().await;
+    install_fake(&fixture, "telegram", "normal").await;
+    let list = || op(&fixture, "plugins_list", serde_json::json!({}));
+    let remove = || {
+        op(
+            &fixture,
+            "plugins_remove",
+            serde_json::json!({"name": "fake-telegram"}),
+        )
+    };
+    assert_eq!(
+        list().await.unwrap(),
+        serde_json::json!({"plugins": [{
+            "name": "fake-telegram",
+            "version": "0.1.0",
+            "channels": [{
+                "channel_kind": "telegram",
+                "credential_fields": [{"name": "token", "secret": true}],
+                "status_note": "telegram fake note",
+            }],
+            "process": "stopped",
+            "last_exit_code": null,
+        }]})
+    );
+    let bound = op(
+        &fixture,
+        "bindings_receiver",
+        serde_json::json!({"channel": "telegram", "fields": {"token": "1001:listed-token"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(list().await.unwrap()["plugins"][0]["process"], "running");
+    assert_eq!(remove().await, Err(DaemonError::PluginInUse));
+    op(
+        &fixture,
+        "bindings_revoke",
+        serde_json::json!({"binding_id": bound["binding_id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        remove().await.unwrap(),
+        serde_json::json!({"name": "fake-telegram"})
+    );
+    assert_eq!(list().await.unwrap(), serde_json::json!({"plugins": []}));
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
+/// One JSON command to the fake platform process and its one-line answer.
+async fn platform_call(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    command: serde_json::Value,
+) -> serde_json::Value {
+    use tokio::io::AsyncWriteExt;
+    stdin
+        .write_all(format!("{command}\n").as_bytes())
+        .await
+        .unwrap();
+    serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap()
+}
+
+/// The fake Bot API's sent messages once there are at least `count`.
+async fn telegram_sent(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    count: usize,
+) -> Vec<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let reply = platform_call(stdin, stdout, serde_json::json!({"op": "telegram_sent"})).await;
+        let sent = reply["sent"].as_array().unwrap().clone();
+        if sent.len() >= count {
+            return sent;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited for {count} sends"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn plugin_telegram_real_binary_happy_line_through_daemon_process() {
+    use tokio::io::AsyncBufReadExt;
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    // The fake host reports the version the embedded window accepts.
+    let window: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../openmybot/compat/crabcode/accepted.json"
+    ))
+    .unwrap();
+    let fake_host = PathBuf::from(
+        std::env::var_os("OMB_TEST_FAKE_CRABCODE")
+            .expect("OMB_TEST_FAKE_CRABCODE: absolute path of the fake host binary"),
+    );
+    let host = fixture.root.join("crabcode");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&host)
+        .unwrap()
+        .write_all(
+            format!(
+                "#!/bin/sh\nFAKE_CRABCODE_VERSION={} exec '{}' \"$@\"\n",
+                window["accepted"][0]["version"].as_str().unwrap(),
+                fake_host.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    configure_crabcode(
+        &fixture,
+        host.to_str().unwrap(),
+        std::slice::from_ref(&workspace),
+    );
+    let mut process =
+        fixture.spawn("plugin_telegram_real_binary_happy_line_through_daemon_process");
+    fixture.ready().await;
+    let mut platform = tokio::process::Command::new(
+        std::env::var_os("OMB_TEST_CHANNEL_PLATFORM")
+            .expect("OMB_TEST_CHANNEL_PLATFORM: absolute path of the fake channel platform"),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut stdin = platform.stdin.take().unwrap();
+    let mut stdout = tokio::io::BufReader::new(platform.stdout.take().unwrap()).lines();
+    let bases: serde_json::Value =
+        serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+    // The real binary and the production manifest, pointed at the fake Bot API.
+    let package = fixture.root.join("package-telegram");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(package.join("bin"))
+        .unwrap();
+    fs::copy(
+        std::env::var_os("OMB_TEST_CHANNEL_TELEGRAM")
+            .expect("OMB_TEST_CHANNEL_TELEGRAM: absolute path of the Telegram plugin"),
+        package.join("bin/openmybot-channel-telegram"),
+    )
+    .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../openmybot/plugins/telegram/plugin.json"
+    ))
+    .unwrap();
+    manifest["extensions"]["org.openmybot"]["channels"]["telegram"]["args"] =
+        serde_json::json!(["--api-base", bases["telegram_api_base"]]);
+    fs::write(package.join("plugin.json"), manifest.to_string()).unwrap();
+    let installed = op(
+        &fixture,
+        "plugins_add",
+        serde_json::json!({"dir": package.to_str().unwrap()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed["name"], "openmybot-channel-telegram");
+    fs::remove_dir_all(package).unwrap();
+    // The plugin verifies the token against the fake Bot API: its bot id becomes the source key.
+    let bound = op(
+        &fixture,
+        "bindings_receiver",
+        serde_json::json!({"channel": "telegram", "fields": {"token": "1001:lifecycle-token"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bound["source_key"], "1001");
+    let started = op(
+        &fixture,
+        "pair_start",
+        serde_json::json!({"channel": "telegram", "workspace": workspace}),
+    )
+    .await
+    .unwrap();
+    let update = |id: u64, text: &str| {
+        serde_json::json!({"op": "telegram_push_update", "update": {"update_id": id, "message": {
+            "message_id": id,
+            "date": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            "from": {"id": 42, "is_bot": false},
+            "chat": {"id": 42, "type": "private"},
+            "text": text,
+        }}})
+    };
+    platform_call(
+        &mut stdin,
+        &mut stdout,
+        update(1, &format!("/pair {}", started["code"].as_str().unwrap())),
+    )
+    .await;
+    let replies = telegram_sent(&mut stdin, &mut stdout, 1).await;
+    assert!(
+        replies[0]["text"].as_str().unwrap().starts_with("绑定成功"),
+        "{replies:?}"
+    );
+    platform_call(&mut stdin, &mut stdout, update(2, "please do the work")).await;
+    let replies = telegram_sent(&mut stdin, &mut stdout, 2).await;
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    let result = replies[1]["text"].as_str().unwrap();
+    assert!(
+        result.starts_with("[OpenMyBot] 已完成 · run ") && result.ends_with("\nhello from fake"),
+        "{result}"
+    );
+    assert!(replies.iter().all(|reply| reply["chat_id"] == 42));
+    let listed = op(&fixture, "plugins_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(listed["plugins"][0]["process"], "running");
+    process.stop(Signal::TERM).await;
     assert_runtime_released(&fixture);
 }
 
@@ -1359,10 +1649,7 @@ async fn daemon_resumed_after_sigstop_records_daemon_suspended_gap_and_resumes_h
             .iter()
             .any(|gap| gap.reason == "daemon_suspended" && gap.ended_at.is_some())
     );
-    assert_eq!(
-        channel.note,
-        "telegram 长轮询；中断区间内的更新在平台保留期内补回"
-    );
+    assert_eq!(channel.note, "no plugin installed for this channel");
     let resumed: i64 = query_own(&fixture, heartbeat).await[0].get(0);
     tokio::time::sleep(Duration::from_secs(35)).await;
     let later: i64 = query_own(&fixture, heartbeat).await[0].get(0);

@@ -29,8 +29,8 @@ const EXPECTED_CHECKS: &[(&str, &[&str])] = &[
         "channel_bindings",
         &[
             "run_deadline_seconds BETWEEN 1 AND 86400",
-            "binding_kind <> 'receiver' OR (channel_kind IN ('telegram','feishu') AND credential_envelope IS NOT NULL AND sender_key IS NULL AND chat_key IS NULL AND workspace_dir IS NULL AND thread_id IS NULL AND status <> 'pending')",
-            "binding_kind <> 'sender' OR (channel_kind IN ('telegram','feishu') AND (status <> 'pending' OR (pairing_code_hash IS NOT NULL AND pairing_expires_at IS NOT NULL AND workspace_dir IS NOT NULL AND thread_id IS NOT NULL AND granted_generation IS NOT NULL AND sender_key IS NULL)) AND (status NOT IN ('active','suspended') OR (sender_key IS NOT NULL AND chat_key IS NOT NULL AND workspace_dir IS NOT NULL AND thread_id IS NOT NULL AND granted_generation IS NOT NULL AND pairing_code_hash IS NULL)))",
+            "binding_kind <> 'receiver' OR (channel_kind ~ '^[a-z][a-z0-9_]{0,31}$' AND channel_kind <> 'host' AND credential_envelope IS NOT NULL AND sender_key IS NULL AND chat_key IS NULL AND workspace_dir IS NULL AND thread_id IS NULL AND status <> 'pending')",
+            "binding_kind <> 'sender' OR (channel_kind ~ '^[a-z][a-z0-9_]{0,31}$' AND channel_kind <> 'host' AND (status <> 'pending' OR (pairing_code_hash IS NOT NULL AND pairing_expires_at IS NOT NULL AND workspace_dir IS NOT NULL AND thread_id IS NOT NULL AND granted_generation IS NOT NULL AND sender_key IS NULL)) AND (status NOT IN ('active','suspended') OR (sender_key IS NOT NULL AND chat_key IS NOT NULL AND workspace_dir IS NOT NULL AND thread_id IS NOT NULL AND granted_generation IS NOT NULL AND pairing_code_hash IS NULL)))",
             "binding_kind <> 'host' OR (channel_kind='host' AND source_key='crabcode' AND sender_key IS NOT NULL AND sender_key='host:crabcode' AND workspace_dir IS NOT NULL AND granted_generation IS NOT NULL AND status <> 'pending')",
             "octet_length(source_key)<=128",
             "octet_length(sender_key)<=128",
@@ -38,7 +38,7 @@ const EXPECTED_CHECKS: &[(&str, &[&str])] = &[
             "octet_length(thread_id)<=128",
             "octet_length(pairing_code_hash)=32",
             "binding_kind IN ('receiver','sender','host')",
-            "channel_kind IN ('telegram','feishu','host')",
+            "channel_kind ~ '^[a-z][a-z0-9_]{0,31}$'",
             "status IN ('pending','active','suspended','revoked','expired')",
             "status_reason IN ('superseded','pairing_expired','owner_revoked','receiver_replaced','restore_detected','credential_rejected','webhook_conflict','grant_stale')",
         ],
@@ -61,12 +61,12 @@ const EXPECTED_CHECKS: &[(&str, &[&str])] = &[
             "octet_length(run_id)<=128",
             "octet_length(thread_id)<=128",
             "record_kind IN ('event','gap')",
-            "channel_kind IN ('telegram','feishu','host')",
+            "channel_kind ~ '^[a-z][a-z0-9_]{0,31}$'",
             "disposition IN ('accepted_message','control_command','pairing_succeeded','pairing_failed','pairing_locked','dropped_unbound','dropped_not_private','dropped_inactive','rejected_outside_window','rejected_too_long','rejected_unsupported','rejected_malformed','rejected_queue_full','gap')",
             "command IN ('help','start','status','cancel','pair','unknown')",
             "dispatch_status IN ('pending','dispatched','conflict','expired','cancelled')",
             "terminal_kind IN ('succeeded','failed','cancelled','reconciliation_required')",
-            "gap_reason IN ('daemon_down','daemon_suspended','connect_failed','stream_broken','receiver_suspended')",
+            "gap_reason IN ('daemon_down','daemon_suspended','connect_failed','stream_broken','receiver_suspended','plugin_missing')",
         ],
     ),
     (
@@ -96,7 +96,7 @@ const EXPECTED_CHECKS: &[(&str, &[&str])] = &[
             "octet_length(chat_key)<=128",
             "octet_length(idempotency_key)<=128",
             "octet_length(platform_message_id)<=128",
-            "channel_kind IN ('telegram','feishu')",
+            "channel_kind ~ '^[a-z][a-z0-9_]{0,31}$' AND channel_kind <> 'host'",
             "kind IN ('run_result','permission_notice','control_reply','pairing_reply','reject_reply','expiry_notice')",
             "status IN ('pending','sending','sent','failed','unknown')",
         ],
@@ -845,7 +845,9 @@ async fn b32_text_byte_lengths_and_closed_enums_are_enforced() {
         "UPDATE openmybot.channel_bindings SET pairing_code_hash=decode('00','hex')",
         "UPDATE openmybot.channel_bindings SET source_key=repeat('界',43)",
         "UPDATE openmybot.channel_bindings SET binding_kind='other'",
-        "UPDATE openmybot.channel_bindings SET channel_kind='other'",
+        "UPDATE openmybot.channel_bindings SET channel_kind='Other'",
+        "UPDATE openmybot.channel_bindings SET channel_kind='1x'",
+        "UPDATE openmybot.channel_bindings SET channel_kind='host'",
         "UPDATE openmybot.channel_bindings SET status='other'",
         "UPDATE openmybot.channel_bindings SET status_reason='other'",
         "UPDATE openmybot.channel_bindings SET run_deadline_seconds=0",
@@ -856,7 +858,6 @@ async fn b32_text_byte_lengths_and_closed_enums_are_enforced() {
     session.client.batch_execute("UPDATE openmybot.channel_bindings SET source_key=repeat('x',128),pairing_code_hash=decode(repeat('ab',32),'hex'),run_deadline_seconds=86400").await.unwrap();
     let enum_fields = [
         ("channel_events", "record_kind"),
-        ("channel_events", "channel_kind"),
         ("channel_events", "disposition"),
         ("channel_events", "command"),
         ("channel_events", "dispatch_status"),
@@ -872,6 +873,13 @@ async fn b32_text_byte_lengths_and_closed_enums_are_enforced() {
         rejected(
             &session.client,
             &format!("UPDATE openmybot.{table} SET {column}='other'"),
+        )
+        .await;
+    }
+    for kind in ["Other", "1x"] {
+        rejected(
+            &session.client,
+            &format!("UPDATE openmybot.channel_events SET channel_kind='{kind}'"),
         )
         .await;
     }
@@ -1025,6 +1033,7 @@ async fn binding_i1_i2_i3_accept_and_reject_each_shape() {
         )
         .await;
     }
+    session.client.batch_execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,created_at) VALUES('00000000-0000-0000-0000-000000000004','receiver','slack','1','envelope','active',statement_timestamp())").await.unwrap();
     session.client.batch_execute(HOST).await.unwrap();
     for change in [
         "channel_kind='telegram'",
@@ -1335,10 +1344,17 @@ async fn delivery_i6_terminal_rows_require_finished_at() {
         .await;
         session.client.batch_execute(&format!("UPDATE openmybot.deliveries SET status='{status}',finished_at=statement_timestamp()")).await.unwrap();
     }
-    for field in ["channel_kind", "kind", "status"] {
+    for field in ["kind", "status"] {
         rejected(
             &session.client,
             &format!("UPDATE openmybot.deliveries SET {field}='other'"),
+        )
+        .await;
+    }
+    for kind in ["Other", "1x", "host"] {
+        rejected(
+            &session.client,
+            &format!("UPDATE openmybot.deliveries SET channel_kind='{kind}'"),
         )
         .await;
     }

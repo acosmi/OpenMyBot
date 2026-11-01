@@ -1,16 +1,33 @@
 <p align="center">
-  <img src=".github/assets/wrok-bot-banner.png" alt="Wrok Bot">
+  <img src=".github/assets/wrok-bot-banner.png" alt="Wrok Bot" width="100%">
 </p>
 
 <h1 align="center">Wrok Bot</h1>
 
-<p align="center"><a href="README.md">English</a> | <strong>简体中文</strong></p>
+<p align="center">
+  <b>AI 员工 / 数字队友平台 · 能独立干活的 AI 同事</b><br>
+  基于 Rust 构建 · 首版面向 macOS · 开发验证中
+</p>
 
-<p align="center">AI 员工 / 数字队友平台 · 能独立干活的 AI 同事</p>
+<p align="center">
+  <a href="#源码目录"><img src="https://img.shields.io/badge/core-Rust-007ec6?style=flat-square" alt="Core: Rust"></a>
+  <a href="crates/openbot-desktop/Cargo.toml"><img src="https://img.shields.io/badge/desktop-Tauri-00897b?style=flat-square" alt="Desktop: Tauri"></a>
+  <a href="crates/openbot-infra/src/db"><img src="https://img.shields.io/badge/data-PostgreSQL-149954?style=flat-square" alt="Data: PostgreSQL"></a>
+  <a href="#当前进度"><img src="https://img.shields.io/badge/status-In%20development-68448b?style=flat-square" alt="Status: in development"></a>
+  <br>
+  <a href="IMPLEMENTATION_LEDGER.md"><img src="https://img.shields.io/badge/evidence-implementation%20ledger-e65100?style=flat-square" alt="Implementation ledger"></a>
+  <a href="https://wrokbot.com"><img src="https://img.shields.io/badge/main%20site-wrokbot.com-0052d9?style=flat-square" alt="Official website: wrokbot.com (primary)"></a>
+  <a href="https://grokbot.si"><img src="https://img.shields.io/badge/website-grokbot.si-00897b?style=flat-square" alt="Official website: grokbot.si"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Custom-4c6ef5?style=flat-square" alt="License terms"></a>
+</p>
+
+<p align="center"><a href="README.md">English</a> | <strong>简体中文</strong></p>
 
 Wrok Bot 是一个使用 Rust 构建的 AI 员工 / 数字队友平台，定位为“能独立干活的 AI 同事”。平台包含桌面宿主、服务端、Web 界面和开发中的移动客户端。项目目前处于开发验证阶段，首版优先面向 macOS。
 
 Wrok Bot 与 [OpenMyBot](openmybot/README.zh-CN.md) 是本工作区中基于同一 OpenBot 引擎装配的两种产品。Wrok Bot 提供桌面与服务端产品入口；OpenMyBot 提供本地前台守护进程、渠道绑定、CrabCode 宿主驱动和 MCP 服务端，第三方能力以插件接入：聊天渠道是 owner 自行安装的渠道插件，OpenMyBot 自身则以 [Agent Plugins 包](openmybot/plugin/README.md) 的形式提供给 MCP 宿主。
+
+官方网站：[wrokbot.com](https://wrokbot.com)（主域名）· [grokbot.si](https://grokbot.si)。
 
 ## 当前进度
 
