@@ -422,8 +422,8 @@ async fn thread_history_clear_fresh52_upgrade51_complete_clear_schema_and_zero_d
             let retained: Value = c.query_one("SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM openbot_internal.schema_migrations m WHERE version<=51", &[]).await.map_err(text)?.get(0);
             require(old == retained, "upgrade changed prior migration evidence")?;
             let row = c.query_one("SELECT count(*),max(version),(SELECT count(*) FROM openbot_internal.thread_history_clear_batches),(SELECT count(*) FROM openbot_internal.thread_history_clear_completions) FROM openbot_internal.schema_migrations", &[]).await.map_err(text)?;
-            require(row.get::<_, i64>(0) == 40 && row.get::<_, i32>(1) == 52 && row.get::<_, i64>(2) == 0 && row.get::<_, i64>(3) == 0,
-                "52 prefix not exact or invented clearing facts")?;
+            require(row.get::<_, i64>(0) == 41 && row.get::<_, i32>(1) == 53 && row.get::<_, i64>(2) == 0 && row.get::<_, i64>(3) == 0,
+                "53 prefix not exact or invented clearing facts")?;
             for fault in [
                 "ALTER TABLE openbot_internal.thread_history_clear_batches ALTER COLUMN xact_id DROP DEFAULT",
                 "ALTER TABLE openbot_internal.thread_history_clear_batches DISABLE TRIGGER thread_history_clear_batches_guard",
@@ -797,7 +797,7 @@ async fn thread_history_clear_reads_after_completion_return_not_visible() {
         let deleted=thread(411003);
         let c=p.get().await.map_err(text)?;insert_thread(&c,&empty,None).await?;insert_thread(&c,&deleted,None).await?;
         c.execute("UPDATE public.threads SET status='deleted',deleted_at=clock_timestamp(),updated_at=clock_timestamp() WHERE thread_id=$1",&[&deleted.as_str()]).await.map_err(text)?;drop(c);
-        let d=PostgresThreadDirectory::with_runtime(p.clone(),config,"owned-clear-reader".into(),DEFAULT_THREAD_LEASE_DURATION).map_err(text)?;
+        let d=PostgresThreadDirectory::with_runtime(p.clone(),config,"owned-clear-reader".into(),DEFAULT_THREAD_LEASE_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(text)?;
         require(!d.thread_history(history_request(&t)).await.map_err(text)?.messages.is_empty(),"positive history absent before completion")?;
         require(d.thread_history(history_request(&empty)).await.map_err(text)?.messages.is_empty(),"visible empty history was denied")?;
         require(d.thread_conversation(conversation_request(&empty)).await.map_err(text)?==openbot_contracts::command::ThreadConversationSnapshot::default(),"visible empty conversation not original default")?;
