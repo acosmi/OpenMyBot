@@ -1,25 +1,19 @@
-//! Telegram and Feishu platform code: boundary parsing, fingerprints and HTTP calls.
+//! Telegram and Feishu channel plugins of the `openmybot-channel/1` protocol: boundary parsing,
+//! the receive loops and the send requests. Each `openmybot-channel-<kind>` binary runs one plugin.
 #[cfg(feature = "testkit")]
 pub mod fake_feishu;
-// The receive and delivery loops that used these helpers moved to the daemon.
-#[allow(dead_code)]
 mod feishu;
-#[allow(dead_code)]
 mod sender;
-#[allow(dead_code)]
 mod telegram;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
-pub use feishu::verify_feishu_credentials;
-pub use telegram::{
-    CredentialProblem, FingerprintInput, Normalized, canonical_json, classify, fingerprint,
-    next_offset, normalize, verify_credentials,
-};
+pub use feishu::FeishuPlugin;
+pub use telegram::TelegramPlugin;
 
-use omb_store::ChannelKind;
 use openbot_infra::net::safe_http::{SafeDialer, SchemePolicy};
 use std::time::Duration;
+use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use url::Url;
 
 pub const TG_POLL_TIMEOUT: Duration = Duration::from_secs(50);
@@ -30,8 +24,10 @@ pub const TG_OFFSET_STALE: Duration = Duration::from_secs(6 * 24 * 3600);
 /// Larger `getUpdates` bodies are refused as a broken stream and fetched again.
 pub const TG_RESPONSE_MAX: usize = 8 * 1024 * 1024;
 pub const HTTP_SEND_TIMEOUT: Duration = Duration::from_secs(15);
-/// A Feishu event is acknowledged only within this budget after its last fragment arrived.
-pub const FS_ACK_BUDGET: Duration = Duration::from_secs(2);
+/// A failed poll or connection is retried after a uniform wait below this bound, doubled per
+/// failure up to `BACKOFF_MAX`.
+pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
+pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A cached tenant token with less validity left is fetched again.
 pub const FS_TOKEN_MARGIN: Duration = Duration::from_secs(30 * 60);
 /// The long connection's ping interval until the platform's `PingInterval` replaces it.
@@ -43,8 +39,6 @@ pub const FS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FS_FRAGMENT_TTL: Duration = Duration::from_secs(5);
 /// Bytes of one WebSocket message or frame, and of one event reassembled from its fragments.
 pub const FS_FRAME_MAX: usize = 1024 * 1024;
-pub const TELEGRAM: ChannelKind = ChannelKind::from_static("telegram");
-pub const FEISHU: ChannelKind = ChannelKind::from_static("feishu");
 /// Where the Bot API is reached; production is HTTPS to the public endpoint only.
 #[derive(Clone)]
 pub struct TelegramEndpoint {
@@ -77,6 +71,14 @@ impl FeishuEndpoint {
         }
     }
 }
+/// RFC 3339 in UTC with milliseconds, the `occurred_at` form of an event frame.
+fn utc_millis(at: OffsetDateTime) -> String {
+    at.to_offset(UtcOffset::UTC)
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+        ))
+        .expect("a UTC time formats")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +87,8 @@ mod tests {
         assert_eq!(TG_POLL_LIMIT, 100);
         assert_eq!(TG_OFFSET_STALE, Duration::from_secs(6 * 24 * 3600));
         assert_eq!(TG_RESPONSE_MAX, 8 * 1024 * 1024);
+        assert_eq!(BACKOFF_MIN, Duration::from_secs(1));
+        assert_eq!(BACKOFF_MAX, Duration::from_secs(60));
     }
     #[test]
     fn production_endpoint_is_https_only() {
@@ -106,8 +110,7 @@ mod tests {
         );
     }
     #[test]
-    fn feishu_constants_and_status_notes_are_fixed() {
-        assert_eq!(FS_ACK_BUDGET, Duration::from_secs(2));
+    fn feishu_constants_are_fixed() {
         assert_eq!(FS_TOKEN_MARGIN, Duration::from_secs(1800));
         assert_eq!(FS_PING_INTERVAL, Duration::from_secs(120));
         assert_eq!(FS_READ_GRACE, Duration::from_secs(5));

@@ -1,17 +1,33 @@
-//! Feishu long connection: frame codec, endpoint and handshake verdicts, event parsing, tenant
-//! tokens and the receive loop. Nothing is logged: the connection URL carries a ticket and the
-//! endpoint request the app secret.
+//! Feishu long-connection plugin: frame codec, endpoint and handshake verdicts, event parsing,
+//! tenant tokens, the receive loop and sending. Nothing is logged: the connection URL carries a
+//! ticket and the endpoint request the app secret.
 use crate::{
-    CredentialProblem, FEISHU, FeishuEndpoint, HTTP_SEND_TIMEOUT, Normalized, classify,
-    sender::SEND_RESPONSE_MAX,
+    BACKOFF_MAX, BACKOFF_MIN, FS_FRAGMENT_TTL, FS_FRAME_MAX, FS_PING_INTERVAL, FS_READ_GRACE,
+    FS_TOKEN_MARGIN, FS_WRITE_TIMEOUT, FeishuEndpoint, HTTP_SEND_TIMEOUT,
+    sender::{SEND_RESPONSE_MAX, classify_feishu, feishu_body, feishu_chat_id},
+    telegram::Normalized,
+    utc_millis,
 };
-use omb_store::{Content, ErrorCode, IdentityKey, NormalizedEvent};
-use openbot_domain::vault::SecretBytes;
-use openbot_infra::net::safe_http::{SafeHttpBudget, SafeHttpError, SafeHttpRequest};
+use futures_util::{SinkExt, StreamExt};
+use omb_channel_sdk::{
+    plugin::{ChannelPlugin, HelloInfo, Outbox, SendArgs, SendOutcome, StartArgs},
+    protocol::{
+        EventFrame, EventKind, FailureClass, GapReason, SendErrorCode, SkipCounter, SuspendReason,
+        VerifyFailure,
+    },
+};
+use openbot_infra::net::safe_http::{
+    AuthorizationValue, SafeHttpBudget, SafeHttpError, SafeHttpRequest,
+};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::time::Duration;
-use time::{OffsetDateTime, UtcOffset, macros::format_description};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::BuildHasher,
+    time::{Duration, SystemTime},
+};
+use time::OffsetDateTime;
+use tokio::{task::JoinHandle, time::Instant};
+use tokio_tungstenite::tungstenite::{self, Message, protocol::WebSocketConfig};
 use url::Url;
 
 /// One `pbbp2.Frame` of the long connection (proto2), parsed once at the boundary.
@@ -254,9 +270,10 @@ pub(crate) fn handshake_reply(response: &http::Response<Option<Vec<u8>>>) -> Han
     }
 }
 
-/// Parses one event payload into the closed event shape; malformed messages keep obtainable
-/// identity.
-pub(crate) fn normalize(payload: &[u8], source_key: &str) -> Normalized {
+/// Parses one event payload into an event frame; a message missing a time, an identity or its
+/// content, or a text message without a string `text` free of NUL, is malformed and keeps the
+/// identity it has.
+pub(crate) fn normalize(payload: &[u8]) -> Normalized {
     let Some(value) = serde_json::from_slice::<Value>(payload)
         .ok()
         .filter(Value::is_object)
@@ -266,10 +283,13 @@ pub(crate) fn normalize(payload: &[u8], source_key: &str) -> Normalized {
     if value.get("schema").and_then(Value::as_str) != Some("2.0") {
         return Normalized::Unparseable;
     }
+    // The daemon keeps event keys of printable ASCII up to 128 bytes.
     let Some(event_id) = value
         .pointer("/header/event_id")
         .and_then(Value::as_str)
-        .filter(|id| IdentityKey::parse(id).is_some())
+        .filter(|id| {
+            (1..=128).contains(&id.len()) && id.bytes().all(|b| (b' '..=b'~').contains(&b))
+        })
     else {
         return Normalized::Unparseable;
     };
@@ -295,7 +315,7 @@ pub(crate) fn normalize(payload: &[u8], source_key: &str) -> Normalized {
     .and_then(|millis| {
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000).ok()
     });
-    let fingerprint = match (
+    let (kind, message_text, data) = match (
         occurred_at,
         chat_id,
         open_id,
@@ -304,110 +324,68 @@ pub(crate) fn normalize(payload: &[u8], source_key: &str) -> Normalized {
         content,
     ) {
         (
-            Some(occurred_at),
+            Some(_),
             Some(chat_id),
             Some(open_id),
             Some(message_id),
             Some(message_type),
             Some(content),
-        ) => Some(fingerprint(&FeishuFingerprint {
-            occurred_at,
-            chat_id,
-            open_id,
-            message_id,
-            message_type,
-            content,
-        })),
-        _ => None,
-    };
-    let content = match (fingerprint, message_type, content) {
-        (None, ..) => Content::Malformed,
-        (Some(_), Some("text"), Some(content)) => {
-            match serde_json::from_str::<Value>(content)
-                .ok()
-                .and_then(|content| content.get("text")?.as_str().map(str::to_owned))
-            {
-                Some(text) if text.contains('\0') => Content::Malformed,
-                Some(text) => {
-                    let (command, pair_code) = classify(&text);
-                    Content::Text {
-                        text,
-                        command,
-                        pair_code,
-                    }
-                }
-                None => Content::Malformed,
+        ) => {
+            let data = BTreeMap::from(
+                [
+                    ("chatId", chat_id),
+                    ("content", content),
+                    ("messageId", message_id),
+                    ("messageType", message_type),
+                    ("openId", open_id),
+                ]
+                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+            );
+            let parsed = (message_type == "text").then(|| {
+                serde_json::from_str::<Value>(content)
+                    .ok()
+                    .and_then(|content| content.get("text")?.as_str().map(str::to_owned))
+            });
+            match parsed {
+                None => (EventKind::Other, String::new(), data),
+                Some(Some(text)) if !text.contains('\0') => (EventKind::Text, text, data),
+                Some(_) => (EventKind::Malformed, String::new(), data),
             }
         }
-        (Some(_), ..) => Content::Other,
+        _ => (EventKind::Malformed, String::new(), BTreeMap::new()),
     };
-    Normalized::Event(NormalizedEvent {
-        channel: FEISHU,
-        source_key: source_key.to_owned(),
+    Normalized::Event(EventFrame {
         event_key: event_id.to_owned(),
         event_type: "feishu.im.message.receive_v1".to_owned(),
-        occurred_at,
+        occurred_at: occurred_at.map(utc_millis),
         private: text("/event/message/chat_type") == Some("p2p"),
-        sender: open_id.and_then(|id| IdentityKey::parse(&format!("feishu:{id}"))),
-        chat: chat_id.and_then(|id| IdentityKey::parse(&format!("feishu:{id}"))),
-        fingerprint,
-        content,
+        sender_key: open_id.map(|id| format!("feishu:{id}")),
+        chat_key: chat_id.map(|id| format!("feishu:{id}")),
+        kind,
+        text: message_text,
+        data,
     })
-}
-
-pub(crate) struct FeishuFingerprint<'a> {
-    pub(crate) occurred_at: OffsetDateTime,
-    pub(crate) chat_id: &'a str,
-    pub(crate) open_id: &'a str,
-    pub(crate) message_id: &'a str,
-    pub(crate) message_type: &'a str,
-    /// The platform's content string as received.
-    pub(crate) content: &'a str,
-}
-/// RFC 8785 form of the fingerprint object: every key is ASCII and written in byte order, and
-/// every value is a string escaped the way JCS requires.
-pub(crate) fn canonical_json(input: &FeishuFingerprint<'_>) -> String {
-    let string = |value: &str| serde_json::to_string(value).unwrap_or_default();
-    let occurred_at = input
-        .occurred_at
-        .to_offset(UtcOffset::UTC)
-        .format(format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        ))
-        .unwrap_or_default();
-    format!(
-        r#"{{"data":{{"chatId":{},"content":{},"messageId":{},"messageType":{},"openId":{}}},"eventType":"feishu.im.message.receive_v1","occurredAt":{}}}"#,
-        string(input.chat_id),
-        string(input.content),
-        string(input.message_id),
-        string(input.message_type),
-        string(input.open_id),
-        string(&occurred_at),
-    )
-}
-pub(crate) fn fingerprint(input: &FeishuFingerprint<'_>) -> [u8; 32] {
-    Sha256::digest(canonical_json(input).as_bytes()).into()
 }
 
 /// What one tenant token request means; no variant renders the token.
 pub(crate) enum TokenReply {
     Granted { token: String, expire: Duration },
-    Retry(ErrorCode),
+    Retry(SendErrorCode),
     Rejected,
 }
 /// Transport failures, 429, 5xx and the rate-limit code 99991400 are retried; anything else but
 /// a granted token refuses the credential.
 pub(crate) fn token_reply(result: Result<(u16, &[u8]), SafeHttpError>) -> TokenReply {
     let (status, body) = match result {
-        Err(_) => return TokenReply::Retry(ErrorCode::Unreachable),
-        Ok((429, _)) => return TokenReply::Retry(ErrorCode::RateLimited),
-        Ok((500..=599, _)) => return TokenReply::Retry(ErrorCode::ServerError),
+        Err(_) => return TokenReply::Retry(SendErrorCode::Unreachable),
+        Ok((429, _)) => return TokenReply::Retry(SendErrorCode::RateLimited),
+        Ok((500..=599, _)) => return TokenReply::Retry(SendErrorCode::ServerError),
         Ok(reply) => reply,
     };
     let body = serde_json::from_slice::<Value>(body).ok();
     let field = |name: &str| body.as_ref().and_then(|body| body.get(name));
     match field("code").and_then(Value::as_i64) {
-        Some(99_991_400) => TokenReply::Retry(ErrorCode::RateLimited),
+        Some(99_991_400) => TokenReply::Retry(SendErrorCode::RateLimited),
         Some(0) if status == 200 => {
             let token = field("tenant_access_token")
                 .and_then(Value::as_str)
@@ -459,27 +437,361 @@ pub(crate) async fn tenant_token(
             .map_err(|error| *error),
     )
 }
-/// Bind-time check: the app's credential must be granted a tenant token. Never changes any
-/// platform setting.
-pub async fn verify_feishu_credentials(
-    endpoint: &FeishuEndpoint,
-    app_id: &str,
-    app_secret: &SecretBytes,
-) -> Result<(), CredentialProblem> {
-    let app_secret = std::str::from_utf8(app_secret.expose())
-        .map_err(|_| CredentialProblem::CredentialRejected)?;
-    match tenant_token(endpoint, app_id, app_secret, HTTP_SEND_TIMEOUT).await {
-        TokenReply::Granted { .. } => Ok(()),
-        TokenReply::Rejected => Err(CredentialProblem::CredentialRejected),
-        TokenReply::Retry(_) => Err(CredentialProblem::Unreachable),
+
+/// The Feishu plugin. The app credential of the latest `start` stays in memory for sending after
+/// `stop`; the tenant token is cached until less than `FS_TOKEN_MARGIN` of it is left on the wall
+/// clock, which keeps counting while the machine sleeps.
+pub struct FeishuPlugin {
+    endpoint: FeishuEndpoint,
+    app_id: Option<String>,
+    app_secret: Option<String>,
+    token: Option<(String, SystemTime)>,
+    task: Option<JoinHandle<()>>,
+}
+impl FeishuPlugin {
+    pub fn new(endpoint: FeishuEndpoint) -> Self {
+        Self {
+            endpoint,
+            app_id: None,
+            app_secret: None,
+            token: None,
+            task: None,
+        }
+    }
+}
+impl ChannelPlugin for FeishuPlugin {
+    fn hello_ok(&self) -> HelloInfo {
+        HelloInfo {
+            plugin_name: "openmybot-channel-feishu".to_owned(),
+            plugin_version: env!("CARGO_PKG_VERSION").to_owned(),
+            channel_kind: "feishu".to_owned(),
+        }
+    }
+
+    /// The app id arrives as the source key and the app secret as the credential; the pair must
+    /// be granted a tenant token. Never changes any platform setting.
+    async fn verify(
+        &mut self,
+        credential: String,
+        source_key: Option<String>,
+    ) -> Result<String, VerifyFailure> {
+        let Some(app_id) = source_key else {
+            return Err(VerifyFailure::Malformed);
+        };
+        match tenant_token(&self.endpoint, &app_id, &credential, HTTP_SEND_TIMEOUT).await {
+            TokenReply::Granted { .. } => Ok(app_id),
+            TokenReply::Rejected => Err(VerifyFailure::CredentialRejected),
+            TokenReply::Retry(_) => Err(VerifyFailure::Unreachable),
+        }
+    }
+
+    async fn start(&mut self, start: StartArgs, outbox: Outbox) {
+        self.app_id = Some(start.source_key.clone());
+        self.app_secret = Some(start.credential.clone());
+        self.token = None;
+        let endpoint = self.endpoint.clone();
+        let (app_id, app_secret) = (start.source_key, start.credential);
+        self.task = Some(tokio::spawn(async move {
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(FS_FRAME_MAX))
+                .max_frame_size(Some(FS_FRAME_MAX));
+            let mut ping = FS_PING_INTERVAL;
+            let mut failures = 0u32;
+            let mut gap_open = false;
+            loop {
+                // `None` suspends the receiver; otherwise the reason of the gap before the next
+                // attempt.
+                let reason = 'attempt: {
+                    let mut url = endpoint.api_base.clone();
+                    url.set_path("/callback/ws/endpoint");
+                    let body = json!({"AppID": app_id, "AppSecret": app_secret})
+                        .to_string()
+                        .into_bytes();
+                    let response = async {
+                        let budget = SafeHttpBudget::new(SEND_RESPONSE_MAX, HTTP_SEND_TIMEOUT)?;
+                        endpoint
+                            .dialer
+                            .execute(SafeHttpRequest::post_json_with_scheme(
+                                url,
+                                endpoint.scheme,
+                                body,
+                                None,
+                                budget,
+                            )?)
+                            .await
+                    }
+                    .await;
+                    let reply = endpoint_reply(
+                        response
+                            .as_ref()
+                            .map(|response| (response.status().as_u16(), response.body()))
+                            .map_err(|error| *error),
+                    );
+                    let (url, service) = match reply {
+                        EndpointReply::Rejected => break 'attempt None,
+                        EndpointReply::ConnectFailed => {
+                            break 'attempt Some(GapReason::ConnectFailed);
+                        }
+                        EndpointReply::Connect {
+                            url,
+                            service,
+                            ping: adopted,
+                        } => {
+                            ping = adopted.unwrap_or(ping);
+                            (url, service)
+                        }
+                    };
+                    // Connect, TLS and the upgrade share one deadline.
+                    let connected = tokio::time::timeout(HTTP_SEND_TIMEOUT, async {
+                        let stream = endpoint
+                            .dialer
+                            .connect_websocket_stream(&url, endpoint.scheme, HTTP_SEND_TIMEOUT)
+                            .await
+                            .map_err(|_| HandshakeReply::ConnectFailed)?;
+                        tokio_tungstenite::client_async_with_config(
+                            url.as_str(),
+                            stream,
+                            Some(config),
+                        )
+                        .await
+                        .map_err(|error| match error {
+                            tungstenite::Error::Http(response) => handshake_reply(&response),
+                            _ => HandshakeReply::ConnectFailed,
+                        })
+                    })
+                    .await
+                    .unwrap_or(Err(HandshakeReply::ConnectFailed));
+                    let socket = match connected {
+                        Ok((socket, _)) => socket,
+                        Err(HandshakeReply::Rejected) => break 'attempt None,
+                        Err(HandshakeReply::ConnectFailed) => {
+                            break 'attempt Some(GapReason::ConnectFailed);
+                        }
+                    };
+                    if gap_open {
+                        outbox.gap_closed().await;
+                        gap_open = false;
+                    }
+                    failures = 0;
+                    let (mut write, mut read) = socket.split();
+                    let mut fragments: HashMap<String, (BTreeMap<usize, Vec<u8>>, Instant)> =
+                        HashMap::new();
+                    let mut last_read = Instant::now();
+                    let mut last_ping = Instant::now();
+                    let sent = tokio::time::timeout(
+                        FS_WRITE_TIMEOUT,
+                        write.send(Message::binary(ping_frame(service).encode())),
+                    )
+                    .await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        break 'attempt Some(GapReason::StreamBroken);
+                    }
+                    loop {
+                        let message = tokio::select! {
+                            () = tokio::time::sleep_until(last_read + 2 * ping + FS_READ_GRACE) => {
+                                break 'attempt Some(GapReason::StreamBroken);
+                            }
+                            () = tokio::time::sleep_until(last_ping + ping) => {
+                                last_ping = Instant::now();
+                                let sent = tokio::time::timeout(
+                                    FS_WRITE_TIMEOUT,
+                                    write.send(Message::binary(ping_frame(service).encode())),
+                                )
+                                .await;
+                                if !matches!(sent, Ok(Ok(()))) {
+                                    break 'attempt Some(GapReason::StreamBroken);
+                                }
+                                continue;
+                            }
+                            message = read.next() => message,
+                        };
+                        // Any message extends the read deadline; a Ping is answered by the library.
+                        let received = Instant::now();
+                        last_read = received;
+                        let frame = match message {
+                            Some(Ok(Message::Binary(bytes))) => FeishuFrame::decode(&bytes),
+                            Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                                break 'attempt Some(GapReason::StreamBroken);
+                            }
+                            Some(Ok(_)) => continue,
+                        };
+                        let Some(mut frame) = frame else {
+                            outbox
+                                .skipped(SkipCounter::PlatformPayloadUnparseable)
+                                .await;
+                            continue;
+                        };
+                        match frame.method {
+                            0 => {
+                                if frame.header("type") == Some("pong")
+                                    && let Some(adopted) = frame
+                                        .payload
+                                        .as_deref()
+                                        .filter(|payload| !payload.is_empty())
+                                        .and_then(|payload| {
+                                            serde_json::from_slice::<Value>(payload).ok()
+                                        })
+                                        .and_then(|config| ping_interval(&config))
+                                {
+                                    ping = adopted;
+                                }
+                                continue;
+                            }
+                            1 => {}
+                            _ => continue,
+                        }
+                        fragments.retain(|_, (_, expires)| *expires > received);
+                        if frame.header("type") != Some("event") {
+                            continue;
+                        }
+                        let sum = frame
+                            .header("sum")
+                            .and_then(|sum| sum.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        let payload = if sum <= 1 {
+                            frame.payload.take().unwrap_or_default()
+                        } else {
+                            let Some(seq) = frame
+                                .header("seq")
+                                .and_then(|seq| seq.parse::<usize>().ok())
+                                .filter(|seq| *seq < sum)
+                            else {
+                                continue;
+                            };
+                            let key = frame.header("message_id").unwrap_or_default().to_owned();
+                            let (parts, expires) = fragments
+                                .entry(key.clone())
+                                .or_insert_with(|| (BTreeMap::new(), received));
+                            parts.insert(seq, frame.payload.take().unwrap_or_default());
+                            *expires = received + FS_FRAGMENT_TTL;
+                            if parts.values().map(Vec::len).sum::<usize>() > FS_FRAME_MAX {
+                                break 'attempt Some(GapReason::StreamBroken);
+                            }
+                            if parts.len() < sum {
+                                continue;
+                            }
+                            fragments
+                                .remove(&key)
+                                .map(|(parts, _)| parts.into_values().flatten().collect())
+                                .unwrap_or_default()
+                        };
+                        // Acknowledged only once the daemon accepted it within its ack window;
+                        // without an acknowledgement the platform delivers it again.
+                        let acknowledge = match normalize(&payload) {
+                            Normalized::Unparseable => {
+                                outbox
+                                    .skipped(SkipCounter::PlatformPayloadUnparseable)
+                                    .await;
+                                true
+                            }
+                            Normalized::Unsupported => {
+                                outbox.skipped(SkipCounter::UnsupportedUpdate).await;
+                                true
+                            }
+                            Normalized::Event(event) => outbox.emit(event).await.is_ok(),
+                        };
+                        if acknowledge {
+                            let ack = ack_frame(&frame, received.elapsed().as_millis());
+                            let sent = tokio::time::timeout(
+                                FS_WRITE_TIMEOUT,
+                                write.send(Message::binary(ack.encode())),
+                            )
+                            .await;
+                            if !matches!(sent, Ok(Ok(()))) {
+                                break 'attempt Some(GapReason::StreamBroken);
+                            }
+                        }
+                    }
+                };
+                let Some(reason) = reason else {
+                    outbox.suspend(SuspendReason::CredentialRejected).await;
+                    return;
+                };
+                if !gap_open {
+                    outbox.gap(reason).await;
+                    gap_open = true;
+                }
+                // Full jitter: uniform below `BACKOFF_MIN` doubled per failure, capped.
+                let ceiling = BACKOFF_MIN
+                    .checked_mul(2u32.saturating_pow(failures))
+                    .unwrap_or(BACKOFF_MAX)
+                    .min(BACKOFF_MAX);
+                let random = std::collections::hash_map::RandomState::new().hash_one(failures);
+                tokio::time::sleep(Duration::from_nanos(
+                    random % (ceiling.as_nanos() as u64 + 1),
+                ))
+                .await;
+                failures = failures.saturating_add(1);
+            }
+        }));
+    }
+
+    async fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+
+    async fn send(&mut self, send: SendArgs) -> SendOutcome {
+        let failed = |class, code| SendOutcome::Failed {
+            class,
+            code,
+            retry_after_ms: None,
+        };
+        let (Some(app_id), Some(app_secret)) = (&self.app_id, &self.app_secret) else {
+            return failed(FailureClass::Final, SendErrorCode::ReceiverInactive);
+        };
+        let Some(chat) = feishu_chat_id(&send.chat_key) else {
+            return failed(FailureClass::Final, SendErrorCode::ClientError);
+        };
+        let now = SystemTime::now();
+        let cached = self.token.take().filter(|(_, expires_at)| {
+            expires_at
+                .duration_since(now)
+                .is_ok_and(|left| left >= FS_TOKEN_MARGIN)
+        });
+        let token = match cached {
+            Some(cached) => cached,
+            None => match tenant_token(&self.endpoint, app_id, app_secret, HTTP_SEND_TIMEOUT).await
+            {
+                TokenReply::Granted { token, expire } => (token, now + expire),
+                TokenReply::Retry(code) => return failed(FailureClass::Retryable, code),
+                TokenReply::Rejected => {
+                    return failed(FailureClass::Final, SendErrorCode::ClientError);
+                }
+            },
+        };
+        let (token, _) = self.token.insert(token);
+        let mut url = self.endpoint.api_base.clone();
+        url.set_path("/open-apis/im/v1/messages");
+        url.set_query(Some("receive_id_type=chat_id"));
+        let response = async {
+            let budget = SafeHttpBudget::new(SEND_RESPONSE_MAX, HTTP_SEND_TIMEOUT)?;
+            let authorization = AuthorizationValue::parse(&format!("Bearer {token}"))?;
+            self.endpoint
+                .dialer
+                .execute(SafeHttpRequest::post_json_with_scheme(
+                    url,
+                    self.endpoint.scheme,
+                    feishu_body(chat, &send.body, &send.idempotency_key),
+                    Some(authorization),
+                    budget,
+                )?)
+                .await
+        }
+        .await;
+        classify_feishu(
+            response
+                .as_ref()
+                .map(|response| (response.status().as_u16(), response.body()))
+                .map_err(|error| *error),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omb_store::Command;
-    use time::macros::datetime;
 
     // Vectors hand-encoded from the proto2 wire format of `pbbp2.Frame`.
     const V1: &str = "08001000180720002a0c0a0474797065120470696e6732003a004a00";
@@ -546,9 +858,9 @@ mod tests {
         })
     }
     fn normalized(value: &Value) -> Normalized {
-        normalize(&serde_json::to_vec(value).unwrap(), "cli_test")
+        normalize(&serde_json::to_vec(value).unwrap())
     }
-    fn event(value: &Value) -> NormalizedEvent {
+    fn event(value: &Value) -> EventFrame {
         match normalized(value) {
             Normalized::Event(event) => event,
             other => panic!("not an event: {other:?}"),
@@ -572,7 +884,6 @@ mod tests {
     fn token(status: u16, body: &str) -> TokenReply {
         token_reply(Ok((status, body.as_bytes())))
     }
-    const AT: OffsetDateTime = datetime!(2026-10-29 08:00:00.123 UTC);
 
     #[test]
     fn ping_frame_encodes_to_vector_v1() {
@@ -809,28 +1120,24 @@ mod tests {
     }
     #[test]
     fn private_text_event_normalizes_every_field() {
-        let expected = NormalizedEvent {
-            channel: FEISHU,
-            source_key: "cli_test".to_owned(),
+        let expected = EventFrame {
             event_key: "ev_1".to_owned(),
             event_type: "feishu.im.message.receive_v1".to_owned(),
-            occurred_at: Some(AT),
+            occurred_at: Some("2026-10-29T08:00:00.123Z".to_owned()),
             private: true,
-            sender: IdentityKey::parse("feishu:ou_user"),
-            chat: IdentityKey::parse("feishu:oc_chat"),
-            fingerprint: Some(fingerprint(&FeishuFingerprint {
-                occurred_at: AT,
-                chat_id: "oc_chat",
-                open_id: "ou_user",
-                message_id: "om_1",
-                message_type: "text",
-                content: "{\"text\":\"/status\"}",
-            })),
-            content: Content::Text {
-                text: "/status".to_owned(),
-                command: Some(Command::Status),
-                pair_code: None,
-            },
+            sender_key: Some("feishu:ou_user".to_owned()),
+            chat_key: Some("feishu:oc_chat".to_owned()),
+            kind: EventKind::Text,
+            text: "/status".to_owned(),
+            data: [
+                ("chatId", "oc_chat"),
+                ("content", "{\"text\":\"/status\"}"),
+                ("messageId", "om_1"),
+                ("messageType", "text"),
+                ("openId", "ou_user"),
+            ]
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .into(),
         };
         assert_eq!(normalized(&envelope()), Normalized::Event(expected.clone()));
         assert_eq!(
@@ -841,15 +1148,15 @@ mod tests {
             "/event/message/content",
             json!("{\"text\":\"/pair ABCD\"}"),
         ));
-        assert!(matches!(
-            pair.content,
-            Content::Text { pair_code: Some(code), .. } if code == "ABCD"
-        ));
+        assert_eq!(
+            (pair.kind, pair.text.as_str()),
+            (EventKind::Text, "/pair ABCD")
+        );
     }
     #[test]
     fn schema_event_id_and_event_type_decide_unparseable_and_unsupported() {
         for payload in [b"not json".as_slice(), b"[]", b"\"x\"", b"{}"] {
-            assert_eq!(normalize(payload, "cli_test"), Normalized::Unparseable);
+            assert_eq!(normalize(payload), Normalized::Unparseable);
         }
         for envelope in [
             with("/schema", json!("1.0")),
@@ -875,7 +1182,7 @@ mod tests {
         }
     }
     #[test]
-    fn missing_identity_or_non_integer_create_time_is_malformed_without_fingerprint() {
+    fn missing_identity_or_non_integer_create_time_is_malformed() {
         let mut envelopes = vec![
             without("/event/sender/sender_id", "open_id"),
             without("/event/message", "chat_id"),
@@ -896,8 +1203,8 @@ mod tests {
         }
         for envelope in envelopes {
             let event = event(&envelope);
-            assert_eq!(event.content, Content::Malformed, "{envelope}");
-            assert_eq!(event.fingerprint, None, "{envelope}");
+            assert_eq!(event.kind, EventKind::Malformed, "{envelope}");
+            assert!(event.data.is_empty(), "{envelope}");
             assert_eq!(event.event_key, "ev_1");
         }
     }
@@ -911,65 +1218,39 @@ mod tests {
             r#"{"text":"a\u0000b"}"#,
         ] {
             let event = event(&with("/event/message/content", json!(content)));
-            assert_eq!(event.content, Content::Malformed, "{content}");
-            assert!(event.fingerprint.is_some(), "{content}");
+            assert_eq!(event.kind, EventKind::Malformed, "{content}");
+            assert_eq!(event.data["content"], content, "{content}");
         }
         let extra = event(&with(
             "/event/message/content",
             json!(r#"{"text":"hi","extra":1}"#),
         ));
-        assert!(matches!(extra.content, Content::Text { text, .. } if text == "hi"));
+        assert_eq!((extra.kind, extra.text.as_str()), (EventKind::Text, "hi"));
     }
     #[test]
     fn non_text_group_chat_and_bot_sender_follow_the_closed_set() {
         let image = event(&with("/event/message/message_type", json!("image")));
-        assert_eq!(image.content, Content::Other);
-        assert!(image.fingerprint.is_some());
+        assert_eq!(image.kind, EventKind::Other);
+        assert_eq!(image.data["messageType"], "image");
         assert!(!event(&with("/event/message/chat_type", json!("group"))).private);
         assert!(!event(&without("/event/message", "chat_type")).private);
         let bot = event(&with("/event/sender/sender_type", json!("bot")));
-        assert_eq!(bot.sender, IdentityKey::parse("feishu:ou_user"));
-        assert!(matches!(bot.content, Content::Text { .. }));
+        assert_eq!(bot.sender_key.as_deref(), Some("feishu:ou_user"));
+        assert_eq!(bot.kind, EventKind::Text);
     }
     #[test]
-    fn identity_keys_over_key_max_are_absent() {
-        let open_id = "u".repeat(121);
-        let at_max = event(&with("/event/sender/sender_id/open_id", json!(open_id)));
-        assert_eq!(
-            at_max.sender.as_ref().map(|key| key.as_str().len()),
-            Some(128)
-        );
-        assert!(at_max.fingerprint.is_some());
+    fn identity_keys_are_passed_on_for_the_daemon_to_check() {
+        // The daemon refuses keys over its limit or outside printable ASCII at its boundary.
         for (pointer, value) in [
             ("/event/sender/sender_id/open_id", "u".repeat(122)),
             ("/event/sender/sender_id/open_id", "ou\u{7f}".to_owned()),
         ] {
             let event = event(&with(pointer, json!(value)));
-            assert_eq!(event.sender, None);
-            assert!(event.fingerprint.is_some());
+            assert_eq!(event.sender_key, Some(format!("feishu:{value}")));
+            assert_eq!(event.kind, EventKind::Text);
         }
         let chat = event(&with("/event/message/chat_id", json!("c".repeat(122))));
-        assert_eq!(chat.chat, None);
-        assert!(chat.fingerprint.is_some());
-    }
-    #[test]
-    fn canonical_json_and_fingerprint_match_the_fixed_vector() {
-        let input = FeishuFingerprint {
-            occurred_at: AT,
-            chat_id: "oc_chat",
-            open_id: "ou_user",
-            message_id: "om_1",
-            message_type: "text",
-            content: "{\"text\":\"你好\"}",
-        };
-        assert_eq!(
-            canonical_json(&input),
-            r#"{"data":{"chatId":"oc_chat","content":"{\"text\":\"你好\"}","messageId":"om_1","messageType":"text","openId":"ou_user"},"eventType":"feishu.im.message.receive_v1","occurredAt":"2026-10-29T08:00:00.123Z"}"#
-        );
-        assert_eq!(
-            hex(&fingerprint(&input)),
-            "dcbcf8f503062bdc046eba31fc043dad5489983c3aa6088f686f49feb91c8a21"
-        );
+        assert_eq!(chat.chat_key, Some(format!("feishu:{}", "c".repeat(122))));
     }
     #[test]
     fn token_reply_maps_transport_rate_limit_server_and_rejection() {
@@ -979,7 +1260,7 @@ mod tests {
         ] {
             assert!(matches!(
                 token_reply(Err(error)),
-                TokenReply::Retry(ErrorCode::Unreachable)
+                TokenReply::Retry(SendErrorCode::Unreachable)
             ));
         }
         for reply in [
@@ -987,12 +1268,15 @@ mod tests {
             token(400, r#"{"code":99991400}"#),
             token(200, r#"{"code":99991400}"#),
         ] {
-            assert!(matches!(reply, TokenReply::Retry(ErrorCode::RateLimited)));
+            assert!(matches!(
+                reply,
+                TokenReply::Retry(SendErrorCode::RateLimited)
+            ));
         }
         for status in [500, 503] {
             assert!(matches!(
                 token(status, ""),
-                TokenReply::Retry(ErrorCode::ServerError)
+                TokenReply::Retry(SendErrorCode::ServerError)
             ));
         }
         match token(

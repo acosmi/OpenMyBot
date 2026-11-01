@@ -14,20 +14,39 @@ default = []
 testkit = []
 
 [dependencies]
-omb-store = { path = "../omb-store" }
+omb-channel-sdk = { path = "../omb-channel-sdk" }
 openbot-infra = { path = "../openbot-infra" }
-openbot-application = { path = "../openbot-application" }
-openbot-contracts = { path = "../openbot-contracts" }
 openbot-domain = { path = "../openbot-domain" }
-tokio.workspace = true
-tokio-postgres.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
 serde_json.workspace = true
 sha2.workspace = true
 time.workspace = true
 url.workspace = true
-getrandom.workspace = true
-thiserror.workspace = true
-uuid.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 http.workspace = true
+
+[dev-dependencies]
+omb-channel-sdk = { path = "../omb-channel-sdk", features = ["testkit"] }
+
+[[bin]]
+name = "openmybot-channel-telegram"
+path = "src/bin/openmybot_channel_telegram.rs"
+
+[[bin]]
+name = "openmybot-channel-feishu"
+path = "src/bin/openmybot_channel_feishu.rs"
+
+[[bin]]
+name = "fake-channel-platform"
+path = "src/bin/fake_channel_platform.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "telegram_plugin"
+required-features = ["testkit"]
+
+[[test]]
+name = "feishu_plugin"
+required-features = ["testkit"]

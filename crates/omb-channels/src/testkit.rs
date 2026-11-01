@@ -67,9 +67,10 @@ struct State {
     /// The last `message_id` an unscripted `sendMessage` answered with.
     message_id: Mutex<i64>,
 }
-/// `getUpdates` answers from a queue of pushed updates with Bot API offset semantics and an
-/// unscripted `sendMessage` succeeds with the next `message_id`; scripted answers take
-/// precedence, one per call of their method.
+/// `getUpdates` answers from a queue of pushed updates with Bot API offset semantics, an
+/// unscripted `sendMessage` succeeds with the next `message_id`, `getMe` answers the bot id of the
+/// token in the path and `getWebhookInfo` no webhook; scripted answers take precedence, one per
+/// call of their method.
 pub struct FakeTelegram {
     port: u16,
     state: Arc<State>,
@@ -271,6 +272,22 @@ async fn serve(mut stream: TcpStream, state: Arc<State>) {
                 serde_json::to_vec(&json!({"ok": true, "result": result})).unwrap(),
             )
         }
+        None if request.method == "getMe" => {
+            let id: i64 = request
+                .path
+                .strip_prefix("/bot")
+                .and_then(|token| token.split(':').next())
+                .and_then(|id| id.parse().ok())
+                .unwrap_or_default();
+            (
+                200,
+                serde_json::to_vec(&json!({"ok": true, "result": {"id": id, "is_bot": true}}))
+                    .unwrap(),
+            )
+        }
+        None if request.method == "getWebhookInfo" => {
+            (200, br#"{"ok":true,"result":{"url":""}}"#.to_vec())
+        }
         None => (
             404,
             br#"{"ok":false,"error_code":404,"description":"Not Found"}"#.to_vec(),
@@ -409,7 +426,17 @@ mod tests {
             Some((401, b"unauthorized".to_vec()))
         );
         assert_eq!(
-            exchange(fake.port(), "/bot1:t/getMe", b"").await.unwrap().0,
+            exchange(fake.port(), "/bot1:t/getMe", b"").await.unwrap(),
+            (
+                200,
+                br#"{"ok":true,"result":{"id":1,"is_bot":true}}"#.to_vec()
+            )
+        );
+        assert_eq!(
+            exchange(fake.port(), "/bot1:t/getChat", b"")
+                .await
+                .unwrap()
+                .0,
             404
         );
     }
