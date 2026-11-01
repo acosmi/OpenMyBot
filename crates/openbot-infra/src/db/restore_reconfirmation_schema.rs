@@ -167,9 +167,15 @@ fn expected() -> Result<Value, InfraError> {
         || value["format"] != "restore-reconfirmation-oracle-v1"
         || value["nativeVersion"] != 53
         || value["migrationSha256"] != Sha256Digest::of(MIGRATION_SQL.as_bytes()).to_hex()
-        || value["schema"].as_object().is_none_or(|object| object.len() != 2)
-        || value["schema"]["tables"].as_array().is_none_or(|rows| rows.len() != 5)
-        || value["schema"]["functions"].as_array().is_none_or(|rows| rows.len() != 2)
+        || value["schema"]
+            .as_object()
+            .is_none_or(|object| object.len() != 2)
+        || value["schema"]["tables"]
+            .as_array()
+            .is_none_or(|rows| rows.len() != 5)
+        || value["schema"]["functions"]
+            .as_array()
+            .is_none_or(|rows| rows.len() != 2)
     {
         return Err(invalid());
     }
@@ -182,14 +188,18 @@ async fn verify_additive_on<C: GenericClient + Sync>(client: &C) -> Result<(), I
     let row = client
         .query_one(CATALOG_SQL, &[&limit])
         .await
-        .map_err(|source| InfraError::query("只读核验恢复重确认 catalog", source))?;
+        .map_err(|source| {
+            InfraError::query("read-only restore reconfirmation catalog check", source)
+        })?;
     let raw_valid: bool = row.try_get("raw_valid").map_err(|source| {
         RowDecodeError::column("(restore_reconfirmation_schema)", "raw_valid", source)
     })?;
     let payload: Option<String> = row.try_get("facts").map_err(|source| {
         RowDecodeError::column("(restore_reconfirmation_schema)", "facts", source)
     })?;
-    let payload = payload.filter(|text| text.len() <= MAX_CATALOG_BYTES).ok_or_else(invalid)?;
+    let payload = payload
+        .filter(|text| text.len() <= MAX_CATALOG_BYTES)
+        .ok_or_else(invalid)?;
     let actual: Value = serde_json::from_str(&payload).map_err(|_| invalid())?;
     if !raw_valid || actual != expected["schema"] {
         return Err(invalid());

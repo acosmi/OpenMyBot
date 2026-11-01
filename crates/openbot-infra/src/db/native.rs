@@ -1250,7 +1250,8 @@ pub(crate) async fn apply_through_in_transaction(
     } else if max_version == NATIVE_0051_VERSION {
         validate_custom_model_v2_legacy_0051_in_transaction(transaction).await?;
     } else if max_version == NATIVE_0052_VERSION {
-        validate_custom_model_v2_legacy_0052_in_transaction(transaction).await?;
+        validate_custom_model_v2_layout_in_transaction(transaction, NATIVE_0052_VERSION, 40)
+            .await?;
     } else if max_version == NATIVE_0053_VERSION {
         validate_custom_model_v2_in_transaction(transaction).await?;
     }
@@ -1310,71 +1311,29 @@ pub(crate) async fn validate_custom_model_catalog_in_transaction(
         .map_err(|_| invalid())
 }
 
-/// Explicit pre-upgrade 0013--0052 prefix and all original model/history schemas.
-/// Only the exact migration target52 calls this observer; it grants no current admission.
-async fn validate_custom_model_v2_legacy_0052_in_transaction(
-    tx: &tokio_postgres::Transaction<'_>,
-) -> Result<(), InfraError> {
-    let invalid = || InfraError::repository_invariant("custom_model_v2_native_prefix_invalid");
-    let rows = tx
-        .query(
-            "SELECT version,name,checksum FROM openbot_internal.schema_migrations ORDER BY version,name,checksum LIMIT 41",
-            &[],
-        )
-        .await
-        .map_err(|source| InfraError::query("核验原事务 legacy0052 native 前缀", source))?;
-    if NATIVE_MIGRATION_COUNT != 41 || rows.len() != 40 {
-        return Err(invalid());
-    }
-    for (index, row) in rows.iter().enumerate() {
-        let version: i32 = row
-            .try_get("version")
-            .map_err(|source| RowDecodeError::column(LEDGER_ROW_LABEL, "version", source))?;
-        let name: String = row
-            .try_get("name")
-            .map_err(|source| RowDecodeError::column(LEDGER_ROW_LABEL, "name", source))?;
-        let checksum: String = row
-            .try_get("checksum")
-            .map_err(|source| RowDecodeError::column(LEDGER_ROW_LABEL, "checksum", source))?;
-        let expected = MIGRATIONS.get(index).ok_or_else(invalid)?;
-        let contiguous = NATIVE_0013_VERSION
-            .checked_add(i32::try_from(index).map_err(|_| invalid())?)
-            .ok_or_else(invalid)?;
-        if version != contiguous
-            || expected.version != contiguous
-            || name != expected.name
-            || checksum != Sha256Digest::of(expected.sql.as_bytes()).to_hex()
-        {
-            return Err(invalid());
-        }
-    }
-    if MIGRATIONS.get(39).map(|migration| migration.version) != Some(NATIVE_0052_VERSION) {
-        return Err(invalid());
-    }
-    super::custom_model_catalog_schema::verify_in_transaction(tx)
-        .await
-        .map_err(|error| match error {
-            super::custom_model_catalog_schema::CustomModelCatalogSchemaError::Unavailable => {
-                InfraError::repository_invariant("custom_model_v2_schema_observation_unavailable")
-            }
-            _ => InfraError::repository_invariant("custom_model_v2_catalog_schema_invalid"),
-        })?;
-    super::custom_model_v2_schema::verify_in_transaction(tx).await?;
-    super::gateway_authorization_schema::verify_in_transaction(tx).await?;
-    super::thread_origin_schema::verify_in_transaction(tx).await?;
-    super::thread_history_writer_schema::verify_in_transaction(tx).await
-}
-
-/// Exact current53 prefix, original complete graphs and additive restore catalog.
+/// Exact current prefix, original complete graphs and additive restore catalog.
 /// No client checkout, migration, repair, commit or rollback occurs in this observer.
 pub(crate) async fn validate_custom_model_v2_in_transaction(
     tx: &tokio_postgres::Transaction<'_>,
 ) -> Result<(), InfraError> {
+    validate_custom_model_v2_layout_in_transaction(
+        tx,
+        NATIVE_LATEST_VERSION,
+        NATIVE_MIGRATION_COUNT,
+    )
+    .await
+}
+
+/// One ledger walk for both observers: the strict prior layout (latest 52,
+/// 40 rows) and the current layout (latest 53, 41 rows). Only the current
+/// layout also carries the additive restore catalog.
+async fn validate_custom_model_v2_layout_in_transaction(
+    tx: &tokio_postgres::Transaction<'_>,
+    latest: i32,
+    count: usize,
+) -> Result<(), InfraError> {
     let invalid = || InfraError::repository_invariant("custom_model_v2_native_prefix_invalid");
-    let limit = NATIVE_MIGRATION_COUNT
-        .checked_add(1)
-        .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(invalid)?;
+    let limit = i64::try_from(count + 1).map_err(|_| invalid())?;
     let rows = tx
         .query(
             "SELECT version,name,checksum FROM openbot_internal.schema_migrations ORDER BY version,name,checksum LIMIT $1",
@@ -1382,7 +1341,9 @@ pub(crate) async fn validate_custom_model_v2_in_transaction(
         )
         .await
         .map_err(|source| InfraError::query("核验原事务模型 V2 native 前缀", source))?;
-    if NATIVE_MIGRATION_COUNT != 41 || rows.len() != NATIVE_MIGRATION_COUNT {
+    if rows.len() != count
+        || MIGRATIONS.get(count - 1).map(|migration| migration.version) != Some(latest)
+    {
         return Err(invalid());
     }
     for (index, row) in rows.iter().enumerate() {
@@ -1406,9 +1367,6 @@ pub(crate) async fn validate_custom_model_v2_in_transaction(
         {
             return Err(invalid());
         }
-    }
-    if MIGRATIONS.last().map(|migration| migration.version) != Some(NATIVE_0053_VERSION) {
-        return Err(invalid());
     }
     super::custom_model_catalog_schema::verify_in_transaction(tx)
         .await
@@ -1422,7 +1380,10 @@ pub(crate) async fn validate_custom_model_v2_in_transaction(
     super::gateway_authorization_schema::verify_in_transaction(tx).await?;
     super::thread_origin_schema::verify_in_transaction(tx).await?;
     super::thread_history_writer_schema::verify_in_transaction(tx).await?;
-    super::restore_reconfirmation_schema::verify_in_transaction(tx).await
+    if latest == NATIVE_LATEST_VERSION {
+        super::restore_reconfirmation_schema::verify_in_transaction(tx).await?;
+    }
+    Ok(())
 }
 /// Exact current 0013--0053 ledger, journal, origin, writer and additive restore schemas.
 /// This observer never checks out a client or migrates, repairs or closes a transaction.
@@ -2220,5 +2181,24 @@ mod tests {
         assert_eq!(NATIVE_0052_SQL.matches("ADD CONSTRAINT thread_history_clear_intents_kind_check CHECK(intent_kind IN('stop_clear','maintenance_clear'));").count(), 1);
         assert_eq!(NATIVE_0051_SQL.matches("$$").count(), 30);
         assert_eq!(NATIVE_0050_SQL.matches("$$").count(), 14);
+    }
+
+    #[test]
+    fn t046_21_native_0053_checksum_is_computed_from_sql_bytes() {
+        use sha2::Digest as _;
+        let hex = |bytes: &[u8]| format!("{:x}", sha2::Sha256::digest(bytes));
+        assert_eq!(native_0053_checksum(), hex(NATIVE_0053_SQL.as_bytes()));
+        assert_eq!(
+            native_0053_checksum(),
+            "865c13ccbae7e53f642df010221c29e648c775c3aa26e1014e130e53778c8988"
+        );
+        assert_eq!(MIGRATIONS.len(), 41);
+        assert_eq!(MIGRATIONS[40].name, NATIVE_0053_NAME);
+        assert_eq!(NATIVE_0052_SQL.len(), 60390);
+        assert_eq!(
+            hex(NATIVE_0052_SQL.as_bytes()),
+            "04d821be27ef4304101c144c7545bfc1caed3ced1725b6065c126330ce40012d"
+        );
+        assert_eq!(native_0052_checksum(), hex(NATIVE_0052_SQL.as_bytes()));
     }
 }

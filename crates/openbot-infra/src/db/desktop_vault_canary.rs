@@ -644,7 +644,8 @@ pub async fn verify_pre_upgrade_layout(
     bounded(async {
         let client = client(pool).await?;
         verify_pre_upgrade_layout_on(&client).await
-    }).await
+    })
+    .await
 }
 
 /// Same original authenticated readonly client. The original startup owner
@@ -677,9 +678,7 @@ pub(crate) async fn verify_pre_upgrade_layout_on(
     if ledger.latest_version() >= native::NATIVE_0046_VERSION {
         super::custom_model_catalog_schema::verify(client)
             .await
-            .map_err(|_| {
-                InfraError::repository_invariant("custom_model_catalog_schema_invalid")
-            })?;
+            .map_err(|_| InfraError::repository_invariant("custom_model_catalog_schema_invalid"))?;
     }
     if ledger.latest_version() >= native::NATIVE_0047_VERSION {
         super::custom_model_v2_schema::verify(client).await?;
@@ -690,13 +689,13 @@ pub(crate) async fn verify_pre_upgrade_layout_on(
     if ledger.latest_version() == native::NATIVE_0049_VERSION {
         super::thread_origin_schema::verify_legacy0049(client).await?;
     }
-    if ledger.latest_version()==native::NATIVE_0050_VERSION {
+    if ledger.latest_version() == native::NATIVE_0050_VERSION {
         super::thread_origin_schema::verify_legacy0050(client).await?;
-    } else if ledger.latest_version()==native::NATIVE_0051_VERSION {
+    } else if ledger.latest_version() == native::NATIVE_0051_VERSION {
         super::thread_origin_schema::verify_legacy0051(client).await?;
-    } else if ledger.latest_version()==native::NATIVE_0052_VERSION {
+    } else if ledger.latest_version() == native::NATIVE_0052_VERSION {
         super::thread_origin_schema::verify_legacy0052(client).await?;
-    } else if ledger.latest_version()==native::NATIVE_0053_VERSION {
+    } else if ledger.latest_version() == native::NATIVE_0053_VERSION {
         super::thread_origin_schema::verify(client).await?;
     }
     Ok(ValidatedDesktopVaultLayout {
