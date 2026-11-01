@@ -3,6 +3,7 @@ use crate::{
     command, finish, rows, timely, unique_rows,
 };
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use subtle::ConstantTimeEq;
 use tokio::time::Instant;
 use tokio_postgres::Client;
@@ -10,25 +11,24 @@ use uuid::Uuid;
 
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Channel {
-    Telegram,
-    Feishu,
-}
-impl Channel {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Telegram => "telegram",
-            Self::Feishu => "feishu",
-        }
+/// Channel kind: `^[a-z][a-z0-9_]{0,31}$` and not `host`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ChannelKind(Cow<'static, str>);
+impl ChannelKind {
+    /// Unchecked; only for in-repository literals.
+    pub const fn from_static(s: &'static str) -> Self {
+        Self(Cow::Borrowed(s))
     }
-    /// The channel of a stored `channel_kind`; any other text is not a channel.
-    pub(crate) fn parse(text: &str) -> Option<Channel> {
-        match text {
-            "telegram" => Some(Self::Telegram),
-            "feishu" => Some(Self::Feishu),
-            _ => None,
-        }
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut bytes = text.bytes();
+        (text.len() <= 32
+            && text != "host"
+            && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+            && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+        .then(|| Self(Cow::Owned(text.to_owned())))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -74,7 +74,7 @@ fn code_hash(binding_id: Uuid, code: &str) -> [u8; 32] {
 }
 
 pub struct PairStart<'a> {
-    pub channel: Channel,
+    pub channel: ChannelKind,
     /// Already verified real path.
     pub workspace_dir: &'a str,
     pub thread_id: &'a str,
@@ -141,7 +141,7 @@ pub struct AcceptedEvent<'a> {
     pub event_type: Option<&'a str>,
 }
 pub struct PairAttempt<'a> {
-    pub channel: Channel,
+    pub channel: ChannelKind,
     /// The active receiver's source, read and share-locked by the caller's transaction.
     pub receiver_source_key: &'a str,
     pub sender_key: &'a IdentityKey,
@@ -246,14 +246,12 @@ mod tests {
         assert_ne!(code_hash(Uuid::now_v7(), "ABCD2345"), expected);
     }
     #[test]
-    fn channel_parse_inverts_as_str_and_refuses_other_text() {
-        assert_eq!(Channel::parse("telegram"), Some(Channel::Telegram));
-        assert_eq!(Channel::parse("feishu"), Some(Channel::Feishu));
-        for channel in [Channel::Telegram, Channel::Feishu] {
-            assert_eq!(Channel::parse(channel.as_str()), Some(channel));
+    fn channel_kind_parse_accepts_the_pattern_and_refuses_host() {
+        for text in ["telegram", "feishu", "slack", "a_b1"] {
+            assert_eq!(ChannelKind::parse(text).unwrap().as_str(), text);
         }
-        for text in ["host", "", "Telegram", "feishu ", " telegram"] {
-            assert_eq!(Channel::parse(text), None, "{text:?}");
+        for text in ["host", "", "Telegram", "feishu ", " telegram", "a-b"] {
+            assert_eq!(ChannelKind::parse(text), None, "{text:?}");
         }
     }
 }

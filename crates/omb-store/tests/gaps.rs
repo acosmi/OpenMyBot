@@ -1,9 +1,9 @@
 //! Heartbeat, interruption intervals, receiver suspension and the status view against an own
 //! PostgreSQL 17.11 cluster.
 use omb_store::{
-    Channel, ControlTokenStart, PollGapReason, Suspension, channel_status, close_poll_gaps,
-    migrate, open_poll_gap, read_heartbeat, reconfirm_binding, record_startup_gaps,
-    start_control_token, stop_control_token, suspend_receiver,
+    ChannelKind, ControlTokenStart, PollGapReason, Suspension, channel_status, close_poll_gaps,
+    migrate, open_plugin_missing_gap, open_poll_gap, read_heartbeat, reconfirm_binding,
+    record_startup_gaps, start_control_token, stop_control_token, suspend_receiver,
     testkit::{Fixture, Session, deadline, insert_receiver, insert_sender},
     touch_heartbeat,
 };
@@ -452,6 +452,78 @@ async fn close_poll_gaps_leaves_other_reasons_open() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn plugin_missing_gap_opens_for_a_plugin_receiver() {
+    let env = Env::new().await;
+    let slack = insert_receiver(&env.session.client, "slack", "T1").await;
+    open_plugin_missing_gap(&env.session.client, slack, deadline())
+        .await
+        .unwrap();
+    let rows = gaps(&env.session.client).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].0, rows[0].1.as_str(), rows[0].3),
+        (slack, "plugin_missing", None)
+    );
+    let row = env.session.client.query_one("SELECT channel_kind,source_key,disposition,event_key='gap:'||record_id FROM openmybot.channel_events WHERE record_kind='gap'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "slack");
+    assert_eq!(row.get::<_, String>(1), "T1");
+    assert_eq!(row.get::<_, String>(2), "gap");
+    assert!(row.get::<_, bool>(3));
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn open_plugin_missing_gap_does_not_reopen_an_open_gap() {
+    let env = Env::new().await;
+    for _ in 0..3 {
+        open_plugin_missing_gap(&env.session.client, env.telegram, deadline())
+            .await
+            .unwrap();
+    }
+    let rows = gaps(&env.session.client).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].1.as_str(), rows[0].3), ("plugin_missing", None));
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn close_poll_gaps_closes_plugin_missing_gap() {
+    let mut env = Env::new().await;
+    open_plugin_missing_gap(&env.session.client, env.telegram, deadline())
+        .await
+        .unwrap();
+    open_poll_gap(
+        &mut env.session.client,
+        env.telegram,
+        PollGapReason::ConnectFailed,
+        deadline(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        close_poll_gaps(&mut env.session.client, env.telegram, deadline())
+            .await
+            .unwrap(),
+        2
+    );
+    let rows = gaps(&env.session.client).await;
+    assert!(
+        rows.iter()
+            .all(|(_, _, started, ended)| ended.unwrap() >= *started)
+    );
+    open_plugin_missing_gap(&env.session.client, env.telegram, deadline())
+        .await
+        .unwrap();
+    let rows = gaps(&env.session.client).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!((rows[2].1.as_str(), rows[2].3), ("plugin_missing", None));
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn suspend_receiver_sets_status_reason_and_opens_receiver_suspended_gap() {
     let mut env = Env::new().await;
     let feishu = insert_receiver(&env.session.client, "feishu", "cli_app").await;
@@ -669,15 +741,15 @@ async fn status_counts_pending_dispatch_per_receiver() {
         }
     }
     let status = channel_status(&env.session.client).await.unwrap();
-    let pending: Vec<(Channel, Uuid, u64)> = status
+    let pending: Vec<(ChannelKind, Uuid, u64)> = status
         .iter()
-        .map(|s| (s.channel, s.binding_id, s.pending_dispatch))
+        .map(|s| (s.channel.clone(), s.binding_id, s.pending_dispatch))
         .collect();
     assert_eq!(
         pending,
         [
-            (Channel::Feishu, feishu, 1),
-            (Channel::Telegram, env.telegram, 3)
+            (ChannelKind::from_static("feishu"), feishu, 1),
+            (ChannelKind::from_static("telegram"), env.telegram, 3)
         ]
     );
     env.stop().await;

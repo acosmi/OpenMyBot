@@ -574,7 +574,7 @@ impl Postgres {
     }
     pub async fn list_active_receivers(
         &mut self,
-        channel: omb_store::Channel,
+        channel: omb_store::ChannelKind,
     ) -> Result<Vec<omb_store::ReceiverRow>, DaemonError> {
         self.binding_call(async |client, _| omb_store::list_active_receivers(client, channel).await)
             .await

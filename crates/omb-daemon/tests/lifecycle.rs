@@ -739,7 +739,7 @@ async fn daemon_runs_store_migrations_before_control_token_publication() {
         fixture.spawn("daemon_runs_store_migrations_before_control_token_publication");
     wait_for_token(&fixture).await;
     let rows=query_own(&fixture,"SELECT (SELECT count(*)::bigint FROM openmybot.omb_migrations),(SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='openmybot')").await;
-    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
     assert_eq!(rows[0].get::<_, i64>(1), 6);
     fixture.ready().await;
     let token = fs::read(fixture.root.join("run/control.token")).unwrap();

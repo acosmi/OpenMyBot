@@ -445,9 +445,9 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::{fixture::Fixture, *};
+    use omb_channels::TELEGRAM;
     use omb_store::{
-        AcceptedEvent, Channel, HostBinding, IdentityKey, PairAttempt, PairOutcome, PairStart,
-        RunDeadline,
+        AcceptedEvent, HostBinding, IdentityKey, PairAttempt, PairOutcome, PairStart, RunDeadline,
     };
     use openbot_application::{BeginDelegatedThreadRun, tenant::package::TenantPackageEnvironment};
     use openbot_contracts::{
@@ -488,7 +488,7 @@ mod tests {
         omb_store::pair_start(
             client,
             PairStart {
-                channel: Channel::Telegram,
+                channel: TELEGRAM,
                 workspace_dir: "/workspaces/project",
                 thread_id: "thread-1",
                 granted_generation: 4,
@@ -507,7 +507,7 @@ mod tests {
         let outcome = omb_store::pair_attempt(
             &tx,
             PairAttempt {
-                channel: Channel::Telegram,
+                channel: TELEGRAM,
                 receiver_source_key: "1001",
                 sender_key: &key,
                 chat_key: &key,

@@ -6,12 +6,12 @@ use crate::{
     pg::{AuthorityConnection, Postgres, map_store_error},
 };
 use omb_channels::{
-    CancelRequests, Connection, Counters, Endpoints, FEISHU_NOTE, ReceiverContext, TELEGRAM_NOTE,
-    Task, Timings, start_dispatcher, start_heartbeat, start_receiver,
+    CancelRequests, Connection, Counters, Endpoints, FEISHU, FEISHU_NOTE, ReceiverContext,
+    TELEGRAM, TELEGRAM_NOTE, Task, Timings, start_dispatcher, start_heartbeat, start_receiver,
 };
 use omb_channels::{SenderContext, start_sender};
 use omb_hostdriver::{CC_KILL_GRACE, CC_TERM_GRACE};
-use omb_store::{Channel, ReceiverRow};
+use omb_store::ReceiverRow;
 use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::ActorId;
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
@@ -57,11 +57,7 @@ impl StatusSource {
             .into_iter()
             .map(|receiver| {
                 Ok(ChannelStatus {
-                    channel: match receiver.channel {
-                        Channel::Telegram => "telegram",
-                        Channel::Feishu => "feishu",
-                    }
-                    .to_owned(),
+                    channel: receiver.channel.as_str().to_owned(),
                     binding_id: receiver.binding_id.to_string(),
                     status: receiver.status,
                     status_reason: receiver.status_reason,
@@ -80,9 +76,10 @@ impl StatusSource {
                             })
                         })
                         .collect::<Result<_, DaemonError>>()?,
-                    note: match receiver.channel {
-                        Channel::Telegram => TELEGRAM_NOTE,
-                        Channel::Feishu => FEISHU_NOTE,
+                    note: match receiver.channel.as_str() {
+                        "telegram" => TELEGRAM_NOTE,
+                        "feishu" => FEISHU_NOTE,
+                        _ => "",
                     }
                     .to_owned(),
                     counters: counters.clone(),
@@ -128,8 +125,8 @@ impl Channels {
         gate: Arc<Mutex<HashSet<String>>>,
     ) -> Result<Self, DaemonError> {
         postgres.record_startup_gaps(token_id).await?;
-        let telegram = postgres.list_active_receivers(Channel::Telegram).await?;
-        let feishu = postgres.list_active_receivers(Channel::Feishu).await?;
+        let telegram = postgres.list_active_receivers(TELEGRAM).await?;
+        let feishu = postgres.list_active_receivers(FEISHU).await?;
         let entry = engine
             .assembly
             .delegated_entry
@@ -239,9 +236,10 @@ impl Channels {
         postgres: &mut Postgres,
         row: ReceiverRow,
     ) -> Result<(), DaemonError> {
-        let slot = match row.channel {
-            Channel::Telegram => &mut self.telegram,
-            Channel::Feishu => &mut self.feishu,
+        let slot = match row.channel.as_str() {
+            "telegram" => &mut self.telegram,
+            "feishu" => &mut self.feishu,
+            _ => return Err(DaemonError::InternalError),
         };
         if let Some((_, task)) = slot.take() {
             task.stop().await;
@@ -422,7 +420,7 @@ mod tests {
         let started = pair_start(
             &mut client,
             PairStart {
-                channel: Channel::Telegram,
+                channel: TELEGRAM,
                 workspace_dir: "/workspaces/project",
                 thread_id: minted.thread_id.as_str(),
                 granted_generation: generation,
@@ -438,7 +436,7 @@ mod tests {
             .unwrap()
             .get(0);
         let event = |key: &str, text: String, pair_code: Option<String>| NormalizedEvent {
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             event_key: key.into(),
             event_type: "telegram.message".into(),
@@ -1039,7 +1037,7 @@ mod tests {
         let binding_id = fixture::receiver(client, "telegram").await;
         ReceiverRow {
             binding_id,
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: resealed(fixture, client, binding_id, token).await,
         }
@@ -1171,7 +1169,7 @@ mod tests {
         let envelope = resealed(&fixture, &client, binding, "1001:token-b").await;
         let second = ReceiverRow {
             binding_id: binding,
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: envelope.clone(),
         };
@@ -1213,7 +1211,7 @@ mod tests {
         let seen = fake.calls("getUpdates").len();
         let third = ReceiverRow {
             binding_id: binding,
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             credential_envelope: envelope,
         };
@@ -2068,7 +2066,7 @@ mod tests {
             .unwrap()
             .get(0);
         let status = NormalizedEvent {
-            channel: Channel::Telegram,
+            channel: TELEGRAM,
             source_key: "1001".into(),
             event_key: "20".into(),
             event_type: "telegram.message".into(),
@@ -2151,7 +2149,7 @@ mod tests {
             .unwrap();
         ReceiverRow {
             binding_id,
-            channel: Channel::Feishu,
+            channel: FEISHU,
             source_key: "cli_a".into(),
             credential_envelope,
         }
@@ -2488,7 +2486,7 @@ mod tests {
         let started_pair = pair_start(
             &mut client,
             PairStart {
-                channel: Channel::Feishu,
+                channel: FEISHU,
                 workspace_dir: "/workspaces/project",
                 thread_id: minted.thread_id.as_str(),
                 granted_generation: generation,

@@ -1,6 +1,6 @@
 //! Store functions of the owner's control operations against an own PostgreSQL 17.11 cluster.
 use omb_store::{
-    AcceptOutcome, AcceptedEvent, Channel, Claim, Command, Content, Disposition, IdentityKey,
+    AcceptOutcome, AcceptedEvent, ChannelKind, Claim, Command, Content, Disposition, IdentityKey,
     NewReceiver, NormalizedEvent, OpenRun, PairAttempt, PairOutcome, PairStart, ReplyTexts,
     ResetDone, SessionStart, Settled, StateLabels, StoreError, Suspension, accept_event,
     activate_host, activate_receiver, claim_dispatch, list_bindings, migrate, open_run,
@@ -84,7 +84,7 @@ async fn event(client: &Client, id: Uuid) -> serde_json::Value {
 async fn suspend(client: &Client, id: Uuid) {
     assert_eq!(client.execute("UPDATE openmybot.channel_bindings SET status='suspended',status_reason='restore_detected',suspended_at=statement_timestamp() WHERE binding_id=$1", &[&id]).await.unwrap(), 1);
 }
-async fn pending_sender(client: &mut Client, channel: Channel) -> Uuid {
+async fn pending_sender(client: &mut Client, channel: ChannelKind) -> Uuid {
     pair_start(
         client,
         PairStart {
@@ -111,7 +111,7 @@ async fn receive(client: &mut Client, id: Uuid, source_key: &str) -> Settled {
         client,
         NewReceiver {
             binding_id: id,
-            channel: Channel::Telegram,
+            channel: ChannelKind::from_static("telegram"),
             source_key,
             credential_envelope: "sealed-envelope",
         },
@@ -122,7 +122,7 @@ async fn receive(client: &mut Client, id: Uuid, source_key: &str) -> Settled {
 }
 fn command(key: &str, body: &str, command: Command) -> NormalizedEvent {
     NormalizedEvent {
-        channel: Channel::Telegram,
+        channel: ChannelKind::from_static("telegram"),
         source_key: "1001".into(),
         event_key: key.into(),
         event_type: "telegram.message".into(),
@@ -170,8 +170,16 @@ async fn list_bindings_returns_live_rows_only_without_secret_columns() {
         "envelope-sentinel",
     )
     .await;
-    let expired = pending_sender(&mut env.session.client, Channel::Telegram).await;
-    let pending = pending_sender(&mut env.session.client, Channel::Telegram).await;
+    let expired = pending_sender(
+        &mut env.session.client,
+        ChannelKind::from_static("telegram"),
+    )
+    .await;
+    let pending = pending_sender(
+        &mut env.session.client,
+        ChannelKind::from_static("telegram"),
+    )
+    .await;
     let revoked = insert_host_binding(env.client(), "/workspaces/old").await;
     revoke_binding(&mut env.session.client, revoked, deadline())
         .await
@@ -374,7 +382,11 @@ async fn revoke_receiver_cascades_active_sender_to_revoked_owner_revoked() {
 async fn revoke_receiver_cascades_pending_sender_to_expired_owner_revoked() {
     let mut env = Env::new().await;
     let receiver = insert_receiver(env.client(), "telegram", "1001").await;
-    let pending = pending_sender(&mut env.session.client, Channel::Telegram).await;
+    let pending = pending_sender(
+        &mut env.session.client,
+        ChannelKind::from_static("telegram"),
+    )
+    .await;
     revoke_binding(&mut env.session.client, receiver, deadline())
         .await
         .unwrap();
@@ -424,8 +436,16 @@ async fn revoke_of_ended_or_unknown_binding_is_refused_without_changes() {
     revoke_binding(&mut env.session.client, revoked, deadline())
         .await
         .unwrap();
-    let expired = pending_sender(&mut env.session.client, Channel::Telegram).await;
-    pending_sender(&mut env.session.client, Channel::Telegram).await;
+    let expired = pending_sender(
+        &mut env.session.client,
+        ChannelKind::from_static("telegram"),
+    )
+    .await;
+    pending_sender(
+        &mut env.session.client,
+        ChannelKind::from_static("telegram"),
+    )
+    .await;
     let before = snapshot(env.client()).await;
     for id in [revoked, expired] {
         assert_eq!(
@@ -588,7 +608,13 @@ async fn activate_receiver_cascades_pending_to_expired_and_active_suspended_to_r
     insert_receiver(env.client(), "telegram", "1001").await;
     for state in ["pending", "active", "suspended"] {
         let sender = match state {
-            "pending" => pending_sender(&mut env.session.client, Channel::Telegram).await,
+            "pending" => {
+                pending_sender(
+                    &mut env.session.client,
+                    ChannelKind::from_static("telegram"),
+                )
+                .await
+            }
             _ => insert_sender(env.client(), "telegram", "1001", SENDER, "thread-T").await,
         };
         if state == "suspended" {
@@ -676,7 +702,7 @@ async fn activate_receiver_failure_rolls_back_old_receiver_and_senders() {
             &mut env.session.client,
             NewReceiver {
                 binding_id: sender,
-                channel: Channel::Telegram,
+                channel: ChannelKind::from_static("telegram"),
                 source_key: "1001",
                 credential_envelope: "sealed-envelope",
             },
@@ -859,7 +885,11 @@ async fn reset_thread_refuses_host_receiver_pending_and_ended_bindings() {
     let host = insert_host_binding(env.client(), "/workspaces/host").await;
     let host_run = dispatched(env.client(), host, "rh", "thread-H").await;
     set_terminal(env.client(), host_run, "reconciliation_required").await;
-    let pending = pending_sender(&mut env.session.client, Channel::Telegram).await;
+    let pending = pending_sender(
+        &mut env.session.client,
+        ChannelKind::from_static("telegram"),
+    )
+    .await;
     let ended = insert_sender(env.client(), "feishu", "cli_app", "feishu:ou_1", "thread-F").await;
     let ended_run = dispatched(env.client(), ended, "rf", "thread-F").await;
     set_terminal(env.client(), ended_run, "reconciliation_required").await;
@@ -1190,7 +1220,7 @@ async fn pair_attempt_uses_the_passed_receiver_source_key_and_reads_no_receiver_
     let started = pair_start(
         &mut env.session.client,
         PairStart {
-            channel: Channel::Telegram,
+            channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-P",
             granted_generation: 1,
@@ -1212,7 +1242,7 @@ async fn pair_attempt_uses_the_passed_receiver_source_key_and_reads_no_receiver_
     let outcome = pair_attempt(
         &tx,
         PairAttempt {
-            channel: Channel::Telegram,
+            channel: ChannelKind::from_static("telegram"),
             receiver_source_key: "1001",
             sender_key: &key,
             chat_key: &key,
