@@ -1,0 +1,28 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openmybot-channel-feishu",
+  "version": "0.0.0",
+  "description": "Feishu channel plugin for the local OpenMyBot daemon.",
+  "extensions": {
+    "org.openmybot": {
+      "channels": {
+        "feishu": {
+          "protocol": "openmybot-channel/1",
+          "command": "./bin/openmybot-channel-feishu",
+          "args": [],
+          "credential_fields": [
+            {
+              "name": "app_id",
+              "secret": false
+            },
+            {
+              "name": "app_secret",
+              "secret": true
+            }
+          ],
+          "status_note": "feishu 长连接；断开区间内的事件丢失，不补回"
+        }
+      }
+    }
+  }
+}

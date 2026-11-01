@@ -239,7 +239,8 @@ impl ChannelPlugin for Fake {
                 .append(true)
                 .open(path)
                 .expect("sent log");
-            writeln!(log, "{line}").expect("sent log");
+            log.write_all(format!("{line}\n").as_bytes())
+                .expect("sent log");
         }
         match &self.scenario {
             Scenario::SendHang => std::future::pending().await,
@@ -290,8 +291,9 @@ async fn relay(recv_log: PathBuf, args: Vec<String>) -> ExitCode {
             status = plugin.wait() => exit(status),
             frame = read_frame(&mut stdin) => {
                 let Ok(Some(payload)) = frame else { break };
-                log.write_all(&payload).expect("recv log");
-                log.write_all(b"\n").expect("recv log");
+                let mut line = payload.clone();
+                line.push(b'\n');
+                log.write_all(&line).expect("recv log");
                 if write_frame(&mut input, &payload).await.is_err() {
                     break;
                 }

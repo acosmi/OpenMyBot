@@ -54,6 +54,10 @@ pub enum Command {
     PluginsAdd {
         dir: PathBuf,
     },
+    /// Installs a first-party plugin from the binaries shipped beside `openmybot`.
+    PluginsAddBuiltIn {
+        kind: String,
+    },
     PluginsRemove {
         name: String,
     },
@@ -109,6 +113,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["status"] => &["--run"],
         ["pair", _] | ["bindings", "host", "crabcode"] => &["--workspace", "--run-deadline"],
         ["bindings", "reset-thread", _] => &["--ack-unknown"],
+        ["plugins", "add"] => &["--built-in"],
         _ => &[],
     };
     // Subcommand flags are legal only after all command words.
@@ -183,6 +188,9 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["plugins", "add", dir] => Command::PluginsAdd {
             dir: absolute(&OsString::from(dir))?,
         },
+        ["plugins", "add"] => Command::PluginsAddBuiltIn {
+            kind: text("--built-in")?.ok_or(UsageError)?,
+        },
         ["plugins", "remove", name] => Command::PluginsRemove {
             name: (*name).into(),
         },
@@ -248,6 +256,7 @@ impl Command {
             Self::Cancel { run_id } => ("cancel", json!({"run_id": run_id})),
             Self::PluginsList => ("plugins_list", json!({})),
             Self::PluginsAdd { dir } => ("plugins_add", json!({"dir": dir})),
+            Self::PluginsAddBuiltIn { kind } => ("plugins_add", json!({"built_in": kind})),
             Self::PluginsRemove { name } => ("plugins_remove", json!({"name": name})),
         })
     }
@@ -595,6 +604,12 @@ mod tests {
             Ok(Command::PluginsAdd { dir: "/pkg".into() })
         );
         assert_eq!(
+            command(&["plugins", "add", "--built-in", "telegram"]),
+            Ok(Command::PluginsAddBuiltIn {
+                kind: "telegram".into()
+            })
+        );
+        assert_eq!(
             command(&["plugins", "remove", "fake"]),
             Ok(Command::PluginsRemove {
                 name: "fake".into()
@@ -604,7 +619,9 @@ mod tests {
             vec!["plugins"],
             vec!["plugins", "add"],
             vec!["plugins", "add", "pkg"],
-            vec!["plugins", "add", "--built-in", "telegram"],
+            vec!["plugins", "add", "/pkg", "--built-in", "telegram"],
+            vec!["plugins", "add", "--built-in", "telegram", "/pkg"],
+            vec!["plugins", "add", "--built-in"],
             vec!["plugins", "add", "/pkg", "--built-in"],
             vec!["plugins", "add", "/a", "/b"],
             vec!["plugins", "remove"],
@@ -710,6 +727,11 @@ mod tests {
                 vec!["plugins", "add", "/pkg"],
                 "plugins_add",
                 json!({"dir": "/pkg"}),
+            ),
+            (
+                vec!["plugins", "add", "--built-in", "feishu"],
+                "plugins_add",
+                json!({"built_in": "feishu"}),
             ),
             (
                 vec!["plugins", "remove", "fake"],

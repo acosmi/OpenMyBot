@@ -313,6 +313,44 @@ impl Plugins {
             replaces,
         })
     }
+    /// Stages a first-party plugin: its embedded manifest and `exe_dir/openmybot-channel-<kind>`
+    /// are put in a temporary package under `plugins/`, which `stage` checks and copies; the
+    /// temporary package is removed whatever the outcome.
+    pub(crate) fn stage_built_in(
+        &self,
+        kind: &ChannelKind,
+        exe_dir: &Path,
+        live: &HashSet<String>,
+    ) -> Result<Staged, DaemonError> {
+        let manifest = match kind.as_str() {
+            "telegram" => include_str!("../../../openmybot/plugins/telegram/plugin.json"),
+            "feishu" => include_str!("../../../openmybot/plugins/feishu/plugin.json"),
+            _ => return Err(DaemonError::InvalidRequest),
+        };
+        let binary = format!("openmybot-channel-{}", kind.as_str());
+        let plugins = self.root.join("plugins");
+        if !plugins.exists() {
+            config::make_dir(&plugins).map_err(|_| DaemonError::InternalError)?;
+        }
+        // A plugin name has no `.`, so this never collides with an installed or staged package.
+        let package = plugins.join(format!(".staging-{}", kind.as_str()));
+        if package.exists() {
+            fs::remove_dir_all(&package).map_err(|_| DaemonError::InternalError)?;
+        }
+        let staged = fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(package.join("bin"))
+            .and_then(|()| fs::write(package.join("plugin.json"), manifest))
+            .map_err(|_| DaemonError::InternalError)
+            .and_then(|()| {
+                fs::copy(exe_dir.join(&binary), package.join("bin").join(&binary))
+                    .map_err(|_| DaemonError::PluginInvalid)
+            })
+            .and_then(|_| self.stage(&package, live));
+        fs::remove_dir_all(&package).map_err(|_| DaemonError::InternalError)?;
+        staged
+    }
     /// Puts a staged package in place of the installed one and records it in the lock.
     pub(crate) fn commit(&self, staged: Staged) -> Result<Installed, DaemonError> {
         let Staged {
@@ -736,6 +774,64 @@ pub(crate) mod tests {
             serde_json::from_slice(&fs::read(root.join("plugins.lock.json")).unwrap()).unwrap();
         assert_eq!(lock, json!({"plugins": []}));
         for dir in [root, package] {
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn built_in_plugins_install_from_the_embedded_manifest_and_the_binary_beside_the_daemon() {
+        let root = config::test_dir();
+        let exe_dir = config::test_dir();
+        let plugins = Plugins::load(&root, Vec::new(), root.clone()).unwrap();
+        let kind = |name| ChannelKind::parse(name).unwrap();
+        let none = HashSet::new();
+        assert_eq!(
+            plugins
+                .stage_built_in(&kind("telegram"), &exe_dir, &none)
+                .err(),
+            Some(DaemonError::PluginInvalid)
+        );
+        assert_eq!(
+            plugins.stage_built_in(&kind("fake"), &exe_dir, &none).err(),
+            Some(DaemonError::InvalidRequest)
+        );
+        for (name, fields, note) in [
+            (
+                "telegram",
+                json!([{"name": "token", "secret": true}]),
+                "telegram 长轮询；中断区间内的更新在平台保留期内补回",
+            ),
+            (
+                "feishu",
+                json!([{"name": "app_id", "secret": false}, {"name": "app_secret", "secret": true}]),
+                "feishu 长连接；断开区间内的事件丢失，不补回",
+            ),
+        ] {
+            let binary = format!("openmybot-channel-{name}");
+            fs::copy(fake(), exe_dir.join(&binary)).unwrap();
+            let staged = plugins
+                .stage_built_in(&kind(name), &exe_dir, &none)
+                .unwrap();
+            let installed = plugins.commit(staged).unwrap();
+            assert_eq!(
+                (installed.name.as_str(), installed.version.as_str()),
+                (binary.as_str(), "0.0.0")
+            );
+            let channel = &installed.channels[name];
+            assert_eq!(channel.command, format!("./bin/{binary}"));
+            assert!(channel.args.is_empty());
+            assert_eq!(
+                serde_json::to_value(&channel.credential_fields).unwrap(),
+                fields
+            );
+            assert_eq!(channel.status_note, note);
+            assert_eq!(
+                mode(&root.join(format!("plugins/{binary}/bin/{binary}"))),
+                0o700
+            );
+            assert!(!root.join(format!("plugins/.staging-{name}")).exists());
+        }
+        assert_eq!(plugins.list().len(), 2);
+        for dir in [root, exe_dir] {
             fs::remove_dir_all(dir).unwrap();
         }
     }

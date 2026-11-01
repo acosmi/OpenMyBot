@@ -127,7 +127,8 @@ struct PermissionArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PluginsAddArgs {
-    dir: PathBuf,
+    dir: Option<PathBuf>,
+    built_in: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +150,7 @@ enum Request {
     Cancel(IdentityKey),
     PluginsList,
     PluginsAdd(PathBuf),
+    PluginsAddBuiltIn(ChannelKind),
     PluginsRemove(String),
 }
 fn decode<T: DeserializeOwned>(args: Value) -> Result<T, DaemonError> {
@@ -218,13 +220,17 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
             decode::<NoArgs>(args)?;
             Request::PluginsList
         }
-        Op::PluginsAdd => {
-            let dir = decode::<PluginsAddArgs>(args)?.dir;
-            if !dir.is_absolute() {
-                return Err(DaemonError::InvalidRequest);
-            }
-            Request::PluginsAdd(dir)
-        }
+        Op::PluginsAdd => match decode::<PluginsAddArgs>(args)? {
+            PluginsAddArgs {
+                dir: Some(dir),
+                built_in: None,
+            } if dir.is_absolute() => Request::PluginsAdd(dir),
+            PluginsAddArgs {
+                dir: None,
+                built_in: Some(built_in),
+            } => Request::PluginsAddBuiltIn(kind(&built_in)?),
+            _ => return Err(DaemonError::InvalidRequest),
+        },
         Op::PluginsRemove => Request::PluginsRemove(decode::<PluginsRemoveArgs>(args)?.name),
     })
 }
@@ -654,11 +660,21 @@ impl Ops {
                     .collect::<Vec<_>>();
                 Ok(json!({ "plugins": plugins }))
             }
-            Request::PluginsAdd(dir) => {
+            request @ (Request::PluginsAdd(_) | Request::PluginsAddBuiltIn(_)) => {
                 let client = self.control.lock().await;
-                let staged = self
-                    .plugins
-                    .stage(&dir, &self.live(&client, deadline).await?)?;
+                let live = self.live(&client, deadline).await?;
+                let staged = match request {
+                    Request::PluginsAdd(dir) => self.plugins.stage(&dir, &live)?,
+                    Request::PluginsAddBuiltIn(kind) => {
+                        // The first-party plugin binaries ship beside the `openmybot` binary.
+                        let exe = std::env::current_exe()
+                            .and_then(|exe| exe.canonicalize())
+                            .map_err(|_| DaemonError::InternalError)?;
+                        let exe_dir = exe.parent().expect("an executable has a directory");
+                        self.plugins.stage_built_in(&kind, exe_dir, &live)?
+                    }
+                    _ => unreachable!("matched as a plugin installation above"),
+                };
                 let replaces = staged.replaces.clone();
                 self.command(|done| ReceiverCommand::Retire(replaces, done), deadline)
                     .await?;
@@ -1328,7 +1344,19 @@ mod tests {
                     json!({}),
                     json!({"dir": "pkg"}),
                     json!({"dir": 1}),
+                    // Exactly one of `dir` and `built_in`.
                     json!({"dir": "/pkg", "built_in": "telegram"}),
+                    json!({"dir": null, "built_in": null}),
+                ],
+            ),
+            (
+                "plugins_add",
+                json!({"built_in": "telegram"}),
+                vec![
+                    json!({"built_in": 1}),
+                    json!({"built_in": "Telegram"}),
+                    json!({"built_in": "host"}),
+                    json!({"built_in": "telegram", "x": 1}),
                 ],
             ),
             (
