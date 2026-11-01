@@ -477,9 +477,28 @@ async fn exercise(prepared: &PreparedDesktopLocalRuntime) -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[ignore = "requires explicitly owned PostgreSQL17.11 binaries via OPENBOT_TEST_PG_BIN"]
-async fn artifact_deletion_real_local_window_deletes_and_stale_window_refuses() {
+fn artifact_deletion_real_local_window_deletes_and_stale_window_refuses() {
+    // An unoptimized build keeps every future temporary of the window -> Application -> cleanup
+    // producer chain in the frames of the polling thread, beyond the default 2 MiB test stack.
+    let polling = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(run())
+        })
+        .expect("test polling thread");
+    if let Err(panic) = polling.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn run() {
     let mut bundle = OwnedBundle::materialize().expect("owned PostgreSQL bundle");
     let mut root = OwnedRoot::new("app").expect("owned Local app-data root");
     // The sidecar data directory lives under this root until a real shutdown ACK.
