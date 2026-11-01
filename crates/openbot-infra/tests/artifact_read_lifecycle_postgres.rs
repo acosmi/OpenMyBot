@@ -270,6 +270,11 @@ impl Fixture {
             config,
             "lifecycle-core-fixture-owner".into(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|_| "owned_directory_failed")?;
         directory

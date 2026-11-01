@@ -319,6 +319,11 @@ impl Fixture {
             config.clone(),
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?;
         Ok(Self {
@@ -421,6 +426,11 @@ impl Fixture {
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?;
         let claim = runtime
@@ -538,6 +548,11 @@ impl Fixture {
                 PROCESS.into(),
                 DEFAULT_THREAD_LEASE_DURATION,
                 DEFAULT_DISPATCH_CLAIM_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(text)?,
         );
@@ -759,6 +774,12 @@ impl Fixture {
         let policy_store = PolicyStore::postgres(self.pool.clone(), None);
         policy_store.load().await.map_err(text)?;
         assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: self.pool.clone(),
             listener_database: self.config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -1709,6 +1730,7 @@ async fn thread_history_run_drain_streaming_and_custom_v2_start_window_terminate
             f.config.clone(),
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
         )
         .map_err(text)?
         .with_model_dataset_binding(Arc::clone(&binding))
@@ -2267,6 +2289,11 @@ async fn capture(
         auth.tenant().clone(),
         policy,
         Arc::clone(&captured),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &f.pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     );
     let journal = CapturingJournal(
         PostgresToolJournal::new(f.pool.clone(), AUDIT_KEY.to_vec()).map_err(text)?,

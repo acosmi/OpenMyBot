@@ -68,7 +68,7 @@ async fn history_is_ordered_scope_aware_empty_on_absence_and_structurally_valida
                 .map_err(|error| error.to_string())?;
             drop(client);
 
-            let directory = PostgresThreadDirectory::new(pool.clone());
+            let directory = PostgresThreadDirectory::new(pool.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")));
             let visible = ThreadHistoryRequest {
                 deployment: DeploymentId::new("dep-a"),
                 tenant: TenantId::new("tenant-a"),

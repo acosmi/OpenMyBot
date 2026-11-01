@@ -96,6 +96,11 @@ impl Fixture {
             OWNER.into(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap();
         let dispatch = runtime.claim_dispatch().await.unwrap().unwrap();
@@ -213,6 +218,11 @@ fn directory(
         config.clone(),
         OWNER.into(),
         DEFAULT_THREAD_LEASE_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .unwrap()
 }
@@ -413,6 +423,7 @@ async fn a_competing_runtime_lease_cannot_hide_visible_occupancy_corruption() {
             f.config.clone(),
             "competing-runtime".into(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
         ).unwrap();
         let mut request = f.begin.clone();
         request.command.run_id = RunId::new("competing-run");

@@ -201,6 +201,11 @@ pub async fn pipeline_with_journal_ids(
         auth.tenant().clone(),
         policy,
         memory.clone(),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     );
     let journal = CapturingJournal {
         inner: PostgresToolJournal::new(pool.clone(), KEY.to_vec()).map_err(|e| e.to_string())?,

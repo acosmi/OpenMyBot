@@ -490,6 +490,11 @@ impl Fixture {
             config.clone(),
             OWNER.into(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &reads,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         directory
@@ -559,6 +564,11 @@ impl Fixture {
             OWNER.into(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.worker,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         self.relay = Some(RunRelay::start(Arc::new(runtime), self.consumer.clone()));
@@ -883,7 +893,7 @@ async fn real_committed_ack_response_loss_revokes_and_original_run_recovers_once
                 let pid: i32 = c.query_one("SELECT pg_backend_pid()",&[]).await.map_err(|e| e.to_string())?.get(0);
                 require(pid != f.worker_pid && pid != f.observer.pid,"new recovery connection must be independent")?;
                 drop(c);
-                let runtime = PostgresRunRuntime::new(recovery_pool.clone(),OWNER.into(),DEFAULT_THREAD_LEASE_DURATION,DEFAULT_DISPATCH_CLAIM_DURATION).map_err(|e| e.to_string())?;
+                let runtime = PostgresRunRuntime::new(recovery_pool.clone(),OWNER.into(),DEFAULT_THREAD_LEASE_DURATION,DEFAULT_DISPATCH_CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&recovery_pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e| e.to_string())?;
                 // A different real connection using the original owner must not reclaim delivered
                 // dispatch, independently of the closed experiment worker pool.
                 require(runtime.claim_dispatch().await.map_err(|e| e.to_string())?.is_none(),"same-owner real runtime reclaimed delivered dispatch before expiry")?;

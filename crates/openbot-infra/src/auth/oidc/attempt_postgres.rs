@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use super::attempt::{
     CallbackLoginAttempt, LoginAttempt, LoginAttemptStorageRecord, PKCE_METHOD_S256,
+    ProviderIncarnationBinding,
 };
 use super::provider::ProviderId;
 use super::redirect::{CanonicalRedirectUri, HTTPS_OR_HTTP};
@@ -26,7 +27,7 @@ use super::redirect::{CanonicalRedirectUri, HTTPS_OR_HTTP};
 type HmacSha256 = Hmac<Sha256>;
 
 const ATTEMPT_LOCK_KEY: i64 = 0x4f50_4f49_4443_4131; // `OPOIDCA1`
-const STORAGE_VERSION: u8 = 1;
+const STORAGE_VERSION: u8 = 2;
 const MAX_STORED_VALUE_BYTES: usize = 16 * 1024;
 
 /// 持久化失败；无 URL/state/DB 原值。
@@ -51,6 +52,7 @@ pub enum PostgresAttemptError {
 struct StoredAttempt {
     version: u8,
     provider: String,
+    binding: ProviderIncarnationBinding,
     nonce: String,
     pkce_verifier: String,
     pkce_method: String,
@@ -215,11 +217,12 @@ impl PostgresLoginAttemptStore {
         }
         let redirect = CanonicalRedirectUri::parse(&stored.redirect_uri, HTTPS_OR_HTTP)
             .map_err(|_| PostgresAttemptError::Corrupt)?;
-        Ok(CallbackLoginAttempt::restore(
+        Ok(CallbackLoginAttempt::restore_bound(
             stored_provider,
             Nonce::new(stored.nonce),
             PkceCodeVerifier::new(stored.pkce_verifier),
             redirect,
+            stored.binding,
         ))
     }
 
@@ -253,9 +256,13 @@ impl core::fmt::Debug for PostgresLoginAttemptStore {
 }
 
 fn encode_record(record: LoginAttemptStorageRecord) -> Result<String, PostgresAttemptError> {
+    if !record.incarnation.valid() {
+        return Err(PostgresAttemptError::Corrupt);
+    }
     let value = serde_json::to_string(&StoredAttempt {
         version: STORAGE_VERSION,
         provider: record.provider,
+        binding: record.incarnation,
         nonce: record.nonce,
         pkce_verifier: record.pkce_verifier,
         pkce_method: record.pkce_method.to_owned(),
@@ -275,7 +282,7 @@ fn decode_record(value: &str) -> Result<StoredAttempt, PostgresAttemptError> {
     }
     let stored: StoredAttempt =
         serde_json::from_str(value).map_err(|_| PostgresAttemptError::Corrupt)?;
-    if stored.version != STORAGE_VERSION {
+    if stored.version != STORAGE_VERSION || !stored.binding.valid() {
         return Err(PostgresAttemptError::Corrupt);
     }
     Ok(stored)

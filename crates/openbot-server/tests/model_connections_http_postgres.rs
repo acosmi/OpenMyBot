@@ -154,6 +154,11 @@ async fn assemble(
     // This is the same production entry used by Server and Desktop. The test does not manually
     // inject PostgresModelConnections: a missing production assembly edge must make it fail.
     let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+        recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &pool,
+            &DeploymentId::new(DEPLOYMENT),
+            &tenant,
+        ),
         pool: pool.clone(),
         listener_database: config.clone().into(),
         deployment: DeploymentId::new(DEPLOYMENT),

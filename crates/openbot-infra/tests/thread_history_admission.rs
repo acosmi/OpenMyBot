@@ -370,6 +370,11 @@ async fn settle(p: &pool::DatabasePool, run: &str) -> TestResult {
         PROCESS.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(|e| e.to_string())?;
     let claim = runtime

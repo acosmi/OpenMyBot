@@ -17,7 +17,7 @@ use super::config::SsoProtocol;
 use crate::auth::oidc::ProviderId;
 
 type HmacSha256 = Hmac<Sha256>;
-const STORAGE_VERSION: u8 = 1;
+const STORAGE_VERSION: u8 = 2;
 const ROUTE_LOCK: i64 = 0x4f50_5353_4f52_5431; // `OPSSORT1`
 const SAML_LOCK: i64 = 0x4f50_5341_4d4c_4131; // `OPSAMLA1`
 const MAX_VALUE_BYTES: usize = 16 * 1024;
@@ -112,14 +112,25 @@ impl core::fmt::Debug for EphemeralCore {
 #[serde(deny_unknown_fields)]
 struct StoredRoute {
     version: u8,
-    provider_id: Option<String>,
-    protocol: Option<String>,
+    routing: StoredRouting,
     expires_at: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredRouting {
+    Unmatched {},
+    Matched {
+        provider_id: String,
+        protocol: String,
+        provider_internal_id: Uuid,
+    },
 }
 
 pub(crate) struct RoutedProvider {
     pub provider_id: ProviderId,
     pub protocol: SsoProtocol,
+    pub internal_id: Uuid,
 }
 
 #[derive(Clone)]
@@ -150,16 +161,28 @@ impl PostgresSsoRouteTicketStore {
     /// 命中与未命中都铸造同长度 ticket，外部响应无法携带 routing bit。
     pub(crate) async fn issue(
         &self,
-        routed: Option<(&ProviderId, SsoProtocol)>,
+        routed: Option<(&ProviderId, SsoProtocol, Uuid)>,
         now: OffsetDateTime,
     ) -> Result<String, SsoEphemeralError> {
+        let routing = match routed {
+            None => StoredRouting::Unmatched {},
+            Some((provider, protocol, provider_internal_id)) => {
+                if provider_internal_id.is_nil() {
+                    return Err(SsoEphemeralError::Corrupt);
+                }
+                StoredRouting::Matched {
+                    provider_id: provider.as_str().to_owned(),
+                    protocol: protocol_name(protocol).to_owned(),
+                    provider_internal_id,
+                }
+            }
+        };
         let ticket = random_token()?;
         let identifier = self.core.identifier("sso-route", &ticket)?;
         let expires_at = now + self.ttl;
         let value = serde_json::to_string(&StoredRoute {
             version: STORAGE_VERSION,
-            provider_id: routed.map(|(provider, _)| provider.as_str().to_owned()),
-            protocol: routed.map(|(_, protocol)| protocol_name(protocol).to_owned()),
+            routing,
             expires_at: expires_at.unix_timestamp(),
         })
         .map_err(|_| SsoEphemeralError::Corrupt)?;
@@ -191,14 +214,23 @@ impl PostgresSsoRouteTicketStore {
         if now.unix_timestamp() >= stored.expires_at {
             return Err(SsoEphemeralError::Expired);
         }
-        match (stored.provider_id, stored.protocol) {
-            (None, None) => Ok(None),
-            (Some(provider), Some(protocol)) => Ok(Some(RoutedProvider {
-                provider_id: ProviderId::parse(&provider)
-                    .map_err(|_| SsoEphemeralError::Corrupt)?,
-                protocol: parse_protocol(&protocol)?,
-            })),
-            _ => Err(SsoEphemeralError::Corrupt),
+        match stored.routing {
+            StoredRouting::Unmatched {} => Ok(None),
+            StoredRouting::Matched {
+                provider_id,
+                protocol,
+                provider_internal_id,
+            } => {
+                if provider_internal_id.is_nil() {
+                    return Err(SsoEphemeralError::Corrupt);
+                }
+                Ok(Some(RoutedProvider {
+                    provider_id: ProviderId::parse(&provider_id)
+                        .map_err(|_| SsoEphemeralError::Corrupt)?,
+                    protocol: parse_protocol(&protocol)?,
+                    internal_id: provider_internal_id,
+                }))
+            }
         }
     }
 }
@@ -208,12 +240,14 @@ impl PostgresSsoRouteTicketStore {
 struct StoredSamlAttempt {
     version: u8,
     provider_id: String,
+    provider_internal_id: Uuid,
     request_id: String,
     acs_url: String,
     expires_at: i64,
 }
 
 pub(crate) struct ConsumedSamlAttempt {
+    pub internal_id: Uuid,
     pub request_id: String,
     pub acs_url: String,
 }
@@ -246,11 +280,16 @@ impl PostgresSamlAttemptStore {
     pub(crate) async fn issue(
         &self,
         provider: &ProviderId,
+        provider_internal_id: Uuid,
         request_id: &str,
         acs_url: &str,
         now: OffsetDateTime,
     ) -> Result<String, SsoEphemeralError> {
-        if request_id.is_empty() || request_id.len() > 512 || !request_id.is_ascii() {
+        if provider_internal_id.is_nil()
+            || request_id.is_empty()
+            || request_id.len() > 512
+            || !request_id.is_ascii()
+        {
             return Err(SsoEphemeralError::Corrupt);
         }
         let relay_state = random_token()?;
@@ -259,6 +298,7 @@ impl PostgresSamlAttemptStore {
         let value = serde_json::to_string(&StoredSamlAttempt {
             version: STORAGE_VERSION,
             provider_id: provider.as_str().to_owned(),
+            provider_internal_id,
             request_id: request_id.to_owned(),
             acs_url: acs_url.to_owned(),
             expires_at: expires_at.unix_timestamp(),
@@ -296,7 +336,11 @@ impl PostgresSamlAttemptStore {
         if stored.provider_id != provider.as_str() {
             return Err(SsoEphemeralError::Mismatch);
         }
+        if stored.provider_internal_id.is_nil() {
+            return Err(SsoEphemeralError::Corrupt);
+        }
         Ok(ConsumedSamlAttempt {
+            internal_id: stored.provider_internal_id,
             request_id: stored.request_id,
             acs_url: stored.acs_url,
         })

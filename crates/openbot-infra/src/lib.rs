@@ -192,11 +192,14 @@ pub mod net;
 pub mod policy;
 #[cfg(feature = "server-runtime")]
 pub mod provider;
+#[cfg(unix)]
+pub mod recovery_control;
 #[cfg(feature = "server-runtime")]
 pub mod remote_agui;
 #[cfg(feature = "server-runtime")]
 pub mod remote_interrupt;
 pub mod repo;
+pub mod restore_reconfirmation;
 #[cfg(feature = "server-runtime")]
 pub mod routing;
 pub mod run_cost_budget;

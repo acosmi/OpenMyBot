@@ -2930,6 +2930,11 @@ pub(crate) async fn prepare_desktop_local_runtime(
         None => (ui_preferences, None, None),
     };
     let assembly = match assemble_postgres_application(PostgresApplicationAssemblyInput {
+        recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &pool,
+            auth.deployment(),
+            auth.tenant(),
+        ),
         pool: pool.clone(),
         listener_database: listener_database.clone(),
         deployment: auth.deployment().clone(),

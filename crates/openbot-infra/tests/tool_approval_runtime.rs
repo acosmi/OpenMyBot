@@ -205,6 +205,11 @@ async fn durable_wait_grant_reuse_deny_expire_and_generation_cancel_are_real() {
                     DeploymentId::new("approval-deployment"),
                     TenantId::new("approval-tenant"),
                     AUDIT_KEY.to_vec(),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -215,6 +220,11 @@ async fn durable_wait_grant_reuse_deny_expire_and_generation_cancel_are_real() {
                 DeploymentId::new("approval-deployment"),
                 TenantId::new("approval-tenant"),
                 AUDIT_KEY.to_vec(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let mut owner_activity = replica

@@ -1654,6 +1654,7 @@ pub(super) async fn run(config: pool::DatabaseConfig) -> Result<(), String> {
         let managed_slot_available=managed_inner.is_some();
         let managed=managed_inner.map(|inner|Arc::new(CountingProvider{inner,counters:counters.clone(),managed:true}) as Arc<dyn ProviderAdapter>);
         assembly=Some(assemble_postgres_application(PostgresApplicationAssemblyInput{
+            recovery_gate:openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&application_pool,&deployment,&tenant),
             pool:application_pool.clone(),listener_database:application_config.clone().into(),deployment:deployment.clone(),tenant:tenant.clone(),single_user:false,admin_floor:None,
             model:"unused-default-model".to_owned(),credential_key_id:"unused-default-model-key".to_owned(),credential_vault:vault.clone(),audit_key:SecretBytes::new(vec![0x82;32]),
             remote_assertions:assertions.clone(),mcp_oauth_state_key:SecretBytes::new(vec![0x84;32]),policy_store:policies,

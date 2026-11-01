@@ -431,6 +431,7 @@ impl PostgresArtifactAdministration {
             let authority = self.read_authority();
             let target = authority.cleanup_host_target(auth);
             let _current = PhysicalCurrentRequest::borrow_before(self, auth, &target, deadline)
+                .await
                 .map_err(arm_error)?;
             let (claim, query) =
                 PhysicalInvocationClaim::register(Arc::clone(&store), key.clone(), deadline)
@@ -505,7 +506,8 @@ async fn supervise(
     let target = authority.cleanup_host_target(&auth);
     // Reborrow the actual enrolled factory inside this owned task. Even a raced pure refusal
     // is followed by the claimed original schema/BEGIN/true rollback, never a fabricated ACK.
-    let current = PhysicalCurrentRequest::borrow_before(&administration, &auth, &target, deadline);
+    let current =
+        PhysicalCurrentRequest::borrow_before(&administration, &auth, &target, deadline).await;
     let mut client = administration
         .registry
         .pool()

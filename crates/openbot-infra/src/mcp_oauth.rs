@@ -30,6 +30,13 @@ use crate::store::plugin_user_credential::{
 /// First-source parity timeout for an OAuth token exchange.
 pub const MCP_OAUTH_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
 const MCP_OAUTH_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+/// One bounded authorization-server round of this client: discovery (one
+/// challenge probe, then at most four protected-resource and four
+/// authorization-server metadata fetches) plus one token or revocation request.
+/// Recovery admission deadlines add it once per round.
+pub(crate) const MCP_OAUTH_ROUND_BUDGET: Duration = MCP_OAUTH_METADATA_TIMEOUT
+    .saturating_mul(9)
+    .saturating_add(MCP_OAUTH_TOKEN_TIMEOUT);
 const MAX_METADATA_BYTES: usize = 64 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_OAUTH_SERVERS: usize = 16;

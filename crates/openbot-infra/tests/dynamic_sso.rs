@@ -122,6 +122,11 @@ fn service_with_dialer(
         ],
         dialer,
         "https://app.example".to_owned(),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &pool,
+            &openbot_contracts::ids::DeploymentId::new("dep-1"),
+            &TenantId::new("tenant-1"),
+        ),
     )
     .unwrap()
 }

@@ -711,6 +711,15 @@ impl PostgresArtifactAdministration {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     ) -> Result<ObservedArtifactReadRecord, PublicReadRecordFailure> {
+        // The real request entry: its recovery admission is held under the same
+        // deadline through the read and rechecked before the observation returns.
+        let binding = auth
+            .request_binding()
+            .ok_or_else(|| PublicReadRecordFailure::observed(unavailable()))?;
+        let admission = binding
+            .borrow_recovery_admission_before(auth, deadline)
+            .await
+            .map_err(|_| PublicReadRecordFailure::observed(unavailable()))?;
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
             let check_budget = || {
                 deadline
@@ -817,6 +826,9 @@ impl PostgresArtifactAdministration {
                 .await
                 .map_err(|_| PublicReadRecordFailure::unproven(unavailable()))?;
             check_budget()?;
+            admission
+                .verify_current_before(binding, auth, deadline)
+                .map_err(|_| PublicReadRecordFailure::observed(unavailable()))?;
             outcome.map_err(PublicReadRecordFailure::observed)
         })
         .await

@@ -266,6 +266,7 @@ impl PostgresArtifactAdministration {
             let authority = self.read_authority();
             let target = authority.cleanup_host_target(auth);
             let _current = TerminalCurrentRequest::borrow_before(self, auth, &target, deadline)
+                .await
                 .map_err(arm_error)?;
             // This separate exact-key query owner is registered before the first real PG await.
             let (claim, query) =
@@ -1698,7 +1699,7 @@ async fn supervise(
     let handled_outcome = async {
     let authority = administration.read_authority();
     let target = authority.cleanup_host_target(&auth);
-    let current = TerminalCurrentRequest::borrow_before(&administration, &auth, &target, deadline);
+    let current = TerminalCurrentRequest::borrow_before(&administration, &auth, &target, deadline).await;
     let mut client = administration
         .registry
         .pool()

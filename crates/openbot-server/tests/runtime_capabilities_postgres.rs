@@ -561,6 +561,11 @@ impl Fixture {
             std::iter::empty::<String>(),
             SafeDialer::new(EgressPolicy::default()),
             "https://capabilities.example.test".to_owned(),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &DeploymentId::new(DEPLOYMENT),
+                &tenant,
+            ),
         )
         .map_err(|_| "actual read-only SSO service source unavailable".to_owned())?;
         let factory = Arc::new(CountActualFactory {
@@ -577,6 +582,12 @@ impl Fixture {
             .await
             .map_err(|_| "actual PolicyStore setup failed".to_owned())?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &DeploymentId::new(DEPLOYMENT),
+                    &tenant,
+                ),
             pool: self.pool.clone(),
             listener_database: self.config.clone().into(),
             deployment: DeploymentId::new(DEPLOYMENT),

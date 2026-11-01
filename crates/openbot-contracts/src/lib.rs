@@ -97,6 +97,7 @@ pub mod model_connections;
 pub mod people;
 pub mod policy;
 pub mod reconciliation;
+pub mod recovery;
 pub mod remote_interrupt;
 pub mod request_binding;
 pub mod revision;
@@ -116,6 +117,9 @@ pub use custom_model_catalog::{
     CustomModelCatalogEntry, CustomModelCatalogPage, CustomModelCatalogPageRequest,
     CustomModelCatalogReply, CustomModelCatalogReplyAllocation, CustomModelCatalogReplyCancel,
     CustomModelCatalogReplyRegistration,
+};
+pub use recovery::{
+    RecoveryAdmissionLease, RecoveryAdmissionPurpose, RecoveryAdmissionWitness, RestoreCohortRef,
 };
 pub use request_binding::{
     ArtifactReadCurrentError, ArtifactReadCurrentTarget, ArtifactReadRecordFacts,

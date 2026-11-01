@@ -84,6 +84,7 @@ async fn lost_notify_replays_and_one_commit_wakes_two_replicas_without_duplicate
                 listener_config,
                 "runtime-a".to_owned(),
                 Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             directory

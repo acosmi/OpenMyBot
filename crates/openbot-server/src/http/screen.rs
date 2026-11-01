@@ -13,8 +13,11 @@ use openbot_computer::screen::{
     SCREEN_VIEWER_MAX_BINARY_BYTES, SCREEN_VIEWER_PROTOCOL, ScreenHubError, ScreenViewer,
     ScreenViewerBinding, ScreenViewerFrame,
 };
+use openbot_contracts::auth::AuthContext;
 use openbot_contracts::command::{AppCommand, AppReply};
 use openbot_contracts::error::AppError;
+use openbot_contracts::recovery::RecoveryAdmissionLease;
+use openbot_contracts::request_binding::VerifiedHostRequestBinding;
 use openbot_contracts::screen::{
     ScreenSessionRequest, ScreenSessionTarget, ScreenSessionTicket, ScreenViewerBindingRequest,
 };
@@ -113,7 +116,9 @@ async fn websocket_with_limits(
         .on_failed_upgrade(|error| {
             tracing::debug!(error = %error, "screen websocket upgrade failed");
         })
-        .on_upgrade(move |socket| drive_screen_socket(socket, viewer, first, limits)))
+        .on_upgrade(move |socket| async move {
+            drive_screen_socket(socket, viewer, first, limits, &auth).await;
+        }))
 }
 
 fn requested_ticket(ws: &WebSocketUpgrade) -> Result<String, AppError> {
@@ -160,8 +165,18 @@ async fn drive_screen_socket(
     mut viewer: ScreenViewer,
     first: std::sync::Arc<ScreenViewerFrame>,
     limits: SocketLimits,
+    auth: &AuthContext,
 ) {
+    let Some(binding) = auth.request_binding() else {
+        close(&mut socket, close_code::POLICY, "screen_revoked").await;
+        return;
+    };
+    let mut admission = None;
     let mut budget = DeliveryBudget::new(limits, Instant::now());
+    if !admitted(&mut admission, binding, auth).await {
+        close(&mut socket, close_code::POLICY, "screen_revoked").await;
+        return;
+    }
     if send_frame(&mut socket, &first, &mut budget, limits)
         .await
         .is_err()
@@ -207,6 +222,10 @@ async fn drive_screen_socket(
             },
             frame = viewer.next() => match frame {
                 Ok(frame) => {
+                    if !admitted(&mut admission, binding, auth).await {
+                        close(&mut socket, close_code::POLICY, "screen_revoked").await;
+                        return;
+                    }
                     if send_frame(&mut socket, &frame, &mut budget, limits).await.is_err() {
                         return;
                     }
@@ -217,6 +236,35 @@ async fn drive_screen_socket(
                 }
             }
         }
+    }
+}
+
+/// The original request's recovery admission, held across frame sends. Each
+/// lease is bounded by the 5 s precedent; an elapsed one is dropped and
+/// borrowed again, and a refused borrow ends the stream.
+async fn admitted<'a>(
+    held: &mut Option<(RecoveryAdmissionLease<'a>, std::time::Instant)>,
+    binding: &'a VerifiedHostRequestBinding,
+    auth: &'a AuthContext,
+) -> bool {
+    if let Some((lease, deadline)) = held
+        && lease
+            .verify_current_before(binding, auth, *deadline)
+            .is_ok()
+    {
+        return true;
+    }
+    *held = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    match binding
+        .borrow_recovery_admission_before(auth, deadline)
+        .await
+    {
+        Ok(lease) => {
+            *held = Some((lease, deadline));
+            true
+        }
+        Err(_) => false,
     }
 }
 

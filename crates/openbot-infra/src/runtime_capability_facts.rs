@@ -472,6 +472,18 @@ impl PostgresRuntimeCapabilityFacts {
         }) {
             return Err(Error::MissingHostSource);
         }
+        // The original request's admission is held through the facts transaction
+        // and its Vault-opens; the returned tail stays synchronous and holds none.
+        let binding = auth.request_binding().ok_or(Error::Unavailable)?;
+        let admission = binding
+            .borrow_recovery_admission_before(auth, deadline.deadline())
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        let current = || {
+            admission
+                .verify_current_before(binding, auth, deadline.deadline())
+                .map_err(|_| Error::Unavailable)
+        };
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline.deadline()), async {
             let mut client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
             let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).read_only(true).start().await.map_err(|_| Error::Unavailable)?;
@@ -484,7 +496,9 @@ impl PostgresRuntimeCapabilityFacts {
                 let session = check_authority(&row, auth, &authority)?;
                 let tail=Arc::new(JointTail { scope:scope.clone(),session,monotonic:std::time::Instant::now(),wall:std::time::SystemTime::now() });
                 deadline.check()?;
-                let mut facts = self.parse_snapshot(row, sso.cloned(), scope.host_mode()==HostMode::Server, deadline).await?;
+                let unconfirmed = unconfirmed_sources(&*tx, &row, admission.restore_cohort(), deadline).await?;
+                current()?;
+                let mut facts = self.parse_snapshot(row, sso.cloned(), scope.host_mode()==HostMode::Server, deadline, unconfirmed).await?;
                 if !auth.has_role(Role::User) && !auth.has_role(Role::Admin) {
                     facts.product_permissions = [PermissionFact::Denied;13];
                 }
@@ -494,6 +508,7 @@ impl PostgresRuntimeCapabilityFacts {
             tx.rollback().await.map_err(|_| Error::Unavailable)?;
             deadline.check()?;
             if !self.is_current() { return Err(Error::NotCurrent); }
+            current()?;
             observed
         }).await.map_err(|_| Error::Unavailable)?
     }
@@ -504,6 +519,7 @@ impl PostgresRuntimeCapabilityFacts {
         sso: Option<ReadOnlySsoCapabilitySource>,
         server_sso: bool,
         deadline: CapabilityDeadline,
+        unconfirmed: UnconfirmedSources,
     ) -> Result<RuntimeCapabilityFacts, Error> {
         let policy: Value = row.try_get("policy").map_err(|_| Error::Unavailable)?;
         let custom: Value = row
@@ -525,8 +541,13 @@ impl PostgresRuntimeCapabilityFacts {
                 deadline.check()?;
                 let acting_policy = observe_policy(&policy, fallback.as_ref(), deadline)?;
                 deadline.check()?;
-                let model_key = observe_default_key(&credentials, &vault, environment.as_deref());
-                let (custom_model_config, custom_key) = observe_custom(&custom, &vault, &actor);
+                let model_key = if unconfirmed.default_key {
+                    ModelKeyFact::Unknown
+                } else {
+                    observe_default_key(&credentials, &vault, environment.as_deref())
+                };
+                let (custom_model_config, custom_key) =
+                    observe_custom(&custom, &vault, &actor, &unconfirmed.connections);
                 let sso_config = sso.as_ref().map_or(
                     if server_sso {
                         ConfigFact::Unknown
@@ -551,6 +572,72 @@ impl PostgresRuntimeCapabilityFacts {
         });
         receiver.await.map_err(|_| Error::Unavailable)?
     }
+}
+
+/// Restored credential sources not yet reconfirmed: their Vault-opens are skipped.
+struct UnconfirmedSources {
+    default_key: bool,
+    connections: std::collections::BTreeSet<String>,
+}
+
+/// Read inside the facts transaction, before parsing and any Vault-open.
+async fn unconfirmed_sources<C: tokio_postgres::GenericClient + Sync>(
+    tx: &C,
+    row: &Row,
+    cohort: Option<openbot_contracts::recovery::RestoreCohortRef>,
+    deadline: CapabilityDeadline,
+) -> Result<UnconfirmedSources, Error> {
+    use crate::restore_reconfirmation::{
+        RequirementKind, RequirementSource, RestoreReconfirmationError, require_confirmed_before,
+    };
+    let mut sources = UnconfirmedSources {
+        default_key: false,
+        connections: std::collections::BTreeSet::new(),
+    };
+    if cohort.is_none() {
+        return Ok(sources);
+    }
+    let unconfirmed = |result: Result<(), RestoreReconfirmationError>| match result {
+        Ok(()) => Ok(false),
+        Err(RestoreReconfirmationError::NotConfirmed) => Ok(true),
+        Err(RestoreReconfirmationError::Unavailable) => Err(Error::Unavailable),
+    };
+    let credentials: Value = row
+        .try_get("default_credentials")
+        .map_err(|_| Error::Unavailable)?;
+    if let Some(id) = credentials
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("id"))
+        .and_then(Value::as_str)
+    {
+        let source = RequirementSource {
+            cohort,
+            kind: RequirementKind::Credential,
+            source_ref: id,
+        };
+        sources.default_key =
+            unconfirmed(require_confirmed_before(tx, source, deadline.deadline()).await)?;
+    }
+    let custom: Value = row
+        .try_get("custom_models")
+        .map_err(|_| Error::Unavailable)?;
+    for id in custom
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+    {
+        let source = RequirementSource {
+            cohort,
+            kind: RequirementKind::ModelSecret,
+            source_ref: id,
+        };
+        if unconfirmed(require_confirmed_before(tx, source, deadline.deadline()).await)? {
+            sources.connections.insert(id.to_owned());
+        }
+    }
+    Ok(sources)
 }
 
 fn auth_actor_from_row(row: &Row) -> Result<ActorId, Error> {
@@ -798,6 +885,7 @@ fn observe_custom(
     value: &Value,
     vault: &CredentialRecordVault,
     actor: &ActorId,
+    unconfirmed: &std::collections::BTreeSet<String>,
 ) -> (ConfigFact, ModelKeyFact) {
     let Some(rows) = value.as_array() else {
         return (ConfigFact::Unknown, ModelKeyFact::Unknown);
@@ -847,6 +935,10 @@ fn observe_custom(
             unknown = true;
             continue;
         };
+        if unconfirmed.contains(id) {
+            unknown = true;
+            continue;
+        }
         let Ok(opened) = vault.open(
             &secret_id,
             SecretKind::Model,

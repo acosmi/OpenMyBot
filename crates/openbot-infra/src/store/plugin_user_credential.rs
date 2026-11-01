@@ -24,6 +24,7 @@ use crate::db::InfraError;
 use crate::db::types::CredentialKind;
 use crate::mcp_egress::parse_stored_mcp_egress;
 use crate::net::safe_http::CidrAllowlist;
+use crate::recovery_control::RecoveryWorkerLease;
 use crate::repo::audit::{append_event_in_transaction, next_event_coordinates};
 use crate::vault::CredentialRecordVault;
 
@@ -396,17 +397,35 @@ pub struct PluginUserCredentialStore {
     pool: Pool,
     vault: CredentialRecordVault,
     rotation_checkpoint_key: Option<Arc<SecretBytes>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl PluginUserCredentialStore {
     /// 用共享池与显式 credential vault 构造。
     #[must_use]
-    pub fn new(pool: Pool, vault: CredentialRecordVault) -> Self {
+    pub fn new(
+        pool: Pool,
+        vault: CredentialRecordVault,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
+    ) -> Self {
         Self {
             pool,
             vault,
             rotation_checkpoint_key: None,
+            recovery_gate,
         }
+    }
+
+    /// One worker admission for a standalone call: SQL steps take the 5 s
+    /// precedent and a refresh adds one OAuth round.
+    async fn admission(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<RecoveryWorkerLease<'_>, UserCredentialSelectionError> {
+        self.recovery_gate
+            .borrow_worker_before(std::time::Instant::now() + budget)
+            .await
+            .map_err(|_| UserCredentialSelectionError::Unavailable)
     }
 
     /// Attach the audit key required before a refresh-token rotation can commit.
@@ -433,6 +452,17 @@ impl PluginUserCredentialStore {
         &self,
         server_id: &str,
         actor: &ActorId,
+    ) -> Result<PreparedUserOAuthCredential, UserCredentialSelectionError> {
+        let admission = self.admission(SQL_STEPS_BUDGET).await?;
+        self.prepare_admitted(server_id, actor, &admission).await
+    }
+
+    /// The caller holds `admission` through every later send and write.
+    async fn prepare_admitted(
+        &self,
+        server_id: &str,
+        actor: &ActorId,
+        admission: &RecoveryWorkerLease<'_>,
     ) -> Result<PreparedUserOAuthCredential, UserCredentialSelectionError> {
         if actor.as_str().is_empty() {
             return Err(UserCredentialRefusal::ActorRequired.into());
@@ -518,6 +548,28 @@ impl PluginUserCredentialStore {
                 field: "deployment_credential_binding",
             });
         }
+        // No Vault-open of either restored credential before its receipt.
+        for credential in [user_id, deployment_id] {
+            crate::restore_reconfirmation::require_confirmed_before(
+                &**client,
+                crate::restore_reconfirmation::RequirementSource {
+                    cohort: admission.restore_cohort(),
+                    kind: crate::restore_reconfirmation::RequirementKind::Credential,
+                    source_ref: &credential.to_string(),
+                },
+                admission.deadline(),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+                    UserCredentialSelectionError::Refused(UserCredentialRefusal::ReconnectRequired)
+                }
+                crate::restore_reconfirmation::RestoreReconfirmationError::Unavailable => {
+                    UserCredentialSelectionError::Unavailable
+                }
+            })?;
+        }
+        current(admission)?;
         let service = SecretPrincipal::Service(ServiceId::new(server_id));
         let refresh_token = self
             .vault
@@ -588,15 +640,36 @@ impl PluginUserCredentialStore {
         actor: &ActorId,
         exchanger: &E,
     ) -> Result<VendorAccessToken, UserOAuthAccessError> {
-        let prepared = self
-            .prepare_user_oauth_call(server_id, actor)
+        let admission = self
+            .admission(SQL_STEPS_BUDGET + crate::mcp_oauth::MCP_OAUTH_ROUND_BUDGET)
             .await
             .map_err(UserOAuthAccessError::Selection)?;
+        self.fresh_user_access_token_admitted(server_id, actor, exchanger, &admission)
+            .await
+    }
+
+    /// Same refresh under the caller's held worker admission: rechecked before
+    /// the Vault-opens, the claim, the token send (in the send fence) and the
+    /// rotation commit.
+    pub(crate) async fn fresh_user_access_token_admitted<
+        E: RotatingOAuthTokenExchanger + ?Sized,
+    >(
+        &self,
+        server_id: &str,
+        actor: &ActorId,
+        exchanger: &E,
+        admission: &RecoveryWorkerLease<'_>,
+    ) -> Result<VendorAccessToken, UserOAuthAccessError> {
+        let prepared = self
+            .prepare_admitted(server_id, actor, admission)
+            .await
+            .map_err(UserOAuthAccessError::Selection)?;
+        current(admission).map_err(UserOAuthAccessError::Selection)?;
         let operation = self
             .claim_refresh(&prepared)
             .await
             .map_err(UserOAuthAccessError::Selection)?;
-        let fence = OperationSendFence::new(self, &prepared, &operation);
+        let fence = OperationSendFence::new(self, &prepared, &operation, admission);
         let mut grant = match prepared.exchange_rotating(exchanger, &fence).await {
             Ok(grant) if fence.admitted() => grant,
             Ok(_) => {
@@ -631,6 +704,10 @@ impl PluginUserCredentialStore {
                 .is_some_and(|token| token.ct_eq(&prepared.refresh_token))
         {
             grant.refresh_token = None;
+        }
+        if let Err(error) = current(admission) {
+            self.fail_refresh(&operation, false).await;
+            return Err(UserOAuthAccessError::Selection(error));
         }
         if let Err(error) = self
             .finish_refresh(
@@ -716,6 +793,7 @@ impl core::fmt::Debug for PluginUserCredentialStore {
 pub struct PostgresOwnedCredentialRetirer {
     pool: Pool,
     checkpoint_key: Arc<SecretBytes>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl PostgresOwnedCredentialRetirer {
@@ -724,7 +802,11 @@ impl PostgresOwnedCredentialRetirer {
     /// # Errors
     ///
     /// `checkpoint_key` 为空时返回 repository invariant。
-    pub fn new(pool: Pool, checkpoint_key: impl Into<Vec<u8>>) -> Result<Self, InfraError> {
+    pub fn new(
+        pool: Pool,
+        checkpoint_key: impl Into<Vec<u8>>,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
+    ) -> Result<Self, InfraError> {
         let checkpoint_key = checkpoint_key.into();
         if checkpoint_key.is_empty() {
             return Err(InfraError::repository_invariant(
@@ -734,6 +816,7 @@ impl PostgresOwnedCredentialRetirer {
         Ok(Self {
             pool,
             checkpoint_key: Arc::new(SecretBytes::new(checkpoint_key)),
+            recovery_gate,
         })
     }
 
@@ -757,6 +840,16 @@ impl PostgresOwnedCredentialRetirer {
         }
         let owner_fact = AuditIdentifier::new(owner.as_str())
             .map_err(|_| InfraError::repository_invariant("credential_owner_not_audit_id"))?;
+        // No caller binding reaches this port: a worker admission held through
+        // the COMMIT (5 s precedent).
+        let deadline = std::time::Instant::now() + SQL_STEPS_BUDGET;
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|error| {
+                InfraError::connect("recovery admission for credential retirement", error)
+            })?;
         let mut client = self
             .pool
             .get()
@@ -824,6 +917,9 @@ impl PostgresOwnedCredentialRetirer {
             )
             .await
             .map_err(|error| InfraError::query("删除已退役个人 connection", error))?;
+        admission.verify_current_before(deadline).map_err(|error| {
+            InfraError::connect("recovery admission for credential retirement", error)
+        })?;
         transaction
             .commit()
             .await
@@ -864,6 +960,15 @@ impl OwnedCredentialRetirer for PostgresOwnedCredentialRetirer {
                 mapped
             })
     }
+}
+
+/// SQL-only steps without a per-step bound: the 5 s precedent.
+const SQL_STEPS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn current(admission: &RecoveryWorkerLease<'_>) -> Result<(), UserCredentialSelectionError> {
+    admission
+        .verify_current_before(admission.deadline())
+        .map_err(|_| UserCredentialSelectionError::Unavailable)
 }
 
 const SELECTION_SQL: &str = "SELECT s.url AS server_endpoint, \

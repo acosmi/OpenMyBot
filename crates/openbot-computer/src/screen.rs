@@ -234,6 +234,16 @@ impl ScreenSessionService {
             } => ScreenViewerBinding::verified_desktop(origin, window_label, window_binding),
         }
         .map_err(|_| ScreenSessionAdministrationError::InvalidInput { field: "binding" })?;
+        // The original request's admission, borrowed (and so verified) right
+        // before the ticket insert and held through it (5 s precedent). The
+        // WebSocket send path holds its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let _admission = auth
+            .request_binding()
+            .ok_or(ScreenSessionAdministrationError::Unavailable)?
+            .borrow_recovery_admission_before(auth, deadline)
+            .await
+            .map_err(|_| ScreenSessionAdministrationError::Unavailable)?;
         let issued = self
             .hub
             .issue_ticket_for_target(
@@ -1200,13 +1210,100 @@ mod tests {
         ));
     }
 
+    struct AdmittingGuard;
+    struct AdmittedLease;
+    impl openbot_contracts::recovery::RecoveryAdmissionWitness for AdmittedLease {
+        fn purpose(&self) -> openbot_contracts::recovery::RecoveryAdmissionPurpose {
+            openbot_contracts::recovery::RecoveryAdmissionPurpose::Normal
+        }
+        fn verify_current_before(
+            &self,
+            _: &openbot_contracts::request_binding::VerifiedHostRequestBinding,
+            _: &AuthContext,
+            _: std::time::Instant,
+        ) -> Result<(), openbot_contracts::request_binding::HostRequestBindingError> {
+            Ok(())
+        }
+        fn restore_cohort(&self) -> Option<openbot_contracts::recovery::RestoreCohortRef> {
+            None
+        }
+    }
+    impl openbot_contracts::request_binding::HostRequestBindingGuard for AdmittingGuard {
+        fn verify_current<'a>(
+            &'a self,
+            _: &'a AuthContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            openbot_contracts::request_binding::HostRequestBindingError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn borrow_recovery_admission_before<'a>(
+            &'a self,
+            _: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+            _: &'a AuthContext,
+            _: std::time::Instant,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                            openbot_contracts::request_binding::HostRequestBindingError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Box::new(AdmittedLease) as _) })
+        }
+    }
+
+    // Implements only the required check: admission keeps the closed default.
+    struct DefaultGuard;
+    impl openbot_contracts::request_binding::HostRequestBindingGuard for DefaultGuard {
+        fn verify_current<'a>(
+            &'a self,
+            _: &'a AuthContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            openbot_contracts::request_binding::HostRequestBindingError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn application_port_resolves_target_and_never_logs_issued_protocol() {
         let hub = ScreenHub::new(3).expect("hub");
         let (source, _sender, key) = source("actor", 4);
         hub.attach(source).await.expect("attach");
         let service = ScreenSessionService::new(hub);
-        let actor = auth("actor", 4);
+        let unbound = auth("actor", 4);
+        let (_owner, issuer) =
+            openbot_contracts::request_binding::RequestBindingOwnerLease::for_trusted_host(
+                openbot_contracts::request_binding::HostRequestBindingKind::DesktopWindow,
+            );
+        let binding = issuer
+            .bind_desktop_window(&unbound, "main".into(), 1, Arc::new(AdmittingGuard))
+            .expect("binding");
+        let actor = unbound
+            .clone()
+            .with_verified_request_binding(binding)
+            .expect("bound");
         let request = ScreenSessionRequest {
             target: openbot_contracts::screen::ScreenSessionTarget {
                 computer_id: key.computer_id().clone(),
@@ -1227,6 +1324,21 @@ mod tests {
             (NOW + SCREEN_TICKET_TTL).unix_timestamp() * 1000
         );
         assert!(!format!("{ticket:?}").contains(ticket.ticket_protocol()));
+        assert_eq!(
+            service.issue_at(&unbound, request.clone(), NOW).await,
+            Err(ScreenSessionAdministrationError::Unavailable)
+        );
+        let closed = issuer
+            .bind_desktop_window(&unbound, "closed".into(), 2, Arc::new(DefaultGuard))
+            .expect("closed binding");
+        let closed = unbound
+            .clone()
+            .with_verified_request_binding(closed)
+            .expect("bound");
+        assert_eq!(
+            service.issue_at(&closed, request.clone(), NOW).await,
+            Err(ScreenSessionAdministrationError::Unavailable)
+        );
 
         let mut stale = request.clone();
         stale.target.computer_generation = ComputerGeneration::new(4);

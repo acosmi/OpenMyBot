@@ -114,6 +114,11 @@ async fn selected_skills_snapshot_order_provider_context_and_exact_replay_surviv
                 config.clone(),
                 "runtime-a".to_owned(),
                 Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let mut request = request(&deployment, "actor-a", 21, "skill-run", "My words only.");
@@ -263,7 +268,7 @@ async fn unavailable_selected_skills_and_stale_actor_leave_no_run_or_partial_sna
             provision_skills(&pool).await?;
             let deployment = DeploymentId::new("dep-a");
             let directory = PostgresThreadDirectory::with_runtime(pool.clone(), config.clone(),
-                "runtime-a".to_owned(), Duration::seconds(30)).map_err(|error| error.to_string())?;
+                "runtime-a".to_owned(), Duration::seconds(30), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|error| error.to_string())?;
             let mut request = request(&deployment, "actor-a", 31, "denied-run", "No partial message.");
             for slug in ["missing", "not-granted"] {
                 request.command.selected_skill_slugs = vec!["a-skill".to_owned(), slug.to_owned()];
@@ -317,6 +322,11 @@ async fn begin_commits_every_surface_and_exact_replay_writes_nothing() {
                 config.clone(),
                 "runtime-a".to_owned(),
                 Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let request = request(&deployment, "actor-a", 1, "run-1", "hello native thread");
@@ -502,6 +512,11 @@ async fn a_late_outbox_conflict_rolls_back_thread_message_run_event_and_lease() 
                 config.clone(),
                 "runtime-a".to_owned(),
                 Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let mut candidate = request(&deployment, "actor-a", 2, "run-rollback", "must rollback");
@@ -572,6 +587,11 @@ async fn existing_legacy_uuid_is_writable_but_a_new_foreign_uuid_is_rejected() {
                 config.clone(),
                 "runtime-a".to_owned(),
                 Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let mut legacy = request(&deployment, "actor-a", 3, "legacy-run", "legacy works");
@@ -630,7 +650,7 @@ async fn concurrent_grant_revocation_finishes_before_skill_snapshot_acceptance()
             provision(&pool).await?;
             provision_skills(&pool).await?;
             let directory = PostgresThreadDirectory::with_runtime(pool.clone(), config.clone(),
-                "runtime-a".to_owned(), Duration::seconds(30)).map_err(|error| error.to_string())?;
+                "runtime-a".to_owned(), Duration::seconds(30), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|error| error.to_string())?;
             let mut request = request(&DeploymentId::new("dep-a"), "actor-a", 41, "racing-run", "Must see revocation.");
             request.command.selected_skill_slugs = vec!["a-skill".to_owned()];
             let mut client = pool.get().await.map_err(|error| error.to_string())?;
