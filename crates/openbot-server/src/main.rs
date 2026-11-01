@@ -47,8 +47,8 @@ use openbot_infra::auth::oidc::{
 use openbot_infra::auth::single_user::{initialize_single_user, load_single_user_principal};
 use openbot_infra::auth::sso::DynamicSsoService;
 use openbot_infra::component_catalogue::PostgresComponentAdministration;
+use openbot_infra::db::native;
 use openbot_infra::db::pool::DatabaseConfig;
-use openbot_infra::db::{native, pool};
 use openbot_infra::mcp_catalog::PostgresMcpCatalog;
 use openbot_infra::net::safe_http::{
     CidrAllowlist, EgressPolicy, SafeDialer, SafeHttpBudget, SchemePolicy,
@@ -64,6 +64,7 @@ use openbot_infra::provider::google::{GoogleApiKey, GoogleProvider, GoogleProvid
 use openbot_infra::provider::openai::{
     OpenAiApiKey, OpenAiProtocol, OpenAiProvider, OpenAiProviderConfig,
 };
+use openbot_infra::recovery_control::AuthorizationPurpose;
 use openbot_infra::remote_agui::SafeRemoteAguiTransport;
 use openbot_infra::run_runtime::RunRelay;
 use openbot_infra::sandboxed_components::PostgresSandboxedComponentAdministration;
@@ -145,7 +146,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     telemetry::init(LogFormat::Json)?;
     let env = openbot_server::config::launch::prepare_environment(env_map_from_process(), local)?;
-    let mut server = ServerConfig::from_env_map(&env)?;
+    let server = ServerConfig::from_env_map(&env)?;
     if let Some(warning) = server.public_transport().startup_warning() {
         tracing::warn!(code = server.public_transport().as_str(), "{warning}");
     }
@@ -183,20 +184,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let key_encryption = KeyEncryptionKey::from_env_map(&env, key_policy)?;
     let recovery_master_encoding = SecretBytes::new(
         openbot_server::config::env::optional(&env, "KEY_ENCRYPTION_KEY")
-            .ok_or_else(|| startup_error("key_encryption_key_missing"))?.as_bytes().to_vec(),
+            .ok_or_else(|| startup_error("key_encryption_key_missing"))?
+            .as_bytes()
+            .to_vec(),
     );
-    let deployment = deployment_id_for_startup(server.deployment_id.as_deref(), &tenant_package.package.tenant_id);
+    let deployment = deployment_id_for_startup(
+        server.deployment_id.as_deref(),
+        &tenant_package.package.tenant_id,
+    );
     let tenant = TenantId::new(&tenant_package.package.tenant_id);
-    let host = server.recovery_host.take().ok_or_else(|| startup_error("recovery_host_missing"))?;
+    let host = server.load_recovery_host()?;
     let limits = host.host_limits().clone();
-    let startup_deadline = std::time::Instant::now().checked_add(Duration::from_nanos(limits.admission_ns))
+    let startup_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_nanos(limits.admission_ns))
         .ok_or_else(|| startup_error("recovery_startup_bounds_invalid"))?;
     let mut recovery_control = openbot_infra::recovery_control::RecoveryControl::open(
         openbot_infra::recovery_control::RecoveryControlConfig::server(host, limits)?,
     )?;
-    let (pool, mut recovery_runtime_owner) = recovery_control.open_existing_server_before(
-        &database, recovery_master_encoding, deployment.as_str(), tenant.as_str(), startup_deadline,
-    ).await?;
+    let (pool, recovery_runtime_owner) = recovery_control
+        .open_existing_server_before(
+            &database,
+            recovery_master_encoding,
+            deployment.as_str(),
+            tenant.as_str(),
+            startup_deadline,
+        )
+        .await?;
     let recovery_read_gate = recovery_runtime_owner.read_gate();
 
     let policy_store = PolicyStore::postgres(
@@ -242,16 +255,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         default_session_lifetime(),
         has_dynamic_provider,
     )?;
-    let server_authorization_keys = recovery_runtime_owner.derive_server_authorization_keys_before(
-        &pool, deployment.as_str(), tenant.as_str(),
-        auth_config.as_ref().map(|config| config.session_secret.expose().as_bytes()),
-        &mcp_state_parent, raw_master.as_bytes(), startup_deadline,
-    )?;
-    // Only these five short-lived purposes use the same external epoch.
-    // Audit, wrapping/master, stored ciphertext and SCRAM parents stay original.
+    // Only these five short-lived purposes use the external epoch. Audit,
+    // wrapping/master, stored ciphertext and SCRAM parents stay original.
+    let mcp_state_key = recovery_runtime_owner
+        .derive_authorization_key(AuthorizationPurpose::McpState, mcp_state_parent.expose())?;
     drop(mcp_state_parent);
+    let run_assertion_key = recovery_runtime_owner
+        .derive_authorization_key(AuthorizationPurpose::RunAssertion, raw_master.as_bytes())?;
     let remote_assertions = Arc::new(RemoteRunAssertionSigner::new(
-        server_authorization_keys.run_assertion_key().to_vec(),
+        run_assertion_key.expose().to_vec(),
     )?);
     let has_provider = auth_config.is_some();
     let single_user = single_user_enabled(&env, has_provider)?;
@@ -288,26 +300,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut remember_session_resolver: Option<PostgresSessionAuthResolver> = None;
     let mut remember_single_user_resolver: Option<SingleUserAuthResolver> = None;
     let (auth, sensitive, floor, oidc_login): AuthAssembly = if let Some(config) = auth_config {
+        let session_parent = config.session_secret.expose().as_bytes();
+        let session_key = recovery_runtime_owner
+            .derive_authorization_key(AuthorizationPurpose::Session, session_parent)?;
+        let oidc_state_key = recovery_runtime_owner
+            .derive_authorization_key(AuthorizationPurpose::OidcState, session_parent)?;
+        let sso_state_key = recovery_runtime_owner
+            .derive_authorization_key(AuthorizationPurpose::SsoState, session_parent)?;
         let oidc = build_oidc_login(
             &config,
             &pool,
             &tenant,
-            server_authorization_keys.session_key()?,
-            server_authorization_keys.oidc_state_key()?,
-            server_authorization_keys.sso_state_key()?,
+            session_key.expose(),
+            oidc_state_key.expose(),
+            sso_state_key.expose(),
             audit_key.expose(),
             key_encryption.into_wrapping_key(),
             server.public_transport().cookie_secure(),
+            recovery_read_gate.clone(),
         )
         .await?;
         let resolver = PostgresSessionAuthResolver::new(
             pool.clone(),
-            server_authorization_keys.session_key()?,
+            session_key.expose(),
             config.session_lifetime,
             deployment.clone(),
             tenant.clone(),
         )?;
-        resolver.install_recovery_read_gate(recovery_read_gate.clone())
+        resolver
+            .install_recovery_read_gate(recovery_read_gate.clone())
             .map_err(|_| startup_error("recovery_host_gate_unavailable"))?;
         let sensitive =
             SensitiveWriteSecurity::new(config.session_lifetime, config.trusted_origins.clone());
@@ -333,7 +354,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let principal =
             load_single_user_principal(&pool, deployment.clone(), tenant.clone()).await?;
         let resolver = SingleUserAuthResolver::from_verified_principal(principal, lifetime);
-        resolver.install_recovery_read_gate(&pool, recovery_read_gate.clone())
+        resolver
+            .install_recovery_read_gate(&pool, recovery_read_gate.clone())
             .map_err(|_| startup_error("recovery_host_gate_unavailable"))?;
         remember_single_user_resolver = Some(resolver.clone());
         (
@@ -504,6 +526,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let screen_hub = ScreenHub::new(DEFAULT_SCREEN_VIEWERS_PER_STREAM)?;
     let screen_sessions = Arc::new(ScreenSessionService::new(screen_hub.clone()));
     let application_assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+        recovery_gate: recovery_read_gate.clone(),
         pool: pool.clone(),
         listener_database: database.clone().into(),
         deployment: deployment.clone(),
@@ -515,7 +538,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         credential_vault: model_credential_vault.clone(),
         audit_key: SecretBytes::new(audit_key.expose().to_vec()),
         remote_assertions: remote_assertions.clone(),
-        mcp_oauth_state_key: SecretBytes::new(server_authorization_keys.mcp_state_key().to_vec()),
+        mcp_oauth_state_key: mcp_state_key,
         policy_store: policy_store.clone(),
         ui_preferences: Arc::new(PostgresUiPreferenceAdministration::new(
             pool.clone(),
@@ -1135,6 +1158,7 @@ async fn build_oidc_login(
     audit_key: &[u8],
     wrapping_key: WrappingKey,
     secure_cookie: bool,
+    recovery_gate: openbot_infra::recovery_control::RecoveryReadGate,
 ) -> Result<OidcLoginAssembly, Box<dyn Error>> {
     let configured = configured_oidc_providers(config)?;
     let registry =
@@ -1159,12 +1183,7 @@ async fn build_oidc_login(
             .await?,
         );
     }
-    let attempts = PostgresLoginAttemptStore::new(
-        pool.clone(),
-        oidc_state_key,
-        tenant,
-        4096,
-    )?;
+    let attempts = PostgresLoginAttemptStore::new(pool.clone(), oidc_state_key, tenant, 4096)?;
     let sessions = PostgresOidcSessionIssuer::new(
         pool.clone(),
         session_key,
@@ -1192,6 +1211,7 @@ async fn build_oidc_login(
         environment_provider_ids,
         dialer,
         config.public_url.clone(),
+        recovery_gate,
     )?;
     dynamic_sso
         .preflight_all(time::OffsetDateTime::now_utc())

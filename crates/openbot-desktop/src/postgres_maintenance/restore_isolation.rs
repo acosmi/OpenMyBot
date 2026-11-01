@@ -32,7 +32,10 @@ pub(super) struct ExcludedLocation<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum IsolationFault { IsolationUnproven, CapacityExceeded }
+pub(super) enum IsolationFault {
+    IsolationUnproven,
+    CapacityExceeded,
+}
 
 /// Raw IO remains available to the enclosing original owner; formatting is redacted.
 pub(super) struct IsolationFailure {
@@ -41,18 +44,29 @@ pub(super) struct IsolationFailure {
 }
 impl std::fmt::Debug for IsolationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IsolationFailure").field("fault", &self.fault).finish_non_exhaustive()
+        f.debug_struct("IsolationFailure")
+            .field("fault", &self.fault)
+            .finish_non_exhaustive()
     }
 }
 fn unproven() -> IsolationFailure {
-    IsolationFailure { fault: IsolationFault::IsolationUnproven, original_io: None }
+    IsolationFailure {
+        fault: IsolationFault::IsolationUnproven,
+        original_io: None,
+    }
 }
 fn capacity() -> IsolationFailure {
-    IsolationFailure { fault: IsolationFault::CapacityExceeded, original_io: None }
+    IsolationFailure {
+        fault: IsolationFault::CapacityExceeded,
+        original_io: None,
+    }
 }
 impl From<io::Error> for IsolationFailure {
     fn from(error: io::Error) -> Self {
-        Self { fault: IsolationFault::IsolationUnproven, original_io: Some(error) }
+        Self {
+            fault: IsolationFault::IsolationUnproven,
+            original_io: Some(error),
+        }
     }
 }
 
@@ -75,8 +89,15 @@ impl<'a> RestoreIsolationPolicy<'a> {
         max_policy_bytes: u64,
     ) -> Result<Self, IsolationFailure> {
         let max_policy_bytes = usize::try_from(max_policy_bytes).map_err(|_| capacity())?;
-        if max_policy_bytes == 0 || system_loader_files.is_empty() { return Err(unproven()); }
-        let policy = Self { generation, excluded, system_loader_files, max_policy_bytes };
+        if max_policy_bytes == 0 || system_loader_files.is_empty() {
+            return Err(unproven());
+        }
+        let policy = Self {
+            generation,
+            excluded,
+            system_loader_files,
+            max_policy_bytes,
+        };
         policy.revalidate()?;
         Ok(policy)
     }
@@ -84,9 +105,16 @@ impl<'a> RestoreIsolationPolicy<'a> {
     pub(super) fn revalidate(&self) -> Result<(), IsolationFailure> {
         let g = &self.generation;
         let identity = directory(&g.root, true)?;
-        for (child, name) in [(&g.data, "data"), (&g.wal, "wal"), (&g.temp, "temp"),
-            (&g.uds, "uds"), (&g.materials, "materials")] {
-            if child.path != g.root.path.join(name) || directory(child, true)?.dev() != identity.dev() {
+        for (child, name) in [
+            (&g.data, "data"),
+            (&g.wal, "wal"),
+            (&g.temp, "temp"),
+            (&g.uds, "uds"),
+            (&g.materials, "materials"),
+        ] {
+            if child.path != g.root.path.join(name)
+                || directory(child, true)?.dev() != identity.dev()
+            {
                 return Err(unproven());
             }
         }
@@ -100,14 +128,18 @@ impl<'a> RestoreIsolationPolicy<'a> {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => (),
                 Err(error) => return Err(error.into()),
             }
-            if overlaps(g.root.path, &excluded) { return Err(unproven()); }
+            if overlaps(g.root.path, &excluded) {
+                return Err(unproven());
+            }
         }
         // Count before traversing the borrowed inventory; no unbounded owned loader list.
         let mut bytes = 0usize;
         for path in self.system_loader_files {
             let text = path_text(path)?;
             bytes = bytes.checked_add(text.len()).ok_or_else(capacity)?;
-            if bytes > self.max_policy_bytes || !system_loader(path) { return Err(unproven()); }
+            if bytes > self.max_policy_bytes || !system_loader(path) {
+                return Err(unproven());
+            }
         }
         Ok(())
     }
@@ -119,7 +151,8 @@ impl<'a> RestoreIsolationPolicy<'a> {
         bundle: &VerifiedMaintenanceBundle,
         args: &[std::ffi::OsString],
     ) -> Result<Command, super::RestoreProgramFailure> {
-        self.revalidate().map_err(super::RestoreProgramFailure::Isolation)?;
+        self.revalidate()
+            .map_err(super::RestoreProgramFailure::Isolation)?;
         let resource = bundle.root().join("postgres-maintenance");
         for location in &self.excluded {
             let excluded = location.parent.path.join(location.component);
@@ -131,19 +164,27 @@ impl<'a> RestoreIsolationPolicy<'a> {
             return Err(super::RestoreProgramFailure::Isolation(unproven()));
         }
         let executable = resource.join("bin/postgres");
-        let profile = self.render(&resource, &executable)
+        let profile = self
+            .render(&resource, &executable)
             .map_err(super::RestoreProgramFailure::Isolation)?;
         // Render first, then recheck the complete original authenticated program
         // and loader tree. The runner repeats directory identity checks at spawn.
-        let verified = bundle.checked_command(Program::Postgres).map_err(super::RestoreProgramFailure::Bundle)?;
+        let verified = bundle
+            .checked_command(Program::Postgres)
+            .map_err(super::RestoreProgramFailure::Bundle)?;
         if verified.as_std().get_program() != executable.as_os_str() {
             return Err(super::RestoreProgramFailure::Isolation(unproven()));
         }
         let mut command = Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(profile).arg(&executable).args(args);
-        command.env_clear().env("LC_ALL", "C").env("LANG", "C")
+        command
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .current_dir(self.generation.temp.path)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(false);
         Ok(command)
     }
@@ -155,32 +196,62 @@ impl<'a> RestoreIsolationPolicy<'a> {
     }
 
     fn render(&self, software: &Path, executable: &Path) -> Result<String, IsolationFailure> {
-        let mut p = BoundedPolicy { text: String::new(), maximum: self.max_policy_bytes };
+        let mut p = BoundedPolicy {
+            text: String::new(),
+            maximum: self.max_policy_bytes,
+        };
         p.parts(&["(version 1)\n(deny default)\n(allow process-fork)\n(allow signal (target self))\n(allow signal (target same-sandbox))\n"])?;
         // No allow-default, imported Engine policy, no-sandbox helper, IP/loopback rule,
         // Mach service or arbitrary-executable fallback is added.
         p.rule("process-exec*", "literal", executable)?;
         p.rule("file-read*", "subpath", software)?;
         p.rule("file-read*", "subpath", self.generation.materials.path)?;
-        for directory in [&self.generation.data, &self.generation.wal, &self.generation.temp, &self.generation.uds] {
+        for directory in [
+            &self.generation.data,
+            &self.generation.wal,
+            &self.generation.temp,
+            &self.generation.uds,
+        ] {
             p.rule("file-read*", "subpath", directory.path)?;
             p.rule("file-write*", "subpath", directory.path)?;
         }
         // Exact private Unix socket only; no IP socket, DNS or loopback exception.
         let socket = self.generation.uds.path.join(".s.PGSQL.5432");
-        p.rule("network-bind network-inbound network-outbound", "literal", &socket)?;
-        for path in self.system_loader_files { p.rule("file-read*", "literal", path)?; }
-        for path in [Path::new("/dev/null"), Path::new("/dev/random"), Path::new("/dev/urandom")] {
+        p.rule(
+            "network-bind network-inbound network-outbound",
+            "literal",
+            &socket,
+        )?;
+        for path in self.system_loader_files {
+            p.rule("file-read*", "literal", path)?;
+        }
+        for path in [
+            Path::new("/dev/null"),
+            Path::new("/dev/random"),
+            Path::new("/dev/urandom"),
+        ] {
             p.rule("file-read*", "literal", path)?;
         }
         // Directory-anchor metadata is literal only, never a recursive home/tmp/OS grant.
-        for directory in [&self.generation.root, &self.generation.data, &self.generation.wal,
-            &self.generation.temp, &self.generation.uds, &self.generation.materials] {
-            for path in directory.path.ancestors() { p.rule("file-read-metadata", "literal", path)?; }
+        for directory in [
+            &self.generation.root,
+            &self.generation.data,
+            &self.generation.wal,
+            &self.generation.temp,
+            &self.generation.uds,
+            &self.generation.materials,
+        ] {
+            for path in directory.path.ancestors() {
+                p.rule("file-read-metadata", "literal", path)?;
+            }
         }
-        for path in software.ancestors() { p.rule("file-read-metadata", "literal", path)?; }
+        for path in software.ancestors() {
+            p.rule("file-read-metadata", "literal", path)?;
+        }
         for loader in self.system_loader_files {
-            for path in loader.ancestors() { p.rule("file-read-metadata", "literal", path)?; }
+            for path in loader.ancestors() {
+                p.rule("file-read-metadata", "literal", path)?;
+            }
         }
         Ok(p.text)
     }
@@ -193,12 +264,16 @@ fn directory(d: &Directory<'_>, private: bool) -> Result<fs::Metadata, Isolation
     // Walk every actual ancestor O_DIRECTORY|O_NOFOLLOW, then compare that FD too.
     let actual = open_directory_chain(d.path)?.metadata()?;
     let identity = |m: &fs::Metadata| (m.dev(), m.ino(), m.uid(), m.mode());
-    if !held.is_dir() || !named.is_dir() || identity(&held) != identity(&named)
+    if !held.is_dir()
+        || !named.is_dir()
+        || identity(&held) != identity(&named)
         || identity(&held) != identity(&actual)
         || held.uid() != rustix::process::getuid().as_raw()
         || (private && held.mode() & 0o7777 != 0o700)
         || (!private && held.mode() & 0o7022 != 0)
-    { return Err(unproven()); }
+    {
+        return Err(unproven());
+    }
     Ok(held)
 }
 fn open_directory_chain(path: &Path) -> Result<File, IsolationFailure> {
@@ -207,49 +282,92 @@ fn open_directory_chain(path: &Path) -> Result<File, IsolationFailure> {
     for part in path.components() {
         if let Component::Normal(name) = part {
             current_path.push(name);
-            original = rustix::fs::openat(&original, name,
-                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty())
-                .map(File::from).map_err(|error| IsolationFailure::from(io::Error::from(error)))?;
+            original = rustix::fs::openat(
+                &original,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| IsolationFailure::from(io::Error::from(error)))?;
             let metadata = original.metadata()?;
             let uid = metadata.uid();
             if (uid != 0 && uid != rustix::process::getuid().as_raw())
-                || metadata.mode() & 0o22 != 0 && !(metadata.mode() & 0o1000 != 0
-                    && uid == 0 && current_path == Path::new("/private/tmp"))
-            { return Err(unproven()); }
+                || metadata.mode() & 0o22 != 0
+                    && !(metadata.mode() & 0o1000 != 0
+                        && uid == 0
+                        && current_path == Path::new("/private/tmp"))
+            {
+                return Err(unproven());
+            }
         }
     }
     Ok(original)
 }
 fn path_text(path: &Path) -> Result<&str, IsolationFailure> {
     let text = path.to_str().ok_or_else(unproven)?;
-    if !path.is_absolute() || text.bytes().any(|b| b < 32 || b == 127 || matches!(b, b'"' | b'\\'))
-        || path.components().any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
-        || text.split('/').skip(1).any(|c| c.is_empty() || c == "." || c == "..")
+    if !path.is_absolute()
+        || text
+            .bytes()
+            .any(|b| b < 32 || b == 127 || matches!(b, b'"' | b'\\'))
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+        || text
+            .split('/')
+            .skip(1)
+            .any(|c| c.is_empty() || c == "." || c == "..")
             && text != "/"
-    { return Err(unproven()); }
+    {
+        return Err(unproven());
+    }
     Ok(text)
 }
 fn component(text: &str) -> Result<(), IsolationFailure> {
     let mut parts = Path::new(text).components();
-    if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some()
-        || text.bytes().any(|b| b < 32 || b == 127 || matches!(b, b'"' | b'\\' | b'/'))
-    { return Err(unproven()); }
+    if !matches!(parts.next(), Some(Component::Normal(_)))
+        || parts.next().is_some()
+        || text
+            .bytes()
+            .any(|b| b < 32 || b == 127 || matches!(b, b'"' | b'\\' | b'/'))
+    {
+        return Err(unproven());
+    }
     Ok(())
 }
-fn overlaps(a: &Path, b: &Path) -> bool { a.starts_with(b) || b.starts_with(a) }
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
 fn system_loader(path: &Path) -> bool {
-    path.starts_with("/usr/lib") || path.starts_with("/System/Library/dyld")
+    path.starts_with("/usr/lib")
+        || path.starts_with("/System/Library/dyld")
         || path.starts_with("/System/Library/Frameworks")
 }
-struct BoundedPolicy { text: String, maximum: usize }
+struct BoundedPolicy {
+    text: String,
+    maximum: usize,
+}
 impl BoundedPolicy {
     fn parts(&mut self, parts: &[&str]) -> Result<(), IsolationFailure> {
-        let extra = parts.iter().try_fold(0usize, |n, part| n.checked_add(part.len())).ok_or_else(capacity)?;
-        if self.text.len().checked_add(extra).is_none_or(|n| n > self.maximum) { return Err(capacity()); }
+        let extra = parts
+            .iter()
+            .try_fold(0usize, |n, part| n.checked_add(part.len()))
+            .ok_or_else(capacity)?;
+        if self
+            .text
+            .len()
+            .checked_add(extra)
+            .is_none_or(|n| n > self.maximum)
+        {
+            return Err(capacity());
+        }
         self.text.try_reserve_exact(extra).map_err(|_| capacity())?;
-        for part in parts { self.text.push_str(part); }
+        for part in parts {
+            self.text.push_str(part);
+        }
         Ok(())
     }
     fn rule(&mut self, operation: &str, filter: &str, path: &Path) -> Result<(), IsolationFailure> {
@@ -263,21 +381,31 @@ mod tests {
     use super::*;
     #[test]
     fn policy_text_injection_and_untrusted_loader_roots_are_rejected() {
-        for text in ["relative", "/a/../b", "/a/./b", "/a//b", "/a/\"b", "/a/\\b", "/a/\nb"] {
+        for text in [
+            "relative", "/a/../b", "/a/./b", "/a//b", "/a/\"b", "/a/\\b", "/a/\nb",
+        ] {
             assert!(path_text(Path::new(text)).is_err());
         }
-        for text in ["", ".", "..", "a/b", "a\"b", "a\nb"] { assert!(component(text).is_err()); }
-        assert!(!system_loader(Path::new("/Users/a/lib")));
+        for text in ["", ".", "..", "a/b", "a\"b", "a\nb"] {
+            assert!(component(text).is_err());
+        }
+        assert!(!system_loader(Path::new("/opt/a/lib")));
         assert!(!system_loader(Path::new("/usr/lib-other/a")));
         assert!(overlaps(Path::new("/a/b"), Path::new("/a")));
         assert!(!overlaps(Path::new("/a/b"), Path::new("/a/bad")));
     }
     #[test]
     fn policy_allocation_is_admitted_before_extension() {
-        let mut p = BoundedPolicy { text: String::new(), maximum: 5 };
+        let mut p = BoundedPolicy {
+            text: String::new(),
+            maximum: 5,
+        };
         p.parts(&["ab", "cde"]).unwrap();
         assert_eq!(p.text, "abcde");
-        assert_eq!(p.parts(&["f"]).unwrap_err().fault, IsolationFault::CapacityExceeded);
+        assert_eq!(
+            p.parts(&["f"]).unwrap_err().fault,
+            IsolationFault::CapacityExceeded
+        );
         assert_eq!(p.text, "abcde");
     }
 }

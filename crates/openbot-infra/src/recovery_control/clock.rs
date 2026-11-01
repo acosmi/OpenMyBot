@@ -44,7 +44,8 @@ pub(super) fn verify_process_evidence(
     let pid = u32::from_be_bytes(evidence[..4].try_into().expect("fixed pid evidence"));
     let seconds = u64::from_be_bytes(evidence[4..12].try_into().expect("fixed seconds evidence"));
     let micros = u32::from_be_bytes(evidence[12..16].try_into().expect("fixed micros evidence"));
-    let nanos = micros.checked_mul(1_000)
+    let nanos = micros
+        .checked_mul(1_000)
         .filter(|value| micros < 1_000_000 && *value < 1_000_000_000)
         .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::OwnerLost))?;
     if pid == 0 || pid != std::process::id() {
@@ -57,10 +58,14 @@ pub(super) fn verify_process_evidence(
         boot[2 * index + 1] = HEX[usize::from(byte & 15)];
     }
     if let Some((boot_identity, original_pid, start)) = expected {
-        if boot_identity.as_bytes() != boot || original_pid != pid
-            || start.seconds != seconds || start.nanos != nanos
+        if boot_identity.as_bytes() != boot
+            || original_pid != pid
+            || start.seconds != seconds
+            || start.nanos != nanos
         {
-            return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::EntryInvalid,
+            ));
         }
     }
     Ok(())
@@ -78,12 +83,11 @@ pub(super) struct OperationClock {
 
 impl OperationClock {
     /// Called once after the original locks, frozen intent and profile.
-    pub(super) fn start(
-        effect_ns: u64,
-        convergence_ns: u64,
-    ) -> Result<Self, RecoveryControlError> {
+    pub(super) fn start(effect_ns: u64, convergence_ns: u64) -> Result<Self, RecoveryControlError> {
         if effect_ns == 0 || convergence_ns == 0 {
-            return Err(RecoveryControlError::new(RecoveryControlFault::ProfileInvalid));
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::ProfileInvalid,
+            ));
         }
         let t0_ns = monotonic_ns()?;
         let effect_absolute = t0_ns
@@ -137,13 +141,12 @@ impl OperationClock {
         Ok(())
     }
 
-    pub(super) fn effect_before(
-        &self,
-        original: Instant,
-    ) -> Result<Instant, RecoveryControlError> {
+    pub(super) fn effect_before(&self, original: Instant) -> Result<Instant, RecoveryControlError> {
         self.require_effect()?;
         if Instant::now() >= original {
-            return Err(RecoveryControlError::new(RecoveryControlFault::EffectExpired));
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::EffectExpired,
+            ));
         }
         Ok(original.min(self.effect))
     }

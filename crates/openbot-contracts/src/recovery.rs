@@ -5,8 +5,6 @@
 //! authority. The registered HostRequestBindingGuard must still authenticate
 //! the same original binding and invoke its own RecoveryReadGate adapter.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Instant;
 
 use crate::auth::AuthContext;
@@ -19,6 +17,17 @@ pub enum RecoveryAdmissionPurpose {
     Normal,
     /// Only the separately authenticated named restored-binding confirmation.
     Reconfirmation,
+}
+
+/// The restored cohort named by the runtime's published RestoreCurrent binding:
+/// the external operation and epoch that requirement rows are compared under.
+/// It is comparison DATA, not a grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreCohortRef {
+    /// Restore operation UUID bytes.
+    pub operation_id: [u8; 16],
+    /// External restore epoch.
+    pub epoch: [u8; 32],
 }
 
 /// Original held admission owner, not a serialized or persistent permission.
@@ -37,28 +46,11 @@ pub trait RecoveryAdmissionWitness: Send + Sync {
         auth: &AuthContext,
         deadline: Instant,
     ) -> Result<(), HostRequestBindingError>;
+
+    /// The cohort frozen when this lease was borrowed: `Some` only when its
+    /// runtime publishes RestoreCurrent. There is no default implementation.
+    fn restore_cohort(&self) -> Option<RestoreCohortRef>;
 }
 
 /// Opaque, non-Clone owned lease. Dropping it is not a Current/closure receipt.
 pub type RecoveryAdmissionLease<'a> = Box<dyn RecoveryAdmissionWitness + 'a>;
-
-/// Read port installed only by the actual registered original host issuer.
-///
-/// No factory, path, caller AuthContext or arbitrary implementation of this
-/// port can mint a restore session. The enclosing original request-binding
-/// guard owns enrollment and rejects unsupported composition.
-pub trait RecoveryHostReadPort: Send + Sync {
-    /// Borrow original admission under one unchanged use-case deadline.
-    fn borrow_before<'a>(
-        &'a self,
-        binding: &'a VerifiedHostRequestBinding,
-        auth: &'a AuthContext,
-        deadline: Instant,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<RecoveryAdmissionLease<'a>, HostRequestBindingError>>
-                + Send
-                + 'a,
-        >,
-    >;
-}

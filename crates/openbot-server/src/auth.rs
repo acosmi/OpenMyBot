@@ -773,14 +773,31 @@ const CURRENT_SESSION_SQL: &str = "SELECT s.id,s.user_id,s.token,s.expires_at,s.
 
 impl HostRequestBindingGuard for ServerSessionCurrentGuard {
     fn borrow_recovery_admission_before<'a>(
-        &'a self, binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
-        auth: &'a AuthContext, deadline: std::time::Instant,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<openbot_contracts::recovery::RecoveryAdmissionLease<'a>, HostRequestBindingError>> + Send + 'a>> {
+        &'a self,
+        binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
-            if !self.owner.is_current() { return Err(HostRequestBindingError::NotCurrent); }
+            if !self.owner.is_current() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
             // This field is installed from the original issuer-owned probe;
             // its borrow is tied to self, not a temporary upgraded Arc.
-            let gate = self.recovery_read_gate.as_ref().ok_or(HostRequestBindingError::Unavailable)?;
+            let gate = self
+                .recovery_read_gate
+                .as_ref()
+                .ok_or(HostRequestBindingError::Unavailable)?;
             gate.borrow_before(binding, auth, deadline).await
         })
     }
@@ -1928,11 +1945,24 @@ impl ServerSessionCurrentGuard {
 impl PostgresSessionAuthResolver {
     /// Attach the original runtime's weak recovery gate once to this live issuer.
     /// Reject a different pool or namespace, a retired issuer or a repeated attachment.
-    pub fn install_recovery_read_gate(&self, gate: openbot_infra::recovery_control::RecoveryReadGate) -> Result<(), HostRequestBindingError> {
+    pub fn install_recovery_read_gate(
+        &self,
+        gate: openbot_infra::recovery_control::RecoveryReadGate,
+    ) -> Result<(), HostRequestBindingError> {
         if !self.binding_owner.issuer.observation().is_current()
-            || !gate.matches_server_scope(&self.pool, self.deployment.as_str(), self.tenant.as_str())
-        { return Err(HostRequestBindingError::Unavailable); }
-        self.binding_owner.probe.recovery_read_gate.set(gate).map_err(|_| HostRequestBindingError::Unavailable)
+            || !gate.matches_server_scope(
+                &self.pool,
+                self.deployment.as_str(),
+                self.tenant.as_str(),
+            )
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        self.binding_owner
+            .probe
+            .recovery_read_gate
+            .set(gate)
+            .map_err(|_| HostRequestBindingError::Unavailable)
     }
 
     #[allow(
@@ -2438,14 +2468,31 @@ struct SingleUserCurrentGuard {
 
 impl HostRequestBindingGuard for SingleUserCurrentGuard {
     fn borrow_recovery_admission_before<'a>(
-        &'a self, binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
-        auth: &'a AuthContext, deadline: std::time::Instant,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<openbot_contracts::recovery::RecoveryAdmissionLease<'a>, HostRequestBindingError>> + Send + 'a>> {
+        &'a self,
+        binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
-            if !self.owner.is_current() { return Err(HostRequestBindingError::NotCurrent); }
+            if !self.owner.is_current() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
             // This field is installed from the original issuer-owned probe;
             // its borrow is tied to self, not a temporary upgraded Arc.
-            let gate = self.recovery_read_gate.as_ref().ok_or(HostRequestBindingError::Unavailable)?;
+            let gate = self
+                .recovery_read_gate
+                .as_ref()
+                .ok_or(HostRequestBindingError::Unavailable)?;
             gate.borrow_before(binding, auth, deadline).await
         })
     }
@@ -3063,13 +3110,30 @@ impl SingleUserAuthResolver {
 
     /// Attach the original runtime's weak recovery gate once to this verified principal.
     /// Require a live issuer, the same actual pool and namespace, and no earlier attachment.
-    pub fn install_recovery_read_gate(&self, pool: &openbot_infra::db::pool::DatabasePool, gate: openbot_infra::recovery_control::RecoveryReadGate) -> Result<(), HostRequestBindingError> {
-        let owner = self.binding_owner.as_ref().ok_or(HostRequestBindingError::Unavailable)?;
+    pub fn install_recovery_read_gate(
+        &self,
+        pool: &openbot_infra::db::pool::DatabasePool,
+        gate: openbot_infra::recovery_control::RecoveryReadGate,
+    ) -> Result<(), HostRequestBindingError> {
+        let owner = self
+            .binding_owner
+            .as_ref()
+            .ok_or(HostRequestBindingError::Unavailable)?;
         if !owner.issuer.observation().is_current()
             || !owner.probe.principal.matches_pool_scope(pool)
-            || !gate.matches_server_scope(pool, self.context.deployment().as_str(), self.context.tenant().as_str())
-        { return Err(HostRequestBindingError::Unavailable); }
-        owner.probe.recovery_read_gate.set(gate).map_err(|_| HostRequestBindingError::Unavailable)
+            || !gate.matches_server_scope(
+                pool,
+                self.context.deployment().as_str(),
+                self.context.tenant().as_str(),
+            )
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        owner
+            .probe
+            .recovery_read_gate
+            .set(gate)
+            .map_err(|_| HostRequestBindingError::Unavailable)
     }
 
     #[allow(

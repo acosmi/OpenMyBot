@@ -44,11 +44,19 @@ struct NativeSpawnFailure {
     original_io: Option<std::io::Error>,
 }
 impl From<MaintenanceError> for NativeSpawnFailure {
-    fn from(fault: MaintenanceError) -> Self { Self { fault, original_io: None } }
+    fn from(fault: MaintenanceError) -> Self {
+        Self {
+            fault,
+            original_io: None,
+        }
+    }
 }
 impl From<std::io::Error> for NativeSpawnFailure {
     fn from(error: std::io::Error) -> Self {
-        Self { fault: MaintenanceError::IoFailure, original_io: Some(error) }
+        Self {
+            fault: MaintenanceError::IoFailure,
+            original_io: Some(error),
+        }
     }
 }
 #[cfg(feature = "postgres-supervisor")]
@@ -69,7 +77,10 @@ enum RestoreStopState {
 #[cfg(feature = "postgres-supervisor")]
 struct RestoreProgramOwner {
     original: ProgramOwner,
-    identity: Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError>,
+    identity: Result<
+        wrok_bot_macos_process::ProcessIdentity,
+        wrok_bot_macos_process::ProcessObservationError,
+    >,
     generation: [u64; 3],
     stop: Option<RestoreStopState>,
     post_directories: Result<(), IsolationFailure>,
@@ -87,13 +98,25 @@ fn spawn_restore_program(
     secret: Arc<SecretBytes>,
     limits: (u64, u64, bool),
 ) -> Result<RestoreProgramOwner, RestoreProgramFailure> {
-    let generation = policy.generation_identity().map_err(RestoreProgramFailure::Isolation)?;
+    let generation = policy
+        .generation_identity()
+        .map_err(RestoreProgramFailure::Isolation)?;
     let command = policy.checked_postgres_command(bundle, authenticated_config_args)?;
-    policy.revalidate().map_err(RestoreProgramFailure::Isolation)?;
+    policy
+        .revalidate()
+        .map_err(RestoreProgramFailure::Isolation)?;
     // This real sandbox-exec Command enters the original spawn body; no second
     // Child/pipe abstraction, optional sandbox or unisolated fallback is used.
-    let original = spawn_program_retaining_io(command, "restore_postgres", clock, secret, false, limits, false)
-        .map_err(RestoreProgramFailure::OriginalSpawn)?;
+    let original = spawn_program_retaining_io(
+        command,
+        "restore_postgres",
+        clock,
+        secret,
+        false,
+        limits,
+        false,
+    )
+    .map_err(RestoreProgramFailure::OriginalSpawn)?;
     // No fallible return drops a spawned Child. Capture failure remains resident
     // with that owner and cannot authorize another native request.
     let identity = wrok_bot_macos_process::ProcessIdentity::capture(original.pid);
@@ -102,8 +125,14 @@ fn spawn_restore_program(
     // Post-check failure stays WITH the original Child and raw identity outcome.
     // The only remaining operations are original-resource stop/wait; no grant is
     // returned and no failure path silently drops or restarts this process.
-    Ok(RestoreProgramOwner { original, identity, generation, stop: None,
-        post_directories, post_software })
+    Ok(RestoreProgramOwner {
+        original,
+        identity,
+        generation,
+        stop: None,
+        post_directories,
+        post_software,
+    })
 }
 
 #[cfg(feature = "postgres-supervisor")]
@@ -111,21 +140,33 @@ fn request_restore_stop(
     owner: &mut RestoreProgramOwner,
     clock: &OperationClock,
 ) -> Result<(), RestoreProgramFailure> {
-    if owner.stop.is_some() { return Err(RestoreProgramFailure::OriginalStopUnknown); }
+    if owner.stop.is_some() {
+        return Err(RestoreProgramFailure::OriginalStopUnknown);
+    }
     // This is the still-resident, unreaped original Child, not a saved PID or
     // reconstructed journal observer. No new pg_ctl process is created.
     if owner.original.role != "restore_postgres"
-        || owner.original.child.id() != Some(owner.original.pid) {
+        || owner.original.child.id() != Some(owner.original.pid)
+    {
         return Err(RestoreProgramFailure::Identity(
-            wrok_bot_macos_process::ProcessObservationError::ObservationChanged));
+            wrok_bot_macos_process::ProcessObservationError::ObservationChanged,
+        ));
     }
-    owner.identity.as_ref().map_err(|error| RestoreProgramFailure::Identity(*error))?
-        .revalidate().map_err(RestoreProgramFailure::Identity)?;
-    let pid = i32::try_from(owner.original.pid).ok()
+    owner
+        .identity
+        .as_ref()
+        .map_err(|error| RestoreProgramFailure::Identity(*error))?
+        .revalidate()
+        .map_err(RestoreProgramFailure::Identity)?;
+    let pid = i32::try_from(owner.original.pid)
+        .ok()
         .and_then(rustix::process::Pid::from_raw)
         .ok_or(RestoreProgramFailure::Identity(
-            wrok_bot_macos_process::ProcessObservationError::InvalidPid))?;
-    clock.permit_closing_request().map_err(RestoreProgramFailure::ClosingGate)?;
+            wrok_bot_macos_process::ProcessObservationError::InvalidPid,
+        ))?;
+    clock
+        .permit_closing_request()
+        .map_err(RestoreProgramFailure::ClosingGate)?;
     owner.stop = Some(RestoreStopState::Entered);
     let result = rustix::process::kill_process(pid, rustix::process::Signal::TERM)
         .map_err(std::io::Error::from);
@@ -133,13 +174,20 @@ fn request_restore_stop(
     owner.stop = Some(RestoreStopState::Returned(result));
     // A successful signal request is not child exit, pipe join or a close receipt.
     // An error/unknown retains the original result and never retries this request.
-    if requested { Ok(()) } else { Err(RestoreProgramFailure::OriginalStopUnknown) }
+    if requested {
+        Ok(())
+    } else {
+        Err(RestoreProgramFailure::OriginalStopUnknown)
+    }
 }
 
 #[cfg(feature = "postgres-supervisor")]
 struct RestoreProgramResult {
     tool: Result<ToolResult, MaintenanceError>,
-    identity: Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError>,
+    identity: Result<
+        wrok_bot_macos_process::ProcessIdentity,
+        wrok_bot_macos_process::ProcessObservationError,
+    >,
     generation: [u64; 3],
     stop: Option<RestoreStopState>,
     post_directories: Result<(), IsolationFailure>,
@@ -153,13 +201,25 @@ async fn wait_restore_program(
 ) -> RestoreProgramResult {
     // Capturing a birth or requesting TERM never substitutes for this original
     // wait and all original pipe joins. Both raw stop and identity outcomes stay.
-    let RestoreProgramOwner { original, identity, generation, stop,
-        post_directories, post_software } = owner;
+    let RestoreProgramOwner {
+        original,
+        identity,
+        generation,
+        stop,
+        post_directories,
+        post_software,
+    } = owner;
     // Only request_restore_stop may issue this restore owner's one TERM. The
     // original wait's optional deadline TERM is disabled, so Unknown cannot send
     // another native request. It still waits the same Child and joins all pipes.
-    RestoreProgramResult { tool: wait_program(original, capacity, closing, false).await,
-        identity, generation, stop, post_directories, post_software }
+    RestoreProgramResult {
+        tool: wait_program(original, capacity, closing, false).await,
+        identity,
+        generation,
+        stop,
+        post_directories,
+        post_software,
+    }
 }
 
 const ROLE: &str = "wrokbot_maintenance_fixture";
