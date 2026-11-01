@@ -527,7 +527,7 @@ fn materialize_sleeping_supervisor_bundle(seconds: &str) -> (PathBuf, PostgresBu
         (
             crate::postgres_sidecar::expected_program_paths()[1],
             "initdb",
-            "data=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--pgdata\" ]; then shift; data=$1; fi\n  shift\ndone\nIFS= read -r first\nIFS= read -r second\n[ -n \"$data\" ] && [ \"$first\" = \"$second\" ] || exit 18\n/usr/bin/printf '17\\n' > \"$data/PG_VERSION\"\nexit 0\n".to_owned(),
+            "data=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--pgdata\" ]; then shift; data=$1; fi\n  shift\ndone\nIFS= read -r first\nif IFS= read -r second; then [ \"$first\" = \"$second\" ] || exit 18; fi\n[ -n \"$data\" ] && [ -n \"$first\" ] || exit 18\n/usr/bin/printf '17\\n' > \"$data/PG_VERSION\"\nexit 0\n".to_owned(),
         ),
         (
             crate::postgres_sidecar::expected_program_paths()[2],
