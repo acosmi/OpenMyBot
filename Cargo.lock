@@ -4581,22 +4581,17 @@ name = "omb-channels"
 version = "0.0.0"
 dependencies = [
  "futures-util",
- "getrandom 0.4.3",
  "http",
- "omb-store",
- "openbot-application",
- "openbot-contracts",
+ "omb-channel-sdk",
  "openbot-domain",
  "openbot-infra",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.20",
  "time",
  "tokio",
- "tokio-postgres",
  "tokio-tungstenite",
  "url",
- "uuid",
 ]
 
 [[package]]

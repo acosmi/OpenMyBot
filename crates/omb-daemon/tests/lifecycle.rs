@@ -1352,6 +1352,183 @@ async fn daemon_lists_plugins_and_removes_one_only_without_a_live_binding() {
     assert_runtime_released(&fixture);
 }
 
+/// One JSON command to the fake platform process and its one-line answer.
+async fn platform_call(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    command: serde_json::Value,
+) -> serde_json::Value {
+    use tokio::io::AsyncWriteExt;
+    stdin
+        .write_all(format!("{command}\n").as_bytes())
+        .await
+        .unwrap();
+    serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap()
+}
+
+/// The fake Bot API's sent messages once there are at least `count`.
+async fn telegram_sent(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    count: usize,
+) -> Vec<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let reply = platform_call(stdin, stdout, serde_json::json!({"op": "telegram_sent"})).await;
+        let sent = reply["sent"].as_array().unwrap().clone();
+        if sent.len() >= count {
+            return sent;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited for {count} sends"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn plugin_telegram_real_binary_happy_line_through_daemon_process() {
+    use tokio::io::AsyncBufReadExt;
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let workspace = fixture.root.join("projects");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&workspace)
+        .unwrap();
+    // The fake host reports the version the embedded window accepts.
+    let window: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../openmybot/compat/crabcode/accepted.json"
+    ))
+    .unwrap();
+    let fake_host = PathBuf::from(
+        std::env::var_os("OMB_TEST_FAKE_CRABCODE")
+            .expect("OMB_TEST_FAKE_CRABCODE: absolute path of the fake host binary"),
+    );
+    let host = fixture.root.join("crabcode");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&host)
+        .unwrap()
+        .write_all(
+            format!(
+                "#!/bin/sh\nFAKE_CRABCODE_VERSION={} exec '{}' \"$@\"\n",
+                window["accepted"][0]["version"].as_str().unwrap(),
+                fake_host.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    configure_crabcode(
+        &fixture,
+        host.to_str().unwrap(),
+        std::slice::from_ref(&workspace),
+    );
+    let mut process =
+        fixture.spawn("plugin_telegram_real_binary_happy_line_through_daemon_process");
+    fixture.ready().await;
+    let mut platform = tokio::process::Command::new(
+        std::env::var_os("OMB_TEST_CHANNEL_PLATFORM")
+            .expect("OMB_TEST_CHANNEL_PLATFORM: absolute path of the fake channel platform"),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut stdin = platform.stdin.take().unwrap();
+    let mut stdout = tokio::io::BufReader::new(platform.stdout.take().unwrap()).lines();
+    let bases: serde_json::Value =
+        serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+    // The real binary and the production manifest, pointed at the fake Bot API.
+    let package = fixture.root.join("package-telegram");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(package.join("bin"))
+        .unwrap();
+    fs::copy(
+        std::env::var_os("OMB_TEST_CHANNEL_TELEGRAM")
+            .expect("OMB_TEST_CHANNEL_TELEGRAM: absolute path of the Telegram plugin"),
+        package.join("bin/openmybot-channel-telegram"),
+    )
+    .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../openmybot/plugins/telegram/plugin.json"
+    ))
+    .unwrap();
+    manifest["extensions"]["org.openmybot"]["channels"]["telegram"]["args"] =
+        serde_json::json!(["--api-base", bases["telegram_api_base"]]);
+    fs::write(package.join("plugin.json"), manifest.to_string()).unwrap();
+    let installed = op(
+        &fixture,
+        "plugins_add",
+        serde_json::json!({"dir": package.to_str().unwrap()}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed["name"], "openmybot-channel-telegram");
+    fs::remove_dir_all(package).unwrap();
+    // The plugin verifies the token against the fake Bot API: its bot id becomes the source key.
+    let bound = op(
+        &fixture,
+        "bindings_receiver",
+        serde_json::json!({"channel": "telegram", "fields": {"token": "1001:lifecycle-token"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bound["source_key"], "1001");
+    let started = op(
+        &fixture,
+        "pair_start",
+        serde_json::json!({"channel": "telegram", "workspace": workspace}),
+    )
+    .await
+    .unwrap();
+    let update = |id: u64, text: &str| {
+        serde_json::json!({"op": "telegram_push_update", "update": {"update_id": id, "message": {
+            "message_id": id,
+            "date": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            "from": {"id": 42, "is_bot": false},
+            "chat": {"id": 42, "type": "private"},
+            "text": text,
+        }}})
+    };
+    platform_call(
+        &mut stdin,
+        &mut stdout,
+        update(1, &format!("/pair {}", started["code"].as_str().unwrap())),
+    )
+    .await;
+    let replies = telegram_sent(&mut stdin, &mut stdout, 1).await;
+    assert!(
+        replies[0]["text"].as_str().unwrap().starts_with("绑定成功"),
+        "{replies:?}"
+    );
+    platform_call(&mut stdin, &mut stdout, update(2, "please do the work")).await;
+    let replies = telegram_sent(&mut stdin, &mut stdout, 2).await;
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    let result = replies[1]["text"].as_str().unwrap();
+    assert!(
+        result.starts_with("[OpenMyBot] 已完成 · run ") && result.ends_with("\nhello from fake"),
+        "{result}"
+    );
+    assert!(replies.iter().all(|reply| reply["chat_id"] == 42));
+    let listed = op(&fixture, "plugins_list", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(listed["plugins"][0]["process"], "running");
+    process.stop(Signal::TERM).await;
+    assert_runtime_released(&fixture);
+}
+
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn daemon_restore_detected_suspends_bindings_and_expires_pending_events_until_reconfirmed() {

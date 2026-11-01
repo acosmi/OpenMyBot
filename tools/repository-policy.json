@@ -92,6 +92,8 @@
     "openmybot/compat/feishu/long-connection.md",
     "openmybot/hosts/README.md",
     "openmybot/hosts/crabcode/skills/openmybot/SKILL.md",
+    "openmybot/plugin/README.md",
+    "openmybot/plugin/skills/openmybot/SKILL.md",
     "supply-chain/README.md",
     "tools/electron-v43.3.0.SHASUMS256.txt"
   ],
