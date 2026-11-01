@@ -3768,6 +3768,72 @@ impl HostRequestBindingGuard for FixedRequestGuard {
             self.verify_current(auth).await
         })
     }
+
+    // The fixed synthetic context lies outside every recovery domain, like
+    // `outside_recovery_domain`: Normal admission only, never reconfirmation.
+    fn borrow_recovery_admission_before<'a>(
+        &'a self,
+        _binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let admission = FixedAdmission(self.0.clone());
+            admission.check(auth, deadline)?;
+            Ok(Box::new(admission) as openbot_contracts::recovery::RecoveryAdmissionLease<'a>)
+        })
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+struct FixedAdmission(AuthContext);
+
+#[cfg(any(test, feature = "testkit"))]
+impl FixedAdmission {
+    fn check(
+        &self,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        if auth == &self.0 {
+            Ok(())
+        } else {
+            Err(HostRequestBindingError::NotCurrent)
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+impl openbot_contracts::recovery::RecoveryAdmissionWitness for FixedAdmission {
+    fn purpose(&self) -> openbot_contracts::recovery::RecoveryAdmissionPurpose {
+        openbot_contracts::recovery::RecoveryAdmissionPurpose::Normal
+    }
+
+    fn verify_current_before(
+        &self,
+        _binding: &openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        self.check(auth, deadline)
+    }
+
+    fn restore_cohort(&self) -> Option<openbot_contracts::recovery::RestoreCohortRef> {
+        None
+    }
 }
 
 #[cfg(any(test, feature = "testkit"))]

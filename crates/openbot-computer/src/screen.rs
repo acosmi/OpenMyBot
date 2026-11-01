@@ -1265,6 +1265,27 @@ mod tests {
         }
     }
 
+    // Implements only the required check: admission keeps the closed default.
+    struct DefaultGuard;
+    impl openbot_contracts::request_binding::HostRequestBindingGuard for DefaultGuard {
+        fn verify_current<'a>(
+            &'a self,
+            _: &'a AuthContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            openbot_contracts::request_binding::HostRequestBindingError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn application_port_resolves_target_and_never_logs_issued_protocol() {
         let hub = ScreenHub::new(3).expect("hub");
@@ -1305,6 +1326,17 @@ mod tests {
         assert!(!format!("{ticket:?}").contains(ticket.ticket_protocol()));
         assert_eq!(
             service.issue_at(&unbound, request.clone(), NOW).await,
+            Err(ScreenSessionAdministrationError::Unavailable)
+        );
+        let closed = issuer
+            .bind_desktop_window(&unbound, "closed".into(), 2, Arc::new(DefaultGuard))
+            .expect("closed binding");
+        let closed = unbound
+            .clone()
+            .with_verified_request_binding(closed)
+            .expect("bound");
+        assert_eq!(
+            service.issue_at(&closed, request.clone(), NOW).await,
             Err(ScreenSessionAdministrationError::Unavailable)
         );
 
