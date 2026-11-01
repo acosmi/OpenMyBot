@@ -30,14 +30,15 @@ url.workspace = true
 tokio-postgres.workspace = true
 semver = "=1.0.28"
 chrono.workspace = true
+time.workspace = true
 
 omb-store = { path = "../omb-store" }
-omb-channels = { path = "../omb-channels" }
+omb-channel-sdk = { path = "../omb-channel-sdk" }
 omb-hostdriver = { path = "../omb-hostdriver" }
 sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 openbot-contracts = { path = "../openbot-contracts", features = ["testkit"] }
-omb-channels = { path = "../omb-channels", features = ["testkit"] }
+omb-channel-sdk = { path = "../omb-channel-sdk", features = ["testkit"] }
 omb-store = { path = "../omb-store", features = ["testkit"] }

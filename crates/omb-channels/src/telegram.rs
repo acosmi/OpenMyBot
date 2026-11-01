@@ -1,31 +1,14 @@
 //! Telegram Bot API long polling: boundary parsing, fingerprints, offsets and the receive loop.
 use crate::{
-    CancelRequests, ChannelError, Connection, Counters, Endpoints, OMB_REPLY_TEXTS_V1,
-    STORE_BUDGET, TELEGRAM, TG_HTTP_MARGIN, TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, Task,
-    TelegramEndpoint, Timings,
+    TELEGRAM, TG_HTTP_MARGIN, TG_OFFSET_STALE, TG_POLL_LIMIT, TG_RESPONSE_MAX, TelegramEndpoint,
 };
-use omb_store::{
-    ACCEPT_TX_BUDGET, AcceptOutcome, Command, Content, IdentityKey, NormalizedEvent, PollGapReason,
-    ReceiverRow, StoreError, Suspension, accept_event, close_poll_gaps, latest_event,
-    open_poll_gap, suspend_receiver,
-};
-use openbot_contracts::ids::ActorId;
-use openbot_domain::vault::{SecretBytes, SecretKind, SecretPrincipal, ServiceId};
-use openbot_infra::{
-    net::safe_http::{SafeHttpBudget, SafeHttpError, SafeHttpRequest},
-    vault::CredentialRecordVault,
-};
+use omb_store::{Command, Content, IdentityKey, NormalizedEvent, Suspension};
+use openbot_domain::vault::SecretBytes;
+use openbot_infra::net::safe_http::{SafeHttpBudget, SafeHttpRequest};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
-};
+use std::time::Duration;
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
-use tokio::{
-    sync::{Notify, oneshot},
-    time::Instant,
-};
 use url::Url;
 
 /// One `getUpdates` element after boundary parsing.
@@ -165,21 +148,6 @@ pub fn next_offset(
         .map(|(update_id, _)| update_id);
     stored.max(memory).map(|update_id| update_id + 1)
 }
-/// `min` doubled per attempt, capped at `max`.
-pub fn backoff_ceiling(attempt: u32, min: Duration, max: Duration) -> Duration {
-    min.checked_mul(2u32.saturating_pow(attempt))
-        .unwrap_or(max)
-        .min(max)
-}
-/// Full jitter: uniform in `[0, backoff_ceiling]`.
-pub fn backoff(attempt: u32, min: Duration, max: Duration) -> Duration {
-    let ceiling = backoff_ceiling(attempt, min, max);
-    let nanos = u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX);
-    getrandom::u64().map_or(ceiling, |random| {
-        Duration::from_nanos(random % nanos.saturating_add(1))
-    })
-}
-
 fn method_url(endpoint: &TelegramEndpoint, token: &str, method: &str) -> Url {
     let mut url = endpoint.api_base.clone();
     url.set_path(&format!("/bot{token}/{method}"));
@@ -237,193 +205,6 @@ fn verdict(status: u16, body: &[u8]) -> Verdict {
                 Verdict::Wait(Duration::from_secs(seconds))
             }),
         _ => Verdict::Backoff,
-    }
-}
-
-#[derive(Clone)]
-pub struct ReceiverContext {
-    pub vault: CredentialRecordVault,
-    pub owner: ActorId,
-    pub endpoints: Endpoints,
-    pub timings: Timings,
-    pub counters: Arc<Counters>,
-    pub wake: Arc<Notify>,
-    pub cancel: CancelRequests,
-}
-
-/// Starts the long-poll loop of one active receiver.
-pub(crate) fn start_receiver(
-    connection: Connection,
-    receiver: ReceiverRow,
-    context: ReceiverContext,
-) -> Task {
-    Task::spawn(connection, move |client, stop| {
-        receive(client, receiver, context, stop)
-    })
-}
-async fn receive(
-    mut client: tokio_postgres::Client,
-    receiver: ReceiverRow,
-    context: ReceiverContext,
-    mut stop: oneshot::Receiver<()>,
-) -> Result<(), ChannelError> {
-    let store = |_: StoreError| ChannelError::StoreFailed;
-    let secret = context
-        .vault
-        .open(
-            &receiver.binding_id,
-            SecretKind::Connector,
-            SecretPrincipal::Actor(context.owner.clone()),
-            SecretPrincipal::Service(ServiceId::new("openmybot.telegram")),
-            &receiver.credential_envelope,
-        )
-        .map(|opened| opened.into_secret());
-    let token = secret
-        .as_ref()
-        .ok()
-        .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
-        .filter(|token| {
-            token
-                .split_once(':')
-                .is_some_and(|(bot_id, _)| bot_id == receiver.source_key)
-        });
-    let Some(token) = token else {
-        suspend_receiver(
-            &mut client,
-            receiver.binding_id,
-            Suspension::CredentialRejected,
-            Instant::now() + STORE_BUDGET,
-        )
-        .await
-        .map_err(store)?;
-        return Ok(());
-    };
-    let timings = context.timings;
-    let mut memory: Option<u64> = None;
-    let mut failures = 0u32;
-    loop {
-        let stored = latest_event(&client, &TELEGRAM, &receiver.source_key)
-            .await
-            .map_err(store)?
-            .map(|(key, at)| Ok((key.parse().map_err(|_| ChannelError::StoreFailed)?, at)))
-            .transpose()?;
-        let url = updates_url(
-            &context.endpoints.telegram,
-            token,
-            next_offset(stored, memory, OffsetDateTime::now_utc()),
-            timings.poll_timeout,
-        );
-        let response = tokio::select! {
-            _ = &mut stop => return Ok(()),
-            response = async {
-                let budget = SafeHttpBudget::new(TG_RESPONSE_MAX, timings.poll_timeout + TG_HTTP_MARGIN)?;
-                context.endpoints.telegram.dialer.execute(SafeHttpRequest::get(url, context.endpoints.telegram.scheme, budget)?).await
-            } => response,
-        };
-        let (reason, delay) = match response.map(|r| verdict(r.status().as_u16(), r.body())) {
-            Err(
-                SafeHttpError::InvalidUrl
-                | SafeHttpError::SchemeRejected
-                | SafeHttpError::InvalidBudget
-                | SafeHttpError::DnsUnavailable
-                | SafeHttpError::DestinationDenied
-                | SafeHttpError::ConnectFailed
-                | SafeHttpError::PeerMismatch
-                | SafeHttpError::TlsFailed,
-            ) => (PollGapReason::ConnectFailed, None),
-            Err(_) | Ok(Verdict::Backoff) => (PollGapReason::StreamBroken, None),
-            Ok(Verdict::Wait(delay)) => (PollGapReason::StreamBroken, Some(delay)),
-            Ok(Verdict::Suspend(why)) => {
-                suspend_receiver(
-                    &mut client,
-                    receiver.binding_id,
-                    why,
-                    Instant::now() + STORE_BUDGET,
-                )
-                .await
-                .map_err(store)?;
-                return Ok(());
-            }
-            Ok(Verdict::Updates(mut updates)) => {
-                close_poll_gaps(
-                    &mut client,
-                    receiver.binding_id,
-                    Instant::now() + STORE_BUDGET,
-                )
-                .await
-                .map_err(store)?;
-                failures = 0;
-                updates.sort_by_key(|update| update.get("update_id").and_then(Value::as_u64));
-                for update in &updates {
-                    let committed = match normalize(update, &receiver.source_key) {
-                        Normalized::Unparseable => {
-                            context
-                                .counters
-                                .platform_payload_unparseable
-                                .fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        Normalized::Unsupported => {
-                            context
-                                .counters
-                                .unsupported_update
-                                .fetch_add(1, Ordering::Relaxed);
-                            true
-                        }
-                        Normalized::Event(event) => {
-                            let accepted = accept_event(
-                                &mut client,
-                                receiver.binding_id,
-                                &event,
-                                &OMB_REPLY_TEXTS_V1,
-                                Instant::now() + ACCEPT_TX_BUDGET,
-                            )
-                            .await;
-                            // Every outcome wakes, an error too: its commit may have landed.
-                            context.wake.notify_one();
-                            match accepted {
-                                Ok(AcceptOutcome::Conflict) => {
-                                    context
-                                        .counters
-                                        .event_conflict
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    true
-                                }
-                                // Sent only after commit; a closed channel means the daemon is stopping.
-                                Ok(AcceptOutcome::Cancel(binding)) => {
-                                    let _ = context.cancel.send(binding).await;
-                                    true
-                                }
-                                Ok(_) => true,
-                                Err(StoreError::ReceiverNotActive) => return Ok(()),
-                                // Not committed: the rest of the batch is fetched again from here.
-                                Err(_) => false,
-                            }
-                        }
-                    };
-                    if !committed {
-                        break;
-                    }
-                    memory = memory.max(update.get("update_id").and_then(Value::as_u64));
-                }
-                continue;
-            }
-        };
-        open_poll_gap(
-            &mut client,
-            receiver.binding_id,
-            reason,
-            Instant::now() + STORE_BUDGET,
-        )
-        .await
-        .map_err(store)?;
-        let delay =
-            delay.unwrap_or_else(|| backoff(failures, timings.backoff_min, timings.backoff_max));
-        failures = failures.saturating_add(1);
-        tokio::select! {
-            _ = &mut stop => return Ok(()),
-            () = tokio::time::sleep(delay) => {}
-        }
     }
 }
 
@@ -919,26 +700,6 @@ mod tests {
         }
     }
     #[test]
-    fn backoff_ceiling_doubles_from_one_to_sixty_seconds() {
-        let (min, max) = (Duration::from_secs(1), Duration::from_secs(60));
-        let ceilings: Vec<u64> = (0..8)
-            .map(|a| backoff_ceiling(a, min, max).as_secs())
-            .collect();
-        assert_eq!(ceilings, [1, 2, 4, 8, 16, 32, 60, 60]);
-        assert_eq!(backoff_ceiling(u32::MAX, min, max), max);
-        assert_eq!(backoff_ceiling(40, min, max), max);
-    }
-    #[test]
-    fn backoff_is_drawn_within_zero_and_ceiling() {
-        let (min, max) = (Duration::from_secs(1), Duration::from_secs(60));
-        for attempt in 0..10 {
-            let ceiling = backoff_ceiling(attempt, min, max);
-            let draws: Vec<Duration> = (0..200).map(|_| backoff(attempt, min, max)).collect();
-            assert!(draws.iter().all(|d| *d <= ceiling));
-            assert!(draws.iter().any(|d| *d < ceiling / 2), "attempt {attempt}");
-        }
-    }
-    #[test]
     fn token_never_appears_in_debug_display_or_error() {
         let sentinel = "1001:token-sentinel-ZXCV";
         let secret = SecretBytes::new(sentinel.as_bytes().to_vec());
@@ -948,16 +709,8 @@ mod tests {
             SafeHttpBudget::new(TG_RESPONSE_MAX, Duration::from_secs(65)).unwrap(),
         )
         .unwrap();
-        let row = ReceiverRow {
-            binding_id: uuid::Uuid::now_v7(),
-            channel: TELEGRAM,
-            source_key: "1001".into(),
-            credential_envelope: sentinel.into(),
-        };
         let rendered = format!(
-            "{secret:?} {request:?} {row:?} {:?} {} {:?} {:?} {:?}",
-            ChannelError::StoreFailed,
-            ChannelError::StoreFailed,
+            "{secret:?} {request:?} {:?} {:?} {:?}",
             CredentialProblem::CredentialRejected,
             Verdict::Suspend(Suspension::CredentialRejected),
             production().dialer

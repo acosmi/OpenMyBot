@@ -103,6 +103,49 @@ fn stand_in(listener: UnixListener, response: Value) -> JoinHandle<(Value, Value
         (hello, request)
     })
 }
+/// A `plugins_list` answer whose plugin serves `telegram` with a plain `bot_id` and a secret
+/// `token`, and `feishu` with a plain `app_id` and a secret `app_secret`.
+fn listed() -> Value {
+    let field = |name: &str, secret: bool| json!({"name": name, "secret": secret});
+    json!({"type": "response", "ok": true, "data": {"plugins": [{
+        "name": "chat", "version": "1.0.0", "process": "stopped", "last_exit_code": null,
+        "channels": [
+            {"channel_kind": "feishu", "status_note": "n", "credential_fields": [field("app_id", false), field("app_secret", true)]},
+            {"channel_kind": "telegram", "status_note": "n", "credential_fields": [field("token", true)]},
+        ],
+    }]}})
+}
+/// Serves the receiver command's two connections: `plugins_list` answered with [`listed`], then
+/// the request answered with `response`; returns the second request frame.
+async fn receiver(args: &[&str], stdin: &'static [u8], response: Value) -> (Output, Value) {
+    let (root, listener) = data_dir();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in [listed(), response] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_frame(&mut stream).await;
+            write_frame(
+                &mut stream,
+                &json!({"type": "hello_ok", "daemon_version": "0.0.0", "engine_pin": "0".repeat(40)}),
+            )
+            .await;
+            requests.push(read_frame(&mut stream).await);
+            write_frame(&mut stream, &response).await;
+        }
+        assert_eq!(
+            requests[0],
+            json!({"type": "request", "op": "plugins_list", "args": {}})
+        );
+        requests.pop().unwrap()
+    });
+    let mut values = strings(args);
+    values.extend(["--data-dir".into(), root.to_str().unwrap().into()]);
+    assert!(values.iter().all(|value| !value.contains("SENTINEL")));
+    let output = run(values, stdin).await;
+    let request = server.await.unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    (output, request)
+}
 async fn answered(args: &[&str], stdin: &'static [u8], response: Value) -> (Output, Value) {
     let (root, listener) = data_dir();
     let server = stand_in(listener, response);
@@ -132,9 +175,12 @@ fn control_forms() -> Vec<(Vec<&'static str>, &'static [u8])> {
             b"123456:SENTINEL-cli-token\n",
         ),
         (
-            vec!["bindings", "receiver", "feishu", "--app-id", "cli_a"],
-            b"app-secret\n",
+            vec!["bindings", "receiver", "feishu"],
+            b"cli_a\napp-secret\n",
         ),
+        (vec!["plugins", "list"], b""),
+        (vec!["plugins", "add", "/pkg"], b""),
+        (vec!["plugins", "remove", "chat"], b""),
         (
             vec!["bindings", "host", "crabcode", "--workspace", "/ws"],
             b"",
@@ -173,6 +219,10 @@ async fn usage_errors_exit_2_with_invalid_arguments_in_json() {
         vec!["--json", "status", "--run", "a", "--run", "b"],
         vec!["--json", "mcp"],
         vec!["--json", "bindings", "reset-thread", "b1"],
+        vec!["--json", "plugins", "add", "--built-in", "telegram"],
+        vec![
+            "--json", "bindings", "receiver", "feishu", "--app-id", "cli_a",
+        ],
     ] {
         let output = run(strings(&args), b"").await;
         assert_eq!(output.status.code(), Some(2), "{args:?}");
@@ -185,16 +235,31 @@ async fn usage_errors_exit_2_with_invalid_arguments_in_json() {
 }
 
 #[tokio::test]
-async fn empty_or_over_512_byte_stdin_secret_exits_2_before_connecting() {
+async fn empty_or_over_512_byte_field_line_exits_2_without_a_second_connection() {
     let long: &'static [u8] = format!("{}\n", "x".repeat(513)).into_bytes().leak();
-    for stdin in [&b""[..], b"\n", long] {
+    for stdin in [&b""[..], b"\n", long, b"cli_a\n"] {
         let (root, listener) = data_dir();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_frame(&mut stream).await;
+            write_frame(
+                &mut stream,
+                &json!({"type": "hello_ok", "daemon_version": "0.0.0", "engine_pin": "0".repeat(40)}),
+            )
+            .await;
+            read_frame(&mut stream).await;
+            write_frame(&mut stream, &listed()).await;
+            // The request is never sent.
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        });
         let output = run(
             strings(&[
                 "--json",
                 "bindings",
                 "receiver",
-                "telegram",
+                "feishu",
                 "--data-dir",
                 root.to_str().unwrap(),
             ]),
@@ -206,13 +271,34 @@ async fn empty_or_over_512_byte_stdin_secret_exits_2_before_connecting() {
             stdout_json(&output),
             json!({"code": "invalid_arguments", "ok": false})
         );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), listener.accept())
-                .await
-                .is_err()
-        );
+        assert!(server.await.unwrap());
         std::fs::remove_dir_all(&root).unwrap();
     }
+}
+
+#[tokio::test]
+async fn receiver_of_a_channel_no_plugin_serves_exits_4_with_plugin_not_installed() {
+    let (root, listener) = data_dir();
+    let server = stand_in(listener, listed());
+    let output = run(
+        strings(&[
+            "--json",
+            "bindings",
+            "receiver",
+            "slack",
+            "--data-dir",
+            root.to_str().unwrap(),
+        ]),
+        b"secret\n",
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"code": "plugin_not_installed", "ok": false})
+    );
+    server.await.unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[tokio::test]
@@ -297,7 +383,7 @@ async fn remote_rejection_codes_exit_4_and_unknown_code_exits_5() {
 #[tokio::test]
 async fn request_frame_carries_op_and_args_and_the_secret_only_in_args_and_never_in_output() {
     let ok = json!({"type": "response", "ok": true, "data": {"binding_id": "b", "source_key": "123456"}});
-    let (output, request) = answered(
+    let (output, request) = receiver(
         &["--json", "bindings", "receiver", "telegram"],
         b"123456:SENTINEL-cli-token\r\n",
         ok.clone(),
@@ -306,20 +392,21 @@ async fn request_frame_carries_op_and_args_and_the_secret_only_in_args_and_never
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         request,
-        json!({"type": "request", "op": "bindings_receiver", "args": {"channel": "telegram", "token": SENTINEL}})
+        json!({"type": "request", "op": "bindings_receiver", "args": {"channel": "telegram", "fields": {"token": SENTINEL}}})
     );
     for stream in [&output.stdout, &output.stderr] {
         assert!(!String::from_utf8_lossy(stream).contains("SENTINEL"));
     }
-    let (_, request) = answered(
-        &["bindings", "receiver", "feishu", "--app-id", "cli_a"],
-        b"feishu-SENTINEL\n",
+    // One line per declared field, in declaration order.
+    let (_, request) = receiver(
+        &["bindings", "receiver", "feishu"],
+        b"cli_a\nfeishu-SENTINEL\n",
         ok.clone(),
     )
     .await;
     assert_eq!(
         request,
-        json!({"type": "request", "op": "bindings_receiver", "args": {"channel": "feishu", "app_id": "cli_a", "app_secret": "feishu-SENTINEL"}})
+        json!({"type": "request", "op": "bindings_receiver", "args": {"channel": "feishu", "fields": {"app_id": "cli_a", "app_secret": "feishu-SENTINEL"}}})
     );
     for (args, op, expected) in [
         (
@@ -346,6 +433,17 @@ async fn request_frame_carries_op_and_args_and_the_secret_only_in_args_and_never
             json!({"binding_id": "b1", "ack_unknown": "r1"}),
         ),
         (vec!["deny", "hp1"], "deny", json!({"permission_id": "hp1"})),
+        (vec!["plugins", "list"], "plugins_list", json!({})),
+        (
+            vec!["plugins", "add", "/pkg"],
+            "plugins_add",
+            json!({"dir": "/pkg"}),
+        ),
+        (
+            vec!["plugins", "remove", "chat"],
+            "plugins_remove",
+            json!({"name": "chat"}),
+        ),
     ] {
         let (_, request) = answered(&args, b"", ok.clone()).await;
         assert_eq!(

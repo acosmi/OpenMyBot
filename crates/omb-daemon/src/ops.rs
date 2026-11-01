@@ -1,19 +1,17 @@
 //! The owner's non-model control operations, executed under the local context.
 use crate::{
-    DaemonError,
+    Counters, DaemonError,
     channels::rfc3339_utc,
     control::REQUEST_TIMEOUT,
     pairing::{self, PairRequest},
     pg,
+    plugins::Plugins,
 };
-use omb_channels::{
-    Counters, CredentialProblem, Endpoints, FEISHU, TELEGRAM, verify_credentials,
-    verify_feishu_credentials,
-};
+use omb_channel_sdk::protocol::VerifyFailure;
 use omb_hostdriver::WorkspaceRoots;
 use omb_store::{
     ChannelKind, Decided, Decision, EventCancel, GrantKind, HostAccept, HostBinding,
-    HostBindingState, HostMessage, IdentityKey, KEY_MAX, MCP_LIST_MAX, NewReceiver, OperationId,
+    HostBindingState, HostMessage, IdentityKey, MCP_LIST_MAX, NewReceiver, OperationId,
     ReceiverRow, RunDeadline, Settled, StoreError, accept_host_begin, binding_run, binding_runs,
     cancel_pending, cancel_state, host_binding_state,
 };
@@ -31,8 +29,7 @@ use openbot_server::SingleUserAuthResolver;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
-    fmt,
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
 };
@@ -57,6 +54,9 @@ pub(crate) enum Op {
     Approve,
     Deny,
     Cancel,
+    PluginsList,
+    PluginsAdd,
+    PluginsRemove,
 }
 impl Op {
     pub(crate) fn parse(name: &str) -> Option<Op> {
@@ -72,6 +72,9 @@ impl Op {
             "approve" => Self::Approve,
             "deny" => Self::Deny,
             "cancel" => Self::Cancel,
+            "plugins_list" => Self::PluginsList,
+            "plugins_add" => Self::PluginsAdd,
+            "plugins_remove" => Self::PluginsRemove,
             _ => return None,
         })
     }
@@ -103,11 +106,12 @@ struct ResetArgs {
     binding_id: String,
     ack_unknown: String,
 }
+/// One value per credential field the channel's plugin declares.
 #[derive(Deserialize)]
-#[serde(tag = "channel", rename_all = "lowercase", deny_unknown_fields)]
-enum ReceiverArgs {
-    Telegram { token: String },
-    Feishu { app_id: String, app_secret: String },
+#[serde(deny_unknown_fields)]
+struct ReceiverArgs {
+    channel: String,
+    fields: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +124,16 @@ struct HostArgs {
 struct PermissionArgs {
     permission_id: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsAddArgs {
+    dir: PathBuf,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsRemoveArgs {
+    name: String,
+}
 
 /// One request after its single boundary parse.
 enum Request {
@@ -129,10 +143,13 @@ enum Request {
     BindingsRevoke(Uuid),
     BindingsReconfirm(Uuid),
     BindingsResetThread(Uuid, IdentityKey),
-    BindingsReceiver(ChannelSecret),
+    BindingsReceiver(ChannelKind, BTreeMap<String, String>),
     BindingsHost(PathBuf, Option<RunDeadline>),
     Decide(IdentityKey, Decision),
     Cancel(IdentityKey),
+    PluginsList,
+    PluginsAdd(PathBuf),
+    PluginsRemove(String),
 }
 fn decode<T: DeserializeOwned>(args: Value) -> Result<T, DaemonError> {
     // A struct also deserializes from a JSON array, so anything but an object is refused here.
@@ -147,6 +164,9 @@ fn uuid(text: &str) -> Result<Uuid, DaemonError> {
 fn key(text: &str) -> Result<IdentityKey, DaemonError> {
     IdentityKey::parse(text).ok_or(DaemonError::InvalidRequest)
 }
+fn kind(text: &str) -> Result<ChannelKind, DaemonError> {
+    ChannelKind::parse(text).ok_or(DaemonError::InvalidRequest)
+}
 fn run_deadline(seconds: Option<u32>) -> Result<Option<RunDeadline>, DaemonError> {
     seconds
         .map(|seconds| RunDeadline::parse(seconds).ok_or(DaemonError::InvalidRequest))
@@ -158,11 +178,7 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
         Op::PairStart => {
             let args: PairArgs = decode(args)?;
             Request::PairStart(PairRequest {
-                channel: match args.channel.as_str() {
-                    "telegram" => TELEGRAM,
-                    "feishu" => FEISHU,
-                    _ => return Err(DaemonError::InvalidRequest),
-                },
+                channel: kind(&args.channel)?,
                 workspace: args.workspace,
                 run_deadline: run_deadline(args.run_deadline)?,
             })
@@ -181,14 +197,10 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
             let args: ResetArgs = decode(args)?;
             Request::BindingsResetThread(uuid(&args.binding_id)?, key(&args.ack_unknown)?)
         }
-        Op::BindingsReceiver => match decode::<ReceiverArgs>(args)? {
-            ReceiverArgs::Telegram { token } => Request::BindingsReceiver(
-                ChannelSecret::telegram(token).ok_or(DaemonError::InvalidRequest)?,
-            ),
-            ReceiverArgs::Feishu { app_id, app_secret } => Request::BindingsReceiver(
-                ChannelSecret::feishu(app_id, app_secret).ok_or(DaemonError::InvalidRequest)?,
-            ),
-        },
+        Op::BindingsReceiver => {
+            let args: ReceiverArgs = decode(args)?;
+            Request::BindingsReceiver(kind(&args.channel)?, args.fields)
+        }
         Op::BindingsHost => {
             let args: HostArgs = decode(args)?;
             Request::BindingsHost(args.workspace, run_deadline(args.run_deadline)?)
@@ -202,76 +214,40 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
             Decision::Deny,
         ),
         Op::Cancel => Request::Cancel(key(&decode::<RunArgs>(args)?.run_id)?),
+        Op::PluginsList => {
+            decode::<NoArgs>(args)?;
+            Request::PluginsList
+        }
+        Op::PluginsAdd => {
+            let dir = decode::<PluginsAddArgs>(args)?.dir;
+            if !dir.is_absolute() {
+                return Err(DaemonError::InvalidRequest);
+            }
+            Request::PluginsAdd(dir)
+        }
+        Op::PluginsRemove => Request::PluginsRemove(decode::<PluginsRemoveArgs>(args)?.name),
     })
 }
 
-/// A channel credential parsed once at the boundary.
-pub(crate) enum ChannelSecret {
-    /// A Bot token: `<decimal bot_id>:<non-empty rest>`.
-    Telegram { bot_id: String, token: SecretBytes },
-    /// An app id of the source key's form and a non-empty app secret.
-    Feishu {
-        app_id: IdentityKey,
-        app_secret: SecretBytes,
-    },
-}
-impl fmt::Debug for ChannelSecret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-impl ChannelSecret {
-    pub(crate) fn telegram(token: String) -> Option<ChannelSecret> {
-        let (bot_id, rest) = token.split_once(':')?;
-        let valid = !bot_id.is_empty()
-            && bot_id.len() <= KEY_MAX
-            && bot_id.bytes().all(|b| b.is_ascii_digit())
-            && !rest.is_empty();
-        let bot_id = valid.then(|| bot_id.to_owned())?;
-        Some(ChannelSecret::Telegram {
-            bot_id,
-            token: SecretBytes::new(token.into_bytes()),
-        })
-    }
-    pub(crate) fn feishu(app_id: String, app_secret: String) -> Option<ChannelSecret> {
-        let app_id = IdentityKey::parse(&app_id)?;
-        (!app_secret.is_empty()).then(|| ChannelSecret::Feishu {
-            app_id,
-            app_secret: SecretBytes::new(app_secret.into_bytes()),
-        })
-    }
-    pub(crate) fn channel(&self) -> ChannelKind {
-        match self {
-            Self::Telegram { .. } => TELEGRAM,
-            Self::Feishu { .. } => FEISHU,
-        }
-    }
-    pub(crate) fn source_key(&self) -> &str {
-        match self {
-            Self::Telegram { bot_id, .. } => bot_id,
-            Self::Feishu { app_id, .. } => app_id.as_str(),
-        }
-    }
-    pub(crate) fn secret(&self) -> &SecretBytes {
-        match self {
-            Self::Telegram { token, .. } => token,
-            Self::Feishu { app_secret, .. } => app_secret,
-        }
-    }
-}
 /// The vault consumer of a channel's receiver credential.
-fn service(channel: &ChannelKind) -> Result<ServiceId, DaemonError> {
-    Ok(ServiceId::new(match channel.as_str() {
-        "telegram" => "openmybot.telegram",
-        "feishu" => "openmybot.feishu",
-        _ => return Err(DaemonError::InvalidRequest),
-    }))
+pub(crate) fn service(kind: &ChannelKind) -> ServiceId {
+    ServiceId::new(format!("openmybot.{}", kind.as_str()))
 }
 
-/// A runtime receiver change the daemon's main loop performs; each carries its receipt.
+/// A runtime receiver change or credential check the daemon's main loop hands to the channel's
+/// plugin; each carries its receipt.
 pub(crate) enum ReceiverCommand {
     Start(ReceiverRow, oneshot::Sender<Result<(), DaemonError>>),
     Stop(Uuid, oneshot::Sender<()>),
+    /// Ends the processes of these channels before their package is removed or replaced.
+    Retire(Vec<String>, oneshot::Sender<()>),
+    /// The reply is dropped when the plugin cannot be started or breaks off.
+    Verify {
+        kind: ChannelKind,
+        credential: String,
+        source_key: Option<String>,
+        reply: oneshot::Sender<Result<String, VerifyFailure>>,
+    },
 }
 
 /// A store failure after the operation's deadline is the request timeout.
@@ -327,7 +303,7 @@ pub(crate) struct Ops {
     pub(crate) vault: CredentialRecordVault,
     pub(crate) owner: ActorId,
     pub(crate) roots: WorkspaceRoots,
-    pub(crate) endpoints: Endpoints,
+    pub(crate) plugins: Plugins,
     pub(crate) receiver: mpsc::Sender<ReceiverCommand>,
     pub(crate) wake: Arc<Notify>,
     pub(crate) minter: ThreadMinter,
@@ -347,6 +323,9 @@ impl Ops {
         match parse(op, args)? {
             Request::StatusRun(run_id) => self.status_run(&run_id, deadline).await,
             Request::PairStart(request) => {
+                self.plugins
+                    .provider(&request.channel)
+                    .ok_or(DaemonError::PluginNotInstalled)?;
                 let mut client = self.control.lock().await;
                 let started = pairing::pair(
                     &mut client,
@@ -421,19 +400,34 @@ impl Ops {
                         .map_err(failed)?;
                 let revision = match receiver {
                     Some(row) => {
+                        self.plugins
+                            .provider(&row.channel)
+                            .ok_or(DaemonError::PluginNotInstalled)?;
                         let secret = self
                             .vault
                             .open(
                                 &row.binding_id,
                                 SecretKind::Connector,
                                 SecretPrincipal::Actor(self.owner.clone()),
-                                SecretPrincipal::Service(service(&row.channel)?),
+                                SecretPrincipal::Service(service(&row.channel)),
                                 &row.credential_envelope,
                             )
                             .map_err(|_| DaemonError::CredentialRejected)?
                             .into_secret();
-                        self.verify(&row.channel, &row.source_key, &secret, deadline)
+                        let credential = String::from_utf8(secret.expose().to_vec())
+                            .map_err(|_| DaemonError::CredentialRejected)?;
+                        let verified = self
+                            .verify(
+                                row.channel.clone(),
+                                credential,
+                                Some(row.source_key.clone()),
+                                deadline,
+                            )
                             .await?;
+                        // The stored credential must still belong to the receiver's account.
+                        if verified != row.source_key {
+                            return Err(DaemonError::CredentialRejected);
+                        }
                         let generation = self.generation()?;
                         let mut client = self.control.lock().await;
                         let revision = omb_store::reconfirm_binding(
@@ -488,14 +482,40 @@ impl Ops {
                     json!({"binding_id": binding_id.to_string(), "thread_generation": done.thread_generation, "revision": done.revision}),
                 )
             }
-            Request::BindingsReceiver(secret) => {
-                self.verify(
-                    &secret.channel(),
-                    secret.source_key(),
-                    secret.secret(),
-                    deadline,
-                )
-                .await?;
+            Request::BindingsReceiver(kind, fields) => {
+                let plugin = self
+                    .plugins
+                    .provider(&kind)
+                    .ok_or(DaemonError::PluginNotInstalled)?;
+                let declared = &plugin.channels[kind.as_str()].credential_fields;
+                if !fields.keys().map(String::as_str).eq(declared
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<BTreeSet<_>>())
+                {
+                    return Err(DaemonError::InvalidRequest);
+                }
+                // The only plain field is the source key candidate; one secret is sealed as its
+                // value, several as a JSON object in name order.
+                let (secrets, plain): (Vec<_>, Vec<_>) =
+                    declared.iter().partition(|field| field.secret);
+                let source_key = match plain.as_slice() {
+                    [field] => Some(fields[&field.name].clone()),
+                    _ => None,
+                };
+                let credential = match secrets.as_slice() {
+                    [field] => fields[&field.name].clone(),
+                    _ => serde_json::to_string(
+                        &secrets
+                            .iter()
+                            .map(|field| (&field.name, &fields[&field.name]))
+                            .collect::<BTreeMap<_, _>>(),
+                    )
+                    .map_err(|_| DaemonError::InternalError)?,
+                };
+                let source_key = self
+                    .verify(kind.clone(), credential.clone(), source_key, deadline)
+                    .await?;
                 let binding_id = Uuid::now_v7();
                 let envelope = self
                     .vault
@@ -503,8 +523,8 @@ impl Ops {
                         &binding_id,
                         SecretKind::Connector,
                         SecretPrincipal::Actor(self.owner.clone()),
-                        SecretPrincipal::Service(service(&secret.channel())?),
-                        secret.secret(),
+                        SecretPrincipal::Service(service(&kind)),
+                        &SecretBytes::new(credential.into_bytes()),
                     )
                     .map_err(|_| DaemonError::InternalError)?;
                 let (settled, started) = {
@@ -519,8 +539,8 @@ impl Ops {
                             &mut client,
                             NewReceiver {
                                 binding_id,
-                                channel: secret.channel(),
-                                source_key: secret.source_key(),
+                                channel: kind.clone(),
+                                source_key: &source_key,
                                 credential_envelope: &envelope,
                             },
                             deadline,
@@ -530,8 +550,8 @@ impl Ops {
                     };
                     let row = ReceiverRow {
                         binding_id,
-                        channel: secret.channel(),
-                        source_key: secret.source_key().to_owned(),
+                        channel: kind,
+                        source_key: source_key.clone(),
                         credential_envelope: envelope,
                     };
                     let started = self
@@ -543,7 +563,7 @@ impl Ops {
                 // start.
                 self.cancel_all(&settled).await?;
                 started??;
-                Ok(json!({"binding_id": binding_id.to_string(), "source_key": secret.source_key()}))
+                Ok(json!({"binding_id": binding_id.to_string(), "source_key": source_key}))
             }
             Request::BindingsHost(workspace, run_deadline) => {
                 let workspace = self
@@ -605,7 +625,73 @@ impl Ops {
                 .ok_or(DaemonError::InternalError)?;
                 Ok(json!({"run_id": run_id.as_str(), "state": state}))
             }
+            Request::PluginsList => {
+                let plugins = self
+                    .plugins
+                    .list()
+                    .into_iter()
+                    .map(|plugin| {
+                        let (process, last_exit_code) = self.plugins.process(&plugin);
+                        let channels: Vec<Value> = plugin
+                            .channels
+                            .iter()
+                            .map(|(kind, channel)| {
+                                json!({
+                                    "channel_kind": kind,
+                                    "credential_fields": channel.credential_fields,
+                                    "status_note": channel.status_note,
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "name": plugin.name,
+                            "version": plugin.version,
+                            "channels": channels,
+                            "process": process,
+                            "last_exit_code": last_exit_code,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({ "plugins": plugins }))
+            }
+            Request::PluginsAdd(dir) => {
+                let client = self.control.lock().await;
+                let staged = self
+                    .plugins
+                    .stage(&dir, &self.live(&client, deadline).await?)?;
+                let replaces = staged.replaces.clone();
+                self.command(|done| ReceiverCommand::Retire(replaces, done), deadline)
+                    .await?;
+                let installed = self.plugins.commit(staged)?;
+                let channels: Vec<&String> = installed.channels.keys().collect();
+                Ok(
+                    json!({"name": installed.name, "version": installed.version, "channels": channels}),
+                )
+            }
+            Request::PluginsRemove(name) => {
+                let client = self.control.lock().await;
+                let kinds = self
+                    .plugins
+                    .removable(&name, &self.live(&client, deadline).await?)?;
+                self.command(|done| ReceiverCommand::Retire(kinds, done), deadline)
+                    .await?;
+                self.plugins.remove(&name)?;
+                Ok(json!({ "name": name }))
+            }
         }
+    }
+    /// The channels with a pending, active or suspended binding.
+    async fn live(
+        &self,
+        client: &tokio_postgres::Client,
+        deadline: Instant,
+    ) -> Result<HashSet<String>, DaemonError> {
+        Ok(omb_store::list_bindings(client, deadline)
+            .await
+            .map_err(|error| store_error(error, deadline))?
+            .into_iter()
+            .map(|view| view.channel_kind)
+            .collect())
     }
     async fn status_run(
         &self,
@@ -702,38 +788,36 @@ impl Ops {
             .auth_generation()
             .get())
     }
-    /// Bind-time credential check of the channel within the operation's deadline.
+    /// Bind-time credential check by the channel's plugin within the operation's deadline; returns
+    /// the source key the credential belongs to.
     async fn verify(
         &self,
-        channel: &ChannelKind,
-        source_key: &str,
-        secret: &SecretBytes,
+        kind: ChannelKind,
+        credential: String,
+        source_key: Option<String>,
         deadline: Instant,
-    ) -> Result<(), DaemonError> {
-        let checked = match channel.as_str() {
-            "telegram" => {
-                timeout_at(
-                    deadline,
-                    verify_credentials(&self.endpoints.telegram, secret, source_key),
-                )
+    ) -> Result<String, DaemonError> {
+        let (reply, receipt) = oneshot::channel();
+        let verified = timeout_at(deadline, async {
+            self.receiver
+                .send(ReceiverCommand::Verify {
+                    kind,
+                    credential,
+                    source_key,
+                    reply,
+                })
                 .await
-            }
-            "feishu" => {
-                timeout_at(
-                    deadline,
-                    verify_feishu_credentials(&self.endpoints.feishu, source_key, secret),
-                )
-                .await
-            }
-            _ => return Err(DaemonError::InvalidRequest),
-        };
-        match checked {
-            Err(_) => Err(DaemonError::RequestTimeout),
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(CredentialProblem::CredentialRejected)) => Err(DaemonError::CredentialRejected),
-            Ok(Err(CredentialProblem::WebhookConflict)) => Err(DaemonError::WebhookConflict),
-            Ok(Err(CredentialProblem::Unreachable)) => Err(DaemonError::ChannelUnreachable),
-        }
+                .map_err(|_| DaemonError::InternalError)?;
+            receipt.await.map_err(|_| DaemonError::PluginUnavailable)
+        })
+        .await
+        .map_err(|_| DaemonError::RequestTimeout)??;
+        verified.map_err(|failure| match failure {
+            VerifyFailure::CredentialRejected => DaemonError::CredentialRejected,
+            VerifyFailure::WebhookConflict => DaemonError::WebhookConflict,
+            VerifyFailure::Unreachable => DaemonError::ChannelUnreachable,
+            VerifyFailure::Malformed => DaemonError::InvalidRequest,
+        })
     }
     /// Hands a receiver change to the main loop and waits for its receipt within the deadline.
     async fn command<T>(
@@ -1112,6 +1196,7 @@ mod mcp {
 mod tests {
     use super::*;
     use crate::{
+        CANCEL_QUEUE, ChannelError, Connection, Timings,
         agent::{
             AgentRuntime,
             tests::{self as agent, Run},
@@ -1121,13 +1206,11 @@ mod tests {
             BOT_ID,
             fixture::{self, Fixture},
         },
+        dispatch::start_dispatcher,
+        plugins::tests::{Logs, fake_channel, package},
+        supervisor::{Context, PluginProcess},
     };
-    use omb_channels::{
-        CANCEL_QUEUE, ChannelError, Connection, Timings,
-        fake_feishu::FakeFeishu,
-        start_dispatcher,
-        testkit::{FakeTelegram, Reply},
-    };
+    use omb_channel_sdk::PLUGIN_MAX;
     use omb_hostdriver::{HostDriverConfig, Limits, OMB_NOTICE_PERMISSION_V1};
     use omb_store::{
         Claim, DispatchOutcome, Suspension, TerminalKind, lock_dispatch, record_dispatch,
@@ -1143,7 +1226,8 @@ mod tests {
         reconciliation::RunReconciliationStatus,
     };
     use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
-    use std::{path::Path, time::Duration};
+    use std::{collections::HashMap, path::Path, time::Duration};
+    use tokio::{sync::Semaphore, task::JoinSet};
     use tokio_postgres::Client;
 
     fn later() -> Instant {
@@ -1179,7 +1263,9 @@ mod tests {
                     json!({"channel": "telegram", "workspace": "/ws", "x": 1}),
                     json!({"channel": 1, "workspace": "/ws"}),
                     json!({"channel": "telegram", "workspace": "/ws", "run_deadline": "60"}),
-                    json!({"channel": "slack", "workspace": "/ws"}),
+                    json!({"channel": "Slack", "workspace": "/ws"}),
+                    json!({"channel": "host", "workspace": "/ws"}),
+                    json!({"channel": "", "workspace": "/ws"}),
                 ],
             ),
             (
@@ -1217,20 +1303,41 @@ mod tests {
             ),
             (
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": "1:x"}),
+                json!({"channel": "telegram", "fields": {"token": "1:x"}}),
                 vec![
                     json!({}),
-                    json!({"token": "1:x"}),
+                    json!({"fields": {"token": "1:x"}}),
                     json!({"channel": "telegram"}),
-                    json!({"channel": "telegram", "token": 1}),
-                    json!({"channel": "telegram", "token": "1:x", "x": 1}),
-                    json!({"channel": "slack", "token": "1:x"}),
-                    json!({"channel": "feishu", "app_id": "a"}),
-                    json!({"channel": "feishu", "app_secret": "s"}),
-                    json!({"channel": "feishu", "app_id": 1, "app_secret": "s"}),
-                    json!({"channel": "feishu", "app_id": "a", "app_secret": "s", "x": 1}),
-                    json!({"channel": "feishu", "app_id": "", "app_secret": "s"}),
-                    json!({"channel": "feishu", "app_id": "a", "app_secret": ""}),
+                    json!({"channel": "telegram", "token": "1:x"}),
+                    json!({"channel": "telegram", "fields": {"token": 1}}),
+                    json!({"channel": "telegram", "fields": ["1:x"]}),
+                    json!({"channel": "telegram", "fields": {"token": "1:x"}, "x": 1}),
+                    json!({"channel": "Telegram", "fields": {"token": "1:x"}}),
+                    json!({"channel": "host", "fields": {}}),
+                ],
+            ),
+            (
+                "plugins_list",
+                json!({}),
+                vec![json!({"x": 1}), json!(null)],
+            ),
+            (
+                "plugins_add",
+                json!({"dir": "/pkg"}),
+                vec![
+                    json!({}),
+                    json!({"dir": "pkg"}),
+                    json!({"dir": 1}),
+                    json!({"dir": "/pkg", "built_in": "telegram"}),
+                ],
+            ),
+            (
+                "plugins_remove",
+                json!({"name": "fake"}),
+                vec![
+                    json!({}),
+                    json!({"name": 1}),
+                    json!({"name": "fake", "x": 1}),
                 ],
             ),
             (
@@ -1276,14 +1383,14 @@ mod tests {
                 assert!(invalid(op, args.clone()), "{op} {args}");
             }
         }
-        let Ok(Request::BindingsReceiver(secret)) = parse(
+        let Ok(Request::BindingsReceiver(kind, fields)) = parse(
             Op::BindingsReceiver,
-            json!({"channel": "feishu", "app_id": "a", "app_secret": "s"}),
+            json!({"channel": "feishu", "fields": {"app_id": "a", "app_secret": "s"}}),
         ) else {
             panic!("not a receiver request");
         };
-        assert_eq!(secret.channel(), FEISHU);
-        assert_eq!(secret.source_key(), "a");
+        assert_eq!(kind.as_str(), "feishu");
+        assert_eq!(fields["app_id"], "a");
     }
 
     #[test]
@@ -1317,69 +1424,6 @@ mod tests {
             parse(Op::Approve, json!({"permission_id": max})),
             Ok(Request::Decide(..))
         ));
-    }
-
-    #[test]
-    fn channel_secret_debug_is_redacted() {
-        let secret = ChannelSecret::telegram("123456:SENTINEL-debug".into()).unwrap();
-        assert_eq!(format!("{secret:?}"), "[REDACTED]");
-        assert_eq!(format!("{secret:#?}"), "[REDACTED]");
-        assert_eq!(secret.source_key(), "123456");
-        assert_eq!(secret.secret().expose(), b"123456:SENTINEL-debug");
-        assert_eq!(secret.channel(), TELEGRAM);
-    }
-
-    #[test]
-    fn feishu_secret_parses_app_id_once_and_needs_a_secret() {
-        let secret = ChannelSecret::feishu("cli_a".into(), "s".into()).unwrap();
-        assert_eq!(secret.channel(), FEISHU);
-        assert_eq!(secret.source_key(), "cli_a");
-        assert_eq!(secret.secret().expose(), b"s");
-        assert_eq!(format!("{secret:?}"), "[REDACTED]");
-        let long = "x".repeat(129);
-        for app_id in ["", long.as_str(), "é", "a\u{7f}"] {
-            assert!(
-                ChannelSecret::feishu(app_id.into(), "s".into()).is_none(),
-                "{app_id}"
-            );
-        }
-        assert!(ChannelSecret::feishu("cli_a".into(), String::new()).is_none());
-        assert_eq!(
-            ChannelSecret::feishu("cli a".into(), "s".into())
-                .unwrap()
-                .source_key(),
-            "cli a"
-        );
-        let telegram = ChannelSecret::telegram("1:x".into()).unwrap();
-        assert_eq!(telegram.channel(), TELEGRAM);
-        assert_eq!(telegram.source_key(), "1");
-    }
-
-    #[test]
-    fn bot_token_requires_decimal_bot_id_non_empty_rest_and_bot_id_within_key_max() {
-        let long = format!("{}:rest", "1".repeat(129));
-        for token in [
-            "123456",
-            "abc:rest",
-            "12a:rest",
-            ":rest",
-            "123456:",
-            "-1:rest",
-            long.as_str(),
-        ] {
-            assert!(ChannelSecret::telegram(token.into()).is_none(), "{token}");
-        }
-        let max = format!("{}:rest", "1".repeat(128));
-        assert_eq!(
-            ChannelSecret::telegram(max).unwrap().source_key(),
-            "1".repeat(128)
-        );
-        assert_eq!(
-            ChannelSecret::telegram("42:a:b".into())
-                .unwrap()
-                .source_key(),
-            "42"
-        );
     }
 
     #[test]
@@ -1471,9 +1515,9 @@ mod tests {
         agent::host(root, "happy", agent::quick(), &[])
     }
 
-    /// `Ops` over the fixture's engine, `FakeTelegram` and `FakeFeishu` endpoints and a temporary
-    /// `HOME` with one workspace root `home/ws` under it; the test serves the receiver commands
-    /// itself.
+    /// `Ops` over the fixture's engine, the fake plugin installed for `telegram` and `feishu` under
+    /// the fixture's data directory, and a temporary `HOME` with one workspace root `home/ws` under
+    /// it; the test serves the receiver commands itself.
     struct Env {
         fixture: Fixture,
         ops: Ops,
@@ -1484,8 +1528,12 @@ mod tests {
         canceller_link: JoinHandle<Result<(), tokio_postgres::Error>>,
         client: Client,
         token: Uuid,
-        fake: FakeTelegram,
-        feishu: FakeFeishu,
+        telegram: Logs,
+        feishu: Logs,
+        /// Without the channel tasks: the supervisors that answer the credential checks.
+        context: Arc<Context>,
+        processes: HashMap<ChannelKind, PluginProcess>,
+        supervisors: JoinSet<Result<(), ChannelError>>,
     }
     impl Env {
         async fn new(mut fixture: Fixture) -> Self {
@@ -1517,8 +1565,6 @@ mod tests {
                 .await
                 .unwrap();
             let client = fixture.client().await;
-            let fake = FakeTelegram::start().await;
-            let feishu = FakeFeishu::start().await;
             let (receiver, commands) = mpsc::channel(8);
             let engine = fixture.engine();
             let ops = Ops {
@@ -1528,10 +1574,7 @@ mod tests {
                 vault: engine.vault.clone(),
                 owner: ActorId::new(SINGLE_USER_ACTOR_ID),
                 roots: WorkspaceRoots::parse(&home, &[workspace]).unwrap(),
-                endpoints: Endpoints {
-                    telegram: fake.endpoint(),
-                    feishu: feishu.endpoint(),
-                },
+                plugins: Plugins::load(&fixture.root, Vec::new(), fixture.root.clone()).unwrap(),
                 receiver,
                 wake: Arc::new(Notify::new()),
                 minter: ThreadMinter::new(
@@ -1546,7 +1589,17 @@ mod tests {
                 ),
                 counters: Arc::new(Counters::default()),
             };
-            Self {
+            let context = Arc::new(Context {
+                plugins: ops.plugins.clone(),
+                vault: engine.vault.clone(),
+                owner: ActorId::new(SINGLE_USER_ACTOR_ID),
+                timings: quick_channels(),
+                counters: Arc::clone(&ops.counters),
+                wake: Arc::clone(&ops.wake),
+                cancel: mpsc::channel(CANCEL_QUEUE).0,
+                slots: Arc::new(Semaphore::new(PLUGIN_MAX)),
+            });
+            let env = Self {
                 fixture,
                 ops,
                 commands,
@@ -1556,9 +1609,35 @@ mod tests {
                 canceller_link: canceller.driver,
                 client,
                 token,
-                fake,
-                feishu,
-            }
+                telegram: Logs::new(),
+                feishu: Logs::new(),
+                context,
+                processes: HashMap::new(),
+                supervisors: JoinSet::new(),
+            };
+            env.install("telegram", "normal", "1001");
+            env.install("feishu", "normal", "cli_a");
+            env
+        }
+        /// Installs the fake as plugin `fake-<kind>` with `scenario`, its credential check
+        /// answering `source_key`, in place of an earlier installation; `telegram` declares one
+        /// secret `token`, `feishu` a plain `app_id` and a secret `app_secret`.
+        fn install(&self, kind: &str, scenario: &str, source_key: &str) {
+            let (logs, fields) = match kind {
+                "telegram" => (&self.telegram, json!([{"name": "token", "secret": true}])),
+                _ => (
+                    &self.feishu,
+                    json!([{"name": "app_id", "secret": false}, {"name": "app_secret", "secret": true}]),
+                ),
+            };
+            let mut channel = fake_channel(kind, logs, scenario, fields);
+            channel["args"]
+                .as_array_mut()
+                .unwrap()
+                .extend([json!("--source-key"), json!(source_key)]);
+            let dir = package(&format!("fake-{kind}"), json!({ kind: channel }));
+            self.ops.plugins.install(&dir, &HashSet::new()).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
         }
         async fn start() -> Self {
             Self::new(Fixture::start().await).await
@@ -1587,10 +1666,7 @@ mod tests {
                 self.fixture.engine.as_ref().unwrap(),
                 self.token,
                 quick_channels(),
-                Endpoints {
-                    telegram: self.fake.endpoint(),
-                    feishu: self.feishu.endpoint(),
-                },
+                self.ops.plugins.clone(),
                 cancel,
                 Outbound {
                     terminals,
@@ -1626,18 +1702,45 @@ mod tests {
                 tokio::select! {
                     result = &mut run => return result,
                     Some(command) = self.commands.recv() => match command {
-                        ReceiverCommand::Start(row, done) => {
-                            let started = match self.channels.as_mut() {
-                                Some(channels) => channels.start_receiver(&mut self.fixture.pg, row).await,
-                                None => Ok(()),
-                            };
-                            let _ = done.send(started);
-                        }
-                        ReceiverCommand::Stop(binding_id, done) => {
-                            if let Some(channels) = self.channels.as_mut() {
-                                channels.stop_receiver(binding_id).await;
+                        ReceiverCommand::Start(row, done) => match self.channels.as_mut() {
+                            Some(channels) => {
+                                channels.start_receiver(&mut self.fixture.pg, row, done).await
                             }
-                            let _ = done.send(());
+                            None => {
+                                let _ = done.send(Ok(()));
+                            }
+                        },
+                        ReceiverCommand::Stop(binding_id, done) => match self.channels.as_mut() {
+                            Some(channels) => channels.stop_receiver(binding_id, done).await,
+                            None => {
+                                let _ = done.send(());
+                            }
+                        },
+                        ReceiverCommand::Retire(kinds, done) => match self.channels.as_mut() {
+                            Some(channels) => channels.retire(kinds, done).await,
+                            None => {
+                                let _ = done.send(());
+                            }
+                        },
+                        ReceiverCommand::Verify { kind, credential, source_key, reply } => {
+                            match self.channels.as_mut() {
+                                Some(channels) => {
+                                    channels.verify(kind, credential, source_key, reply).await
+                                }
+                                None => {
+                                    self.processes
+                                        .entry(kind.clone())
+                                        .or_insert_with(|| {
+                                            PluginProcess::spawn(
+                                                kind,
+                                                Arc::clone(&self.context),
+                                                &mut self.supervisors,
+                                            )
+                                        })
+                                        .verify(credential, source_key, reply)
+                                        .await
+                                }
+                            }
                         }
                     },
                 }
@@ -1747,23 +1850,14 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-        /// Scripts a successful bind-time check for bot `bot_id`.
-        fn verified(&self, bot_id: u64) {
-            self.fake.script(
-                "getMe",
-                200,
-                serde_json::to_vec(&json!({"ok": true, "result": {"id": bot_id, "is_bot": true, "first_name": "Bot", "username": "bot"}})).unwrap(),
-            );
-            self.fake.script(
-                "getWebhookInfo",
-                200,
-                br#"{"ok":true,"result":{"url":"","pending_update_count":0}}"#.to_vec(),
-            );
-        }
-        async fn stop(self) {
+        async fn stop(mut self) {
             if let Some(channels) = self.channels {
                 channels.stop().await;
             }
+            for process in self.processes.values() {
+                process.terminate().await;
+            }
+            while self.supervisors.join_next().await.is_some() {}
             if let Some(runtime) = self.runtime {
                 runtime.stop().await;
             }
@@ -1790,15 +1884,11 @@ mod tests {
             text.len() >= 20 && text.as_bytes()[10] == b'T' && text.ends_with('Z')
         })
     }
-    async fn polls_with(fake: &FakeTelegram, token: &str) {
-        let path = format!("/bot{token}/getUpdates");
-        let limit = Instant::now() + Duration::from_secs(10);
-        while !fake
-            .calls("getUpdates")
-            .iter()
-            .any(|request| request.path == path)
-        {
-            assert!(Instant::now() < limit, "no poll with {token}");
+    /// Polls `probe`, usually over a fake plugin's frame log, until it holds.
+    async fn waits_for(what: &str, probe: impl Fn() -> bool) {
+        let limit = Instant::now() + Duration::from_secs(20);
+        while !probe() {
+            assert!(Instant::now() < limit, "{what} deadline");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -2718,11 +2808,10 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_verifies_seals_activates_and_starts_the_poller() {
         let mut env = Env::with_channels().await;
-        env.verified(1001);
         let bound = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": "1001:receiver-token"}),
+                json!({"channel": "telegram", "fields": {"token": "1001:receiver-token"}}),
             )
             .await
             .unwrap();
@@ -2733,19 +2822,32 @@ mod tests {
         assert_eq!(row["status"], "active");
         assert_eq!(row["revision"], 1);
         assert_eq!(row["source_key"], "1001");
-        polls_with(&env.fake, "1001:receiver-token").await;
-        let methods: Vec<String> = env.fake.requests().into_iter().map(|r| r.method).collect();
-        assert_eq!(&methods[..2], ["getMe", "getWebhookInfo"]);
-        assert!(methods[2..].iter().all(|method| method == "getUpdates"));
+        waits_for("start", || !env.telegram.received_of("start").is_empty()).await;
+        // The plugin checked the token before it started receiving with it.
+        let frames: Vec<Value> = env
+            .telegram
+            .received()
+            .into_iter()
+            .map(|frame| json!([frame["type"], frame["credential"], frame["source_key"]]))
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                json!(["hello", null, null]),
+                json!(["verify", "1001:receiver-token", null]),
+                json!(["start", "1001:receiver-token", "1001"]),
+            ]
+        );
         env.stop().await;
     }
 
-    async fn refused_receiver(env: &mut Env, token: &str, expected: DaemonError) {
+    /// Binding `fields` on `channel` is refused with `expected` and leaves every row unchanged.
+    async fn refused(env: &mut Env, channel: &str, fields: Value, expected: DaemonError) {
         let before = env.rows().await;
         assert_eq!(
             env.call(
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": token})
+                json!({"channel": channel, "fields": fields})
             )
             .await,
             Err(expected)
@@ -2758,8 +2860,14 @@ mod tests {
     async fn bindings_receiver_with_other_bot_id_is_credential_rejected_and_writes_nothing() {
         let mut env = Env::start().await;
         fixture::receiver(&env.client, "telegram").await;
-        env.verified(2002);
-        refused_receiver(&mut env, "1001:token", DaemonError::CredentialRejected).await;
+        env.install("telegram", "verify_fail:credential_rejected", "1001");
+        refused(
+            &mut env,
+            "telegram",
+            json!({"token": "1001:token"}),
+            DaemonError::CredentialRejected,
+        )
+        .await;
         env.stop().await;
     }
 
@@ -2767,17 +2875,14 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_with_webhook_set_is_webhook_conflict_and_writes_nothing() {
         let mut env = Env::start().await;
-        env.fake.script(
-            "getMe",
-            200,
-            br#"{"ok":true,"result":{"id":1001,"is_bot":true,"first_name":"Bot"}}"#.to_vec(),
-        );
-        env.fake.script(
-            "getWebhookInfo",
-            200,
-            br#"{"ok":true,"result":{"url":"https://example.invalid/hook"}}"#.to_vec(),
-        );
-        refused_receiver(&mut env, "1001:token", DaemonError::WebhookConflict).await;
+        env.install("telegram", "verify_fail:webhook_conflict", "1001");
+        refused(
+            &mut env,
+            "telegram",
+            json!({"token": "1001:token"}),
+            DaemonError::WebhookConflict,
+        )
+        .await;
         env.stop().await;
     }
 
@@ -2785,8 +2890,14 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_unreachable_is_channel_unreachable_and_writes_nothing() {
         let mut env = Env::start().await;
-        env.ops.endpoints.telegram = FakeTelegram::endpoint_at(FakeTelegram::unused_port());
-        refused_receiver(&mut env, "1001:token", DaemonError::ChannelUnreachable).await;
+        env.install("telegram", "verify_fail:unreachable", "1001");
+        refused(
+            &mut env,
+            "telegram",
+            json!({"token": "1001:token"}),
+            DaemonError::ChannelUnreachable,
+        )
+        .await;
         env.stop().await;
     }
 
@@ -2794,10 +2905,25 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_with_malformed_token_is_invalid_request_without_network_call() {
         let mut env = Env::start().await;
-        for token in ["no-colon", "abc:rest", "1001:"] {
-            refused_receiver(&mut env, token, DaemonError::InvalidRequest).await;
+        // Fields other than the declared ones are refused before the plugin sees them.
+        for fields in [
+            json!({}),
+            json!({"bot_token": "1001:token"}),
+            json!({"token": "1001:token", "app_id": "1001"}),
+        ] {
+            refused(&mut env, "telegram", fields, DaemonError::InvalidRequest).await;
         }
-        assert!(env.fake.requests().is_empty());
+        assert!(env.telegram.received_of("verify").is_empty());
+        // The plugin judges the token's shape.
+        env.install("telegram", "verify_fail:malformed", "1001");
+        refused(
+            &mut env,
+            "telegram",
+            json!({"token": "no-colon"}),
+            DaemonError::InvalidRequest,
+        )
+        .await;
+        assert_eq!(env.telegram.received_of("verify").len(), 1);
         env.stop().await;
     }
 
@@ -2808,17 +2934,18 @@ mod tests {
         let bound = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "secret"}),
+                json!({"channel": "feishu", "fields": {"app_id": "cli_a", "app_secret": "secret"}}),
             )
             .await
             .unwrap();
         assert_eq!(bound["source_key"], "cli_a");
         let binding = Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap();
-        let tokens = env.feishu.calls(TOKEN_PATH);
-        assert_eq!(tokens.len(), 1);
+        // The only secret field is the credential; the plain one is the source key candidate.
+        let verify = env.feishu.received_of("verify");
+        assert_eq!(verify.len(), 1);
         assert_eq!(
-            serde_json::from_slice::<Value>(&tokens[0].body).unwrap(),
-            json!({"app_id": "cli_a", "app_secret": "secret"})
+            (&verify[0]["credential"], &verify[0]["source_key"]),
+            (&json!("secret"), &json!("cli_a"))
         );
         let row = env.binding(binding).await;
         assert_eq!(
@@ -2846,8 +2973,12 @@ mod tests {
             b"secret"
         );
         assert!(open("openmybot.telegram").is_err());
-        connected(&env.feishu, 1).await;
-        assert_eq!(env.feishu.calls(ENDPOINT_PATH).len(), 1);
+        waits_for("start", || !env.feishu.received_of("start").is_empty()).await;
+        let start = env.feishu.received_of("start");
+        assert_eq!(
+            (&start[0]["credential"], &start[0]["source_key"]),
+            (&json!("secret"), &json!("cli_a"))
+        );
         let paired = env
             .call(
                 "pair_start",
@@ -2856,51 +2987,20 @@ mod tests {
             .await
             .unwrap();
         assert!(paired["code"].is_string());
-        assert!(env.fake.requests().is_empty());
+        assert!(env.telegram.received().is_empty());
         env.stop().await;
-    }
-
-    const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
-    const ENDPOINT_PATH: &str = "/callback/ws/endpoint";
-    fn respond(status: u16, body: &[u8]) -> Reply {
-        Reply::Respond {
-            status,
-            body: body.to_vec(),
-        }
-    }
-    async fn connected(feishu: &FakeFeishu, handshakes: usize) {
-        let limit = Instant::now() + Duration::from_secs(10);
-        while feishu.handshakes().len() < handshakes {
-            assert!(Instant::now() < limit, "no Feishu connection");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    async fn refused_feishu(env: &mut Env, app_id: &str, app_secret: &str, expected: DaemonError) {
-        let before = env.rows().await;
-        assert_eq!(
-            env.call(
-                "bindings_receiver",
-                json!({"channel": "feishu", "app_id": app_id, "app_secret": app_secret})
-            )
-            .await,
-            Err(expected)
-        );
-        assert_eq!(env.rows().await, before);
     }
 
     #[tokio::test]
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_feishu_rejected_token_is_credential_rejected_and_leaks_nothing() {
         let mut env = Env::start().await;
-        env.feishu.script(
-            TOKEN_PATH,
-            respond(200, br#"{"code":10014,"msg":"app secret invalid"}"#),
-        );
+        env.install("feishu", "verify_fail:credential_rejected", "cli_a");
         let before = env.rows().await;
         let refused = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "SENTINEL-feishu-ops"}),
+                json!({"channel": "feishu", "fields": {"app_id": "cli_a", "app_secret": "SENTINEL-feishu-ops"}}),
             )
             .await
             .unwrap_err();
@@ -2917,14 +3017,13 @@ mod tests {
             .unwrap()
             .get(0);
         let rendered = format!(
-            "{refused} {refused:?} {} {listed} {bindings} {:?}",
-            refused.code(),
-            ChannelSecret::feishu("cli_a".into(), "SENTINEL-feishu-ops".into()).unwrap()
+            "{refused} {refused:?} {} {listed} {bindings}",
+            refused.code()
         );
         assert_eq!(rendered.matches("SENTINEL").count(), 0);
-        assert_eq!(env.feishu.calls(TOKEN_PATH).len(), 1);
-        assert!(env.feishu.calls(ENDPOINT_PATH).is_empty());
-        assert!(env.feishu.handshakes().is_empty());
+        // One check reached the plugin, and nothing started receiving.
+        assert_eq!(env.feishu.received_of("verify").len(), 1);
+        assert!(env.feishu.received_of("start").is_empty());
         env.stop().await;
     }
 
@@ -2932,14 +3031,15 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_feishu_unreachable_or_server_error_is_channel_unreachable() {
         let mut env = Env::start().await;
-        env.ops.endpoints.feishu = FakeFeishu::endpoint_at(FakeTelegram::unused_port());
-        refused_feishu(&mut env, "cli_a", "secret", DaemonError::ChannelUnreachable).await;
-        env.ops.endpoints.feishu = env.feishu.endpoint();
-        for status in [503, 429] {
-            env.feishu.script(TOKEN_PATH, respond(status, b"{}"));
-            refused_feishu(&mut env, "cli_a", "secret", DaemonError::ChannelUnreachable).await;
-        }
-        assert_eq!(env.feishu.calls(TOKEN_PATH).len(), 2);
+        env.install("feishu", "verify_fail:unreachable", "cli_a");
+        refused(
+            &mut env,
+            "feishu",
+            json!({"app_id": "cli_a", "app_secret": "secret"}),
+            DaemonError::ChannelUnreachable,
+        )
+        .await;
+        assert_eq!(env.feishu.received_of("verify").len(), 1);
         env.stop().await;
     }
 
@@ -2947,6 +3047,17 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_feishu_malformed_args_are_invalid_request_without_network_call() {
         let mut env = Env::start().await;
+        // Fields other than the declared ones are refused before the plugin sees them.
+        for fields in [
+            json!({"app_id": "cli_a"}),
+            json!({"app_secret": "secret"}),
+            json!({"app_id": "cli_a", "app_secret": "secret", "token": "x"}),
+        ] {
+            refused(&mut env, "feishu", fields, DaemonError::InvalidRequest).await;
+        }
+        assert!(env.feishu.received_of("verify").is_empty());
+        // The plugin judges the values.
+        env.install("feishu", "verify_fail:malformed", "cli_a");
         let long = "x".repeat(129);
         for (app_id, app_secret) in [
             ("", "secret"),
@@ -2954,9 +3065,15 @@ mod tests {
             (long.as_str(), "secret"),
             ("cli_a", ""),
         ] {
-            refused_feishu(&mut env, app_id, app_secret, DaemonError::InvalidRequest).await;
+            refused(
+                &mut env,
+                "feishu",
+                json!({"app_id": app_id, "app_secret": app_secret}),
+                DaemonError::InvalidRequest,
+            )
+            .await;
         }
-        assert!(env.feishu.requests().is_empty());
+        assert_eq!(env.feishu.received_of("verify").len(), 4);
         env.stop().await;
     }
 
@@ -2964,19 +3081,16 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn reconfirm_feishu_receiver_rechecks_the_token_and_restarts_it() {
         let mut env = Env::with_channels().await;
+        // The platform refuses the credential once receiving started.
+        env.install("feishu", "suspend:credential_rejected", "cli_a");
         let bound = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "feishu", "app_id": "cli_a", "app_secret": "secret"}),
+                json!({"channel": "feishu", "fields": {"app_id": "cli_a", "app_secret": "secret"}}),
             )
             .await
             .unwrap();
         let binding = Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap();
-        connected(&env.feishu, 1).await;
-        // The reconnect after the server closes fetches the endpoint again and is refused.
-        env.feishu
-            .script(ENDPOINT_PATH, respond(200, br#"{"code":10014}"#));
-        env.feishu.disconnect();
         let limit = Instant::now() + Duration::from_secs(10);
         while env.binding(binding).await["status"] != "suspended" {
             assert!(Instant::now() < limit, "receiver did not suspend");
@@ -2986,8 +3100,7 @@ mod tests {
             env.binding(binding).await["status_reason"],
             "credential_rejected"
         );
-        env.feishu
-            .script(TOKEN_PATH, respond(200, br#"{"code":10014}"#));
+        env.install("feishu", "verify_fail:credential_rejected", "cli_a");
         assert_eq!(
             env.call(
                 "bindings_reconfirm",
@@ -2999,7 +3112,8 @@ mod tests {
         let row = env.binding(binding).await;
         assert_eq!(row["status"], "suspended");
         assert_eq!(row["revision"], 1);
-        let handshakes = env.feishu.handshakes().len();
+        env.install("feishu", "normal", "cli_a");
+        let starts = env.feishu.received_of("start").len();
         let reconfirmed = env
             .call(
                 "bindings_reconfirm",
@@ -3009,13 +3123,14 @@ mod tests {
             .unwrap();
         assert_eq!(reconfirmed["revision"], 2);
         assert_eq!(env.binding(binding).await["status"], "active");
-        connected(&env.feishu, handshakes + 1).await;
-        let tokens = env.feishu.calls(TOKEN_PATH);
-        assert_eq!(tokens.len(), 3);
-        for request in &tokens {
+        waits_for("restart", || env.feishu.received_of("start").len() > starts).await;
+        // Every check carried the stored secret and the receiver's app id.
+        let verify = env.feishu.received_of("verify");
+        assert_eq!(verify.len(), 3);
+        for frame in &verify {
             assert_eq!(
-                serde_json::from_slice::<Value>(&request.body).unwrap()["app_id"],
-                "cli_a"
+                (&frame["credential"], &frame["source_key"]),
+                (&json!("secret"), &json!("cli_a"))
             );
         }
         env.stop().await;
@@ -3025,58 +3140,106 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn bindings_receiver_replacement_stops_old_poller_before_new_starts() {
         let mut env = Env::with_channels().await;
-        let sampler = std::sync::Arc::new(env.fixture.client().await);
         for round in 0..10 {
-            let token = format!("1001:token-{round}");
-            let watch = std::sync::Arc::clone(&sampler);
-            let (stop, mut stopped) = oneshot::channel::<()>();
-            let most = tokio::spawn(async move {
-                let mut most = 0;
-                loop {
-                    let count: i64 = watch
-                        .query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name='openmybot-receiver'", &[])
-                        .await
-                        .unwrap()
-                        .get(0);
-                    most = most.max(count);
-                    if stopped.try_recv().is_ok() {
-                        return most;
-                    }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-            });
-            env.verified(1001);
             env.call(
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": token}),
+                json!({"channel": "telegram", "fields": {"token": format!("1001:token-{round}")}}),
             )
             .await
             .unwrap();
-            polls_with(&env.fake, &token).await;
-            stop.send(()).unwrap();
-            assert!(most.await.unwrap() <= 1, "round {round}");
-            if round > 0 {
-                let requests = env.fake.requests();
-                let old = format!("/bot1001:token-{}/", round - 1);
-                let new = format!("/bot{token}/");
-                let last_old = requests
-                    .iter()
-                    .filter(|r| r.path.starts_with(&old))
-                    .map(|r| r.at)
-                    .max()
-                    .unwrap();
-                let first_new = requests
-                    .iter()
-                    .filter(|r| r.path.starts_with(&new) && r.method == "getUpdates")
-                    .map(|r| r.at)
-                    .min()
-                    .unwrap();
-                assert!(last_old < first_new, "round {round}");
-            }
+            waits_for("start", || {
+                env.telegram.received_of("start").len() == round + 1
+            })
+            .await;
+            // Each replacement ends the old process before a new one starts with the new token.
+            let frames: Vec<Value> = env
+                .telegram
+                .received()
+                .into_iter()
+                .filter(|frame| frame["type"] == "start" || frame["type"] == "hello")
+                .map(|frame| json!([frame["type"], frame["credential"]]))
+                .collect();
+            let expected: Vec<Value> = (0..=round)
+                .flat_map(|at| {
+                    [
+                        json!(["hello", null]),
+                        json!(["start", format!("1001:token-{at}")]),
+                    ]
+                })
+                .collect();
+            assert_eq!(frames, expected, "round {round}");
+            // The replaced receiver's store connection is closed.
+            until(
+                &env.client,
+                "one receiver connection",
+                "SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='openmybot-receiver'",
+            )
+            .await;
         }
         let live: i64 = env.client.query_one("SELECT count(*) FROM openmybot.channel_bindings WHERE binding_kind='receiver' AND status='active'", &[]).await.unwrap().get(0);
         assert_eq!(live, 1);
-        drop(sampler);
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn plugins_add_and_remove_end_the_running_process_and_free_its_slot() {
+        let mut env = Env::with_channels().await;
+        let telegram = ChannelKind::from_static("telegram");
+        // A refused credential check leaves the plugin running without a binding.
+        env.install("telegram", "verify_fail:credential_rejected", "1001");
+        for op in ["plugins_add", "plugins_remove"] {
+            assert_eq!(
+                env.call(
+                    "bindings_receiver",
+                    json!({"channel": "telegram", "fields": {"token": "1001:token"}}),
+                )
+                .await,
+                Err(DaemonError::CredentialRejected)
+            );
+            let plugin = env.ops.plugins.provider(&telegram).unwrap();
+            let slots = |env: &Env| {
+                env.channels
+                    .as_ref()
+                    .unwrap()
+                    .context
+                    .slots
+                    .available_permits()
+            };
+            assert_eq!(
+                env.ops.plugins.process(&plugin).0,
+                crate::ProcessState::Running
+            );
+            assert_eq!(slots(&env), PLUGIN_MAX - 1);
+            let replacement = (op == "plugins_add").then(|| {
+                let mut channel = fake_channel(
+                    "telegram",
+                    &env.telegram,
+                    "verify_fail:credential_rejected",
+                    json!([{"name": "token", "secret": true}]),
+                );
+                channel["args"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend([json!("--source-key"), json!("1001")]);
+                package("fake-telegram", json!({ "telegram": channel }))
+            });
+            let args = match &replacement {
+                Some(dir) => json!({ "dir": dir }),
+                None => json!({"name": "fake-telegram"}),
+            };
+            env.call(op, args).await.unwrap();
+            // The process went through the stop ladder before the package changed.
+            assert_eq!(
+                env.ops.plugins.process(&plugin).0,
+                crate::ProcessState::Stopped
+            );
+            assert_eq!(slots(&env), PLUGIN_MAX);
+            if let Some(dir) = replacement {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        assert!(env.ops.plugins.provider(&telegram).is_none());
         env.stop().await;
     }
 
@@ -3089,10 +3252,9 @@ mod tests {
         let run = env.begun(sender, &thread).await;
         testkit::insert_permission_row(&env.client, sender, run.run.as_str(), "hp-128", 600.0)
             .await;
-        env.verified(1001);
         env.call(
             "bindings_receiver",
-            json!({"channel": "telegram", "token": "1001:new-token"}),
+            json!({"channel": "telegram", "fields": {"token": "1001:new-token"}}),
         )
         .await
         .unwrap();
@@ -3126,17 +3288,31 @@ mod tests {
         fixture::receiver(&env.client, "telegram").await;
         let (sender, thread) = env.sender().await;
         let run = env.begun(sender, &thread).await;
-        env.verified(1001);
-        // Nothing receives the command, so sending it fails after the replacement committed.
-        env.commands.close();
-        assert_eq!(
-            env.call(
-                "bindings_receiver",
-                json!({"channel": "telegram", "token": "1001:new-token"}),
-            )
-            .await,
-            Err(DaemonError::InternalError)
-        );
+        let answer = {
+            let replaced = env.ops.run(
+                Op::BindingsReceiver,
+                json!({"channel": "telegram", "fields": {"token": "1001:new-token"}}),
+                later(),
+                env.token,
+            );
+            tokio::pin!(replaced);
+            loop {
+                tokio::select! {
+                    answer = &mut replaced => break answer,
+                    Some(command) = env.commands.recv() => match command {
+                        ReceiverCommand::Verify { reply, .. } => {
+                            let _ = reply.send(Ok("1001".to_owned()));
+                        }
+                        // The start receipt is dropped unanswered after the replacement
+                        // committed.
+                        ReceiverCommand::Start(..)
+                        | ReceiverCommand::Stop(..)
+                        | ReceiverCommand::Retire(..) => {}
+                    },
+                }
+            }
+        };
+        assert_eq!(answer, Err(DaemonError::InternalError));
         assert_eq!(env.cancel_state(&run).await, "already_requested");
         env.stop().await;
     }
@@ -3145,11 +3321,10 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn sealed_envelope_opens_with_the_receivers_principals() {
         let mut env = Env::start().await;
-        env.verified(1001);
         let bound = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": "1001:sealed-token"}),
+                json!({"channel": "telegram", "fields": {"token": "1001:sealed-token"}}),
             )
             .await
             .unwrap();
@@ -3211,24 +3386,20 @@ mod tests {
         const SENTINEL: &str = "123456:SENTINEL-ops-secret";
         let mut env = Env::start().await;
         let mut seen = Vec::new();
-        env.fake.script(
-            "getMe",
-            200,
-            br#"{"ok":true,"result":{"id":999,"is_bot":true,"first_name":"Bot"}}"#.to_vec(),
-        );
+        env.install("telegram", "verify_fail:credential_rejected", "123456");
         let refused = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": SENTINEL}),
+                json!({"channel": "telegram", "fields": {"token": SENTINEL}}),
             )
             .await
             .unwrap_err();
         seen.push(format!("{refused} {refused:?} {}", refused.code()));
-        env.verified(123456);
+        env.install("telegram", "normal", "123456");
         let bound = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": SENTINEL}),
+                json!({"channel": "telegram", "fields": {"token": SENTINEL}}),
             )
             .await
             .unwrap();
@@ -3245,10 +3416,6 @@ mod tests {
                 .await
                 .map_or_else(|error| error.code().to_owned(), |value| value.to_string()),
         );
-        seen.push(format!(
-            "{:?}",
-            ChannelSecret::telegram(SENTINEL.into()).unwrap()
-        ));
         let rows: String = env
             .client
             .query_one("SELECT coalesce(json_agg(b),'[]')::text FROM (SELECT binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,status,status_reason,workspace_dir,thread_id FROM openmybot.channel_bindings) b", &[])
@@ -3332,12 +3499,8 @@ mod tests {
         let mut env = Env::start().await;
         let binding = suspended_receiver(&mut env, "1001:reconfirm-token").await;
         let before = env.rows().await;
-        // A refused bot id ends the check before getWebhookInfo, so only getMe is scripted.
-        env.fake.script(
-            "getMe",
-            200,
-            br#"{"ok":true,"result":{"id":2002,"is_bot":true,"first_name":"Bot"}}"#.to_vec(),
-        );
+        // The stored token now belongs to another bot.
+        env.install("telegram", "normal", "2002");
         assert_eq!(
             env.call(
                 "bindings_reconfirm",
@@ -3347,16 +3510,7 @@ mod tests {
             Err(DaemonError::CredentialRejected)
         );
         assert_eq!(env.rows().await, before);
-        env.fake.script(
-            "getMe",
-            200,
-            br#"{"ok":true,"result":{"id":1001,"is_bot":true,"first_name":"Bot"}}"#.to_vec(),
-        );
-        env.fake.script(
-            "getWebhookInfo",
-            200,
-            br#"{"ok":true,"result":{"url":"https://example.invalid/hook"}}"#.to_vec(),
-        );
+        env.install("telegram", "verify_fail:webhook_conflict", "1001");
         assert_eq!(
             env.call(
                 "bindings_reconfirm",
@@ -3367,6 +3521,15 @@ mod tests {
         );
         assert_eq!(env.rows().await, before);
         assert_eq!(env.binding(binding).await["status"], "suspended");
+        // Both checks carried the stored token and the receiver's source key.
+        let verify = env.telegram.received_of("verify");
+        assert_eq!(verify.len(), 2);
+        for frame in &verify {
+            assert_eq!(
+                (&frame["credential"], &frame["source_key"]),
+                (&json!("1001:reconfirm-token"), &json!("1001"))
+            );
+        }
         env.stop().await;
     }
 
@@ -3375,7 +3538,6 @@ mod tests {
     async fn reconfirm_receiver_success_restarts_the_poller_and_closes_the_gap() {
         let mut env = Env::with_channels().await;
         let binding = suspended_receiver(&mut env, "1001:reconfirm-token").await;
-        env.verified(1001);
         assert_eq!(
             env.call(
                 "bindings_reconfirm",
@@ -3389,7 +3551,12 @@ mod tests {
         assert_eq!(row["status"], "active");
         let open: i64 = env.client.query_one("SELECT count(*) FROM openmybot.channel_events WHERE binding_id=$1 AND record_kind='gap' AND gap_reason='receiver_suspended' AND gap_ended_at IS NULL", &[&binding]).await.unwrap().get(0);
         assert_eq!(open, 0);
-        polls_with(&env.fake, "1001:reconfirm-token").await;
+        waits_for("start", || !env.telegram.received_of("start").is_empty()).await;
+        let start = env.telegram.received_of("start");
+        assert_eq!(
+            (&start[0]["credential"], &start[0]["source_key"]),
+            (&json!("1001:reconfirm-token"), &json!("1001"))
+        );
         env.stop().await;
     }
 
@@ -3503,15 +3670,14 @@ mod tests {
     #[ignore = "own PG17.11; explicit binary directory; serial"]
     async fn revoke_receiver_stops_the_poller_and_cascades_to_the_sender() {
         let mut env = Env::with_channels().await;
-        env.verified(1001);
         let bound = env
             .call(
                 "bindings_receiver",
-                json!({"channel": "telegram", "token": "1001:revoked-token"}),
+                json!({"channel": "telegram", "fields": {"token": "1001:revoked-token"}}),
             )
             .await
             .unwrap();
-        polls_with(&env.fake, "1001:revoked-token").await;
+        waits_for("start", || !env.telegram.received_of("start").is_empty()).await;
         let (sender, _) = env.sender().await;
         env.call(
             "bindings_revoke",
@@ -3519,9 +3685,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let seen = env.fake.requests().len();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(env.fake.requests().len(), seen);
+        waits_for("stop", || !env.telegram.received_of("stop").is_empty()).await;
         let row = env.binding(sender).await;
         assert_eq!(row["status"], "revoked");
         assert_eq!(row["status_reason"], "owner_revoked");
@@ -3776,6 +3940,9 @@ mod tests {
             "approve",
             "deny",
             "cancel",
+            "plugins_list",
+            "plugins_add",
+            "plugins_remove",
         ] {
             assert_eq!(McpOp::parse(name), None, "{name:?}");
         }
@@ -4352,10 +4519,7 @@ mod tests {
             env.fixture.engine.as_ref().unwrap(),
             env.token,
             quick_channels(),
-            Endpoints {
-                telegram: env.fake.endpoint(),
-                feishu: env.feishu.endpoint(),
-            },
+            env.ops.plugins.clone(),
             cancel,
             Outbound {
                 terminals,
@@ -5649,16 +5813,16 @@ mod tests {
                     .get(0);
                 assert!(ended, "round {round}");
             }
-            env.verified(1001);
             let replaced = env.ops.run(
                 Op::BindingsReceiver,
-                json!({"channel": "telegram", "token": format!("1001:token-{round}")}),
+                json!({"channel": "telegram", "fields": {"token": format!("1001:token-{round}")}}),
                 later(),
                 env.token,
             );
             tokio::pin!(replaced);
             // Answer the receiver commands while asserting, as `call_until` does: a replacement
-            // that is not held by the gate would otherwise also stall on the missing answer.
+            // that is not held by the gate would otherwise also stall on the missing answer. The
+            // credential check answers for source `1001` at once.
             loop {
                 tokio::select! {
                     answer = &mut replaced => {
@@ -5668,8 +5832,11 @@ mod tests {
                         ReceiverCommand::Start(_, done) => {
                             let _ = done.send(Ok(()));
                         }
-                        ReceiverCommand::Stop(_, done) => {
+                        ReceiverCommand::Stop(_, done) | ReceiverCommand::Retire(_, done) => {
                             let _ = done.send(());
+                        }
+                        ReceiverCommand::Verify { reply, .. } => {
+                            let _ = reply.send(Ok("1001".to_owned()));
                         }
                     },
                     () = tokio::time::sleep_until(parked + Duration::from_secs(3)) => break,
@@ -5696,8 +5863,11 @@ mod tests {
                         ReceiverCommand::Start(_, done) => {
                             let _ = done.send(Ok(()));
                         }
-                        ReceiverCommand::Stop(_, done) => {
+                        ReceiverCommand::Stop(_, done) | ReceiverCommand::Retire(_, done) => {
                             let _ = done.send(());
+                        }
+                        ReceiverCommand::Verify { reply, .. } => {
+                            let _ = reply.send(Ok("1001".to_owned()));
                         }
                     },
                 }

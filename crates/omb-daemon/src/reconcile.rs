@@ -1,6 +1,6 @@
 //! Reconciliation of OpenMyBot rows: once at startup before the dispatcher runs, and the terminal
 //! backfill with the cleaner every `sweep_interval`. Runs are never created here.
-use omb_channels::{ChannelError, Connection, Task, Timings};
+use crate::{ChannelError, Connection, Task, Timings};
 use omb_store::{
     EndReason, OpenRun, SessionEnd, StopRecord, StoreError, TerminalKind, clear_content,
     delete_expired, deny_undecided_permissions, end_session, list_orphan_sessions,
@@ -277,9 +277,9 @@ pub(crate) mod tests {
             tests::{self as agent, Run},
         },
         delegation::{BOT_ID, fixture::Fixture},
-    };
-    use omb_channels::{
-        Endpoints, SenderContext, fake_feishu::FakeFeishu, start_sender, testkit::FakeTelegram,
+        outbound::{OutboundContext, start_outbound},
+        plugins::tests::Logs,
+        supervisor::tests::Serving,
     };
     use omb_hostdriver::HostDriverConfig;
     use omb_store::{Decided, Decision, testkit};
@@ -477,13 +477,16 @@ pub(crate) mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    /// The `sendMessage` bodies once `count` have arrived.
-    pub(crate) async fn messages(fake: &FakeTelegram, count: usize) -> Vec<String> {
+    /// The bodies the fake plugin sent once `count` have arrived.
+    pub(crate) async fn messages(logs: &Logs, count: usize) -> Vec<String> {
         let limit = Instant::now() + Duration::from_secs(90);
         loop {
-            let sent = fake.sent_messages();
+            let sent = logs.sent();
             if sent.len() >= count {
-                return sent.into_iter().map(|sent| sent.text).collect();
+                return sent
+                    .into_iter()
+                    .map(|sent| sent["body"].as_str().unwrap().to_owned())
+                    .collect();
             }
             assert!(Instant::now() < limit, "{count} messages deadline");
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -627,7 +630,7 @@ pub(crate) mod tests {
     }
     /// Waits until the run's single `run_result` row is sent and the fake has seen exactly one
     /// more message after a quiet period.
-    async fn sent_once(client: &Client, fake: &FakeTelegram, run: &RunId, before: usize) {
+    async fn sent_once(client: &Client, logs: &Logs, run: &RunId, before: usize) {
         let limit = Instant::now() + Duration::from_secs(30);
         loop {
             let rows = results(client, run).await;
@@ -640,7 +643,7 @@ pub(crate) mod tests {
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(results(client, run).await.len(), 1);
-        assert_eq!(fake.sent_messages().len(), before + 1);
+        assert_eq!(logs.sent().len(), before + 1);
     }
     /// Whether `wake` holds a stored permit.
     async fn woken(wake: &Notify) -> bool {
@@ -1188,18 +1191,14 @@ pub(crate) mod tests {
         let mut client = fixture.client().await;
         let (_, run) = finished(&mut fixture, &client).await;
         sealed(&fixture, &client).await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let serving = Serving::start(&fixture, "telegram", &logs).await;
         let (queue, terminals) = mpsc::channel(8);
         let sent = Arc::new(Notify::new());
-        let sender = start_sender(
+        let sender = start_outbound(
             connection(&mut fixture, "openmybot-delivery").await,
-            SenderContext {
-                vault: fixture.engine().vault.clone(),
-                owner: ActorId::new(SINGLE_USER_ACTOR_ID),
-                endpoints: Endpoints {
-                    telegram: fake.endpoint(),
-                    feishu: FakeFeishu::endpoint_at(FakeTelegram::unused_port()),
-                },
+            OutboundContext {
+                processes: Arc::clone(&serving.processes),
                 timings: fast(),
                 wake: Arc::clone(&sent),
             },
@@ -1210,20 +1209,21 @@ pub(crate) mod tests {
         let timings = Timings::default();
         for round in 0..10 {
             unrecorded(&client, &run.run).await;
-            let before = fake.sent_messages().len();
+            let before = logs.sent().len();
             let (queued, swept) = tokio::join!(
                 queue.send(notice.clone()),
                 sweep(&mut client, &reconciler, &timings)
             );
             queued.unwrap();
             swept.unwrap();
-            sent_once(&client, &fake, &run.run, before).await;
+            sent_once(&client, &logs, &run.run, before).await;
             assert_eq!(event(&client, &run.run).await["terminal_kind"], "succeeded");
             let by_sender = woken(&sent).await;
             let by_sweep = woken(&reconciler.wake).await;
             assert!(by_sender != by_sweep, "round {round}");
         }
         sender.stop().await;
+        serving.stop().await;
         drop(client);
         fixture.stop().await;
     }
@@ -1235,17 +1235,13 @@ pub(crate) mod tests {
         let mut client = fixture.client().await;
         let (_, run) = finished(&mut fixture, &client).await;
         sealed(&fixture, &client).await;
-        let fake = FakeTelegram::start().await;
+        let logs = Logs::new();
+        let serving = Serving::start(&fixture, "telegram", &logs).await;
         let (queue, terminals) = mpsc::channel(8);
-        let sender = start_sender(
+        let sender = start_outbound(
             connection(&mut fixture, "openmybot-delivery").await,
-            SenderContext {
-                vault: fixture.engine().vault.clone(),
-                owner: ActorId::new(SINGLE_USER_ACTOR_ID),
-                endpoints: Endpoints {
-                    telegram: fake.endpoint(),
-                    feishu: FakeFeishu::endpoint_at(FakeTelegram::unused_port()),
-                },
+            OutboundContext {
+                processes: Arc::clone(&serving.processes),
                 timings: fast(),
                 wake: Arc::new(Notify::new()),
             },
@@ -1256,17 +1252,18 @@ pub(crate) mod tests {
         let timings = Timings::default();
         for _ in 0..10 {
             unrecorded(&client, &run.run).await;
-            let before = fake.sent_messages().len();
+            let before = logs.sent().len();
             queue.send(notice.clone()).await.unwrap();
             sweep(&mut client, &reconciler, &timings).await.unwrap();
-            sent_once(&client, &fake, &run.run, before).await;
+            sent_once(&client, &logs, &run.run, before).await;
             unrecorded(&client, &run.run).await;
-            let before = fake.sent_messages().len();
+            let before = logs.sent().len();
             sweep(&mut client, &reconciler, &timings).await.unwrap();
             queue.send(notice.clone()).await.unwrap();
-            sent_once(&client, &fake, &run.run, before).await;
+            sent_once(&client, &logs, &run.run, before).await;
         }
         sender.stop().await;
+        serving.stop().await;
         drop(client);
         fixture.stop().await;
     }

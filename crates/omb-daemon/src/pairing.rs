@@ -87,7 +87,7 @@ mod tests {
     }
     fn request(workspace: PathBuf) -> PairRequest {
         PairRequest {
-            channel: omb_channels::TELEGRAM,
+            channel: omb_store::ChannelKind::from_static("telegram"),
             workspace,
             run_deadline: omb_store::RunDeadline::parse(300),
         }

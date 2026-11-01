@@ -31,18 +31,3 @@ uuid.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 http.workspace = true
-
-[dev-dependencies]
-omb-store = { path = "../omb-store", features = ["testkit"] }
-
-[[test]]
-name = "receiver"
-required-features = ["testkit"]
-
-[[test]]
-name = "sender"
-required-features = ["testkit"]
-
-[[test]]
-name = "feishu"
-required-features = ["testkit"]

@@ -1,6 +1,6 @@
 use crate::{
     DaemonError, InitOptions, InitResult,
-    config::{self, Config, DIRECTORIES, HBA, Hosts},
+    config::{self, Config, DIRECTORIES, HBA, Hosts, PluginsConfig},
     pg::{self, Postgres},
 };
 use std::fs;
@@ -50,6 +50,7 @@ pub async fn init(options: InitOptions) -> Result<InitResult, DaemonError> {
         deployment_id: format!("omb-local-{}", config::hex_random(16)?),
         pg_bin_dir: options.pg_bin_dir.clone(),
         hosts: Hosts::default(),
+        plugins: PluginsConfig::default(),
     };
     let pwfile = root.join("pg/initdb-password");
     config::write_private(&pwfile, password.as_bytes(), true)

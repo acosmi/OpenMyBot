@@ -1,40 +1,43 @@
-//! In-process closed-loop acceptance: the daemon's assembly (channel tasks, control operations,
-//! the `/cancel` canceller and the Agent runtime) against the fake Bot API, the in-repository fake
-//! host and an own PostgreSQL 17.11 cluster. Events from the channel arrive as fake updates;
-//! events written to the store directly are written before the channel tasks start.
+//! In-process closed-loop acceptance: the daemon's assembly (channel plugin supervisors, control
+//! operations, the `/cancel` canceller and the Agent runtime) against the fake channel plugin, the
+//! in-repository fake host and an own PostgreSQL 17.11 cluster. Events from a channel are lines the
+//! fake plugin emits; events written to the store directly are written before the channel tasks
+//! start.
 use crate::{
-    DaemonError, StatusOptions, StatusSnapshot,
+    CANCEL_QUEUE, DaemonError, OMB_REPLY_CANCEL_REQUESTED_V1, StatusOptions, StatusSnapshot,
+    TERMINAL_QUEUE, Timings,
     agent::{AgentRuntime, tests as agent},
-    channels::{Channels, Outbound},
+    channels::{Channels, Outbound, utc_millis},
     config,
     control::{self, ControlState, ENGINE_PIN},
     delegation::fixture::Fixture,
     ops::{BindingRunCanceller, CancelQueue, Op, Ops, ReceiverCommand, ThreadMinter},
-};
-use omb_channels::{
-    CANCEL_QUEUE, Counters, Endpoints, OMB_REPLY_CANCEL_REQUESTED_V1, TERMINAL_QUEUE, Timings,
-    fake_feishu::FakeFeishu,
-    testkit::{FakeTelegram, Reply, Sent},
+    plugins::{
+        Plugins,
+        tests::{Logs, fake_channel, package},
+    },
 };
 use omb_hostdriver::{HostDriverConfig, Limits, WorkspaceRoots};
-use omb_store::testkit;
+use omb_store::{ChannelKind, testkit};
 use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::{ActorId, RunId, thread::ThreadIdentity};
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
 use serde_json::{Value, json};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
     time::Instant,
 };
 use tokio_postgres::Client;
 use uuid::Uuid;
 
-/// The Bot API token the receiver is bound with; its prefix is the bot id `getMe` answers.
+/// The credential every receiver is bound with: the plugins declare one secret field `token`.
 const TOKEN: &str = "1001:omb008-closed-loop-token";
+/// The source key the fake's verify answers for that credential.
+const SOURCE: &str = "1001";
 /// The paired sender, whose private chat has the same id.
 const OWNER: i64 = 42;
 /// Upper bound of every wait on the assembly.
@@ -53,25 +56,62 @@ fn timings() -> Timings {
         ..Timings::default()
     }
 }
-/// A Telegram text message from `from` in chat `chat`, private when the chat is the sender's own.
-fn update(id: u64, from: i64, chat: i64, text: &str) -> Value {
-    let kind = if chat == from { "private" } else { "group" };
-    json!({"update_id": id, "message": {"message_id": id, "date": chrono::Utc::now().timestamp(), "from": {"id": from, "is_bot": false}, "chat": {"id": chat, "type": kind}, "text": text}})
-}
-/// A private Feishu text of the paired sender, as a 2.0 `im.message.receive_v1` envelope created now.
-fn feishu_text(event_id: &str, text: &str) -> Value {
+/// A text event of channel `kind` created now, as the fake plugin emits it.
+fn message(kind: &str, key: &str, sender: &str, chat: &str, private: bool, text: &str) -> Value {
     json!({
-        "schema": "2.0",
-        "header": {"event_id": event_id, "event_type": "im.message.receive_v1", "create_time": chrono::Utc::now().timestamp_millis().to_string()},
-        "event": {
-            "sender": {"sender_id": {"open_id": "ou_rig"}, "sender_type": "user"},
-            "message": {"message_id": format!("om_{event_id}"), "chat_id": "oc_rig", "chat_type": "p2p", "message_type": "text", "content": json!({"text": text}).to_string()}
-        }
+        "event_key": key,
+        "event_type": format!("{kind}.message"),
+        "occurred_at": utc_millis(time::OffsetDateTime::now_utc()),
+        "private": private,
+        "sender_key": format!("{kind}:{sender}"),
+        "chat_key": format!("{kind}:{chat}"),
+        "kind": "text",
+        "text": text,
+        "data": {"text": text},
     })
 }
-/// One scripted `getUpdates` answer.
-fn batch(updates: &[Value]) -> Vec<u8> {
-    serde_json::to_vec(&json!({"ok": true, "result": updates})).unwrap()
+/// A Telegram text of `from` in chat `chat`, private when the chat is the sender's own.
+fn update(id: u64, from: i64, chat: i64, text: &str) -> Value {
+    message(
+        "telegram",
+        &id.to_string(),
+        &from.to_string(),
+        &chat.to_string(),
+        chat == from,
+        text,
+    )
+}
+/// A private Feishu text of the paired sender `ou_rig` in its chat `oc_rig`.
+fn feishu_text(event_id: &str, text: &str) -> Value {
+    message("feishu", event_id, "ou_rig", "oc_rig", true, text)
+}
+/// The text of one logged send.
+fn body(sent: &Value) -> &str {
+    sent["body"].as_str().unwrap()
+}
+/// How often the daemon confirmed event `key` of the channel `logs` belongs to.
+fn acks(logs: &Logs, key: &str) -> usize {
+    logs.received_of("accepted")
+        .iter()
+        .filter(|frame| frame["event_key"] == key)
+        .count()
+}
+/// Installs the fake as plugin `fake-<kind>` serving `kind` with `scenario`, replacing an earlier
+/// installation of it; its verify answers `SOURCE`.
+fn install(plugins: &Plugins, kind: &str, logs: &Logs, scenario: &str) {
+    let mut channel = fake_channel(
+        kind,
+        logs,
+        scenario,
+        json!([{"name": "token", "secret": true}]),
+    );
+    channel["args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([json!("--source-key"), json!(SOURCE)]);
+    let package = package(&format!("fake-{kind}"), json!({kind: channel}));
+    plugins.install(&package, &HashSet::new()).unwrap();
+    std::fs::remove_dir_all(package).unwrap();
 }
 /// Polls `probe` every 20 ms until it yields a value, for at most `limit`.
 async fn until<T>(limit: Duration, mut probe: impl AsyncFnMut() -> Option<T>) -> T {
@@ -157,12 +197,15 @@ fn stderr_over(root: &Path) -> HostDriverConfig {
 }
 
 /// The daemon's assembly in this process: the fixture's engine and host driver, a control token
-/// row, the Agent runtime, `Ops` on the fake Bot API, and, once started, the channel tasks with
-/// the `/cancel` canceller. The test serves the receiver commands the daemon's main loop serves.
+/// row, the Agent runtime, the fake plugin installed for `telegram` and `feishu` under the
+/// fixture's data directory, `Ops` on those plugins, and, once started, the channel tasks with the
+/// `/cancel` canceller. The test serves the receiver commands the daemon's main loop serves.
 struct Rig {
     fixture: Fixture,
-    fake: FakeTelegram,
-    feishu: FakeFeishu,
+    /// What the `telegram` and `feishu` plugins emit, sent and received.
+    telegram: Logs,
+    feishu: Logs,
+    plugins: Plugins,
     token: Uuid,
     /// Setup and inspection connection outside the assembly.
     client: Client,
@@ -186,8 +229,11 @@ impl Rig {
             .await
             .unwrap();
         let client = fixture.client().await;
-        let fake = FakeTelegram::start().await;
-        let feishu = FakeFeishu::start().await;
+        let telegram = Logs::new();
+        let feishu = Logs::new();
+        let plugins = Plugins::load(&fixture.root, Vec::new(), fixture.root.clone()).unwrap();
+        install(&plugins, "telegram", &telegram, "normal");
+        install(&plugins, "feishu", &feishu, "normal");
         let (receiver, commands) = mpsc::channel(8);
         let home = fixture.root.join("home");
         let canceller = fixture
@@ -203,10 +249,7 @@ impl Rig {
             vault: engine.vault.clone(),
             owner: ActorId::new(SINGLE_USER_ACTOR_ID),
             roots: WorkspaceRoots::parse(&home, &[home.join("ws")]).unwrap(),
-            endpoints: Endpoints {
-                telegram: fake.endpoint(),
-                feishu: feishu.endpoint(),
-            },
+            plugins: plugins.clone(),
             receiver,
             // Replaced by the channels' wake-up at every start of the channel tasks.
             wake: Arc::new(Notify::new()),
@@ -217,12 +260,14 @@ impl Rig {
                 Arc::new(canceller.client),
                 Arc::default(),
             ),
-            counters: Arc::new(Counters::default()),
+            // Replaced by the channels' counters at every start of the channel tasks.
+            counters: Arc::default(),
         };
         Rig {
             fixture,
-            fake,
+            telegram,
             feishu,
+            plugins,
             token,
             client,
             ops: Some(ops),
@@ -234,8 +279,8 @@ impl Rig {
             canceller_link: canceller.driver,
         }
     }
-    /// Starts the channel tasks on the fake endpoint with `terminals` as the engine's notices,
-    /// the canceller on its own connection, and points `Ops` at the channels' wake-up.
+    /// Starts the channel tasks on the installed plugins with `terminals` as the engine's notices,
+    /// the canceller on its own connection, and points `Ops` at the channels' wake-up and counters.
     async fn start_channels(
         &mut self,
         timings: Timings,
@@ -255,10 +300,7 @@ impl Rig {
             engine,
             self.token,
             timings,
-            Endpoints {
-                telegram: self.fake.endpoint(),
-                feishu: self.feishu.endpoint(),
-            },
+            self.plugins.clone(),
             cancel,
             Outbound {
                 terminals,
@@ -279,8 +321,10 @@ impl Rig {
             connection.driver,
             requests,
         ));
-        self.ops.as_mut().unwrap().canceller = canceller;
-        self.ops.as_mut().unwrap().wake = channels.wake();
+        let ops = self.ops.as_mut().unwrap();
+        ops.canceller = canceller;
+        ops.wake = channels.wake();
+        ops.counters = channels.status_source().counters;
         self.channels = Some(channels);
     }
     async fn start(host: fn(&Path) -> HostDriverConfig, timings: Timings) -> Rig {
@@ -301,45 +345,42 @@ impl Rig {
         loop {
             tokio::select! {
                 result = &mut run => return result,
-                Some(command) = self.commands.recv() => match command {
-                    ReceiverCommand::Start(row, done) => {
-                        let started = self.channels.as_mut().unwrap().start_receiver(&mut self.fixture.pg, row).await;
-                        let _ = done.send(started);
+                Some(command) = self.commands.recv() => {
+                    let channels = self.channels.as_mut().unwrap();
+                    match command {
+                        ReceiverCommand::Start(row, done) => {
+                            channels.start_receiver(&mut self.fixture.pg, row, done).await;
+                        }
+                        ReceiverCommand::Stop(binding_id, done) => {
+                            channels.stop_receiver(binding_id, done).await;
+                        }
+                        ReceiverCommand::Retire(kinds, done) => {
+                            channels.retire(kinds, done).await;
+                        }
+                        ReceiverCommand::Verify { kind, credential, source_key, reply } => {
+                            channels.verify(kind, credential, source_key, reply).await;
+                        }
                     }
-                    ReceiverCommand::Stop(binding_id, done) => {
-                        self.channels.as_mut().unwrap().stop_receiver(binding_id).await;
-                        let _ = done.send(());
-                    }
-                },
+                }
             }
         }
     }
-    /// Binds the Telegram receiver through `bindings_receiver` after a scripted credential check.
-    async fn bind_receiver(&mut self) {
-        self.fake.script(
-            "getMe",
-            200,
-            json!({"ok": true, "result": {"id": 1001, "is_bot": true, "first_name": "Bot", "username": "bot"}}).to_string(),
-        );
-        self.fake.script(
-            "getWebhookInfo",
-            200,
-            br#"{"ok":true,"result":{"url":"","pending_update_count":0}}"#.to_vec(),
-        );
+    /// Binds the `kind` receiver through `bindings_receiver`; the plugin verifies the credential.
+    async fn bind(&mut self, kind: &str) {
         self.call(
             "bindings_receiver",
-            json!({"channel": "telegram", "token": TOKEN}),
+            json!({"channel": kind, "fields": {"token": TOKEN}}),
         )
         .await
         .unwrap();
     }
-    /// A pending sender on the workspace: its binding id and one-time code.
-    async fn pair_start(&mut self) -> (Uuid, String) {
+    /// A pending sender of `channel` on the workspace: its binding id and one-time code.
+    async fn pair_start(&mut self, channel: &str) -> (Uuid, String) {
         let workspace = self.fixture.root.join("home/ws");
         let started = self
             .call(
                 "pair_start",
-                json!({"channel": "telegram", "workspace": workspace}),
+                json!({"channel": channel, "workspace": workspace}),
             )
             .await
             .unwrap();
@@ -348,63 +389,51 @@ impl Rig {
             started["code"].as_str().unwrap().to_owned(),
         )
     }
-    /// Pairs the owner's chat with update `1`; returns the active sender and the used code.
+    /// Pairs the owner's Telegram chat with update `1`; returns the active sender and the used
+    /// code.
     async fn pair(&mut self) -> (Uuid, String) {
-        let (binding, code) = self.pair_start().await;
-        self.fake
-            .push_update(update(1, OWNER, OWNER, &format!("/pair {code}")));
+        let (binding, code) = self.pair_start("telegram").await;
+        self.telegram
+            .push(&update(1, OWNER, OWNER, &format!("/pair {code}")));
         let reply = until(LIMIT, async || self.sent().into_iter().next()).await;
-        assert!(reply.text.starts_with("绑定成功"), "{reply:?}");
-        assert_eq!(reply.chat_id, OWNER);
+        assert!(body(&reply).starts_with("绑定成功"), "{reply}");
+        assert_eq!(reply["chat_key"], "telegram:42");
         assert_eq!(self.binding(binding).await["status"], "active");
         (binding, code)
     }
-    /// Binds the Feishu receiver through `bindings_receiver` and waits for its connection.
-    async fn bind_feishu(&mut self) {
-        self.call(
-            "bindings_receiver",
-            json!({"channel": "feishu", "app_id": "cli_rig", "app_secret": "rig-secret"}),
-        )
-        .await
-        .unwrap();
+    /// Installs the Telegram plugin again with `scenario` and starts the active receiver again,
+    /// which replaces the running process with one of the new installation. The new process
+    /// emits the earlier events again; they are duplicates and change nothing.
+    async fn rescenario(&mut self, scenario: &str) {
+        // No send is in flight when the process is replaced.
         until(LIMIT, async || {
-            (!self.feishu.handshakes().is_empty()).then_some(())
+            (self
+                .count("SELECT count(*) FROM openmybot.deliveries WHERE status IN ('pending','sending')")
+                .await
+                == 0)
+                .then_some(())
         })
         .await;
-    }
-    /// Pairs the Feishu chat `oc_rig` of `ou_rig`.
-    async fn pair_feishu(&mut self) {
-        let workspace = self.fixture.root.join("home/ws");
-        let started = self
-            .call(
-                "pair_start",
-                json!({"channel": "feishu", "workspace": workspace}),
-            )
+        install(&self.plugins, "telegram", &self.telegram, scenario);
+        let row = self
+            .fixture
+            .pg
+            .list_active_receivers(ChannelKind::from_static("telegram"))
             .await
+            .unwrap()
+            .pop()
             .unwrap();
-        let binding = Uuid::parse_str(started["binding_id"].as_str().unwrap()).unwrap();
-        let code = started["code"].as_str().unwrap();
-        assert!(
-            self.feishu
-                .push_event(&feishu_text("ev_rig_pair", &format!("/pair {code}")))
-        );
-        let reply = until(LIMIT, async || {
-            self.feishu.sent_messages().into_iter().next()
-        })
-        .await;
-        assert!(
-            reply.content.starts_with(r#"{"text":"绑定成功"#),
-            "{reply:?}"
-        );
-        assert_eq!(reply.receive_id, "oc_rig");
-        let row = self.binding(binding).await;
-        assert_eq!(
-            [&row["status"], &row["chat_key"]],
-            ["active", "feishu:oc_rig"]
-        );
+        let (done, started) = oneshot::channel();
+        self.channels
+            .as_mut()
+            .unwrap()
+            .start_receiver(&mut self.fixture.pg, row, done)
+            .await;
+        started.await.unwrap().unwrap();
     }
-    fn sent(&self) -> Vec<Sent> {
-        self.fake.sent_messages()
+    /// Every send of the Telegram plugin, in order.
+    fn sent(&self) -> Vec<Value> {
+        self.telegram.sent()
     }
     async fn count(&self, sql: &str) -> i64 {
         self.client.query_one(sql, &[]).await.unwrap().get(0)
@@ -458,13 +487,16 @@ impl Rig {
         let mine = || {
             self.sent()
                 .into_iter()
-                .filter(|sent| sent.text.starts_with("[OpenMyBot] ") && sent.text.contains(&marker))
+                .filter(|sent| {
+                    body(sent).starts_with("[OpenMyBot] ") && body(sent).contains(&marker)
+                })
                 .collect::<Vec<_>>()
         };
         let first = until(LIMIT, async || mine().into_iter().next()).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(mine().len(), 1, "{:?}", self.sent());
-        assert_eq!(first.chat_id, OWNER);
+        assert_eq!(first["chat_key"], "telegram:42");
+        assert_eq!(first["idempotency_key"], format!("result:{run}"));
         let rows = self
             .client
             .query(
@@ -475,7 +507,7 @@ impl Rig {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, String>(0), "sent");
-        first.text
+        body(&first).to_owned()
     }
     /// The permission id the run's host asked for, once its row exists.
     async fn permission_of(&self, run: &str) -> String {
@@ -485,15 +517,11 @@ impl Rig {
         })
         .await
     }
-    /// Waits until the receiver asked for updates from `offset` on, so every earlier one is consumed.
-    async fn consumed(&self, offset: u64) {
-        let offset = offset.to_string();
+    /// Waits until the daemon confirmed Telegram event `key` `times` times. The fake emits in file
+    /// order and awaits each confirmation, so every earlier event was committed too.
+    async fn consumed(&self, key: &str, times: usize) {
         until(LIMIT, async || {
-            self.fake
-                .calls("getUpdates")
-                .iter()
-                .any(|request| request.param("offset") == Some(offset.as_str()))
-                .then_some(())
+            (acks(&self.telegram, key) >= times).then_some(())
         })
         .await;
     }
@@ -577,10 +605,10 @@ async fn injected_pending_host_events_dispatch_in_order_on_a_fingerprint_minted_
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn happy_line_pushed_update_runs_and_sends_one_result() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "please do the work"));
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "please do the work"));
     let run = rig.run_of(2).await;
     assert_eq!(rig.terminal_of(&run).await, "succeeded");
     assert_eq!(
@@ -589,18 +617,20 @@ async fn happy_line_pushed_update_runs_and_sends_one_result() {
     );
     let sent = rig.sent();
     assert_eq!(sent.len(), 2, "{sent:?}");
-    // Polling and sending share the one fake endpoint and the bound token.
-    for request in rig.fake.requests() {
-        assert!(
-            request.path.starts_with(&format!("/bot{TOKEN}/")),
-            "{}",
-            request.path
-        );
-    }
-    assert!(sent.iter().all(|sent| !sent.has_parse_mode));
+    // Receiving and sending share the one plugin process, started once with the bound credential
+    // and the source key its verify answered.
+    let starts = rig.telegram.received_of("start");
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert_eq!(
+        [&starts[0]["credential"], &starts[0]["source_key"]],
+        [TOKEN, SOURCE]
+    );
+    assert_eq!(rig.telegram.received_of("hello").len(), 1);
+    assert!(sent.iter().all(|sent| sent["chat_key"] == "telegram:42"));
     let event = rig.event(2).await;
     assert_eq!(event["dispatch_status"], "dispatched");
     assert_eq!(event["terminal_kind"], "succeeded");
+    assert_eq!(event["source_key"], SOURCE);
     let status = rig
         .call("status_run", json!({"run_id": run}))
         .await
@@ -614,15 +644,15 @@ async fn happy_line_pushed_update_runs_and_sends_one_result() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn permission_line_notice_cli_approve_then_one_result() {
     let mut rig = Rig::start(asking, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "write the file"));
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "write the file"));
     let run = rig.run_of(2).await;
     let id = rig.permission_of(&run).await;
     let notice = until(LIMIT, async || rig.sent().into_iter().nth(1)).await;
-    assert!(notice.text.contains(&id), "{notice:?}");
-    assert!(notice.text.contains("openmybot approve"), "{notice:?}");
+    assert!(body(&notice).contains(&id), "{notice}");
+    assert!(body(&notice).contains("openmybot approve"), "{notice}");
     assert_eq!(
         rig.call("approve", json!({"permission_id": id}))
             .await
@@ -643,10 +673,14 @@ async fn permission_line_notice_cli_approve_then_one_result() {
         result.starts_with(&format!("[OpenMyBot] 已完成 · run {}", &run[..8])),
         "{result}"
     );
-    let texts: Vec<String> = rig.sent().into_iter().map(|sent| sent.text).collect();
+    let texts: Vec<String> = rig
+        .sent()
+        .iter()
+        .map(|sent| body(sent).to_owned())
+        .collect();
     assert_eq!(texts.len(), 3, "{texts:?}");
     assert!(texts[0].starts_with("绑定成功"));
-    assert_eq!(texts[1], notice.text);
+    assert_eq!(texts[1], body(&notice));
     assert_eq!(texts[2], result);
     rig.stop().await;
 }
@@ -655,19 +689,19 @@ async fn permission_line_notice_cli_approve_then_one_result() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn cancel_line_channel_cancel_ends_cancelled_with_one_result() {
     let mut rig = Rig::start(agent::cooperative, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
     // A host binding's run beside the sender's: the channel `/cancel` must leave it running.
     let (other, other_client) = agent::begin(&mut rig.fixture).await;
     agent::initialized(&rig.client, &other.run).await;
-    rig.fake.push_update(update(2, OWNER, OWNER, "a long task"));
+    rig.telegram.push(&update(2, OWNER, OWNER, "a long task"));
     let run = rig.run_of(2).await;
     agent::initialized(&rig.client, &RunId::new(&run)).await;
-    rig.fake.push_update(update(3, OWNER, OWNER, "/cancel"));
+    rig.telegram.push(&update(3, OWNER, OWNER, "/cancel"));
     until(LIMIT, async || {
         rig.sent()
             .into_iter()
-            .find(|sent| sent.text == OMB_REPLY_CANCEL_REQUESTED_V1)
+            .find(|sent| body(sent) == OMB_REPLY_CANCEL_REQUESTED_V1)
     })
     .await;
     assert_eq!(rig.terminal_of(&run).await, "cancelled");
@@ -716,29 +750,41 @@ async fn result_row(rig: &Rig, run: &str, status: &str) -> Value {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn deterministic_send_failure_retries_on_schedule_and_keeps_the_run_terminal() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .script("sendMessage", 500, b"{\"ok\":false}".to_vec());
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "please do the work"));
+    // The first send of the restarted plugin, the run's result, fails with a retryable server
+    // error.
+    rig.rescenario("send_fail_once:retryable:server_error")
+        .await;
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "please do the work"));
     let run = rig.run_of(2).await;
     assert_eq!(rig.terminal_of(&run).await, "succeeded");
     let row = result_row(&rig, &run, "sent").await;
     assert_eq!(row["attempts"], 2);
     assert_eq!(row["last_error_code"], "server_error");
+    // The retry waited for the first interval of the plan.
+    let waited: bool = rig
+        .client
+        .query_one(
+            "SELECT finished_at-first_attempt_at>=interval '300 milliseconds' FROM openmybot.deliveries WHERE idempotency_key=$1",
+            &[&format!("result:{run}")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(waited);
     // Three more retry intervals bring no further send.
     tokio::time::sleep(Duration::from_millis(900)).await;
-    let sends = rig.fake.calls("sendMessage");
-    assert_eq!(sends.len(), 3, "pairing reply, refused result, sent result");
-    assert!(sends[2].at - sends[1].at >= Duration::from_millis(300));
     let sent = rig.sent();
-    assert_eq!(sent[1].text, sent[2].text);
-    assert!(
-        sent[2]
-            .text
-            .starts_with(&format!("[OpenMyBot] 已完成 · run {}", &run[..8]))
+    assert_eq!(
+        sent.len(),
+        3,
+        "pairing reply, refused result, sent result: {sent:?}"
     );
+    assert_eq!(sent[1]["delivery_id"], sent[2]["delivery_id"]);
+    assert_eq!(body(&sent[1]), body(&sent[2]));
+    assert!(body(&sent[2]).starts_with(&format!("[OpenMyBot] 已完成 · run {}", &run[..8])));
     assert_eq!(rig.event(2).await["terminal_kind"], "succeeded");
     rig.stop().await;
 }
@@ -747,18 +793,18 @@ async fn deterministic_send_failure_retries_on_schedule_and_keeps_the_run_termin
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn unknown_send_result_is_not_retried_and_keeps_the_run_terminal() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake.script_reply("sendMessage", Reply::Disconnect);
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "please do the work"));
+    rig.rescenario("send_fail:unknown:server_error").await;
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "please do the work"));
     let run = rig.run_of(2).await;
     assert_eq!(rig.terminal_of(&run).await, "succeeded");
     let row = result_row(&rig, &run, "unknown").await;
     assert_eq!(row["last_error_code"], "result_unknown");
     tokio::time::sleep(Duration::from_millis(900)).await;
     assert_eq!(
-        rig.fake.calls("sendMessage").len(),
+        rig.sent().len(),
         2,
         "pairing reply and the one result attempt"
     );
@@ -767,14 +813,6 @@ async fn unknown_send_result_is_not_retried_and_keeps_the_run_terminal() {
     rig.stop().await;
 }
 
-/// Waits until three more `getUpdates` answers than `before` were consumed and processed: the
-/// receiver asks again only after finishing the previous batch.
-async fn polled_past(rig: &Rig, before: usize, answers: usize) {
-    until(LIMIT, async || {
-        (rig.fake.calls("getUpdates").len() > before + answers).then_some(())
-    })
-    .await;
-}
 async fn event_conflicts(rig: &Rig) -> u64 {
     let channels = rig
         .channels
@@ -791,19 +829,14 @@ async fn event_conflicts(rig: &Rig) -> u64 {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn redelivered_update_adds_no_event_no_run_and_one_result() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
     let message = update(2, OWNER, OWNER, "please do the work");
     let changed = update(2, OWNER, OWNER, "please do other work");
-    let before = rig.fake.calls("getUpdates").len();
-    for updates in [
-        vec![message.clone(), message.clone()],
-        vec![message.clone()],
-        vec![changed],
-    ] {
-        rig.fake.script("getUpdates", 200, batch(&updates));
+    for event in [&message, &message, &message, &changed] {
+        rig.telegram.push(event);
     }
-    polled_past(&rig, before, 3).await;
+    rig.consumed("2", 4).await;
     let run = rig.run_of(2).await;
     assert_eq!(rig.terminal_of(&run).await, "succeeded");
     rig.result_of(&run).await;
@@ -825,24 +858,19 @@ async fn redelivered_update_adds_no_event_no_run_and_one_result() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn race_duplicate_delivery_dispatcher_and_engine_run_once_per_round() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
     // RACE_REPEAT_MIN rounds; each round's redeliveries overlap the claim, `begin` and the start.
     for round in 1..=10_i64 {
         let id = round as u64 + 1;
         let message = update(id, OWNER, OWNER, &format!("round {round}"));
-        let before = rig.fake.calls("getUpdates").len();
-        for updates in [
-            vec![message.clone(), message.clone()],
-            vec![message.clone()],
-            vec![message.clone()],
-        ] {
-            rig.fake.script("getUpdates", 200, batch(&updates));
+        for _ in 0..4 {
+            rig.telegram.push(&message);
         }
         let run = rig.run_of(id).await;
         assert_eq!(rig.terminal_of(&run).await, "succeeded");
         rig.result_of(&run).await;
-        polled_past(&rig, before, 3).await;
+        rig.consumed(&id.to_string(), 4).await;
         assert_eq!(
             rig.count(&format!("SELECT count(*) FROM openmybot.channel_events WHERE channel_kind='telegram' AND event_key='{id}'")).await,
             1,
@@ -859,8 +887,8 @@ async fn race_duplicate_delivery_dispatcher_and_engine_run_once_per_round() {
         assert_eq!(rig.count("SELECT count(*) FROM openmybot.deliveries WHERE kind='run_result' AND status='sent'").await, round);
         let results = rig
             .sent()
-            .into_iter()
-            .filter(|sent| sent.text.starts_with("[OpenMyBot] "))
+            .iter()
+            .filter(|sent| body(sent).starts_with("[OpenMyBot] "))
             .count();
         assert_eq!(results as i64, round);
         assert_eq!(event_conflicts(&rig).await, 0, "round {round}");
@@ -880,13 +908,24 @@ async fn race_duplicate_delivery_dispatcher_and_engine_run_once_per_round() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn feishu_redelivery_racing_dispatch_adds_no_run() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_feishu().await;
-    rig.pair_feishu().await;
+    rig.bind("feishu").await;
+    // Pairs the Feishu chat `oc_rig` of `ou_rig`.
+    let (binding, code) = rig.pair_start("feishu").await;
+    rig.feishu
+        .push(&feishu_text("ev_rig_pair", &format!("/pair {code}")));
+    let reply = until(LIMIT, async || rig.feishu.sent().into_iter().next()).await;
+    assert!(body(&reply).starts_with("绑定成功"), "{reply}");
+    assert_eq!(reply["chat_key"], "feishu:oc_rig");
+    let row = rig.binding(binding).await;
+    assert_eq!(
+        [&row["status"], &row["chat_key"]],
+        ["active", "feishu:oc_rig"]
+    );
     let results = |rig: &Rig| {
         rig.feishu
-            .sent_messages()
-            .into_iter()
-            .filter(|sent| sent.content.starts_with(r#"{"text":"[OpenMyBot] 已完成"#))
+            .sent()
+            .iter()
+            .filter(|sent| body(sent).starts_with("[OpenMyBot] 已完成"))
             .count() as i64
     };
     // RACE_REPEAT_MIN rounds; each round's redeliveries overlap the claim, `begin` and the start.
@@ -894,7 +933,7 @@ async fn feishu_redelivery_racing_dispatch_adds_no_run() {
         let event = format!("ev_rig_{round}");
         let message = feishu_text(&event, &format!("work {round}"));
         for _ in 0..3 {
-            assert!(rig.feishu.push_event(&message));
+            rig.feishu.push(&message);
         }
         let run: String = until(LIMIT, async || {
             let rows = rig.client.query("SELECT run_id FROM openmybot.channel_events WHERE channel_kind='feishu' AND event_key=$1 AND run_id IS NOT NULL", &[&event]).await.unwrap();
@@ -903,16 +942,12 @@ async fn feishu_redelivery_racing_dispatch_adds_no_run() {
         .await;
         assert_eq!(rig.terminal_of(&run).await, "succeeded");
         until(LIMIT, async || (results(&rig) >= round).then_some(())).await;
-        let acks = || {
-            rig.feishu
-                .acks()
-                .into_iter()
-                .filter(|ack| ack.message_id == event && ack.valid)
-                .count()
-        };
-        until(LIMIT, async || (acks() >= 3).then_some(())).await;
+        until(LIMIT, async || {
+            (acks(&rig.feishu, &event) >= 3).then_some(())
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(acks(), 3, "round {round}");
+        assert_eq!(acks(&rig.feishu, &event), 3, "round {round}");
         assert_eq!(results(&rig), round, "round {round}");
         assert_eq!(
             rig.count(&format!("SELECT count(*) FROM openmybot.channel_events WHERE channel_kind='feishu' AND event_key='{event}'")).await,
@@ -942,18 +977,18 @@ async fn feishu_redelivery_racing_dispatch_adds_no_run() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn unbound_and_group_traffic_gets_no_reply_no_row_and_no_run() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .push_update(update(2, 99, 99, "hello from a stranger"));
-    rig.fake
-        .push_update(update(3, OWNER, -100, "hello from the group"));
-    rig.consumed(4).await;
+    rig.telegram
+        .push(&update(2, 99, 99, "hello from a stranger"));
+    rig.telegram
+        .push(&update(3, OWNER, -100, "hello from the group"));
+    rig.consumed("3", 1).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     // Only the pairing reply the paired uid needed was ever sent.
     let sent = rig.sent();
     assert_eq!(sent.len(), 1, "{sent:?}");
-    assert!(sent[0].text.starts_with("绑定成功"));
+    assert!(body(&sent[0]).starts_with("绑定成功"));
     // The owner's pairing reply is the one delivery row.
     assert_eq!(
         rig.count("SELECT count(*) FROM openmybot.deliveries").await,
@@ -984,15 +1019,15 @@ async fn unbound_and_group_traffic_gets_no_reply_no_row_and_no_run() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn pairing_code_is_single_use_end_to_end() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     let (binding, code) = rig.pair().await;
-    rig.fake
-        .push_update(update(2, 43, 43, &format!("/pair {code}")));
-    rig.consumed(3).await;
+    rig.telegram
+        .push(&update(2, 43, 43, &format!("/pair {code}")));
+    rig.consumed("2", 1).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     let sent = rig.sent();
     assert_eq!(sent.len(), 1, "{sent:?}");
-    assert_eq!(sent[0].chat_id, OWNER);
+    assert_eq!(sent[0]["chat_key"], "telegram:42");
     // The first pairing's reply is the one delivery row.
     assert_eq!(
         rig.count("SELECT count(*) FROM openmybot.deliveries").await,
@@ -1016,8 +1051,8 @@ async fn pairing_code_is_single_use_end_to_end() {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn five_wrong_pair_codes_lock_and_the_right_code_is_refused_without_replies() {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
-    let (binding, code) = rig.pair_start().await;
+    rig.bind("telegram").await;
+    let (binding, code) = rig.pair_start("telegram").await;
     // The first symbol replaced by another Crockford base32 symbol.
     let wrong = format!(
         "{}{}",
@@ -1025,12 +1060,12 @@ async fn five_wrong_pair_codes_lock_and_the_right_code_is_refused_without_replie
         &code[1..]
     );
     for id in 1..=5 {
-        rig.fake
-            .push_update(update(id, OWNER, OWNER, &format!("/pair {wrong}")));
+        rig.telegram
+            .push(&update(id, OWNER, OWNER, &format!("/pair {wrong}")));
     }
-    rig.fake
-        .push_update(update(6, OWNER, OWNER, &format!("/pair {code}")));
-    rig.consumed(7).await;
+    rig.telegram
+        .push(&update(6, OWNER, OWNER, &format!("/pair {code}")));
+    rig.consumed("6", 1).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(rig.sent().is_empty(), "{:?}", rig.sent());
     assert_eq!(rig.binding(binding).await["status"], "pending");
@@ -1056,10 +1091,10 @@ async fn five_wrong_pair_codes_lock_and_the_right_code_is_refused_without_replie
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn channel_text_yes_tongyi_and_approve_leave_the_permission_row_undecided() {
     let mut rig = Rig::start(asking, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "write the file"));
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "write the file"));
     let run = rig.run_of(2).await;
     let id = rig.permission_of(&run).await;
     until(LIMIT, async || rig.sent().into_iter().nth(1)).await;
@@ -1068,7 +1103,7 @@ async fn channel_text_yes_tongyi_and_approve_leave_the_permission_row_undecided(
         (4, "同意".to_owned()),
         (5, format!("approve {id}")),
     ] {
-        rig.fake.push_update(update(update_id, OWNER, OWNER, &text));
+        rig.telegram.push(&update(update_id, OWNER, OWNER, &text));
     }
     for update_id in 3..=5 {
         assert_eq!(rig.event(update_id).await["dispatch_status"], "pending");
@@ -1095,20 +1130,19 @@ async fn channel_text_yes_tongyi_and_approve_leave_the_permission_row_undecided(
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn unconfirmable_stop_ends_reconciliation_required_pauses_later_events_until_reset_thread() {
     let mut rig = Rig::start(agent::unconfirmable, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     let (binding, _) = rig.pair().await;
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "first message"));
+    rig.telegram.push(&update(2, OWNER, OWNER, "first message"));
     let run = rig.run_of(2).await;
     agent::initialized(&rig.client, &RunId::new(&run)).await;
-    rig.fake
-        .push_update(update(3, OWNER, OWNER, "second message"));
+    rig.telegram
+        .push(&update(3, OWNER, OWNER, "second message"));
     let later = rig.run_of(3).await;
-    rig.fake.push_update(update(4, OWNER, OWNER, "/cancel"));
+    rig.telegram.push(&update(4, OWNER, OWNER, "/cancel"));
     until(LIMIT, async || {
         rig.sent()
             .into_iter()
-            .find(|sent| sent.text == OMB_REPLY_CANCEL_REQUESTED_V1)
+            .find(|sent| body(sent) == OMB_REPLY_CANCEL_REQUESTED_V1)
     })
     .await;
     assert_eq!(rig.terminal_of(&run).await, "reconciliation_required");
@@ -1174,15 +1208,13 @@ async fn unconfirmable_stop_ends_reconciliation_required_pauses_later_events_unt
 async fn telegram_offset_catch_up_after_channels_restart_adds_no_duplicates_and_records_daemon_down_gap()
  {
     let mut rig = Rig::start(agent::happy, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    // Built once: a redelivery carries the same date and so the same fingerprint.
-    let status: Vec<Value> = (0..=5)
-        .map(|id| update(id, OWNER, OWNER, "/status"))
-        .collect();
-    rig.fake.push_update(status[2].clone());
-    rig.fake.push_update(status[3].clone());
+    for id in [2, 3] {
+        rig.telegram.push(&update(id, OWNER, OWNER, "/status"));
+    }
     until(LIMIT, async || (rig.sent().len() == 3).then_some(())).await;
+    rig.consumed("3", 1).await;
     rig.channels.take().unwrap().stop().await;
     rig.canceller.take().unwrap().stop().await;
     let old = rig.token;
@@ -1195,22 +1227,26 @@ async fn telegram_offset_catch_up_after_channels_restart_adds_no_duplicates_and_
         .await
         .unwrap()
         .get(0);
-    // While the channel tasks are down: two new updates and a redelivery of an accepted one.
-    rig.fake.push_update(status[4].clone());
-    rig.fake.push_update(status[5].clone());
-    rig.fake.script("getUpdates", 200, batch(&status[3..4]));
+    // While the channel tasks are down: two new updates. The restarted plugin emits the accepted
+    // ones again as well, as redeliveries.
+    for id in [4, 5] {
+        rig.telegram.push(&update(id, OWNER, OWNER, "/status"));
+    }
     // The restart writes a control token row as a daemon start does.
     rig.token = control_token(&mut rig.fixture).await;
-    let before = rig.fake.calls("getUpdates").len();
     rig.start_channels(timings(), mpsc::channel(TERMINAL_QUEUE).1)
         .await;
     until(LIMIT, async || (rig.sent().len() == 5).then_some(())).await;
-    rig.consumed(6).await;
+    rig.consumed("5", 1).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(
-        rig.fake.calls("getUpdates")[before].param("offset"),
-        Some("4")
-    );
+    // The restarted plugin is told the last accepted update to catch up from, and every
+    // redelivered update is confirmed again without a new row or reply.
+    let starts = rig.telegram.received_of("start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert_eq!(starts[1]["last_event_key"], "3");
+    for key in ["1", "2", "3"] {
+        assert_eq!(acks(&rig.telegram, key), 2, "update {key}");
+    }
     for id in 2..=5 {
         let event = rig.event(id).await;
         assert_eq!(event["disposition"], "control_command");
@@ -1227,7 +1263,7 @@ async fn telegram_offset_catch_up_after_channels_restart_adds_no_duplicates_and_
     assert!(
         sent[1..]
             .iter()
-            .all(|sent| sent.text.starts_with("绑定：telegram 已激活"))
+            .all(|sent| body(sent).starts_with("绑定：telegram 已激活"))
     );
     let gaps = rig.client.query("SELECT binding_id,gap_started_at=(SELECT last_heartbeat_at FROM openmybot.control_tokens WHERE token_id=$1),gap_ended_at IS NOT NULL FROM openmybot.channel_events WHERE gap_reason='daemon_down'", &[&old]).await.unwrap();
     assert_eq!(gaps.len(), 1);
@@ -1242,10 +1278,7 @@ async fn telegram_offset_catch_up_after_channels_restart_adds_no_duplicates_and_
         .read()
         .await
         .unwrap();
-    assert_eq!(
-        channels[0].note,
-        "telegram 长轮询；中断区间内的更新在平台保留期内补回"
-    );
+    assert_eq!(channels[0].note, "telegram fake note");
     assert_eq!(channels[0].counters.event_conflict, 0);
     assert!(
         channels[0]
@@ -1274,10 +1307,10 @@ async fn sessions(rig: &Rig, run: &str) -> Vec<Value> {
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn version_outside_window_refuses_start_and_the_child_receives_no_input() {
     let mut rig = Rig::start(outside_window, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "please do the work"));
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "please do the work"));
     let run = rig.run_of(2).await;
     // The engine retries an unavailable provider start before the run fails.
     let terminal = until(Duration::from_secs(240), async || {
@@ -1320,10 +1353,10 @@ async fn version_outside_window_refuses_start_and_the_child_receives_no_input() 
 /// failure result message.
 async fn failed_on_limit(host: fn(&Path) -> HostDriverConfig, reason: &str) {
     let mut rig = Rig::start(host, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "please do the work"));
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "please do the work"));
     let run = rig.run_of(2).await;
     assert_eq!(rig.terminal_of(&run).await, "failed");
     let rows = sessions(&rig, &run).await;
@@ -1379,6 +1412,7 @@ async fn t10_rejected_connections_run_no_operation_on_the_assembled_control_stat
             engine_pin: ENGINE_PIN.into(),
             authentication_failures: 0,
             channels: Vec::new(),
+            plugins: Vec::new(),
         },
         Some(rig.channels.as_ref().unwrap().status_source()),
         rig.ops.take(),
@@ -1448,10 +1482,10 @@ async fn t10_rejected_connections_run_no_operation_on_the_assembled_control_stat
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn undecided_permission_expires_to_deny_and_late_approve_is_not_pending() {
     let mut rig = Rig::start(expiring, timings()).await;
-    rig.bind_receiver().await;
+    rig.bind("telegram").await;
     rig.pair().await;
-    rig.fake
-        .push_update(update(2, OWNER, OWNER, "write the file"));
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "write the file"));
     let run = rig.run_of(2).await;
     let id = rig.permission_of(&run).await;
     let row = until(LIMIT, async || {

@@ -1,24 +1,19 @@
 use crate::{
-    DaemonError, DaemonOptions, StatusSnapshot,
+    CANCEL_QUEUE, DaemonError, DaemonOptions, StatusSnapshot, TERMINAL_QUEUE, Timings,
     agent::AgentRuntime,
     channels::{Channels, Outbound},
     config,
     control::{self, ControlState, ENGINE_PIN},
     engine,
     ops::{BindingRunCanceller, CancelQueue, Ops, ReceiverCommand, ThreadMinter},
+    outbound::TerminalQueue,
     pg::{self, Postgres},
-};
-use omb_channels::{
-    CANCEL_QUEUE, Endpoints, FeishuEndpoint, TERMINAL_QUEUE, TelegramEndpoint, TerminalQueue,
-    Timings,
+    plugins::Plugins,
 };
 use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow};
 use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::ActorId;
-use openbot_infra::{
-    auth::single_user::SINGLE_USER_ACTOR_ID,
-    net::safe_http::{EgressPolicy, SafeDialer},
-};
+use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
 use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::UnixListener,
@@ -36,6 +31,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         .filter(|home| home.is_absolute())
         .ok_or(DaemonError::WorkspaceRootInvalid)?;
     let crabcode = config::Crabcode::parse(&config, &home)?;
+    let plugins = Plugins::load(root, config.plugins.path_extra.clone(), home.clone())?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| DaemonError::InternalError)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(|_| DaemonError::InternalError)?;
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
@@ -72,22 +68,20 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let canceller_connection=postgres.open_resident_connection("openmybot-canceller").await?;
         let (cancel,requests)=mpsc::channel(CANCEL_QUEUE);
         let (receiver,mut commands)=mpsc::channel(8);
-        let dialer=SafeDialer::new(EgressPolicy::default());
-        let endpoints=Endpoints{telegram:TelegramEndpoint::production(dialer.clone()),feishu:FeishuEndpoint::production(dialer)};
         // The one dispatch gate of the daemon, shared by the dispatcher and the run canceller, and
         // the runs whose begin outcome is unknown.
         let gate=Arc::default();
-        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),endpoints.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary},Arc::clone(&gate)).await?);
+        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),plugins.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary},Arc::clone(&gate)).await?);
         let run_canceller=BindingRunCanceller::new(assembled.assembly.application.clone(),assembled.resolver.clone(),Arc::new(canceller_connection.client),gate);
         canceller=Some(CancelQueue::start(run_canceller.clone(),canceller_connection.driver,requests));
-        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,endpoints,receiver,wake:started.wake(),minter:ThreadMinter::new(assembled.assembly.application.clone(),assembled.resolver.clone()),canceller:run_canceller,counters:started.status_source().counters};
+        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,plugins,receiver,wake:started.wake(),minter:ThreadMinter::new(assembled.assembly.application.clone(),assembled.resolver.clone()),canceller:run_canceller,counters:started.status_source().counters};
         let path=root.join("run/control.sock");
         let listener=UnixListener::bind(&path).map_err(|_|DaemonError::ControlSocketFailed)?;
         std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).map_err(|_|DaemonError::ControlSocketFailed)?;
         config::check(&path,false)?;
         let state=ControlState::new(token,current_token_id,StatusSnapshot{
             deployment_id:config.deployment_id,daemon_pid:std::process::id(),pg_pid:postgres.pid(),
-            pg_server_version_num:postgres.version,daemon_version:env!("CARGO_PKG_VERSION").into(),engine_pin:ENGINE_PIN.into(),authentication_failures:0,channels:Vec::new(),
+            pg_server_version_num:postgres.version,daemon_version:env!("CARGO_PKG_VERSION").into(),engine_pin:ENGINE_PIN.into(),authentication_failures:0,channels:Vec::new(),plugins:Vec::new(),
         },Some(started.status_source()),Some(ops));
         let mut connections=JoinSet::new();
         let mut health=tokio::time::interval(Duration::from_millis(200));
@@ -109,10 +103,13 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
                 finished=connections.join_next(),if !connections.is_empty()=>{
                     if finished.is_some_and(|r|r.is_err()){break Err(DaemonError::ControlSocketFailed);}
                 },
-                // Receiver changes run here, where the store handle and the running tasks live.
+                // Receiver changes and credential checks are handed to the plugin supervisors here,
+                // where the store handle lives; the supervisors answer the receipts.
                 Some(command)=commands.recv()=>match command {
-                    ReceiverCommand::Start(row,done)=>{let _=done.send(started.start_receiver(&mut postgres,row).await);},
-                    ReceiverCommand::Stop(binding_id,done)=>{started.stop_receiver(binding_id).await;let _=done.send(());},
+                    ReceiverCommand::Start(row,done)=>started.start_receiver(&mut postgres,row,done).await,
+                    ReceiverCommand::Stop(binding_id,done)=>started.stop_receiver(binding_id,done).await,
+                    ReceiverCommand::Retire(kinds,done)=>started.retire(kinds,done).await,
+                    ReceiverCommand::Verify{kind,credential,source_key,reply}=>started.verify(kind,credential,source_key,reply).await,
                 },
             }
         };

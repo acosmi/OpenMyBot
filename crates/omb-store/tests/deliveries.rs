@@ -621,6 +621,29 @@ async fn claim_delivery_claims_feishu_rows_with_channel_and_idempotency_key() {
 
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn claim_delivery_claims_slack_rows_of_a_plugin_channel() {
+    let env = Env::new().await;
+    let slack = insert_sender(env.client(), "slack", "T0SLACK", "slack:C1", "T3").await;
+    let id = insert_delivery(
+        env.client(),
+        slack,
+        "control_reply",
+        "control_reply:s",
+        Some("z"),
+        "pending",
+        None,
+    )
+    .await;
+    let claimed = env.claim().await.unwrap();
+    assert_eq!(claimed.delivery_id, id);
+    assert_eq!(claimed.channel, ChannelKind::from_static("slack"));
+    assert_eq!(claimed.chat_key, "slack:C1");
+    assert_eq!(env.row(id).await["status"], "sending");
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn claim_delivery_returns_text_for_stored_kinds_and_run_id_for_run_result() {
     let env = Env::new().await;
     let mut expected = Vec::new();
