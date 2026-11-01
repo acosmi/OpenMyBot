@@ -18,8 +18,14 @@ use deadpool_postgres::{ClientWrapper, Manager, ManagerConfig, RecyclingMethod, 
 
 use crate::db::InfraError;
 
-mod owner;
+pub(super) mod owner;
 
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
+pub use owner::CapturePgIo;
 use owner::{ClientLease, OwnerSupervisor, SupervisedConnect};
 pub use owner::{
     ConnectionDestruction, ConnectionObservation, ConnectionSnapshot, OwnershipSnapshot,
@@ -85,7 +91,20 @@ impl DatabasePool {
         max_pool_size: usize,
         connect_timeout: Duration,
     ) -> Result<Self, PoolError> {
-        let supervisor = OwnerSupervisor::new();
+        Self::build_with_supervisor(
+            config,
+            max_pool_size,
+            connect_timeout,
+            OwnerSupervisor::new(),
+        )
+    }
+
+    fn build_with_supervisor(
+        config: tokio_postgres::Config,
+        max_pool_size: usize,
+        connect_timeout: Duration,
+        supervisor: Arc<OwnerSupervisor>,
+    ) -> Result<Self, PoolError> {
         let manager = Manager::from_connect(
             config,
             SupervisedConnect::new(&supervisor),
@@ -748,6 +767,34 @@ pub(super) async fn connect_config(
     let context = context.into();
     let pool = DatabasePool::build_config(config, max_pool_size, connect_timeout)
         .map_err(|source| InfraError::connect(format!("建立{context}连接池"), source))?;
+    let _probe = pool
+        .get()
+        .await
+        .map_err(|source| InfraError::connect(format!("取{context}首个连接"), source))?;
+    Ok(pool)
+}
+
+#[cfg(all(
+    feature = "desktop-local-vault",
+    feature = "server-runtime",
+    target_os = "macos"
+))]
+pub(super) async fn connect_config_retained(
+    config: tokio_postgres::Config,
+    max_pool_size: usize,
+    connect_timeout: Duration,
+    context: impl Into<String>,
+    custody: &owner::DesktopLocalDriverCustody,
+    application: bool,
+) -> Result<DatabasePool, InfraError> {
+    let context = context.into();
+    let supervisor = custody.supervisor(application);
+    let pool =
+        DatabasePool::build_with_supervisor(config, max_pool_size, connect_timeout, supervisor)
+            .map_err(|source| InfraError::connect(format!("建立{context}连接池"), source))?;
+    custody
+        .register_stock(application, pool.stock.clone())
+        .map_err(|source| InfraError::connect(format!("登记{context}原监督者"), source))?;
     let _probe = pool
         .get()
         .await

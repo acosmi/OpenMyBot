@@ -55,11 +55,13 @@ network_callers=$(rg -l 'TcpStream::connect|lookup_host\(|TlsConnector|http1::ha
 # provider/custom.rs 是生产文件，命中行在其 #[cfg(test)] mod v2_vault_tests 内。
 expected_callers_list=(
   crates/omb-channels/src/testkit.rs # 测试夹具 PR #243（testkit feature 模块，命中在其 #[cfg(test)] mod tests 内）
+  crates/omb-daemon/src/delegation.rs # 测试夹具 FIX-OMB-009-2（命中在其 #[cfg(test)] mod fixture 的回环 PG 代理内）
   crates/openbot-computer/src/engine/process.rs
   crates/openbot-desktop/src/postgres_sidecar.rs
   crates/openbot-desktop/src/tauri_host/approval_preference_local_tests.rs # 测试夹具 PR #147
   crates/openbot-infra/src/artifact_read_authority/save_receipt_tests.rs # 测试夹具 PR #141
   crates/openbot-infra/src/artifact_read_authority/tests.rs # 测试夹具 PR #131
+  crates/openbot-infra/src/db/pool/owner.rs # V7-IMPL-045 R475-B：mod capture_io 只惰性连接原 127.0.0.1:port 本机 socket
   crates/openbot-infra/src/mcp/selected_target_tests.rs # 测试夹具 PR #118
   crates/openbot-infra/src/net/safe_http.rs
   crates/openbot-infra/src/provider/custom.rs # 测试夹具 mod v2_vault_tests，PR #171

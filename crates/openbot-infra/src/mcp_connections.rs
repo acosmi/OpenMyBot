@@ -115,7 +115,18 @@ pub struct McpRevocationSweep {
 /// Lifecycle handle for periodic pending vendor-revocation reconciliation.
 pub struct McpRevocationReconciler {
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    capture_stop_requested: bool,
+    capture_stop: Option<Result<(), McpReconcilerStopFailure>>,
+}
+
+/// Actual original reconciler join, without SQL, endpoint or vendor diagnostic text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpReconcilerStopFailure {
+    /// The original reconciler was cancelled.
+    Cancelled,
+    /// The original reconciler panicked.
+    Panicked,
 }
 
 impl McpRevocationReconciler {
@@ -124,13 +135,40 @@ impl McpRevocationReconciler {
     pub fn start(connections: Arc<PostgresMcpConnections>) -> Self {
         let (stop, stop_rx) = watch::channel(false);
         let task = tokio::spawn(supervise_revocations(connections, stop_rx));
-        Self { stop, task }
+        Self {
+            stop,
+            task: Some(task),
+            capture_stop_requested: false,
+            capture_stop: None,
+        }
     }
 
     /// Stop claiming new tombstones and wait for the current bounded sweep.
-    pub async fn stop(self) {
-        self.stop.send_replace(true);
-        let _ = self.task.await;
+    pub async fn stop(mut self) {
+        let _ = self.stop_for_capture().await;
+    }
+
+    /// Borrow the original handle; interrupted waits retain it and cached results send no
+    /// additional stop request. Failure is permanent for this exact original task.
+    pub async fn stop_for_capture(&mut self) -> Result<(), McpReconcilerStopFailure> {
+        if let Some(result) = self.capture_stop {
+            return result;
+        }
+        if !self.capture_stop_requested {
+            self.stop.send_replace(true);
+            self.capture_stop_requested = true;
+        }
+        let result = match self.task.as_mut() {
+            Some(task) => match task.await {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_cancelled() => Err(McpReconcilerStopFailure::Cancelled),
+                Err(_) => Err(McpReconcilerStopFailure::Panicked),
+            },
+            None => Err(McpReconcilerStopFailure::Cancelled),
+        };
+        self.task = None;
+        self.capture_stop = Some(result);
+        result
     }
 }
 

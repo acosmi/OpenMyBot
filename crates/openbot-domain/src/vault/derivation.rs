@@ -18,6 +18,8 @@ pub enum ApplicationKeyPurpose {
     DesktopVaultCanary,
     /// Backup recovery-metadata wrapping under an owner-supplied 256-bit recovery key.
     BackupRecoveryWrap,
+    /// Independent whole-PostgreSQL capture carrier; never reused for legacy wrapping.
+    WholePgCaptureStreamV1,
 }
 
 impl ApplicationKeyPurpose {
@@ -27,6 +29,7 @@ impl ApplicationKeyPurpose {
             Self::McpOauthState => b"openbot:mcp-oauth-state:v1",
             Self::DesktopVaultCanary => b"openbot:desktop-vault-canary:v1",
             Self::BackupRecoveryWrap => b"openbot:backup-recovery-wrap:v1",
+            Self::WholePgCaptureStreamV1 => b"openbot:whole-pg-capture-stream:v1",
         }
     }
 }
@@ -43,7 +46,8 @@ pub fn derive_application_key(
 ) -> Result<SecretBytes, VaultError> {
     if master.is_empty()
         || ((purpose == ApplicationKeyPurpose::DesktopVaultCanary
-            || purpose == ApplicationKeyPurpose::BackupRecoveryWrap)
+            || purpose == ApplicationKeyPurpose::BackupRecoveryWrap
+            || purpose == ApplicationKeyPurpose::WholePgCaptureStreamV1)
             && master.len() != 32)
     {
         return Err(VaultError::KeyLength);
@@ -117,5 +121,32 @@ mod tests {
             write!(&mut encoded, "{byte:02x}").unwrap();
         }
         encoded
+    }
+}
+
+#[cfg(test)]
+mod whole_pg_capture_tests {
+    use super::*;
+    #[test]
+    fn capture_purpose_is_distinct_and_requires_exact_recovery_key_size() {
+        let key = SecretBytes::new(vec![23; 32]);
+        let capture =
+            derive_application_key(&key, ApplicationKeyPurpose::WholePgCaptureStreamV1).unwrap();
+        let wrap = derive_application_key(&key, ApplicationKeyPurpose::BackupRecoveryWrap).unwrap();
+        assert!(!capture.ct_eq(&wrap));
+        assert!(
+            derive_application_key(
+                &SecretBytes::new(vec![1; 31]),
+                ApplicationKeyPurpose::WholePgCaptureStreamV1
+            )
+            .is_err()
+        );
+        assert!(
+            derive_application_key(
+                &SecretBytes::new(vec![1; 44]),
+                ApplicationKeyPurpose::AuditCheckpoint
+            )
+            .is_ok()
+        );
     }
 }

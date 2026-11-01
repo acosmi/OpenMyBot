@@ -154,13 +154,23 @@ enum PhysicalIoPermission {
 }
 
 struct WorkerPermission {
+    capture_operation: crate::artifact_store::CaptureMutationLease,
     state: Mutex<PhysicalIoPermission>,
     changed: Condvar,
 }
 
+impl Drop for WorkerPermission {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.capture_operation.record_returned();
+        }
+    }
+}
+
 impl WorkerPermission {
-    fn new() -> Arc<Self> {
+    fn new(capture_operation: crate::artifact_store::CaptureMutationLease) -> Arc<Self> {
         Arc::new(Self {
+            capture_operation,
             state: Mutex::new(PhysicalIoPermission::Pending),
             changed: Condvar::new(),
         })
@@ -402,61 +412,74 @@ impl PostgresArtifactAdministration {
         original_deadline: Instant,
         remove: bool,
     ) -> Result<ArtifactCleanupPhysicalObservation, Error> {
-        let deadline = original_deadline.min(
-            Instant::now()
-                .checked_add(Duration::from_secs(5))
-                .ok_or(Error::Unavailable)?,
-        );
-        remaining(deadline)?;
-        let (store, key) = intent
-            .validated_physical_binding(self)
-            .map_err(|_| Error::Conflict)?
-            .into_original_parts();
-        // Pure original attachment refusals precede any invocation or PG resource registration.
-        let authority = self.read_authority();
-        let target = authority.cleanup_host_target(auth);
-        let _current = PhysicalCurrentRequest::borrow_before(self, auth, &target, deadline)
-            .map_err(arm_error)?;
-        let (claim, query) =
-            PhysicalInvocationClaim::register(Arc::clone(&store), key.clone(), deadline)
-                .map_err(|_| Error::PhysicalUnproven)?;
-        let permission = WorkerPermission::new();
-        let mut waiter = CallerWaiter {
-            permission: Arc::clone(&permission),
-            claim: Arc::clone(&claim),
-            deadline,
-            completed: false,
-        };
-        let (sender, receiver) = oneshot::channel();
-        let administration = Arc::clone(self);
-        let original_auth = auth.clone();
-        // This owned main task retains the original query when only its caller waiter drops.
-        // Runtime/task Drop instead drops the real query owner and permanently poisons the key.
-        tokio::spawn(async move {
-            let result = supervise(
-                administration,
-                original_auth,
-                store,
-                key,
-                claim,
-                query,
-                permission,
+        let capture_operation = self
+            .store
+            .begin_capture_mutation()
+            .map_err(|_| Error::Unavailable)?;
+        let result = async {
+            let deadline = original_deadline.min(
+                Instant::now()
+                    .checked_add(Duration::from_secs(5))
+                    .ok_or(Error::Unavailable)?,
+            );
+            remaining(deadline)?;
+            let (store, key) = intent
+                .validated_physical_binding(self)
+                .map_err(|_| Error::Conflict)?
+                .into_original_parts();
+            // Pure original attachment refusals precede any invocation or PG resource registration.
+            let authority = self.read_authority();
+            let target = authority.cleanup_host_target(auth);
+            let _current = PhysicalCurrentRequest::borrow_before(self, auth, &target, deadline)
+                .map_err(arm_error)?;
+            let (claim, query) =
+                PhysicalInvocationClaim::register(Arc::clone(&store), key.clone(), deadline)
+                    .map_err(|_| Error::PhysicalUnproven)?;
+            let permission = WorkerPermission::new(capture_operation.delegated());
+            let mut waiter = CallerWaiter {
+                permission: Arc::clone(&permission),
+                claim: Arc::clone(&claim),
                 deadline,
-                remove,
-            )
-            .await;
-            let _ = sender.send(result);
-        });
-        let received = before(deadline, receiver).await;
-        registered_remaining(&waiter.claim, deadline)?;
-        let observation = received
-            .map_err(|failure| failure.error)?
-            .map_err(|_| Error::PhysicalUnproven)??;
-        let delivery = observation.verify_delivery(auth);
-        registered_remaining(&waiter.claim, deadline)?;
-        delivery?;
-        waiter.completed = true;
-        Ok(observation)
+                completed: false,
+            };
+            let (sender, receiver) = oneshot::channel();
+            let administration = Arc::clone(self);
+            let original_auth = auth.clone();
+            // This owned main task retains the original query when only its caller waiter drops.
+            // Runtime/task Drop instead drops the real query owner and permanently poisons the key.
+            self.store
+                .spawn_capture_mutation(async move {
+                    let result = supervise(
+                        administration,
+                        original_auth,
+                        store,
+                        key,
+                        claim,
+                        query,
+                        permission,
+                        deadline,
+                        remove,
+                    )
+                    .await;
+                    let _ = sender.send(result);
+                })
+                .map_err(|_| Error::Unavailable)?;
+            let received = before(deadline, receiver).await;
+            registered_remaining(&waiter.claim, deadline)?;
+            let observation = received
+                .map_err(|failure| failure.error)?
+                .map_err(|_| Error::PhysicalUnproven)??;
+            let delivery = observation.verify_delivery(auth);
+            registered_remaining(&waiter.claim, deadline)?;
+            delivery?;
+            waiter.completed = true;
+            Ok(observation)
+        }
+        .await;
+        if !matches!(&result, Err(Error::Unavailable | Error::PhysicalUnproven)) {
+            capture_operation.complete();
+        }
+        result
     }
 }
 
@@ -588,7 +611,7 @@ async fn work_before(
         .cleanup_physical_observer
         .get()
         .map(Arc::clone);
-    let mut worker = tokio::task::spawn_blocking(move || {
+    let mut worker = store.capture_blocking(move || {
         run_worker(
             original_store,
             original_claim,
@@ -666,7 +689,7 @@ fn run_worker(
     let mut ready = Some(ready);
     let result = (|| {
         let io = store
-            .try_physical_io_before(deadline)
+            .try_physical_io_before_admitted(deadline, &permission.capture_operation)
             .map_err(store_error)?;
         let mut stop = |_| permission.should_stop(deadline);
         let original = io

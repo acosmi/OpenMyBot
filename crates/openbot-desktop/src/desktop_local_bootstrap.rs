@@ -26,6 +26,25 @@ use openbot_infra::thread_listener::ThreadListenerDatabase;
 
 use crate::postgres_sidecar::{PostgresSidecarOrigin, RunningPostgresSidecar};
 
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+use openbot_infra::db::desktop_local::{
+    DesktopLocalDriverCustody, connect_for_attestation_retained,
+};
+
+enum StartupDriverCustody {
+    Ordinary,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    Armed(DesktopLocalDriverCustody),
+}
+
 const STARTUP_DB_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One running PostgreSQL child plus the exact verified business pool and app-instance authority.
@@ -37,6 +56,12 @@ pub struct RunningDesktopLocalDataPlane {
     database: DesktopLocalDatabase,
     sidecar: Option<RunningPostgresSidecar>,
     installation: DesktopLocalInstallation,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    capture_custody: Option<DesktopLocalDriverCustody>,
     runtime_auth: AuthContext,
     report: DesktopLocalBootstrapReport,
     artifact_datasets: std::sync::Arc<ArtifactDatasetRegistry>,
@@ -47,6 +72,12 @@ pub struct PreparedDesktopLocalDataPlane {
     database: DesktopLocalDatabase,
     sidecar: Option<RunningPostgresSidecar>,
     installation: DesktopLocalInstallation,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    capture_custody: Option<DesktopLocalDriverCustody>,
     #[cfg(feature = "desktop-vault")]
     pub(crate) vault_creation_attempted: std::sync::atomic::AtomicBool,
 }
@@ -162,10 +193,56 @@ impl RunningDesktopLocalDataPlane {
             .map_err(|_| DesktopLocalCompositionError::ListenerConfiguration)
     }
 
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) fn capture_custody_mut(&mut self) -> Option<&mut DesktopLocalDriverCustody> {
+        self.capture_custody.as_mut()
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) fn capture_sidecar_port(&self) -> Option<u16> {
+        self.sidecar
+            .as_ref()
+            .map(|sidecar| sidecar.connection().port())
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) fn take_sidecar_for_capture(&mut self) -> Option<RunningPostgresSidecar> {
+        self.sidecar.take()
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) fn installation(&self) -> &DesktopLocalInstallation {
+        &self.installation
+    }
+
     /// Close the application pool, then stop the exact child through its verified `pg_ctl` before
     /// releasing the single-instance lock.
     pub async fn shutdown(mut self) -> Result<(), DesktopLocalCompositionError> {
         self.database.close();
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        if let Some(custody) = self.capture_custody.as_mut() {
+            close_startup_original_drivers(custody).await;
+        }
         let Some(sidecar) = self.sidecar.take() else {
             return Err(DesktopLocalCompositionError::SidecarShutdown);
         };
@@ -416,6 +493,12 @@ impl PreparedDesktopLocalDataPlane {
             database: self.database,
             sidecar: self.sidecar.take(),
             installation: self.installation,
+            #[cfg(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            ))]
+            capture_custody: self.capture_custody.take(),
             runtime_auth,
             report,
             artifact_datasets: std::sync::Arc::new(artifact_datasets),
@@ -424,6 +507,14 @@ impl PreparedDesktopLocalDataPlane {
 
     pub(crate) async fn shutdown(mut self) -> Result<(), DesktopLocalCompositionError> {
         self.database.close();
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        if let Some(custody) = self.capture_custody.as_mut() {
+            close_startup_original_drivers(custody).await;
+        }
         self.sidecar
             .take()
             .ok_or(DesktopLocalCompositionError::SidecarShutdown)?
@@ -437,6 +528,14 @@ impl PreparedDesktopLocalDataPlane {
         original: DesktopLocalCompositionError,
     ) -> DesktopLocalCompositionError {
         self.database.close();
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        if let Some(custody) = self.capture_custody.as_mut() {
+            close_startup_original_drivers(custody).await;
+        }
         let result = match self.sidecar.take() {
             Some(sidecar) => sidecar.shutdown().await,
             None => return DesktopLocalCompositionError::FailureCleanup,
@@ -504,25 +603,63 @@ pub async fn prepare_running_sidecar(
     sidecar: RunningPostgresSidecar,
     package: &LoadedTenantPackage,
 ) -> Result<PreparedDesktopLocalDataPlane, DesktopLocalCompositionError> {
+    prepare_running_sidecar_inner(
+        installation,
+        sidecar,
+        package,
+        StartupDriverCustody::Ordinary,
+    )
+    .await
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) async fn prepare_running_sidecar_retained(
+    installation: DesktopLocalInstallation,
+    sidecar: RunningPostgresSidecar,
+    package: &LoadedTenantPackage,
+    custody: DesktopLocalDriverCustody,
+) -> Result<PreparedDesktopLocalDataPlane, DesktopLocalCompositionError> {
+    prepare_running_sidecar_inner(
+        installation,
+        sidecar,
+        package,
+        StartupDriverCustody::Armed(custody),
+    )
+    .await
+}
+
+async fn prepare_running_sidecar_inner(
+    installation: DesktopLocalInstallation,
+    sidecar: RunningPostgresSidecar,
+    package: &LoadedTenantPackage,
+    mut custody: StartupDriverCustody,
+) -> Result<PreparedDesktopLocalDataPlane, DesktopLocalCompositionError> {
     if sidecar.data_dir() != installation.sidecar_data_dir() {
-        return Err(cleanup_after_failure(
+        return Err(cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
+            &mut custody,
         )
         .await);
     }
     if let Err(error) = installation.validate_package_scope(package) {
-        return Err(cleanup_after_failure(
+        return Err(cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::PackageScope(error),
+            &mut custody,
         )
         .await);
     }
 
     if sidecar.ensure_owner_current().is_err() {
-        return Err(cleanup_after_failure(
+        return Err(cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
+            &mut custody,
         )
         .await);
     }
@@ -534,27 +671,39 @@ pub async fn prepare_running_sidecar(
             SecretBytes::new(connection.expose_password().to_vec()),
         )
     };
-    let admin = tokio::time::timeout(
-        STARTUP_DB_STEP_TIMEOUT,
-        connect_for_attestation(port, password),
-    )
-    .await
-    .map_err(|_| DesktopLocalDatabaseError::ShapeInvalid)
-    .and_then(std::convert::identity);
+    let connect = async {
+        match &custody {
+            StartupDriverCustody::Ordinary => connect_for_attestation(port, password).await,
+            #[cfg(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            ))]
+            StartupDriverCustody::Armed(retained) => {
+                connect_for_attestation_retained(port, password, retained).await
+            }
+        }
+    };
+    let admin = tokio::time::timeout(STARTUP_DB_STEP_TIMEOUT, connect)
+        .await
+        .map_err(|_| DesktopLocalDatabaseError::ShapeInvalid)
+        .and_then(std::convert::identity);
     let admin = match admin {
         Ok(admin) => admin,
         Err(error) => {
-            return Err(cleanup_after_failure(
+            return Err(cleanup_after_failure_with_custody(
                 sidecar,
                 DesktopLocalCompositionError::Database(error),
+                &mut custody,
             )
             .await);
         }
     };
     if sidecar.ensure_owner_current().is_err() {
-        return Err(cleanup_after_failure(
+        return Err(cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
+            &mut custody,
         )
         .await);
     }
@@ -568,17 +717,19 @@ pub async fn prepare_running_sidecar(
     {
         Ok(admin) => admin,
         Err(error) => {
-            return Err(cleanup_after_failure(
+            return Err(cleanup_after_failure_with_custody(
                 sidecar,
                 DesktopLocalCompositionError::Bootstrap(error),
+                &mut custody,
             )
             .await);
         }
     };
     if sidecar.ensure_owner_current().is_err() {
-        return Err(cleanup_after_failure(
+        return Err(cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
+            &mut custody,
         )
         .await);
     }
@@ -593,18 +744,20 @@ pub async fn prepare_running_sidecar(
     {
         Ok(database) => database,
         Err(error) => {
-            return Err(cleanup_after_failure(
+            return Err(cleanup_after_failure_with_custody(
                 sidecar,
                 DesktopLocalCompositionError::Database(error),
+                &mut custody,
             )
             .await);
         }
     };
     if sidecar.ensure_owner_current().is_err() {
         database.close();
-        return Err(cleanup_after_failure(
+        return Err(cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
+            &mut custody,
         )
         .await);
     }
@@ -612,9 +765,79 @@ pub async fn prepare_running_sidecar(
         database,
         sidecar: Some(sidecar),
         installation,
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        capture_custody: match custody {
+            StartupDriverCustody::Ordinary => None,
+            StartupDriverCustody::Armed(retained) => Some(retained),
+        },
         #[cfg(feature = "desktop-vault")]
         vault_creation_attempted: std::sync::atomic::AtomicBool::new(false),
     })
+}
+
+async fn cleanup_after_failure_with_custody(
+    sidecar: RunningPostgresSidecar,
+    original: DesktopLocalCompositionError,
+    custody: &mut StartupDriverCustody,
+) -> DesktopLocalCompositionError {
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    if let StartupDriverCustody::Armed(retained) = custody {
+        close_startup_original_drivers(retained).await;
+    }
+    let _ = custody;
+    cleanup_after_failure(sidecar, original).await
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+async fn close_startup_original_drivers(custody: &mut DesktopLocalDriverCustody) {
+    // No capture operation exists on this path. Only original startup resources are closed.
+    let mut drivers = match custody.freeze() {
+        Ok(drivers) => drivers,
+        Err(_) => {
+            std::future::pending::<()>().await;
+            let _keep_original_custody = custody;
+            return;
+        }
+    };
+    let mut actual_facts_ok = true;
+    while let Some(retirement) = drivers.next_retirement() {
+        retirement.request();
+    }
+    while drivers.original_tasks_remaining() != 0 {
+        match drivers.join_next_original().await {
+            Some(fact) => {
+                actual_facts_ok &= fact.destruction().is_some();
+            }
+            None => {
+                actual_facts_ok = false;
+                break;
+            }
+        }
+    }
+    let deadline = tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT;
+    while drivers.live_proxy_future_count() != 0 && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    if !actual_facts_ok
+        || drivers.original_tasks_remaining() != 0
+        || drivers.original_destructions_missing() != 0
+        || drivers.live_proxy_future_count() != 0
+    {
+        std::future::pending::<()>().await;
+        drop(drivers);
+    }
 }
 
 async fn cleanup_after_failure(

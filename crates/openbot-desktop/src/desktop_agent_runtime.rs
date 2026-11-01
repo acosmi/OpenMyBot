@@ -218,15 +218,28 @@ pub(crate) struct DesktopAgentHost {
     agent: Option<BuiltInAgentRuntime>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DesktopAgentStopFailure {
+    Relay,
+    Agent,
+}
+
 impl DesktopAgentHost {
-    pub(crate) async fn stop(self) {
-        // Both stop signals must be polled even if the relay is still completing a database
-        // operation. The Desktop owner applies one shared shutdown window to these futures.
-        tokio::join!(self.relay.stop(), async {
-            if let Some(agent) = self.agent {
-                agent.stop().await;
+    pub(crate) async fn stop(mut self) {
+        let _ = self.stop_for_capture().await;
+    }
+
+    /// Both original stop futures are polled. The outer capture owner retains this host and
+    /// applies its one original clock; no handle is moved into a disposable timeout future.
+    pub(crate) async fn stop_for_capture(&mut self) -> Result<(), DesktopAgentStopFailure> {
+        let (relay, agent) = tokio::join!(self.relay.stop_for_capture(), async {
+            match self.agent.as_mut() {
+                Some(agent) => agent.stop_for_capture().await,
+                None => Ok(()),
             }
         });
+        relay.map_err(|_| DesktopAgentStopFailure::Relay)?;
+        agent.map_err(|_| DesktopAgentStopFailure::Agent)
     }
 }
 

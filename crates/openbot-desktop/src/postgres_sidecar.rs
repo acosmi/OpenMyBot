@@ -392,6 +392,17 @@ impl core::fmt::Debug for PostgresStartLock {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // Moved once into the start path, never stored.
+enum StartControlInspection {
+    Ordinary,
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    Reviewed(crate::tauri_background::capture::control::Limits),
+}
+
 impl PostgresStartLock {
     /// Acquire the persistent kernel guard, then atomically publish this start's evidence.
     ///
@@ -403,17 +414,29 @@ impl PostgresStartLock {
         instance_id: &str,
         bundle_digest: PostgresBundleDigest,
     ) -> Result<Self, PostgresSidecarError> {
-        Self::acquire_inner(app_data_root, instance_id, bundle_digest, None)
+        Self::acquire_inner(
+            app_data_root,
+            instance_id,
+            bundle_digest,
+            None,
+            StartControlInspection::Ordinary,
+        )
     }
 
-    #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
+    #[cfg(all(test, feature = "postgres-supervisor", target_os = "macos"))]
     fn acquire_with_data_dir(
         app_data_root: &Path,
         instance_id: &str,
         bundle_digest: PostgresBundleDigest,
         data_dir: &Path,
     ) -> Result<Self, PostgresSidecarError> {
-        Self::acquire_inner(app_data_root, instance_id, bundle_digest, Some(data_dir))
+        Self::acquire_inner(
+            app_data_root,
+            instance_id,
+            bundle_digest,
+            Some(data_dir),
+            StartControlInspection::Ordinary,
+        )
     }
 
     fn acquire_inner(
@@ -421,8 +444,26 @@ impl PostgresStartLock {
         instance_id: &str,
         bundle_digest: PostgresBundleDigest,
         data_dir: Option<&Path>,
+        control_inspection: StartControlInspection,
     ) -> Result<Self, PostgresSidecarError> {
         let kernel_guard = KernelStartLock::acquire(app_data_root, instance_id)?;
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        {
+            let app = crate::tauri_background::capture::open_app_data_read_only(app_data_root)
+                .map_err(|_| PostgresSidecarError::StartLockRecoveryRequired)?
+                .ok_or(PostgresSidecarError::StartLockRecoveryRequired)?;
+            let limits = match &control_inspection {
+                StartControlInspection::Ordinary => None,
+                StartControlInspection::Reviewed(limits) => Some(limits),
+            };
+            crate::tauri_background::capture::control::inspect_startup_control(&app, limits)
+                .map_err(|_| PostgresSidecarError::StartLockRecoveryRequired)?;
+        }
+        let _ = control_inspection;
         let path = app_data_root.join(format!(".postgresql-17-{instance_id}.start-lock-v1"));
         let mut nonce = [0_u8; LOCK_NONCE_BYTES];
         getrandom::fill(&mut nonce).map_err(|error| {
@@ -978,7 +1019,7 @@ impl core::fmt::Debug for ReviewedPostgresKeyStoreService {
 
 /// Exact 256-bit random PostgreSQL password encoded as 64 lowercase hexadecimal bytes.
 #[cfg(feature = "postgres-key-store")]
-pub struct PostgresScramSecret(SecretBytes);
+pub struct PostgresScramSecret(Arc<SecretBytes>);
 
 #[cfg(feature = "postgres-key-store")]
 impl PostgresScramSecret {
@@ -1001,7 +1042,7 @@ impl PostgresScramSecret {
         {
             return Err(PostgresSecretStoreError::Corrupt);
         }
-        Ok(Self(stored.0))
+        Ok(Self(Arc::new(stored.0)))
     }
 
     /// Explicitly expose the password only to `initdb`/PostgreSQL process framing.
@@ -1156,7 +1197,7 @@ impl core::fmt::Debug for PostgresSidecarConnection<'_> {
 pub struct RunningPostgresSidecar {
     child: Option<Child>,
     lock: Option<PostgresStartLock>,
-    secret: PostgresScramSecret,
+    secret: Option<PostgresScramSecret>,
     bundle: VerifiedPostgresBundle,
     data_dir: PathBuf,
     port: u16,
@@ -1251,7 +1292,10 @@ impl RunningPostgresSidecar {
     pub const fn connection(&self) -> PostgresSidecarConnection<'_> {
         PostgresSidecarConnection {
             port: self.port,
-            secret: &self.secret,
+            secret: self
+                .secret
+                .as_ref()
+                .expect("running sidecar owns original SCRAM"),
         }
     }
 
@@ -1344,6 +1388,280 @@ impl RunningPostgresSidecar {
     }
 }
 
+/// Internal stopped-normal capsule. The original start-lock, secret and journal never leave it.
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) struct CaptureStoppedPostgres {
+    original: RunningPostgresSidecar,
+    normal_status: std::process::ExitStatus,
+    stop_status: std::process::ExitStatus,
+}
+
+/// The sole registered capture entry consumes the genuine post-stop consumer permit.
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) async fn start_capture_source(
+    permit: crate::tauri_background::capture::CaptureStartPermit,
+    operation: &crate::tauri_background::capture::CaptureOperation,
+) -> Result<
+    crate::postgres_maintenance::capture::CaptureSourceOwner,
+    crate::tauri_background::capture::RetainedCaptureFailure,
+> {
+    crate::postgres_maintenance::capture::CaptureSourceOwner::start_from_permit(permit, operation)
+        .await
+}
+
+/// An error retains every original handle; it is not a normal-closed capability.
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+pub(crate) struct RetainedSidecarCaptureFailure {
+    original: Option<RunningPostgresSidecar>,
+    helper: Option<Child>,
+    fault: openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl RetainedSidecarCaptureFailure {
+    pub(crate) fn fault(&self) -> openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault {
+        self.fault
+    }
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl RunningPostgresSidecar {
+    /// The caller stores this future's original task before awaiting it. No timeout drops it.
+    #[allow(clippy::result_large_err)] // Err hands the original sidecar back by value.
+    pub(crate) async fn stop_for_capture(
+        self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<CaptureStoppedPostgres, RetainedSidecarCaptureFailure> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        let mut retained = RetainedSidecarCaptureFailure {
+            original: Some(self),
+            helper: None,
+            fault: Fault::ClosingPending,
+        };
+        // The original owners stay outside this borrowed future. A failure is terminal for this
+        // one attempt; no replacement task or retry is made.
+        match retained.stop_original(clock).await {
+            Ok((normal_status, stop_status)) => {
+                let Some(original) = retained.original.take() else {
+                    retained.fault = Fault::IntentMismatch;
+                    return Err(retained);
+                };
+                Ok(CaptureStoppedPostgres {
+                    original,
+                    normal_status,
+                    stop_status,
+                })
+            }
+            Err(fault) => {
+                retained.fault = fault;
+                Err(retained)
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl RetainedSidecarCaptureFailure {
+    async fn stop_original(
+        &mut self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<
+        (std::process::ExitStatus, std::process::ExitStatus),
+        openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault,
+    > {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        clock.require_effect()?;
+        let original = self.original.as_mut().ok_or(Fault::IntentMismatch)?;
+        original
+            .ensure_owner_current()
+            .map_err(|_| Fault::SourceChanged)?;
+        let lock = original.lock.as_ref().ok_or(Fault::SourceChanged)?;
+        clock.require_effect()?;
+        original
+            .startup_journal
+            .mark_stop(lock)
+            .map_err(|_| Fault::IoFailure)?;
+        clock.require_effect()?;
+        let mut command = original
+            .bundle
+            .checked_command(PostgresProgram::Control)
+            .map_err(|_| Fault::SourceChanged)?;
+        command
+            .arg("-D")
+            .arg(&original.data_dir)
+            .args(["-m", "fast", "-w", "-t", "5", "stop"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        // Store the actual helper before its first wait, rather than command.status().
+        clock.require_effect()?;
+        self.helper = Some(command.spawn().map_err(|_| Fault::IoFailure)?);
+        clock.require_closing()?;
+        let remaining = clock
+            .closing_remaining_ns()?
+            .min(u64::try_from(SHUTDOWN_DEADLINE.as_nanos()).map_err(|_| Fault::BoundsOverflow)?);
+        if remaining == 0 {
+            return Err(Fault::ClosingPending);
+        }
+        let stop_status = tokio::time::timeout(
+            Duration::from_nanos(remaining),
+            self.helper.as_mut().ok_or(Fault::IntentMismatch)?.wait(),
+        )
+        .await
+        .map_err(|_| Fault::ClosingPending)?
+        .map_err(|_| Fault::IoFailure)?;
+        clock.require_closing()?;
+        self.helper.take(); // only the actual helper's successful wait permits release
+        if !stop_status.success() {
+            return Err(Fault::SourceChanged);
+        }
+        let original = self.original.as_mut().ok_or(Fault::IntentMismatch)?;
+        let remaining = clock.closing_remaining_ns()?;
+        if remaining == 0 {
+            return Err(Fault::ClosingPending);
+        }
+        let normal_status = tokio::time::timeout(
+            Duration::from_nanos(remaining),
+            original.child.as_mut().ok_or(Fault::IntentMismatch)?.wait(),
+        )
+        .await
+        .map_err(|_| Fault::ClosingPending)?
+        .map_err(|_| Fault::IoFailure)?;
+        clock.require_closing()?;
+        original.child.take(); // the original Child::wait above, never PID absence
+        if !normal_status.success() {
+            return Err(Fault::SourceChanged);
+        }
+        let lock = original.lock.as_ref().ok_or(Fault::SourceChanged)?;
+        clock.require_effect()?;
+        original
+            .startup_journal
+            .confirm_exit(lock)
+            .map_err(|_| Fault::IoFailure)?;
+        clock.require_effect()?;
+        original
+            .startup_journal
+            .capture_exit_material(lock)
+            .map_err(|_| Fault::SourceChanged)?;
+        clock.require_effect()?;
+        // The original kernel/evidence lock is deliberately NOT removed or reacquired here.
+        Ok((normal_status, stop_status))
+    }
+}
+
+#[cfg(all(
+    feature = "desktop-launcher",
+    feature = "postgres-maintenance",
+    target_os = "macos"
+))]
+impl CaptureStoppedPostgres {
+    pub(crate) fn revalidate(
+        &self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        clock.require_effect()?;
+        if self.original.child.is_some()
+            || !self.normal_status.success()
+            || !self.stop_status.success()
+        {
+            return Err(Fault::SourceChanged);
+        }
+        let lock = self.original.lock.as_ref().ok_or(Fault::SourceChanged)?;
+        lock.ensure_current().map_err(|_| Fault::SourceChanged)?;
+        self.original
+            .startup_journal
+            .capture_exit_material(lock)
+            .map_err(|_| Fault::SourceChanged)?;
+        clock.require_effect()
+    }
+
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.original.data_dir
+    }
+    pub(crate) fn port(&self) -> u16 {
+        self.original.port
+    }
+
+    /// Borrow the same original allocation; no password payload is copied or independently minted.
+    pub(crate) fn native_scram_allocation(
+        &self,
+    ) -> Result<Arc<SecretBytes>, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault>
+    {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        let original = self.original.secret.as_ref().ok_or(Fault::SecretInvalid)?;
+        if original.expose().len() != 64 {
+            return Err(Fault::SecretInvalid);
+        }
+        Ok(Arc::clone(&original.0))
+    }
+
+    /// Move the original SCRAM allocation exactly once after all source users have closed.
+    pub(crate) fn take_original_scram(
+        &mut self,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<SecretBytes, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault as Fault;
+        self.revalidate(clock)?;
+        let PostgresScramSecret(secret) =
+            self.original.secret.take().ok_or(Fault::SecretInvalid)?;
+        match Arc::try_unwrap(secret) {
+            Ok(original) => Ok(original),
+            Err(original) => {
+                self.original.secret = Some(PostgresScramSecret(original));
+                Err(Fault::ClosingPending)
+            }
+        }
+    }
+
+    /// Unit-only comparison with this capsule's original journal-held directory.
+    pub(crate) fn capture_original_data_directory_matches(
+        &self,
+        retained: &File,
+        clock: &dyn openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        clock.require_effect()?;
+        let actual = self
+            .original
+            .startup_journal
+            .capture_original_data_directory_matches(retained, clock);
+        clock.require_effect()?;
+        actual
+    }
+
+    pub(crate) fn data_directory_file(&self) -> Result<File, PostgresSidecarError> {
+        self.original
+            .startup_journal
+            .capture_data_directory()
+            .map_err(map_startup_journal_error)
+    }
+}
+
 #[cfg(feature = "postgres-supervisor")]
 impl Drop for RunningPostgresSidecar {
     fn drop(&mut self) {
@@ -1373,13 +1691,61 @@ impl PostgresSidecarSupervisor {
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
     ) -> Result<RunningPostgresSidecar, PostgresSidecarError> {
+        Self::start_inner(
+            bundle,
+            app_data_root,
+            instance_id,
+            data_dir,
+            store,
+            service,
+            StartControlInspection::Ordinary,
+        )
+        .await
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    pub(crate) async fn start_with_capture_limits<S: PostgresSecretStore + ?Sized>(
+        bundle: VerifiedPostgresBundle,
+        app_data_root: &Path,
+        instance_id: &str,
+        data_dir: &Path,
+        store: &S,
+        service: &ReviewedPostgresKeyStoreService,
+        limits: crate::tauri_background::capture::control::Limits,
+    ) -> Result<RunningPostgresSidecar, PostgresSidecarError> {
+        Self::start_inner(
+            bundle,
+            app_data_root,
+            instance_id,
+            data_dir,
+            store,
+            service,
+            StartControlInspection::Reviewed(limits),
+        )
+        .await
+    }
+
+    async fn start_inner<S: PostgresSecretStore + ?Sized>(
+        bundle: VerifiedPostgresBundle,
+        app_data_root: &Path,
+        instance_id: &str,
+        data_dir: &Path,
+        store: &S,
+        service: &ReviewedPostgresKeyStoreService,
+        control_inspection: StartControlInspection,
+    ) -> Result<RunningPostgresSidecar, PostgresSidecarError> {
         validate_supervisor_paths(app_data_root, instance_id, data_dir)?;
         #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
-        let mut lock = PostgresStartLock::acquire_with_data_dir(
+        let mut lock = PostgresStartLock::acquire_inner(
             app_data_root,
             instance_id,
             PostgresBundleDigest(bundle.manifest_sha256),
-            data_dir,
+            Some(data_dir),
+            control_inspection,
         )?;
         #[cfg(not(all(feature = "postgres-supervisor", target_os = "macos")))]
         let mut lock = PostgresStartLock::acquire(
@@ -1574,7 +1940,7 @@ impl PostgresSidecarSupervisor {
         Ok(RunningPostgresSidecar {
             child: Some(child),
             lock: Some(lock),
-            secret,
+            secret: Some(secret),
             bundle,
             data_dir: data_dir.to_owned(),
             port,
@@ -3066,7 +3432,7 @@ mod tests {
             );
             assert!(marker.exists());
             fs::remove_file(&marker).unwrap();
-            let secret = PostgresScramSecret(SecretBytes::new(vec![b'a'; 64]));
+            let secret = PostgresScramSecret(Arc::new(SecretBytes::new(vec![b'a'; 64])));
             let data = bundle_root.join("not-created-data");
             let result = match phase {
                 0 => verify_program_versions(&bundle).await,
@@ -3179,7 +3545,10 @@ mod tests {
         let running = RunningPostgresSidecar {
             child: Some(child),
             lock: Some(lock),
-            secret: PostgresScramSecret(SecretBytes::new(vec![b'a'; 64])),
+            secret: Some(PostgresScramSecret(Arc::new(SecretBytes::new(vec![
+                b'a';
+                64
+            ])))),
             bundle,
             data_dir,
             port: 0,
@@ -3748,6 +4117,378 @@ mod tests {
             .expect("probe driver task join")
             .expect("probe driver close");
         exists
+    }
+
+    // The armed application pool reads through CapturePgIo, whose largest accepted backend
+    // message is F = M / 4 - 1 bytes for M = decodeCryptoTemporary.maxOneBytes. A fresh
+    // startup reads the 0052 Thread history writer schema observation as one 643066-byte
+    // DataRow during schema initialization, so F must reach that frame before the layout
+    // check (one 297619-byte schema-facts DataRow) is even reached.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    #[tokio::test]
+    #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+    async fn armed_application_frame_limit_decides_the_fresh_layout_check() {
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault;
+        use openbot_infra::auth::single_user::desktop_local::DesktopLocalBootstrapError;
+        use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
+        use openbot_infra::db::InfraError;
+        use openbot_infra::db::capture_materials::{
+            CaptureDbExpectation, CaptureDecodeBudget, CaptureSqlBudget, CaptureSqlFailure,
+            CaptureSqlLimits, collect_database_materials_before,
+        };
+        use openbot_infra::db::desktop_local::{DesktopLocalDriverCustody, DesktopPoolJoinBounds};
+        use openbot_infra::db::desktop_vault_canary::verify_current_layout;
+        use openbot_infra::db::initialization::DatabaseInitializationError;
+        struct UnitClock;
+        impl CaptureClockCheck for UnitClock {
+            fn require_effect(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn require_closing(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn effect_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn closing_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn observed_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(1)
+            }
+        }
+        // 534804 (retired fixture) and 2097152 leave F below the 643066-byte frame. 4194304
+        // (F = 1048575) is the G2' value ruled for the F03 profile, chosen above that need.
+        for (max_one_bytes, starts) in [(534_804, false), (2_097_152, false), (4_194_304, true)] {
+            let fixture = MasterJournalPgFixture::new("armed-frame-limit").await;
+            let running = PostgresSidecarSupervisor::start(
+                VerifiedPostgresBundle::open(
+                    &fixture.bundle_root,
+                    fixture.digest,
+                    &fixture.signing,
+                )
+                .unwrap(),
+                &fixture.app_root,
+                &fixture.instance,
+                &fixture.data_dir,
+                &fixture.scram,
+                &fixture.scram_service,
+            )
+            .await
+            .unwrap();
+            // The F03 profile keeps the F02 maxCount 65536 and drivers 64/64/64/17/16 MiB.
+            let decode = CaptureDecodeBudget::checked(65_536, max_one_bytes).unwrap();
+            let custody = DesktopLocalDriverCustody::prepare(
+                DesktopPoolJoinBounds::checked(64, 64, 64, 17, 16 << 20).unwrap(),
+                Arc::clone(&decode),
+            )
+            .unwrap();
+            let plane = crate::desktop_local_bootstrap::prepare_running_sidecar_retained(
+                fixture.installation.clone(),
+                running,
+                &fixture.package,
+                custody,
+            )
+            .await
+            .unwrap();
+            let initialized = plane.initialize_fresh_schema(&fixture.package).await;
+            if !starts {
+                assert!(matches!(
+                    initialized,
+                    Err(DesktopLocalCompositionError::Bootstrap(
+                        DesktopLocalBootstrapError::Database(DatabaseInitializationError::Infra(
+                            InfraError::Query { .. }
+                        ))
+                    ))
+                ));
+                plane.shutdown().await.unwrap();
+                continue;
+            }
+            initialized.unwrap();
+            verify_current_layout(plane.pool()).await.unwrap();
+            decode.bind_original_clock(Arc::new(UnitClock)).unwrap();
+            let neutral = CaptureDbExpectation {
+                deployment_id: String::new(),
+                tenant_id: String::new(),
+                dataset_id: String::new(),
+                instance_id: String::new(),
+                system_identifier: String::new(),
+                database_oid: 0,
+                store_id: String::new(),
+                root_device: String::new(),
+                root_inode: String::new(),
+                root_uid: String::new(),
+            };
+            let client = plane.pool().get().await.unwrap();
+            // The retired maxRowBytes 44540 refuses one catalog_functions row whose weighted
+            // size is 44594. With 65536, the G2' value ruled for the F03 profile above that
+            // need, every projection is read before the missing vault canary is reported, and
+            // the decode count still admits a credit.
+            for (max_row_bytes, expected) in [
+                (44_540, CaptureSqlFailure::Bounds),
+                (65_536, CaptureSqlFailure::SourceMismatch),
+            ] {
+                let mut budget = CaptureSqlBudget::new(
+                    CaptureSqlLimits {
+                        max_rows: 12_288,
+                        max_row_bytes,
+                        max_field_bytes: 8_192,
+                        max_pages: 1_024,
+                        page_rows: 8,
+                        max_catalog_objects: 8_192,
+                        max_query_tasks: 1_152,
+                        phase_ns: 30_000_000_000,
+                    },
+                    256 << 20,
+                    0,
+                )
+                .unwrap();
+                budget
+                    .bind_sensitive_decode_bound(Arc::clone(&decode))
+                    .unwrap();
+                assert_eq!(
+                    collect_database_materials_before(&client, &neutral, &mut budget, &UnitClock)
+                        .await
+                        .err(),
+                    Some(expected)
+                );
+                assert!(decode.reserve_allocations(&[(1, 8192)]).is_ok());
+            }
+            drop(client);
+            plane.shutdown().await.unwrap();
+        }
+    }
+
+    // A fresh installation as the normal-exit capture finds it right after Ready: the
+    // normal read (five safety gates, frozen catalog) succeeds and the Periodic passes the
+    // never-audited chain without a checkpoint. An unlinked row alone is still refused, and
+    // one ordinary event is still sealed by a Periodic checkpoint.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    #[tokio::test]
+    #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+    async fn fresh_database_passes_the_normal_capture_reads_and_the_empty_periodic() {
+        use openbot_contracts::ids::AuditEventId;
+        use openbot_domain::audit::event::{AuditEvent, AuditEventType};
+        use openbot_domain::audit::payload::{AuditFact, AuditLabel, AuditPayload};
+        use openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault;
+        use openbot_infra::backup::whole_pg_capture_stream::CaptureClockCheck;
+        use openbot_infra::db::capture_materials::{
+            CaptureDbExpectation, CaptureDecodeBudget, CaptureSqlBudget, CaptureSqlFailure,
+            CaptureSqlLimits,
+        };
+        use openbot_infra::repo::audit::AuditEventRepo;
+        struct UnitClock;
+        impl CaptureClockCheck for UnitClock {
+            fn require_effect(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn require_closing(&self) -> Result<(), WholePgCarrierFault> {
+                Ok(())
+            }
+            fn effect_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn closing_remaining_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(60_000_000_000)
+            }
+            fn observed_ns(&self) -> Result<u64, WholePgCarrierFault> {
+                Ok(1)
+            }
+        }
+        let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+        let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
+        let bundle =
+            VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
+        let app_root = root("capture-reads-app");
+        let dist = materialize_desktop_dist();
+        let os_store: Arc<dyn OsSecretStore> = Arc::new(RuntimeMemorySecretStore::empty());
+        let release = DesktopLocalReleaseInput::new(
+            &dist,
+            "openbot",
+            "main",
+            bundle,
+            ReviewedPostgresKeyStoreService::from_reviewed_release(
+                "com.example.product.postgresql.capture-reads",
+            )
+            .unwrap(),
+            ReviewedDesktopVaultKeyStoreService::from_reviewed_release(
+                "com.example.product.desktop-vault.capture-reads",
+            )
+            .unwrap(),
+            os_store,
+        )
+        .unwrap();
+        let application = DesktopLocalApplicationInput::new(
+            DesktopOpenAiProviderInput::new("https://api.example.test/v1", Vec::new()).unwrap(),
+            DesktopAgentBudgets::new(
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(1_800)),
+                16_384,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let config = DesktopLocalRuntimeConfig::new(release, application, |authority| {
+            Ok(loaded_desktop_package(
+                authority.auth_context().tenant().as_str(),
+            ))
+        });
+        let prepared = prepare_desktop_local_runtime(
+            CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap(),
+            config,
+        )
+        .await
+        .unwrap();
+        let decode = CaptureDecodeBudget::checked(65_536, 4_194_304).unwrap();
+        decode.bind_original_clock(Arc::new(UnitClock)).unwrap();
+        // pageRows 8 also proves the file-settings read no longer needs one 21-row page.
+        let budget = || {
+            let mut budget = CaptureSqlBudget::new(
+                CaptureSqlLimits {
+                    max_rows: 12_288,
+                    max_row_bytes: 65_536,
+                    max_field_bytes: 8_192,
+                    max_pages: 1_024,
+                    page_rows: 8,
+                    max_catalog_objects: 8_192,
+                    max_query_tasks: 1_152,
+                    phase_ns: 30_000_000_000,
+                },
+                256 << 20,
+                0,
+            )
+            .unwrap();
+            budget
+                .bind_sensitive_decode_bound(Arc::clone(&decode))
+                .unwrap();
+            budget
+        };
+        let repo = AuditEventRepo::new(prepared.pool().clone());
+        let key = [7_u8; 32];
+        let client = prepared.pool().get().await.unwrap();
+        // Production order on one budget: identity, Periodic, normal read.
+        let mut reads = budget();
+        let identity = repo
+            .capture_source_identity_before(&mut reads, &UnitClock)
+            .await
+            .unwrap();
+        let empty = repo
+            .append_capture_periodic_before(&key, &mut reads, &UnitClock)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                empty.sequence(),
+                empty.event_count(),
+                empty.unlinked_before()
+            ),
+            (None, 0, 0)
+        );
+        let mut line = Vec::new();
+        empty.write_material(&mut line).unwrap();
+        assert_eq!(line, br#"[null,"empty",null,null,null,null,0,null,null]"#);
+        let checkpoints: i64 = client
+            .query_one("SELECT count(*)::bigint FROM public.audit_checkpoints", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(checkpoints, 0);
+        // The identity side comes from the actual bindings; this test is about the gates
+        // and the frozen catalog.
+        let auth = prepared.auth_context();
+        let binding = client
+            .query_one(
+                "SELECT d.dataset_id::text,s.store_id::text,s.root_device::text,\
+                        s.root_inode::text,s.root_uid::text \
+                 FROM openbot_internal.artifact_dataset_bindings d \
+                 JOIN openbot_internal.artifact_store_bindings s \
+                   USING (deployment_id,tenant_id,dataset_id) \
+                 WHERE d.deployment_id=$1 AND d.tenant_id=$2",
+                &[&auth.deployment().as_str(), &auth.tenant().as_str()],
+            )
+            .await
+            .unwrap();
+        let expected = CaptureDbExpectation {
+            deployment_id: auth.deployment().as_str().to_owned(),
+            tenant_id: auth.tenant().as_str().to_owned(),
+            dataset_id: binding.get(0),
+            // Not part of the SQL read.
+            instance_id: String::new(),
+            system_identifier: identity.system_identifier().to_owned(),
+            database_oid: identity.database_oid(),
+            store_id: binding.get(1),
+            root_device: binding.get(2),
+            root_inode: binding.get(3),
+            root_uid: binding.get(4),
+        };
+        assert_eq!(
+            repo.collect_capture_materials_before(&expected, &mut reads, &UnitClock)
+                .await
+                .map(|_| ()),
+            Ok(())
+        );
+        client
+            .batch_execute(
+                "INSERT INTO public.audit_events (event_type,target_type,payload) \
+                 VALUES ('configuration.changed','capture_test','{}')",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.append_capture_periodic_before(&key, &mut budget(), &UnitClock)
+                .await
+                .err(),
+            Some(CaptureSqlFailure::RowInvalid)
+        );
+        let coordinates = client
+            .query_one("SELECT gen_random_uuid()::text,clock_timestamp()", &[])
+            .await
+            .unwrap();
+        let event = AuditEvent {
+            id: AuditEventId::new(coordinates.get::<_, String>(0)),
+            actor: None,
+            event_type: AuditEventType::parse("configuration.changed").unwrap(),
+            target_kind: AuditLabel::new("capture_test"),
+            target_id: None,
+            payload: AuditPayload::from_facts([AuditFact::ConfigurationChange(AuditLabel::new(
+                "capture_test",
+            ))])
+            .unwrap(),
+            created_at: coordinates.get(1),
+        };
+        repo.append(&event, &key).await.unwrap();
+        let sealed = repo
+            .append_capture_periodic_before(&key, &mut budget(), &UnitClock)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                sealed.sequence(),
+                sealed.event_count(),
+                sealed.unlinked_before()
+            ),
+            (Some(1), 1, 1)
+        );
+        let checkpoints: i64 = client
+            .query_one("SELECT count(*)::bigint FROM public.audit_checkpoints", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(checkpoints, 2);
+        drop(client);
+        drop(repo);
+        prepared.shutdown().await.unwrap();
+        fs::remove_dir_all(app_root).unwrap();
+        fs::remove_dir_all(bundle_root).unwrap();
+        fs::remove_dir_all(dist).unwrap();
     }
 
     #[cfg(all(feature = "desktop-local-runtime", unix))]
@@ -5327,7 +6068,12 @@ mod tests {
         let leaked = LeakedPostgres {
             identity,
             port: running.port,
-            password: running.secret.expose().to_vec(),
+            password: running
+                .secret
+                .as_ref()
+                .expect("running postgres SCRAM secret")
+                .expose()
+                .to_vec(),
         };
         if let Some(child) = running.child.take() {
             std::mem::forget(child);
