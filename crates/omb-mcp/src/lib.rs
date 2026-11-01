@@ -333,7 +333,7 @@ mod tests {
             assert_eq!(texts(&failed), [error.code()]);
             assert_eq!(failed.structured_content, None);
         }
-        assert_eq!(DaemonError::ALL.len(), 46);
+        assert_eq!(DaemonError::ALL.len(), 51);
     }
 
     #[tokio::test]

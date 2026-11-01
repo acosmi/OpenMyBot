@@ -70,7 +70,7 @@ pub async fn claim_delivery(
     client: &Client,
     deadline: Instant,
 ) -> Result<Option<Claimed>, StoreError> {
-    let claimed = rows(client, "UPDATE openmybot.deliveries SET status='sending', attempts=attempts+1, first_attempt_at=COALESCE(first_attempt_at, now()) WHERE delivery_id = (SELECT delivery_id FROM openmybot.deliveries WHERE status='pending' AND channel_kind IN ('telegram','feishu') AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING delivery_id, binding_id, chat_key, kind, idempotency_key, body, attempts, channel_kind", &[], deadline, ERROR).await?;
+    let claimed = rows(client, "UPDATE openmybot.deliveries SET status='sending', attempts=attempts+1, first_attempt_at=COALESCE(first_attempt_at, now()) WHERE delivery_id = (SELECT delivery_id FROM openmybot.deliveries WHERE status='pending' AND channel_kind <> 'host' AND (next_attempt_at IS NULL OR next_attempt_at <= now()) ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING delivery_id, binding_id, chat_key, kind, idempotency_key, body, attempts, channel_kind", &[], deadline, ERROR).await?;
     let Some(row) = claimed.first() else {
         return Ok(None);
     };

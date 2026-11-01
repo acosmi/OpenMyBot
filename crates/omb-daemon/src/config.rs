@@ -28,6 +28,16 @@ pub(crate) struct Config {
     pub(crate) deployment_id: String,
     pub(crate) pg_bin_dir: PathBuf,
     pub(crate) hosts: Hosts,
+    /// Absent in instances initialized before channel plugins.
+    #[serde(default)]
+    pub(crate) plugins: PluginsConfig,
+}
+/// The `plugins` section: absolute directories appended to the plugins' fixed `PATH`.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PluginsConfig {
+    #[serde(default)]
+    pub(crate) path_extra: Vec<PathBuf>,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +241,11 @@ pub(crate) fn load(root: &Path) -> Result<Config, DaemonError> {
     .map_err(|_| DaemonError::DataDirPermissionsInvalid)?;
     if !config.pg_bin_dir.is_absolute()
         || !config
+            .plugins
+            .path_extra
+            .iter()
+            .all(|path| path.is_absolute())
+        || !config
             .deployment_id
             .strip_prefix("omb-local-")
             .is_some_and(|id| is_hex(id, 32))
@@ -338,6 +353,7 @@ mod tests {
                     workspace_roots: roots.to_vec(),
                 },
             },
+            plugins: PluginsConfig::default(),
         }
     }
     #[test]
@@ -428,6 +444,48 @@ mod tests {
         assert_eq!(
             read_private(&link, 100),
             Err(DaemonError::DataDirPermissionsInvalid)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn plugins_section_defaults_to_no_path_extra_and_a_relative_entry_refuses_startup() {
+        let base = "deployment_id='omb-local-00000000000000000000000000000000'\npg_bin_dir='/pg'\n[hosts.crabcode]\nworkspace_roots=[]\n";
+        assert!(
+            toml::from_str::<Config>(base)
+                .unwrap()
+                .plugins
+                .path_extra
+                .is_empty()
+        );
+        assert!(toml::from_str::<Config>(&format!("{base}[plugins]\nunknown=1\n")).is_err());
+        let root = test_dir();
+        for name in DIRECTORIES {
+            make_dir(&root.join(name)).unwrap();
+        }
+        for name in ["keys/vault-kek.key", "keys/app-master.key"] {
+            write_private(&root.join(name), &[7; 32], true).unwrap();
+        }
+        write_private(&root.join("pg/password"), "a".repeat(64).as_bytes(), true).unwrap();
+        let config = root.join("config.toml");
+        write_private(
+            &config,
+            format!("{base}[plugins]\npath_extra=['/opt/node/bin']\n").as_bytes(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            load(&root).unwrap().plugins.path_extra,
+            [PathBuf::from("/opt/node/bin")]
+        );
+        write_private(
+            &config,
+            format!("{base}[plugins]\npath_extra=['node/bin']\n").as_bytes(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            load(&root).err(),
+            Some(DaemonError::DataDirPermissionsInvalid)
         );
         fs::remove_dir_all(root).unwrap();
     }

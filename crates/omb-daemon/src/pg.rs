@@ -1120,6 +1120,7 @@ mod tests {
             deployment_id: String::new(),
             pg_bin_dir: PathBuf::from("/unavailable-pg"),
             hosts: Default::default(),
+            plugins: Default::default(),
         };
         assert_eq!(
             stop_stale(&root, &cfg).await,

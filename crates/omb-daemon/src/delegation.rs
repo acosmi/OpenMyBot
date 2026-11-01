@@ -123,12 +123,12 @@ impl DelegationAuthority for OmbDelegationAuthority {
 
 #[cfg(test)]
 pub(crate) mod fixture {
+    use crate::{TERMINAL_QUEUE, outbound::TerminalQueue};
     use crate::{
         config,
         engine::{self, Engine},
         pg::Postgres,
     };
-    use omb_channels::{TERMINAL_QUEUE, TerminalQueue};
     use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots};
     use openbot_application::RunTerminalNotice;
     use openbot_application::tenant::package::{
@@ -445,7 +445,7 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::{fixture::Fixture, *};
-    use omb_channels::TELEGRAM;
+    const TELEGRAM: omb_store::ChannelKind = omb_store::ChannelKind::from_static("telegram");
     use omb_store::{
         AcceptedEvent, HostBinding, IdentityKey, PairAttempt, PairOutcome, PairStart, RunDeadline,
     };

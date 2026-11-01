@@ -1,5 +1,5 @@
 //! Turns pending accepted messages into delegated runs through the engine's single entry.
-use crate::{ChannelError, Connection, OMB_EXPIRY_NOTICE_V1, STORE_BUDGET, Task, Timings, backoff};
+use crate::{ChannelError, Connection, OMB_EXPIRY_NOTICE_V1, STORE_BUDGET, Task, Timings};
 use omb_store::{
     Claim, DispatchItem, DispatchOutcome, claim_dispatch, expire_pending, lock_dispatch,
     record_dispatch,
@@ -11,7 +11,7 @@ use openbot_contracts::{
     error::AppError,
     ids::{BotId, RunId, ThreadId},
 };
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -19,6 +19,21 @@ use tokio::{
 };
 
 const BOT_ID: &str = "omb-crabcode";
+
+/// `min` doubled per attempt, capped at `max`.
+pub(crate) fn backoff_ceiling(attempt: u32, min: Duration, max: Duration) -> Duration {
+    min.checked_mul(2u32.saturating_pow(attempt))
+        .unwrap_or(max)
+        .min(max)
+}
+/// Full jitter: uniform in `[0, backoff_ceiling]`.
+pub(crate) fn backoff(attempt: u32, min: Duration, max: Duration) -> Duration {
+    let ceiling = backoff_ceiling(attempt, min, max);
+    let nanos = u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX);
+    getrandom::u64().map_or(ceiling, |random| {
+        Duration::from_nanos(random % nanos.saturating_add(1))
+    })
+}
 
 fn request(item: DispatchItem) -> BeginDelegatedThreadRun {
     BeginDelegatedThreadRun {
@@ -66,7 +81,7 @@ fn outcome(
 /// up; the canceller asks the engine first, so the begun run is still stopped, and at worst its
 /// store update waits up to 2 s on the event's row lock and answers `internal_error`. The gate
 /// also holds the run ids whose begin outcome is unknown.
-pub fn start_dispatcher(
+pub(crate) fn start_dispatcher(
     connection: Connection,
     entry: DelegatedRunEntry,
     timings: Timings,
@@ -158,8 +173,6 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backoff_ceiling;
-    use std::time::Duration;
     use uuid::Uuid;
 
     fn item() -> DispatchItem {
@@ -296,5 +309,25 @@ mod tests {
             backoff_ceiling(3, timings.backoff_min, timings.backoff_max),
             Duration::from_secs(8)
         );
+    }
+    #[test]
+    fn backoff_ceiling_doubles_from_one_to_sixty_seconds() {
+        let (min, max) = (Duration::from_secs(1), Duration::from_secs(60));
+        let ceilings: Vec<u64> = (0..8)
+            .map(|a| backoff_ceiling(a, min, max).as_secs())
+            .collect();
+        assert_eq!(ceilings, [1, 2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(backoff_ceiling(u32::MAX, min, max), max);
+        assert_eq!(backoff_ceiling(40, min, max), max);
+    }
+    #[test]
+    fn backoff_is_drawn_within_zero_and_ceiling() {
+        let (min, max) = (Duration::from_secs(1), Duration::from_secs(60));
+        for attempt in 0..10 {
+            let ceiling = backoff_ceiling(attempt, min, max);
+            let draws: Vec<Duration> = (0..200).map(|_| backoff(attempt, min, max)).collect();
+            assert!(draws.iter().all(|d| *d <= ceiling));
+            assert!(draws.iter().any(|d| *d < ceiling / 2), "attempt {attempt}");
+        }
     }
 }
