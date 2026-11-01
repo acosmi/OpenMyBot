@@ -8,7 +8,8 @@
 //! Thread's history is cleared. No other Thread is scanned, and `Deleted` claims no erasure of
 //! database WAL or backups.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use openbot_contracts::artifacts::{
@@ -28,6 +29,22 @@ use super::{
 /// The whole budget of one call. The arm, the removal and the completion keep their own 5 s caps
 /// inside it.
 const DELETION_BUDGET: Duration = Duration::from_secs(15);
+
+/// This call's claim on advancing one artifact's deletion; dropping it, also on cancellation,
+/// releases the artifact to the next call.
+struct Advancing<'a> {
+    deleting: &'a Mutex<HashSet<String>>,
+    artifact_id: &'a str,
+}
+
+impl Drop for Advancing<'_> {
+    fn drop(&mut self) {
+        self.deleting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(self.artifact_id);
+    }
+}
 
 /// Where one call stopped: at its arm, or after its confirmed arm.
 enum Stop {
@@ -56,7 +73,26 @@ impl PostgresArtifactAdministration {
             .arm_explicit_saved_delete_before(auth, &artifact_id, deadline)
             .await
         {
-            Ok(intent) => self.advance_deletion(auth, &intent, deadline).await,
+            Ok(intent) => {
+                // One call of this instance advances an artifact at a time. A second one would
+                // collide with the first one's physical or terminal slot, which answers it unproven
+                // and poisons an armed capture gate, so it answers Pending without a slot. This
+                // call's own arm has authorised it before anything is answered.
+                let claimed = self
+                    .deleting
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(artifact_id.clone());
+                if claimed {
+                    let _advancing = Advancing {
+                        deleting: &self.deleting,
+                        artifact_id: &artifact_id,
+                    };
+                    self.advance_deletion(auth, &intent, deadline).await
+                } else {
+                    Ok(ArtifactDeletionState::Pending)
+                }
+            }
             Err(error) => Err(Stop::Arm(error)),
         }
         .or_else(deletion_outcome)?;

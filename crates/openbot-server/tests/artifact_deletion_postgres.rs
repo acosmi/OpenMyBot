@@ -1,6 +1,7 @@
 //! V7-IMPL-031 part 2: public deletion of an explicitly saved artifact through the real Axum
 //! router, a real Session and an owned PostgreSQL. The artifact comes from a real Run and Save;
-//! the fixture grants no authority.
+//! the fixture grants no authority. On macOS the Store's capture barrier is armed as on Desktop,
+//! so an unproven step of an overlapping deletion would poison it and refuse the next Save.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
 #[path = "support/transport_fixture.rs"]
@@ -93,13 +94,14 @@ struct Fixture {
     pool: DatabasePool,
     resolver: Arc<PostgresSessionAuthResolver>,
     router: axum::Router,
-    receipt: ArtifactRegistrationReceipt,
+    application: Arc<dyn ApplicationService>,
+    begin: BeginThreadRun,
     _actual: Arc<PostgresArtifactAdministration>,
     _root: OwnedRoot,
 }
 
 impl Fixture {
-    /// One real Run of the owner, then one real Save of its user message, as in the arm fixture.
+    /// One real Run of the owner, as in the arm fixture; `save` saves its user message.
     async fn new(config: DatabaseConfig) -> Result<Self> {
         let direct = config.clone().with_max_pool_size(5);
         let admin = pool::connect(&direct).await.map_err(text)?;
@@ -185,6 +187,8 @@ impl Fixture {
             .await
             .map_err(text)?,
         );
+        #[cfg(target_os = "macos")]
+        store.arm_capture_barrier(3).map_err(text)?;
         let actual = Arc::new(
             PostgresArtifactAdministration::new(
                 registry,
@@ -213,25 +217,8 @@ impl Fixture {
             )
             .with_artifacts(actual.clone()),
         );
-        let auth = resolve(resolver.as_ref(), OWNER).await?;
-        let AppReply::ArtifactRegistrationReceipt(receipt) = application
-            .execute(
-                auth,
-                AppCommand::SaveRunMessageTextArtifact(SaveRunMessageTextArtifact {
-                    request_id: Uuid::now_v7().to_string(),
-                    source_message_id: format!("{}:input", begin.command.run_id.as_str()),
-                    source_thread_id: begin.command.thread_id,
-                    source_run_id: begin.command.run_id,
-                    expected_sha256: format!("{:x}", Sha256::digest(TEXT.as_bytes())),
-                }),
-            )
-            .await
-            .map_err(text)?
-        else {
-            return Err("the Save returned another reply".to_owned());
-        };
         let router = transport_fixture::loopback_router(
-            ServerBuilder::new(application, resolver.clone())
+            ServerBuilder::new(application.clone(), resolver.clone())
                 .with_transport_policy(transport_fixture::loopback_policy())
                 .with_sensitive_write_security(SensitiveWriteSecurity::new(
                     default_session_lifetime(),
@@ -244,20 +231,43 @@ impl Fixture {
             pool,
             resolver,
             router,
-            receipt,
+            application,
+            begin: begin.command,
             _actual: actual,
             _root: root,
         })
     }
 
-    async fn delete(&self, actor: &str) -> Result<(StatusCode, Value)> {
+    /// One real Save of the owner's Run message.
+    async fn save(&self) -> Result<ArtifactRegistrationReceipt> {
+        let AppReply::ArtifactRegistrationReceipt(receipt) = self
+            .application
+            .execute(
+                resolve(self.resolver.as_ref(), OWNER).await?,
+                AppCommand::SaveRunMessageTextArtifact(SaveRunMessageTextArtifact {
+                    request_id: Uuid::now_v7().to_string(),
+                    source_message_id: format!("{}:input", self.begin.run_id.as_str()),
+                    source_thread_id: self.begin.thread_id.clone(),
+                    source_run_id: self.begin.run_id.clone(),
+                    expected_sha256: format!("{:x}", Sha256::digest(TEXT.as_bytes())),
+                }),
+            )
+            .await
+            .map_err(text)?
+        else {
+            return Err("the Save returned another reply".to_owned());
+        };
+        Ok(receipt)
+    }
+
+    async fn delete(&self, actor: &str, id: &str) -> Result<(StatusCode, Value)> {
         let response = self
             .router
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(format!("/api/artifacts/{}", self.receipt.artifact_id))
+                    .uri(format!("/api/artifacts/{id}"))
                     .header(
                         http::header::COOKIE,
                         format!("openbot_session={}", cookie(actor)),
@@ -302,35 +312,43 @@ async fn resolve(resolver: &dyn AuthResolver, actor: &str) -> Result<AuthContext
 }
 
 async fn exercise(f: &Fixture) -> Result {
-    let id = f.receipt.artifact_id.as_str();
-    // The owner deletes; resending the same deletion resumes it until it is deleted.
-    let mut pending = 0;
-    let mut deleted = false;
-    for _ in 0..RESENDS {
-        let (status, value) = f.delete(OWNER).await?;
-        let state = if status == StatusCode::OK {
-            "deleted"
-        } else {
-            "pending"
-        };
+    let receipt = f.save().await?;
+    let id = receipt.artifact_id.as_str();
+    let receipt_of = |state: &str| {
+        json!({
+            "artifactId": id,
+            "state": state,
+            "injectedCopies": "retained_until_thread_history_clear",
+        })
+    };
+    // Every answer to the owner is 200 deleted, 202 pending or, once completed, 409; never 503.
+    let answered = |(status, value): (StatusCode, Value)| -> Result<StatusCode> {
         check(
-            matches!(status, StatusCode::OK | StatusCode::ACCEPTED)
-                && value
-                    == json!({
-                        "artifactId": id,
-                        "state": state,
-                        "injectedCopies": "retained_until_thread_history_clear",
-                    }),
-            &format!("a deletion step was neither 202 pending nor 200 deleted: {status} {value}"),
+            (status == StatusCode::OK && value == receipt_of("deleted"))
+                || (status == StatusCode::ACCEPTED && value == receipt_of("pending"))
+                || (status == StatusCode::CONFLICT && value == json!({"code": "request_conflict"})),
+            &format!("an owner's deletion answered {status} {value}"),
         )?;
-        if status == StatusCode::OK {
-            deleted = true;
-            break;
-        }
-        pending += 1;
+        Ok(status)
+    };
+
+    // Two overlapping deletions by the owner: one advances the artifact and the other answers
+    // pending without touching its slot. The pending one is resent until it is deleted (200) or
+    // found deleted (409).
+    let (first, second) = tokio::join!(f.delete(OWNER, id), f.delete(OWNER, id));
+    let overlapping = [answered(first?)?, answered(second?)?];
+    check(
+        overlapping.contains(&StatusCode::ACCEPTED),
+        "neither overlapping deletion answered pending",
+    )?;
+    let mut pending_resends = 0;
+    let mut status = StatusCode::ACCEPTED;
+    while status == StatusCode::ACCEPTED {
+        check(pending_resends < RESENDS, "the deletion never completed")?;
         tokio::time::sleep(Duration::from_millis(100)).await;
+        status = answered(f.delete(OWNER, id).await?)?;
+        pending_resends += 1;
     }
-    check(deleted, "the deletion never completed")?;
     let completed: bool = f
         .admin
         .get()
@@ -349,25 +367,31 @@ async fn exercise(f: &Fixture) -> Result {
     check(completed, "the record or its fence was not completed")?;
 
     // After completion the owner's resend is a conflict and another user cannot see it.
-    let (status, value) = f.delete(OWNER).await?;
+    let (status_after, value) = f.delete(OWNER, id).await?;
     check(
-        status == StatusCode::CONFLICT && value == json!({"code": "request_conflict"}),
-        &format!("the owner's resend after deletion was not 409: {status} {value}"),
+        status_after == StatusCode::CONFLICT && value == json!({"code": "request_conflict"}),
+        &format!("the owner's resend after deletion was not 409: {status_after} {value}"),
     )?;
-    let (status, value) = f.delete(OTHER).await?;
+    let (status_other, value) = f.delete(OTHER, id).await?;
     check(
-        status == StatusCode::NOT_FOUND && value == json!({"code": "not_visible"}),
-        &format!("another user's deletion was not 404: {status} {value}"),
+        status_other == StatusCode::NOT_FOUND && value == json!({"code": "not_visible"}),
+        &format!("another user's deletion was not 404: {status_other} {value}"),
     )?;
+    // The capture barrier is not poisoned: the owner saves the same message again.
+    f.save().await?;
     eprintln!(
-        "ARTIFACT_DELETION pending_resends={pending} deleted=200 owner_resend=409 other=404 no_store=true"
+        "ARTIFACT_DELETION overlapping={},{} pending_resends={pending_resends} resumed={} \
+         owner_resend=409 other=404 resave=ok no_store=true",
+        overlapping[0].as_u16(),
+        overlapping[1].as_u16(),
+        status.as_u16(),
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires explicitly owned loopback PostgreSQL17.11"]
-async fn artifact_deletion_http_owner_deletes_then_resend_conflicts_and_other_is_not_visible() {
+async fn artifact_deletion_http_overlapping_owner_deletes_complete_then_conflict_and_resave() {
     let tag = "artifact_deletion";
     harness::with_temp_database(&harness::admin_config(tag), tag, |config| async move {
         let f = Fixture::new(config).await?;

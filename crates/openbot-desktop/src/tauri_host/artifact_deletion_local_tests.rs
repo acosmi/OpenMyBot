@@ -425,11 +425,17 @@ async fn exercise(prepared: &PreparedDesktopLocalRuntime) -> TestResult {
     let artifact = save(prepared).await?;
     let id = artifact.artifact_id.as_str();
 
-    // The original window deletes the artifact; resending the same deletion resumes it.
+    // The original window deletes the artifact; resending the same deletion resumes it. Each
+    // request runs on a runtime worker with its default stack, as the Desktop host spawns it.
     let mut pending = 0;
     let mut deleted = false;
     for _ in 0..RESENDS {
-        let (status, value) = answered(&protocol.handle("main", delete_request(id)?).await)?;
+        let request = tokio::spawn({
+            let protocol = Arc::clone(protocol);
+            let request = delete_request(id)?;
+            async move { protocol.handle("main", request).await }
+        });
+        let (status, value) = answered(&request.await.map_err(text)?)?;
         let state = if status == StatusCode::OK {
             "deleted"
         } else {
@@ -480,8 +486,9 @@ async fn exercise(prepared: &PreparedDesktopLocalRuntime) -> TestResult {
 #[test]
 #[ignore = "requires explicitly owned PostgreSQL17.11 binaries via OPENBOT_TEST_PG_BIN"]
 fn artifact_deletion_real_local_window_deletes_and_stale_window_refuses() {
-    // An unoptimized build keeps every future temporary of the window -> Application -> cleanup
-    // producer chain in the frames of the polling thread, beyond the default 2 MiB test stack.
+    // The test body and the Prepared Local setup poll on this larger thread; with them on the
+    // default 2 MiB test stack, unoptimized Prepared Local cases overflow it. Each deletion request
+    // runs on a runtime worker with its default stack, as the Desktop host spawns every request.
     let polling = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {

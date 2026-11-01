@@ -507,6 +507,8 @@ pub struct PostgresArtifactAdministration {
     read_authority: OnceLock<Arc<artifact_read_authority::PostgresArtifactReadAuthority>>,
     cleanup_physical_observer: OnceLock<Arc<dyn ArtifactCleanupPhysicalObserver>>,
     save_producer_diagnostic: OnceLock<Arc<SaveProducerDiagnosticCapture>>,
+    /// Artifacts whose public deletion a call of this instance is removing or completing.
+    deleting: Mutex<std::collections::HashSet<String>>,
 }
 
 /// A single owned-PG record/source snapshot bound to its exact actual byte-store owner.
@@ -633,6 +635,7 @@ impl PostgresArtifactAdministration {
             read_authority: OnceLock::new(),
             cleanup_physical_observer: OnceLock::new(),
             save_producer_diagnostic: OnceLock::new(),
+            deleting: Mutex::default(),
         })
     }
 
