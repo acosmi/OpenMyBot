@@ -63,13 +63,6 @@ pub(super) struct LocalSiteExpectation {
     pub(super) installation_id: Option<String>,
 }
 
-/// The head a shared-lock branch saw; only that branch rewrites it.
-enum ExpectedHead {
-    Absent,
-    ActiveBelowLatest(String),
-    CurrentBelowLatest(String),
-}
-
 /// The original producer's entry intent. It is not Clone or Serde and holds
 /// no actual PG tuple or transaction (spec 8329).
 pub struct VerifiedOrdinaryStartupIntent {
@@ -81,7 +74,6 @@ pub struct VerifiedOrdinaryStartupIntent {
     admission: Instant,
     effect: Instant,
     convergence: Instant,
-    head: ExpectedHead,
     resource_model: ResourceModel,
     owners: Vec<RuntimeOwner>,
     #[cfg(feature = "desktop-local")]
@@ -151,7 +143,6 @@ impl VerifiedOrdinaryStartupIntent {
             admission,
             effect,
             convergence,
-            head: ExpectedHead::Absent,
             resource_model,
             owners: owners.to_vec(),
             #[cfg(feature = "desktop-local")]
@@ -313,14 +304,8 @@ fn shared_head_inner(
         return Err(error);
     }
     if published.binding().native_version() < latest() {
-        let digest = published.digest().to_owned();
-        intent.head = if published.observation().record.phase == ActivationPhase::RestoreCurrent {
-            ExpectedHead::CurrentBelowLatest(digest)
-        } else {
-            ExpectedHead::ActiveBelowLatest(digest)
-        };
         files.release_registration_attempt();
-        return Err(initialization_required(Some(intent)));
+        return Err(initialization_required(None));
     }
     Ok((published, intent))
 }
@@ -346,18 +331,11 @@ pub(super) fn enter_runtime(
     enroll(control, published, &intent)
 }
 
-/// What the exclusive session will do with the head it saw.
-enum SessionKind {
-    Initialize,
-    Upgrade,
-}
-
 /// The exclusive ordinary writer: ownerEX, admissionEX and runtimeEX held in
 /// the control owner from `begin` until `into_runtime_before` or drop.
 pub struct OrdinaryInitializationSession {
     control: ControlOwner,
     intent: VerifiedOrdinaryStartupIntent,
-    kind: SessionKind,
     /// The descriptor this session holds as head, with its digest.
     head: Option<(ActivationRecord, String)>,
     /// The open operation and its pending StageIntent sequence.
@@ -428,27 +406,10 @@ pub(super) fn begin(
             return Err(error.retain(control));
         }
     };
-    let kind = match (&intent.head, head) {
-        (ExpectedHead::Absent, Head::Absent) if intent.source.is_some() => {
-            (SessionKind::Initialize, None)
-        }
-        (ExpectedHead::ActiveBelowLatest(seen), Head::Published(published))
-            if published.observation().record.phase == ActivationPhase::OrdinaryActive
-                && published.digest() == seen =>
-        {
-            (SessionKind::Upgrade, Some(published))
-        }
-        (ExpectedHead::CurrentBelowLatest(seen), Head::Published(published))
-            if published.observation().record.phase == ActivationPhase::RestoreCurrent
-                && published.digest() == seen =>
-        {
-            (SessionKind::Upgrade, Some(published))
-        }
-        _ => {
-            files.release_writer();
-            return Err(fault(RecoveryControlFault::OwnerBusy));
-        }
-    };
+    if !matches!(head, Head::Absent) || intent.source.is_none() {
+        files.release_writer();
+        return Err(fault(RecoveryControlFault::OwnerBusy));
+    }
     #[cfg(feature = "desktop-local")]
     if let SiteExpectation::Local(local) = &intent.site {
         files.verify_local_root_before(
@@ -459,12 +420,10 @@ pub(super) fn begin(
         )?;
     }
     drop(files);
-    let (kind, published) = kind;
     Ok(OrdinaryInitializationSession {
         control: Arc::clone(control),
         intent,
-        kind,
-        head: published.map(|p| (p.observation().record.clone(), p.digest().to_owned())),
+        head: None,
         operation: None,
         pending: None,
         last: None,
@@ -479,38 +438,12 @@ impl OrdinaryInitializationSession {
         self.initialization_source() == Some(OrdinaryInitializationSource::LocalPhysicalFresh)
     }
 
-    /// Consume the original Fresh installation once; upgrades have no new installation.
+    /// Consume the original Fresh installation once.
     #[cfg(feature = "desktop-local")]
     pub fn take_fresh_installation(
         &mut self,
     ) -> Option<crate::auth::single_user::desktop_local::DesktopLocalInstallation> {
         self.intent.fresh_installation.take()
-    }
-
-    /// Verify the held Local binding before upgrading its original pool.
-    #[cfg(feature = "desktop-local")]
-    pub async fn verify_local_upgrade_before(
-        &mut self,
-        authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
-        database: &crate::db::desktop_local::DesktopLocalDatabase,
-        canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
-    ) -> Result<(), RecoveryControlError> {
-        let SiteExpectation::Local(local) = &self.intent.site else {
-            return Err(fault(RecoveryControlFault::EntryInvalid));
-        };
-        let binding = self
-            .held_binding()
-            .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))?;
-        entry::verify_local_binding_before(
-            &self.control,
-            binding,
-            authority,
-            database,
-            canary,
-            [&local.master_service, &local.postgres_service],
-            self.intent.effect,
-        )
-        .await
     }
 
     /// The one Server initialization request of this session (S7); scope and
@@ -538,21 +471,9 @@ impl OrdinaryInitializationSession {
         }
     }
 
-    /// The sealed source when this session initializes; `None` for an upgrade.
+    /// The sealed source of this original initialization session.
     pub(super) fn initialization_source(&self) -> Option<OrdinaryInitializationSource> {
-        match self.kind {
-            SessionKind::Initialize => self.intent.source.map(|(source, _, _)| source),
-            SessionKind::Upgrade => None,
-        }
-    }
-
-    /// The published binding an upgrade session starts from.
-    pub(super) fn held_binding(&self) -> Option<&ActivationBinding> {
-        match self.head.as_ref()?.0.data() {
-            ActivationPayload::Active(active) => Some(&active.binding),
-            ActivationPayload::Current(current) => Some(&current.binding),
-            _ => None,
-        }
+        self.intent.source.map(|(source, _, _)| source)
     }
 
     fn operation(&self) -> Result<Hex32, RecoveryControlError> {
@@ -568,7 +489,7 @@ impl OrdinaryInitializationSession {
         actual: ServerDatabaseSite,
     ) -> Result<(), RecoveryControlError> {
         let invalid = || fault(RecoveryControlFault::EntryInvalid);
-        if !matches!(self.kind, SessionKind::Initialize) || self.head.is_some() {
+        if self.head.is_some() {
             return Err(invalid());
         }
         let (source, _, _) = self.intent.source.ok_or_else(invalid)?;
@@ -1064,146 +985,6 @@ impl OrdinaryInitializationSession {
         self.resource_close()
     }
 
-    /// Upgrade the held Active or Current from its sealed native version to
-    /// the latest one in a new `ordinary_upgrade` operation (S6b).
-    pub async fn upgrade_native_before(
-        &mut self,
-        pool: &crate::db::pool::DatabasePool,
-    ) -> Result<(), RecoveryControlError> {
-        let invalid = || fault(RecoveryControlFault::ControlInvalid);
-        let (prior, prior_digest) = self
-            .head
-            .clone()
-            .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))?;
-        let binding = match prior.data() {
-            ActivationPayload::Active(active) => active.binding.clone(),
-            ActivationPayload::Current(current) => current.binding.clone(),
-            _ => return Err(fault(RecoveryControlFault::EntryInvalid)),
-        };
-        let from = binding.native_version();
-        let to = latest();
-        if from >= to || self.pending.is_some() {
-            return Err(fault(RecoveryControlFault::EntryInvalid));
-        }
-        let effect = self.intent.effect;
-        // 1. intent
-        let operation = Hex32::mint(&mint::<16>()?)?;
-        {
-            let mut files = entry::lock(&self.control)?;
-            let control_id: Hex32 =
-                serde_json::from_value(serde_json::Value::String(prior.control_id.clone()))
-                    .map_err(RecoveryControlError::from_json)?;
-            files.begin_journal(
-                &operation,
-                &control_id,
-                binding.authorization_epoch(),
-                effect,
-            )?;
-            let clock = files.owner_clock(
-                Hex32::mint(&mint::<16>()?)?,
-                self.intent.t0_ns,
-                &self.intent.bounds,
-            )?;
-            files.append_journal(
-                &operation,
-                &JournalData::ordinary_upgrade(&prior_digest, from, to, self.intent.bounds, clock),
-                effect,
-            )?;
-        }
-        self.operation = Some(operation);
-        self.last = None;
-        self.evidence.clear();
-        // 2. ledger check, read only, before BEGIN on the same connection
-        let mut client = pool
-            .get()
-            .await
-            .map_err(|_| fault(RecoveryControlFault::IoFailure))?;
-        super::before(effect)?;
-        let ledger =
-            native::validate_known_prefix(&client, i32::try_from(from).map_err(|_| invalid())?)
-                .await
-                .map_err(|_| invalid())?;
-        super::before(effect)?;
-        if ledger.latest_version().unsigned_abs() != from
-            || ledger_checksum(&client, from).await? != binding.migration_digest()
-        {
-            return Err(invalid());
-        }
-        super::before(effect)?;
-        // 3. pg_upgrade
-        self.intend_stage(Stage::PgUpgrade)?;
-        let applied = {
-            use crate::db::native::BootstrapTransactionClient as _;
-            match client
-                .bootstrap_transaction_builder()
-                .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
-                .start()
-                .await
-            {
-                Ok(transaction) => {
-                    match native::apply_through_in_transaction(
-                        &transaction,
-                        native::NATIVE_LATEST_VERSION,
-                    )
-                    .await
-                    {
-                        Ok(_) => Some(transaction.commit().await.is_ok()),
-                        Err(_) => {
-                            let _ = transaction.rollback().await;
-                            None
-                        }
-                    }
-                }
-                Err(_) => None,
-            }
-        };
-        let returned = Instant::now();
-        let Some(acknowledged) = applied else {
-            // No COMMIT was issued: the stage stays an unanswered intent.
-            return Err(fault(RecoveryControlFault::IoFailure));
-        };
-        if !self.observe_commit(acknowledged, returned)? {
-            return Err(fault(RecoveryControlFault::EffectExpired));
-        }
-        // 4. read back on the same connection
-        native::validate_current(&client)
-            .await
-            .map_err(|_| invalid())?;
-        let layout = crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(&client)
-            .await
-            .map_err(|_| invalid())?;
-        if layout.native_version().unsigned_abs() != to {
-            return Err(invalid());
-        }
-        let digest = ledger_checksum(&client, to).await?;
-        super::before(effect)?;
-        // 5. publish under the prior phase
-        let upgraded = binding.upgraded(to, &digest);
-        let evidence = self.evidence.clone();
-        match prior.data() {
-            ActivationPayload::Active(_) => {
-                self.publish(ActivationPhase::OrdinaryActive, |publish_intent| {
-                    ActivationPayload::Active(Active {
-                        binding: upgraded,
-                        initialization_evidence: evidence,
-                        publish_intent,
-                    })
-                })?;
-            }
-            ActivationPayload::Current(current) => {
-                let mut current = current.clone();
-                self.publish(ActivationPhase::RestoreCurrent, |publish_intent| {
-                    current.binding = upgraded;
-                    current.publish_intent = publish_intent;
-                    ActivationPayload::Current(current)
-                })?;
-            }
-            _ => return Err(invalid()),
-        }
-        // 6. resource_close
-        self.resource_close()
-    }
-
     /// Downgrade runtimeEX to SH on the same FD, write the enrollment and
     /// release ownerEX/admissionEX (spec 8073). The held head must be at the
     /// latest native version.
@@ -1213,7 +994,6 @@ impl OrdinaryInitializationSession {
             .as_ref()
             .is_some_and(|(record, _)| match record.data() {
                 ActivationPayload::Active(active) => active.binding.native_version() == latest(),
-                ActivationPayload::Current(current) => current.binding.native_version() == latest(),
                 _ => false,
             });
         if !latest_head || self.pending.is_some() {

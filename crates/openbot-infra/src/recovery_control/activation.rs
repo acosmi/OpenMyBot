@@ -493,28 +493,6 @@ impl ActivationBinding {
         self.common().migration_digest
     }
 
-    /// The same binding after a native schema upgrade: only the version and
-    /// its ledger checksum change (spec 8338).
-    pub(super) fn upgraded(&self, version: u32, digest: &str) -> Self {
-        let mut binding = self.clone();
-        match &mut binding.site {
-            ActivationSiteBinding::LocalPhysical {
-                native_version,
-                migration_digest,
-                ..
-            }
-            | ActivationSiteBinding::ServerDatabase {
-                native_version,
-                migration_digest,
-                ..
-            } => {
-                *native_version = version;
-                digest.clone_into(migration_digest);
-            }
-        }
-        binding
-    }
-
     pub(super) fn validate(
         &self,
         l: &TrustedHostRecoveryLimits,

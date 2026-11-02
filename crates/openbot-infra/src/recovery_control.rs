@@ -1012,8 +1012,8 @@ impl RecoveryControl {
 
     /// Ordinary Server startup (S8). One clock read seals the entry intent;
     /// an existing latest head is checked under SH, otherwise the handed-back
-    /// intent takes the exclusive writer for Fresh, legacy adoption or a
-    /// native upgrade. The returned Pool is the bootstrap Pool of this site.
+    /// intent takes the exclusive writer for Fresh or legacy adoption. The
+    /// returned Pool is the bootstrap Pool of this site.
     #[cfg(feature = "server-runtime")]
     pub async fn open_server_before(
         &mut self,
@@ -1073,26 +1073,8 @@ impl RecoveryControl {
                 entry::adopt_server_legacy_before(&self.shared, &mut session, &pool, configured)
                     .await?;
             }
-            Some(_) => {
-                return Err(RecoveryControlError::new(
-                    RecoveryControlFault::EntryInvalid,
-                ));
-            }
-            None => {
-                let binding = session
-                    .held_binding()
-                    .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?
-                    .clone();
-                let client = pool
-                    .get()
-                    .await
-                    .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
-                entry::compare_server_site_before(
-                    &client, &binding, database, configured, &dataset, effect,
-                )
-                .await?;
-                drop(client);
-                session.upgrade_native_before(&pool).await?;
+            _ => {
+                return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
             }
         }
         let owner = session.into_runtime_before()?;
@@ -2187,6 +2169,43 @@ mod tests {
         assert!(!fixture.control_root().join("activation-v1").exists());
         assert_eq!(std::fs::read(&key).unwrap(), [3u8; 104]);
         assert!(!fixture.directory.join("new-generation").exists());
+    }
+
+    #[test]
+    fn closed_codec_rejects_unadopted_upgrade_and_retains_52_data() {
+        let mut record = journal_record(
+            "OperationIntent",
+            json!({
+                "mode": "ordinary_upgrade", "priorActivationDigest": ZERO64,
+                "fromNativeVersion": 52, "toNativeVersion": 53,
+                "ordinaryStartupBounds": {"effectNs": 5, "convergenceNs": 9},
+                "originalClockRelation": clock(),
+            }),
+        );
+        record["sequence"] = json!(1);
+        let body = serde_json::to_vec(&record).unwrap();
+        let mut raw = b"WBRCJ001".to_vec();
+        raw.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes());
+        raw.extend_from_slice(&body);
+        let digest = Sha256::new()
+            .chain_update(b"wrokbot.restore.journal.v1\0")
+            .chain_update(&raw)
+            .finalize();
+        raw.extend_from_slice(&digest);
+        let error = observe_chain(&raw, &limits())
+            .err()
+            .expect("only original three modes decode");
+        assert!(
+            error.original_json_error.is_some(),
+            "the fourth mode must fail closed enum decoding before canonical/publication checks"
+        );
+
+        let (_, mut prior_data) = descriptors().into_iter().nth(1).unwrap();
+        prior_data["data"]["binding"]["nativeVersion"] = json!(52);
+        assert!(
+            observe(&canonical_descriptor(prior_data), &limits()).is_ok(),
+            "strict-prior52 remains parseable DATA, not startup or migration authority"
+        );
     }
 
 }

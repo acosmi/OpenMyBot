@@ -203,23 +203,12 @@ struct LegacyIntent {
     initializing_descriptor_digest: String,
     original_clock_relation: OwnerClockRecord,
 }
-/// Native schema upgrade of an already published ordinary or restored site.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpgradeIntent {
-    prior_activation_digest: String,
-    from_native_version: u32,
-    to_native_version: u32,
-    ordinary_startup_bounds: OrdinaryStartupBounds,
-    original_clock_relation: OwnerClockRecord,
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum OperationIntent {
     Restore(RestoreIntent),
     FreshInit(FreshIntent),
     LegacyAdoption(LegacyIntent),
-    OrdinaryUpgrade(UpgradeIntent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,25 +615,6 @@ impl JournalData {
         }
     }
 
-    pub(super) fn ordinary_upgrade(
-        prior_activation_digest: &str,
-        from_native_version: u32,
-        to_native_version: u32,
-        ordinary_startup_bounds: OrdinaryStartupBounds,
-        original_clock_relation: OwnerClockRecord,
-    ) -> Self {
-        Self {
-            kind: Kind::OperationIntent,
-            data: Data::Operation(OperationIntent::OrdinaryUpgrade(UpgradeIntent {
-                prior_activation_digest: prior_activation_digest.to_owned(),
-                from_native_version,
-                to_native_version,
-                ordinary_startup_bounds,
-                original_clock_relation,
-            })),
-        }
-    }
-
     pub(super) fn stage_intent(stage: Stage, original_effect_id: &str) -> Self {
         Self {
             kind: Kind::StageIntent,
@@ -844,17 +814,6 @@ impl Record {
                     v.expected_original_business_and_installation.validate(l)?;
                     v.original_clock_relation.validate(l)?;
                 }
-                OperationIntent::OrdinaryUpgrade(v) => {
-                    hex(&v.prior_activation_digest, 64, false)?;
-                    super::activation::supported_native_version(v.from_native_version)?;
-                    super::activation::supported_native_version(v.to_native_version)?;
-                    if v.from_native_version >= v.to_native_version {
-                        return Err(RecoveryControlError::new(
-                            RecoveryControlFault::ControlInvalid,
-                        ));
-                    }
-                    v.original_clock_relation.validate(l)?;
-                }
             },
             (Kind::StageIntent, Data::StageIntent(v)) => {
                 hex(&v.original_effect_id, 32, true)?;
@@ -1030,10 +989,6 @@ pub(super) fn observe_chain(
                             | Stage::Publish
                             | Stage::ResourceClose
                     ),
-                    Data::Operation(OperationIntent::OrdinaryUpgrade(_)) => matches!(
-                        stage.stage,
-                        Stage::PgUpgrade | Stage::Publish | Stage::ResourceClose
-                    ),
                     _ => false,
                 };
                 if !allowed {
@@ -1122,20 +1077,6 @@ fn unproven() -> RecoveryControlError {
     RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)
 }
 
-/// An upgrade operation names its descriptor's predecessor and new version.
-fn upgrade_names(
-    upgrade: &UpgradeIntent,
-    observation: &super::activation::ActivationObservation,
-    binding: &ActivationBinding,
-) -> Result<(), RecoveryControlError> {
-    if observation.record.previous_digest() != Some(upgrade.prior_activation_digest.as_str())
-        || upgrade.to_native_version != binding.native_version()
-    {
-        return Err(unproven());
-    }
-    Ok(())
-}
-
 impl JournalObservation {
     pub(super) fn restore_candidate_plan(&self) -> Option<&CandidatePlan> {
         match &self.records.first()?.data {
@@ -1160,9 +1101,7 @@ impl JournalObservation {
     }
 
     /// Check the original ordinary operation and actual full-digest evidence
-    /// references. Unknown / other-context evidence remains closed. An
-    /// `ordinary_upgrade` operation must name this descriptor's predecessor,
-    /// its version and its epoch.
+    /// references. Unknown / other-context evidence remains closed.
     pub(super) fn verify_ordinary_evidence(
         &self,
         observation: &super::activation::ActivationObservation,
@@ -1175,51 +1114,21 @@ impl JournalObservation {
         match &first.data {
             Data::Operation(OperationIntent::FreshInit(_) | OperationIntent::LegacyAdoption(_)) => {
             }
-            Data::Operation(OperationIntent::OrdinaryUpgrade(v)) => {
-                upgrade_names(v, observation, binding)?;
-            }
             _ => return Err(unproven()),
         }
         self.confirmed(evidence, &first.operation_id)
     }
 
-    /// RestoreCurrent evidence. `self` is the journal its publishIntent names.
-    /// When that is the restore operation itself, closure and switch readback
-    /// are checked here; otherwise `self` is an `ordinary_upgrade` of this
-    /// descriptor and `restore` is the original restore operation's journal.
+    /// RestoreCurrent evidence comes from its one original restore journal.
     pub(super) fn verify_current_evidence(
         &self,
         observation: &super::activation::ActivationObservation,
-        restore: Option<&JournalObservation>,
     ) -> Result<(), RecoveryControlError> {
         let super::activation::ActivationPayload::Current(current) = observation.record.data()
         else {
             return Err(unproven());
         };
-        let first = self.records.first().ok_or_else(unproven)?;
-        if first.epoch != current.epoch {
-            return Err(unproven());
-        }
-        let restore = if first.operation_id == current.operation_id {
-            self
-        } else {
-            let Data::Operation(OperationIntent::OrdinaryUpgrade(v)) = &first.data else {
-                return Err(unproven());
-            };
-            upgrade_names(v, observation, &current.binding)?;
-            let published = usize::try_from(current.publish_intent.sequence.get() - 1)
-                .map_err(|_| unproven())?;
-            let upgraded = self.records.get(..published).ok_or_else(unproven)?.iter().any(|r| {
-                matches!(&r.data, Data::StageObserved(o)
-                    if o.typed_disposition.confirms_effect()
-                        && matches!(usize::try_from(o.intent_sequence - 1).ok().and_then(|i| self.records.get(i)),
-                            Some(Record { data: Data::StageIntent(StageIntent { stage: Stage::PgUpgrade, .. }), .. })))
-            });
-            if !upgraded {
-                return Err(unproven());
-            }
-            restore.ok_or_else(unproven)?
-        };
+        let restore = self;
         let original = restore.records.first().ok_or_else(unproven)?;
         if original.operation_id != current.operation_id
             || original.epoch != current.epoch

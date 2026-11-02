@@ -1012,8 +1012,6 @@ pub struct DesktopLocalRuntimeConfig {
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     recovery_fresh: Option<openbot_infra::recovery_control::OrdinaryInitializationSession>,
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-    recovery_upgrade: Option<openbot_infra::recovery_control::OrdinaryInitializationSession>,
-    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     self_owned_capture_fixture: Option<SelfOwnedCaptureFixtureBinding>,
     #[cfg(all(
         feature = "desktop-launcher",
@@ -1046,8 +1044,6 @@ impl DesktopLocalRuntimeConfig {
             recovery_runtime: None,
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             recovery_fresh: None,
-            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-            recovery_upgrade: None,
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             self_owned_capture_fixture: None,
             #[cfg(all(
@@ -1093,14 +1089,6 @@ impl DesktopLocalRuntimeConfig {
         session: openbot_infra::recovery_control::OrdinaryInitializationSession,
     ) -> Self {
         self.recovery_fresh = Some(session);
-        self
-    }
-
-    pub(crate) fn with_recovery_upgrade(
-        mut self,
-        session: openbot_infra::recovery_control::OrdinaryInitializationSession,
-    ) -> Self {
-        self.recovery_upgrade = Some(session);
         self
     }
 
@@ -2571,10 +2559,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
             .recovery_bootstrap
             .as_ref()
             .ok_or(DesktopLocalRuntimeError::InitializationRequired)?;
-        if config.recovery_runtime.is_none()
-            && config.recovery_fresh.is_none()
-            && config.recovery_upgrade.is_none()
-        {
+        if config.recovery_runtime.is_none() && config.recovery_fresh.is_none() {
             let mut control = RecoveryControl::open(RecoveryControlConfig::local(
                 app_data_root.clone(),
                 bootstrap.host_limits.clone(),
@@ -2606,7 +2591,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                     if session.is_local_fresh() {
                         config.with_recovery_fresh(session)
                     } else {
-                        config.with_recovery_upgrade(session)
+                        return Err(DesktopLocalRuntimeError::InitializationRequired);
                     }
                 }
                 Err(error) => return Err(error.into()),
@@ -2625,8 +2610,6 @@ pub(crate) async fn prepare_desktop_local_runtime(
         mut recovery_runtime,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         mut recovery_fresh,
-        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-        mut recovery_upgrade,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         mut self_owned_capture_fixture,
         #[cfg(all(
@@ -3133,18 +3116,6 @@ pub(crate) async fn prepare_desktop_local_runtime(
                     )
                     .await?;
                 session.publish_active(OrdinaryActivationProof::LocalFresh(proof))?;
-                recovery_runtime = Some(session.into_runtime_before()?);
-            } else if let Some(mut session) = recovery_upgrade.take() {
-                session
-                    .verify_local_upgrade_before(
-                        prepared_data_plane.authority(),
-                        prepared_data_plane.database(),
-                        vault_ready.canary(),
-                    )
-                    .await?;
-                session
-                    .upgrade_native_before(prepared_data_plane.pool())
-                    .await?;
                 recovery_runtime = Some(session.into_runtime_before()?);
             } else {
                 recovery_runtime

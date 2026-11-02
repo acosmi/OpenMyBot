@@ -1,6 +1,5 @@
 //! One complete read of the activation head: its descriptor, the journal its
-//! publication names and, for an upgraded RestoreCurrent, the original restore
-//! journal. Raw results stay resident in `ControlFiles` for the later
+//! publication names. Raw results stay resident in `ControlFiles` for the later
 //! held/named head recheck.
 
 use std::fs::File;
@@ -10,8 +9,7 @@ use std::time::Instant;
 
 use rustix::fs::{AtFlags, Mode, OFlags};
 
-use super::super::activation::{ActivationPayload, ActivationPhase, PublishedActivation};
-use super::super::journal::JournalObservation;
+use super::super::activation::{ActivationPhase, PublishedActivation};
 use super::super::{RecoveryControlError, RecoveryControlFault};
 use super::{ControlFiles, Directory, OwnedRecord};
 
@@ -37,7 +35,6 @@ impl ControlFiles {
         self.publication_operation = None;
         self.publication_chain = None;
         self.publication_seal = None;
-        self.restore_chain = None;
         self.reserve_io(0)?;
         self.raw.named = Some(rustix::fs::statat(
             self.directory(Directory::Root)?,
@@ -79,24 +76,6 @@ impl ControlFiles {
             return Ok(Head::Unpublished);
         }
         let reference = observation.publication_reference()?.clone();
-        // An upgraded Current names its upgrade operation; the original
-        // restore journal is read first so the publication journal stays the
-        // held operation directory for the later head recheck.
-        if let ActivationPayload::Current(current) = observation.record.data() {
-            if current.operation_id != reference.context_id.as_str() {
-                let operation = current.operation_id.clone();
-                let journal = self.read_journal(&operation, record as u64, deadline)?;
-                let fee =
-                    super::super::journal::read_metadata_reservation(&journal.bytes, &self.limits)?;
-                self.prepay(fee, 0)?;
-                self.restore_chain = Some(super::super::journal::observe_chain(
-                    &journal.bytes,
-                    &self.limits,
-                ));
-                self.restore_journal = Some(journal);
-                self.post(deadline)?;
-            }
-        }
         let context = reference.context_id.as_str();
         let journal = self.read_journal(context, record as u64, deadline)?;
         self.publication_journal = Some(Arc::clone(&journal));
@@ -115,12 +94,7 @@ impl ControlFiles {
         if phase == ActivationPhase::OrdinaryActive {
             chain.verify_ordinary_evidence(&observation)?;
         } else {
-            let restore: Option<&JournalObservation> = match self.restore_chain.as_ref() {
-                Some(Ok(restore)) => Some(restore),
-                Some(Err(error)) => return Err(RecoveryControlError::new(error.fault())),
-                None => None,
-            };
-            chain.verify_current_evidence(&observation, restore)?;
+            chain.verify_current_evidence(&observation)?;
         }
         self.publication_seal = Some(chain.publication_for(
             &observation.record.control_id,
