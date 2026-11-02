@@ -484,7 +484,7 @@ impl CandidateGeneration {
     /// Move the same session and clock into the resident original wait future.
     /// Cancelling observe_wait leaves that future and all original handles here.
     pub(super) fn begin_wait(&mut self, session: &mut Option<RestoreControlSession>) -> Result<(), DesktopRestoreError> {
-        if self.program.as_ref().is_none_or(|original| original.original_stop().is_none())
+        if self.program.is_none()
             || self.clock.is_none() || self.waiting.is_some() || self.returned_session.is_some() {
             return Err(DesktopRestoreError::EntryInvalid);
         }
