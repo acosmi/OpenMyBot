@@ -1,5 +1,7 @@
 //! Native 0021 actor-scoped UI preference PostgreSQL 17 evidence.
 
+#![cfg(feature = "server-runtime")]
+
 mod harness;
 
 use harness::{admin_config, with_temp_database};
