@@ -253,6 +253,8 @@ impl<'a> RestoreIsolationPolicy<'a> {
                 p.rule("file-read-metadata", "literal", path)?;
             }
         }
+        // Loader bootstrap needs the root directory itself; this grants no subtree.
+        p.rule("file-read-data", "literal", Path::new("/"))?;
         Ok(p.text)
     }
 }
@@ -379,6 +381,176 @@ impl BoundedPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Component-only: authenticated F07 software, original policy and a real wait.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires explicit retained F07 release and task-owned result directory"]
+    async fn f07_authenticated_postgres_version_under_original_policy() {
+        use crate::postgres_sidecar::{PostgresBundleDigest, ReviewedPostgresSigningIdentity};
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::process::ExitStatusExt;
+        use std::path::PathBuf;
+
+        let release = PathBuf::from(
+            std::env::var_os("WROKBOT_TEST_F07_RELEASE").expect("explicit F07 release"),
+        );
+        let results = PathBuf::from(
+            std::env::var_os("WROKBOT_TEST_POLICY_RESULT_DIR")
+                .expect("explicit task result directory"),
+        );
+        assert!(release.is_absolute() && results.is_absolute());
+        let outer = fs::read(release.join("wrok-bot-release.json")).expect("read retained outer");
+        // Existing tauri_background::SELF_OWNED_CAPTURE_FIXTURE pin; never
+        // replace this independent expectation with a newly calculated digest.
+        let expected = "02c306937c8238a34d58ddf01f1739f0b7a4a0f8929413932c9a9e8b19013ca2";
+        let actual = Sha256::digest(&outer)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(actual, expected);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&outer).expect("pinned outer JSON");
+        let pg = &manifest["postgres"];
+        assert_eq!(pg["root"].as_str(), Some("postgres"));
+        let digest = PostgresBundleDigest::from_hex(
+            pg["manifest_sha256"].as_str().expect("pinned PG digest"),
+        )
+        .expect("PG digest shape");
+        let signer = ReviewedPostgresSigningIdentity::from_reviewed_release(
+            pg["signing_identity"].as_str().expect("pinned signer"),
+        )
+        .expect("reviewed fixture signer");
+        let bundle = VerifiedPostgresBundle::open(release.join("postgres"), digest, &signer)
+            .expect("actual authenticated PG bundle");
+
+        let root = PathBuf::from("/private/tmp").join(format!(
+            "wrokbot-s20-policy-version-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("exclusive own fixture");
+        struct OwnFixture(PathBuf);
+        impl Drop for OwnFixture {
+            fn drop(&mut self) {
+                if let Err(error) = fs::remove_dir_all(&self.0) {
+                    eprintln!("own component fixture cleanup failed: {error}");
+                }
+            }
+        }
+        let fixture = OwnFixture(root.clone());
+        let parent = File::open(&root).expect("held own parent");
+        let paths = [
+            "generation",
+            "generation/data",
+            "generation/wal",
+            "generation/temp",
+            "generation/uds",
+            "generation/materials",
+        ]
+        .map(|leaf| root.join(leaf));
+        for path in &paths {
+            fs::create_dir(path).expect("exclusive own generation directory");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("private generation directory");
+        }
+        let held = paths
+            .each_ref()
+            .map(|path| File::open(path).expect("held original generation directory"));
+        let excluded_paths = ["old-site", "control", "key-medium"].map(|leaf| root.join(leaf));
+        for path in &excluded_paths {
+            fs::create_dir(path).expect("exclusive own excluded directory");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("private excluded directory");
+        }
+        let excluded_held = excluded_paths
+            .each_ref()
+            .map(|path| File::open(path).expect("held own excluded directory"));
+        let directory = |index: usize| Directory {
+            path: &paths[index],
+            original: &held[index],
+        };
+        // Actual Mach-O import paths read from this authenticated postgres.
+        // This does not assert held files or a complete host cache inventory.
+        let imports = [
+            Path::new("/usr/lib/dyld"),
+            Path::new("/usr/lib/libSystem.B.dylib"),
+        ];
+        let policy = RestoreIsolationPolicy::prepare(
+            Generation {
+                root: directory(0),
+                data: directory(1),
+                wal: directory(2),
+                temp: directory(3),
+                uds: directory(4),
+                materials: directory(5),
+            },
+            ["old-site", "control", "key-medium"].map(|component| ExcludedLocation {
+                parent: Directory {
+                    path: &root,
+                    original: &parent,
+                },
+                component,
+            }),
+            &imports,
+            65_536, // Explicit limit for this component test, not a product default.
+        )
+        .expect("prepare original policy");
+        let mut command = policy
+            .checked_postgres_command(&bundle, &[std::ffi::OsString::from("--version")])
+            .unwrap_or_else(|error| match error {
+                super::super::RestoreProgramFailure::Isolation(error) => {
+                    panic!("original policy command: {error:?}")
+                }
+                super::super::RestoreProgramFailure::Bundle(error) => {
+                    panic!("original bundle command: {error:?}")
+                }
+                _ => panic!("unexpected pre-spawn failure in original policy command"),
+            });
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                fs::write(results.join("spawn-error.txt"), format!("{error:?}\n"))
+                    .expect("retain spawn error");
+                panic!("original sandbox spawn failed: {error}");
+            }
+        };
+        let pid = child.id().expect("actual component Child pid");
+        let output = child
+            .wait_with_output()
+            .await
+            .expect("original component Child wait and pipes");
+        fs::write(results.join("stdout.txt"), &output.stdout).expect("retain full stdout");
+        fs::write(results.join("stderr.txt"), &output.stderr).expect("retain full stderr");
+        fs::write(
+            results.join("RESULT.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "component": "authenticated-postgres-version-under-original-policy",
+            "pid": pid, "status": output.status.code(), "success": output.status.success(),
+            "signal": output.status.signal(), "core_dumped": output.status.core_dumped(),
+            "status_debug": format!("{:?}", output.status),
+                "stdout_bytes": output.stdout.len(), "stderr_bytes": output.stderr.len(),
+                "original_child_wait_completed": true,
+                "candidate_database_started": false,
+            }))
+            .expect("result JSON"),
+        )
+        .expect("retain actual result");
+        assert!(
+            output.status.success(),
+            "original policy refused ({:?}); see retained raw outputs",
+            output.status
+        );
+        assert_eq!(output.stdout, b"postgres (PostgreSQL) 17.11\n");
+        assert!(output.stderr.is_empty(), "see retained component stderr");
+        drop(excluded_held);
+        drop(held);
+        drop(parent);
+        drop(fixture);
+    }
+
     #[test]
     fn policy_text_injection_and_untrusted_loader_roots_are_rejected() {
         for text in [
