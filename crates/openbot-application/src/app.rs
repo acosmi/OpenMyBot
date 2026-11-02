@@ -979,6 +979,26 @@ where
                     .await?,
                 ))
             }
+            AppCommand::ListBotThreads {
+                bot_id,
+                status,
+                cursor,
+                limit,
+            } => Ok(AppReply::BotThreadPage(
+                crate::use_cases::thread::list_bot_threads(
+                    &self.threads,
+                    auth,
+                    bot_id,
+                    status,
+                    cursor,
+                    limit,
+                )
+                .await?,
+            )),
+            AppCommand::SetThreadTitle { thread_id, title } => Ok(AppReply::ThreadTitleSet(
+                crate::use_cases::thread::set_thread_title(&self.threads, auth, thread_id, title)
+                    .await?,
+            )),
             AppCommand::GetThreadStatus { thread_id } => Ok(AppReply::ThreadStatus(
                 get_thread_status(&self.threads, auth, &thread_id).await?,
             )),

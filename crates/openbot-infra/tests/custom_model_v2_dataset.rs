@@ -329,6 +329,65 @@ async fn original_dataset_accepts_both_anchors_three_protocols_and_exact_replay(
     }).await;
 }
 
+#[tokio::test]
+#[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
+async fn default_title_v2_uses_first_message_and_preserves_renames() {
+    harness::with_temp_database(
+        &harness::admin_config("v2_default_title"),
+        "v2title",
+        |config| async move {
+            let f = Fixture::new(config, 4).await;
+            let model = f.model(CustomModelProtocol::OpenaiChatCompletions).await;
+            let mut request = f.request(700, false, &model);
+            request.command.message = "\u{2003}v2 first title\u{2003}\nsecond line".into();
+            f.directory
+                .begin_thread_run_v2(request.clone())
+                .await
+                .unwrap();
+            let page = openbot_application::use_cases::thread::list_bot_threads(
+                &f.directory,
+                &auth(),
+                BotId::new("bot"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.threads[0].title.as_deref(), Some("v2 first title"));
+            openbot_application::use_cases::thread::set_thread_title(
+                &f.directory,
+                &auth(),
+                request.command.thread_id.clone(),
+                " renamed v2 ".into(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                f.directory
+                    .begin_thread_run_v2(request)
+                    .await
+                    .unwrap()
+                    .replayed
+            );
+            let page = openbot_application::use_cases::thread::list_bot_threads(
+                &f.directory,
+                &auth(),
+                BotId::new("bot"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.threads[0].title.as_deref(), Some("renamed v2"));
+            f.finish().await;
+            Ok(())
+        },
+    )
+    .await;
+}
+
 fn update(model: &ModelConnection) -> UpdateModelConnection {
     UpdateModelConnection {
         expected_revision: model.revision,

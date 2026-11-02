@@ -30,6 +30,12 @@ async fn w01_atomic_start_queue_and_replay() {
                 else {panic!("idle duplicate must replay one Run")};
             assert_ne!(left.replayed,right.replayed);
             assert_eq!(left.run_id,right.run_id);
+            let page = openbot_application::use_cases::thread::list_bot_threads(
+                &f.directory, &auth(), BotId::new("bot"), None, None, None,
+            ).await.unwrap();
+            let work = page.threads.iter().find(|work| work.thread_id == first.command.thread_id).unwrap();
+            assert_eq!(work.title.as_deref(), Some("Exact owned words"));
+            assert_eq!(work.pending_inputs, 0);
             let mut queued = first.clone();
             queued.command.run_id = RunId::new(format!("queued-{index}"));
             queued.command.message = format!("frozen follow-up {index}");
@@ -101,6 +107,11 @@ async fn w07_pending_capacity_and_withdrawal() {
         let mut overflow=first.clone();overflow.command.run_id=RunId::new("overflow");
         assert!(matches!(f.directory.submit_thread_input(overflow.clone(),None).await,Err(ThreadDirectoryError::PendingInputLimit)));
         assert_eq!(f.directory.list_pending_inputs(&auth(),&first.command.thread_id).await.unwrap().items.len(),20);
+        let page = openbot_application::use_cases::thread::list_bot_threads(
+            &f.directory, &auth(), BotId::new("bot"), None, None, None,
+        ).await.unwrap();
+        assert_eq!(page.threads.len(), 1);
+        assert_eq!(page.threads[0].pending_inputs, 20);
         assert!(matches!(accepted(f.directory.submit_thread_input(inputs[0].clone(),None).await),ThreadInputOutcome::Queued {..}));
         for input in [&inputs[0],&inputs[1]] {
             let receipt=f.directory.withdraw_pending_input(&auth(),&first.command.thread_id,&input.command.run_id).await.unwrap();
@@ -114,6 +125,11 @@ async fn w07_pending_capacity_and_withdrawal() {
         drop(c);
         assert!(matches!(f.directory.withdraw_pending_input(&auth(),&first.command.thread_id,&inputs[2].command.run_id).await,Err(ThreadDirectoryError::PendingInputState)));
         assert_eq!(f.directory.list_pending_inputs(&auth(),&first.command.thread_id).await.unwrap().items.len(),17);
+        let page = openbot_application::use_cases::thread::list_bot_threads(
+            &f.directory, &auth(), BotId::new("bot"), None, None, None,
+        ).await.unwrap();
+        assert_eq!(page.threads.len(), 1);
+        assert_eq!(page.threads[0].pending_inputs, 17);
         assert!(matches!(accepted(f.directory.submit_thread_input(overflow,None).await),ThreadInputOutcome::Queued {..}));
         f.finish().await;Ok(())
     }).await;

@@ -227,6 +227,7 @@ enum ComponentGovernanceRoute<'a> {
 
 #[derive(Clone, Copy)]
 enum AgentRoute<'a> {
+    Threads { raw_agent_id: &'a str },
     Detail { raw_agent_id: &'a str },
     Duplicate { raw_agent_id: &'a str },
     Hide { raw_agent_id: &'a str },
@@ -236,6 +237,7 @@ enum AgentRoute<'a> {
 
 #[derive(Clone, Copy)]
 enum AgentReplyKind {
+    Threads,
     Profile(StatusCode),
     CallbackToken,
     Empty,
@@ -255,6 +257,9 @@ enum ThreadRoute<'a> {
     WithdrawInput {
         raw_thread_id: &'a str,
         raw_run_id: &'a str,
+    },
+    Title {
+        raw_thread_id: &'a str,
     },
     Status {
         raw_thread_id: &'a str,
@@ -294,7 +299,8 @@ enum SensitiveBodyError {
 impl<'a> AgentRoute<'a> {
     fn raw_agent_id(self) -> &'a str {
         match self {
-            Self::Detail { raw_agent_id }
+            Self::Threads { raw_agent_id }
+            | Self::Detail { raw_agent_id }
             | Self::Duplicate { raw_agent_id }
             | Self::Hide { raw_agent_id }
             | Self::Unhide { raw_agent_id }
@@ -309,6 +315,7 @@ fn agent_route(path: &str) -> Option<AgentRoute<'_>> {
         .split('/')
         .collect::<Vec<_>>();
     match segments.as_slice() {
+        [raw_agent_id, "threads"] => Some(AgentRoute::Threads { raw_agent_id }),
         [raw_agent_id] => Some(AgentRoute::Detail { raw_agent_id }),
         [raw_agent_id, "duplicate"] => Some(AgentRoute::Duplicate { raw_agent_id }),
         [raw_agent_id, "hide"] => Some(AgentRoute::Hide { raw_agent_id }),
@@ -326,7 +333,8 @@ fn raw_channel_id(path: &str) -> Option<&str> {
 impl<'a> ThreadRoute<'a> {
     fn raw_thread_id(self) -> &'a str {
         match self {
-            Self::Status { raw_thread_id }
+            Self::Title { raw_thread_id }
+            | Self::Status { raw_thread_id }
             | Self::Conversation { raw_thread_id }
             | Self::Runs { raw_thread_id }
             | Self::Cancel { raw_thread_id, .. }
@@ -360,6 +368,9 @@ fn thread_route(path: &str) -> Option<ThreadRoute<'_>> {
         }
         [raw_thread_id, "conversation"] if !raw_thread_id.is_empty() => {
             Some(ThreadRoute::Conversation { raw_thread_id })
+        }
+        [raw_thread_id, "title"] if !raw_thread_id.is_empty() => {
+            Some(ThreadRoute::Title { raw_thread_id })
         }
         [raw_thread_id, "runs"] if !raw_thread_id.is_empty() => {
             Some(ThreadRoute::Runs { raw_thread_id })
@@ -2894,6 +2905,7 @@ impl DesktopTauriProtocol {
                 | (ThreadRoute::Cancel { .. }, &Method::POST)
                 | (ThreadRoute::Inputs { .. }, &Method::GET | &Method::POST)
                 | (ThreadRoute::WithdrawInput { .. }, &Method::POST)
+                | (ThreadRoute::Title { .. }, &Method::POST)
         );
         if !supported {
             request.body_mut().fill(0);
@@ -2956,6 +2968,23 @@ impl DesktopTauriProtocol {
                     AppCommand::WithdrawPendingInput {
                         thread_id,
                         run_id: RunId::new(run_id),
+                    },
+                )
+                .await
+            }
+            (ThreadRoute::Title { .. }, &Method::POST) => {
+                let body = match parse_sensitive_body::<
+                    openbot_contracts::command::SetThreadTitleBody,
+                >(&mut request, CHANNEL_THREAD_BODY_MAX_BYTES)
+                {
+                    Ok(body) => body,
+                    Err(error) => return sensitive_body_error_response(error),
+                };
+                self.thread_command(
+                    authority.auth,
+                    AppCommand::SetThreadTitle {
+                        thread_id,
+                        title: body.title,
                     },
                 )
                 .await
@@ -3033,6 +3062,7 @@ impl DesktopTauriProtocol {
             Ok(AppReply::ThreadInputOutcome(outcome)) => json_response(&outcome),
             Ok(AppReply::PendingInputs(inputs)) => json_response(&inputs),
             Ok(AppReply::PendingInputState(receipt)) => json_response(&receipt),
+            Ok(AppReply::ThreadTitleSet(receipt)) => json_response(&receipt),
             Ok(AppReply::ThreadStatus(status)) => json_response(&status),
             Ok(AppReply::ThreadConversation(snapshot)) => json_response(&snapshot),
             Ok(AppReply::ThreadRunStarted(started)) => {
@@ -3151,6 +3181,7 @@ impl DesktopTauriProtocol {
         let supported = matches!(
             (route, request.method()),
             (AgentRoute::Detail { .. }, &Method::GET)
+                | (AgentRoute::Threads { .. }, &Method::GET)
                 | (AgentRoute::Detail { .. }, &Method::PATCH)
                 | (AgentRoute::Detail { .. }, &Method::DELETE)
                 | (AgentRoute::Duplicate { .. }, &Method::POST)
@@ -3178,6 +3209,63 @@ impl DesktopTauriProtocol {
             }
         };
         let (command, reply_kind) = match (route, request.method()) {
+            (AgentRoute::Threads { .. }, &Method::GET) => {
+                if !request.body().is_empty() {
+                    request.body_mut().fill(0);
+                    return error_response(AppError::MalformedPayload { field: "body" });
+                }
+                use openbot_contracts::command::{BotThreadListQuery, ThreadStatusFilter};
+                let mut query = BotThreadListQuery::default();
+                for pair in request
+                    .uri()
+                    .query()
+                    .unwrap_or_default()
+                    .split('&')
+                    .filter(|pair| !pair.is_empty())
+                {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    let (Some(key), Some(value)) = (
+                        percent_decode_query_component(key),
+                        percent_decode_query_component(value),
+                    ) else {
+                        return error_response(AppError::MalformedPayload { field: "query" });
+                    };
+                    match key.as_str() {
+                        "status" if query.status.is_none() => {
+                            query.status = Some(match value.as_str() {
+                                "active" => ThreadStatusFilter::Active,
+                                "archived" => ThreadStatusFilter::Archived,
+                                _ => {
+                                    return error_response(AppError::MalformedPayload {
+                                        field: "query",
+                                    });
+                                }
+                            });
+                        }
+                        "limit" if query.limit.is_none() => {
+                            query.limit = Some(match value.parse() {
+                                Ok(limit) => limit,
+                                Err(_) => {
+                                    return error_response(AppError::MalformedPayload {
+                                        field: "query",
+                                    });
+                                }
+                            });
+                        }
+                        "cursor" if query.cursor.is_none() => query.cursor = Some(value),
+                        _ => return error_response(AppError::MalformedPayload { field: "query" }),
+                    }
+                }
+                (
+                    AppCommand::ListBotThreads {
+                        bot_id: agent_id,
+                        status: query.status,
+                        cursor: query.cursor,
+                        limit: query.limit,
+                    },
+                    AgentReplyKind::Threads,
+                )
+            }
             (AgentRoute::Detail { .. }, &Method::GET) if request.body().is_empty() => (
                 AppCommand::GetVisibleAgent { agent_id },
                 AgentReplyKind::Profile(StatusCode::OK),
@@ -3233,6 +3321,7 @@ impl DesktopTauriProtocol {
             self.transport.execute(authority.auth, command).await,
             reply_kind,
         ) {
+            (Ok(AppReply::BotThreadPage(page)), AgentReplyKind::Threads) => json_response(&page),
             (Ok(AppReply::Agent(agent)), AgentReplyKind::Profile(status)) => {
                 json_response_with_status(&AgentProfileResponse { agent }, status)
             }
@@ -5241,6 +5330,59 @@ mod tests {
             })
         }
 
+        async fn list_bot_threads(
+            &self,
+            auth: &AuthContext,
+            bot_id: &BotId,
+            status: openbot_contracts::command::ThreadStatusFilter,
+            cursor: Option<openbot_application::BotThreadCursor>,
+            limit: u32,
+        ) -> Result<openbot_contracts::command::BotThreadPage, ThreadDirectoryError> {
+            Self::authorize_scope(auth.deployment(), auth.tenant(), auth.actor())?;
+            if bot_id.as_str() == "missing" {
+                return Err(ThreadDirectoryError::NotVisible);
+            }
+            if bot_id.as_str() == "default" {
+                assert_eq!(
+                    status,
+                    openbot_contracts::command::ThreadStatusFilter::Active
+                );
+                assert_eq!(limit, 50);
+                assert!(cursor.is_none());
+                return Ok(openbot_contracts::command::BotThreadPage::default());
+            }
+            assert_eq!(bot_id.as_str(), "agent-one");
+            assert_eq!(
+                status,
+                openbot_contracts::command::ThreadStatusFilter::Archived
+            );
+            assert_eq!(limit, 7);
+            let cursor = cursor.expect("the protocol must preserve the cursor");
+            assert_eq!(cursor.updated_at, time::OffsetDateTime::UNIX_EPOCH);
+            assert_eq!(
+                cursor.thread_id.as_str(),
+                "550e8400-e29b-41d4-a716-446655440000"
+            );
+            Ok(openbot_contracts::command::BotThreadPage::default())
+        }
+
+        async fn set_thread_title(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            title: String,
+        ) -> Result<openbot_contracts::command::ThreadTitleSet, ThreadDirectoryError> {
+            Self::authorize_scope(auth.deployment(), auth.tenant(), auth.actor())?;
+            assert_eq!(title, "renamed");
+            if thread_id.as_str().ends_with("0001") {
+                return Err(ThreadDirectoryError::AnchorUnsupported);
+            }
+            Ok(openbot_contracts::command::ThreadTitleSet {
+                thread_id: thread_id.clone(),
+                title,
+            })
+        }
+
         async fn mint_thread_id(
             &self,
             deployment: &DeploymentId,
@@ -6693,6 +6835,105 @@ mod tests {
             assert_eq!(body, expected, "{uri}");
         }
         protocol.unbind_window("pending-inputs").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bot_thread_protocol_commands_preserve_inputs_and_errors() {
+        let (protocol, root) = protocol();
+        protocol.bind_window("bot-threads", auth(), None).unwrap();
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for (method, uri, body, expected_status, expected_body) in [
+            (
+                Method::GET,
+                "/api/agents/default/threads".into(),
+                String::new(),
+                200,
+                json!({"threads":[],"nextCursor":null}),
+            ),
+            (
+                Method::GET,
+                format!(
+                    "/api/agents/agent-one/threads?status=archived&limit=7&cursor=0%3A{thread}"
+                ),
+                String::new(),
+                200,
+                json!({"threads":[],"nextCursor":null}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/missing/threads".into(),
+                String::new(),
+                404,
+                json!({"code":"not_visible"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/agent-one/threads?limit=0".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/agent-one/threads?status=other".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/agent-one/threads?limit=1&limit=2".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/agent-one/threads".into(),
+                "x".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/title"),
+                r#"{"title":"  renamed  "}"#.into(),
+                200,
+                json!({"threadId":thread,"title":"renamed"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440001/title".into(),
+                r#"{"title":"renamed"}"#.into(),
+                400,
+                json!({"code":"anchor_unsupported"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/title"),
+                r#"{"title":"renamed","unexpected":true}"#.into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+        ] {
+            let response = protocol
+                .handle(
+                    "bot-threads",
+                    Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header("content-type", "application/json")
+                        .body(body.into_bytes())
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(response.status().as_u16(), expected_status, "{uri}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{uri}");
+            let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(body, expected_body, "{uri}");
+        }
+        protocol.unbind_window("bot-threads").unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

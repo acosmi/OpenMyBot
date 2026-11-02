@@ -381,6 +381,8 @@ impl AgentToolGateway {
                 | AppReply::ThreadInputOutcome(_)
                 | AppReply::PendingInputs(_)
                 | AppReply::PendingInputState(_)
+                | AppReply::BotThreadPage(_)
+                | AppReply::ThreadTitleSet(_)
                 | AppReply::ThreadRunStarted(_)
                 | AppReply::ThreadRunCancellation(_)
                 | AppReply::ThreadHistoryDeletion(_)
@@ -1201,6 +1203,14 @@ mod tests {
             AppReply::PendingInputState(openbot_contracts::command::PendingInputReceipt {
                 run_id: RunId::new("input-1"),
                 state: openbot_contracts::command::PendingInputState::Withdrawn,
+            }),
+            AppReply::BotThreadPage(openbot_contracts::command::BotThreadPage {
+                threads: vec![],
+                next_cursor: None,
+            }),
+            AppReply::ThreadTitleSet(openbot_contracts::command::ThreadTitleSet {
+                thread_id: ThreadId::new("thread-1"),
+                title: "work".into(),
             }),
         ] {
             let application = Arc::new(FakeApplication {

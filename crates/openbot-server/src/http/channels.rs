@@ -166,6 +166,8 @@ pub async fn list(
         | AppReply::ThreadInputOutcome(_)
         | AppReply::PendingInputs(_)
         | AppReply::PendingInputState(_)
+        | AppReply::BotThreadPage(_)
+        | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
         | AppReply::ThreadRunCancellation(_)
         | AppReply::ThreadHistoryDeletion(_)
@@ -272,6 +274,8 @@ pub async fn get(
         | AppReply::ThreadInputOutcome(_)
         | AppReply::PendingInputs(_)
         | AppReply::PendingInputState(_)
+        | AppReply::BotThreadPage(_)
+        | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
         | AppReply::ThreadRunCancellation(_)
         | AppReply::ThreadHistoryDeletion(_)
@@ -384,6 +388,8 @@ pub async fn create(
         | AppReply::ThreadInputOutcome(_)
         | AppReply::PendingInputs(_)
         | AppReply::PendingInputState(_)
+        | AppReply::BotThreadPage(_)
+        | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
         | AppReply::ThreadRunCancellation(_)
         | AppReply::ThreadHistoryDeletion(_)
@@ -769,7 +775,7 @@ mod tests {
                 })
             }
         }
-        let replies: [fn() -> AppReply; 3] = [
+        let replies: [fn() -> AppReply; 5] = [
             || {
                 AppReply::ThreadInputOutcome(
                     openbot_contracts::command::ThreadInputOutcome::Queued {
@@ -783,6 +789,18 @@ mod tests {
                 AppReply::PendingInputState(openbot_contracts::command::PendingInputReceipt {
                     run_id: openbot_contracts::ids::RunId::new("input-1"),
                     state: openbot_contracts::command::PendingInputState::Withdrawn,
+                })
+            },
+            || {
+                AppReply::BotThreadPage(openbot_contracts::command::BotThreadPage {
+                    threads: vec![],
+                    next_cursor: None,
+                })
+            },
+            || {
+                AppReply::ThreadTitleSet(openbot_contracts::command::ThreadTitleSet {
+                    thread_id: ThreadId::new("thread-1"),
+                    title: "work".into(),
                 })
             },
         ];

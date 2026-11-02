@@ -57,6 +57,71 @@ pub async fn get_thread_status<D: ThreadDirectory>(
     Ok(ThreadStatus { known })
 }
 
+/// Validate the external page position and bounds before querying direct conversations.
+pub async fn list_bot_threads<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    bot_id: openbot_contracts::ids::BotId,
+    status: Option<openbot_contracts::command::ThreadStatusFilter>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<openbot_contracts::command::BotThreadPage, AppError> {
+    if bot_id.as_str().is_empty() {
+        return Err(AppError::MalformedPayload { field: "bot_id" });
+    }
+    let limit = limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::MalformedPayload { field: "limit" });
+    }
+    let cursor = match cursor {
+        None => None,
+        Some(raw) => {
+            let malformed = || AppError::MalformedPayload { field: "cursor" };
+            let (timestamp, thread) = raw.split_once(':').ok_or_else(malformed)?;
+            let updated_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+                timestamp.parse().map_err(|_| malformed())?,
+            )
+            .map_err(|_| malformed())?;
+            let thread_id = ThreadId::new(thread);
+            if !ThreadIdentity::is_plausible(&thread_id) {
+                return Err(malformed());
+            }
+            Some(crate::BotThreadCursor {
+                updated_at,
+                thread_id,
+            })
+        }
+    };
+    directory
+        .list_bot_threads(auth, &bot_id, status.unwrap_or_default(), cursor, limit)
+        .await
+        .map_err(|error| error.into_app_error())
+}
+
+/// Normalize and validate a rename once before passing it to the transaction owner.
+pub async fn set_thread_title<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    title: String,
+) -> Result<openbot_contracts::command::ThreadTitleSet, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    let title = title.trim();
+    if title.is_empty()
+        || title.len() > 480
+        || title.chars().count() > 120
+        || title.chars().any(char::is_control)
+    {
+        return Err(AppError::MalformedPayload { field: "title" });
+    }
+    directory
+        .set_thread_title(auth, &thread_id, title.to_owned())
+        .await
+        .map_err(|error| error.into_app_error())
+}
+
 /// 校验 caller-controlled 字段后，把一次 foreground turn 交给唯一事务端口。
 pub async fn begin_thread_run<D: ThreadDirectory>(
     directory: &D,

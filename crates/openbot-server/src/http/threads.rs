@@ -203,6 +203,71 @@ fn valid_reconciliation_percent_escapes(raw: &str) -> bool {
     true
 }
 
+/// Read the current actor's direct conversations with the selected Bot.
+pub async fn list_bot_threads(
+    State(state): State<ServerState>,
+    Authenticated(auth): Authenticated,
+    Path(bot_id): Path<String>,
+    query: Result<Query<openbot_contracts::command::BotThreadListQuery>, QueryRejection>,
+    request: Request,
+) -> Result<(HeaderMap, Json<openbot_contracts::command::BotThreadPage>), HttpError> {
+    let Query(query) = query.map_err(|_| AppError::MalformedPayload { field: "query" })?;
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    let reply = state
+        .application()
+        .execute(
+            auth,
+            AppCommand::ListBotThreads {
+                bot_id: openbot_contracts::ids::BotId::new(bot_id),
+                status: query.status,
+                cursor: query.cursor,
+                limit: query.limit,
+            },
+        )
+        .await?;
+    match reply {
+        AppReply::BotThreadPage(page) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok((headers, Json(page)))
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Rename a conversation through the shared application boundary.
+pub async fn set_title(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    body: Result<Json<openbot_contracts::command::SetThreadTitleBody>, JsonRejection>,
+) -> Result<(HeaderMap, Json<openbot_contracts::command::ThreadTitleSet>), HttpError> {
+    let Json(body) = body.map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::SetThreadTitle {
+                thread_id: ThreadId::new(thread_id),
+                title: body.title,
+            },
+        )
+        .await?
+    {
+        AppReply::ThreadTitleSet(receipt) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok((headers, Json(receipt)))
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
 /// `POST /api/threads/mint`：为已认证 actor 铸造当前 deployment 的 UUIDv8。
 pub async fn mint(
     State(state): State<ServerState>,
@@ -965,6 +1030,59 @@ mod tests {
             })
         }
 
+        async fn list_bot_threads(
+            &self,
+            auth: &AuthContext,
+            bot_id: &openbot_contracts::ids::BotId,
+            status: openbot_contracts::command::ThreadStatusFilter,
+            cursor: Option<openbot_application::BotThreadCursor>,
+            limit: u32,
+        ) -> Result<openbot_contracts::command::BotThreadPage, ThreadDirectoryError> {
+            if bot_id.as_str() == "missing" {
+                return Err(ThreadDirectoryError::NotVisible);
+            }
+            assert_eq!(auth.actor().as_str(), "u1");
+            if bot_id.as_str() == "default" {
+                assert_eq!(
+                    status,
+                    openbot_contracts::command::ThreadStatusFilter::Active
+                );
+                assert_eq!(limit, 50);
+                assert!(cursor.is_none());
+                return Ok(openbot_contracts::command::BotThreadPage::default());
+            }
+            assert_eq!(bot_id.as_str(), "bot");
+            assert_eq!(
+                status,
+                openbot_contracts::command::ThreadStatusFilter::Archived
+            );
+            assert_eq!(limit, 7);
+            let cursor = cursor.expect("the transport must preserve the cursor");
+            assert_eq!(cursor.updated_at, time::OffsetDateTime::UNIX_EPOCH);
+            assert_eq!(
+                cursor.thread_id.as_str(),
+                "550e8400-e29b-41d4-a716-446655440000"
+            );
+            Ok(openbot_contracts::command::BotThreadPage::default())
+        }
+
+        async fn set_thread_title(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            title: String,
+        ) -> Result<openbot_contracts::command::ThreadTitleSet, ThreadDirectoryError> {
+            assert_eq!(auth.actor().as_str(), "u1");
+            assert_eq!(title, "renamed");
+            if thread_id.as_str().ends_with("0001") {
+                return Err(ThreadDirectoryError::AnchorUnsupported);
+            }
+            Ok(openbot_contracts::command::ThreadTitleSet {
+                thread_id: thread_id.clone(),
+                title,
+            })
+        }
+
         async fn mint_thread_id(
             &self,
             deployment: &DeploymentId,
@@ -1212,6 +1330,106 @@ mod tests {
                 serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
                     .unwrap();
             assert_eq!(body, expected, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bot_thread_http_commands_preserve_inputs_and_errors() {
+        use serde_json::json;
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for (method, uri, body, expected_status, expected_body) in [
+            (
+                Method::GET,
+                "/api/agents/default/threads".into(),
+                String::new(),
+                200,
+                json!({"threads":[],"nextCursor":null}),
+            ),
+            (
+                Method::GET,
+                format!("/api/agents/bot/threads?status=archived&limit=7&cursor=0%3A{thread}"),
+                String::new(),
+                200,
+                json!({"threads":[],"nextCursor":null}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/missing/threads".into(),
+                String::new(),
+                404,
+                json!({"code":"not_visible"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads?limit=0".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads?status=other".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads?limit=1&limit=2".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads".into(),
+                "x".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/title"),
+                r#"{"title":"  renamed  "}"#.into(),
+                200,
+                json!({"threadId":thread,"title":"renamed"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440001/title".into(),
+                r#"{"title":"renamed"}"#.into(),
+                400,
+                json!({"code":"anchor_unsupported"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/title"),
+                r#"{"title":"renamed","unexpected":true}"#.into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+        ] {
+            let response = app(
+                FakeThreadDirectory::new(Ok(true)),
+                FixedAuthResolver::granting(auth("u1")),
+            )
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("origin", "https://app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), expected_status, "{uri}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{uri}");
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body, expected_body, "{uri}");
         }
     }
 

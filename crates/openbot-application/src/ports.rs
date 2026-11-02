@@ -666,6 +666,15 @@ pub enum SubmitThreadInputAttempt {
     NeedsArtifacts,
 }
 
+/// Parsed position in the direct Bot conversation ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotThreadCursor {
+    /// Authoritative update time carried by the preceding page.
+    pub updated_at: time::OffsetDateTime,
+    /// Stable tie breaker within that update time.
+    pub thread_id: ThreadId,
+}
+
 /// application 已把权威 scope 与封闭 command 合并后的事务请求。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BeginThreadRunRequest {
@@ -842,6 +851,27 @@ pub trait ThreadDirectory: Send + Sync {
         Err(ThreadDirectoryError::Unavailable)
     }
 
+    /// Read a bounded, actor-scoped direct conversation page.
+    async fn list_bot_threads(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _bot_id: &BotId,
+        _status: openbot_contracts::command::ThreadStatusFilter,
+        _cursor: Option<BotThreadCursor>,
+        _limit: u32,
+    ) -> Result<openbot_contracts::command::BotThreadPage, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Store an application-validated title and update the conversation's recency.
+    async fn set_thread_title(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _thread_id: &ThreadId,
+        _title: String,
+    ) -> Result<openbot_contracts::command::ThreadTitleSet, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
     /// 以 OS CSPRNG 铸造当前 deployment 的 UUIDv8 thread ID。
     async fn mint_thread_id(
         &self,

@@ -226,6 +226,8 @@ pub const fn command_kind(command: &AppCommand) -> &'static str {
         AppCommand::SubmitThreadInput(_) => "submit_thread_input",
         AppCommand::ListPendingInputs { .. } => "list_pending_inputs",
         AppCommand::WithdrawPendingInput { .. } => "withdraw_pending_input",
+        AppCommand::ListBotThreads { .. } => "list_bot_threads",
+        AppCommand::SetThreadTitle { .. } => "set_thread_title",
         AppCommand::GetThreadStatus { .. } => "get_thread_status",
         AppCommand::BeginThreadRun(_) => "begin_thread_run",
         AppCommand::BeginThreadRunV2(_) => "begin_thread_run_v2",
