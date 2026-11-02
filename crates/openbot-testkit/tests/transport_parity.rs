@@ -522,6 +522,9 @@ fn http_route_of(command: &AppCommand) -> Option<String> {
         | AppCommand::SubmitThreadInput(_)
         | AppCommand::ListPendingInputs { .. }
         | AppCommand::WithdrawPendingInput { .. }
+        | AppCommand::ReleasePendingInput { .. }
+        | AppCommand::StopThreadWork { .. }
+        | AppCommand::CompleteThread { .. }
         | AppCommand::ListBotThreads { .. }
         | AppCommand::SetThreadTitle { .. }
         | AppCommand::GetThreadStatus { .. }

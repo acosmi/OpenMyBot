@@ -6,7 +6,7 @@ use openbot_contracts::auth::{AuthContextBuilder, AuthGeneration, Role};
 use openbot_contracts::command::BeginThreadRunV2;
 use openbot_contracts::error::AppError;
 use openbot_contracts::ids::{ActorId, DeploymentId, TenantId, ThreadId};
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 /// Current database authority and frozen payload, verified inside the pending row transaction.
 pub struct VerifiedPendingInput {
@@ -52,14 +52,17 @@ pub trait PendingInputWake: Send + Sync {
 }
 
 /// The sole consumer of durable direct conversation input.
-pub struct PendingInputDispatcher<D: ThreadDirectory> {
-    directory: Arc<D>,
+pub struct PendingInputDispatcher<D> {
+    directory: D,
     artifacts: Arc<dyn ArtifactAdministration>,
 }
 
-impl<D: ThreadDirectory> PendingInputDispatcher<D> {
+impl<D: Deref + Send + Sync> PendingInputDispatcher<D>
+where
+    D::Target: ThreadDirectory,
+{
     /// Use the same thread and artifact authorities as ordinary BeginV2.
-    pub fn new(directory: Arc<D>, artifacts: Arc<dyn ArtifactAdministration>) -> Self {
+    pub fn new(directory: D, artifacts: Arc<dyn ArtifactAdministration>) -> Self {
         Self {
             directory,
             artifacts,
@@ -94,7 +97,10 @@ impl<D: ThreadDirectory> PendingInputDispatcher<D> {
 }
 
 #[async_trait]
-impl<D: ThreadDirectory> PendingInputWake for PendingInputDispatcher<D> {
+impl<D: Deref + Send + Sync> PendingInputWake for PendingInputDispatcher<D>
+where
+    D::Target: ThreadDirectory,
+{
     async fn wake(&self, thread: &ThreadId) -> Result<(), AppError> {
         self.wake(thread).await
     }
@@ -104,7 +110,10 @@ impl<D: ThreadDirectory> PendingInputWake for PendingInputDispatcher<D> {
 }
 
 #[async_trait]
-impl<D: ThreadDirectory> PendingInputConsumer for PendingInputDispatcher<D> {
+impl<D: Deref + Send + Sync> PendingInputConsumer for PendingInputDispatcher<D>
+where
+    D::Target: ThreadDirectory,
+{
     async fn begin(
         &self,
         input: VerifiedPendingInput,

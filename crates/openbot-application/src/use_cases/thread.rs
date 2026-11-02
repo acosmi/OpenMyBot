@@ -361,6 +361,59 @@ pub async fn withdraw_pending_input<D: ThreadDirectory>(
         .map_err(|error| error.into_app_error())
 }
 
+/// Hold pending work and preserve the ordinary cancellation contract.
+pub async fn stop_thread_work<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    run_id: Option<openbot_contracts::ids::RunId>,
+) -> Result<openbot_contracts::command::ThreadWorkStopped, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    if run_id.as_ref().is_some_and(|run| run.as_str().is_empty()) {
+        return Err(AppError::MalformedPayload { field: "run_id" });
+    }
+    directory
+        .stop_thread_work(auth, &thread_id, run_id.as_ref())
+        .await
+        .map_err(|e| e.into_app_error())
+}
+
+/// Release a held input under current authority before the postcommit wake.
+pub async fn release_pending_input<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    run_id: openbot_contracts::ids::RunId,
+) -> Result<openbot_contracts::command::PendingInputReceipt, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    if run_id.as_str().is_empty() {
+        return Err(AppError::MalformedPayload { field: "run_id" });
+    }
+    directory
+        .release_pending_input(auth, &thread_id, &run_id)
+        .await
+        .map_err(|e| e.into_app_error())
+}
+
+/// Complete a conversation only after all foreground and retained work has settled.
+pub async fn complete_thread<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+) -> Result<openbot_contracts::command::ThreadCompleted, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    directory
+        .complete_thread(auth, &thread_id)
+        .await
+        .map_err(|e| e.into_app_error())
+}
+
 fn artifact_refs_malformed() -> AppError {
     AppError::MalformedPayload {
         field: "artifact_refs",

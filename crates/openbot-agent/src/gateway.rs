@@ -381,6 +381,8 @@ impl AgentToolGateway {
                 | AppReply::ThreadInputOutcome(_)
                 | AppReply::PendingInputs(_)
                 | AppReply::PendingInputState(_)
+                | AppReply::ThreadWorkStopped(_)
+                | AppReply::ThreadCompleted(_)
                 | AppReply::BotThreadPage(_)
                 | AppReply::ThreadTitleSet(_)
                 | AppReply::ThreadRunStarted(_)
@@ -615,6 +617,7 @@ impl AuthorizedAgentToolGateway {
                 | AppError::AnchorUnsupported
                 | AppError::PendingInputLimit
                 | AppError::PendingInputState
+                | AppError::ThreadNotIdle { .. }
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -701,6 +704,7 @@ impl AuthorizedAgentToolGateway {
                 | AppError::AnchorUnsupported
                 | AppError::PendingInputLimit
                 | AppError::PendingInputState
+                | AppError::ThreadNotIdle { .. }
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -771,6 +775,7 @@ impl AuthorizedAgentToolGateway {
                 | AppError::AnchorUnsupported
                 | AppError::PendingInputLimit
                 | AppError::PendingInputState
+                | AppError::ThreadNotIdle { .. }
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -897,6 +902,7 @@ fn map_application_reply(
             | AppError::AnchorUnsupported
             | AppError::PendingInputLimit
             | AppError::PendingInputState
+            | AppError::ThreadNotIdle { .. }
             | AppError::ArtifactGone { .. }
             | AppError::DependencyUnavailable { .. }
             | AppError::VendorFailure { .. }
@@ -1199,6 +1205,13 @@ mod tests {
                 run_id: RunId::new("input-1"),
                 position: 1,
             }),
+            AppReply::ThreadWorkStopped(openbot_contracts::command::ThreadWorkStopped {
+                held: 1,
+                cancellation: None,
+            }),
+            AppReply::ThreadCompleted(openbot_contracts::command::ThreadCompleted {
+                status: openbot_contracts::command::ThreadStatusFilter::Archived,
+            }),
             AppReply::PendingInputs(openbot_contracts::command::PendingInputs::default()),
             AppReply::PendingInputState(openbot_contracts::command::PendingInputReceipt {
                 run_id: RunId::new("input-1"),
@@ -1234,6 +1247,10 @@ mod tests {
             AppError::AnchorUnsupported,
             AppError::PendingInputLimit,
             AppError::PendingInputState,
+            AppError::ThreadNotIdle {
+                foreground: None,
+                pending_inputs: 1,
+            },
         ] {
             assert!(matches!(
                 map_application_reply(ToolCallId::new("call-1"), Err(error)),

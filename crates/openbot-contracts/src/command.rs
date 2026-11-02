@@ -433,6 +433,26 @@ pub enum AppCommand {
         run_id: RunId,
     },
 
+    /// Requeue a held input under the current user generation.
+    ReleasePendingInput {
+        /// Visible direct conversation.
+        thread_id: ThreadId,
+        /// Original held input identity.
+        run_id: RunId,
+    },
+    /// Hold pending input and optionally request cancellation of the current Run.
+    StopThreadWork {
+        /// Visible direct conversation.
+        thread_id: ThreadId,
+        /// Current foreground candidate; omission holds input only.
+        run_id: Option<RunId>,
+    },
+    /// Archive an idle direct conversation.
+    CompleteThread {
+        /// Visible direct conversation.
+        thread_id: ThreadId,
+    },
+
     /// List the current actor's direct conversations with one visible Bot.
     ListBotThreads {
         /// Selected Bot whose visibility is checked by the application.
@@ -789,6 +809,10 @@ pub enum AppReply {
     PendingInputs(PendingInputs),
     /// Committed state of an individually addressed input.
     PendingInputState(PendingInputReceipt),
+    /// Atomic hold and original cancellation receipt.
+    ThreadWorkStopped(ThreadWorkStopped),
+    /// Idle conversation archived.
+    ThreadCompleted(ThreadCompleted),
     /// Current actor's requested page of direct conversations.
     BotThreadPage(BotThreadPage),
     /// Committed normalized conversation title.
@@ -1251,6 +1275,32 @@ pub struct PendingInputReceipt {
     pub state: PendingInputState,
 }
 
+/// Result of holding a conversation's pending inputs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadWorkStopped {
+    /// Number of pending rows held by this transaction.
+    pub held: u32,
+    /// Original cancellation receipt only for the selected foreground Run.
+    pub cancellation: Option<ThreadRunCancellation>,
+}
+
+/// Result of archiving an idle conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadCompleted {
+    /// Existing conversation lifecycle status.
+    pub status: ThreadStatusFilter,
+}
+
+/// Optional current foreground identity for a stop request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopThreadWorkBody {
+    /// Omission only holds pending input.
+    pub run_id: Option<RunId>,
+}
+
 /// Minimal input for durable foreground-run cancellation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1679,6 +1729,60 @@ pub struct ThreadRunEvent {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn work_control_commands_and_receipts_keep_closed_wire_shapes() {
+        for (command, expected) in [
+            (
+                AppCommand::StopThreadWork {
+                    thread_id: ThreadId::new("thread"),
+                    run_id: Some(RunId::new("run")),
+                },
+                serde_json::json!({"kind":"stop_thread_work","thread_id":"thread","run_id":"run"}),
+            ),
+            (
+                AppCommand::ReleasePendingInput {
+                    thread_id: ThreadId::new("thread"),
+                    run_id: RunId::new("run"),
+                },
+                serde_json::json!({"kind":"release_pending_input","thread_id":"thread","run_id":"run"}),
+            ),
+            (
+                AppCommand::CompleteThread {
+                    thread_id: ThreadId::new("thread"),
+                },
+                serde_json::json!({"kind":"complete_thread","thread_id":"thread"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&command).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_value(
+                    serde_json::from_value::<AppCommand>(expected.clone()).unwrap()
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(ThreadWorkStopped {
+                held: 2,
+                cancellation: None
+            })
+            .unwrap(),
+            serde_json::json!({"held":2,"cancellation":null})
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadCompleted {
+                status: ThreadStatusFilter::Archived
+            })
+            .unwrap(),
+            serde_json::json!({"status":"archived"})
+        );
+        assert!(
+            serde_json::from_str::<StopThreadWorkBody>(r#"{"runId":"run","authGeneration":1}"#)
+                .is_err()
+        );
+    }
 
     #[test]
     fn pending_input_outcome_wire_is_closed() {

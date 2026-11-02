@@ -1133,6 +1133,197 @@ impl ThreadDirectory for PostgresThreadDirectory {
         Ok(openbot_contracts::command::PendingInputs { items })
     }
 
+    async fn stop_thread_work(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+        run_id: Option<&openbot_contracts::ids::RunId>,
+    ) -> Result<openbot_contracts::command::ThreadWorkStopped, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread_id.as_str()],
+        )
+        .await
+        .map_err(|e| unavailable("lock work conversation", e))?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        let now = database_now(&tx).await?;
+        let held = tx.execute("UPDATE openbot_internal.thread_pending_inputs SET state='held',held_reason='stopped_by_user',state_changed_at=$2 WHERE thread_id=$1 AND state='pending'", &[&thread_id.as_str(), &now]).await.map_err(|e| write_error("hold stopped inputs",e))?;
+        let mut cancellation = None;
+        if let Some(run_id) = run_id {
+            checked_thread_occupancy(&tx, thread_id).await?;
+            let current = tx
+                .query_opt(
+                    "SELECT run_id FROM public.thread_run_occupancy WHERE thread_id=$1",
+                    &[&thread_id.as_str()],
+                )
+                .await
+                .map_err(|e| unavailable("read stopped foreground", e))?;
+            if current
+                .as_ref()
+                .map(|row| decode::<String>(row, "run_id"))
+                .transpose()?
+                .as_deref()
+                == Some(run_id.as_str())
+            {
+                if self.runtime.is_none() {
+                    return Err(ThreadDirectoryError::Unavailable);
+                }
+                let request = CancelThreadRunRequest {
+                    deployment: auth.deployment().clone(),
+                    tenant: auth.tenant().clone(),
+                    actor: auth.actor().clone(),
+                    command: openbot_contracts::command::CancelThreadRun {
+                        thread_id: thread_id.clone(),
+                        run_id: run_id.clone(),
+                    },
+                };
+                cancellation = Some(match request_run_cancellation(&tx, &request).await? {
+                    CancelRequestOutcome::Created(reply)
+                    | CancelRequestOutcome::Observed(reply) => reply,
+                });
+            }
+        }
+        tx.execute(
+            "UPDATE public.threads SET updated_at=$2 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|e| write_error("touch stopped conversation", e))?;
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
+        Ok(openbot_contracts::command::ThreadWorkStopped {
+            held: u32::try_from(held).map_err(|_| ThreadDirectoryError::Corrupt {
+                field: "pending_inputs",
+            })?,
+            cancellation,
+        })
+    }
+
+    async fn release_pending_input(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+        run_id: &openbot_contracts::ids::RunId,
+    ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread_id.as_str()],
+        )
+        .await
+        .map_err(|e| unavailable("lock work conversation", e))?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        let row = tx.query_opt("SELECT state FROM openbot_internal.thread_pending_inputs WHERE thread_id=$1 AND run_id=$2 FOR UPDATE", &[&thread_id.as_str(), &run_id.as_str()]).await.map_err(|e| unavailable("read released input",e))?.ok_or(ThreadDirectoryError::NotVisible)?;
+        if decode::<String>(&row, "state")? != "held" {
+            return Err(ThreadDirectoryError::PendingInputState);
+        }
+        let generation = i64::try_from(auth.auth_generation().get()).map_err(|_| {
+            ThreadDirectoryError::InvalidInput {
+                field: "auth_generation",
+            }
+        })?;
+        let now = database_now(&tx).await?;
+        tx.execute("UPDATE openbot_internal.thread_pending_inputs SET state='pending',queued_at=$3,auth_generation=$4,held_reason=NULL,last_error=NULL,state_changed_at=$3 WHERE thread_id=$1 AND run_id=$2", &[&thread_id.as_str(), &run_id.as_str(), &now, &generation]).await.map_err(|e| write_error("release held input",e))?;
+        tx.execute(
+            "UPDATE public.threads SET updated_at=$2 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|e| write_error("touch released conversation", e))?;
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
+        Ok(openbot_contracts::command::PendingInputReceipt {
+            run_id: run_id.clone(),
+            state: openbot_contracts::command::PendingInputState::Pending,
+        })
+    }
+
+    async fn complete_thread(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+    ) -> Result<openbot_contracts::command::ThreadCompleted, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread_id.as_str()],
+        )
+        .await
+        .map_err(|e| unavailable("lock work conversation", e))?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        checked_thread_occupancy(&tx, thread_id).await?;
+        let row = tx.query_one("SELECT r.status AS run_status, EXISTS(SELECT 1 FROM public.outbox o WHERE o.aggregate_id=r.run_id AND o.destination=$2 AND o.status<>'dead_letter') AS cancel_requested, (SELECT count(*) FROM openbot_internal.thread_pending_inputs p WHERE p.thread_id=$1 AND p.state IN ('pending','held')) AS pending_inputs, EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_intents q WHERE q.thread_id=$1 AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions c WHERE c.operation_id=q.operation_id)) AS clearing FROM (SELECT $1::text AS thread_id) t LEFT JOIN public.thread_run_occupancy slot ON slot.thread_id=t.thread_id LEFT JOIN public.runs r ON r.run_id=slot.run_id AND r.thread_id=t.thread_id", &[&thread_id.as_str(), &RUN_CANCEL_DESTINATION]).await.map_err(|e| unavailable("read conversation completion facts",e))?;
+        let foreground = match (
+            decode::<Option<String>>(&row, "run_status")?.as_deref(),
+            decode::<bool>(&row, "cancel_requested")?,
+        ) {
+            (None, false) => None,
+            (Some("queued"), false) => Some(ThreadForegroundRunState::Queued),
+            (Some("running"), false) => Some(ThreadForegroundRunState::Running),
+            (Some("queued" | "running"), true) => Some(ThreadForegroundRunState::Cancelling),
+            (Some("reconciliation_required"), false) => {
+                Some(ThreadForegroundRunState::ReconciliationRequired)
+            }
+            _ => {
+                return Err(ThreadDirectoryError::Corrupt {
+                    field: "active_run_state",
+                });
+            }
+        };
+        let pending_inputs =
+            u32::try_from(decode::<i64>(&row, "pending_inputs")?).map_err(|_| {
+                ThreadDirectoryError::Corrupt {
+                    field: "pending_inputs",
+                }
+            })?;
+        if foreground.is_some() || pending_inputs != 0 || decode::<bool>(&row, "clearing")? {
+            return Err(ThreadDirectoryError::ThreadNotIdle {
+                foreground,
+                pending_inputs,
+            });
+        }
+        let now = database_now(&tx).await?;
+        tx.execute(
+            "UPDATE public.threads SET status='archived',updated_at=$2 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|e| write_error("archive conversation", e))?;
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
+        Ok(openbot_contracts::command::ThreadCompleted {
+            status: openbot_contracts::command::ThreadStatusFilter::Archived,
+        })
+    }
+
     async fn withdraw_pending_input(
         &self,
         auth: &openbot_contracts::auth::AuthContext,

@@ -58,6 +58,8 @@ impl ErrorCode {
     pub const PENDING_INPUT_LIMIT: Self = Self("pending_input_limit");
     /// The input has become a Run and cannot be withdrawn as pending.
     pub const PENDING_INPUT_STATE: Self = Self("pending_input_state");
+    /// Conversation still has work to settle.
+    pub const THREAD_NOT_IDLE: Self = Self("thread_not_idle");
     /// policy 拒绝（403），必带 rule id。
     pub const POLICY_REFUSED: Self = Self("policy_refused");
     /// 依赖不可用（503）。
@@ -308,6 +310,14 @@ pub enum AppError {
     /// An already dispatched input cannot be withdrawn (409).
     #[error("pending_input_state")]
     PendingInputState,
+    /// Foreground work, a clear intent or retained input prevents completion.
+    #[error("thread_not_idle")]
+    ThreadNotIdle {
+        /// Existing foreground projection, if occupied.
+        foreground: Option<crate::command::ThreadForegroundRunState>,
+        /// Pending and held input count.
+        pending_inputs: u32,
+    },
     /// 未登录（401）。
     #[error("unauthenticated")]
     Unauthenticated,
@@ -434,6 +444,7 @@ impl AppError {
             Self::AnchorUnsupported => ErrorCode::ANCHOR_UNSUPPORTED,
             Self::PendingInputLimit => ErrorCode::PENDING_INPUT_LIMIT,
             Self::PendingInputState => ErrorCode::PENDING_INPUT_STATE,
+            Self::ThreadNotIdle { .. } => ErrorCode::THREAD_NOT_IDLE,
             Self::PolicyRefused { .. } => ErrorCode::POLICY_REFUSED,
             Self::DependencyUnavailable { .. } => ErrorCode::DEPENDENCY_UNAVAILABLE,
             Self::VendorFailure { .. } => ErrorCode::VENDOR_FAILURE,
@@ -461,7 +472,7 @@ impl AppError {
             Self::ArtifactGone { .. } => 410,
             Self::MalformedPayload { .. } | Self::AnchorUnsupported => 400,
             Self::PendingInputLimit => 429,
-            Self::PendingInputState => 409,
+            Self::PendingInputState | Self::ThreadNotIdle { .. } => 409,
             Self::DependencyUnavailable { .. } => 503,
             Self::VendorFailure { .. } => 502,
             Self::StaleGeneration { .. }
@@ -492,7 +503,7 @@ impl AppError {
             Self::MalformedPayload { .. } | Self::AnchorUnsupported | Self::PendingInputLimit => {
                 AuditKind::InputRejected
             }
-            Self::PendingInputState => AuditKind::ConcurrencyConflict,
+            Self::PendingInputState | Self::ThreadNotIdle { .. } => AuditKind::ConcurrencyConflict,
             Self::PolicyRefused { .. } => AuditKind::PolicyRefusal,
             Self::DependencyUnavailable { .. } => AuditKind::DependencyFailure,
             Self::VendorFailure { .. } => AuditKind::VendorFailure,
@@ -568,7 +579,7 @@ mod tests {
 
     /// 变体总数。新增变体必须同 PR 改这里 —— 它与 [`variant_index`] 和
     /// [`all_variants_for_test`] 三者互相咬合，见下方三条测试。
-    const VARIANT_COUNT: usize = 17;
+    const VARIANT_COUNT: usize = 18;
 
     /// 无通配 `_` 的穷举 match：**新增变体在这里编译失败**，逼作者同 PR 更新下面的变体台账。
     ///
@@ -594,6 +605,7 @@ mod tests {
             AppError::AnchorUnsupported => 14,
             AppError::PendingInputLimit => 15,
             AppError::PendingInputState => 16,
+            AppError::ThreadNotIdle { .. } => 17,
         }
     }
 
@@ -610,6 +622,10 @@ mod tests {
             AppError::AnchorUnsupported,
             AppError::PendingInputLimit,
             AppError::PendingInputState,
+            AppError::ThreadNotIdle {
+                foreground: None,
+                pending_inputs: 1,
+            },
             AppError::Unauthenticated,
             AppError::ForbiddenRole {
                 required: Role::Admin,
@@ -715,6 +731,13 @@ mod tests {
             (AppError::AnchorUnsupported, 400),
             (AppError::PendingInputLimit, 429),
             (AppError::PendingInputState, 409),
+            (
+                AppError::ThreadNotIdle {
+                    foreground: None,
+                    pending_inputs: 1,
+                },
+                409,
+            ),
             (AppError::Unauthenticated, 401),
             (
                 AppError::ForbiddenRole {

@@ -600,6 +600,12 @@ pub enum ThreadDirectoryError {
     /// This input has already become a Run.
     #[error("pending_input_state")]
     PendingInputState,
+    /// Existing work prevents archiving.
+    #[error("thread_not_idle")]
+    ThreadNotIdle {
+        foreground: Option<openbot_contracts::command::ThreadForegroundRunState>,
+        pending_inputs: u32,
+    },
     /// OS CSPRNG 或 PostgreSQL 当前不可用。
     #[error("thread_directory_unavailable")]
     Unavailable,
@@ -643,6 +649,13 @@ impl ThreadDirectoryError {
             Self::AnchorUnsupported => AppError::AnchorUnsupported,
             Self::PendingInputLimit => AppError::PendingInputLimit,
             Self::PendingInputState => AppError::PendingInputState,
+            Self::ThreadNotIdle {
+                foreground,
+                pending_inputs,
+            } => AppError::ThreadNotIdle {
+                foreground,
+                pending_inputs,
+            },
             Self::Unavailable | Self::Corrupt { .. } => AppError::DependencyUnavailable {
                 dependency: "thread_directory",
             },
@@ -862,6 +875,33 @@ pub trait ThreadDirectory: Send + Sync {
         _thread_id: &ThreadId,
         _run_id: &openbot_contracts::ids::RunId,
     ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Hold all pending inputs and optionally cancel the current foreground Run atomically.
+    async fn stop_thread_work(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _thread_id: &ThreadId,
+        _run_id: Option<&openbot_contracts::ids::RunId>,
+    ) -> Result<openbot_contracts::command::ThreadWorkStopped, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+    /// Release a held input at the tail under the current generation.
+    async fn release_pending_input(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _thread_id: &ThreadId,
+        _run_id: &openbot_contracts::ids::RunId,
+    ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+    /// Archive only an idle direct conversation.
+    async fn complete_thread(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _thread_id: &ThreadId,
+    ) -> Result<openbot_contracts::command::ThreadCompleted, ThreadDirectoryError> {
         Err(ThreadDirectoryError::Unavailable)
     }
 

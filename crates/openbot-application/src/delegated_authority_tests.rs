@@ -142,7 +142,7 @@ fn subscriptions() -> [SubscriptionRequest; 4] {
 }
 
 // Fixed independent expected inventory; no wildcard in the typed projection below.
-const EXPECTED_COMMANDS: [&str; 105] = [
+const EXPECTED_COMMANDS: [&str; 108] = [
     "GetRuntimeCapabilities",
     "SaveRunMessageTextArtifact",
     "GetArtifactMetadata",
@@ -202,6 +202,9 @@ const EXPECTED_COMMANDS: [&str; 105] = [
     "SubmitThreadInput",
     "ListPendingInputs",
     "WithdrawPendingInput",
+    "ReleasePendingInput",
+    "StopThreadWork",
+    "CompleteThread",
     "ListBotThreads",
     "SetThreadTitle",
     "BeginThreadRun",
@@ -311,6 +314,9 @@ fn variant_name(command: &AppCommand) -> &'static str {
         AppCommand::SubmitThreadInput(..) => "SubmitThreadInput",
         AppCommand::ListPendingInputs { .. } => "ListPendingInputs",
         AppCommand::WithdrawPendingInput { .. } => "WithdrawPendingInput",
+        AppCommand::ReleasePendingInput { .. } => "ReleasePendingInput",
+        AppCommand::StopThreadWork { .. } => "StopThreadWork",
+        AppCommand::CompleteThread { .. } => "CompleteThread",
         AppCommand::ListBotThreads { .. } => "ListBotThreads",
         AppCommand::SetThreadTitle { .. } => "SetThreadTitle",
         AppCommand::BeginThreadRun(..) => "BeginThreadRun",
@@ -589,6 +595,17 @@ fn commands() -> Vec<AppCommand> {
         AppCommand::WithdrawPendingInput {
             thread_id: ThreadId::new(""),
             run_id: RunId::new(""),
+        },
+        AppCommand::ReleasePendingInput {
+            thread_id: ThreadId::new(""),
+            run_id: RunId::new(""),
+        },
+        AppCommand::StopThreadWork {
+            thread_id: ThreadId::new(""),
+            run_id: None,
+        },
+        AppCommand::CompleteThread {
+            thread_id: ThreadId::new(""),
         },
         AppCommand::ListBotThreads {
             bot_id: BotId::new(""),
@@ -1120,7 +1137,7 @@ fn assert_untouched(app: &Guarded, poison: &Poison) {
 async fn every_command_variant_refuses_unbound_delegation_before_dispatch() {
     let (app, poison) = guarded();
     let inventory = commands();
-    assert_eq!(inventory.len(), 105);
+    assert_eq!(inventory.len(), 108);
     assert_eq!(
         inventory.iter().map(variant_name).collect::<Vec<_>>(),
         EXPECTED_COMMANDS
