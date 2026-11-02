@@ -1270,7 +1270,7 @@ async fn w07_history_delete_withdraws_inputs() {
         let f=Fixture::new_with_artifacts(config,7).await?;
         let current=f.pool.get().await.map_err(text)?;
         openbot_infra::db::thread_origin_schema::verify(&current).await.map_err(text)?;
-        openbot_infra::db::thread_history_writer_schema::verify(&current).await.map_err(text)?;
+        openbot_infra::db::thread_history_admission_schema::verify(&current).await.map_err(text)?;
         drop(current);
         let a=f.auth(A).await?;
         check(a.request_binding().is_some(),"actual Server Host binding absent")?;
