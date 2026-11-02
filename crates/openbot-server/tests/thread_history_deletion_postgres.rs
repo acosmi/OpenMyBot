@@ -331,6 +331,11 @@ impl Fixture {
         resolver
             .install_thread_history_authority(&authority)
             .map_err(text)?;
+        if let Some(artifacts) = &artifacts {
+            resolver
+                .install_artifact_read_authority(&artifacts.read_authority())
+                .map_err(text)?;
+        }
         let directory = PostgresThreadDirectory::with_runtime(
             pool.clone(),
             config,
