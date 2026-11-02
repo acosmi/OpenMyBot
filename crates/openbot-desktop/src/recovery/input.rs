@@ -170,6 +170,8 @@ impl RestoreEntryInput {
             actual.clone(),
             bootstrap.release_digest,
             limits.clone(),
+            bootstrap.bounds,
+            [crate::desktop_release::VAULT_KEY_STORE_SERVICE, crate::desktop_release::POSTGRES_KEY_STORE_SERVICE],
         );
         match host {
             Ok(host) => self.host = Some(host),

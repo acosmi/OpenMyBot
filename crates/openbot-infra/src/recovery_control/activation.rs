@@ -567,7 +567,7 @@ impl ActivationBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct JournalReference {
+pub(crate) struct JournalReference {
     pub(super) context_id: String,
     pub(super) sequence: u64,
     pub(super) digest: String,

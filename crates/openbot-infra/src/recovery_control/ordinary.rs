@@ -61,6 +61,7 @@ pub(super) struct LocalSiteExpectation {
     pub(super) master_service: String,
     pub(super) postgres_service: String,
     pub(super) installation_id: Option<String>,
+    pub(super) legacy_expected: Option<BusinessAndInstallation>,
 }
 
 /// The original producer's entry intent. It is not Clone or Serde and holds
@@ -76,6 +77,7 @@ pub struct VerifiedOrdinaryStartupIntent {
     convergence: Instant,
     resource_model: ResourceModel,
     owners: Vec<RuntimeOwner>,
+    local_request: Option<entry::VerifiedRecoveryHostIntent>,
     #[cfg(feature = "desktop-local")]
     fresh_installation: Option<crate::auth::single_user::desktop_local::DesktopLocalInstallation>,
 }
@@ -145,9 +147,25 @@ impl VerifiedOrdinaryStartupIntent {
             convergence,
             resource_model,
             owners: owners.to_vec(),
+            local_request: None,
             #[cfg(feature = "desktop-local")]
             fresh_installation: None,
         })
+    }
+
+    pub(super) fn seal_local_legacy(
+        source: SealedSource,
+        site: SiteExpectation,
+        bounds: OrdinaryStartupBounds,
+        admission_ns: u64,
+        owners: &[RuntimeOwner],
+        request: entry::VerifiedRecoveryHostIntent,
+        request_deadline: Instant,
+    ) -> Result<Self, RecoveryControlError> {
+        match Self::seal(Some(source), site, bounds, admission_ns, owners) {
+            Ok(mut intent) => { intent.admission = intent.admission.min(request_deadline); intent.local_request = Some(request); Ok(intent) }
+            Err(mut error) => { error.retained_restore_intent = Some(Box::new(request)); Err(error) }
+        }
     }
 
     /// Deadline A: lock acquisition and the shared-lock head read.
@@ -331,6 +349,25 @@ pub(super) fn enter_runtime(
     enroll(control, published, &intent)
 }
 
+enum LocalLegacyTerminal {
+    Commit(Result<(), crate::db::pool::TransactionOwnerError>),
+    Rollback(Result<(), crate::db::pool::TransactionOwnerError>),
+}
+
+#[derive(Default)]
+struct LocalLegacySql {
+    client: Option<crate::db::pool::GuardedClient>,
+    checkout: Option<Result<Result<crate::db::pool::GuardedClient, crate::db::pool::PoolError>, tokio::time::error::Elapsed>>,
+    begin: Option<Result<Result<(), crate::db::pool::TransactionOwnerError>, tokio::time::error::Elapsed>>,
+    canary: Option<Result<Result<bool, crate::db::desktop_vault_canary::DesktopVaultCanaryError>, tokio::time::error::Elapsed>>,
+    layout: Option<Result<Result<crate::db::desktop_vault_canary::ValidatedDesktopVaultLayout, crate::db::InfraError>, tokio::time::error::Elapsed>>,
+    validation: Option<Result<Result<(), crate::db::InfraError>, tokio::time::error::Elapsed>>,
+    row: Option<Result<Result<tokio_postgres::Row, tokio_postgres::Error>, tokio::time::error::Elapsed>>,
+    statement: Option<Result<Result<(), tokio_postgres::Error>, tokio::time::error::Elapsed>>,
+    count: Option<Result<Result<u64, tokio_postgres::Error>, tokio::time::error::Elapsed>>,
+    terminal: Option<LocalLegacyTerminal>,
+}
+
 /// The exclusive ordinary writer: ownerEX, admissionEX and runtimeEX held in
 /// the control owner from `begin` until `into_runtime_before` or drop.
 pub struct OrdinaryInitializationSession {
@@ -344,6 +381,7 @@ pub struct OrdinaryInitializationSession {
     /// Final disposition of the operation's last transaction or task.
     last: Option<Disposition>,
     evidence: Vec<JournalReference>,
+    local_sql: LocalLegacySql,
 }
 
 /// Closed proofs a sealed initialization publishes; none is publicly
@@ -363,10 +401,15 @@ pub struct LocalFreshProof {
 
 /// Legacy adoption facts read back after the read-only site checks (S9).
 pub struct VerifiedOrdinaryLegacyProof {
-    pub(crate) site: ServerDatabaseSite,
-    pub(crate) key_id: Hex32,
+    pub(super) operation: Hex32,
+    pub(super) site: LegacySite,
     pub(crate) native_version: u32,
     pub(crate) migration_digest: String,
+}
+
+pub(super) enum LegacySite {
+    Local(OrdinaryLocalSite),
+    Server { site: ServerDatabaseSite, key_id: Hex32 },
 }
 
 /// Server Fresh facts read back on the initializing connection (S7).
@@ -396,6 +439,9 @@ pub(super) fn begin(
     intent: VerifiedOrdinaryStartupIntent,
     deadline: Instant,
 ) -> Result<OrdinaryInitializationSession, RecoveryControlError> {
+    let mut original = Some(intent);
+    let result = (|| {
+    let intent = original.as_ref().expect("original intent retained");
     let admission = deadline.min(intent.admission);
     let mut files = entry::lock(control)?;
     files.acquire_writer_before(admission)?;
@@ -411,6 +457,10 @@ pub(super) fn begin(
         return Err(fault(RecoveryControlFault::OwnerBusy));
     }
     #[cfg(feature = "desktop-local")]
+    if intent.source.is_some_and(|(source, _, _)| source == OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical }) {
+        if let Err(error) = files.require_empty_legacy_control_before(admission) { files.release_writer(); return Err(error); }
+    }
+    #[cfg(feature = "desktop-local")]
     if let SiteExpectation::Local(local) = &intent.site {
         files.verify_local_root_before(
             local
@@ -422,12 +472,18 @@ pub(super) fn begin(
     drop(files);
     Ok(OrdinaryInitializationSession {
         control: Arc::clone(control),
-        intent,
+        intent: original.take().expect("original intent transferred once"),
         head: None,
         operation: None,
         pending: None,
         last: None,
         evidence: Vec::new(),
+        local_sql: LocalLegacySql::default(),
+    })
+    })();
+    result.map_err(|mut error: RecoveryControlError| {
+        error.unconsumed = original.take().map(Box::new);
+        error.retain(control)
     })
 }
 
@@ -476,7 +532,7 @@ impl OrdinaryInitializationSession {
         self.intent.source.map(|(source, _, _)| source)
     }
 
-    fn operation(&self) -> Result<Hex32, RecoveryControlError> {
+    pub(super) fn operation(&self) -> Result<Hex32, RecoveryControlError> {
         self.operation
             .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))
     }
@@ -553,6 +609,7 @@ impl OrdinaryInitializationSession {
         planned: PlannedInstallation,
         legacy: Option<(SiteSelection, BusinessAndInstallation)>,
     ) -> Result<(), RecoveryControlError> {
+        if self.operation.is_some() { return Err(fault(RecoveryControlFault::EntryInvalid)); }
         let (_, intent_id, intent_file) = self
             .intent
             .source
@@ -566,7 +623,7 @@ impl OrdinaryInitializationSession {
         let mut files = entry::lock(&self.control)?;
         host.validate_plan(&planned, &files.limits)?;
         let control_id = Hex32::mint(&mint::<16>()?)?;
-        let operation = Hex32::mint(&mint::<16>()?)?;
+        let operation = if legacy.is_some() { intent_id } else { Hex32::mint(&mint::<16>()?)? };
         let epoch = Hex64::mint(&mint::<32>()?)?;
         let limits = serde_json::to_vec(&files.limits).map_err(RecoveryControlError::from_json)?;
         let limits_digest = Hex64::of(&sha2::Sha256::digest(&limits).into());
@@ -586,6 +643,8 @@ impl OrdinaryInitializationSession {
             },
         );
         let (_, digest) = record.encoded()?;
+        // Keep the original operation even when its first durable write is unknown.
+        self.operation = Some(operation);
         files.begin_journal(&operation, &control_id, epoch.as_str(), effect)?;
         let clock = files.owner_clock(
             Hex32::mint(&mint::<16>()?)?,
@@ -658,6 +717,281 @@ impl OrdinaryInitializationSession {
         self.intend(OrdinaryStage::Initialize)
     }
 
+    /// Seal the original positive Local legacy request before sidecar or schema effects.
+    #[cfg(feature = "desktop-local")]
+    pub fn seal_local_legacy_before(&mut self) -> Result<(), RecoveryControlError> {
+        let invalid = || fault(RecoveryControlFault::EntryInvalid);
+        if self.initialization_source() != Some(OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical }) || self.head.is_some() { return Err(invalid()); }
+        let SiteExpectation::Local(local) = &self.intent.site else { return Err(invalid()); };
+        let expected = local.legacy_expected.as_ref().ok_or_else(invalid)?.clone();
+        let mut files = entry::lock(&self.control)?;
+        files.verify_local_root_before(local.root.ok_or_else(invalid)?, self.intent.effect)?;
+        entry::recheck_legacy_request_before(&mut files, self.intent.local_request.as_mut().ok_or_else(invalid)?, self.intent.effect)?;
+        let host = HostBinding::LocalPhysical { actual_os_owner: ActualOsOwner::LocalUid { uid: local.root.ok_or_else(invalid)?.uid }, app_data_parent: local.parent, control_root: files.root_identity(self.intent.effect)?, reviewed_release_digest: local.release.as_str().to_owned() };
+        let planned = PlannedInstallation::LocalPhysical { trusted_parent: local.parent, entry_component: local.component.clone(), installation_id: expected.target_installation_id.clone() };
+        let selection = SiteSelection::LocalPhysical { trusted_parent: local.parent, entry_component: local.component.clone() };
+        drop(files);
+        self.seal_site(host, planned, Some((selection, expected)))?;
+        self.intend(OrdinaryStage::Verify)
+    }
+
+    fn local_effect_before(&self) -> Result<(), RecoveryControlError> {
+        entry::lock(&self.control)?.post(self.intent.effect)
+    }
+
+    /// Verify and, only for strict52, migrate the original legacy installation
+    /// inside its existing Initializing/ordinary_verify owner.
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub async fn verify_local_legacy_before(
+        &mut self,
+        authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+        database: &crate::db::desktop_local::DesktopLocalDatabase,
+        canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
+    ) -> Result<VerifiedOrdinaryLegacyProof, RecoveryControlError> {
+        use super::activation::{KeyKind, KeyReference};
+        use crate::db::pool::TransactionOwnerError;
+        let invalid = || fault(RecoveryControlFault::ControlInvalid);
+        if self.initialization_source()
+            != Some(OrdinaryInitializationSource::LegacyAdoption {
+                site: OrdinarySite::LocalPhysical,
+            })
+            || self.pending.as_ref().map(|pending| pending.0) != Some(Stage::OrdinaryVerify)
+            || self.local_sql.client.is_some()
+            || self.local_sql.checkout.is_some()
+            || self.local_sql.begin.is_some()
+            || database.origin() == crate::db::desktop_local::DesktopLocalDatabaseOrigin::Created
+        {
+            return Err(invalid());
+        }
+        let SiteExpectation::Local(local) = &self.intent.site else {
+            return Err(invalid());
+        };
+        let expected = local.legacy_expected.as_ref().ok_or_else(invalid)?;
+        if local.installation_id.as_deref() != Some(authority.instance_id())
+            || expected.target_installation_id != authority.instance_id()
+            || expected.dataset_id != canary.dataset_id()
+            || expected.deployment_id != canary.deployment_id()
+            || expected.tenant_id != canary.tenant_id()
+            || expected.deployment_id != authority.auth_context().deployment().as_str()
+            || expected.tenant_id != authority.auth_context().tenant().as_str()
+        {
+            return Err(invalid());
+        }
+        let root = local.root.ok_or_else(invalid)?;
+        let master_service = local.master_service.clone();
+        let postgres_service = local.postgres_service.clone();
+        self.local_sql.canary = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async { canary.matches_database(database).await }).await);
+        self.local_effect_before()?;
+        if !matches!(self.local_sql.canary, Some(Ok(Ok(true)))) {
+            return Err(invalid());
+        }
+        entry::lock(&self.control)?.prepay(
+            (std::mem::size_of::<LocalLegacySql>()
+                + std::mem::size_of::<crate::db::pool::GuardedClient>()) as u64,
+            0,
+        )?;
+        self.local_sql.checkout = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), database.pool().get_guarded(self.intent.convergence)).await);
+        self.local_effect_before()?;
+        if !matches!(self.local_sql.checkout, Some(Ok(Ok(_)))) { return Err(fault(RecoveryControlFault::IoFailure)); }
+        self.local_sql.client = match self.local_sql.checkout.take().expect("resident checkout") { Ok(Ok(client)) => Some(client), _ => unreachable!("checked original checkout") };
+        let client = self
+            .local_sql
+            .client
+            .as_ref()
+            .ok_or_else(|| fault(RecoveryControlFault::IoFailure))?;
+        self.local_sql.layout =
+            Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client.as_client())).await);
+        self.local_effect_before()?;
+        let version = self
+            .local_sql
+            .layout
+            .as_ref()
+            .and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok())
+            .ok_or_else(invalid)?
+            .native_version();
+        if version != native::NATIVE_0052_VERSION && version != native::NATIVE_LATEST_VERSION {
+            return Err(invalid());
+        }
+        let mut client = self
+            .local_sql
+            .client
+            .take()
+            .expect("original client resident");
+        let stage_result = {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async {
+                if version == native::NATIVE_LATEST_VERSION { client.begin_read_committed_read_only().await } else { client.begin_read_committed().await }
+            }).await {
+                Err(error) => { self.local_sql.begin = Some(Err(error)); Err(fault(RecoveryControlFault::EffectExpired)) }
+                Ok(Err(error)) => { self.local_sql.begin = Some(Ok(Err(error))); Err(fault(RecoveryControlFault::IoFailure)) }
+                Ok(Ok(owner)) => {
+                    self.local_sql.begin = Some(Ok(Ok(())));
+                    let transaction = owner.as_transaction();
+                    let verified: Result<bool, RecoveryControlError> = async {
+                        let end = tokio::time::Instant::from_std(self.intent.effect);
+                        self.local_effect_before()?;
+                        self.local_sql.validation = Some(tokio::time::timeout_at(end, native::lock_migrations(transaction)).await);
+                        self.local_effect_before()?;
+                        if !matches!(self.local_sql.validation, Some(Ok(Ok(())))) { return Err(invalid()); }
+                        self.local_sql.validation = Some(tokio::time::timeout_at(end, async {
+                            if version == native::NATIVE_0052_VERSION { native::validate_custom_model_v2_layout_in_transaction(transaction, native::NATIVE_0052_VERSION, 40).await }
+                            else { native::validate_custom_model_v2_in_transaction(transaction).await }
+                        }).await);
+                        self.local_effect_before()?;
+                        if !matches!(self.local_sql.validation, Some(Ok(Ok(())))) { return Err(invalid()); }
+                        self.local_sql.row = Some(tokio::time::timeout_at(end, transaction.query_one("SELECT to_regclass('openbot_internal.restore_pg_operations') IS NOT NULL", &[])).await);
+                        self.local_effect_before()?;
+                        let exists: bool = self.local_sql.row.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.as_ref().ok()).ok_or_else(invalid)?.try_get(0).map_err(|_| invalid())?;
+                        if exists {
+                            self.local_sql.row = Some(tokio::time::timeout_at(end, transaction.query_one("SELECT EXISTS(SELECT 1 FROM openbot_internal.restore_pg_operations)", &[])).await);
+                            self.local_effect_before()?;
+                            if self.local_sql.row.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.as_ref().ok()).ok_or_else(invalid)?.try_get::<_,bool>(0).map_err(|_| invalid())? { return Err(invalid()); }
+                        }
+                        if version == native::NATIVE_0052_VERSION {
+                            self.local_effect_before()?;
+                            self.local_sql.statement = Some(tokio::time::timeout_at(end, transaction.batch_execute(native::NATIVE_0053_SQL)).await);
+                            self.local_effect_before()?;
+                            if !matches!(self.local_sql.statement, Some(Ok(Ok(())))) { return Err(invalid()); }
+                            let checksum = native::native_0053_checksum();
+                            self.local_sql.count = Some(tokio::time::timeout_at(end, transaction.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES($1,$2,$3)", &[&native::NATIVE_0053_VERSION, &native::NATIVE_0053_NAME, &checksum])).await);
+                            self.local_effect_before()?;
+                            if !matches!(self.local_sql.count, Some(Ok(Ok(1)))) { return Err(invalid()); }
+                        }
+                        self.local_sql.validation = Some(tokio::time::timeout_at(end, native::validate_custom_model_v2_in_transaction(transaction)).await);
+                        self.local_effect_before()?;
+                        if !matches!(self.local_sql.validation, Some(Ok(Ok(())))) { return Err(invalid()); }
+                        Ok(version == native::NATIVE_0052_VERSION)
+                    }.await;
+                    self.local_sql.terminal = Some(if matches!(verified, Ok(true)) {
+                        LocalLegacyTerminal::Commit(owner.commit_before(self.intent.effect).await)
+                    } else {
+                        LocalLegacyTerminal::Rollback(owner.rollback_before(self.intent.convergence).await)
+                    });
+                    verified
+                }
+            }
+        };
+        self.local_sql.client = Some(client);
+        let returned = Instant::now();
+        let observation = match self.local_sql.terminal.as_ref() {
+            Some(LocalLegacyTerminal::Commit(Ok(()))) => Some((Disposition::PgCommit(CommitAck::TimelyAck), true, None)),
+            Some(LocalLegacyTerminal::Commit(Err(TransactionOwnerError::CommitAcknowledgedAfterDeadline))) => Some((Disposition::PgCommit(CommitAck::AcknowledgedAfterDeadline), false, Some(RecoveryControlFault::EffectExpired))),
+            Some(LocalLegacyTerminal::Commit(Err(TransactionOwnerError::CommitUnknown))) => Some((Disposition::PgCommit(CommitAck::CommitUnknown), false, Some(RecoveryControlFault::DatabaseUnknown))),
+            Some(LocalLegacyTerminal::Commit(Err(_))) => Some((Disposition::PgRollback(RollbackAck::RollbackUnproven), false, Some(RecoveryControlFault::EffectExpired))),
+            Some(LocalLegacyTerminal::Rollback(Ok(()))) => {
+                let timely = returned <= self.intent.effect;
+                Some((Disposition::PgRollback(if timely { RollbackAck::TimelyAck } else { RollbackAck::AcknowledgedAfterDeadline }), timely, (!timely).then_some(RecoveryControlFault::EffectExpired)))
+            }
+            Some(LocalLegacyTerminal::Rollback(Err(TransactionOwnerError::RollbackAcknowledgedAfterDeadline))) => Some((Disposition::PgRollback(RollbackAck::AcknowledgedAfterDeadline), false, Some(RecoveryControlFault::ConvergenceExpired))),
+            Some(LocalLegacyTerminal::Rollback(Err(_))) => Some((Disposition::PgRollback(RollbackAck::RollbackUnproven), false, Some(RecoveryControlFault::DatabaseUnknown))),
+            None => None,
+        };
+        let recorded = match observation {
+            Some((disposition, timely, failure)) => { self.observe(disposition, timely).map(|_| ())?; failure }
+            None => None,
+        };
+        stage_result?;
+        if let Some(failure) = recorded { return Err(fault(failure)); }
+        self.local_effect_before()?;
+        let client = self
+            .local_sql
+            .client
+            .as_ref()
+            .expect("original client restored before clock checks");
+        self.local_sql.layout =
+            Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client.as_client())).await);
+        self.local_effect_before()?;
+        if self
+            .local_sql
+            .layout
+            .as_ref()
+            .and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok())
+            .ok_or_else(invalid)?
+            .native_version()
+            != native::NATIVE_LATEST_VERSION
+        {
+            return Err(invalid());
+        }
+        let client = self
+            .local_sql
+            .client
+            .as_ref()
+            .expect("original client retained");
+        self.local_sql.row = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async { client.as_client().query_one("SELECT pcs.system_identifier::text AS system_identifier,d.oid AS database_oid,current_setting('server_version_num')::int / 10000 AS pg_major FROM pg_control_system() pcs JOIN pg_database d ON d.datname=current_database()", &[]).await }).await);
+        self.local_effect_before()?;
+        let row = self
+            .local_sql
+            .row
+            .as_ref()
+            .and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok())
+            .ok_or_else(invalid)?;
+        let system: String = row.try_get("system_identifier").map_err(|_| invalid())?;
+        let pg_system_id = system
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id != 0)
+            .ok_or_else(invalid)?;
+        let database_oid: u32 = row.try_get("database_oid").map_err(|_| invalid())?;
+        if database_oid == 0 || row.try_get::<_, i32>("pg_major").ok() != Some(17) {
+            return Err(invalid());
+        }
+        self.local_sql.canary = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async { canary.matches_database(database).await }).await);
+        self.local_effect_before()?;
+        if !matches!(self.local_sql.canary, Some(Ok(Ok(true)))) {
+            return Err(invalid());
+        }
+        let mut files = entry::lock(&self.control)?;
+        files.verify_local_root_before(root, self.intent.effect)?;
+        entry::recheck_legacy_request_before(
+            &mut files,
+            self.intent.local_request.as_mut().ok_or_else(invalid)?,
+            self.intent.effect,
+        )?;
+        files.bind_original_local_pool(database.pool());
+        drop(files);
+        let operation = self.operation()?;
+        let installation = authority.instance_id().to_owned();
+        let master = KeyReference {
+            kind: KeyKind::HistoricalMaster,
+            reviewed_service: master_service,
+            account: format!("desktop-vault-master-v1-{installation}"),
+            key_id: canary.key_id().to_owned(),
+            key_version: u32::try_from(canary.key_version()).map_err(|_| invalid())?,
+            target_installation_id: installation.clone(),
+            operation_id: operation.as_str().to_owned(),
+        };
+        let postgres = KeyReference {
+            kind: KeyKind::PostgresScram,
+            reviewed_service: postgres_service,
+            account: format!("postgresql-17-{installation}"),
+            key_id: format!("postgresql-17-{installation}"),
+            key_version: 1,
+            target_installation_id: installation.clone(),
+            operation_id: operation.as_str().to_owned(),
+        };
+        let client = self.local_sql.client.as_ref().expect("original client retained");
+        self.local_sql.row = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async { client.as_client().query_one("SELECT version,checksum FROM openbot_internal.schema_migrations WHERE version=$1", &[&native::NATIVE_LATEST_VERSION]).await }).await);
+        self.local_effect_before()?;
+        let row = self.local_sql.row.as_ref().and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok()).ok_or_else(invalid)?;
+        let actual_version: i32 = row.try_get("version").map_err(|_| invalid())?;
+        let migration_digest: String = row.try_get("checksum").map_err(|_| invalid())?;
+        if actual_version != native::NATIVE_LATEST_VERSION || migration_digest != native::native_0053_checksum() { return Err(invalid()); }
+        Ok(VerifiedOrdinaryLegacyProof {
+            operation,
+            site: LegacySite::Local(OrdinaryLocalSite {
+                dataset_id: canary.dataset_id().to_owned(),
+                deployment_id: canary.deployment_id().to_owned(),
+                tenant_id: canary.tenant_id().to_owned(),
+                installation_id: installation,
+                generation_root: root,
+                pg_system_id,
+                database_oid,
+                master,
+                postgres,
+            }),
+            native_version: actual_version.unsigned_abs(),
+            migration_digest,
+        })
+    }
     /// Verify the actual Fresh database, canary and original root, then record the
     /// observed completion of that chain. Its internal COMMITs are not fabricated ACKs.
     #[cfg(feature = "desktop-local")]
@@ -923,6 +1257,25 @@ impl OrdinaryInitializationSession {
             return Err(fault(RecoveryControlFault::ClosureUnproven));
         }
         let operation = self.operation()?;
+        if let OrdinaryActivationProof::Legacy(legacy) = &proof {
+            if legacy.operation != operation {
+                return Err(invalid());
+            }
+            if let (SiteExpectation::Local(expected), LegacySite::Local(site)) =
+                (&self.intent.site, &legacy.site)
+            {
+                let business = expected.legacy_expected.as_ref().ok_or_else(invalid)?;
+                if expected.root != Some(site.generation_root)
+                    || expected.installation_id.as_deref() != Some(site.installation_id.as_str())
+                    || business.target_installation_id != site.installation_id
+                    || business.dataset_id != site.dataset_id
+                    || business.deployment_id != site.deployment_id
+                    || business.tenant_id != site.tenant_id
+                {
+                    return Err(invalid());
+                }
+            }
+        }
         let binding = match (&self.intent.site, proof) {
             (SiteExpectation::Local(_), OrdinaryActivationProof::LocalFresh(proof)) => {
                 ActivationBinding::local(
@@ -959,18 +1312,12 @@ impl OrdinaryInitializationSession {
                     service_config,
                     ..
                 },
-                OrdinaryActivationProof::Legacy(proof),
+                OrdinaryActivationProof::Legacy(VerifiedOrdinaryLegacyProof { site: LegacySite::Server { site, key_id }, native_version, migration_digest, .. }),
             ) => ActivationBinding::server(
-                dataset,
-                ids,
-                service_config,
-                proof.site,
-                proof.native_version,
-                &proof.migration_digest,
-                &initializing.initial_epoch,
-                proof.key_id.as_str(),
-                operation.as_str(),
+                dataset, ids, service_config, site, native_version, &migration_digest,
+                &initializing.initial_epoch, key_id.as_str(), operation.as_str(),
             ),
+            (SiteExpectation::Local(_), OrdinaryActivationProof::Legacy(VerifiedOrdinaryLegacyProof { site: LegacySite::Local(site), native_version, migration_digest, .. })) => ActivationBinding::local(site, native_version, migration_digest, initializing.initial_epoch.clone(), operation),
             _ => return Err(invalid()),
         };
         binding.validate(&entry::lock(&self.control)?.limits)?;

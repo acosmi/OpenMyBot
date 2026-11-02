@@ -38,8 +38,8 @@ fn invalid() -> RecoveryControlError {
 }
 
 impl ControlFiles {
-    /// Temp → write/file-fsync/readback → same-root rename onto
-    /// `activation-v1` → parent fsync → held/named final readback. The
+    /// Temp → write/file-fsync/readback → no-replace first head or successor
+    /// rename → parent fsync → held/named final readback. The
     /// returned record is the held published file and its exact bytes.
     pub(in super::super) fn publish_activation(
         &mut self,
@@ -55,19 +55,27 @@ impl ControlFiles {
         let original = self.write_new_file(Directory::Root, &temporary, &bytes, deadline)?;
         self.reserve_io(0)?;
         before(deadline)?;
-        self.raw.unit = Some(
-            rustix::fs::renameat(
-                self.directory(Directory::Root)?,
-                temporary.as_str(),
-                self.directory(Directory::Root)?,
-                "activation-v1",
-            )
-            .map_err(io::Error::from),
-        );
-        self.post(deadline)?;
-        if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) {
-            return Err(io_failure());
+        if record.previous_digest().is_none() {
+            // Initializing and a first RestorePending never replace an existing head.
+            self.raw.unit = Some(rustix::fs::linkat(
+                self.directory(Directory::Root)?, temporary.as_str(),
+                self.directory(Directory::Root)?, "activation-v1", rustix::fs::AtFlags::empty(),
+            ).map_err(io::Error::from));
+            self.post(deadline)?;
+            if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) { return Err(io_failure()); }
+            // nlink is temporarily two until this original temp name is retired.
+            // No valid_meta/readback is performed in that intermediate state.
+            self.reserve_io(0)?;
+            before(deadline)?;
+            self.raw.unit = Some(rustix::fs::unlinkat(self.directory(Directory::Root)?, temporary.as_str(), rustix::fs::AtFlags::empty()).map_err(io::Error::from));
+        } else {
+            self.raw.unit = Some(rustix::fs::renameat(
+                self.directory(Directory::Root)?, temporary.as_str(),
+                self.directory(Directory::Root)?, "activation-v1",
+            ).map_err(io::Error::from));
         }
+        self.post(deadline)?;
+        if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) { return Err(io_failure()); }
         self.sync_directory(Directory::Root, deadline)?;
         if self.check_opened(false, deadline)? != original {
             return Err(invalid());

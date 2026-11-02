@@ -5,9 +5,10 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use openbot_infra::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging;
 use openbot_infra::recovery_control::{
-    OwnedRestoreCandidatePlan, RecoveryControlError, RestoreCapacityResource,
-    RestoreControlSession, RestoreNewChildKind, RestoreStorageKind,
+    RecoveryControlError, RestoreCapacityResource, RestoreControlSession, RestoreNewChildKind,
+    RestoreStorageKind,
 };
 use rustix::fs::{Mode, OFlags};
 
@@ -20,7 +21,7 @@ const GENERATION_CHILDREN: [&str; 5] = ["data", "wal", "temp", "uds", "materials
 
 /// Keeps each original creation/open result even when the next observation is late.
 pub(super) struct CandidateGeneration {
-    plan: OwnedRestoreCandidatePlan,
+    staging: VerifiedWholePgRestoreStaging,
     paths: [PathBuf; 6],
     directories: [Option<File>; 6],
     clock: Option<OperationClock>,
@@ -36,9 +37,9 @@ pub(super) struct CandidateGeneration {
 }
 
 impl CandidateGeneration {
-    pub(super) fn new(plan: OwnedRestoreCandidatePlan) -> Self {
+    pub(super) fn new(staging: VerifiedWholePgRestoreStaging) -> Self {
         Self {
-            plan,
+            staging,
             paths: std::array::from_fn(|_| PathBuf::new()),
             directories: std::array::from_fn(|_| None),
             clock: None,
@@ -54,12 +55,15 @@ impl CandidateGeneration {
         }
     }
 
-    /// Create only this sealed plan's sibling generation; an existing leaf is never reused.
+    /// Prepare the four candidate write roots under the original verified staging owner.
     pub(super) fn prepare_directories(
         &mut self,
         session: &mut RestoreControlSession,
     ) -> Result<(), DesktopRestoreError> {
-        if self.clock.is_some() || self.first_fault.is_some() {
+        if self.clock.is_some()
+            || self.first_fault.is_some()
+            || self.staging.candidate_plan().operation_id() != session.operation_id()
+        {
             return Err(DesktopRestoreError::EntryInvalid);
         }
         let result = (|| {
@@ -108,12 +112,13 @@ impl CandidateGeneration {
                 })
             };
             let root_length = self
-                .plan
+                .staging
+                .candidate_plan()
                 .parent_path()
                 .as_os_str()
                 .len()
                 .checked_add(1)
-                .and_then(|n| n.checked_add(self.plan.component().len()))
+                .and_then(|n| n.checked_add(self.staging.candidate_plan().component().len()))
                 .ok_or(DesktopRestoreError::CapacityExceeded)?;
             let paths_length = GENERATION_CHILDREN
                 .iter()
@@ -125,7 +130,12 @@ impl CandidateGeneration {
                 .ok_or(DesktopRestoreError::CapacityExceeded)?;
             let planned_memory = paths_length
                 .checked_mul(2)
-                .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+                .and_then(|n| {
+                    n.checked_add(
+                        (std::mem::size_of::<Self>()
+                            - std::mem::size_of::<VerifiedWholePgRestoreStaging>()),
+                    )
+                })
                 .ok_or(DesktopRestoreError::CapacityExceeded)?;
             let original_error = &mut self.control_error;
             let mut retain = |error: RecoveryControlError| {
@@ -139,33 +149,32 @@ impl CandidateGeneration {
                     planned_memory as u64,
                 )
                 .map_err(&mut retain)?;
-            self.paths[0] = self.plan.parent_path().join(self.plan.component());
+            self.paths[0] = self
+                .staging
+                .candidate_plan()
+                .parent_path()
+                .join(self.staging.candidate_plan().component());
             for (index, child) in GENERATION_CHILDREN.iter().enumerate() {
                 self.paths[index + 1] = self.paths[0].join(child);
             }
             let actual_memory = self
                 .paths
                 .iter()
-                .try_fold(std::mem::size_of::<Self>(), |n, path| {
-                    n.checked_add(path.capacity())
-                })
+                .try_fold(
+                    (std::mem::size_of::<Self>()
+                        - std::mem::size_of::<VerifiedWholePgRestoreStaging>()),
+                    |n, path| n.checked_add(path.capacity()),
+                )
                 .ok_or(DesktopRestoreError::CapacityExceeded)?;
             session
                 .settle_capacity(memory, actual_memory as u64)
                 .map_err(&mut retain)?;
-            for index in 0..self.directories.len() {
-                let parent = if index == 0 {
-                    self.plan.parent()
-                } else {
-                    self.directories[0]
-                        .as_ref()
-                        .expect("original generation directory retained")
-                };
-                let name = if index == 0 {
-                    self.plan.component()
-                } else {
-                    std::ffi::OsStr::new(GENERATION_CHILDREN[index - 1])
-                };
+            // The verified staging owner already exclusively created the root
+            // and materials directories; only the four candidate write roots
+            // are created here. The same owner keeps staging read-only inputs.
+            for index in 1..=4 {
+                let parent = self.staging.generation_root();
+                let name = std::ffi::OsStr::new(GENERATION_CHILDREN[index - 1]);
                 require_effect()?;
                 self.space = Some(rustix::fs::fstatvfs(parent));
                 require_effect()?;

@@ -1052,6 +1052,62 @@ struct RestoreRequestWire {
     profile: super::RestoreOperationProfile,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyInputSelection {
+    installation: RestoreFileSelection,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyRequestWire {
+    format_version: u32,
+    request_id: Hex32,
+    purpose: RecoveryRequestPurpose,
+    expected_reviewed_release_digest: Hex64,
+    expected_deployment_id: String,
+    expected_tenant_id: String,
+    expected_dataset_id: Hex32,
+    expected_source_installation_id: Hex64,
+    expected_target_installation_id: Hex64,
+    trusted_input_selection: LegacyInputSelection,
+    limits: OrdinaryStartupBounds,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RecoveryRequestWire {
+    Restore(RestoreRequestWire),
+    Legacy(LegacyRequestWire),
+}
+
+enum DecodedRecoveryRequest {
+    Restore(RecoveryRequestV1),
+    Legacy(LocalLegacyRequest),
+}
+
+struct LocalLegacyRequest {
+    request_id: Hex32,
+    expected: RecoveryRequestExpected,
+    selection: LegacyInputSelection,
+    limits: OrdinaryStartupBounds,
+}
+
+impl DecodedRecoveryRequest {
+    fn purpose(&self) -> RecoveryRequestPurpose {
+        match self {
+            Self::Restore(request) => request.purpose,
+            Self::Legacy(_) => RecoveryRequestPurpose::AdoptOrdinaryLegacy,
+        }
+    }
+    fn expected(&self) -> &RecoveryRequestExpected {
+        match self {
+            Self::Restore(request) => &request.expected,
+            Self::Legacy(request) => &request.expected,
+        }
+    }
+}
+
 struct RecoveryRequestV1 {
     request_id: Hex32,
     purpose: RecoveryRequestPurpose,
@@ -1063,9 +1119,24 @@ struct RecoveryRequestV1 {
 fn decode_restore_request(
     raw: &[u8],
     limits: &TrustedHostRecoveryLimits,
-) -> Result<RecoveryRequestV1, RecoveryControlError> {
-    let wire: RestoreRequestWire =
-        serde_json::from_slice(raw).map_err(RecoveryControlError::from_json)?;
+) -> Result<DecodedRecoveryRequest, RecoveryControlError> {
+    let wire: RecoveryRequestWire = serde_json::from_slice(raw).map_err(RecoveryControlError::from_json)?;
+    let wire = match wire {
+        RecoveryRequestWire::Restore(wire) => wire,
+        RecoveryRequestWire::Legacy(wire) => {
+            if wire.format_version != 1 || wire.purpose != RecoveryRequestPurpose::AdoptOrdinaryLegacy || wire.expected_source_installation_id != wire.expected_target_installation_id { return Err(service_invalid()); }
+            for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] { super::id(value, limits.max_id_bytes)?; }
+            let selection = &wire.trusted_input_selection.installation;
+            service_absolute(&selection.parent)?;
+            component(&selection.component, limits)?;
+            if selection.parent.components().count() as u64 > limits.max_path_depth || selection.parent.as_os_str().len() as u64 > limits.max_relative_path_bytes { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); }
+            return Ok(DecodedRecoveryRequest::Legacy(LocalLegacyRequest {
+                request_id: wire.request_id,
+                expected: RecoveryRequestExpected { reviewed_release_digest: wire.expected_reviewed_release_digest, deployment_id: wire.expected_deployment_id, tenant_id: wire.expected_tenant_id, dataset_id: wire.expected_dataset_id, source_installation_id: wire.expected_source_installation_id, target_installation_id: wire.expected_target_installation_id },
+                selection: wire.trusted_input_selection, limits: wire.limits,
+            }));
+        }
+    };
     if wire.format_version != 1
         || !matches!(
             wire.purpose,
@@ -1104,7 +1175,7 @@ fn decode_restore_request(
             ));
         }
     }
-    Ok(RecoveryRequestV1 {
+    Ok(DecodedRecoveryRequest::Restore(RecoveryRequestV1 {
         request_id: wire.request_id,
         purpose: wire.purpose,
         expected: RecoveryRequestExpected {
@@ -1117,7 +1188,7 @@ fn decode_restore_request(
         },
         selection: wire.trusted_input_selection,
         profile: wire.profile,
-    })
+    }))
 }
 
 /// Independent expected identities sealed by the one request parser.
@@ -1157,6 +1228,8 @@ pub struct VerifiedRecoveryHost {
     limits: TrustedHostRecoveryLimits,
     uid: u32,
     original: HostOrigin,
+    ordinary_bounds: OrdinaryStartupBounds,
+    services: [String; 2],
 }
 
 impl VerifiedRecoveryHost {
@@ -1170,11 +1243,15 @@ impl VerifiedRecoveryHost {
         actual: crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
         reviewed_digest: [u8; 32],
         limits: TrustedHostRecoveryLimits,
+        ordinary_bounds: OrdinaryStartupBounds,
+        services: [&str; 2],
     ) -> Result<Self, RecoveryControlError> {
         let mut host = Self {
             reviewed_release_digest: reviewed_digest,
             limits,
             uid: rustix::process::getuid().as_raw(),
+            ordinary_bounds,
+            services: services.map(str::to_owned),
             original: HostOrigin::LocalRelease {
                 program,
                 release,
@@ -1207,7 +1284,8 @@ impl VerifiedRecoveryHost {
     }
 
     pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
-        let fixed = std::mem::size_of::<Self>() as u64;
+        let fixed = (std::mem::size_of::<Self>() as u64)
+            .checked_add(self.services[0].capacity() as u64).and_then(|n| n.checked_add(self.services[1].capacity() as u64)).ok_or_else(service_invalid)?;
         match &self.original {
             #[cfg(feature = "desktop-local")]
             HostOrigin::LocalRelease {
@@ -1461,24 +1539,39 @@ pub struct VerifiedRecoveryHostIntent {
     request: OwnedRecoveryRequestFile,
     request_bytes: Vec<u8>,
     control_root: RecoveryFileIdentity,
+    decoded: DecodedRecoveryRequest,
+    original_deadline: Instant,
+}
+
+struct VerifiedRestoreHostIntent {
+    host: VerifiedRecoveryHost,
+    request: OwnedRecoveryRequestFile,
+    request_bytes: Vec<u8>,
+    control_root: RecoveryFileIdentity,
     decoded: RecoveryRequestV1,
     original_deadline: Instant,
 }
 
 impl VerifiedRecoveryHostIntent {
+    /// Consume this original positive adoption request with its actual control owner.
+    #[cfg(feature = "desktop-local")]
+    pub fn into_ordinary_legacy_intent(self, control: &super::RecoveryControl, owners: &[super::runtime::RuntimeOwner]) -> Result<super::ordinary::VerifiedOrdinaryStartupIntent, RecoveryControlError> {
+        local_legacy_intent(&control.shared, self, owners)
+    }
+
     pub fn purpose(&self) -> RecoveryRequestPurpose {
-        self.decoded.purpose
+        self.decoded.purpose()
     }
     pub fn restore_profile(&self) -> Option<&super::RestoreOperationProfile> {
-        Some(&self.decoded.profile)
+        match &self.decoded { DecodedRecoveryRequest::Restore(request) => Some(&request.profile), DecodedRecoveryRequest::Legacy(_) => None }
     }
     pub fn expected(&self) -> &RecoveryRequestExpected {
-        &self.decoded.expected
+        self.decoded.expected()
     }
 }
 
 struct RestoreOperationOwner {
-    intent: VerifiedRecoveryHostIntent,
+    intent: VerifiedRestoreHostIntent,
     operation: Hex32,
     epoch: Hex64,
     clock: super::clock::OperationClock,
@@ -1561,6 +1654,12 @@ pub(crate) struct RestoreStages {
 pub(crate) struct RestoreStageIntent {
     operation: Hex32,
     reference: super::activation::JournalReference,
+}
+
+impl RestoreStageIntent {
+    pub(crate) fn reference(&self) -> &super::activation::JournalReference {
+        &self.reference
+    }
 }
 
 impl RestoreStages {
@@ -1913,7 +2012,10 @@ pub(super) fn claim_restore(
         if state.restore_operation.is_some() || state.pending_restore_intent.is_some() {
             return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
         }
-        state.pending_restore_intent = incoming.take();
+        state.pending_restore_intent = Some(match incoming.take().expect("original entry retained") {
+            VerifiedRecoveryHostIntent { host, request, request_bytes, control_root, decoded: DecodedRecoveryRequest::Restore(decoded), original_deadline } => VerifiedRestoreHostIntent { host, request, request_bytes, control_root, decoded, original_deadline },
+            other => { incoming = Some(other); return Err(service_invalid()); }
+        });
         let original = state
             .pending_restore_intent
             .as_ref()
@@ -2476,6 +2578,7 @@ impl RestoreControlSession {
                 .expect("held original key medium");
             state.restore_input = Some(
                 crate::backup::whole_pg_restore_stream::input::from_original_held(
+                    self.stages.operation,
                     (carrier, state.restore_input_metadata[0].take().expect("original carrier metadata")),
                     (key, state.restore_input_metadata[1].take().expect("original key metadata")),
                     bounds,
@@ -3037,7 +3140,7 @@ pub(super) struct ControlFiles {
     pub(super) pending_owner: Option<File>,
     pending_request: Option<OwnedRecoveryRequestFile>,
     pending_host: Option<VerifiedRecoveryHost>,
-    raw_request_decode: Option<Result<RecoveryRequestV1, RecoveryControlError>>,
+    raw_request_decode: Option<Result<DecodedRecoveryRequest, RecoveryControlError>>,
     preheld_restore_usage: Option<(u64, u64)>,
     service_source: Option<VerifiedServiceRecoveryHost>,
     pub(super) runtime_record: Option<OwnedRecord>,
@@ -3050,7 +3153,7 @@ pub(super) struct ControlFiles {
     restore_runtime_readbacks: Vec<RestoreRuntimeReadback>,
     restore_operation: Option<RestoreOperationOwner>,
     closing_observation: Option<RestoreClosingAllowance>,
-    pending_restore_intent: Option<VerifiedRecoveryHostIntent>,
+    pending_restore_intent: Option<VerifiedRestoreHostIntent>,
     pending_restore_clock: Option<super::clock::OperationClock>,
     #[cfg(feature = "server-runtime")]
     restore_input_buffer: Option<zeroize::Zeroizing<Vec<u8>>>,
@@ -3623,6 +3726,13 @@ impl ControlFiles {
         }
         if let Some(plan) = &original.candidate_plan_output { ledger.observe_file(&plan.parent, false, deadline)?; }
         ledger.check_storage()
+    }
+
+    pub(super) fn require_empty_legacy_control_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        let operations = self.inventory_count(Directory::Operations, self.limits.max_retained_operations, None, deadline)?;
+        let runtimes = self.inventory_count(Directory::Runtimes, self.limits.max_registered_runtimes, None, deadline)?;
+        if operations != 0 || runtimes != 0 { return Err(RecoveryControlError::new(RecoveryControlFault::InitializationRequired)); }
+        Ok(())
     }
 
     /// Drop the writer's locks and open journal; written files stay.
@@ -5837,6 +5947,64 @@ pub(super) fn server_intent(
 
 /// Seal the Local producer's expected original host before any installation write.
 #[cfg(feature = "desktop-local")]
+pub(super) fn local_legacy_intent(
+    owner: &ControlOwner,
+    request: VerifiedRecoveryHostIntent,
+    owners: &[super::runtime::RuntimeOwner],
+) -> Result<super::ordinary::VerifiedOrdinaryStartupIntent, RecoveryControlError> {
+    use super::ordinary::{LocalSiteExpectation, OrdinaryInitializationSource, OrdinarySite, SiteExpectation, VerifiedOrdinaryStartupIntent};
+    let mut original = Some(request);
+    let result = (|| {
+        let mut files = lock(owner)?;
+        let request = original.as_mut().expect("original request retained");
+        let deadline = request.original_deadline;
+        if files.root_identity(deadline)? != request.control_root { return Err(service_invalid()); }
+        request.host.recheck_original(deadline)?;
+        let DecodedRecoveryRequest::Legacy(decoded) = &request.decoded else { return Err(service_invalid()); };
+        let metadata = request.request_bytes.len().checked_mul(4).and_then(|n| n.checked_add(std::mem::size_of::<VerifiedOrdinaryStartupIntent>() + owners.len() * 2 * std::mem::size_of::<super::runtime::RuntimeOwner>())).ok_or_else(service_invalid)?;
+        files.prepay(metadata as u64, 0)?;
+        let (root, parent, component) = files.observe_local_root(deadline)?;
+        let root = root.ok_or_else(service_invalid)?;
+        let expected = &decoded.expected;
+        let ids = super::journal::BusinessAndInstallation { deployment_id: expected.deployment_id.clone(), tenant_id: expected.tenant_id.clone(), dataset_id: expected.dataset_id.as_str().to_owned(), source_installation_id: expected.source_installation_id.as_str().to_owned(), target_installation_id: expected.target_installation_id.as_str().to_owned() };
+        let source = (OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical }, decoded.request_id, request.request.identity);
+        let site = SiteExpectation::Local(LocalSiteExpectation { root: Some(root), parent, component, release: Hex64::of(&request.host.reviewed_release_digest), master_service: request.host.services[0].clone(), postgres_service: request.host.services[1].clone(), installation_id: Some(ids.target_installation_id.clone()), legacy_expected: Some(ids) });
+        let bounds = decoded.limits;
+        let admission_ns = files.limits.admission_ns;
+        drop(files);
+        VerifiedOrdinaryStartupIntent::seal_local_legacy(source, site, bounds, admission_ns, owners, original.take().expect("original entry transferred once"), deadline)
+    })();
+    result.map_err(|mut error: RecoveryControlError| { if original.is_some() { error.retained_restore_intent = original.take().map(Box::new); } error.retain(owner) })
+}
+
+#[cfg(feature = "desktop-local")]
+pub(super) fn recheck_legacy_request_before(files: &mut ControlFiles, request: &mut VerifiedRecoveryHostIntent, deadline: Instant) -> Result<(), RecoveryControlError> {
+    request.host.recheck_original(deadline)?;
+    files.raw.metadata = Some(request.request.file.as_ref().ok_or_else(service_invalid)?.metadata());
+    files.post(deadline)?;
+    let metadata = files.raw.metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
+    let stamp = ServiceFileStamp::of(metadata, files.uid)?;
+    if stamp.identity != request.request.identity || stamp.length != request.request_bytes.len() as u64 { return Err(service_invalid()); }
+    files.raw.named = Some(rustix::fs::statat(&request.request.parent, request.request.component.as_str(), AtFlags::SYMLINK_NOFOLLOW));
+    files.post(deadline)?;
+    let named = files.raw.named.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
+    if named.st_dev as u64 != stamp.identity.device || named.st_ino as u64 != stamp.identity.inode || named.st_size as u64 != stamp.length || named.st_nlink != 1 || named.st_mode & 0o7777 != 0o600 || named.st_uid != files.uid { return Err(service_invalid()); }
+    let mut offset = 0;
+    while offset < request.request_bytes.len() {
+        let count = (request.request_bytes.len() - offset).min(8);
+        before(deadline)?;
+        files.raw.unit = Some(request.request.file.as_ref().ok_or_else(service_invalid)?.read_exact_at(&mut files.raw.small[..count], offset as u64));
+        files.post(deadline)?;
+        if !matches!(files.raw.unit, Some(Ok(()))) || files.raw.small[..count] != request.request_bytes[offset..offset+count] { return Err(service_invalid()); }
+        offset += count;
+    }
+    files.raw.metadata = Some(request.request.file.as_ref().ok_or_else(service_invalid)?.metadata());
+    files.post(deadline)?;
+    if ServiceFileStamp::of(files.raw.metadata.as_ref().and_then(|result| result.as_ref().ok()).ok_or_else(service_invalid)?, files.uid)? != stamp { return Err(service_invalid()); }
+    Ok(())
+}
+
+#[cfg(feature = "desktop-local")]
 pub(super) fn local_intent(
     owner: &ControlOwner,
     creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
@@ -5872,6 +6040,7 @@ pub(super) fn local_intent(
         master_service: services[0].to_owned(),
         postgres_service: services[1].to_owned(),
         installation_id: None,
+        legacy_expected: None,
     });
     drop(files);
     VerifiedOrdinaryStartupIntent::seal_at(None, site, bounds, admission_ns, owners, t0, t0_ns)
@@ -6793,8 +6962,8 @@ pub(super) fn verify_intent(
             .checked_mul(32)
             .and_then(|n| {
                 n.checked_add(
-                    std::mem::size_of::<RestoreRequestWire>()
-                        + std::mem::size_of::<RecoveryRequestV1>()
+                    std::mem::size_of::<RecoveryRequestWire>()
+                        + std::mem::size_of::<DecodedRecoveryRequest>()
                         + 1024,
                 )
             })
@@ -6810,17 +6979,21 @@ pub(super) fn verify_intent(
         let host = state.pending_host.as_ref().ok_or_else(service_invalid)?;
         if !super::journal::hex_matches(
             &host.reviewed_release_digest,
-            decoded.expected.reviewed_release_digest.as_str(),
+            decoded.expected().reviewed_release_digest.as_str(),
         ) {
             return Err(service_invalid());
         }
         match &host.original {
             #[cfg(feature = "desktop-local")]
             HostOrigin::LocalRelease { actual, .. } => {
-                if Some(decoded.selection.target.parent.as_path()) != actual.as_path().parent()
-                    || decoded.selection.target.component == state.root_component
-                {
-                    return Err(service_invalid());
+                match decoded {
+                    DecodedRecoveryRequest::Restore(decoded) => {
+                        if Some(decoded.selection.target.parent.as_path()) != actual.as_path().parent() || decoded.selection.target.component == state.root_component { return Err(service_invalid()); }
+                    }
+                    DecodedRecoveryRequest::Legacy(decoded) => {
+                        let selection = &decoded.selection.installation;
+                        if Some(selection.parent.as_path()) != actual.as_path().parent() || actual.as_path().file_name() != Some(std::ffi::OsStr::new(&selection.component)) || decoded.limits.effect_ns > host.ordinary_bounds.effect_ns || decoded.limits.convergence_ns > host.ordinary_bounds.convergence_ns { return Err(service_invalid()); }
+                    }
                 }
             }
             HostOrigin::ServiceConfig(_) => return Err(service_invalid()),

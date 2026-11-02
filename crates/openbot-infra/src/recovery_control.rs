@@ -1185,7 +1185,7 @@ fn before(deadline: Instant) -> Result<(), RecoveryControlError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
 
@@ -1735,10 +1735,10 @@ mod tests {
     }
 
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
-    struct RestoreEntryFixture {
-        directory: std::path::PathBuf,
+    pub(crate) struct RestoreEntryFixture {
+        pub(crate) directory: std::path::PathBuf,
         limits: TrustedHostRecoveryLimits,
-        profile: super::RestoreOperationProfile,
+        pub(crate) profile: super::RestoreOperationProfile,
     }
 
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
     impl RestoreEntryFixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
             // A private task-owned root below the real checkout avoids the
             // intentionally world-writable system temporary ancestor.
@@ -1807,20 +1807,34 @@ mod tests {
                 ).unwrap()
         }
 
-        fn open(&self) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
-            self.open_with_key_parent(&self.directory.join("key-medium"))
+        pub(crate) fn open(&self) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
+            self.open_request(self.request())
+        }
+
+        pub(crate) fn request(&self) -> Value {
+            let root = self.directory.as_path();
+            let selected = |name: &str| json!({"parent": root, "component": name});
+            json!({"formatVersion": 1, "requestId": OPERATION, "purpose": "restore_same_installation",
+                    "expectedReviewedReleaseDigest": "11".repeat(32), "expectedDeploymentId": "dep", "expectedTenantId": "ten",
+                    "expectedDatasetId": CONTROL, "expectedSourceInstallationId": "22".repeat(32), "expectedTargetInstallationId": "22".repeat(32),
+                    "trustedInputSelection": {"carrier": {"parent": root.join("carrier-medium"), "component": "carrier"}, "keyMedium": {"parent": root.join("key-medium"), "component": "key"},
+                        "expectedBundleId": "01234567-89ab-4def-8123-456789abcdef", "expectedSourceOperationId": "11234567-89ab-4def-8123-456789abcdef",
+                        "expectedManifestSha256": ZERO64, "target": selected("new-generation")}, "profile": self.profile})
         }
 
         fn open_with_key_parent(&self, key_parent: &std::path::Path) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
+            let mut request = self.request();
+            request["trustedInputSelection"]["keyMedium"]["parent"] = json!(key_parent);
+            self.open_request(request)
+        }
+
+        pub(crate) fn open_request(&self, request: Value) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
+            self.try_open_request(request).unwrap()
+        }
+
+        pub(crate) fn try_open_request(&self, request: Value) -> Result<(super::RecoveryControl, super::VerifiedRecoveryHostIntent), super::RecoveryControlError> {
             use std::os::unix::fs::PermissionsExt;
             let root = self.directory.as_path();
-            let selected = |name: &str| json!({"parent": root, "component": name});
-            let request = json!({"formatVersion": 1, "requestId": OPERATION, "purpose": "restore_same_installation",
-                    "expectedReviewedReleaseDigest": "11".repeat(32), "expectedDeploymentId": "dep", "expectedTenantId": "ten",
-                    "expectedDatasetId": CONTROL, "expectedSourceInstallationId": "22".repeat(32), "expectedTargetInstallationId": "22".repeat(32),
-                    "trustedInputSelection": {"carrier": {"parent": root.join("carrier-medium"), "component": "carrier"}, "keyMedium": {"parent": key_parent, "component": "key"},
-                        "expectedBundleId": "01234567-89ab-4def-8123-456789abcdef", "expectedSourceOperationId": "11234567-89ab-4def-8123-456789abcdef",
-                        "expectedManifestSha256": ZERO64, "target": selected("new-generation")}, "profile": self.profile});
             std::fs::write(root.join("request"), serde_json::to_vec(&request).unwrap()).unwrap();
             std::fs::set_permissions(root.join("request"), std::fs::Permissions::from_mode(0o600))
                 .unwrap();
@@ -1829,6 +1843,8 @@ mod tests {
                     (std::fs::File::open(root).unwrap(), "release".into(), std::fs::File::open(root.join("release")).unwrap()),
                     crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(root.join("old-app")).unwrap(),
                     [0x11; 32], self.limits.clone(),
+                    serde_json::from_value(json!({"effectNs":30_000_000_000u64,"convergenceNs":30_000_000_000u64})).unwrap(),
+                    ["test.vault", "test.postgres"],
                 ).unwrap();
             let request = super::OwnedRecoveryRequestFile::from_held(
                 std::fs::File::open(root).unwrap(),
@@ -1839,7 +1855,7 @@ mod tests {
             super::RecoveryControl::open_local_restore_before(
                     crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(root.join("old-app")).unwrap(),
                     request, host, std::time::Instant::now() + std::time::Duration::from_secs(30),
-                ).unwrap()
+                )
         }
 
         fn control_root(&self) -> std::path::PathBuf {
@@ -2206,6 +2222,67 @@ mod tests {
             observe(&canonical_descriptor(prior_data), &limits()).is_ok(),
             "strict-prior52 remains parseable DATA, not startup or migration authority"
         );
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn local_legacy_request(fixture: &RestoreEntryFixture) -> Value {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fixture.directory.join("old-app");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = fixture.request();
+        request["purpose"] = json!("adopt_ordinary_legacy");
+        request.as_object_mut().unwrap().remove("profile");
+        request["trustedInputSelection"] = json!({"installation":{"parent":fixture.directory,"component":"old-app"}});
+        request["limits"] = json!({"effectNs":30_000_000_000u64,"convergenceNs":30_000_000_000u64});
+        request
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn local_legacy_request_seals_initializing_before_site_effects() {
+        let fixture = RestoreEntryFixture::new();
+        let request = local_legacy_request(&fixture);
+        let (mut control, entry) = fixture.open_request(request);
+        assert_eq!(entry.purpose(), super::RecoveryRequestPurpose::AdoptOrdinaryLegacy);
+        assert!(entry.restore_profile().is_none());
+        let intent = entry.into_ordinary_legacy_intent(&control, &[super::RuntimeOwner::PostgresSidecar, super::RuntimeOwner::SqlDriver]).unwrap();
+        let deadline = intent.admission_deadline();
+        let mut session = control.begin_ordinary_initialization_before(intent, deadline).unwrap();
+        session.seal_local_legacy_before().unwrap();
+        let root = fixture.control_root();
+        let bytes = std::fs::read(root.join("activation-v1")).unwrap();
+        let observation = observe(&bytes, &fixture.limits).unwrap();
+        assert_eq!(observation.record.phase, super::ActivationPhase::OrdinaryInitializing);
+        assert_eq!(std::fs::read_dir(fixture.directory.join("old-app")).unwrap().count(), 0, "no sidecar/schema/key effect precedes Initializing");
+        let journal = std::fs::read(root.join("operations").join(OPERATION).join("journal-v1")).unwrap();
+        observe_chain(&journal, &fixture.limits).unwrap();
+        let length = u32::from_be_bytes(journal[8..12].try_into().unwrap()) as usize;
+        let first: Value = serde_json::from_slice(&journal[12..12+length]).unwrap();
+        assert_eq!(first["operationId"], OPERATION);
+        assert_eq!(first["data"]["mode"], "legacy_adoption");
+        assert_eq!(first["data"]["originalStartupIntent"], OPERATION);
+        assert!(first["data"].get("request").is_none());
+        // An actual EEXIST leaves the old first head and all its bytes intact.
+        assert!(super::entry::lock(&control.shared).unwrap().publish_activation(&observation.record, deadline).is_err());
+        assert_eq!(std::fs::read(root.join("activation-v1")).unwrap(), bytes);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn local_legacy_request_rejects_cross_payload_or_enlarged_bounds() {
+        for mutation in 0..3 {
+            let fixture = RestoreEntryFixture::new();
+            let mut request = local_legacy_request(&fixture);
+            match mutation {
+                0 => request["profile"] = serde_json::to_value(&fixture.profile).unwrap(),
+                1 => request["trustedInputSelection"]["carrier"] = json!({"parent":fixture.directory,"component":"carrier"}),
+                _ => request["limits"]["effectNs"] = json!(30_000_000_001u64),
+            }
+            assert!(fixture.try_open_request(request).is_err());
+            assert!(!fixture.control_root().join("activation-v1").exists());
+            assert_eq!(std::fs::read_dir(fixture.control_root().join("operations")).unwrap().count(), 0);
+        }
     }
 
 }

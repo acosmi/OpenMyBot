@@ -388,8 +388,8 @@ pub(in super::super) async fn adopt_server_legacy_before(
     // 7. proof and publication
     session.publish_active(OrdinaryActivationProof::Legacy(
         VerifiedOrdinaryLegacyProof {
-            site,
-            key_id,
+            operation: session.operation()?,
+            site: super::super::ordinary::LegacySite::Server { site, key_id },
             native_version: native::NATIVE_LATEST_VERSION.unsigned_abs(),
             migration_digest,
         },
