@@ -265,12 +265,17 @@ Phase 8 completion point: V7-IMPL-047 (#233) is merged together with V7-COMP-026
 | V7-IMPL-031 part 2 | Public artifact deletion with owned cleanup and capture coordination | [#269](https://github.com/acosmi/OpenMyBot/pull/269) | [f002a43780](https://github.com/acosmi/OpenMyBot/commit/f002a437804fed36d47639cb329362f1c22d85b1) | 2026-11-01 |
 | FIX-TESTKIT-MISSING-BINDING | Align artifact tests with request binding and scope the desktop transport mutable binding to its feature | [#270](https://github.com/acosmi/OpenMyBot/pull/270) | [2870686dcf](https://github.com/acosmi/OpenMyBot/commit/2870686dcf5d3d0d742783fd6142f7e0d3abf63f) | 2026-11-02 |
 | FIX-DESKTOP-TEST-STACK | Run five Prepared Local test request futures on default worker stacks while giving setup a larger test thread | [#271](https://github.com/acosmi/OpenMyBot/pull/271) | [c016d73b9f](https://github.com/acosmi/OpenMyBot/commit/c016d73b9ffa0fd6faa9c192b7c4bf84a6f9e610) | 2026-11-02 |
+| Ledger sync | Record the testkit binding and desktop test-stack repairs while retaining open implementation and owner checks | [#272](https://github.com/acosmi/OpenMyBot/pull/272) | [9a361a0af6](https://github.com/acosmi/OpenMyBot/commit/9a361a0af61fb82d0a19d54c84c0c949e8a36ada) | 2026-11-02 |
+| FIX-NATIVE0021-FEATURE-GATE | Require server-runtime for the native 0021 integration test target | [#274](https://github.com/acosmi/OpenMyBot/pull/274) | [5558540a0b](https://github.com/acosmi/OpenMyBot/commit/5558540a0b8c997e6b5f03b26d4c46088f930040) | 2026-11-02 |
+| FIX-INFRA-TEST-FEATURES | Declare server-runtime requirements for 72 integration test targets while retaining shared tests in supported builds | [#276](https://github.com/acosmi/OpenMyBot/pull/276) | [d8bbda0ebf](https://github.com/acosmi/OpenMyBot/commit/d8bbda0ebf7ed9b1d6c4b8d4e289e06b3b741717) | 2026-11-02 |
 
 ## Open
 
 | Task | Status | PR |
 |---|---|---|
 | V7-IMPL-046 | Draft PR, open: bounded whole-PostgreSQL restore | [#226](https://github.com/acosmi/OpenMyBot/pull/226) |
+| V7-IMPL-048 | Draft PR, open: Bot work listing and conversation titles | [#273](https://github.com/acosmi/OpenMyBot/pull/273) |
+| V7-IMPL-049 | Draft PR, open: persistent direct-assistant inputs | [#275](https://github.com/acosmi/OpenMyBot/pull/275) |
 | V6-PR-048 | Closed unmerged 2026-10-12; the naming unification moves to a separate compatibility migration | [#59](https://github.com/acosmi/OpenMyBot/pull/59) |
 | V6-PR-054 | Closed unmerged 2026-10-12; skip-link keyboard focus carried as a UI accessibility item | [#70](https://github.com/acosmi/OpenMyBot/pull/70) |
 | V6-PR-059 | Not approved: SDK own-login contract draft; no PR | none |
