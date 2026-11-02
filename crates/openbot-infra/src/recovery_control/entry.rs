@@ -1653,6 +1653,29 @@ struct RestoreCandidateIsolationWork {
     generation: String,
 }
 
+/// Fixed native slot observation DATA, never a slot/candidate/runtime proof.
+#[derive(Clone, Copy)]
+pub enum RestoreTargetSlotOutcome {
+    /// Original exact readback matched under the issuer's constant-time comparison.
+    ReadbackMatched,
+    /// Original write result did not prove completion.
+    WriteUnknown,
+    /// Original readback result did not prove the expected value.
+    ReadbackUnknown,
+}
+#[derive(Clone, Copy)]
+enum TargetSlotKind { Master, Scram }
+impl TargetSlotKind {
+    fn index(self) -> usize { match self { Self::Master => 0, Self::Scram => 1 } }
+    fn prefix(self) -> &'static str { match self { Self::Master => "desktop-vault-master-v1-", Self::Scram => "postgresql-17-" } }
+    fn effect_id(self) -> &'static str { match self { Self::Master => "restore_master_slot", Self::Scram => "restore_scram_slot" } }
+    fn exact_length(self) -> u64 { match self { Self::Master => 33, Self::Scram => 64 } }
+}
+struct RestoreTargetSlotJournal {
+    intent: Option<RestoreStageIntent>,
+    refs: Option<(String, String)>,
+}
+
 pub struct OwnedRestoreCandidatePlan {
     parent: File,
     parent_path: PathBuf,
@@ -2358,6 +2381,7 @@ pub(super) fn claim_restore(
             },
             candidate: None,
             isolation_intent: None,
+            target_slots: [None, None],
         })
     })();
     result.map_err(|mut error: RecoveryControlError| {
@@ -2462,6 +2486,7 @@ pub struct RestoreControlSession {
     stages: RestoreStages,
     candidate: Option<PendingRestoreCandidateAuthority>,
     isolation_intent: Option<RestoreStageIntent>,
+    target_slots: [Option<RestoreTargetSlotJournal>; 2],
 }
 
 impl Drop for RestoreControlSession {
@@ -2484,6 +2509,84 @@ impl Drop for RestoreControlSession {
 }
 
 impl RestoreControlSession {
+    /// Same original owner/E check before each native slot-store effect.
+    pub fn check_restore_slot_effect_before(&mut self, deadline: Instant) -> Result<Instant, RecoveryControlError> { self.stages.effect_before(deadline) }
+    /// Original C for observing already-entered native results, without renewal.
+    pub fn restore_slot_convergence_deadline(&self) -> Result<Instant, RecoveryControlError> { self.stages.convergence_deadline() }
+    /// Remaining original secret-memory credit, after the same E/owner check.
+    pub fn restore_slot_secret_capacity_before(&mut self, deadline: Instant) -> Result<u64, RecoveryControlError> {
+        self.stages.effect_before(deadline)?;
+        self.stages.capacity_available(super::RestoreCapacityResource::SecretMemoryBytes)
+    }
+    /// Record the master's native result against its fixed intent/refs (matched33B).
+    pub fn observe_restore_master_slot_before(&mut self, outcome: RestoreTargetSlotOutcome, deadline: Instant) -> Result<(), RecoveryControlError> { self.observe_target_slot_before(outcome, deadline, TargetSlotKind::Master) }
+    /// Record the SCRAM native result against its fixed intent/refs (matched64B).
+    pub fn observe_restore_scram_slot_before(&mut self, outcome: RestoreTargetSlotOutcome, deadline: Instant) -> Result<(), RecoveryControlError> { self.observe_target_slot_before(outcome, deadline, TargetSlotKind::Scram) }
+    fn observe_target_slot_before(&mut self, outcome: RestoreTargetSlotOutcome, deadline: Instant, kind: TargetSlotKind) -> Result<(), RecoveryControlError> {
+        let closing = self.stages.convergence_deadline()?.min(deadline);
+        let slot = self.target_slots[kind.index()].as_mut().ok_or_else(service_invalid)?;
+        let intent = slot.intent.take().ok_or_else(service_invalid)?;
+        let (service_ref, account_ref) = slot.refs.take().ok_or_else(service_invalid)?;
+        let intent_ref = intent.reference.clone();
+        let disposition = match outcome {
+            RestoreTargetSlotOutcome::ReadbackMatched => super::RestoreDisposition::OsStoreReadbackMatched { intent_ref, service_ref, account_ref, exact_length: kind.exact_length() },
+            RestoreTargetSlotOutcome::WriteUnknown => super::RestoreDisposition::OsStoreWriteUnknown { intent_ref, service_ref, account_ref },
+            RestoreTargetSlotOutcome::ReadbackUnknown => super::RestoreDisposition::OsStoreReadbackUnknown { intent_ref, service_ref, account_ref },
+        };
+        self.stages.observe_stage_before(intent, disposition, closing)
+    }
+
+    /// Fixed historical-master service/account DATA and original E.
+    #[cfg(feature = "server-runtime")]
+    pub fn begin_restore_master_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant) -> Result<(String, String, Instant), RecoveryControlError> { self.begin_target_slot_before(staging, deadline, TargetSlotKind::Master) }
+    /// Fixed new-SCRAM service/account DATA and original E.
+    #[cfg(feature = "server-runtime")]
+    pub fn begin_restore_scram_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant) -> Result<(String, String, Instant), RecoveryControlError> { self.begin_target_slot_before(staging, deadline, TargetSlotKind::Scram) }
+    #[cfg(feature = "server-runtime")]
+    fn begin_target_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant, kind: TargetSlotKind) -> Result<(String, String, Instant), RecoveryControlError> {
+        let result = (|| {
+            let index = kind.index();
+            if self.target_slots[index].is_some() { return Err(service_invalid()); }
+            let effect = self.stages.effect_before(deadline)?;
+            {
+                let state = lock(&self.stages.owner)?;
+                let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+                let plan = staging.candidate_plan();
+                if plan.operation_id() != self.operation_id() || plan.generation_id() != operation.candidate_plan.generation_id
+                    || plan.target_installation_id() != operation.intent.decoded.expected.target_installation_id.as_str() { return Err(service_invalid()); }
+                super::id(&operation.intent.host.services[index], state.limits.max_id_bytes)?;
+                if (kind.prefix().len() + 64 + 3 + 32) as u64 > state.limits.max_id_bytes { return Err(service_invalid()); }
+            }
+            let intent = self.stages.begin_stage_before(super::RestoreStage::KeySlot, kind.effect_id(), effect)?;
+            self.target_slots[index] = Some(RestoreTargetSlotJournal { intent: Some(intent), refs: None });
+            let mut state = lock(&self.stages.owner)?;
+            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let service_len = operation.intent.host.services[index].len();
+            let account_len = kind.prefix().len() + 64 + 3 + 32;
+            let prepaid = service_len.checked_add(account_len).and_then(|n| n.checked_mul(4))
+                .and_then(|n| n.checked_add(std::mem::size_of::<(String, String, Instant)>())).ok_or_else(service_invalid)?;
+            state.prepay(prepaid as u64, 0)?;
+            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let service = operation.intent.host.services[index].clone();
+            let mut account = String::new();
+            account.try_reserve_exact(account_len).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            account.push_str(kind.prefix());
+            account.push_str(operation.intent.decoded.expected.target_installation_id.as_str());
+            account.push_str("-r-");
+            account.push_str(self.operation_id());
+            let service_reply = service.clone();
+            let account_reply = account.clone();
+            let observed = std::mem::size_of::<(String, String, Instant)>()
+                .checked_add(service.capacity()).and_then(|n| n.checked_add(account.capacity()))
+                .and_then(|n| n.checked_add(service_reply.capacity())).and_then(|n| n.checked_add(account_reply.capacity())).ok_or_else(service_invalid)?;
+            self.target_slots[index].as_mut().expect("original slot intent retained").refs = Some((service, account));
+            state.restore_operation.as_mut().ok_or_else(service_invalid)?.ledger.settle(super::RestoreCapacityResource::MetadataBytes, prepaid as u64, observed as u64)?;
+            state.post(effect)?;
+            Ok((service_reply, account_reply, effect))
+        })();
+        self.retain_failure(result)
+    }
+
     /// Begin the original Isolation stage once before the first candidate write.
     /// The stage intent remains private; only original owned resource copies leave.
     #[cfg(feature = "server-runtime")]

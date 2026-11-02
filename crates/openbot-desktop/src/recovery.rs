@@ -3,6 +3,7 @@
 mod candidate;
 mod entry;
 pub(crate) mod input;
+mod slots;
 #[cfg(test)]
 mod tests;
 

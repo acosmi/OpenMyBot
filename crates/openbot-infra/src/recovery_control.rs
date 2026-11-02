@@ -20,7 +20,7 @@ pub use activation::{ActivationBinding, ActivationPhase, OrdinaryStartupBounds};
 pub use journal::{NativeExit, PipeJoin, ProcessStart};
 pub(crate) use activation::{Hex32, ServerDatabaseSite};
 pub use entry::{
-    ReadOnlyRestoreOwner, RestoreOriginalObservation, OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
+    RestoreTargetSlotOutcome, ReadOnlyRestoreOwner, RestoreOriginalObservation, OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
     VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
 };
 pub(crate) use ordinary::OrdinaryStage;

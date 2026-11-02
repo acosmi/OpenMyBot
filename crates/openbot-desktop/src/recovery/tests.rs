@@ -284,6 +284,51 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+// A real held-request producer reused by the four S23 store scenarios. Its
+// numbers are the existing S17 CAR profile, fixed before any case executes.
+fn s23_car_request(fixture: &EntryFixture) -> RestoreOperationProfile {
+    let source = PathBuf::from(std::env::var_os("OPENBOT_TEST_WHOLE_PG_CARRIER_DIR").expect("explicit authorized CAR"));
+    for (directory, original, leaf) in [("carrier-medium", "carrier", "carrier"), ("key-medium", "key", "key")] {
+        DirBuilder::new().mode(0o700).create(fixture.root.join(directory)).unwrap();
+        let mut entries = fs::read_dir(source.join(original)).unwrap();
+        let path = entries.next().expect("one CAR file").unwrap().path();
+        assert!(entries.next().is_none());
+        fs::copy(path, fixture.root.join(directory).join(leaf)).unwrap();
+        fs::set_permissions(fixture.root.join(directory).join(leaf), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::copy(source.join("expected.json"), fixture.root.join("expected.json")).unwrap();
+    let expected: Value = serde_json::from_slice(&fs::read(fixture.root.join("expected.json")).unwrap()).unwrap();
+    let mut request = fixture.request_value();
+    request["profile"]["effectNs"] = json!(120_000_000_000u64);
+    request["profile"]["convergenceNs"] = json!(30_000_000_000u64);
+    for (field, value) in [
+        ("maxInputWireBytes", 64u64 << 20), ("maxManifestBytes", 4 << 20),
+        ("maxMaterialFiles", 4096), ("maxMaterialDirectories", 512),
+        ("maxSingleMaterialBytes", 32 << 20), ("maxMaterialPlainBytes", 64 << 20),
+        ("maxPathBytes", 1024), ("maxPathDepth", 16),
+        ("maxCandidateDataBytes", 64 << 20), ("maxCandidateWalBytes", 64 << 20),
+        ("maxCandidateTempBytes", 16 << 20), ("maxSpoolBytes", 64 << 20),
+        ("maxRetainedPriorBytes", 64 << 20), ("maxJournalRecords", 64),
+        ("maxMetadataBytes", 1 << 24), ("maxOpenFiles", 4096),
+        ("maxPgConnections", 4), ("maxPgTransactions", 4), ("maxPgRows", 64),
+        ("maxReconfirmRequirements", 64), ("maxSecretMemoryBytes", 8 << 20),
+        ("maxTotalAllocationBytes", 1 << 32), ("reserveBytes", 1), ("freeFloorBytes", 1),
+        ("maxKeyMediumAllocationBytes", 1 << 30), ("keyMediumReserveBytes", 1), ("keyMediumFreeFloorBytes", 1),
+    ] { request["profile"]["capacity"][field] = json!(value); }
+    for (field, original) in [("expectedDeploymentId", "deploymentId"), ("expectedTenantId", "tenantId"), ("expectedDatasetId", "datasetId"), ("expectedSourceInstallationId", "sourceInstallationId")] {
+        request[field] = expected[original].clone();
+    }
+    for (field, original) in [("expectedBundleId", "bundleId"), ("expectedSourceOperationId", "sourceOperationId"), ("expectedManifestSha256", "manifestSha256")] {
+        request["trustedInputSelection"][field] = expected[original].clone();
+    }
+    request["trustedInputSelection"]["carrier"] = json!({"parent":fixture.root.join("carrier-medium"),"component":"carrier"});
+    request["trustedInputSelection"]["keyMedium"] = json!({"parent":fixture.root.join("key-medium"),"component":"key"});
+    request["trustedInputSelection"]["target"] = json!({"parent":fixture.root,"component":"new-generation"});
+    let profile = serde_json::from_value(request["profile"].clone()).unwrap();
+    fixture.write_request(&request);
+    profile
+}
+
 #[test]
 fn t046_01_release_and_request_verify_without_business_grant() {
     let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
@@ -506,4 +551,115 @@ async fn s20_authenticated_staging_copies_pg_files_and_closed_configuration() {
     assert_eq!(fs::read(&sentinel).unwrap(), old_contents);
     assert_eq!(fs::read_dir(&fixture.app).unwrap().map(|entry| entry.unwrap().file_name()).collect::<BTreeSet<_>>(), old_entries);
     assert!(candidate.original_program().is_none(), "no process or candidate PG authority");
+}
+
+#[tokio::test]
+#[ignore = "explicit CAR; genuine Import-completed source and named memory store only"]
+async fn s23_real_staging_two_named_slots_preserve_old_and_never_retry_unknown() {
+    use std::sync::Mutex;
+    use openbot_domain::vault::SecretBytes;
+    use crate::os_secret_store::{OsSecretStore, OsSecretStoreError};
+    use super::slots::install_target_slots_before;
+
+    struct NamedMemoryStore {
+        expected: [(String, String); 2],
+        values: Mutex<Vec<(String, String, SecretBytes)>>,
+        reads: Mutex<Vec<(String, String)>>,
+        writes: Mutex<Vec<(String, String)>>,
+        fault: u8,
+    }
+    impl NamedMemoryStore {
+        fn target(&self, service: &str, account: &str) -> usize {
+            self.expected.iter().position(|pair| pair.0 == service && pair.1 == account)
+                .expect("native calls use only the two original fixed target pairs")
+        }
+        fn value(&self, service: &str, account: &str) -> Option<SecretBytes> {
+            self.values.lock().unwrap().iter().find(|entry| entry.0 == service && entry.1 == account)
+                .map(|entry| SecretBytes::new(entry.2.expose().to_vec()))
+        }
+    }
+    impl OsSecretStore for NamedMemoryStore {
+        fn read(&self, service: &str, account: &str) -> Result<Option<SecretBytes>, OsSecretStoreError> {
+            let index = self.target(service, account);
+            self.reads.lock().unwrap().push((service.to_owned(), account.to_owned()));
+            let value = self.value(service, account);
+            if self.fault == 3 && index == 1 && self.writes.lock().unwrap().len() == 2 {
+                let value = value.expect("actual persisted new SCRAM before injected stale readback");
+                let mut bytes = zeroize::Zeroizing::new(value.expose().to_vec());
+                bytes[0] = if bytes[0] == b'0' { b'1' } else { b'0' };
+                return Ok(Some(SecretBytes::new(std::mem::take(&mut *bytes))));
+            }
+            Ok(value)
+        }
+        fn write(&self, service: &str, account: &str, secret: &[u8]) -> Result<(), OsSecretStoreError> {
+            let index = self.target(service, account);
+            assert_eq!(secret.len(), if index == 0 { 33 } else { 64 });
+            self.writes.lock().unwrap().push((service.to_owned(), account.to_owned()));
+            let mut values = self.values.lock().unwrap();
+            assert!(!values.iter().any(|entry| entry.0 == service && entry.1 == account), "absence before write");
+            values.push((service.to_owned(), account.to_owned(), SecretBytes::new(secret.to_vec())));
+            if self.fault == 2 && index == 1 { return Err(OsSecretStoreError::Unknown); }
+            Ok(())
+        }
+    }
+
+    for fault in 0..4 {
+        // Every scenario has its own genuine claim/clock/staging. A failed
+        // session is used again only to assert that the same work sends no IO.
+        let fixture = EntryFixture::with_open_file_limit(4096);
+        let profile = s23_car_request(&fixture);
+        let VerifiedRestoreEntry { mut control, intent, original: _original } = fixture.entry().expect("original verified release/OS/request");
+        let mut session = control.claim_restore(intent, profile).expect("actual same-session source claim");
+        let (input, intent) = session.frozen_input().expect("one actual held source transfer");
+        let staging = openbot_infra::backup::whole_pg_restore_stream::verify_whole_pg_restore_input(input, intent, &mut session).await
+            .unwrap_or_else(|failure| panic!("actual source authentication failed: {:?}", failure.fault()));
+        let target = staging.candidate_plan().target_installation_id();
+        let source = staging.candidate_plan().source_installation_id();
+        let expected = [
+            (VAULT_KEY_STORE_SERVICE.to_owned(), format!("desktop-vault-master-v1-{target}-r-{}", session.operation_id())),
+            (POSTGRES_KEY_STORE_SERVICE.to_owned(), format!("postgresql-17-{target}-r-{}", session.operation_id())),
+        ];
+        let old_master = (VAULT_KEY_STORE_SERVICE.to_owned(), format!("desktop-vault-master-v1-{source}"));
+        let old_scram = (POSTGRES_KEY_STORE_SERVICE.to_owned(), format!("postgresql-17-{source}"));
+        let mut values = vec![
+            (old_master.0.clone(), old_master.1.clone(), crate::desktop_vault::frame_stored(staging.authenticated_secrets().historical_master())),
+            (old_scram.0.clone(), old_scram.1.clone(), SecretBytes::new(staging.authenticated_secrets().postgres_scram().expose().to_vec())),
+        ];
+        if fault == 1 {
+            values.push((expected[0].0.clone(), expected[0].1.clone(), crate::desktop_vault::frame_stored(staging.authenticated_secrets().historical_master())));
+        }
+        let store = NamedMemoryStore { expected, values: Mutex::new(values), reads: Mutex::new(Vec::new()), writes: Mutex::new(Vec::new()), fault };
+        let mut work = None;
+        let result = install_target_slots_before(&mut work, &staging, &mut session, &store);
+        assert_eq!(result, if fault == 0 { Ok(()) } else { Err(DesktopRestoreError::KeyStoreUnknown) });
+        let writes = store.writes.lock().unwrap().len();
+        let reads = store.reads.lock().unwrap().len();
+        assert_eq!((reads, writes), match fault { 0 => (4, 2), 1 => (1, 0), 2 => (3, 2), _ => (4, 2) });
+        assert_eq!(install_target_slots_before(&mut work, &staging, &mut session, &store), result);
+        assert_eq!((store.reads.lock().unwrap().len(), store.writes.lock().unwrap().len()), (reads, writes), "same work never resends native calls");
+        let retained = work.as_ref().expect("original private work retained");
+        if fault == 1 {
+            assert!(matches!(retained.returned_absence(0), Some(Ok(Some(_)))));
+            assert!(retained.returned_write(0).is_none());
+        } else {
+            assert!(retained.returned_readback(0).is_some_and(|result| result.as_ref().is_ok_and(|value| value.is_some())));
+            let master = store.value(&store.expected[0].0, &store.expected[0].1).expect("actual target master");
+            assert!(master.len() == 33 && master.expose()[0] == 1);
+            let payload = SecretBytes::new(master.expose()[1..].to_vec());
+            assert!(payload.ct_eq(staging.authenticated_secrets().historical_master()));
+            let scram = store.value(&store.expected[1].0, &store.expected[1].1).expect("actual target new SCRAM");
+            assert!(scram.len() == 64 && scram.expose().iter().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)));
+            assert!(!scram.ct_eq(staging.authenticated_secrets().postgres_scram()), "new password, not historical SCRAM");
+            if fault == 2 {
+                assert!(matches!(retained.returned_write(1), Some(Err(OsSecretStoreError::Unknown))));
+                assert!(retained.returned_readback(1).is_none());
+            } else if fault == 3 {
+                let returned = retained.returned_readback(1).and_then(|result| result.as_ref().ok()).and_then(Option::as_ref).expect("original wrong readback payload retained");
+                assert!(returned.len() == 64 && !returned.ct_eq(&scram));
+            }
+        }
+        assert!(store.value(&old_master.0, &old_master.1).expect("old master unchanged").ct_eq(&crate::desktop_vault::frame_stored(staging.authenticated_secrets().historical_master())));
+        assert!(store.value(&old_scram.0, &old_scram.1).expect("old SCRAM unchanged").ct_eq(staging.authenticated_secrets().postgres_scram()));
+        eprintln!("S23 named MemoryStore scenario {fault}: actual reads={reads} writes={writes}; old slots intact; repeated work zero IO");
+    }
 }

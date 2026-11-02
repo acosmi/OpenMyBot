@@ -73,6 +73,9 @@ pub(super) struct CandidateGeneration {
     metadata: Option<io::Result<std::fs::Metadata>>,
     isolation: Option<RestoreCandidateIsolationInput>,
     wait_capacity_error: Option<RecoveryControlError>,
+    // Self's existing body fee includes this pointer; the concrete work heap
+    // and every returned secret allocation are paid by the same session.
+    target_slots: Option<Box<super::slots::RestoreTargetSlotWork>>,
 }
 
 impl CandidateGeneration {
@@ -107,6 +110,7 @@ impl CandidateGeneration {
             metadata: None,
             isolation: None,
             wait_capacity_error: None,
+            target_slots: None,
         }
     }
 
@@ -543,6 +547,17 @@ impl CandidateGeneration {
 
     pub(super) fn isolation_input(&self) -> Option<&RestoreCandidateIsolationInput> {
         self.isolation.as_ref()
+    }
+
+    pub(super) fn install_target_slots(
+        &mut self,
+        session: &mut RestoreControlSession,
+        store: &dyn crate::os_secret_store::OsSecretStore,
+    ) -> Result<(), DesktopRestoreError> {
+        if !self.prepared || self.first_fault.is_some() { return Err(DesktopRestoreError::EntryInvalid); }
+        // This does not clear a Pending Isolation. The original KeySlot
+        // adapter must admit this stage, or retain/refuse it before store IO.
+        super::slots::install_target_slots_before(&mut self.target_slots, &self.staging, session, store)
     }
 
     pub(super) fn data_directory(&self) -> Option<(&File, &std::path::Path)> {
