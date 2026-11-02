@@ -733,7 +733,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         } else {
             let roles = tx
                 .query(
-                    "SELECT role FROM public.user_roles WHERE user_id=$1 FOR SHARE",
+                    "SELECT role::text AS role FROM public.user_roles WHERE user_id=$1 FOR SHARE",
                     &[&actor],
                 )
                 .await

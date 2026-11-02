@@ -10,9 +10,12 @@ async fn w02_terminal_commit_dispatches_frozen_fifo() {
     harness::with_temp_database(&harness::admin_config("pending_w02"), "pendingw02", |config| async move {
         let f = Fixture::new_with_artifacts(config, 12).await;
         let model = f.model(CustomModelProtocol::OpenaiResponses).await;
-        let runtime = &f.assembly.run_runtime;
         let administration = f.artifact_administration.as_ref().unwrap();
-        let dispatcher = PendingInputDispatcher::new(Arc::new(f.directory.clone()), administration.clone());
+        let dispatcher = Arc::new(PendingInputDispatcher::new(Arc::new(f.directory.clone()), administration.clone()));
+        let runtime = openbot_infra::run_runtime::PostgresRunRuntime::new(
+            f.pool.clone(), "owned-v2-runtime".into(), time::Duration::seconds(30),
+            openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION,
+        ).unwrap().with_pending_input_dispatcher(dispatcher.clone());
         let c = f.pool.get().await.unwrap();
         c.batch_execute("INSERT INTO public.skills(id,slug,title,summary,instructions,origin,owner_user_id)
             VALUES('w02-a','w02-a','W02 A','','W02 A instruction.','yours','alice'),
@@ -137,6 +140,7 @@ async fn w02_terminal_commit_dispatches_frozen_fifo() {
             assert_eq!(c.query_one("SELECT count(*) FROM public.runs WHERE thread_id=$1 AND foreground AND status IN ('queued','running','cancelling','reconciliation_required')", &[&first.command.thread_id.as_str()]).await.unwrap().get::<_, i64>(0), 0);
         }
         assert_eq!(races, 36);
+        drop(runtime);
         drop(dispatcher);
         f.finish().await;
         Ok(())

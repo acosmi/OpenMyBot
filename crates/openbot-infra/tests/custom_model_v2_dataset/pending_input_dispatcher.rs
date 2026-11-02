@@ -14,15 +14,17 @@ async fn w06_generation_change_holds_frozen_input() {
         queued.command.run_id = RunId::new("generation-frozen-input");
         queued.command.message = "Preserve this frozen message".into();
         f.directory.submit_thread_input(queued.clone(), None).await.unwrap();
-        let runtime = &f.assembly.run_runtime;
+        let dispatcher = Arc::new(PendingInputDispatcher::new(Arc::new(f.directory.clone()), Arc::new(NoArtifactAdministration)));
+        let runtime = openbot_infra::run_runtime::PostgresRunRuntime::new(
+            f.pool.clone(), "owned-v2-runtime".into(), time::Duration::seconds(30),
+            openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION,
+        ).unwrap().with_pending_input_dispatcher(dispatcher.clone());
         let claim = runtime.claim_dispatch().await.unwrap().unwrap();
         let lease = runtime.acknowledge_dispatch(&claim).await.unwrap();
         let c = f.pool.get().await.unwrap();
         c.execute("UPDATE public.users SET auth_generation=8 WHERE id='alice'", &[]).await.unwrap();
         drop(c);
         runtime.finish_run(&lease, 1, openbot_application::RunTerminal::Failed(openbot_application::RunFailureCode::ProviderUnavailable)).await.unwrap();
-        let dispatcher = PendingInputDispatcher::new(Arc::new(f.directory.clone()), Arc::new(NoArtifactAdministration));
-        dispatcher.wake(&first.command.thread_id).await.unwrap();
         let c = f.pool.get().await.unwrap();
         let row = c.query_one("SELECT state,held_reason,message,auth_generation FROM openbot_internal.thread_pending_inputs WHERE run_id=$1", &[&queued.command.run_id.as_str()]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "held");
@@ -31,6 +33,7 @@ async fn w06_generation_change_holds_frozen_input() {
         assert_eq!(row.get::<_, i64>(3), 7);
         assert!(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1", &[&queued.command.run_id.as_str()]).await.unwrap().is_none());
         drop(c);
+        drop(runtime);
         drop(dispatcher);
         f.finish().await;
         Ok(())
