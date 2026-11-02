@@ -107,7 +107,7 @@ Vectors (lower-case hex):
 | Size limit | This project caps the buffered total at 1 MiB; exceeding it closes the connection as `stream_broken` |
 | Types | Only `type=event` is processed; `card` and unknown types are neither processed nor acknowledged |
 | Acknowledgement frame | The inbound frame (for fragments, the one that completed the set) with its headers plus `biz_rt`, payload replaced by exactly `{"code":200,"headers":null,"data":null}` (39 bytes); every other field keeps its inbound value; written as a Binary message on the same connection |
-| Budget | 2 seconds from the arrival of the last fragment on the monotonic clock (`FS_ACK_BUDGET`) |
+| Budget | The daemon's acknowledgement window: its `accepted` must arrive within `ack_timeout_ms` of `hello` (3 seconds) after the completed event is handed to it |
 | Acknowledged | A committed acceptance of any disposition, an unparseable payload and an event type other than `im.message.receive_v1` |
 | Not acknowledged | An acceptance that did not commit, one that exceeded the budget, and a receiver that is no longer active; no failure-shaped reply is ever written |
 

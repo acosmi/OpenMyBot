@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
+use axum::http::request::Parts;
 use axum::http::{Method, Request, StatusCode};
 use openbot_application::{
     ApplicationService, ArtifactAdministration, ArtifactAdministrationError, ChannelCursor,
@@ -19,7 +20,7 @@ use openbot_contracts::error::AppError;
 use openbot_contracts::ids::{ActorId, DeploymentId, RunId, TenantId, ThreadId};
 use openbot_contracts::request_binding::*;
 use openbot_desktop::InProcessTransport;
-use openbot_server::auth::FixedAuthResolver;
+use openbot_server::auth::AuthResolver;
 use openbot_server::{ServerBuilder, router};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -36,6 +37,15 @@ impl ChannelReader for EmptyChannels {
         _: Option<ChannelCursor>,
     ) -> Result<Vec<ChannelSummary>, PortError> {
         panic!("source IDs must not use channel enumeration")
+    }
+}
+/// Hands the HTTP carrier exactly the prepared identity. Unlike `FixedAuthResolver`, it never
+/// attaches a synthetic host binding, so an unbound context reaches the route unbound.
+struct ExactAuth(AuthContext);
+#[async_trait]
+impl AuthResolver for ExactAuth {
+    async fn resolve(&self, _parts: &Parts) -> Result<AuthContext, AppError> {
+        Ok(self.0.clone())
     }
 }
 fn plain() -> AuthContext {
@@ -166,7 +176,7 @@ async fn http(
     suffix: &str,
     body: &str,
 ) -> (StatusCode, Value) {
-    let state = ServerBuilder::new(service, Arc::new(FixedAuthResolver::granting(auth))).build();
+    let state = ServerBuilder::new(service, Arc::new(ExactAuth(auth))).build();
     let uri = format!(
         "/api/artifacts/source-runs/{}/{}{}",
         segment(input.source_thread_id.as_str()),

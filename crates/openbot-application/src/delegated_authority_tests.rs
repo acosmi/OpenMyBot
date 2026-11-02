@@ -142,10 +142,11 @@ fn subscriptions() -> [SubscriptionRequest; 4] {
 }
 
 // Fixed independent expected inventory; no wildcard in the typed projection below.
-const EXPECTED_COMMANDS: [&str; 102] = [
+const EXPECTED_COMMANDS: [&str; 103] = [
     "GetRuntimeCapabilities",
     "SaveRunMessageTextArtifact",
     "GetArtifactMetadata",
+    "DeleteArtifact",
     "GetSourceRunArtifactIds",
     "GetArtifactSaveReceipt",
     "OpenArtifactRead",
@@ -252,6 +253,7 @@ fn variant_name(command: &AppCommand) -> &'static str {
         AppCommand::GetRuntimeCapabilities => "GetRuntimeCapabilities",
         AppCommand::SaveRunMessageTextArtifact(..) => "SaveRunMessageTextArtifact",
         AppCommand::GetArtifactMetadata(..) => "GetArtifactMetadata",
+        AppCommand::DeleteArtifact { .. } => "DeleteArtifact",
         AppCommand::GetSourceRunArtifactIds(..) => "GetSourceRunArtifactIds",
         AppCommand::GetArtifactSaveReceipt(..) => "GetArtifactSaveReceipt",
         AppCommand::OpenArtifactRead(..) => "OpenArtifactRead",
@@ -367,6 +369,9 @@ fn commands() -> Vec<AppCommand> {
         AppCommand::GetArtifactMetadata(GetArtifactMetadata {
             artifact_id: String::new(),
         }),
+        AppCommand::DeleteArtifact {
+            artifact_id: String::new(),
+        },
         AppCommand::GetSourceRunArtifactIds(GetSourceRunArtifactIds {
             source_thread_id: ThreadId::new(""),
             source_run_id: RunId::new(""),
@@ -1101,7 +1106,7 @@ fn assert_untouched(app: &Guarded, poison: &Poison) {
 async fn every_command_variant_refuses_unbound_delegation_before_dispatch() {
     let (app, poison) = guarded();
     let inventory = commands();
-    assert_eq!(inventory.len(), 102);
+    assert_eq!(inventory.len(), 103);
     assert_eq!(
         inventory.iter().map(variant_name).collect::<Vec<_>>(),
         EXPECTED_COMMANDS

@@ -65,6 +65,9 @@ pub use cleanup_terminal::{
     ArtifactCleanupTerminalObserver, ArtifactCleanupTerminalPhase, ArtifactCleanupTerminalState,
 };
 
+#[path = "artifact_administration/public_delete.rs"]
+mod public_delete;
+
 const WAIT: Duration = Duration::from_secs(5);
 const PG_PHASE: Duration = Duration::from_secs(30);
 const MEDIA: &str = "text/plain; charset=utf-8";
@@ -504,6 +507,8 @@ pub struct PostgresArtifactAdministration {
     read_authority: OnceLock<Arc<artifact_read_authority::PostgresArtifactReadAuthority>>,
     cleanup_physical_observer: OnceLock<Arc<dyn ArtifactCleanupPhysicalObserver>>,
     save_producer_diagnostic: OnceLock<Arc<SaveProducerDiagnosticCapture>>,
+    /// Artifacts whose public deletion a call of this instance is removing or completing.
+    deleting: Mutex<std::collections::HashSet<String>>,
 }
 
 /// A single owned-PG record/source snapshot bound to its exact actual byte-store owner.
@@ -630,6 +635,7 @@ impl PostgresArtifactAdministration {
             read_authority: OnceLock::new(),
             cleanup_physical_observer: OnceLock::new(),
             save_producer_diagnostic: OnceLock::new(),
+            deleting: Mutex::default(),
         })
     }
 
@@ -2096,6 +2102,17 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
         tx.rollback().await.map_err(|_| unavailable())?;
         Ok(metadata)
         }).await.map_err(|_| unavailable())?
+    }
+
+    async fn delete_explicit_saved_artifact(
+        self: Arc<Self>,
+        auth: &AuthContext,
+        artifact_id: &str,
+    ) -> Result<
+        openbot_contracts::artifacts::ArtifactDeletionReceipt,
+        openbot_contracts::error::AppError,
+    > {
+        self.delete_explicit_saved(auth, artifact_id).await
     }
 }
 

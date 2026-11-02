@@ -418,6 +418,7 @@ impl AgentToolGateway {
                 | AppReply::UiPreferences(_)
                 | AppReply::ArtifactRegistrationReceipt(_)
                 | AppReply::ArtifactMetadata(_)
+                | AppReply::ArtifactDeletion(_)
                 | AppReply::SourceRunArtifactIds(_)
                 | AppReply::ArtifactReadOpened(_)
                 | AppReply::ArtifactReadChunkDescriptor(_)

@@ -2814,11 +2814,14 @@ mod tests {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "openbot-postgres-bundle-{name}-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ))
+        // Resolve the OS temp-dir alias (such as macOS /var) that trusted-root opens reject.
+        fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "openbot-postgres-bundle-{name}-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ))
     }
 
     pub(super) fn signing_identity() -> ReviewedPostgresSigningIdentity {
@@ -3118,6 +3121,10 @@ mod tests {
         ));
         let source = include_str!("postgres_sidecar.rs");
         let production = source.split("\nmod tests {").next().unwrap();
+        // The macOS initdb stdin password input is the single reviewed `--pwfile` occurrence.
+        let reviewed_input = "const INITDB_PASSWORD_INPUT: &str = \"--pwfile=/dev/stdin\";\n";
+        assert_eq!(production.matches(reviewed_input).count(), 1);
+        let production = production.replace(reviewed_input, "");
         for forbidden in [
             ["PG", "PASSWORD"].concat(),
             ["--pw", "file"].concat(),
@@ -3744,7 +3751,7 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"postgres (PostgreSQL) {POSTGRES_VERSION}\"; /bin/sleep 0.2; exit 0; fi\nexit 17\n"
         );
         let initdb = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"initdb (PostgreSQL) {POSTGRES_VERSION}\"; /bin/sleep 0.2; exit 0; fi\ndata=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"--pgdata\" ]; then data=$2; shift 2; else shift; fi; done\nIFS= read -r first\nIFS= read -r second\n[ -n \"$data\" ] && [ \"$first\" = \"$second\" ] || exit 18\nprintf '17\\n' > \"$data/PG_VERSION\"\nexit 0\n"
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"initdb (PostgreSQL) {POSTGRES_VERSION}\"; /bin/sleep 0.2; exit 0; fi\ndata=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"--pgdata\" ]; then data=$2; shift 2; else shift; fi; done\nIFS= read -r first\nif IFS= read -r second; then [ \"$first\" = \"$second\" ] || exit 18; fi\n[ -n \"$data\" ] && [ -n \"$first\" ] || exit 18\nprintf '17\\n' > \"$data/PG_VERSION\"\nexit 0\n"
         );
         let pg_ctl = format!(
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"pg_ctl (PostgreSQL) {POSTGRES_VERSION}\"; /bin/sleep 0.2; exit 0; fi\nexit 17\n"

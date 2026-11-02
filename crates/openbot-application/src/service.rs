@@ -178,6 +178,7 @@ pub const fn command_kind(command: &AppCommand) -> &'static str {
         AppCommand::SaveRunMessageTextArtifact(_) => "save_run_message_text_artifact",
         AppCommand::GetArtifactSaveReceipt(_) => "get_artifact_save_receipt",
         AppCommand::GetArtifactMetadata(_) => "get_artifact_metadata",
+        AppCommand::DeleteArtifact { .. } => "delete_artifact",
         AppCommand::GetSourceRunArtifactIds(_) => "get_source_run_artifact_ids",
         AppCommand::OpenArtifactRead(_) => "open_artifact_read",
         AppCommand::ReadArtifactReadBlock(_) => "read_artifact_read_block",
