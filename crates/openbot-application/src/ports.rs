@@ -603,7 +603,9 @@ pub enum ThreadDirectoryError {
     /// Existing work prevents archiving.
     #[error("thread_not_idle")]
     ThreadNotIdle {
+        /// Current foreground state, when a foreground run still occupies the thread.
         foreground: Option<openbot_contracts::command::ThreadForegroundRunState>,
+        /// Number of accepted inputs currently pending or held.
         pending_inputs: u32,
     },
     /// OS CSPRNG 或 PostgreSQL 当前不可用。
