@@ -1124,6 +1124,40 @@ async fn bridge(
     protocol.finish_public_artifact_read_response(label, prepared, |response| response)
 }
 
+/// One public reader request on a runtime worker with its default stack, as the Desktop host
+/// spawns every request. The caller's tracing dispatch follows it onto the worker.
+async fn spawned_bridge(
+    protocol: &Arc<DesktopTauriProtocol>,
+    label: &'static str,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
+    use tracing::instrument::WithSubscriber as _;
+    let protocol = Arc::clone(protocol);
+    tokio::spawn(async move { bridge(&protocol, label, request).await }.with_current_subscriber())
+        .await
+        .expect("spawned public reader request")
+}
+
+/// Runs a Prepared Local case on a 16 MiB thread over a two-worker runtime. The case body and the
+/// Prepared Local setup poll on this thread; unoptimized, they overflow the default 2 MiB test
+/// stack. Requests spawned from the body run on runtime workers with their default stack.
+fn on_large_stack<F: Future<Output = ()> + 'static>(case: fn() -> F) {
+    let polling = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(case())
+        })
+        .expect("test polling thread");
+    if let Err(panic) = polling.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn no_store(response: &Response<Vec<u8>>) -> Result<(), String> {
     require(
         response
@@ -1955,9 +1989,15 @@ fn cleanup_cached_schema_difference_paths(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[ignore = "requires Root-owned genuine Prepared Local, committed 0044 consumer fence and original retained reader"]
-async fn actual_prepared_local_public_reader_cached_first_cleanup_fence_recheck_refuses_body() {
+fn actual_prepared_local_public_reader_cached_first_cleanup_fence_recheck_refuses_body() {
+    on_large_stack(
+        actual_prepared_local_public_reader_cached_first_cleanup_fence_recheck_refuses_body_run,
+    );
+}
+
+async fn actual_prepared_local_public_reader_cached_first_cleanup_fence_recheck_refuses_body_run() {
     use tracing::instrument::WithSubscriber as _;
     let mut bundle = OwnedBundle::materialize().expect("Root-owned exact PG bundle");
     let fixture = LocalFixture::new(&bundle, "public-read-cached-cleanup")
@@ -1975,7 +2015,7 @@ async fn actual_prepared_local_public_reader_cached_first_cleanup_fence_recheck_
         let phases = Arc::new(CleanupCachedIoPhases::default());
         let dispatch = tracing::Dispatch::new(CleanupCachedPhaseSubscriber(phases.clone()));
         let opened: ArtifactReadOpened = control(
-            bridge(protocol, "main", open_request(&fixture.artifact.artifact_id)?)
+            spawned_bridge(protocol, "main", open_request(&fixture.artifact.artifact_id)?)
                 .with_subscriber(dispatch.clone()).await,
         )?;
         require(opened.artifact_id == fixture.artifact.artifact_id
@@ -1999,7 +2039,7 @@ async fn actual_prepared_local_public_reader_cached_first_cleanup_fence_recheck_
         ).await?;
         expected["fences"] = serde_json::json!([inserted]);
         // The actual transaction's COMMIT ACK precedes this same handle's delayed seq0 request.
-        let response = bridge(protocol, "main", next_request(&opened.handle_id, 0)?)
+        let response = spawned_bridge(protocol, "main", next_request(&opened.handle_id, 0)?)
             .with_subscriber(dispatch).await;
         no_store(&response)?;
         require(response.status() == StatusCode::SERVICE_UNAVAILABLE,
@@ -2138,9 +2178,15 @@ async fn cleanup_arm_local_waiter(
     }
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "requires genuine Prepared Local/Window, owned PostgreSQL bundle and real Save/arm"]
-async fn actual_local_original_window_arms_missing_source_and_rebound_window_is_refused() {
+fn actual_local_original_window_arms_missing_source_and_rebound_window_is_refused() {
+    on_large_stack(
+        actual_local_original_window_arms_missing_source_and_rebound_window_is_refused_run,
+    );
+}
+
+async fn actual_local_original_window_arms_missing_source_and_rebound_window_is_refused_run() {
     use openbot_infra::artifact_administration::ArtifactCleanupArmError as ArmError;
     let missing_source_status = |response: Response<Vec<u8>>, phase: &'static str| {
         let actual_status = response.status().as_u16();
@@ -2167,7 +2213,7 @@ async fn actual_local_original_window_arms_missing_source_and_rebound_window_is_
         let path=fixture.root.0.join("artifacts/objects").join(&fixture.artifact.artifact_id);
         let second_path=fixture.root.0.join("artifacts/objects").join(&second.artifact_id);
         let first_object=cleanup_arm_local_object_fact(&path)?;let second_object=cleanup_arm_local_object_fact(&second_path)?;
-        let opened:ArtifactReadOpened=control(bridge(&protocol,"main",open_request(&fixture.artifact.artifact_id)?).await)?;
+        let opened:ArtifactReadOpened=control(spawned_bridge(&protocol,"main",open_request(&fixture.artifact.artifact_id)?).await)?;
         require(opened.artifact_id==fixture.artifact.artifact_id&&cleanup_owned_inode_fds(&path)?.len()==1,"original actual Local cached reader has no real original key/FD")?;
         let before_source=cleanup_arm_local_database_facts(fixture.prepared().pool()).await?;
         let mut controller=fixture.prepared().pool().get().await.map_err(|e|e.to_string())?;
@@ -2182,7 +2228,7 @@ async fn actual_local_original_window_arms_missing_source_and_rebound_window_is_
         let retained_messages:Vec<_>=original_messages.iter().filter(|v|v["row"]["message_id"].as_str()!=Some(fixture.artifact.source_message_id.as_str())).cloned().collect();
         require(retained_messages.len()+1==original_messages.len()&&retained_messages==*current_messages,"Local source controller changed undeclared messages or physical row carriers")?;
         require(before_source.get("public.messages")!=after_source.get("public.messages"),"Local source controller did not commit a real source row difference")?;
-        missing_source_status(bridge(&protocol,"main",open_request(&fixture.artifact.artifact_id)?).await,"source_hard_delete_commit_ack_before_arm")?;
+        missing_source_status(spawned_bridge(&protocol,"main",open_request(&fixture.artifact.artifact_id)?).await,"source_hard_delete_commit_ack_before_arm")?;
         require(matches!(fixture.prepared().application().execute(original_auth.clone(),AppCommand::GetArtifactMetadata(openbot_contracts::artifacts::GetArtifactMetadata{artifact_id:fixture.artifact.artifact_id.clone()})).await,Err(openbot_contracts::error::AppError::NotVisible)),"Local cleanup owner management reopened missing-source metadata")?;
         let before_arm=cleanup_arm_local_database_facts(fixture.prepared().pool()).await?;
         let intent=actual.arm_explicit_saved_delete_before(&original_auth,&fixture.artifact.artifact_id,Instant::now()+Duration::from_secs(10)).await.map_err(|e|e.to_string())?;
@@ -2200,7 +2246,7 @@ async fn actual_local_original_window_arms_missing_source_and_rebound_window_is_
         let barrier=actual.close_armed_artifact_reads(&intent).map_err(|e|e.to_string())?;
         let ack=barrier.drain_before(Instant::now()+Duration::from_secs(4)).await.map_err(|e|format!("{e:?}"))?;
         require(cleanup_owned_inode_fds(&path)?.is_empty()&&cleanup_arm_local_object_fact(&path)?==first_object,"Local finite armed close ACK lacked actual FD end or deleted original object")?;
-        missing_source_status(bridge(&protocol,"main",open_request(&fixture.artifact.artifact_id)?).await,"armed_close_ack_original_source_missing")?;
+        missing_source_status(spawned_bridge(&protocol,"main",open_request(&fixture.artifact.artifact_id)?).await,"armed_close_ack_original_source_missing")?;
         require(cleanup_arm_local_database_facts(fixture.prepared().pool()).await?==armed,"Local finite close or stopped reader wrote business rows")?;
         drop(ack);drop(barrier);drop(intent);
         // A second actual pair remains unfenced. Wait for its real original arm quota query,
@@ -2876,9 +2922,15 @@ async fn physical_local_original_rollback_ack(
     )
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "requires genuine Prepared Local/original Arc, two actual objects and original-window physical gates"]
-async fn actual_local_original_window_is_required_through_physical_cleanup_completion() {
+fn actual_local_original_window_is_required_through_physical_cleanup_completion() {
+    on_large_stack(
+        actual_local_original_window_is_required_through_physical_cleanup_completion_run,
+    );
+}
+
+async fn actual_local_original_window_is_required_through_physical_cleanup_completion_run() {
     let mut bundle = OwnedBundle::materialize().expect("Root-owned exact Local PostgreSQL bundle");
     let bundle_path = bundle.root.0.clone();
     let fixture = LocalFixture::new(&bundle, "physical-cleanup-original-window")
@@ -3788,9 +3840,13 @@ async fn terminal_local_completed_without_quota(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[ignore = "requires Root-owned genuine Prepared Local and original R436 transaction/worker resources"]
-async fn actual_prepared_local_terminal_commits_once_and_window_retry_has_no_io() {
+fn actual_prepared_local_terminal_commits_once_and_window_retry_has_no_io() {
+    on_large_stack(actual_prepared_local_terminal_commits_once_and_window_retry_has_no_io_run);
+}
+
+async fn actual_prepared_local_terminal_commits_once_and_window_retry_has_no_io_run() {
     let mut bundle = OwnedBundle::materialize().expect("Root-owned exact Local PostgreSQL bundle");
     let bundle_path = bundle.root.0.clone();
     // Reuse the original P1 durable terminal/foreground-inactive precondition, never retry Save.
@@ -3847,7 +3903,7 @@ async fn actual_prepared_local_terminal_commits_once_and_window_retry_has_no_io(
         )
         .await?;
         status(
-            bridge(
+            spawned_bridge(
                 fixture.prepared().protocol(),
                 "main",
                 open_request(&fixture.artifact.artifact_id)?,
@@ -3902,14 +3958,22 @@ async fn terminal_local_carrier_then_physical(
     let phases = Arc::new(CleanupCachedIoPhases::default());
     let dispatch = tracing::Dispatch::new(CleanupCachedPhaseSubscriber(phases.clone()));
     let opened: ArtifactReadOpened = control(
-        bridge(&protocol, "main", open_request(&saved.artifact_id)?)
+        spawned_bridge(&protocol, "main", open_request(&saved.artifact_id)?)
             .with_subscriber(dispatch.clone())
             .await,
     )?;
-    let prepared = protocol
-        .prepare_public_artifact_read_response("main", next_request(&opened.handle_id, 0)?)
+    let prepared = tokio::spawn({
+        let protocol = Arc::clone(&protocol);
+        let request = next_request(&opened.handle_id, 0)?;
+        async move {
+            protocol
+                .prepare_public_artifact_read_response("main", request)
+                .await
+        }
         .with_subscriber(dispatch)
-        .await;
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     let original_counts = phases.actual_counts();
     require(
         original_counts.0 == 1 && original_counts.1 >= 2,
@@ -4115,9 +4179,13 @@ async fn terminal_local_precommit_rebind(
     Ok(fresh)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[ignore = "requires genuine Local copy/responder carriers, original Window epochs and true terminal ACK controls"]
-async fn actual_prepared_local_terminal_revoke_and_rebind_keep_truth_and_store_scope() {
+fn actual_prepared_local_terminal_revoke_and_rebind_keep_truth_and_store_scope() {
+    on_large_stack(actual_prepared_local_terminal_revoke_and_rebind_keep_truth_and_store_scope_run);
+}
+
+async fn actual_prepared_local_terminal_revoke_and_rebind_keep_truth_and_store_scope_run() {
     let mut bundle = OwnedBundle::materialize().expect("Root-owned exact Local PostgreSQL bundle");
     let bundle_path = bundle.root.0.clone();
     let fixture = LocalFixture::new(&bundle, "p1-window-operation")
