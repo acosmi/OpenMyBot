@@ -2034,6 +2034,13 @@ async fn apply_submit_input(
     if !matches!(command.anchor, ThreadRunAnchor::DirectBot) {
         return Err(ThreadDirectoryError::AnchorUnsupported);
     }
+    // One submission identity spans the pending and Run tables, including different threads.
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('pending_input:' || $1::text,0))",
+        &[&command.run_id.as_str()],
+    )
+    .await
+    .map_err(|error| unavailable("lock submitted input identity", error))?;
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
         &[&command.thread_id.as_str()],

@@ -68,9 +68,10 @@ async fn w01_atomic_start_queue_and_replay() {
             let mut busy=first.clone();busy.command.run_id=identity.clone();
             let mut idle=f.request(200+index,false,&model);idle.command.run_id=identity.clone();
             let (left,right)=tokio::join!(f.directory.submit_thread_input(busy,None),f.directory.submit_thread_input(idle,None));
-            assert!(matches!((left,right),
+            assert!(matches!((&left,&right),
                 (Ok(SubmitThreadInputAttempt::Accepted(_)),Err(ThreadDirectoryError::RequestConflict)) |
-                (Err(ThreadDirectoryError::RequestConflict),Ok(SubmitThreadInputAttempt::Accepted(_)))));
+                (Err(ThreadDirectoryError::RequestConflict),Ok(SubmitThreadInputAttempt::Accepted(_)))),
+                "mixed-path identity {index}: {left:?} / {right:?}");
             let c=f.pool.get().await.unwrap();
             let accepted_count:i64=c.query_one("SELECT (SELECT count(*) FROM public.runs WHERE run_id=$1)+(SELECT count(*) FROM openbot_internal.thread_pending_inputs WHERE run_id=$1)",&[&identity.as_str()]).await.unwrap().get(0);
             assert_eq!(accepted_count,1);drop(c);
