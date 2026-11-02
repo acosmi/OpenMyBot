@@ -260,12 +260,16 @@ Phase 8 completion point: V7-IMPL-047 (#233) is merged together with V7-COMP-026
 | FIX-OMB-009-4 | Safe dialer guard lists the delegation test fixture added by FIX-OMB-009-2 | [#264](https://github.com/acosmi/OpenMyBot/pull/264) | [79d804bec0](https://github.com/acosmi/OpenMyBot/commit/79d804bec0000febbaf4ee9f8d44cd045bc9053b) | 2026-11-01 |
 | FIX-OMB-014-1 | Fake channel plugin writes each log line with one write call so concurrent fakes cannot interleave test logs | [#265](https://github.com/acosmi/OpenMyBot/pull/265) | [f42bc61806](https://github.com/acosmi/OpenMyBot/commit/f42bc61806625f1404b2ec3526f3a02995132cb7) | 2026-11-01 |
 | OMB-012 to OMB-017 ledger | Ledger rows for OMB-012 to OMB-017, FIX-OMB-009-4 and FIX-OMB-014-1, and the owner checks for OMB-015 and OMB-017 | [#266](https://github.com/acosmi/OpenMyBot/pull/266) | [d5ca2db13d](https://github.com/acosmi/OpenMyBot/commit/d5ca2db13dcd829c569a75cb5e714f89a4e03dbd) | 2026-11-01 |
+| Ledger sync | Record the capture merge, cancellation repair and plugin ledger; keep remaining implementation and owner checks open | [#267](https://github.com/acosmi/OpenMyBot/pull/267) | [cc82d6e006](https://github.com/acosmi/OpenMyBot/commit/cc82d6e00602a45269d74f446d91176141ec17ad) | 2026-11-01 |
+| FIX-SIDECAR-TESTS | Update sidecar test expectations and fixtures for the accepted startup and shutdown behavior | [#268](https://github.com/acosmi/OpenMyBot/pull/268) | [241cbae16f](https://github.com/acosmi/OpenMyBot/commit/241cbae16f80a2c2b6d7d24551ca26f4ec48d464) | 2026-11-01 |
+| V7-IMPL-031 part 2 | Public artifact deletion with owned cleanup and capture coordination | [#269](https://github.com/acosmi/OpenMyBot/pull/269) | [f002a43780](https://github.com/acosmi/OpenMyBot/commit/f002a437804fed36d47639cb329362f1c22d85b1) | 2026-11-01 |
+| FIX-TESTKIT-MISSING-BINDING | Align artifact tests with request binding and scope the desktop transport mutable binding to its feature | [#270](https://github.com/acosmi/OpenMyBot/pull/270) | [2870686dcf](https://github.com/acosmi/OpenMyBot/commit/2870686dcf5d3d0d742783fd6142f7e0d3abf63f) | 2026-11-02 |
+| FIX-DESKTOP-TEST-STACK | Run five Prepared Local test request futures on default worker stacks while giving setup a larger test thread | [#271](https://github.com/acosmi/OpenMyBot/pull/271) | [c016d73b9f](https://github.com/acosmi/OpenMyBot/commit/c016d73b9ffa0fd6faa9c192b7c4bf84a6f9e610) | 2026-11-02 |
 
 ## Open
 
 | Task | Status | PR |
 |---|---|---|
-| V7-IMPL-031 | Part 1 merged (#256); part 2 in progress | none |
 | V7-IMPL-046 | Draft PR, open: bounded whole-PostgreSQL restore | [#226](https://github.com/acosmi/OpenMyBot/pull/226) |
 | V6-PR-048 | Closed unmerged 2026-10-12; the naming unification moves to a separate compatibility migration | [#59](https://github.com/acosmi/OpenMyBot/pull/59) |
 | V6-PR-054 | Closed unmerged 2026-10-12; skip-link keyboard focus carried as a UI accessibility item | [#70](https://github.com/acosmi/OpenMyBot/pull/70) |
