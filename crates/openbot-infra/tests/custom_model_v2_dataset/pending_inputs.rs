@@ -153,7 +153,7 @@ async fn pending_input_migration_and_visibility() {
         let c=f.pool.get().await.unwrap();
         assert_eq!(c.query_one("SELECT status FROM public.threads WHERE thread_id=$1",&[&first.command.thread_id.as_str()]).await.unwrap().get::<_,String>(0),"active");
         assert!(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1",&[&next.command.run_id.as_str()]).await.unwrap().is_none());
-        c.execute("UPDATE public.thread_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE thread_id=$1",&[&first.command.thread_id.as_str()]).await.unwrap();
+        c.execute("UPDATE public.thread_leases SET expires_at=clock_timestamp() WHERE thread_id=$1",&[&first.command.thread_id.as_str()]).await.unwrap();
         c.execute("UPDATE openbot_internal.thread_pending_inputs SET state='held',held_reason='stopped_by_user' WHERE run_id=$1",&[&next.command.run_id.as_str()]).await.unwrap();drop(c);
         let mut held_follower=first.clone();held_follower.command.run_id=RunId::new("behind-held");
         assert!(matches!(accepted(f.directory.submit_thread_input(held_follower.clone(),None).await),ThreadInputOutcome::Queued {position:1,..}));
