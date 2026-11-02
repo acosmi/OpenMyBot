@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openmybot",
+  "version": "0.0.0",
+  "description": "Start, inspect, cancel and fetch background runs of the local OpenMyBot daemon.",
+  "homepage": "https://github.com/acosmi/OpenMyBot",
+  "repository": "https://github.com/acosmi/OpenMyBot",
+  "keywords": [
+    "mcp",
+    "openmybot"
+  ]
+}

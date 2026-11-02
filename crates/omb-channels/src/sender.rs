@@ -1,9 +1,11 @@
 //! Telegram and Feishu send requests and the classification of their responses.
-use omb_store::ErrorCode;
+use omb_channel_sdk::{
+    plugin::SendOutcome,
+    protocol::{FailureClass, SendErrorCode},
+};
 use openbot_infra::net::safe_http::SafeHttpError;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
 
 /// Bytes read of one `sendMessage` response.
 pub(crate) const SEND_RESPONSE_MAX: usize = 64 * 1024;
@@ -46,24 +48,28 @@ pub(crate) fn feishu_body(chat_id: &str, text: &str, idempotency_key: &str) -> V
     .into_bytes()
 }
 
-/// What one `sendMessage` outcome means for the row.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Verdict {
-    Sent {
-        message_id: String,
-    },
-    /// A definite failure that takes a retry slot.
-    Retry {
-        code: ErrorCode,
-        retry_after: Option<Duration>,
-    },
-    Failed {
-        code: ErrorCode,
-    },
-    /// The request may have reached the platform; never resent.
-    Unknown,
+/// A definite failure that takes a retry slot.
+fn retry(code: SendErrorCode, retry_after_ms: Option<u64>) -> SendOutcome {
+    SendOutcome::Failed {
+        class: FailureClass::Retryable,
+        code,
+        retry_after_ms,
+    }
 }
-pub(crate) fn classify(result: Result<(u16, &[u8]), SafeHttpError>) -> Verdict {
+fn failed(code: SendErrorCode) -> SendOutcome {
+    SendOutcome::Failed {
+        class: FailureClass::Final,
+        code,
+        retry_after_ms: None,
+    }
+}
+/// The request may have reached the platform; never resent.
+const UNKNOWN: SendOutcome = SendOutcome::Failed {
+    class: FailureClass::Unknown,
+    code: SendErrorCode::ServerError,
+    retry_after_ms: None,
+};
+pub(crate) fn classify(result: Result<(u16, &[u8]), SafeHttpError>) -> SendOutcome {
     match result {
         Err(
             SafeHttpError::DnsUnavailable
@@ -76,10 +82,7 @@ pub(crate) fn classify(result: Result<(u16, &[u8]), SafeHttpError>) -> Verdict {
             | SafeHttpError::InvalidBudget
             | SafeHttpError::InvalidHeader
             | SafeHttpError::InvalidAllowlist,
-        ) => Verdict::Retry {
-            code: ErrorCode::Unreachable,
-            retry_after: None,
-        },
+        ) => retry(SendErrorCode::Unreachable, None),
         Err(
             SafeHttpError::DeadlineExceeded
             | SafeHttpError::ProtocolFailed
@@ -89,36 +92,31 @@ pub(crate) fn classify(result: Result<(u16, &[u8]), SafeHttpError>) -> Verdict {
             | SafeHttpError::RedirectLimit
             | SafeHttpError::RedirectMethodRejected
             | SafeHttpError::SensitiveRedirectRejected,
-        ) => Verdict::Unknown,
-        Ok((429, body)) => Verdict::Retry {
-            code: ErrorCode::RateLimited,
-            retry_after: serde_json::from_slice::<Value>(body)
+        ) => UNKNOWN,
+        Ok((429, body)) => retry(
+            SendErrorCode::RateLimited,
+            serde_json::from_slice::<Value>(body)
                 .ok()
                 .and_then(|body| {
                     body.pointer("/parameters/retry_after")
                         .and_then(Value::as_u64)
                 })
-                .map(Duration::from_secs),
-        },
-        Ok((500..=599, _)) => Verdict::Retry {
-            code: ErrorCode::ServerError,
-            retry_after: None,
-        },
+                .map(|seconds| seconds.saturating_mul(1000)),
+        ),
+        Ok((500..=599, _)) => retry(SendErrorCode::ServerError, None),
         Ok((200..=299, body)) => serde_json::from_slice::<Value>(body)
             .ok()
             .filter(|body| body.get("ok") == Some(&Value::Bool(true)))
             .and_then(|body| body.pointer("/result/message_id").and_then(Value::as_i64))
-            .map_or(Verdict::Unknown, |id| Verdict::Sent {
-                message_id: id.to_string(),
+            .map_or(UNKNOWN, |id| SendOutcome::Sent {
+                platform_message_id: Some(id.to_string()),
             }),
-        Ok(_) => Verdict::Failed {
-            code: ErrorCode::ClientError,
-        },
+        Ok(_) => failed(SendErrorCode::ClientError),
     }
 }
 /// The Feishu send outcome: the rate-limit codes 230020 and 99991400 count as 429 whatever the
 /// status, and only code 0 with a message id is sent.
-pub(crate) fn classify_feishu(result: Result<(u16, &[u8]), SafeHttpError>) -> Verdict {
+pub(crate) fn classify_feishu(result: Result<(u16, &[u8]), SafeHttpError>) -> SendOutcome {
     let (status, body) = match result {
         Err(
             SafeHttpError::DnsUnavailable
@@ -131,12 +129,7 @@ pub(crate) fn classify_feishu(result: Result<(u16, &[u8]), SafeHttpError>) -> Ve
             | SafeHttpError::InvalidBudget
             | SafeHttpError::InvalidHeader
             | SafeHttpError::InvalidAllowlist,
-        ) => {
-            return Verdict::Retry {
-                code: ErrorCode::Unreachable,
-                retry_after: None,
-            };
-        }
+        ) => return retry(SendErrorCode::Unreachable, None),
         Err(
             SafeHttpError::DeadlineExceeded
             | SafeHttpError::ProtocolFailed
@@ -146,19 +139,9 @@ pub(crate) fn classify_feishu(result: Result<(u16, &[u8]), SafeHttpError>) -> Ve
             | SafeHttpError::RedirectLimit
             | SafeHttpError::RedirectMethodRejected
             | SafeHttpError::SensitiveRedirectRejected,
-        ) => return Verdict::Unknown,
-        Ok((429, _)) => {
-            return Verdict::Retry {
-                code: ErrorCode::RateLimited,
-                retry_after: None,
-            };
-        }
-        Ok((500..=599, _)) => {
-            return Verdict::Retry {
-                code: ErrorCode::ServerError,
-                retry_after: None,
-            };
-        }
+        ) => return UNKNOWN,
+        Ok((429, _)) => return retry(SendErrorCode::RateLimited, None),
+        Ok((500..=599, _)) => return retry(SendErrorCode::ServerError, None),
         Ok(reply) => reply,
     };
     let body = serde_json::from_slice::<Value>(body).ok();
@@ -168,22 +151,17 @@ pub(crate) fn classify_feishu(result: Result<(u16, &[u8]), SafeHttpError>) -> Ve
             .and_then(|body| body.get("code"))
             .and_then(Value::as_i64),
     ) {
-        (_, Some(230_020 | 99_991_400)) => Verdict::Retry {
-            code: ErrorCode::RateLimited,
-            retry_after: None,
-        },
+        (_, Some(230_020 | 99_991_400)) => retry(SendErrorCode::RateLimited, None),
         (200..=299, Some(0)) => body
             .as_ref()
             .and_then(|body| body.pointer("/data/message_id"))
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .map_or(Verdict::Unknown, |id| Verdict::Sent {
-                message_id: id.to_owned(),
+            .map_or(UNKNOWN, |id| SendOutcome::Sent {
+                platform_message_id: Some(id.to_owned()),
             }),
-        (200..=299, None) => Verdict::Unknown,
-        _ => Verdict::Failed {
-            code: ErrorCode::ClientError,
-        },
+        (200..=299, None) => UNKNOWN,
+        _ => failed(SendErrorCode::ClientError),
     }
 }
 #[cfg(test)]
@@ -225,8 +203,8 @@ mod tests {
                 200,
                 br#"{"ok":true,"result":{"message_id":123,"text":"x"}}"#
             ))),
-            Verdict::Sent {
-                message_id: "123".into()
+            SendOutcome::Sent {
+                platform_message_id: Some("123".into())
             }
         );
     }
@@ -238,7 +216,7 @@ mod tests {
             br#"{"ok":true,"result":{}}"#,
             br#"{"ok":true}"#,
         ] {
-            assert_eq!(classify(Ok((200, body))), Verdict::Unknown);
+            assert_eq!(classify(Ok((200, body))), UNKNOWN);
         }
     }
     #[test]
@@ -248,17 +226,11 @@ mod tests {
                 429,
                 br#"{"ok":false,"error_code":429,"parameters":{"retry_after":7}}"#
             ))),
-            Verdict::Retry {
-                code: ErrorCode::RateLimited,
-                retry_after: Some(Duration::from_secs(7)),
-            }
+            retry(SendErrorCode::RateLimited, Some(7000))
         );
         assert_eq!(
             classify(Ok((429, br#"{"ok":false,"error_code":429}"#))),
-            Verdict::Retry {
-                code: ErrorCode::RateLimited,
-                retry_after: None,
-            }
+            retry(SendErrorCode::RateLimited, None)
         );
     }
     #[test]
@@ -266,10 +238,7 @@ mod tests {
         for status in [500, 502, 503] {
             assert_eq!(
                 classify(Ok((status, b"{}"))),
-                Verdict::Retry {
-                    code: ErrorCode::ServerError,
-                    retry_after: None,
-                }
+                retry(SendErrorCode::ServerError, None)
             );
         }
     }
@@ -278,9 +247,7 @@ mod tests {
         for status in [400, 401, 403, 404, 302] {
             assert_eq!(
                 classify(Ok((status, b"{}"))),
-                Verdict::Failed {
-                    code: ErrorCode::ClientError
-                },
+                failed(SendErrorCode::ClientError),
                 "{status}"
             );
         }
@@ -301,10 +268,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify(Err(error)),
-                Verdict::Retry {
-                    code: ErrorCode::Unreachable,
-                    retry_after: None,
-                },
+                retry(SendErrorCode::Unreachable, None),
                 "{error:?}"
             );
         }
@@ -321,7 +285,7 @@ mod tests {
             SafeHttpError::RedirectMethodRejected,
             SafeHttpError::SensitiveRedirectRejected,
         ] {
-            assert_eq!(classify(Err(error)), Verdict::Unknown, "{error:?}");
+            assert_eq!(classify(Err(error)), UNKNOWN, "{error:?}");
         }
     }
     #[test]
@@ -375,10 +339,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_feishu(Err(error)),
-                Verdict::Retry {
-                    code: ErrorCode::Unreachable,
-                    retry_after: None,
-                },
+                retry(SendErrorCode::Unreachable, None),
                 "{error:?}"
             );
         }
@@ -392,12 +353,9 @@ mod tests {
             SafeHttpError::RedirectMethodRejected,
             SafeHttpError::SensitiveRedirectRejected,
         ] {
-            assert_eq!(classify_feishu(Err(error)), Verdict::Unknown, "{error:?}");
+            assert_eq!(classify_feishu(Err(error)), UNKNOWN, "{error:?}");
         }
-        let rate_limited = Verdict::Retry {
-            code: ErrorCode::RateLimited,
-            retry_after: None,
-        };
+        let rate_limited = retry(SendErrorCode::RateLimited, None);
         for (status, body) in [
             (429, r#"{"parameters":{"retry_after":9}}"#),
             (400, r#"{"code":230020}"#),
@@ -413,16 +371,13 @@ mod tests {
         for status in [500, 502] {
             assert_eq!(
                 classify_feishu(Ok((status, b""))),
-                Verdict::Retry {
-                    code: ErrorCode::ServerError,
-                    retry_after: None,
-                }
+                retry(SendErrorCode::ServerError, None)
             );
         }
         assert_eq!(
             classify_feishu(Ok((200, br#"{"code":0,"data":{"message_id":"om_1"}}"#))),
-            Verdict::Sent {
-                message_id: "om_1".into()
+            SendOutcome::Sent {
+                platform_message_id: Some("om_1".into())
             }
         );
         for body in [
@@ -433,7 +388,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_feishu(Ok((200, body.as_bytes()))),
-                Verdict::Unknown,
+                UNKNOWN,
                 "{body}"
             );
         }
@@ -446,9 +401,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_feishu(Ok((status, body.as_bytes()))),
-                Verdict::Failed {
-                    code: ErrorCode::ClientError
-                },
+                failed(SendErrorCode::ClientError),
                 "{status} {body}"
             );
         }

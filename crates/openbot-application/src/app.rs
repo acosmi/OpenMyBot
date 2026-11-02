@@ -740,6 +740,12 @@ where
             AppCommand::GetArtifactMetadata(input) => Ok(AppReply::ArtifactMetadata(
                 get_artifact_metadata(self.artifacts.as_ref(), auth, input).await?,
             )),
+            // No Application check: the artifact id is canonicalized once, by the deletion.
+            AppCommand::DeleteArtifact { artifact_id } => Ok(AppReply::ArtifactDeletion(
+                std::sync::Arc::clone(&self.artifacts)
+                    .delete_explicit_saved_artifact(auth, &artifact_id)
+                    .await?,
+            )),
             AppCommand::Health => Ok(AppReply::Health(health())),
             AppCommand::ListVisibleChannels { limit, cursor } => {
                 let page =

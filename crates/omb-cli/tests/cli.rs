@@ -180,6 +180,7 @@ fn control_forms() -> Vec<(Vec<&'static str>, &'static [u8])> {
         ),
         (vec!["plugins", "list"], b""),
         (vec!["plugins", "add", "/pkg"], b""),
+        (vec!["plugins", "add", "--built-in", "telegram"], b""),
         (vec!["plugins", "remove", "chat"], b""),
         (
             vec!["bindings", "host", "crabcode", "--workspace", "/ws"],
@@ -219,7 +220,8 @@ async fn usage_errors_exit_2_with_invalid_arguments_in_json() {
         vec!["--json", "status", "--run", "a", "--run", "b"],
         vec!["--json", "mcp"],
         vec!["--json", "bindings", "reset-thread", "b1"],
-        vec!["--json", "plugins", "add", "--built-in", "telegram"],
+        vec!["--json", "plugins", "add", "/pkg", "--built-in", "telegram"],
+        vec!["--json", "plugins", "add"],
         vec![
             "--json", "bindings", "receiver", "feishu", "--app-id", "cli_a",
         ],
@@ -438,6 +440,11 @@ async fn request_frame_carries_op_and_args_and_the_secret_only_in_args_and_never
             vec!["plugins", "add", "/pkg"],
             "plugins_add",
             json!({"dir": "/pkg"}),
+        ),
+        (
+            vec!["plugins", "add", "--built-in", "telegram"],
+            "plugins_add",
+            json!({"built_in": "telegram"}),
         ),
         (
             vec!["plugins", "remove", "chat"],

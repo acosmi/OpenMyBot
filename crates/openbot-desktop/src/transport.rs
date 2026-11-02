@@ -926,8 +926,13 @@ impl InProcessTransport {
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
+        let mut pumps = pumps;
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
         if pumps.capture_requested {
-            let mut pumps = pumps;
             if poisoned {
                 fail_capture(&mut pumps, CaptureTransportFault::Poisoned);
             }

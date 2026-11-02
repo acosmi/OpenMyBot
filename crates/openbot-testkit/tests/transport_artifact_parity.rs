@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
+use axum::http::request::Parts;
 use axum::http::{Method, Request, StatusCode};
 use openbot_application::{
     ApplicationService, ArtifactAdministration, ArtifactAdministrationError, ChannelCursor,
@@ -18,6 +19,7 @@ use openbot_contracts::artifacts::{
 };
 use openbot_contracts::auth::{AuthContext, AuthGeneration, Role};
 use openbot_contracts::command::{AppCommand, AppReply, ChannelSummary};
+use openbot_contracts::error::AppError;
 use openbot_contracts::ids::thread::ThreadIdentity;
 use openbot_contracts::ids::{ActorId, DeploymentId, RunId, TenantId};
 use openbot_contracts::{
@@ -28,7 +30,7 @@ use openbot_desktop::InProcessTransport;
 use openbot_domain::identity::session::{
     SessionLifetimePolicy, SessionState, TrustedOrigins, evaluate_session,
 };
-use openbot_server::auth::{FixedAuthResolver, ResolvedAuth, SensitiveWriteSecurity};
+use openbot_server::auth::{AuthResolver, ResolvedAuth, SensitiveWriteSecurity};
 use openbot_server::{ServerBuilder, router};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -50,6 +52,21 @@ impl ChannelReader for EmptyChannels {
         _cursor: Option<ChannelCursor>,
     ) -> Result<Vec<ChannelSummary>, PortError> {
         Ok(Vec::new())
+    }
+}
+
+/// Hands the HTTP carrier exactly the prepared identity. Unlike `FixedAuthResolver`, it never
+/// attaches a synthetic host binding, so an unbound context reaches the route unbound.
+struct ExactAuth(ResolvedAuth);
+
+#[async_trait]
+impl AuthResolver for ExactAuth {
+    async fn resolve(&self, _parts: &Parts) -> Result<AuthContext, AppError> {
+        Ok(self.0.context().clone())
+    }
+
+    async fn resolve_with_assurance(&self, _parts: &Parts) -> Result<ResolvedAuth, AppError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -224,14 +241,12 @@ impl Fixture {
             now,
         )
         .unwrap();
-        let resolver = if live {
-            FixedAuthResolver::granting_resolved(ResolvedAuth::from_live_session(
-                context, session, None,
-            ))
+        let resolved = if live {
+            ResolvedAuth::from_live_session(context, session, None)
         } else {
-            FixedAuthResolver::granting(context)
+            ResolvedAuth::without_session(context)
         };
-        let state = ServerBuilder::new(Arc::clone(&self.service), Arc::new(resolver))
+        let state = ServerBuilder::new(Arc::clone(&self.service), Arc::new(ExactAuth(resolved)))
             .with_sensitive_write_security(SensitiveWriteSecurity::new(
                 lifetime,
                 TrustedOrigins::from_configured(["https://app.example.test"]).unwrap(),

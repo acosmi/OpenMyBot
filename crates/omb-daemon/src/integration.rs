@@ -23,10 +23,18 @@ use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::{ActorId, RunId, thread::ThreadIdentity};
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
 use serde_json::{Value, json};
-use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
     net::{UnixListener, UnixStream},
+    process::{Child, ChildStdin, ChildStdout},
     sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
     time::Instant,
@@ -1502,5 +1510,471 @@ async fn undecided_permission_expires_to_deny_and_late_approve_is_not_pending() 
         Err(DaemonError::PermissionNotPending)
     );
     assert!(!rig.fixture.root.join("home/ws/approved.txt").exists());
+    rig.stop().await;
+}
+
+// ---- End to end with the first-party plugins -------------------------------------------------
+
+/// The fake Telegram and Feishu platforms of `fake-channel-platform` in their own process, driven
+/// by one JSON line per command.
+struct Platform {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    telegram: String,
+    feishu: String,
+}
+impl Platform {
+    async fn start() -> Platform {
+        let binary = std::env::var_os("OMB_TEST_CHANNEL_PLATFORM")
+            .expect("OMB_TEST_CHANNEL_PLATFORM: absolute path of the fake channel platform");
+        let mut child = tokio::process::Command::new(binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+        let bases: Value =
+            serde_json::from_str(&stdout.next_line().await.unwrap().unwrap()).unwrap();
+        Platform {
+            _child: child,
+            stdin,
+            stdout,
+            telegram: bases["telegram_api_base"].as_str().unwrap().to_owned(),
+            feishu: bases["feishu_api_base"].as_str().unwrap().to_owned(),
+        }
+    }
+    async fn call(&mut self, command: Value) -> Value {
+        self.stdin
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .unwrap();
+        serde_json::from_str(&self.stdout.next_line().await.unwrap().unwrap()).unwrap()
+    }
+    async fn push_update(&mut self, update: Value) {
+        let pushed = self
+            .call(json!({"op": "telegram_push_update", "update": update}))
+            .await;
+        assert_eq!(pushed, json!({"ok": true}));
+    }
+    /// Pushes the event once the long connection is up.
+    async fn push_event(&mut self, event: &Value) {
+        until(LIMIT, async || {
+            let pushed = self
+                .call(json!({"op": "feishu_push_event", "event": event}))
+                .await;
+            (pushed == json!({"ok": true})).then_some(())
+        })
+        .await;
+    }
+    async fn list(&mut self, op: &str, key: &str) -> Vec<Value> {
+        self.call(json!({ "op": op }))
+            .await
+            .get(key)
+            .and_then(Value::as_array)
+            .unwrap()
+            .clone()
+    }
+    async fn telegram_sent(&mut self) -> Vec<Value> {
+        self.list("telegram_sent", "sent").await
+    }
+    async fn feishu_sent(&mut self) -> Vec<Value> {
+        self.list("feishu_sent", "sent").await
+    }
+    async fn offsets(&mut self) -> Vec<Value> {
+        self.list("telegram_offsets", "offsets").await
+    }
+    async fn acks(&mut self) -> u64 {
+        self.call(json!({"op": "feishu_acks"})).await["acks"]
+            .as_u64()
+            .unwrap()
+    }
+}
+
+/// Replaces the fake for `kind` with the first-party plugin binary in `OMB_TEST_CHANNEL_<KIND>`,
+/// installed from its production manifest plus `--api-base` of the fake platform.
+fn install_first_party(plugins: &Plugins, kind: &str, base: &str) {
+    plugins.remove(&format!("fake-{kind}")).unwrap();
+    let variable = format!("OMB_TEST_CHANNEL_{}", kind.to_uppercase());
+    let binary = PathBuf::from(
+        std::env::var_os(&variable)
+            .unwrap_or_else(|| panic!("{variable}: absolute path of the {kind} plugin")),
+    );
+    assert!(binary.is_absolute());
+    let package = config::test_dir();
+    let name = format!("openmybot-channel-{kind}");
+    std::fs::create_dir(package.join("bin")).unwrap();
+    std::fs::copy(binary, package.join("bin").join(&name)).unwrap();
+    let mut manifest: Value = serde_json::from_str(match kind {
+        "telegram" => include_str!("../../../openmybot/plugins/telegram/plugin.json"),
+        _ => include_str!("../../../openmybot/plugins/feishu/plugin.json"),
+    })
+    .unwrap();
+    manifest["extensions"]["org.openmybot"]["channels"][kind]["args"] = json!(["--api-base", base]);
+    std::fs::write(package.join("plugin.json"), manifest.to_string()).unwrap();
+    assert_eq!(
+        plugins.install(&package, &HashSet::new()).unwrap().name,
+        name
+    );
+    std::fs::remove_dir_all(package).unwrap();
+}
+/// The assembly with the first-party plugin of `kind` against a fresh fake platform.
+async fn first_party(kind: &str) -> (Rig, Platform) {
+    let mut rig = Rig::prepare(agent::happy).await;
+    let platform = Platform::start().await;
+    let base = match kind {
+        "telegram" => &platform.telegram,
+        _ => &platform.feishu,
+    };
+    install_first_party(&rig.plugins, kind, base);
+    let terminals = rig.fixture.take_terminals();
+    rig.start_channels(timings(), terminals).await;
+    (rig, platform)
+}
+/// A Bot API update of `from` in chat `chat` sent now, private when the chat is the sender's own.
+fn bot_update(id: u64, from: i64, chat: i64, text: &str) -> Value {
+    json!({"update_id": id, "message": {
+        "message_id": id,
+        "date": time::OffsetDateTime::now_utc().unix_timestamp(),
+        "from": {"id": from, "is_bot": false},
+        "chat": {"id": chat, "type": if chat == from { "private" } else { "group" }},
+        "text": text,
+    }})
+}
+/// A Feishu message event of the paired user `ou_rig` sent now in `chat`.
+fn feishu_event(event_id: &str, chat: &str, chat_type: &str, text: &str) -> Value {
+    json!({
+        "schema": "2.0",
+        "header": {
+            "event_id": event_id,
+            "event_type": "im.message.receive_v1",
+            "create_time": (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).to_string(),
+            "app_id": "cli_rig",
+        },
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_rig"}, "sender_type": "user"},
+            "message": {
+                "message_id": format!("om_{event_id}"),
+                "chat_id": chat,
+                "chat_type": chat_type,
+                "message_type": "text",
+                "content": json!({"text": text}).to_string(),
+            },
+        },
+    })
+}
+/// Binds the Telegram receiver through the plugin's verify against the fake Bot API and pairs the
+/// owner's private chat with update 1.
+async fn pair_telegram(rig: &mut Rig, platform: &mut Platform) {
+    rig.bind("telegram").await;
+    let (binding, code) = rig.pair_start("telegram").await;
+    platform
+        .push_update(bot_update(1, OWNER, OWNER, &format!("/pair {code}")))
+        .await;
+    let reply = until(LIMIT, async || {
+        platform.telegram_sent().await.into_iter().next()
+    })
+    .await;
+    assert!(
+        reply["text"].as_str().unwrap().starts_with("绑定成功"),
+        "{reply}"
+    );
+    assert_eq!(reply["chat_id"], OWNER);
+    assert_eq!(rig.binding(binding).await["status"], "active");
+}
+/// Binds the Feishu receiver with app id `cli_rig` and pairs `ou_rig`'s private chat `oc_rig`.
+async fn pair_feishu(rig: &mut Rig, platform: &mut Platform) {
+    let bound = rig
+        .call(
+            "bindings_receiver",
+            json!({"channel": "feishu", "fields": {"app_id": "cli_rig", "app_secret": "rig-secret"}}),
+        )
+        .await
+        .unwrap();
+    let receiver = Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap();
+    assert_eq!(rig.binding(receiver).await["source_key"], "cli_rig");
+    let (binding, code) = rig.pair_start("feishu").await;
+    platform
+        .push_event(&feishu_event(
+            "ev_pair",
+            "oc_rig",
+            "p2p",
+            &format!("/pair {code}"),
+        ))
+        .await;
+    let reply = until(LIMIT, async || {
+        platform.feishu_sent().await.into_iter().next()
+    })
+    .await;
+    assert!(
+        reply["text"].as_str().unwrap().starts_with("绑定成功"),
+        "{reply}"
+    );
+    assert_eq!(reply["receive_id"], "oc_rig");
+    let row = rig.binding(binding).await;
+    assert_eq!(
+        [&row["status"], &row["chat_key"]],
+        ["active", "feishu:oc_rig"]
+    );
+}
+/// The run id of the event `key` of `kind`, once recorded.
+async fn run_of(rig: &Rig, kind: &str, key: &str) -> String {
+    until(LIMIT, async || {
+        let rows = rig.client.query("SELECT run_id FROM openmybot.channel_events WHERE channel_kind=$1 AND event_key=$2 AND run_id IS NOT NULL", &[&kind, &key]).await.unwrap();
+        rows.first().map(|row| row.get(0))
+    })
+    .await
+}
+/// The expected result text of a happy run.
+fn result_text(run: &str) -> String {
+    format!("[OpenMyBot] 已完成 · run {}\nhello from fake", &run[..8])
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn e2e_telegram_pushed_update_runs_and_sends_one_result() {
+    let (mut rig, mut platform) = first_party("telegram").await;
+    pair_telegram(&mut rig, &mut platform).await;
+    platform
+        .push_update(bot_update(2, OWNER, OWNER, "please do the work"))
+        .await;
+    let run = run_of(&rig, "telegram", "2").await;
+    assert_eq!(rig.terminal_of(&run).await, "succeeded");
+    let result = until(LIMIT, async || {
+        platform.telegram_sent().await.into_iter().nth(1)
+    })
+    .await;
+    assert_eq!(result, json!({"chat_id": OWNER, "text": result_text(&run)}));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(platform.telegram_sent().await.len(), 2);
+    let event = rig.event(2).await;
+    assert_eq!(event["source_key"], SOURCE);
+    assert_eq!(event["dispatch_status"], "dispatched");
+    assert_eq!(
+        rig.count(
+            "SELECT count(*) FROM openmybot.deliveries WHERE kind='run_result' AND status='sent'"
+        )
+        .await,
+        1
+    );
+    rig.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn e2e_telegram_redelivered_update_adds_no_event_and_no_run() {
+    let (mut rig, mut platform) = first_party("telegram").await;
+    pair_telegram(&mut rig, &mut platform).await;
+    // While the plugin process is ended the platform holds three copies of update 2 and a changed
+    // one; the receiver's next process fetches them in one batch from the stored cursor.
+    let (done, retired) = oneshot::channel();
+    rig.channels
+        .as_mut()
+        .unwrap()
+        .retire(vec!["telegram".to_owned()], done)
+        .await;
+    retired.await.unwrap();
+    let message = bot_update(2, OWNER, OWNER, "please do the work");
+    let mut changed = message.clone();
+    changed["message"]["text"] = json!("please do other work");
+    for update in [&message, &message, &message, &changed] {
+        platform.push_update(update.clone()).await;
+    }
+    let row = rig
+        .fixture
+        .pg
+        .list_active_receivers(ChannelKind::from_static("telegram"))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let (done, started) = oneshot::channel();
+    rig.channels
+        .as_mut()
+        .unwrap()
+        .start_receiver(&mut rig.fixture.pg, row, done)
+        .await;
+    started.await.unwrap().unwrap();
+    let run = run_of(&rig, "telegram", "2").await;
+    assert_eq!(rig.terminal_of(&run).await, "succeeded");
+    until(LIMIT, async || {
+        (event_conflicts(&rig).await == 1).then_some(())
+    })
+    .await;
+    let result = until(LIMIT, async || {
+        platform.telegram_sent().await.into_iter().nth(1)
+    })
+    .await;
+    assert_eq!(result["text"], result_text(&run));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(platform.telegram_sent().await.len(), 2);
+    assert_eq!(rig.count("SELECT count(*) FROM openmybot.channel_events WHERE channel_kind='telegram' AND event_key='2'").await, 1);
+    assert_eq!(rig.event(2).await["text"], "please do the work");
+    assert_eq!(rig.count("SELECT count(DISTINCT run_id) FROM openmybot.channel_events WHERE disposition='accepted_message'").await, 1);
+    assert_eq!(
+        rig.count(
+            "SELECT count(*) FROM openmybot.host_driver_sessions WHERE record_kind='session'"
+        )
+        .await,
+        1
+    );
+    rig.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn e2e_telegram_offset_catch_up_after_restart_adds_no_duplicates() {
+    let (mut rig, mut platform) = first_party("telegram").await;
+    pair_telegram(&mut rig, &mut platform).await;
+    for id in [2, 3] {
+        platform
+            .push_update(bot_update(id, OWNER, OWNER, "/status"))
+            .await;
+    }
+    until(LIMIT, async || {
+        (platform.telegram_sent().await.len() == 3).then_some(())
+    })
+    .await;
+    // Update 3 was confirmed once the plugin polls past it.
+    until(LIMIT, async || {
+        platform.offsets().await.contains(&json!(4)).then_some(())
+    })
+    .await;
+    rig.channels.take().unwrap().stop().await;
+    rig.canceller.take().unwrap().stop().await;
+    // A request of the ended plugin may still be on its way to the platform.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = platform.offsets().await.len();
+    for id in [4, 5] {
+        platform
+            .push_update(bot_update(id, OWNER, OWNER, "/status"))
+            .await;
+    }
+    rig.token = control_token(&mut rig.fixture).await;
+    rig.start_channels(timings(), mpsc::channel(TERMINAL_QUEUE).1)
+        .await;
+    until(LIMIT, async || {
+        (platform.telegram_sent().await.len() == 5).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The restarted plugin's first poll continues one past the last accepted update.
+    assert_eq!(platform.offsets().await[before], json!(4));
+    for id in 2..=5 {
+        let event = rig.event(id).await;
+        assert_eq!(event["disposition"], "control_command");
+        let replies = rig.count(&format!("SELECT count(*) FROM openmybot.deliveries WHERE kind='control_reply' AND idempotency_key='control_reply:{}'", event["record_id"].as_str().unwrap())).await;
+        assert_eq!(replies, 1, "update {id}");
+    }
+    assert_eq!(
+        rig.count("SELECT count(*) FROM openmybot.channel_events WHERE channel_kind='telegram' AND record_kind='event'")
+            .await,
+        5
+    );
+    let sent = platform.telegram_sent().await;
+    assert_eq!(sent.len(), 5, "{sent:?}");
+    assert!(sent[1..].iter().all(|sent| {
+        sent["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("绑定：telegram 已激活")
+    }));
+    assert_eq!(event_conflicts(&rig).await, 0);
+    rig.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn e2e_feishu_event_runs_and_platform_receives_one_ack_and_one_send() {
+    let (mut rig, mut platform) = first_party("feishu").await;
+    pair_feishu(&mut rig, &mut platform).await;
+    // Group traffic of the paired user is confirmed and dropped without a reply.
+    platform
+        .push_event(&feishu_event(
+            "ev_group",
+            "oc_group",
+            "group",
+            "hello group",
+        ))
+        .await;
+    platform
+        .push_event(&feishu_event(
+            "ev_work",
+            "oc_rig",
+            "p2p",
+            "please do the work",
+        ))
+        .await;
+    let run = run_of(&rig, "feishu", "ev_work").await;
+    assert_eq!(rig.terminal_of(&run).await, "succeeded");
+    let result = until(LIMIT, async || {
+        platform.feishu_sent().await.into_iter().nth(1)
+    })
+    .await;
+    let uuid: String = Sha256::digest(format!("result:{run}").as_bytes())[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        result,
+        json!({"receive_id": "oc_rig", "text": result_text(&run), "uuid": uuid})
+    );
+    until(LIMIT, async || (platform.acks().await == 3).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The pairing message, the group message and the work message: one acknowledgement each, and
+    // the pairing reply and the result as the only sends.
+    assert_eq!(platform.acks().await, 3);
+    assert_eq!(platform.feishu_sent().await.len(), 2);
+    let group: Value = rig.client.query_one("SELECT row_to_json(e) FROM openmybot.channel_events e WHERE channel_kind='feishu' AND event_key='ev_group'", &[]).await.unwrap().get(0);
+    assert_eq!(group["disposition"], "dropped_not_private");
+    assert!(group["text"].is_null());
+    assert_eq!(
+        rig.count(
+            "SELECT count(*) FROM openmybot.host_driver_sessions WHERE record_kind='session'"
+        )
+        .await,
+        1
+    );
+    rig.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn e2e_feishu_redelivered_event_adds_no_run() {
+    let (mut rig, mut platform) = first_party("feishu").await;
+    pair_feishu(&mut rig, &mut platform).await;
+    let message = feishu_event("ev_work", "oc_rig", "p2p", "please do the work");
+    for _ in 0..3 {
+        platform.push_event(&message).await;
+    }
+    let run = run_of(&rig, "feishu", "ev_work").await;
+    assert_eq!(rig.terminal_of(&run).await, "succeeded");
+    until(LIMIT, async || {
+        platform.feishu_sent().await.into_iter().nth(1)
+    })
+    .await;
+    // The pairing message once and the work message once per delivery.
+    until(LIMIT, async || (platform.acks().await == 4).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(platform.acks().await, 4);
+    assert_eq!(platform.feishu_sent().await.len(), 2);
+    assert_eq!(rig.count("SELECT count(*) FROM openmybot.channel_events WHERE channel_kind='feishu' AND event_key='ev_work'").await, 1);
+    assert_eq!(
+        rig.count(&format!(
+            "SELECT count(*) FROM openmybot.channel_events WHERE run_id='{run}'"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        rig.count(
+            "SELECT count(*) FROM openmybot.host_driver_sessions WHERE record_kind='session'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(event_conflicts(&rig).await, 0);
     rig.stop().await;
 }

@@ -848,7 +848,6 @@ impl Candidate {
             column::<Option<Value>>(row, "operation_row")?.ok_or(corrupt("operation_pair"))?;
         let receipt =
             column::<Option<Value>>(row, "receipt_row")?.ok_or(corrupt("positive_receipt"))?;
-        let quota = column::<Option<Value>>(row, "quota_row")?.ok_or(corrupt("workspace_quota"))?;
         let binding = administration.registry.binding();
         let operation_id = text(&record, "operation_id", "record_pair")?.to_owned();
         for (field, expected) in [
@@ -892,6 +891,9 @@ impl Candidate {
         {
             return Err(Error::Conflict);
         }
+        // Required only for an available pair: a completed deletion nulls the record's workspace,
+        // so its quota join is empty and the owner gets Conflict above, not Corrupt.
+        let quota = column::<Option<Value>>(row, "quota_row")?.ok_or(corrupt("workspace_quota"))?;
         for field in ["request_id", "operation_id", "artifact_id"] {
             let value = text(&record, field, "record_pair")?;
             if canonical_artifact_uuid_v7(value).as_deref() != Some(value) {

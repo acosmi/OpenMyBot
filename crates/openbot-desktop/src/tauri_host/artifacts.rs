@@ -1,8 +1,9 @@
-//! Current host-bound explicit save and metadata framing; no filesystem path ingress.
+//! Current host-bound explicit save, metadata and saved-owner deletion framing; no filesystem
+//! path ingress.
 
 use http::{Method, Request, Response, StatusCode};
 use openbot_contracts::artifacts::{
-    GetArtifactMetadata, GetSourceRunArtifactIds, SaveRunMessageTextArtifact,
+    ArtifactDeletionState, GetArtifactMetadata, GetSourceRunArtifactIds, SaveRunMessageTextArtifact,
 };
 use openbot_contracts::command::{AppCommand, AppReply};
 use openbot_contracts::error::{AppError, SensitiveWriteReason};
@@ -10,8 +11,8 @@ use openbot_contracts::ids::{RunId, ThreadId};
 
 use super::{
     CHANNEL_THREAD_BODY_MAX_BYTES, DesktopTauriProtocol, WindowAuthority, dependency_response,
-    empty_response, error_response, json_response, parse_sensitive_body, payload_too_large,
-    percent_decode_segment, sensitive_body_error_response,
+    empty_response, error_response, json_response, json_response_with_status, parse_sensitive_body,
+    payload_too_large, percent_decode_segment, sensitive_body_error_response,
 };
 
 impl DesktopTauriProtocol {
@@ -52,14 +53,16 @@ impl DesktopTauriProtocol {
             return error_response(AppError::MalformedPayload { field: "query" });
         }
         let path = request.uri().path().to_owned();
-        let write = path == "/api/artifacts/save-run-message-text";
+        let save = path == "/api/artifacts/save-run-message-text";
+        // Deletion is irreversible: a sensitive write like the save.
+        let write = save || request.method() == Method::DELETE;
         if write && !authority.is_fresh() {
             request.body_mut().fill(0);
             return error_response(AppError::SensitiveWriteRefused {
                 reason: SensitiveWriteReason::SessionNotFresh,
             });
         }
-        let command = if write {
+        let command = if save {
             if request.method() != Method::POST {
                 request.body_mut().fill(0);
                 return empty_response(StatusCode::METHOD_NOT_ALLOWED);
@@ -79,7 +82,7 @@ impl DesktopTauriProtocol {
                 request.body_mut().fill(0);
                 return empty_response(StatusCode::NOT_FOUND);
             };
-            if request.method() != Method::GET {
+            if !write && request.method() != Method::GET {
                 request.body_mut().fill(0);
                 return empty_response(StatusCode::METHOD_NOT_ALLOWED);
             }
@@ -92,7 +95,11 @@ impl DesktopTauriProtocol {
                     field: "artifact_id",
                 });
             };
-            AppCommand::GetArtifactMetadata(GetArtifactMetadata { artifact_id })
+            if write {
+                AppCommand::DeleteArtifact { artifact_id }
+            } else {
+                AppCommand::GetArtifactMetadata(GetArtifactMetadata { artifact_id })
+            }
         };
         if let Err(error) = self.artifact_binding_current(label, &authority) {
             return error_response(error);
@@ -118,6 +125,13 @@ impl DesktopTauriProtocol {
         }
         match (write, result) {
             (true, Ok(AppReply::ArtifactRegistrationReceipt(receipt))) => json_response(&receipt),
+            (true, Ok(AppReply::ArtifactDeletion(receipt))) => {
+                let status = match receipt.state {
+                    ArtifactDeletionState::Pending => StatusCode::ACCEPTED,
+                    ArtifactDeletionState::Deleted => StatusCode::OK,
+                };
+                json_response_with_status(&receipt, status)
+            }
             (false, Ok(AppReply::ArtifactMetadata(metadata))) => json_response(&metadata),
             (_, Err(error)) => error_response(error),
             (_, Ok(_)) => dependency_response(),
