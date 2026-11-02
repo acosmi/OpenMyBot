@@ -28,7 +28,7 @@ async fn w02_terminal_commit_dispatches_frozen_fifo() {
         source.command.message = BODY.into();
         f.directory.begin_thread_run_v2(source.clone()).await.unwrap();
         let claim = runtime.claim_dispatch().await.unwrap().unwrap();
-        assert_eq!(claim.run_id, source.command.run_id);
+        assert_eq!(claim.lease().run_id(), &source.command.run_id);
         let lease = runtime.acknowledge_dispatch(&claim).await.unwrap();
         runtime.finish_run(&lease, lease.next_event_sequence(), RunTerminal::Completed).await.unwrap();
         let digest = Sha256Digest::of(BODY.as_bytes()).to_hex();
@@ -72,7 +72,7 @@ async fn w02_terminal_commit_dispatches_frozen_fifo() {
             assert_eq!(order.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>(), expected.iter().map(|input| input.command.run_id.as_str().to_owned()).collect::<Vec<_>>());
             drop(c);
             let claim = runtime.claim_dispatch().await.unwrap().unwrap();
-            assert_eq!(claim.run_id, first.command.run_id);
+            assert_eq!(claim.lease().run_id(), &first.command.run_id);
             let mut lease = runtime.acknowledge_dispatch(&claim).await.unwrap();
             // No explicit wake: this must be the shared runtime's post-commit hook.
             runtime.finish_run(&lease, lease.next_event_sequence(), terminal).await.unwrap();
@@ -119,7 +119,7 @@ async fn w02_terminal_commit_dispatches_frozen_fifo() {
                 assert_eq!(c.query_one("SELECT count(*) FROM public.runs WHERE run_id=$1", &[&input.command.run_id.as_str()]).await.unwrap().get::<_, i64>(0), 1);
                 drop(c);
                 let claim = runtime.claim_dispatch().await.unwrap().unwrap();
-                assert_eq!(claim.run_id, input.command.run_id);
+                assert_eq!(claim.lease().run_id(), &input.command.run_id);
                 lease = runtime.acknowledge_dispatch(&claim).await.unwrap();
                 // Real competing consumers straddle the terminal commit. The hook
                 // and either explicit wake can win; only one next Run may result.
