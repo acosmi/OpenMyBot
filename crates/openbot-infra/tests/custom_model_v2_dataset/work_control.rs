@@ -232,8 +232,12 @@ async fn w06_release_adopts_current_generation() {
         let body:Value=c.query_one("SELECT content FROM public.messages WHERE message_id=$1||':input'", &[&pending.command.run_id.as_str()]).await.unwrap().get(0);
         assert_eq!(body["text"], pending.command.message);
         assert_eq!(body["modelSelection"],serde_json::to_value(&pending.command.model_selection).unwrap());
-        assert_eq!(body["selectedSkillSlugs"],json!(pending.command.selected_skill_slugs));
-        assert_eq!(body["artifactRefs"],json!(pending.command.artifact_refs));
+        let frozen=c.query_one("SELECT selected_skill_slugs,artifact_refs FROM openbot_internal.thread_pending_inputs WHERE run_id=$1", &[&pending.command.run_id.as_str()]).await.unwrap();
+        assert_eq!(frozen.get::<_,Vec<String>>(0),pending.command.selected_skill_slugs);
+        assert_eq!(frozen.get::<_,Vec<String>>(1),pending.command.artifact_refs);
+        // Existing begin omits empty optional input arrays.
+        assert_eq!(body.get("selectedSkillSlugs"),None);
+        assert_eq!(body.get("artifactRefs"),None);
         assert!(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1", &[&pending.command.run_id.as_str()]).await.unwrap().is_some());
         drop(c);f.finish().await;Ok(())
     }).await;
