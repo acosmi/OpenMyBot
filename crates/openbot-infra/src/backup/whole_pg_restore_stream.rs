@@ -2434,6 +2434,130 @@ pub(crate) mod input {
             assert!(failure.input.staging.is_none()); assert!(failure.input.carrier.metadata().is_ok()); assert!(failure.input.key_medium.metadata().is_ok());
             assert!(!fixture.directory.join("new-generation").exists());
         }
+        eprintln!("T15 original six mismatch/corruption cases rejected before staging");
+        assert_valid_other_bundle_mixtures_rejected().await;
+    }
+
+    #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+    async fn assert_valid_other_bundle_mixtures_rejected() {
+        use openbot_domain::backup::whole_pg_carrier::{WholePgManifestClaim, WholePgSealCodec};
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (source_fixture, _source_control, mut source_session) = real_staging_fixture();
+        let (input, intent) = source_session.frozen_input().expect("original held CAR inputs");
+        let mut source = verify_whole_pg_restore_input(input, intent, &mut source_session).await
+            .unwrap_or_else(|failure| panic!("original full CAR invalid: {:?}", failure.fault()));
+        let original_header = source.manifest().header();
+        let bounds = source.carrier.input.bounds;
+        // Reuse the original bounded single-frame allocation. Material bytes
+        // come only from real authenticated stage FDs or its private secrets.
+        let mut buffer = std::mem::take(&mut source.carrier.input.buffer);
+        source.manifest().encode_manifest_into(&mut buffer).expect("original canonical manifest");
+        let mut claim: WholePgManifestClaim = serde_json::from_slice(&buffer).expect("original typed manifest DATA");
+        buffer.as_mut_slice().zeroize(); buffer.clear();
+        let mut bundle_bytes = [0u8; 16]; getrandom::fill(&mut bundle_bytes).expect("independent bundle DATA");
+        bundle_bytes[6] = (bundle_bytes[6] & 15) | 0x40;
+        bundle_bytes[8] = (bundle_bytes[8] & 63) | 0x80;
+        let other_bundle = uuid::Uuid::from_bytes(bundle_bytes);
+        claim.bundle_id = other_bundle.to_string();
+        let manifest = FrozenWholePgManifest::check(claim, bounds).expect("other complete frozen layout");
+        let other_header = manifest.header();
+        assert_ne!(original_header, other_header);
+        assert_eq!(&original_header[28..48], &other_header[28..48], "same complete material lengths and chunk layout");
+        let mut raw_key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut raw_key[..]).expect("fresh independent K, never reuse the capture nonce key");
+        let key = SecretBytes::new(raw_key.to_vec()); raw_key.zeroize();
+        let carrier_path = source_fixture.directory.join("other-complete-carrier");
+        let key_path = source_fixture.directory.join("other-complete-key");
+        let mut carrier = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&carrier_path).expect("owned complete carrier output");
+        carrier.write_all(&other_header).expect("complete other carrier header");
+        let mut codec = WholePgSealCodec::new(&key, &manifest).expect("original 045 sealing codec");
+        let mut frames = 0u64;
+        while let Some(spec) = codec.next_frame() {
+            match spec.kind() {
+                0 => manifest.encode_manifest_into(&mut buffer).expect("complete other manifest plaintext"),
+                1 => {
+                    buffer.resize(spec.plain_len() as usize, 0);
+                    let ordinal = spec.material_ordinal() as usize;
+                    match manifest.materials()[ordinal].kind {
+                        WholePgMaterialKind::MasterSecret => buffer.copy_from_slice(source.authenticated_secrets().historical_master().expose()),
+                        WholePgMaterialKind::ScramSecret => buffer.copy_from_slice(source.authenticated_secrets().postgres_scram().expose()),
+                        _ => source.material_file(ordinal).expect("actual authenticated readonly material FD")
+                            .read_exact_at(&mut buffer, spec.offset()).expect("original authenticated material frame"),
+                    }
+                }
+                2 => manifest.encode_terminal_into(&mut buffer).expect("complete other terminal"),
+                _ => unreachable!("original closed codec frame kinds"),
+            }
+            let parts = codec.seal_next_in_place(&mut buffer).expect("seal actual complete frame");
+            carrier.write_all(&parts.header).and_then(|_| carrier.write_all(&buffer)).and_then(|_| carrier.write_all(&parts.tag)).expect("write entire original-format frame");
+            buffer.as_mut_slice().zeroize(); buffer.clear(); frames += 1;
+        }
+        carrier.sync_all().expect("complete other carrier fsync");
+        assert_eq!(carrier.metadata().expect("actual complete wire length").len(), manifest.wire_bytes().expect("full frozen wire length"));
+        assert!(frames > 2, "manifest, all material frames and terminal, not a prefix");
+        let mut key_medium = Zeroizing::new([0u8; 104]);
+        key_medium[..8].copy_from_slice(b"WBPGKEY1");
+        key_medium[8..24].copy_from_slice(other_bundle.as_bytes());
+        key_medium[24..40].copy_from_slice(uuid::Uuid::parse_str(&manifest.claim().operation_id).expect("unchanged source operation").as_bytes());
+        key_medium[40..72].copy_from_slice(&other_header[48..80]);
+        key_medium[72..104].copy_from_slice(key.expose());
+        let mut key_file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path).expect("owned independent original-format key medium");
+        key_file.write_all(&key_medium[..]).and_then(|_| key_file.sync_all()).expect("complete other key medium");
+        drop(key_medium); drop(key_file); drop(codec); drop(key); drop(carrier); drop(buffer); drop(source);
+
+        // The original production whole-carrier authentication checks all
+        // materials, terminal and EOF. Its three inputs come from one real claim.
+        let (valid_fixture, mut valid_request) = real_staging_request();
+        std::fs::copy(&carrier_path, valid_fixture.directory.join("carrier-medium/carrier")).expect("other carrier verification copy");
+        std::fs::copy(&key_path, valid_fixture.directory.join("key-medium/key")).expect("other key verification copy");
+        valid_request["trustedInputSelection"]["expectedBundleId"] = serde_json::json!(other_bundle.to_string());
+        valid_request["trustedInputSelection"]["expectedManifestSha256"] = serde_json::json!(other_header[48..80].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        let (mut valid_control, entry) = valid_fixture.open_request(valid_request);
+        let mut valid_session = valid_control.claim_restore(entry, valid_fixture.profile.clone()).expect("real independent complete-carrier claim");
+        let (input, intent) = valid_session.frozen_input().expect("independent original held input");
+        assert_eq!(input.operation.as_str(), valid_session.operation_id());
+        assert_eq!(intent.operation.as_str(), valid_session.operation_id());
+        let valid = authenticate_whole_pg_restore_carrier_before(input, intent, &mut valid_session)
+            .unwrap_or_else(|failure| panic!("independent complete other CAR invalid: {:?}", failure.fault()));
+        assert_eq!(valid.input.manifest.as_ref().expect("complete other manifest").header(), other_header);
+        assert_eq!(valid.input.authenticated_frames, frames);
+        assert!(valid.input.staging.is_none());
+        eprintln!("T15 independent complete alternate carrier: frames={} materials={} wire_bytes={}", frames, manifest.materials().len(), valid.input.carrier.metadata().expect("actual alternate length").len());
+        drop(valid); drop(valid_session); drop(valid_control); drop(valid_fixture);
+
+        for mix_header in [true, false] {
+            let (fixture, request) = real_staging_request();
+            let other = File::open(&carrier_path).expect("independently validated complete other carrier");
+            let mixed = std::fs::OpenOptions::new().read(true).write(true).open(fixture.directory.join("carrier-medium/carrier")).expect("original CAR copy to mix");
+            if mix_header {
+                mixed.write_all_at(&other_header, 0).expect("literal entire valid-other header splice");
+            } else {
+                let length = u32::from_be_bytes(other_header[28..32].try_into().expect("fixed manifest length")) as usize;
+                let mut frame_header = [0u8; 21]; let mut tag = [0u8; 16];
+                let mut frame = Zeroizing::new(vec![0u8; length]);
+                other.read_exact_at(&mut frame_header, 80).expect("valid-other manifest frame header");
+                other.read_exact_at(&mut frame, 101).expect("entire valid-other manifest ciphertext");
+                other.read_exact_at(&mut tag, 101 + length as u64).expect("valid-other manifest tag");
+                mixed.write_all_at(&frame_header, 80).and_then(|_| mixed.write_all_at(&frame, 101)).and_then(|_| mixed.write_all_at(&tag, 101 + length as u64)).expect("literal entire valid-other manifest frame splice");
+            }
+            mixed.sync_all().expect("owned literal mixture fsync");
+            let carrier_before = mixed.metadata().expect("actual mixed carrier identity");
+            let key_before = std::fs::metadata(fixture.directory.join("key-medium/key")).expect("original independent key identity");
+            let (mut control, entry) = fixture.open_request(request);
+            let mut session = control.claim_restore(entry, fixture.profile.clone()).expect("real mixture claim");
+            let (input, intent) = session.frozen_input().expect("original expected/key remain unchanged");
+            let failure = verify_whole_pg_restore_input(input, intent, &mut session).await.err().expect("literal cross-package mixture rejected");
+            assert_eq!(failure.fault(), if mix_header { WholePgCarrierFault::IntentMismatch } else { WholePgCarrierFault::AuthenticationFailed });
+            let carrier_after = failure.input.carrier.metadata().expect("original rejected carrier FD retained");
+            let key_after = failure.input.key_medium.metadata().expect("original independent key FD retained");
+            assert_eq!((carrier_before.dev(), carrier_before.ino(), carrier_before.len()), (carrier_after.dev(), carrier_after.ino(), carrier_after.len()));
+            assert_eq!((key_before.dev(), key_before.ino(), key_before.len()), (key_after.dev(), key_after.ino(), key_after.len()));
+            assert!(failure.input.staging.is_none());
+            assert!(!fixture.directory.join("new-generation").exists());
+            eprintln!("T15 literal valid-other {} rejected with retained original FDs and zero staging", if mix_header { "header" } else { "complete manifest frame" });
+        }
     }
 
     #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]

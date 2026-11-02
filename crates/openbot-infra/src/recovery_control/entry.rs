@@ -1224,6 +1224,7 @@ impl RecoveryRequestExpected {
 
 /// Original live host evidence, never Deserialize/Clone or a supplied digest.
 pub struct VerifiedRecoveryHost {
+    admission_deadline: Option<Instant>,
     reviewed_release_digest: [u8; 32],
     limits: TrustedHostRecoveryLimits,
     uid: u32,
@@ -1234,6 +1235,7 @@ pub struct VerifiedRecoveryHost {
 
 impl VerifiedRecoveryHost {
     pub(super) fn trusted_limits(&self) -> &TrustedHostRecoveryLimits { &self.limits }
+    pub(super) fn admission_deadline(&self) -> Instant { self.admission_deadline.expect("verified original host deadline") }
     /// Consume the original executable and verified release handles. Request
     /// facts and the control identity are sealed later by the control owner.
     #[cfg(feature = "desktop-local")]
@@ -1247,6 +1249,7 @@ impl VerifiedRecoveryHost {
         services: [&str; 2],
     ) -> Result<Self, RecoveryControlError> {
         let mut host = Self {
+            admission_deadline: None,
             reviewed_release_digest: reviewed_digest,
             limits,
             uid: rustix::process::getuid().as_raw(),
@@ -1265,6 +1268,7 @@ impl VerifiedRecoveryHost {
             let deadline = Instant::now()
                 .checked_add(Duration::from_nanos(host.limits.admission_ns))
                 .ok_or_else(service_invalid)?;
+            host.admission_deadline = Some(deadline);
             host.limits.clone().checked()?;
             let (bytes, files) = host.retained_usage()?;
             if bytes > host.limits.max_metadata_bytes || files > host.limits.max_open_files {
@@ -2365,6 +2369,91 @@ pub(super) fn claim_restore(
         }
         error.retain(owner)
     })
+}
+
+/// Bounded same-operation reader after the original restore owner has gone.
+/// It carries no effect clock, stages, candidate or execution API.
+pub struct ReadOnlyRestoreOwner {
+    owner: ControlOwner,
+    intent: Option<VerifiedRecoveryHostIntent>,
+    operation: Hex32,
+    deadline: Instant,
+    observation: Option<RestoreOriginalObservation>,
+}
+
+/// Observed descriptor/journal DATA, never a publication or runtime grant.
+pub struct RestoreOriginalObservation {
+    operation: Hex32,
+    epoch: String,
+    control_id: String,
+    phase: super::ActivationPhase,
+}
+impl RestoreOriginalObservation {
+    /// The existing operation, selected by the original authenticated request.
+    pub fn operation_id(&self) -> &str { self.operation.as_str() }
+    /// The old journal epoch, observed without minting or restoring a clock.
+    pub fn epoch(&self) -> &str { &self.epoch }
+    /// The existing external control identity.
+    pub fn control_id(&self) -> &str { &self.control_id }
+    /// The observed descriptor phase; it does not authorize that phase's effects.
+    pub fn phase(&self) -> super::ActivationPhase { self.phase }
+}
+impl Drop for ReadOnlyRestoreOwner {
+    fn drop(&mut self) { if let Ok(mut state) = lock(&self.owner) { state.release_writer(); } }
+}
+#[cfg(feature = "desktop-local")]
+impl ReadOnlyRestoreOwner {
+    pub(super) fn from_original(owner: ControlOwner, intent: VerifiedRecoveryHostIntent, deadline: Instant) -> Result<Self, RecoveryControlError> {
+        let operation = match &intent.decoded {
+            DecodedRecoveryRequest::Restore(request) => request.request_id,
+            _ => { let mut error = service_invalid(); error.retained_restore_intent = Some(Box::new(intent)); return Err(error.retain(&owner)); }
+        };
+        let mut reader = Self { owner, operation, deadline: deadline.min(intent.original_deadline), intent: Some(intent), observation: None };
+        let result: Result<(), RecoveryControlError> = (|| {
+            let mut state = lock(&reader.owner)?;
+            let wrapper = std::mem::size_of::<ReadOnlyRestoreOwner>().checked_sub(std::mem::size_of::<VerifiedRecoveryHostIntent>()).ok_or_else(service_invalid)?;
+            state.prepay(wrapper as u64, 0)?;
+            state.acquire_writer_before(reader.deadline)?;
+            Ok(())
+        })();
+        if let Err(mut error) = result {
+            error.retained_restore_intent = reader.intent.take().map(Box::new);
+            return Err(error.retain(&reader.owner));
+        }
+        // A complete read is required before an observer is exposed.
+        reader.observe_original()?;
+        Ok(reader)
+    }
+
+    /// Re-read within this same host admission period; never renew E/C or the read period.
+    pub fn observe_original(&mut self) -> Result<&RestoreOriginalObservation, RecoveryControlError> {
+        let result: Result<RestoreOriginalObservation, RecoveryControlError> = (|| {
+            let mut state = lock(&self.owner)?;
+            state.post(self.deadline)?;
+            let intent = self.intent.as_mut().ok_or_else(service_invalid)?;
+            recheck_legacy_request_before(&mut state, intent, self.deadline)?;
+            if !state.holds_writer() || state.root_identity(self.deadline)? != intent.control_root { return Err(service_invalid()); }
+            for index in 0..3 {
+                let (file, name) = match index {
+                    0 => (state.pending_owner.take(), "owner.lock"),
+                    1 => (state.pending_admission.take(), "admission.lock"),
+                    _ => (state.pending_runtime.take(), "runtime.lock"),
+                };
+                let file = file.ok_or_else(service_invalid)?;
+                let checked = state.verify_held_lock(&file, name, self.deadline);
+                match index { 0 => state.pending_owner = Some(file), 1 => state.pending_admission = Some(file), _ => state.pending_runtime = Some(file) }
+                checked?;
+            }
+            state.read_original_restore_before(self.operation, self.deadline)
+        })();
+        match result {
+            Ok(observation) => { self.observation = Some(observation); Ok(self.observation.as_ref().expect("observed original data")) }
+            Err(mut error) => {
+                error.retained_restore_intent = self.intent.take().map(Box::new);
+                Err(error.retain(&self.owner))
+            },
+        }
+    }
 }
 
 /// One original restore operation. Its clock, input and journal stay in the
@@ -6388,6 +6477,14 @@ pub(super) async fn verify_existing_server_before(
 pub(super) fn open_control(
     config: RecoveryControlConfig,
 ) -> Result<ControlOwner, RecoveryControlError> {
+    open_control_inner(config, true)
+}
+
+pub(super) fn open_existing_control(config: RecoveryControlConfig) -> Result<ControlOwner, RecoveryControlError> {
+    open_control_inner(config, false)
+}
+
+fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Result<ControlOwner, RecoveryControlError> {
     if !config.root.is_absolute() {
         return Err(RecoveryControlError::new(
             RecoveryControlFault::EntryInvalid,
@@ -6669,6 +6766,7 @@ pub(super) fn open_control(
                 return Err(service_invalid());
             }
         }
+        if create_layout {
         state.reserve_io(0)?;
         before(deadline)?;
         state.raw.unit = Some({
@@ -6699,6 +6797,7 @@ pub(super) fn open_control(
             if !matches!(state.raw.unit, Some(Ok(()))) {
                 return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
             }
+        }
         }
         state.reserve_io(1)?;
         before(deadline)?;
@@ -6769,7 +6868,7 @@ pub(super) fn open_control(
             ("operations", Directory::Operations),
             ("runtimes", Directory::Runtimes),
         ] {
-            state.ensure_directory(name, deadline)?;
+            if create_layout { state.ensure_directory(name, deadline)?; }
             state.reserve_io(1)?;
             before(deadline)?;
             state.raw.file = Some(
@@ -6802,7 +6901,7 @@ pub(super) fn open_control(
             ("admission.lock", b"WBRCADM1"),
             ("runtime.lock", b"WBRCRUN1"),
         ] {
-            state.ensure_lock(name, marker, deadline)?;
+            if create_layout { state.ensure_lock(name, marker, deadline)?; }
         }
         state.check_root_namespace(deadline)?;
         if let Some(source) = &mut state.service_source {

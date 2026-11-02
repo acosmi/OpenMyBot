@@ -25,6 +25,48 @@ fn invalid() -> RecoveryControlError {
 }
 
 impl ControlFiles {
+    pub(super) fn read_original_restore_before(
+        &mut self,
+        operation: super::super::activation::Hex32,
+        deadline: Instant,
+    ) -> Result<super::RestoreOriginalObservation, RecoveryControlError> {
+        self.read_head_before(deadline)?;
+        // Both identity strings are fixed closed hex (32/64); admit their backing before clone.
+        self.prepay(2 * (32 + 64), 0)?;
+        let observation = self.activation_observation.as_ref().and_then(|raw| raw.as_ref().ok()).cloned().ok_or_else(invalid)?;
+        if self.publication_chain.is_none() {
+            let fee = self.limits.max_journal_frame_bytes.checked_mul(4).ok_or_else(invalid)?;
+            let journal = self.read_journal(operation.as_str(), fee, deadline)?;
+            self.publication_journal = Some(Arc::clone(&journal));
+            let metadata = super::super::journal::read_metadata_reservation(&journal.bytes, &self.limits)?;
+            self.prepay(metadata, 0)?;
+            self.publication_chain = Some(super::super::journal::observe_chain(&journal.bytes, &self.limits));
+            self.post(deadline)?;
+        }
+        let chain = match self.publication_chain.as_ref() {
+            Some(Ok(chain)) => chain,
+            Some(Err(error)) => return Err(RecoveryControlError::new(error.fault())),
+            None => return Err(invalid()),
+        };
+        let (control, observed_operation, epoch) = chain.first_context().ok_or_else(invalid)?;
+        if !chain.is_restore() || observed_operation != operation.as_str() || control != observation.record.control_id { return Err(invalid()); }
+        match observation.record.data() {
+            super::super::activation::ActivationPayload::Pending(pending) => chain.matches_restore_pending(pending)?,
+            super::super::activation::ActivationPayload::Current(current) => {
+                if current.operation_id != observed_operation || current.epoch != epoch { return Err(invalid()); }
+            }
+            super::super::activation::ActivationPayload::Switched(switched) => {
+                if switched.publish_intent.context_id.as_str() != observed_operation || switched.binding.authorization_epoch() != epoch { return Err(invalid()); }
+                chain.publication_for(control, &observation.digest, &switched.publish_intent, self.activation_source.as_ref().ok_or_else(invalid)?.identity, observation.record.phase)?;
+            }
+            _ => return Err(invalid()),
+        }
+        let epoch = epoch.to_owned();
+        let control_id = control.to_owned();
+        self.post(deadline)?;
+        Ok(super::RestoreOriginalObservation { operation, epoch, control_id, phase: observation.record.phase })
+    }
+
     pub(in super::super) fn read_head_before(
         &mut self,
         deadline: Instant,

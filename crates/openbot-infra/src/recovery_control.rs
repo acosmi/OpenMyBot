@@ -20,7 +20,7 @@ pub use activation::{ActivationBinding, ActivationPhase, OrdinaryStartupBounds};
 pub use journal::{NativeExit, PipeJoin, ProcessStart};
 pub(crate) use activation::{Hex32, ServerDatabaseSite};
 pub use entry::{
-    OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
+    ReadOnlyRestoreOwner, RestoreOriginalObservation, OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
     VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
 };
 pub(crate) use ordinary::OrdinaryStage;
@@ -989,6 +989,35 @@ impl RecoveryControl {
         })
     }
 
+    /// Authenticate one original request and open only the existing same-operation reader.
+    #[cfg(feature = "desktop-local")]
+    pub fn reopen_local_restore_before(
+        actual: crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
+        request: OwnedRecoveryRequestFile,
+        host: VerifiedRecoveryHost,
+        deadline: Instant,
+    ) -> Result<ReadOnlyRestoreOwner, RecoveryControlError> {
+        let deadline = deadline.min(host.admission_deadline());
+        let mut request = Some(request);
+        let mut host = Some(host);
+        let result = (|| {
+            let original = host.as_ref().expect("original host retained");
+            let (hb, hf) = original.retained_usage()?;
+            let (rb, rf) = request.as_ref().expect("original request retained").retained_usage()?;
+            let mut config = RecoveryControlConfig::local(actual, original.trusted_limits().clone())?;
+            config.preheld_restore_usage = Some((hb.checked_add(rb).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?, hf.checked_add(rf).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?));
+            config.original_admission_deadline = Some(deadline);
+            let owner = entry::open_existing_control(config)?;
+            let intent = entry::verify_intent(&owner, request.take().expect("original request moved once"), host.take().expect("original host moved once"), deadline)?;
+            ReadOnlyRestoreOwner::from_original(owner, intent, deadline)
+        })();
+        result.map_err(|mut error: RecoveryControlError| {
+            if host.is_some() { error.retained_host = host.take().map(Box::new); }
+            if request.is_some() { error.retained_restore_input = request.take().map(Box::new); }
+            error
+        })
+    }
+
     /// Open/authenticate the external root. Missing head remains missing.
     pub fn open(config: RecoveryControlConfig) -> Result<Self, RecoveryControlError> {
         entry::open_control(config).map(|shared| Self { shared })
@@ -1837,6 +1866,16 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn try_open_request(&self, request: Value) -> Result<(super::RecoveryControl, super::VerifiedRecoveryHostIntent), super::RecoveryControlError> {
+            let (actual, request, host) = self.original_inputs(request);
+            super::RecoveryControl::open_local_restore_before(actual, request, host, std::time::Instant::now() + std::time::Duration::from_secs(30))
+        }
+
+        fn reopen(&self, deadline: std::time::Instant) -> Result<super::ReadOnlyRestoreOwner, super::RecoveryControlError> {
+            let (actual, request, host) = self.original_inputs(self.request());
+            super::RecoveryControl::reopen_local_restore_before(actual, request, host, deadline)
+        }
+
+        fn original_inputs(&self, request: Value) -> (crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot, super::OwnedRecoveryRequestFile, super::VerifiedRecoveryHost) {
             use std::os::unix::fs::PermissionsExt;
             let root = self.directory.as_path();
             std::fs::write(root.join("request"), serde_json::to_vec(&request).unwrap()).unwrap();
@@ -1856,10 +1895,7 @@ pub(crate) mod tests {
                 rustix::process::getuid().as_raw(),
             )
             .unwrap();
-            super::RecoveryControl::open_local_restore_before(
-                    crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(root.join("old-app")).unwrap(),
-                    request, host, std::time::Instant::now() + std::time::Duration::from_secs(30),
-                )
+            (crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(root.join("old-app")).unwrap(), request, host)
         }
 
         fn control_root(&self) -> std::path::PathBuf {
@@ -1867,6 +1903,133 @@ pub(crate) mod tests {
                 .as_path()
                 .join("com.acosmi.wrokbot.restore-control")
         }
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn restore_control_bytes(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut bytes = std::collections::BTreeMap::new();
+        if !root.exists() { return bytes; }
+        bytes.insert(root.to_owned(), Vec::new());
+        for child in std::fs::read_dir(root).unwrap() {
+            let child = child.unwrap();
+            if child.file_type().unwrap().is_dir() { bytes.extend(restore_control_bytes(&child.path())); }
+            else { bytes.insert(child.path(), std::fs::read(child.path()).unwrap()); }
+        }
+        bytes
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn closed_restore_claim(fixture: &RestoreEntryFixture) -> String {
+        let (mut control, intent) = fixture.open();
+        let session = control.claim_restore(intent, fixture.profile.clone()).unwrap();
+        let record: Value = serde_json::from_slice(&std::fs::read(fixture.control_root().join("activation-v1")).unwrap()).unwrap();
+        let epoch = record["data"]["epoch"].as_str().unwrap().to_owned();
+        drop(session);
+        drop(control);
+        epoch
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_reopened_reads_same_operation_epoch_without_writes() {
+        let fixture = RestoreEntryFixture::new();
+        let epoch = closed_restore_claim(&fixture);
+        let before = restore_control_bytes(&fixture.control_root());
+        let mut reader = fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).unwrap();
+        for _ in 0..2 {
+            let observed = reader.observe_original().unwrap();
+            assert_eq!(observed.operation_id(), OPERATION);
+            assert_eq!(observed.epoch(), epoch);
+            assert_eq!(observed.phase(), super::ActivationPhase::RestorePending);
+        }
+        drop(reader);
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_reopened_busy_preserves_every_control_byte() {
+        let fixture = RestoreEntryFixture::new();
+        let (mut control, intent) = fixture.open();
+        let session = control.claim_restore(intent, fixture.profile.clone()).unwrap();
+        let before = restore_control_bytes(&fixture.control_root());
+        assert!(matches!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)), Err(error) if error.fault() == super::RecoveryControlFault::OwnerBusy));
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+        drop(session); drop(control);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_reopened_missing_layout_is_never_created() {
+        let fixture = RestoreEntryFixture::new();
+        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert!(!fixture.control_root().exists());
+        closed_restore_claim(&fixture);
+        std::fs::remove_file(fixture.control_root().join("owner.lock")).unwrap();
+        let before = restore_control_bytes(&fixture.control_root());
+        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert!(!fixture.control_root().join("owner.lock").exists());
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_reopened_torn_tail_is_not_truncated() {
+        use std::io::Write;
+        let fixture = RestoreEntryFixture::new();
+        closed_restore_claim(&fixture);
+        let journal = fixture.control_root().join("operations").join(OPERATION).join("journal-v1");
+        std::fs::OpenOptions::new().append(true).open(journal).unwrap().write_all(b"x").unwrap();
+        let before = restore_control_bytes(&fixture.control_root());
+        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_reopened_original_read_deadline_cannot_renew() {
+        let fixture = RestoreEntryFixture::new();
+        closed_restore_claim(&fixture);
+        let before = restore_control_bytes(&fixture.control_root());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let mut reader = fixture.reopen(deadline).unwrap();
+        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + std::time::Duration::from_millis(10));
+        assert!(reader.observe_original().is_err());
+        assert!(reader.observe_original().is_err());
+        drop(reader);
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_reopened_expired_host_cannot_get_a_new_read_period() {
+        let mut fixture = RestoreEntryFixture::new();
+        closed_restore_claim(&fixture);
+        fixture.limits.admission_ns = 200_000_000;
+        let (actual, request, host) = fixture.original_inputs(fixture.request());
+        let original = host.admission_deadline();
+        std::thread::sleep(original.saturating_duration_since(std::time::Instant::now()) + std::time::Duration::from_millis(10));
+        let before = restore_control_bytes(&fixture.control_root());
+        assert!(super::RecoveryControl::reopen_local_restore_before(actual, request, host, std::time::Instant::now() + std::time::Duration::from_secs(30)).is_err());
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_reopened_rejects_descriptor_prefix_digest_mismatch() {
+        let fixture = RestoreEntryFixture::new();
+        closed_restore_claim(&fixture);
+        let path = fixture.control_root().join("activation-v1");
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        let record: Value = serde_json::from_str(&bytes).unwrap();
+        let digest = record["data"]["journalPrefix"]["digest"].as_str().unwrap();
+        assert_eq!(bytes.matches(digest).count(), 1);
+        let wrong = "f".repeat(64);
+        assert_ne!(digest, wrong);
+        std::fs::write(&path, bytes.replacen(digest, &wrong, 1)).unwrap();
+        let before = restore_control_bytes(&fixture.control_root());
+        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
     }
 
     #[test]
@@ -2131,6 +2294,45 @@ pub(crate) mod tests {
         );
     }
 
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_11_effect_convergence_and_owner_loss_are_read_only() {
+        let mut fixture = RestoreEntryFixture::new();
+        fixture.profile.effect_ns = 500_000_000;
+        fixture.profile.convergence_ns = 200_000_000;
+        let (mut control, entry) = fixture.open();
+        let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+        let (_, t0, effect, close) = session.original_native_clock().unwrap();
+        assert_eq!(effect - t0, fixture.profile.effect_ns);
+        assert_eq!(close - effect, fixture.profile.convergence_ns);
+        let before = restore_control_bytes(&fixture.control_root());
+        let descriptor: Value = serde_json::from_slice(&std::fs::read(fixture.control_root().join("activation-v1")).unwrap()).unwrap();
+        let epoch = descriptor["data"]["epoch"].as_str().unwrap().to_owned();
+        let now = super::clock::monotonic_ns().unwrap();
+        std::thread::sleep(std::time::Duration::from_nanos(effect.saturating_sub(now) + 10_000_000));
+        let effect_error = session.admit_capacity(super::RestoreCapacityResource::NativeTasks, 1).err().expect("original E denies a new effect");
+        assert_eq!(effect_error.fault(), RecoveryControlFault::EffectExpired);
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+        drop(effect_error);
+        let now = super::clock::monotonic_ns().unwrap();
+        std::thread::sleep(std::time::Duration::from_nanos(close.saturating_sub(now) + 10_000_000));
+        assert!(super::clock::monotonic_ns().unwrap() >= close);
+        let close_error = session.admit_capacity(super::RestoreCapacityResource::NativeTasks, 1).err().expect("original C cannot admit a new effect");
+        assert_eq!(close_error.fault(), RecoveryControlFault::ConvergenceExpired);
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+        drop(close_error);
+        drop(session);
+        drop(control);
+        let mut reader = fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).unwrap();
+        let observed = reader.observe_original().unwrap();
+        assert_eq!(observed.operation_id(), OPERATION);
+        assert_eq!(observed.epoch(), epoch);
+        assert_eq!(observed.phase(), super::ActivationPhase::RestorePending);
+        drop(reader);
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+        assert!(!fixture.directory.join("new-generation").exists());
+    }
 
     #[test]
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
