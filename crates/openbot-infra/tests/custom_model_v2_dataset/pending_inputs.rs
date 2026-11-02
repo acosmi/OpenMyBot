@@ -127,6 +127,8 @@ async fn pending_input_migration_and_visibility() {
         assert!(c.query_one("SELECT to_regclass('openbot_internal.thread_pending_inputs') IS NULL",&[]).await.unwrap().get::<_,bool>(0));
         assert_eq!(native::apply(&mut c).await.unwrap(),native::ApplyOutcome::Applied);
         assert_eq!(native::apply(&mut c).await.unwrap(),native::ApplyOutcome::AlreadyApplied);
+        // The explicit historical target must not admit a database with the new suffix.
+        assert!(native::apply_through(&mut c,52).await.is_err());
         let row=c.query_one("SELECT name,checksum FROM openbot_internal.schema_migrations WHERE version=$1",&[&native::NATIVE_0053_VERSION]).await.unwrap();
         assert_eq!(row.get::<_,String>(0),native::NATIVE_0053_NAME);
         assert_eq!(row.get::<_,String>(1),native::native_0053_checksum());
