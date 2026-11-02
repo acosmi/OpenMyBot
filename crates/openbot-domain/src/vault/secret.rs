@@ -174,6 +174,12 @@ impl SecretBytes {
         self.0.len()
     }
 
+    /// Actual owned allocation capacity for the original operation's resource accounting.
+    #[must_use]
+    pub fn allocation_capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
     /// 是否为空。上游允许加密空字符串（实测：空明文的 v1 密文恰好 16 字节 = 只有 tag）。
     #[must_use]
     pub fn is_empty(&self) -> bool {

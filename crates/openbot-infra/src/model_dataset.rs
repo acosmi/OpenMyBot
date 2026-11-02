@@ -825,6 +825,11 @@ mod physical_lineage_tests {
                 cluster.config(APP_DATABASE),
                 "owned-original-lineage-runtime".into(),
                 time::Duration::seconds(30),
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &database.clone_pool(),
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .unwrap()
             .with_model_dataset_binding(binding.clone())

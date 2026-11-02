@@ -12,6 +12,8 @@ use axum::response::{IntoResponse, Response};
 use openbot_contracts::auth::{
     ApplicationRuntimeMode, AuthProviderId, AuthenticationCapabilities, AuthenticationStartResponse,
 };
+use openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET;
+use openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest;
 use openbot_infra::auth::oidc::{OidcLoginError, ProviderId};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -131,6 +133,12 @@ pub(crate) async fn callback(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let request = OriginalLoginRequest::new(
+        std::time::Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET,
+        cancel.clone(),
+    );
+    let _cancel_on_drop = cancel.drop_guard();
     if query.error.is_some() {
         return auth_failure(StatusCode::BAD_REQUEST, "authentication_failed");
     }
@@ -157,6 +165,7 @@ pub(crate) async fn callback(
                 now,
                 &peer,
                 user_agent,
+                request,
             )
             .await
         {
@@ -171,7 +180,7 @@ pub(crate) async fn callback(
         );
     };
     match dynamic
-        .oidc_callback(&provider, csrf_state, code, now, &peer, user_agent)
+        .oidc_callback(&provider, csrf_state, code, now, &peer, user_agent, request)
         .await
     {
         Ok(issued) => issued_session_response(&state, &issued, now),

@@ -1,6 +1,8 @@
 //! MCP OAuth production slice: PRM/AS discovery, RFC 8707 refresh rotation, actor binding and one
 //! controlled RMCP 401 retry against real loopback HTTP plus PostgreSQL 17.
 
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 mod harness {
     include!("../../../test-support/postgres_harness.rs");
 }
@@ -101,9 +103,9 @@ async fn admin_credential_retirement_keeps_exact_oauth_context_through_retry_rep
             }
             drop(pg);
             let catalog = Arc::new(PostgresMcpCatalog::new(pool.clone(),rmcp_client(),AUDIT_KEY.to_vec()).map_err(|e| e.to_string())?);
-            let connections = Arc::new(PostgresMcpConnections::new(pool.clone(),vault.clone(),McpOAuthClient::new(SafeDialer::new(EgressPolicy::default()),SchemePolicy::HttpOrHttps),catalog,DeploymentId::new("admin-token-deployment"),TenantId::new("admin-token-tenant"),vec![0x5a;32],AUDIT_KEY.to_vec(),None,None,SchemePolicy::HttpOrHttps).map_err(|e| e.to_string())?);
+            let connections = Arc::new(PostgresMcpConnections::new(pool.clone(),vault.clone(),McpOAuthClient::new(SafeDialer::new(EgressPolicy::default()),SchemePolicy::HttpOrHttps),catalog,DeploymentId::new("admin-token-deployment"),TenantId::new("admin-token-tenant"),vec![0x5a;32],AUDIT_KEY.to_vec(),None,None,SchemePolicy::HttpOrHttps, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e| e.to_string())?);
             let admin = PostgresCredentialAdministration::new(pool.clone(),vault,DeploymentId::new("admin-token-deployment"),TenantId::new("admin-token-tenant"),SecretBytes::new(AUDIT_KEY.to_vec()),connections.clone()).map_err(|e| e.to_string())?;
-            let auth = AuthContextBuilder::from_verified_session(DeploymentId::new("admin-token-deployment"),TenantId::new("admin-token-tenant"),ActorId::new("credential-admin"),AuthGeneration::new(0),false).with_roles([Role::Admin]).build();
+            let auth = recovery_admission::outside_domain(AuthContextBuilder::from_verified_session(DeploymentId::new("admin-token-deployment"),TenantId::new("admin-token-tenant"),ActorId::new("credential-admin"),AuthGeneration::new(0),false).with_roles([Role::Admin]).build());
             let retired = admin.revoke(&auth,&tokens[0].to_string()).await.map_err(|e| e.to_string())?;
             assert_eq!(retired.external_revocation,CredentialExternalRevocation::Pending);
             let pg=pool.get().await.map_err(|e| e.to_string())?;
@@ -606,7 +608,7 @@ async fn actor_oauth_rotates_before_use_and_retries_one_401_exactly_once() {
             drop(pg);
 
             let broker = Arc::new(
-                PostgresMcpCredentialBroker::new(pool.clone(), vault.clone())
+                PostgresMcpCredentialBroker::new(pool.clone(), vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                     .with_user_oauth(
                         SafeDialer::new(EgressPolicy::default()),
                         SchemePolicy::HttpOrHttps,
@@ -770,6 +772,7 @@ async fn actor_oauth_rotates_before_use_and_retries_one_401_exactly_once() {
                 TenantId::new("oauth-tenant"),
                 policy.clone(),
                 Arc::new(memory.clone()),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .with_mcp(catalog.clone(), rmcp)
             .with_mcp_credentials(broker.clone());
@@ -980,9 +983,10 @@ async fn authorization_code_state_pkce_callback_and_local_first_disconnect_are_r
                 Some(&base),
                 Some("http://app.example.test"),
                 SchemePolicy::HttpOrHttps,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
-            let auth = AuthContextBuilder::from_verified_session(
+            let auth = recovery_admission::outside_domain(AuthContextBuilder::from_verified_session(
                 DeploymentId::new("oauth-connect-deployment"),
                 TenantId::new("oauth-connect-tenant"),
                 ActorId::new(ACTOR),
@@ -990,7 +994,7 @@ async fn authorization_code_state_pkce_callback_and_local_first_disconnect_are_r
                 false,
             )
             .with_roles([Role::User, Role::Admin])
-            .build();
+            .build());
             let registration_input = McpOAuthClientRegistration::new(
                 CLIENT_ID.to_owned(),
                 CLIENT_SECRET.to_owned(),
@@ -1192,6 +1196,7 @@ async fn authorization_code_state_pkce_callback_and_local_first_disconnect_are_r
                 Some(&base),
                 Some("http://app.example.test"),
                 SchemePolicy::HttpOrHttps,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let wrong_key = wrong_key_connections
@@ -1293,7 +1298,7 @@ async fn authorization_code_state_pkce_callback_and_local_first_disconnect_are_r
             .await
             .map_err(|error| error.to_string())?;
             drop(pg);
-            let broker = PostgresMcpCredentialBroker::new(pool.clone(), vault.clone())
+            let broker = PostgresMcpCredentialBroker::new(pool.clone(), vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                 .with_user_oauth(
                     SafeDialer::new(EgressPolicy::default()),
                     SchemePolicy::HttpOrHttps,

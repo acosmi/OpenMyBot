@@ -174,7 +174,7 @@ async fn assert_failure(behavior: OutputBehavior, tag: &str, immediate: bool) {
     let mut unrelated = unrelated_owned_child();
     let started = Instant::now();
     assert!(matches!(
-        verify_program_versions_with_helper(&bundle, &mut lock, &mut journal).await,
+        verify_program_versions_with_helper(&bundle, &mut lock, &mut journal, None).await,
         Err(PostgresSidecarError::VersionMismatch)
     ));
     if immediate {
@@ -204,7 +204,7 @@ async fn assert_failure(behavior: OutputBehavior, tag: &str, immediate: bool) {
 async fn version_output_4096_bytes_completes_all_owned_helpers() {
     let fixture = Fixture::new("version-output-4096", OutputBehavior::ExactBytes(4096));
     let (bundle, mut lock, mut journal) = fixture.prepare();
-    verify_program_versions_with_helper(&bundle, &mut lock, &mut journal)
+    verify_program_versions_with_helper(&bundle, &mut lock, &mut journal, None)
         .await
         .unwrap();
     let record = fixture.record();
@@ -260,7 +260,7 @@ async fn version_output_cancellation_cleans_owned_child_and_retains_exact_eviden
     let lock_bytes = fs::read(fixture.lock_path()).unwrap();
     let mut unrelated = unrelated_owned_child();
     let task = tokio::spawn(async move {
-        verify_program_versions_with_helper(&bundle, &mut lock, &mut journal).await
+        verify_program_versions_with_helper(&bundle, &mut lock, &mut journal, None).await
     });
     let (record, journal_bytes) = wait_for_observed_record(&fixture).await;
     assert_eq!(record["helperKind"], "version_postgres");

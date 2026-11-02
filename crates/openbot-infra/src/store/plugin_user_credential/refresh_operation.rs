@@ -19,6 +19,7 @@ pub(super) struct OperationSendFence<'a> {
     store: &'a PluginUserCredentialStore,
     prepared: &'a PreparedUserOAuthCredential,
     operation: &'a RefreshOperation,
+    admission: &'a RecoveryWorkerLease<'a>,
     // 0=new, 1=claim in progress, 2=durably admitted, 3=refused/uncertain. Never reset.
     state: AtomicU8,
 }
@@ -28,11 +29,13 @@ impl<'a> OperationSendFence<'a> {
         store: &'a PluginUserCredentialStore,
         prepared: &'a PreparedUserOAuthCredential,
         operation: &'a RefreshOperation,
+        admission: &'a RecoveryWorkerLease<'a>,
     ) -> Self {
         Self {
             store,
             prepared,
             operation,
+            admission,
             state: AtomicU8::new(0),
         }
     }
@@ -48,10 +51,16 @@ impl RefreshSendFence for OperationSendFence<'_> {
         self.state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| OAuthTokenExchangeError::Unavailable)?;
-        let result = self
-            .store
-            .admit_refresh(self.prepared, self.operation)
-            .await;
+        // The held admission is rechecked at the durable send admission, which
+        // the adapter reaches immediately before its token POST.
+        let result = match current(self.admission) {
+            Ok(()) => {
+                self.store
+                    .admit_refresh(self.prepared, self.operation)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         self.state
             .store(if result.is_ok() { 2 } else { 3 }, Ordering::Release);
         result.map_err(|_| OAuthTokenExchangeError::Unavailable)

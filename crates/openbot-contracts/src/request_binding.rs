@@ -2,6 +2,7 @@
 
 use crate::auth::{AuthContext, AuthGeneration, Role};
 use crate::ids::{ActorId, DeploymentId, TenantId};
+use crate::recovery::{RecoveryAdmissionLease, RecoveryAdmissionPurpose};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
@@ -777,6 +778,40 @@ pub type ArtifactSaveReceiptCurrentCheck<'a> =
 
 /// 受信 Rust host 的当前验证 port；任意 Rust 实现不自动取得可信身份。
 pub trait HostRequestBindingGuard: Send + Sync {
+    /// Borrow normal admission only from this enrolled original host's real read gate.
+    /// Unsupported hosts refuse; implementing this port grants no restore authority.
+    fn borrow_recovery_admission_before<'a>(
+        &'a self,
+        _binding: &'a VerifiedHostRequestBinding,
+        _auth: &'a AuthContext,
+        _deadline: std::time::Instant,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<RecoveryAdmissionLease<'a>, HostRequestBindingError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Err(HostRequestBindingError::Unavailable) })
+    }
+
+    /// Borrow only this original host's separately authenticated reconfirmation admission.
+    /// Missing fresh-producer composition refuses and never falls back to normal admission.
+    fn borrow_restore_reconfirmation_before<'a>(
+        &'a self,
+        _binding: &'a VerifiedHostRequestBinding,
+        _auth: &'a AuthContext,
+        _deadline: std::time::Instant,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<RecoveryAdmissionLease<'a>, HostRequestBindingError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Err(HostRequestBindingError::Unavailable) })
+    }
+
     /// Borrow an enrolled original Server authorization journal Host without database I/O.
     fn borrow_gateway_authorization_host_before<'a>(
         &'a self,
@@ -1088,6 +1123,56 @@ pub struct VerifiedHostRequestBinding {
     guard: Arc<dyn HostRequestBindingGuard>,
 }
 impl VerifiedHostRequestBinding {
+    /// Borrow the original normal lease with unchanged attachment and absolute deadline.
+    /// The caller retains this same lease through its final send, commit or publication
+    /// and checks its actual witness again there with this binding/auth/deadline.
+    /// Returning or dropping the lease is not a Current or resource-close receipt.
+    pub async fn borrow_recovery_admission_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<RecoveryAdmissionLease<'a>, HostRequestBindingError> {
+        self.check_repository_host_attachment(auth, deadline)?;
+        let outcome = self
+            .guard
+            .borrow_recovery_admission_before(self, auth, deadline)
+            .await;
+        // Even a refused producer cannot bypass the original after-check.
+        self.check_repository_host_attachment(auth, deadline)?;
+        let lease = outcome?;
+        if lease.purpose() != RecoveryAdmissionPurpose::Normal {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let verification = lease.verify_current_before(self, auth, deadline);
+        self.check_repository_host_attachment(auth, deadline)?;
+        verification?;
+        Ok(lease)
+    }
+
+    /// Borrow only the original fresh producer's narrow reconfirmation lease.
+    /// Purpose selection is not fresh proof or a confirmed requirement. The caller
+    /// holds and rechecks this same original lease at its actual final boundary.
+    pub async fn borrow_restore_reconfirmation_before<'a>(
+        &'a self,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<RecoveryAdmissionLease<'a>, HostRequestBindingError> {
+        self.check_repository_host_attachment(auth, deadline)?;
+        let outcome = self
+            .guard
+            .borrow_restore_reconfirmation_before(self, auth, deadline)
+            .await;
+        self.check_repository_host_attachment(auth, deadline)?;
+        let lease = outcome?;
+        if lease.purpose() != RecoveryAdmissionPurpose::Reconfirmation {
+            return Err(HostRequestBindingError::NotCurrent);
+        }
+        let verification = lease.verify_current_before(self, auth, deadline);
+        self.check_repository_host_attachment(auth, deadline)?;
+        verification?;
+        Ok(lease)
+    }
+
     /// Check the same attachment before and after the real producer's synchronous borrowing.
     pub fn borrow_gateway_authorization_host_before<'a>(
         &'a self,

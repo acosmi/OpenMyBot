@@ -309,6 +309,11 @@ impl Fixture {
             config,
             "read-bridge-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         directory
@@ -603,6 +608,7 @@ async fn actual_queued_running_completed_sources_use_ordinary_r398_visibility() 
             "read-bridge-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            crate::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
         )
         .map_err(|e| e.to_string())?;
         let claim = runtime
@@ -1414,6 +1420,7 @@ async fn actual_run_and_thread_harddelete_hide_records_but_do_not_erase_saved_by
                     "read-bridge-fixture-owner".to_owned(),
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    crate::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|e| e.to_string())?;
                 let claim = runtime

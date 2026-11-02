@@ -8,7 +8,7 @@ pub(crate) mod capture;
 pub(crate) mod clock;
 pub(crate) mod limits;
 mod protocol;
-mod runner;
+pub(crate) mod runner;
 
 use std::ffi::OsString;
 use std::fmt;

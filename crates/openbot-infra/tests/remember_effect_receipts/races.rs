@@ -394,8 +394,8 @@ async fn producer_first_commit_orders_real_terminal_and_cancellation_without_era
             let memory=store(&producer);let first_request=request.clone();
             let production=tokio::spawn(async move {memory.remember_from_tool(first_request).await});
             blocked(&observer,producer_pid,blocker_pid).await?;
-            let directory=PostgresThreadDirectory::with_runtime(next_pool.clone(),f.config.clone(),"effect-owner".into(),time::Duration::minutes(10)).map_err(|e|e.to_string())?;
-            let runtime=PostgresRunRuntime::new(next_pool.clone(),"effect-owner".into(),time::Duration::minutes(10),DEFAULT_DISPATCH_CLAIM_DURATION).map_err(|e|e.to_string())?;
+            let directory=PostgresThreadDirectory::with_runtime(next_pool.clone(),f.config.clone(),"effect-owner".into(),time::Duration::minutes(10), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&next_pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e|e.to_string())?;
+            let runtime=PostgresRunRuntime::new(next_pool.clone(),"effect-owner".into(),time::Duration::minutes(10),DEFAULT_DISPATCH_CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&next_pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e|e.to_string())?;
             let lease=f.lease.clone();let begin=f.begin.clone();
             let next=tokio::spawn(async move {
                 if cancel {

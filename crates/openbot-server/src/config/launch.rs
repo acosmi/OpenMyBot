@@ -72,6 +72,9 @@ impl std::error::Error for LaunchError {}
 /// 本机模式仅填充未配置项，仍需要真实 PG 与持久 Vault key，仍执行原安全校验。
 pub fn prepare_environment(mut input: EnvMap, local: bool) -> Result<EnvMap, LaunchError> {
     for name in input.keys().filter(|name| name.starts_with("WROK_BOT_")) {
+        if name == "WROK_BOT_RECOVERY_CONFIG" {
+            continue;
+        }
         let Some((_, legacy)) = VARIABLES.iter().find(|(brand, _)| *brand == name) else {
             return Err(LaunchError::UnknownVariable);
         };
@@ -264,5 +267,47 @@ mod tests {
                 Err(LaunchError::LocalPortInvalid)
             );
         }
+    }
+
+    #[test]
+    fn recovery_config_variable_passes_through_with_original_name_and_value() {
+        for local in [false, true] {
+            let mapped = prepare_environment(
+                values(&[("WROK_BOT_RECOVERY_CONFIG", "/srv/wrok/recovery.json")]),
+                local,
+            )
+            .unwrap();
+            assert_eq!(
+                mapped.get("WROK_BOT_RECOVERY_CONFIG").map(String::as_str),
+                Some("/srv/wrok/recovery.json")
+            );
+        }
+        // The pass-through leaves every other rule unchanged.
+        let with = |pairs: &[(&str, &str)], local| {
+            let mut input = values(pairs);
+            input.insert(
+                "WROK_BOT_RECOVERY_CONFIG".into(),
+                "/srv/wrok/recovery.json".into(),
+            );
+            prepare_environment(input, local)
+        };
+        assert_eq!(
+            with(&[("WROK_BOT_SINGEL_USER", "true")], false),
+            Err(LaunchError::UnknownVariable)
+        );
+        assert_eq!(
+            with(&[("WROK_BOT_PORT", "1"), ("PORT", "1")], false),
+            Err(LaunchError::VariableCollision)
+        );
+        assert_eq!(
+            with(&[("WROK_BOT_SINGLE_USER", "false")], true),
+            Err(LaunchError::LocalModeConflict)
+        );
+        let retired = with(
+            &[("WROK_BOT_ENV", "production"), ("AGENT_TOOL_TOKEN", "")],
+            false,
+        )
+        .unwrap();
+        assert!(super::super::ServerConfig::from_env_map(&retired).is_err());
     }
 }

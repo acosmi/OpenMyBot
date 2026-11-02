@@ -344,15 +344,29 @@ impl Fixture {
             config.clone(),
             OWNER.into(),
             LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         let original_begin = directory
             .begin_thread_run(begin.clone())
             .await
             .map_err(|e| e.to_string())?;
-        let runtime =
-            PostgresRunRuntime::new(pool.clone(), OWNER.into(), LEASE_DURATION, CLAIM_DURATION)
-                .map_err(|e| e.to_string())?;
+        let runtime = PostgresRunRuntime::new(
+            pool.clone(),
+            OWNER.into(),
+            LEASE_DURATION,
+            CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
+        )
+        .map_err(|e| e.to_string())?;
         let claim = runtime
             .claim_dispatch()
             .await
@@ -810,7 +824,7 @@ async fn positive_running_restart_recovers_original_and_fences_late_writers() {
                 .with_effect_audit_key(KEY.to_vec()).map_err(|e|e.to_string())?,entries:AtomicUsize::new(0),
                 request:Mutex::new(None),effect:Mutex::new(None)});
             let control=Arc::new(ForwardBuiltIn {inner:PostgresBuiltInToolControlPlane::new(f.pool.clone(),
-                f.begin.deployment.clone(),f.begin.tenant.clone(),policy,memory.clone()),executions:AtomicUsize::new(0)});
+                f.begin.deployment.clone(),f.begin.tenant.clone(),policy,memory.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))),executions:AtomicUsize::new(0)});
             f.launch(control.clone());
             tokio::time::timeout(BOUND,f.journal.entered.notified()).await
                 .map_err(|_|"real positive producer did not reach pre-checkout ordinary-outcome gate")?;
@@ -882,7 +896,7 @@ async fn positive_running_restart_recovers_original_and_fences_late_writers() {
                 }
             }).await.map_err(|_|"original lease did not naturally expire in bounded DB observation")??;
             require(f.observer.snapshot().await?==restarted,"waiting for natural expiry wrote persistent facts")?;
-            let recovery=PostgresRunRuntime::new(recovery_pool.clone(),RECOVERY_OWNER.into(),LEASE_DURATION,CLAIM_DURATION)
+            let recovery=PostgresRunRuntime::new(recovery_pool.clone(),RECOVERY_OWNER.into(),LEASE_DURATION,CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&recovery_pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                 .map_err(|e|e.to_string())?;
             let terminal=recovery.recover_one_stale_run().await.map_err(|e|e.to_string())?
                 .ok_or("actual expired positive-running original not recovered")?;
@@ -939,7 +953,7 @@ async fn positive_running_restart_recovers_original_and_fences_late_writers() {
             require(historical==effect && f.observer.snapshot().await?==rr,"current-authorized exact history duplicated business effect or changed16tables")?;
             println!("POSITIVE_HISTORICAL_RECEIPT {}",json!({"receipt_id":historical.receipt_id,"memory_id":historical.memory_id,
                 "historical_read_entries":1,"original_executed_business_entries":memory.entries.load(Ordering::SeqCst),"full16_equal":true}));
-            let directory=PostgresThreadDirectory::with_runtime(recovery_pool.clone(),f.config.clone(),RECOVERY_OWNER.into(),LEASE_DURATION)
+            let directory=PostgresThreadDirectory::with_runtime(recovery_pool.clone(),f.config.clone(),RECOVERY_OWNER.into(),LEASE_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&recovery_pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                 .map_err(|e|e.to_string())?;
             let replay=directory.begin_thread_run(f.begin.clone()).await.map_err(|e|e.to_string())?;
             let mut original_replay=f.original_begin.clone();original_replay.replayed=true;

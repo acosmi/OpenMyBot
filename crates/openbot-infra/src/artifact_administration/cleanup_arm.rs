@@ -10,6 +10,7 @@ use openbot_contracts::artifacts::{
     is_valid_artifact_sha256,
 };
 use openbot_contracts::auth::{AuthContext, AuthContextBuilder, AuthGeneration, Role};
+use openbot_contracts::recovery::RecoveryAdmissionLease;
 use openbot_contracts::request_binding::{
     ArtifactCleanupHostObservation, ArtifactCleanupHostTailWitness, ArtifactCleanupHostTarget,
     ArtifactCleanupSessionFacts, HostRequestBindingError, HostRequestBindingKind,
@@ -191,10 +192,15 @@ impl PostgresArtifactAdministration {
             let host = binding
                 .borrow_artifact_cleanup_host_before(auth, &target, deadline)
                 .map_err(Error::Host)?;
+            let admission = binding
+                .borrow_recovery_admission_before(auth, deadline)
+                .await
+                .map_err(|_| Error::Unavailable)?;
             let current = CurrentRequest {
                 administration: self,
                 auth,
                 host,
+                admission,
             };
             current.check_attachment(deadline)?;
             let mut client = self
@@ -275,6 +281,8 @@ struct CurrentRequest<'a> {
     administration: &'a PostgresArtifactAdministration,
     auth: &'a AuthContext,
     host: ArtifactCleanupHostObservation<'a>,
+    /// The original recovery admission, held as long as the Host observation.
+    admission: RecoveryAdmissionLease<'a>,
 }
 
 /// Only the existing enrolled original Host factory is borrowed. Terminal decoding and quota
@@ -305,17 +313,17 @@ impl TerminalCurrentFailure {
 }
 
 impl<'a> TerminalCurrentRequest<'a> {
-    pub(super) fn borrow_before(
+    pub(super) async fn borrow_before(
         administration: &'a PostgresArtifactAdministration,
         auth: &'a AuthContext,
         target: &'a dyn ArtifactCleanupHostTarget,
         deadline: Instant,
     ) -> Result<Self, Error> {
-        PhysicalCurrentRequest::borrow_before(administration, auth, target, deadline).map(
-            |original| Self {
+        PhysicalCurrentRequest::borrow_before(administration, auth, target, deadline)
+            .await
+            .map(|original| Self {
                 current: original.current,
-            },
-        )
+            })
     }
 
     // Exactly one registered terminal joint statement, never caller-provided SQL. In particular
@@ -400,7 +408,7 @@ pub(super) struct PhysicalCurrentSnapshot {
 }
 
 impl<'a> PhysicalCurrentRequest<'a> {
-    pub(super) fn borrow_before(
+    pub(super) async fn borrow_before(
         administration: &'a PostgresArtifactAdministration,
         auth: &'a AuthContext,
         target: &'a dyn ArtifactCleanupHostTarget,
@@ -422,10 +430,15 @@ impl<'a> PhysicalCurrentRequest<'a> {
         let host = binding
             .borrow_artifact_cleanup_host_before(auth, target, deadline)
             .map_err(Error::Host)?;
+        let admission = binding
+            .borrow_recovery_admission_before(auth, deadline)
+            .await
+            .map_err(|_| Error::Unavailable)?;
         let current = CurrentRequest {
             administration,
             auth,
             host,
+            admission,
         };
         current.check_attachment(deadline)?;
         Ok(Self { current })
@@ -506,7 +519,9 @@ impl CurrentRequest<'_> {
         {
             return Err(Error::Host(HostRequestBindingError::NotCurrent));
         }
-        Ok(())
+        self.admission
+            .verify_current_before(binding, self.auth, deadline)
+            .map_err(|_| Error::Unavailable)
     }
 
     async fn observe(

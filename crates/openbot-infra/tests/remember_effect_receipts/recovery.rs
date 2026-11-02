@@ -263,7 +263,7 @@ async fn whole_database_consistent_restore_retains_receipt_original_unknown_and_
             let port:i32=restored.get().await.map_err(|e|e.to_string())?.query_one("SELECT inet_server_port()",&[]).await.map_err(|e|e.to_string())?.get(0);
             assert_eq!(port,i32::from(config.port));assert_ne!(config.port,f.config.port);
             assert_eq!(dataset(&restored).await?,original);
-            let directory=PostgresThreadDirectory::with_runtime(restored.clone(),config,"restored-query-only".into(),time::Duration::minutes(10)).map_err(|e|e.to_string())?;
+            let directory=PostgresThreadDirectory::with_runtime(restored.clone(),config,"restored-query-only".into(),time::Duration::minutes(10), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&restored, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e|e.to_string())?;
             let actual=directory.run_effect_receipts(query).await.map_err(|e|e.to_string())?;
             assert_eq!(actual.receipts,expected.receipts);assert_eq!(actual.terminal_event_sequence,expected.terminal_event_sequence);assert!(actual.foreground_blocked);assert!(actual.available_actions.is_empty());
             assert!(matches!(directory.begin_thread_run(competing).await,Err(ThreadDirectoryError::LeaseConflict)));

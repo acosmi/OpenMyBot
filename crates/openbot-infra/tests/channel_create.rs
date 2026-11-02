@@ -186,6 +186,11 @@ async fn create_is_atomic_scoped_independent_native_and_single_connection() {
                 runtime_config,
                 "runtime-channel-create".to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let started = directory

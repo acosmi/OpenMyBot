@@ -130,6 +130,8 @@ mod desktop_agent_runtime;
 pub mod desktop_local_bootstrap;
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 pub mod desktop_release;
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub mod recovery;
 #[cfg(feature = "desktop-vault")]
 pub mod desktop_vault;
 pub mod event;

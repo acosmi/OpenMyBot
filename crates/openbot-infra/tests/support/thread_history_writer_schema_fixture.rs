@@ -37,12 +37,12 @@ async fn writer_check(c: &Client) -> TestResult {
         .await
         .map_err(|e| e.to_string())?;
     origin_schema::verify(c).await.map_err(|e| e.to_string())?;
-    let ledger = native::validate_known_prefix(c, 52)
+    let ledger = native::validate_known_prefix(c, 53)
         .await
         .map_err(|e| e.to_string())?;
     require(
-        ledger.latest_version() == 52,
-        "current prefix not exact0052",
+        ledger.latest_version() == 53,
+        "current prefix not exact0053",
     )?;
     Ok(())
 }
@@ -135,6 +135,7 @@ fn writer_runtime(p: &pool::DatabasePool) -> TestResult<PostgresRunRuntime> {
         PROCESS.into(),
         DEFAULT_THREAD_LEASE_DURATION,
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
     )
     .map_err(|e| e.to_string())
 }

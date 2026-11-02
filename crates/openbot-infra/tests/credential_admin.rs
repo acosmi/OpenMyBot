@@ -112,6 +112,11 @@ async fn setup(
             None,
             None,
             SchemePolicy::HttpsOnly,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?,
     );
@@ -219,7 +224,7 @@ async fn mcp_reference_and_grants_move_atomically_and_revocation_cannot_enable_a
             pg.execute("INSERT INTO public.mcp_servers(id,title,vendor,url,provenance,credential_id,transport,credential_generation,catalog_generation,catalog_hash,catalog_transport_fingerprint) VALUES('notes','Notes','notes.example.test','https://notes.example.test/mcp','custom',$1,'mcp',0,1,repeat('a',64),repeat('b',64))",&[&id]).await.map_err(|e| format!("{e:?}"))?;
             pg.batch_execute("INSERT INTO public.agents(id,name,type,configuration) VALUES('holder','Holder','remote_ag_ui','{}'); INSERT INTO public.plugin_grants(kind,ref,agent_id,granted_by,state,catalog_generation,schema_hash,effect,transport_fingerprint,credential_generation) VALUES('mcp','notes/search','holder','credential-admin','active',1,repeat('a',64),'read',repeat('b',64),0);").await.map_err(|e| format!("{e:?}"))?;
             drop(pg);
-            let broker=PostgresMcpCredentialBroker::new(pool.clone(),vault);
+            let broker=PostgresMcpCredentialBroker::new(pool.clone(),vault, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")));
             assert!(broker.bearer_for("notes",auth().actor()).await.unwrap().is_some());
             let replaced=admin.rotate(&auth(),&first.credential.id,&write(ManualCredentialKind::Mcp,"notes","second","NEW_MCP_CANARY")).await.map_err(|e| format!("{e:?}"))?;
             let pg=pool.get().await.map_err(|e| format!("{e:?}"))?;

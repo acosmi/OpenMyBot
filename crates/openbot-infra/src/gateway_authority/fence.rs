@@ -14,6 +14,7 @@ use crate::gateway_transport::{
 use super::GatewayAuthorityError;
 use super::store::{self, DetachedSession};
 use super::strict::AuthorityInner;
+use crate::recovery_control::{RecoveryReadGate, RecoveryWorkerLease};
 
 pub(super) struct EnrollmentFence {
     pool: crate::db::pool::DatabasePool,
@@ -21,6 +22,7 @@ pub(super) struct EnrollmentFence {
     deployment: DeploymentId,
     tenant: TenantId,
     deadline: Instant,
+    recovery_gate: RecoveryReadGate,
 }
 
 impl EnrollmentFence {
@@ -30,6 +32,7 @@ impl EnrollmentFence {
         deployment: DeploymentId,
         tenant: TenantId,
         deadline: Instant,
+        recovery_gate: RecoveryReadGate,
     ) -> Self {
         Self {
             pool,
@@ -37,8 +40,20 @@ impl EnrollmentFence {
             deployment,
             tenant,
             deadline,
+            recovery_gate,
         }
     }
+}
+
+/// Borrow the worker admission under the original deadline; the permit holds
+/// it until its release or drop, which ends the transport's execute.
+async fn admitted(
+    gate: &RecoveryReadGate,
+    deadline: Instant,
+) -> Result<RecoveryWorkerLease<'static>, GatewayFenceError> {
+    gate.borrow_worker_before(deadline.into_std())
+        .await
+        .map_err(|_| GatewayFenceError::Unavailable)
 }
 
 struct Permit {
@@ -47,6 +62,7 @@ struct Permit {
     deadline: Instant,
     close: bool,
     released: bool,
+    _admission: RecoveryWorkerLease<'static>,
 }
 
 #[async_trait]
@@ -97,6 +113,7 @@ impl GatewayHttpAuthority for EnrollmentFence {
         {
             return Err(GatewayFenceError::Refused);
         }
+        let admission = admitted(&self.recovery_gate, self.deadline).await?;
         let session = DetachedSession::acquire(&self.pool, &cancel, self.deadline)
             .await
             .map_err(map)?;
@@ -105,12 +122,16 @@ impl GatewayHttpAuthority for EnrollmentFence {
             .verify_actor(&self.auth, &cancel, self.deadline, true)
             .await
             .map_err(map)?;
+        admission
+            .verify_current_before(self.deadline.into_std())
+            .map_err(|_| GatewayFenceError::Unavailable)?;
         Ok(Box::new(Permit {
             session,
             cancel,
             deadline: self.deadline,
             close: true,
             released: false,
+            _admission: admission,
         }))
     }
 }
@@ -131,6 +152,7 @@ impl GatewayHttpAuthority for AuthorityInner {
         ) {
             return Err(GatewayFenceError::Refused);
         }
+        let admission = admitted(&self.recovery_gate, self.scope.deadline).await?;
 
         let (session, operation_id, close) = match self.active_session() {
             Some(active) => (active.session, active.operation_id, false),
@@ -196,12 +218,16 @@ impl GatewayHttpAuthority for AuthorityInner {
             }
             _ => return Err(GatewayFenceError::Refused),
         }
+        admission
+            .verify_current_before(self.scope.deadline.into_std())
+            .map_err(|_| GatewayFenceError::Unavailable)?;
         Ok(Box::new(Permit {
             session,
             cancel,
             deadline: self.scope.deadline,
             close,
             released: false,
+            _admission: admission,
         }))
     }
 }
@@ -246,6 +272,8 @@ pub(crate) enum EnrollmentFenceEnd {
 struct EnrollmentAuthority {
     kind: EnrollmentRequestKind,
     acquire: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<EnrollmentAcquireControl>>>,
+    recovery_gate: RecoveryReadGate,
+    deadline: Option<Instant>,
 }
 #[async_trait]
 impl GatewayHttpAuthority for EnrollmentAuthority {
@@ -266,6 +294,8 @@ impl GatewayHttpAuthority for EnrollmentAuthority {
         {
             return Err(GatewayFenceError::Refused);
         }
+        let deadline = self.deadline.ok_or(GatewayFenceError::Refused)?;
+        let admission = admitted(&self.recovery_gate, deadline).await?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         sender
             .send(EnrollmentAcquireControl {
@@ -279,13 +309,19 @@ impl GatewayHttpAuthority for EnrollmentAuthority {
             () = cancel.cancelled() => return Err(GatewayFenceError::CleanupUnknown),
             result = receive => result.map_err(|_| GatewayFenceError::CleanupUnknown)??,
         };
+        // A refused recheck drops the delivered control, ending that header owner.
+        admission
+            .verify_current_before(deadline.into_std())
+            .map_err(|_| GatewayFenceError::Unavailable)?;
         Ok(Box::new(EnrollmentPermit {
             control: Some(control),
+            _admission: admission,
         }))
     }
 }
 struct EnrollmentPermit {
     control: Option<EnrollmentPermitControl>,
+    _admission: RecoveryWorkerLease<'static>,
 }
 #[async_trait]
 impl GatewayHttpPermit for EnrollmentPermit {
@@ -338,6 +374,8 @@ impl Drop for EnrollmentEndGuard {
 }
 pub(crate) fn enrollment_headers_channel(
     kind: EnrollmentRequestKind,
+    recovery_gate: RecoveryReadGate,
+    deadline: Option<Instant>,
 ) -> (
     Arc<dyn GatewayHttpAuthority>,
     EnrollmentFenceControl,
@@ -349,6 +387,8 @@ pub(crate) fn enrollment_headers_channel(
         Arc::new(EnrollmentAuthority {
             kind,
             acquire: std::sync::Mutex::new(Some(acquire)),
+            recovery_gate,
+            deadline,
         }),
         EnrollmentFenceControl {
             acquire: acquire_receive,

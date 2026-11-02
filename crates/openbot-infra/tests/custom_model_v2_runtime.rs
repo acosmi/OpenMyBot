@@ -83,6 +83,11 @@ async fn assemble(
     let policy_store = openbot_infra::policy::PolicyStore::postgres(p.clone(), None);
     policy_store.load().await.unwrap();
     assemble_postgres_application(PostgresApplicationAssemblyInput {
+        recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
         pool: p.clone(),
         listener_database: config.clone().into(),
         deployment: DeploymentId::new(DEP),
@@ -186,6 +191,11 @@ impl Fixture {
             config.clone(),
             OWNER.into(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(binding.clone())

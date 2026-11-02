@@ -162,6 +162,19 @@ pub trait AuthResolver: Send + Sync {
     /// 在一堆"用户登录失败"里找不到真正的故障。
     async fn resolve(&self, parts: &Parts) -> Result<AuthContext, AppError>;
 
+    /// Confirm one named restored binding through the installed real session producer only.
+    async fn confirm_restore_requirement(
+        &self,
+        _auth: &AuthContext,
+        _requirement_id: uuid::Uuid,
+        _request: openbot_infra::restore_reconfirmation::OriginalReconfirmationRequest,
+    ) -> Result<
+        openbot_infra::restore_reconfirmation::ReconfirmationCommitFact,
+        openbot_infra::restore_reconfirmation::RestoreReconfirmationError,
+    > {
+        Err(openbot_infra::restore_reconfirmation::RestoreReconfirmationError::Unavailable)
+    }
+
     /// 同一次认证附带 live-session assurance；普通实现缺省只有身份，敏感写会 fail-closed。
     async fn resolve_with_assurance(&self, parts: &Parts) -> Result<ResolvedAuth, AppError> {
         self.resolve(parts).await.map(ResolvedAuth::without_session)
@@ -556,6 +569,9 @@ impl Drop for ServerSessionBindingOwner {
 }
 
 struct ServerSessionProbeState {
+    recovery_read_gate: std::sync::OnceLock<openbot_infra::recovery_control::RecoveryReadGate>,
+    restore_reconfirmation:
+        std::sync::OnceLock<Arc<openbot_infra::restore_reconfirmation::RestoreReconfirmation>>,
     pool: openbot_infra::db::pool::DatabasePool,
     lifetime: SessionLifetimePolicy,
     deployment: DeploymentId,
@@ -755,6 +771,7 @@ struct ServerSessionRowTuple {
 }
 
 struct ServerSessionCurrentGuard {
+    recovery_read_gate: Option<openbot_infra::recovery_control::RecoveryReadGate>,
     probe: Weak<ServerSessionProbeState>,
     owner: RequestBindingOwnerObservation,
     issuer: RequestBindingIssuer,
@@ -770,6 +787,74 @@ const CURRENT_SESSION_SQL: &str = "SELECT s.id,s.user_id,s.token,s.expires_at,s.
     WHERE s.id=$1 AND s.user_id=$2 AND s.token=$3 AND s.created_at=$4 AND s.auth_generation=$5";
 
 impl HostRequestBindingGuard for ServerSessionCurrentGuard {
+    fn borrow_restore_reconfirmation_before<'a>(
+        &'a self,
+        binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if auth != &self.original || !self.owner.is_current() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
+            let probe = self
+                .probe
+                .upgrade()
+                .ok_or(HostRequestBindingError::NotCurrent)?;
+            if OffsetDateTime::now_utc() - self.row.created_at > probe.lifetime.fresh() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
+            self.issuer
+                .borrow_server_session_epoch(binding.identity())?;
+            let gate = self
+                .recovery_read_gate
+                .as_ref()
+                .ok_or(HostRequestBindingError::Unavailable)?;
+            gate.borrow_reconfirmation_before(binding, auth, deadline)
+                .await
+        })
+    }
+
+    fn borrow_recovery_admission_before<'a>(
+        &'a self,
+        binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if !self.owner.is_current() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
+            // This field is installed from the original issuer-owned probe;
+            // its borrow is tied to self, not a temporary upgraded Arc.
+            let gate = self
+                .recovery_read_gate
+                .as_ref()
+                .ok_or(HostRequestBindingError::Unavailable)?;
+            gate.borrow_before(binding, auth, deadline).await
+        })
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn borrow_artifact_cleanup_host_before<'a>(
         &'a self,
@@ -1911,6 +1996,57 @@ impl ServerSessionCurrentGuard {
 }
 
 impl PostgresSessionAuthResolver {
+    /// Install the actual same-pool reconfirmation adapter and retain its strong owner.
+    pub fn install_restore_reconfirmation(
+        &self,
+        audit_key: openbot_domain::vault::SecretBytes,
+        vault: openbot_infra::vault::CredentialRecordVault,
+    ) -> Result<(), HostRequestBindingError> {
+        let probe = &self.binding_owner.probe;
+        let gate = probe
+            .recovery_read_gate
+            .get()
+            .cloned()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let adapter = openbot_infra::restore_reconfirmation::RestoreReconfirmation::new(
+            self.pool.clone(),
+            self.deployment.clone(),
+            self.tenant.clone(),
+            self.lifetime,
+            audit_key,
+            vault,
+            &gate,
+        )
+        .map_err(|_| HostRequestBindingError::Unavailable)?;
+        adapter.enroll_host_issuer(&self.binding_owner.issuer)?;
+        probe
+            .restore_reconfirmation
+            .set(Arc::new(adapter))
+            .map_err(|_| HostRequestBindingError::Unavailable)
+    }
+
+    /// Attach the original runtime's weak recovery gate once to this live issuer.
+    /// Reject a different pool or namespace, a retired issuer or a repeated attachment.
+    pub fn install_recovery_read_gate(
+        &self,
+        gate: openbot_infra::recovery_control::RecoveryReadGate,
+    ) -> Result<(), HostRequestBindingError> {
+        if !self.binding_owner.issuer.observation().is_current()
+            || !gate.matches_server_scope(
+                &self.pool,
+                self.deployment.as_str(),
+                self.tenant.as_str(),
+            )
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        self.binding_owner
+            .probe
+            .recovery_read_gate
+            .set(gate)
+            .map_err(|_| HostRequestBindingError::Unavailable)
+    }
+
     #[allow(
         dead_code,
         reason = "The production callback URL destination remains disabled"
@@ -2001,6 +2137,8 @@ impl PostgresSessionAuthResolver {
         let (lease, issuer) =
             RequestBindingOwnerLease::for_trusted_host(HostRequestBindingKind::ServerSession);
         let probe = Arc::new(ServerSessionProbeState {
+            recovery_read_gate: std::sync::OnceLock::new(),
+            restore_reconfirmation: std::sync::OnceLock::new(),
             pool: pool.clone(),
             lifetime,
             deployment: deployment.clone(),
@@ -2212,6 +2350,7 @@ impl PostgresSessionAuthResolver {
         .with_role(effective)
         .build();
         let guard = Arc::new(ServerSessionCurrentGuard {
+            recovery_read_gate: self.binding_owner.probe.recovery_read_gate.get().cloned(),
             probe: Arc::downgrade(&self.binding_owner.probe),
             owner: self.binding_owner.issuer.observation(),
             issuer: self.binding_owner.issuer.clone(),
@@ -2263,6 +2402,29 @@ impl core::fmt::Debug for PostgresSessionAuthResolver {
 
 #[async_trait]
 impl AuthResolver for PostgresSessionAuthResolver {
+    async fn confirm_restore_requirement(
+        &self,
+        auth: &AuthContext,
+        requirement_id: uuid::Uuid,
+        request: openbot_infra::restore_reconfirmation::OriginalReconfirmationRequest,
+    ) -> Result<
+        openbot_infra::restore_reconfirmation::ReconfirmationCommitFact,
+        openbot_infra::restore_reconfirmation::RestoreReconfirmationError,
+    > {
+        let adapter = self
+            .binding_owner
+            .probe
+            .restore_reconfirmation
+            .get()
+            .ok_or(
+                openbot_infra::restore_reconfirmation::RestoreReconfirmationError::Unavailable,
+            )?;
+        let confirmation = adapter
+            .prepare_server_confirmation(auth, requirement_id, request.deadline())
+            .await?;
+        adapter.confirm_current_binding(confirmation, request).await
+    }
+
     fn runtime_capability_factory(
         &self,
         sso: Option<ReadOnlySsoCapabilitySource>,
@@ -2376,6 +2538,7 @@ impl Drop for SingleUserBindingOwner {
 }
 
 struct SingleUserProbeState {
+    recovery_read_gate: std::sync::OnceLock<openbot_infra::recovery_control::RecoveryReadGate>,
     principal: openbot_infra::auth::single_user::VerifiedSingleUserPrincipal,
     capability_facts: std::sync::OnceLock<Weak<PostgresRuntimeCapabilityFacts>>,
     remember_preferences: std::sync::OnceLock<Weak<PostgresRememberPreferenceRepository>>,
@@ -2403,12 +2566,43 @@ struct SingleUserCustomCatalogEnrollment {
 }
 
 struct SingleUserCurrentGuard {
+    recovery_read_gate: Option<openbot_infra::recovery_control::RecoveryReadGate>,
     probe: Weak<SingleUserProbeState>,
     owner: RequestBindingOwnerObservation,
     issuer: RequestBindingIssuer,
 }
 
 impl HostRequestBindingGuard for SingleUserCurrentGuard {
+    fn borrow_recovery_admission_before<'a>(
+        &'a self,
+        binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if !self.owner.is_current() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
+            // This field is installed from the original issuer-owned probe;
+            // its borrow is tied to self, not a temporary upgraded Arc.
+            let gate = self
+                .recovery_read_gate
+                .as_ref()
+                .ok_or(HostRequestBindingError::Unavailable)?;
+            gate.borrow_before(binding, auth, deadline).await
+        })
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn verify_artifact_read_current_before<'a>(
         &'a self,
@@ -3020,6 +3214,34 @@ impl SingleUserAuthResolver {
         self.resolved().map(ResolvedAuth::into_context)
     }
 
+    /// Attach the original runtime's weak recovery gate once to this verified principal.
+    /// Require a live issuer, the same actual pool and namespace, and no earlier attachment.
+    pub fn install_recovery_read_gate(
+        &self,
+        pool: &openbot_infra::db::pool::DatabasePool,
+        gate: openbot_infra::recovery_control::RecoveryReadGate,
+    ) -> Result<(), HostRequestBindingError> {
+        let owner = self
+            .binding_owner
+            .as_ref()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        if !owner.issuer.observation().is_current()
+            || !owner.probe.principal.matches_pool_scope(pool)
+            || !gate.matches_server_scope(
+                pool,
+                self.context.deployment().as_str(),
+                self.context.tenant().as_str(),
+            )
+        {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        owner
+            .probe
+            .recovery_read_gate
+            .set(gate)
+            .map_err(|_| HostRequestBindingError::Unavailable)
+    }
+
     #[allow(
         dead_code,
         reason = "The production callback URL destination remains disabled"
@@ -3174,6 +3396,7 @@ impl SingleUserAuthResolver {
                 lease,
                 issuer,
                 probe: Arc::new(SingleUserProbeState {
+                    recovery_read_gate: std::sync::OnceLock::new(),
                     principal,
                     capability_facts: std::sync::OnceLock::new(),
                     remember_preferences: std::sync::OnceLock::new(),
@@ -3294,6 +3517,7 @@ impl SingleUserAuthResolver {
         let mut context = self.context.clone();
         if let Some(owner) = &self.binding_owner {
             let guard = Arc::new(SingleUserCurrentGuard {
+                recovery_read_gate: owner.probe.recovery_read_gate.get().cloned(),
                 probe: Arc::downgrade(&owner.probe),
                 owner: owner.issuer.observation(),
                 issuer: owner.issuer.clone(),
@@ -3649,6 +3873,72 @@ impl HostRequestBindingGuard for FixedRequestGuard {
             }
             self.verify_current(auth).await
         })
+    }
+
+    // The fixed synthetic context lies outside every recovery domain, like
+    // `outside_recovery_domain`: Normal admission only, never reconfirmation.
+    fn borrow_recovery_admission_before<'a>(
+        &'a self,
+        _binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let admission = FixedAdmission(self.0.clone());
+            admission.check(auth, deadline)?;
+            Ok(Box::new(admission) as openbot_contracts::recovery::RecoveryAdmissionLease<'a>)
+        })
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+struct FixedAdmission(AuthContext);
+
+#[cfg(any(test, feature = "testkit"))]
+impl FixedAdmission {
+    fn check(
+        &self,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        if std::time::Instant::now() >= deadline {
+            return Err(HostRequestBindingError::Unavailable);
+        }
+        if auth == &self.0 {
+            Ok(())
+        } else {
+            Err(HostRequestBindingError::NotCurrent)
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+impl openbot_contracts::recovery::RecoveryAdmissionWitness for FixedAdmission {
+    fn purpose(&self) -> openbot_contracts::recovery::RecoveryAdmissionPurpose {
+        openbot_contracts::recovery::RecoveryAdmissionPurpose::Normal
+    }
+
+    fn verify_current_before(
+        &self,
+        _binding: &openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &AuthContext,
+        deadline: std::time::Instant,
+    ) -> Result<(), HostRequestBindingError> {
+        self.check(auth, deadline)
+    }
+
+    fn restore_cohort(&self) -> Option<openbot_contracts::recovery::RestoreCohortRef> {
+        None
     }
 }
 

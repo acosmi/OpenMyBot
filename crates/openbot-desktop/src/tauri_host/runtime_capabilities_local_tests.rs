@@ -714,6 +714,12 @@ impl LocalFixture {
             .await
             .map_err(|_| "actual Local policy setup failed".to_owned())?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &desktop.database.clone_pool(),
+                    &original.deployment(),
+                    &original.tenant(),
+                ),
             pool: desktop.database.clone_pool(),
             listener_database: ThreadListenerDatabase::desktop_local(
                 desktop.port,

@@ -203,6 +203,11 @@ impl Fixture {
             config.clone(),
             "artifact-host-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?;
         directory
@@ -241,6 +246,12 @@ impl Fixture {
         let policies = PolicyStore::postgres(pool.clone(), None);
         policies.load().await.map_err(|error| error.to_string())?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &deployment,
+                    &tenant,
+                ),
             pool: pool.clone(),
             listener_database: config.into(),
             deployment: deployment.clone(),

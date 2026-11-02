@@ -295,6 +295,11 @@ fn directory(
         config.clone(),
         PROCESS.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(text)
 }
@@ -774,6 +779,12 @@ impl V2 {
         let policy_store = PolicyStore::postgres(p.clone(), None);
         policy_store.load().await.map_err(text)?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &p,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: p.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -815,6 +826,11 @@ impl V2 {
             config.clone(),
             PROCESS.to_owned(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &p,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?
         .with_model_dataset_binding(binding.clone())
@@ -1154,6 +1170,7 @@ async fn consumer_closure_closed_context_run_ends_without_provider_start() {
                 PROCESS.to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
                 DEFAULT_DISPATCH_CLAIM_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(text)?,
         );
@@ -2011,6 +2028,11 @@ async fn capture_remember(
         TenantId::new(TENANT),
         policy,
         memory.clone(),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     );
     let journal = KeepExecuting {
         inner: PostgresToolJournal::new(p.clone(), AUDIT_KEY.to_vec()).map_err(text)?,
@@ -2047,7 +2069,7 @@ async fn consumer_closure_remember_effect_refuses_new_and_replays_existing() {
     owned("closure_remember", |p, config| async move {
         let lease_for = time::Duration::minutes(10);
         let begin = begin_v1(51, false, None);
-        PostgresThreadDirectory::with_runtime(p.clone(), config.clone(), PROCESS.to_owned(), lease_for)
+        PostgresThreadDirectory::with_runtime(p.clone(), config.clone(), PROCESS.to_owned(), lease_for, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
             .map_err(text)?
             .begin_thread_run(begin.clone())
             .await
@@ -2057,6 +2079,7 @@ async fn consumer_closure_remember_effect_refuses_new_and_replays_existing() {
             PROCESS.to_owned(),
             lease_for,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
         )
         .map_err(text)?;
         let claim = runtime
@@ -2897,6 +2920,11 @@ async fn not_closed_case(
         config.clone(),
         PROCESS.to_owned(),
         time::Duration::minutes(10),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(text)?;
     let lease_for = time::Duration::minutes(10);
@@ -2927,6 +2955,11 @@ async fn not_closed_case(
         PROCESS.to_owned(),
         lease_for,
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(text)?;
     // The remember effect needs its own Run leased; the others do not.

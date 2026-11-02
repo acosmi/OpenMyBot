@@ -89,7 +89,7 @@ impl ReviewedDesktopVaultKeyStoreService {
         Ok(Self(Arc::from(value)))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -101,7 +101,13 @@ impl core::fmt::Debug for ReviewedDesktopVaultKeyStoreService {
 }
 
 /// Unique current-version Desktop master key. It is neither Clone nor serializable.
-struct DesktopVaultMasterKey(SecretBytes);
+pub(crate) struct DesktopVaultMasterKey(SecretBytes);
+
+impl DesktopVaultMasterKey {
+    pub(crate) fn secret_bytes(&self) -> &SecretBytes {
+        &self.0
+    }
+}
 
 impl core::fmt::Debug for DesktopVaultMasterKey {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -183,6 +189,8 @@ pub(crate) struct VaultReadyDesktopMaterial {
         target_os = "macos"
     ))]
     retained_capture: Option<ArmedCaptureVault>,
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    retained_master: Option<DesktopVaultMasterKey>,
 }
 
 /// The original master and its original confirmed journal, retained only for an armed request.
@@ -327,6 +335,38 @@ enum MasterRetention {
 }
 
 impl VaultReadyDesktopMaterial {
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(crate) fn canary(&self) -> &VerifiedDesktopVaultCanary {
+        &self.proof
+    }
+
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(crate) fn bind_recovery_runtime(
+        &mut self,
+        runtime: &openbot_infra::recovery_control::RecoveryRuntimeOwner,
+    ) -> Result<(), DesktopVaultKeyError> {
+        use openbot_infra::recovery_control::AuthorizationPurpose;
+        let master = match (&self.retained_capture, &self.retained_master) {
+            (Some(armed), None) => &armed.master,
+            (None, Some(master)) => master,
+            _ => return Err(DesktopVaultKeyError::MaterialInvalid),
+        };
+        let assertion = runtime
+            .derive_authorization_key(AuthorizationPurpose::RunAssertion, master.0.expose())
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        let mcp_parent = derive_application_key(&master.0, ApplicationKeyPurpose::McpOauthState)
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        let mcp_state = runtime
+            .derive_authorization_key(AuthorizationPurpose::McpState, mcp_parent.expose())
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        let assertions = RemoteRunAssertionSigner::new(assertion.expose().to_vec())
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        self.material.remote_assertions = Arc::new(assertions);
+        self.material.mcp_oauth_state_key = mcp_state;
+        drop(self.retained_master.take());
+        Ok(())
+    }
+
     #[cfg(any(
         test,
         not(all(
@@ -553,22 +593,22 @@ impl PreparedDesktopLocalDataPlane {
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
-        let retained_capture = match retention {
-            MasterRetention::Armed => Some(ArmedCaptureVault {
-                dataset_id: proof.dataset_id().to_owned(),
-                deployment_id: proof.deployment_id().to_owned(),
-                tenant_id: proof.tenant_id().to_owned(),
-                key_id: proof.key_id().to_owned(),
-                key_version: proof.key_version(),
-                master,
-                journal: journal
-                    .take()
-                    .ok_or(DesktopVaultKeyError::ReconciliationRequired)?,
-            }),
-            MasterRetention::Ordinary => {
-                drop(master);
-                None
-            }
+        let (retained_capture, retained_master) = match retention {
+            MasterRetention::Armed => (
+                Some(ArmedCaptureVault {
+                    dataset_id: proof.dataset_id().to_owned(),
+                    deployment_id: proof.deployment_id().to_owned(),
+                    tenant_id: proof.tenant_id().to_owned(),
+                    key_id: proof.key_id().to_owned(),
+                    key_version: proof.key_version(),
+                    master,
+                    journal: journal
+                        .take()
+                        .ok_or(DesktopVaultKeyError::ReconciliationRequired)?,
+                }),
+                None,
+            ),
+            MasterRetention::Ordinary => (None, Some(master)),
         };
         #[cfg(not(all(
             feature = "desktop-launcher",
@@ -589,6 +629,8 @@ impl PreparedDesktopLocalDataPlane {
                 target_os = "macos"
             ))]
             retained_capture,
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            retained_master,
         })
     }
 }
@@ -608,10 +650,7 @@ fn create_master<S: OsSecretStore + ?Sized>(
         .ensure_owner_current()
         .map_err(|_| DesktopVaultKeyError::DataPlaneNotRunning)?;
     journal.revalidate(owner).map_err(map_journal)?;
-    let mut framed = Vec::with_capacity(STORED_BYTES);
-    framed.push(STORED_FORMAT_VERSION);
-    framed.extend_from_slice(generated.0.expose());
-    let framed = SecretBytes::new(framed);
+    let framed = frame_stored(&generated.0);
     store
         .write(service.as_str(), account, framed.expose())
         .map_err(DesktopVaultKeyError::OsStoreReconciliationRequired)?;
@@ -735,10 +774,7 @@ fn load_or_create_master_key<S: OsSecretStore + ?Sized>(
     let mut bytes = vec![0_u8; MASTER_KEY_BYTES];
     getrandom::fill(&mut bytes).map_err(|_| DesktopVaultKeyError::Unavailable)?;
     let generated = DesktopVaultMasterKey(SecretBytes::new(bytes));
-    let mut framed = Vec::with_capacity(STORED_BYTES);
-    framed.push(STORED_FORMAT_VERSION);
-    framed.extend_from_slice(generated.0.expose());
-    let framed = SecretBytes::new(framed);
+    let framed = frame_stored(&generated.0);
     store
         .write(service.as_str(), &account, framed.expose())
         .map_err(DesktopVaultKeyError::OsStoreReconciliationRequired)?;
@@ -753,7 +789,16 @@ fn load_or_create_master_key<S: OsSecretStore + ?Sized>(
     Ok(persisted)
 }
 
-fn decode_stored(stored: SecretBytes) -> Result<DesktopVaultMasterKey, DesktopVaultKeyError> {
+pub(crate) fn frame_stored(master: &SecretBytes) -> SecretBytes {
+    let mut framed = Vec::with_capacity(STORED_BYTES);
+    framed.push(STORED_FORMAT_VERSION);
+    framed.extend_from_slice(master.expose());
+    SecretBytes::new(framed)
+}
+
+pub(crate) fn decode_stored(
+    stored: SecretBytes,
+) -> Result<DesktopVaultMasterKey, DesktopVaultKeyError> {
     let bytes = stored.expose();
     if bytes.len() != STORED_BYTES || bytes[0] != STORED_FORMAT_VERSION {
         return Err(DesktopVaultKeyError::Corrupt);
@@ -882,6 +927,59 @@ mod tests {
             "com.example.product.desktop-vault.test",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn restore_slot_formats_reuse_original_master_and_scram_codecs() {
+        use crate::postgres_sidecar::{PostgresScramSecret, PostgresStoredSecret};
+
+        let mut bytes = Vec::with_capacity(96);
+        bytes.extend_from_slice(&[7; MASTER_KEY_BYTES]);
+        let capacity = bytes.capacity();
+        let master = SecretBytes::new(bytes);
+        assert_eq!(master.allocation_capacity(), capacity);
+        assert!(master.allocation_capacity() > master.len());
+        let framed = frame_stored(&master);
+        assert_eq!(framed.len(), STORED_BYTES);
+        assert_eq!(framed.expose()[0], STORED_FORMAT_VERSION);
+        let store = MemoryStore::empty();
+        let account = format!(
+            "desktop-vault-master-v1-{}-r-{}",
+            "a".repeat(64),
+            "b".repeat(32)
+        );
+        store
+            .write(service().as_str(), &account, framed.expose())
+            .unwrap();
+        let readback = store.read(service().as_str(), &account).unwrap().unwrap();
+        assert!(framed.ct_eq(&readback));
+        let decoded = decode_stored(readback).unwrap();
+        assert!(master.ct_eq(decoded.secret_bytes()));
+        assert!(decode_stored(SecretBytes::new(vec![2; STORED_BYTES])).is_err());
+
+        let scram = PostgresScramSecret::generate().unwrap();
+        assert_eq!(scram.expose().len(), 64);
+        assert!(
+            scram
+                .expose()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        );
+        let account = format!("postgresql-17-{}-r-{}", "a".repeat(64), "b".repeat(32));
+        store
+            .write("com.example.017.restore", &account, scram.expose())
+            .unwrap();
+        let readback = store
+            .read("com.example.017.restore", &account)
+            .unwrap()
+            .unwrap();
+        let stored = PostgresStoredSecret::from_secret_bytes(readback);
+        let persisted = PostgresScramSecret::from_stored(stored).unwrap();
+        assert!(scram.secret_bytes().ct_eq(persisted.secret_bytes()));
+        let binary = PostgresStoredSecret::from_owned_bytes(vec![0; 64]);
+        let short = PostgresStoredSecret::from_owned_bytes(vec![b'a'; 63]);
+        assert!(PostgresScramSecret::from_stored(binary).is_err());
+        assert!(PostgresScramSecret::from_stored(short).is_err());
     }
 
     #[test]

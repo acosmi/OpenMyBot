@@ -49,6 +49,11 @@ pub(super) fn assemble(
         None,
         None,
         SchemePolicy::HttpsOnly,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )?);
     Ok(Arc::new(
         PostgresCredentialAdministration::new(

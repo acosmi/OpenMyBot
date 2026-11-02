@@ -109,6 +109,12 @@ impl Fixture {
         let policy_store = PolicyStore::postgres(p.clone(), None);
         policy_store.load().await.unwrap();
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &p,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: p.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -150,6 +156,11 @@ impl Fixture {
             config.clone(),
             "owned-v2-runtime".into(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &p,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(binding.clone())
@@ -466,7 +477,12 @@ async fn original_pool_scope_once_enrollment_and_owner_lifetime_are_closed() {
                 other.clone(),
                 f.config.clone(),
                 "other".into(),
-                time::Duration::seconds(30)
+                time::Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &other,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside")
+                )
             )
             .unwrap()
             .with_model_dataset_binding(f.binding.clone())

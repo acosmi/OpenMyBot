@@ -838,6 +838,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/me/session", get(session::status))
         .route("/api/auth/sign-out", post(session::sign_out))
         .route(
+            "/api/auth/restore/reconfirm",
+            post(reconfirm_restore_requirement),
+        )
+        .route(
             "/api/me/preferences",
             get(ui_preferences::get).put(ui_preferences::put),
         )
@@ -918,6 +922,71 @@ pub fn router(state: ServerState) -> Router {
         ))
         .layer(axum::middleware::from_fn(record_http_metrics))
         .layer(axum::middleware::from_fn(trace_request))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct NamedRestoreRequirement {
+    requirement_id: uuid::Uuid,
+}
+
+struct ReconfirmationEntry {
+    request: openbot_infra::restore_reconfirmation::OriginalReconfirmationRequest,
+    _cancellation: tokio_util::sync::DropGuard,
+}
+
+impl axum::extract::FromRequestParts<ServerState> for ReconfirmationEntry {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        _parts: &mut http::request::Parts,
+        _state: &ServerState,
+    ) -> Result<Self, Self::Rejection> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        Ok(Self {
+            request: openbot_infra::restore_reconfirmation::OriginalReconfirmationRequest::new(
+                deadline,
+                cancel.clone(),
+            ),
+            _cancellation: cancel.drop_guard(),
+        })
+    }
+}
+
+async fn reconfirm_restore_requirement(
+    axum::extract::State(state): axum::extract::State<ServerState>,
+    entry: ReconfirmationEntry,
+    crate::auth::FreshOriginAuthenticated(auth): crate::auth::FreshOriginAuthenticated,
+    body: Result<axum::Json<NamedRestoreRequirement>, axum::extract::rejection::JsonRejection>,
+) -> Result<(http::HeaderMap, http::StatusCode), crate::error::HttpError> {
+    use openbot_contracts::error::{AppError, SensitiveWriteReason};
+    use openbot_infra::restore_reconfirmation::RestoreReconfirmationError;
+    let axum::Json(named) = body.map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    state
+        .auth_resolver()
+        .confirm_restore_requirement(&auth, named.requirement_id, entry.request)
+        .await
+        .map_err(|error| match error {
+            RestoreReconfirmationError::NotVisible => AppError::NotVisible,
+            RestoreReconfirmationError::NotFresh => AppError::SensitiveWriteRefused {
+                reason: SensitiveWriteReason::SessionNotFresh,
+            },
+            RestoreReconfirmationError::NotConfirmed
+            | RestoreReconfirmationError::Unavailable
+            | RestoreReconfirmationError::CommitUnknown
+            | RestoreReconfirmationError::CommitAcknowledgedAfterDeadline => {
+                AppError::DependencyUnavailable {
+                    dependency: "restore_reconfirmation",
+                }
+            }
+        })?;
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    Ok((headers, http::StatusCode::NO_CONTENT))
 }
 
 #[cfg(test)]
@@ -1136,6 +1205,142 @@ mod tests {
             FixedAuthResolver::granting(auth()),
             Vec::new(),
         ))
+    }
+
+    #[tokio::test]
+    async fn reconfirmation_route_closes_payload_and_rejects_synthetic_session_authority() {
+        use crate::auth::ResolvedAuth;
+        use openbot_domain::identity::session::{SessionState, evaluate_session};
+        use openbot_infra::auth::config::default_session_lifetime;
+
+        let now = OffsetDateTime::now_utc();
+        let lifetime = default_session_lifetime();
+        let context = auth();
+        let live = evaluate_session(
+            lifetime,
+            SessionState::rehydrate(now, now, context.auth_generation()),
+            context.auth_generation(),
+            now,
+        )
+        .unwrap();
+        let resolver = FixedAuthResolver::granting_resolved(ResolvedAuth::from_live_session(
+            context,
+            live,
+            Some("synthetic-reconfirmation-session".into()),
+        ));
+        let state = ServerBuilder::new(app_with_rows(Vec::new()), Arc::new(resolver))
+            .with_sensitive_write_security(SensitiveWriteSecurity::new(
+                lifetime,
+                TrustedOrigins::from_configured(["https://app.example.test"]).unwrap(),
+            ))
+            .build();
+        let app = router(state);
+        let requirement_id = uuid::Uuid::now_v7();
+        for (body, expected) in [
+            (
+                serde_json::json!({"requirementId": requirement_id, "fresh": true}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"requirementId": requirement_id, "actor": ACTOR}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({"requirementId": requirement_id}),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/auth/restore/reconfirm")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::ORIGIN, "https://app.example.test")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            assert_eq!(send(app.clone(), request).await.status, expected);
+        }
+        let untrusted = Request::builder()
+            .method("POST")
+            .uri("/api/auth/restore/reconfirm")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::ORIGIN, "https://untrusted.example.test")
+            .body(Body::from("not-json"))
+            .unwrap();
+        assert_eq!(send(app, untrusted).await.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn reconfirmation_authentication_freshness_and_origin_precede_body_poll() {
+        use crate::auth::ResolvedAuth;
+        use openbot_domain::identity::session::{SessionState, evaluate_session};
+        use openbot_infra::auth::config::default_session_lifetime;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let now = OffsetDateTime::now_utc();
+        let lifetime = default_session_lifetime();
+        let generation = auth().auth_generation();
+        let fresh = evaluate_session(
+            lifetime,
+            SessionState::rehydrate(now, now, generation),
+            generation,
+            now,
+        )
+        .unwrap();
+        let stale = evaluate_session(
+            lifetime,
+            SessionState::rehydrate(
+                now - lifetime.fresh() - time::Duration::seconds(1),
+                now,
+                generation,
+            ),
+            generation,
+            now,
+        )
+        .unwrap();
+        for (resolved, origin, expected) in [
+            (None, "https://app.example.test", StatusCode::UNAUTHORIZED),
+            (
+                Some(ResolvedAuth::without_session(auth())),
+                "https://app.example.test",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(ResolvedAuth::from_live_session(auth(), stale, None)),
+                "https://app.example.test",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Some(ResolvedAuth::from_live_session(auth(), fresh, None)),
+                "https://untrusted.example.test",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let resolver = match resolved {
+                Some(resolved) => FixedAuthResolver::granting_resolved(resolved),
+                None => FixedAuthResolver::rejecting(AppError::Unauthenticated),
+            };
+            let state = ServerBuilder::new(app_with_rows(Vec::new()), Arc::new(resolver))
+                .with_sensitive_write_security(SensitiveWriteSecurity::new(
+                    lifetime,
+                    TrustedOrigins::from_configured(["https://app.example.test"]).unwrap(),
+                ))
+                .build();
+            let polled = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&polled);
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"not-json"))
+            }));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/auth/restore/reconfirm")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header(http::header::ORIGIN, origin)
+                .body(body)
+                .unwrap();
+            assert_eq!(send(router(state), request).await.status, expected);
+            assert!(!polled.load(Ordering::SeqCst));
+        }
     }
 
     #[tokio::test]

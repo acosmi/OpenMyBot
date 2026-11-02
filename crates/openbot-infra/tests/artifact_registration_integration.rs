@@ -233,6 +233,11 @@ impl Fixture {
             config.clone(),
             "artifact-registration-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?;
         directory
@@ -361,6 +366,11 @@ impl Fixture {
             "artifact-registration-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?;
         let claim = runtime

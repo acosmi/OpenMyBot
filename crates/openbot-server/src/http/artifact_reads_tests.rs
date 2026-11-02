@@ -320,6 +320,11 @@ impl Fixture {
             config.clone(),
             "artifact-current-read-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?
         .begin_thread_run(begin.clone())
@@ -1045,6 +1050,11 @@ impl ActualSingleUserRead {
             config,
             "single-user-read-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &fixture.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?
         .begin_thread_run(begin.clone())

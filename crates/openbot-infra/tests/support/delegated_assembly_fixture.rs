@@ -154,6 +154,12 @@ impl Fixture {
         let notices = Arc::new(Notices::default());
         let signer = Arc::new(RemoteRunAssertionSigner::new(vec![0x52; 32]).map_err(text)?);
         let assembled = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &deployment,
+                    &tenant,
+                ),
             pool: pool.clone(),
             listener_database: config.clone().into(),
             deployment: deployment.clone(),

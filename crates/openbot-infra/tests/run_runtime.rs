@@ -74,6 +74,11 @@ fn runtime(
         owner.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(|error| error.to_string())
 }
@@ -94,6 +99,11 @@ async fn provider_usage_is_run_wide_exact_replayable_and_budget_fenced() {
                 config,
                 "runtime-usage".to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             directory
@@ -517,6 +527,7 @@ async fn claim_chunk_terminal_are_exact_and_materialize_one_assistant_message() 
                 config,
                 "runtime-a".to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let request = request(&deployment, 1, "run-1");
@@ -840,6 +851,11 @@ async fn expired_unaccepted_dispatch_rebinds_but_delivered_stale_run_reconciles(
                 config,
                 "runtime-a".to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let request = request(&deployment, 2, "run-2");
@@ -954,6 +970,7 @@ async fn rejected_dispatch_terminal_and_outbox_ack_share_one_transaction() {
                 config,
                 "runtime-a".to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             directory
@@ -1076,6 +1093,11 @@ async fn production_relay_fail_closed_consumer_never_leaves_a_fake_running_run()
                 config,
                 "runtime-a".to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             directory

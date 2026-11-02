@@ -308,13 +308,21 @@ async fn assert_refresh_redirect_is_unresolved(adapter: Adapter, redirect: Statu
             .await
             .map_err(|error| error.to_string())?;
             drop(pg);
-            let mut broker = PostgresMcpCredentialBroker::new(pool.clone(), vault)
-                .with_user_oauth(
-                    SafeDialer::new(EgressPolicy::default()),
-                    SchemePolicy::HttpOrHttps,
-                    AUDIT_KEY.to_vec(),
-                )
-                .map_err(|error| error.to_string())?;
+            let mut broker = PostgresMcpCredentialBroker::new(
+                pool.clone(),
+                vault,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
+            )
+            .with_user_oauth(
+                SafeDialer::new(EgressPolicy::default()),
+                SchemePolicy::HttpOrHttps,
+                AUDIT_KEY.to_vec(),
+            )
+            .map_err(|error| error.to_string())?;
             if matches!(adapter, Adapter::Drive) {
                 let endpoints = GoogleDriveOAuthEndpoints {
                     resource: Url::parse(GOOGLE_DRIVE_API_BASE).unwrap(),

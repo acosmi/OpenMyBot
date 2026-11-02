@@ -18,7 +18,8 @@ use openbot_contracts::artifacts::{
 };
 use openbot_contracts::auth::AuthContext;
 use openbot_contracts::error::AppError;
-use openbot_contracts::request_binding::HostRequestBindingError;
+use openbot_contracts::recovery::RecoveryAdmissionLease;
+use openbot_contracts::request_binding::{HostRequestBindingError, VerifiedHostRequestBinding};
 
 use super::{
     ArmedArtifactCleanupIntent, ArtifactCleanupArmError as ArmError,
@@ -69,31 +70,45 @@ impl PostgresArtifactAdministration {
                 .ok_or(AppError::DependencyUnavailable {
                     dependency: "artifacts",
                 })?;
-        let state = match self
-            .arm_explicit_saved_delete_before(auth, &artifact_id, deadline)
-            .await
-        {
-            Ok(intent) => {
-                // One call of this instance advances an artifact at a time. A second one would
-                // collide with the first one's physical or terminal slot, which answers it unproven
-                // and poisons an armed capture gate, so it answers Pending without a slot. This
-                // call's own arm has authorised it before anything is answered.
-                let claimed = self
-                    .deleting
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(artifact_id.clone());
-                if claimed {
-                    let _advancing = Advancing {
-                        deleting: &self.deleting,
-                        artifact_id: &artifact_id,
-                    };
-                    self.advance_deletion(auth, &intent, deadline).await
-                } else {
-                    Ok(ArtifactDeletionState::Pending)
+        // One request lease for the whole call, borrowed before the arm and held to return; no
+        // effect happens before it.
+        let admission = match auth.request_binding() {
+            None => Err(Stop::Arm(ArmError::Host(HostRequestBindingError::Missing))),
+            Some(binding) => binding
+                .borrow_recovery_admission_before(auth, deadline)
+                .await
+                .map(|lease| (binding, lease))
+                .map_err(|_| Stop::Arm(ArmError::Unavailable)),
+        };
+        let state = match admission {
+            Err(stop) => Err(stop),
+            Ok((binding, admission)) => match self
+                .arm_explicit_saved_delete_before(auth, &artifact_id, deadline)
+                .await
+            {
+                Ok(intent) => {
+                    // One call of this instance advances an artifact at a time. A second one would
+                    // collide with the first one's physical or terminal slot, which answers it unproven
+                    // and poisons an armed capture gate, so it answers Pending without a slot. This
+                    // call's own arm has authorised it before anything is answered.
+                    let claimed = self
+                        .deleting
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(artifact_id.clone());
+                    if claimed {
+                        let _advancing = Advancing {
+                            deleting: &self.deleting,
+                            artifact_id: &artifact_id,
+                        };
+                        self.advance_deletion(auth, binding, &admission, &intent, deadline)
+                            .await
+                    } else {
+                        Ok(ArtifactDeletionState::Pending)
+                    }
                 }
-            }
-            Err(error) => Err(Stop::Arm(error)),
+                Err(error) => Err(Stop::Arm(error)),
+            },
         }
         .or_else(deletion_outcome)?;
         Ok(ArtifactDeletionReceipt {
@@ -108,9 +123,14 @@ impl PostgresArtifactAdministration {
     async fn advance_deletion(
         self: &Arc<Self>,
         auth: &AuthContext,
+        binding: &VerifiedHostRequestBinding,
+        admission: &RecoveryAdmissionLease<'_>,
         intent: &ArmedArtifactCleanupIntent,
         deadline: Instant,
     ) -> Result<ArtifactDeletionState, Stop> {
+        admission
+            .verify_current_before(binding, auth, deadline)
+            .map_err(|_| Stop::Remove(PhysicalError::Unavailable))?;
         // The observation is dropped here: completion registers its own claim on the same key.
         let removed = self
             .remove_armed_explicit_saved_bytes_before(auth, intent, deadline)
@@ -120,6 +140,9 @@ impl PostgresArtifactAdministration {
         if removed != ArtifactCleanupPhysicalState::DurableAbsent {
             return Ok(ArtifactDeletionState::Pending);
         }
+        admission
+            .verify_current_before(binding, auth, deadline)
+            .map_err(|_| Stop::Finalize(TerminalError::Unavailable))?;
         // Committed and AlreadyCompleted are both this deletion's completed tombstone.
         self.finalize_armed_explicit_saved_before(auth, intent, deadline)
             .await

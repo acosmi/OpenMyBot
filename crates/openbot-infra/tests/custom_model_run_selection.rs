@@ -104,6 +104,11 @@ async fn setup(
         config.clone(),
         "selection-runtime".into(),
         Duration::seconds(30),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .unwrap();
     let vault = CredentialRecordVault::single_key(
@@ -483,7 +488,7 @@ async fn custom_binding_requires_both_halves_and_missing_adapter_never_starts_le
             }
             runs.push(req.command.run_id);
         }
-        let runtime: Arc<dyn RunRuntime> = Arc::new(PostgresRunRuntime::new(pool.clone(), "selection-runtime".into(), Duration::seconds(30), DEFAULT_DISPATCH_CLAIM_DURATION).unwrap());
+        let runtime: Arc<dyn RunRuntime> = Arc::new(PostgresRunRuntime::new(pool.clone(), "selection-runtime".into(), Duration::seconds(30), DEFAULT_DISPATCH_CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap());
         let provider = Arc::new(LegacyProviderSpy::default());
         let agent = openbot_agent::BuiltInAgentRuntime::start(
             runtime.clone(), context, Arc::new(openbot_agent::ProviderRouter::new(provider.clone(), None)), Arc::new(openbot_agent::NoAgentToolInvoker),
@@ -657,7 +662,7 @@ async fn custom_binding_requires_both_halves_even_when_input_metadata_is_corrupt
             let lease = RunExecutionLease::new(req.command.run_id.clone(), req.command.thread_id.clone(), req.command.bot_id.clone(), req.actor.clone(), openbot_domain::thread::FencingToken::new(1).unwrap(), 0).unwrap();
             let context = Arc::new(PostgresAgentContextSource::new(pool.clone(), DeploymentId::new(DEP), TenantId::new(TENANT), Some(32)).unwrap());
             assert_eq!(context.load(&lease).await.unwrap_err(), AgentContextError::Corrupt { field: "model_selection_storage" });
-            let runtime: Arc<dyn RunRuntime> = Arc::new(PostgresRunRuntime::new(pool.clone(), "selection-runtime".into(), Duration::seconds(30), DEFAULT_DISPATCH_CLAIM_DURATION).unwrap());
+            let runtime: Arc<dyn RunRuntime> = Arc::new(PostgresRunRuntime::new(pool.clone(), "selection-runtime".into(), Duration::seconds(30), DEFAULT_DISPATCH_CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap());
             let provider = Arc::new(LegacyProviderSpy::default());
             let agent = openbot_agent::BuiltInAgentRuntime::start(runtime.clone(), context,
                 Arc::new(openbot_agent::ProviderRouter::new(provider.clone(), None)), Arc::new(openbot_agent::NoAgentToolInvoker),

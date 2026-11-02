@@ -94,6 +94,8 @@ impl core::fmt::Debug for ChannelRoutingProviderInput {
 
 /// Explicit inputs shared by Server and the Tauri background setup.
 pub struct PostgresApplicationAssemblyInput {
+    /// Held runtime gate (or the typed outside-domain admission) for worker consumers.
+    pub recovery_gate: crate::recovery_control::RecoveryReadGate,
     pub pool: Pool,
     pub listener_database: ThreadListenerDatabase,
     pub deployment: DeploymentId,
@@ -314,6 +316,7 @@ pub async fn assemble_postgres_application(
     input: PostgresApplicationAssemblyInput,
 ) -> Result<PostgresApplicationAssembly, PostgresApplicationAssemblyError> {
     let PostgresApplicationAssemblyInput {
+        recovery_gate,
         pool,
         listener_database,
         deployment,
@@ -354,6 +357,9 @@ pub async fn assemble_postgres_application(
     if audit_key.is_empty() || mcp_oauth_state_key.is_empty() {
         return Err(fail("key_material"));
     }
+    if !recovery_gate.matches_server_scope(&pool, deployment.as_str(), tenant.as_str()) {
+        return Err(fail("recovery_gate"));
+    }
     let audit_key = audit_key.expose();
     let agent_administration = Arc::new(
         PostgresAgentAdministration::new(
@@ -366,8 +372,12 @@ pub async fn assemble_postgres_application(
         .map_err(|_| fail("agent_administration"))?,
     );
     let owned_credentials = Arc::new(
-        PostgresOwnedCredentialRetirer::new(pool.clone(), audit_key.to_vec())
-            .map_err(|_| fail("owned_credentials"))?,
+        PostgresOwnedCredentialRetirer::new(
+            pool.clone(),
+            audit_key.to_vec(),
+            recovery_gate.clone(),
+        )
+        .map_err(|_| fail("owned_credentials"))?,
     );
     let people = PostgresPeopleAdministration::new(pool.clone(), admin_floor, audit_key.to_vec())
         .map_err(|_| fail("people"))?
@@ -381,6 +391,7 @@ pub async fn assemble_postgres_application(
         runtime_owner.clone(),
         DEFAULT_THREAD_LEASE_DURATION,
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        recovery_gate.clone(),
     )
     .map_err(|_| fail("run_runtime"))?;
     let remote_interrupts = Arc::new(
@@ -402,6 +413,7 @@ pub async fn assemble_postgres_application(
             .with_application_name("openbot-thread-events"),
         runtime_owner,
         DEFAULT_THREAD_LEASE_DURATION,
+        recovery_gate.clone(),
     )
     .map_err(|_| fail("thread_directory"))?
     .with_model_dataset_binding(model_dataset_binding.clone())
@@ -461,14 +473,18 @@ pub async fn assemble_postgres_application(
     let drive_transport = GoogleDriveRestTransport::new(SafeDialer::new(EgressPolicy::default()))
         .map_err(|_| fail("drive_transport"))?;
     let mcp_credentials = Arc::new(
-        PostgresMcpCredentialBroker::new(pool.clone(), credential_vault.clone())
-            .with_user_oauth(
-                SafeDialer::new(EgressPolicy::default()),
-                SchemePolicy::HttpsOnly,
-                audit_key.to_vec(),
-            )
-            .map_err(|_| fail("mcp_user_oauth"))?
-            .with_google_drive_oauth(drive_oauth.clone()),
+        PostgresMcpCredentialBroker::new(
+            pool.clone(),
+            credential_vault.clone(),
+            recovery_gate.clone(),
+        )
+        .with_user_oauth(
+            SafeDialer::new(EgressPolicy::default()),
+            SchemePolicy::HttpsOnly,
+            audit_key.to_vec(),
+        )
+        .map_err(|_| fail("mcp_user_oauth"))?
+        .with_google_drive_oauth(drive_oauth.clone()),
     );
     match tokio::time::timeout(
         Duration::from_secs(30),
@@ -504,6 +520,7 @@ pub async fn assemble_postgres_application(
             oauth_public_url.as_deref(),
             app_url.as_deref(),
             SchemePolicy::HttpsOnly,
+            recovery_gate.clone(),
         )
         .map_err(|_| fail("mcp_connections"))?
         .with_mcp_credentials(mcp_credentials.clone())
@@ -515,6 +532,7 @@ pub async fn assemble_postgres_application(
             deployment.clone(),
             tenant.clone(),
             audit_key.to_vec(),
+            recovery_gate.clone(),
         )
         .map_err(|_| fail("tool_approvals"))?,
     );
@@ -525,6 +543,7 @@ pub async fn assemble_postgres_application(
         tenant.clone(),
         policy_store.clone(),
         Arc::new(memory.clone()),
+        recovery_gate.clone(),
     )
     .with_mcp(mcp_catalog.clone(), mcp_client)
     .with_google_drive(drive_transport)
@@ -548,6 +567,7 @@ pub async fn assemble_postgres_application(
             single_user,
             remote_assertions,
             audit_key.to_vec(),
+            recovery_gate.clone(),
         )
         .map_err(|_| fail("remote_callback_auth"))?
         .with_mcp_catalog(mcp_catalog.clone())

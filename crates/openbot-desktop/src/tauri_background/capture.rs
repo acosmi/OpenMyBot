@@ -933,7 +933,12 @@ impl CaptureJobCustody {
     }
 }
 /// Only the final original owner may construct this after publication and control closure.
-pub(super) struct CaptureCompleted(());
+pub(super) struct CaptureCompleted {
+    pub(super) sidecar: crate::postgres_sidecar::SidecarExit,
+    pub(super) drivers: DriverClosureFacts,
+    pub(super) writers: materials::StoppedNormalWriters,
+    pub(super) close_deadline: std::time::Instant,
+}
 /// This is a result tag only; the original job retains every unclosed owner and input.
 pub(super) struct CaptureClosingPending {
     fault: Fault,
@@ -1279,15 +1284,41 @@ pub(super) async fn run_normal_exit_capture(
                 operation.require_closing()?;
                 drop(custody.original_master_journal_bytes.take());
                 operation.require_closing()?;
+                let writers = custody
+                    .retained_materials
+                    .as_mut()
+                    .and_then(|materials| materials.retained.writer_facts.take())
+                    .ok_or(Fault::MaterialMissing)?;
                 drop(custody.retained_materials.take());
                 operation.require_closing()?;
                 // Every journal worker has actually ACKed; only its passive original files remain.
                 drop(custody.control.take());
                 operation.require_closing()?;
+                let Some(CaptureOwnerPhase::Source(source)) = custody.phase.as_mut() else {
+                    return Err(Fault::IntentMismatch);
+                };
+                let normal = &mut source.permit.closed.normal;
+                let sidecar = normal
+                    .stopped
+                    .as_ref()
+                    .ok_or(Fault::MaterialMissing)?
+                    .original_exit();
+                let drivers = normal.driver_facts.take().ok_or(Fault::MaterialMissing)?;
                 // This closes the original source's passive FDs and outer continuous kernel lease last.
                 drop(custody.phase.take());
                 operation.require_closing()?;
-                Ok(CaptureCompleted(()))
+                let close_started = std::time::Instant::now();
+                let close_deadline = close_started
+                    .checked_add(std::time::Duration::from_nanos(
+                        operation.closing_remaining_ns()?,
+                    ))
+                    .ok_or(Fault::BoundsOverflow)?;
+                Ok(CaptureCompleted {
+                    sidecar,
+                    drivers,
+                    writers,
+                    close_deadline,
+                })
             }
             .await
         }

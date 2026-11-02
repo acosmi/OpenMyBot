@@ -412,7 +412,7 @@ async fn native_0045_desktop_canary_preflight_accepts_fresh_and_upgrade_read_onl
                         .expect(
                             "current canary preflight must accept its registered public layout",
                         );
-                assert_eq!(layout.native_version(), native::NATIVE_0052_VERSION);
+                assert_eq!(layout.native_version(), native::NATIVE_0053_VERSION);
                 openbot_infra::db::desktop_vault_canary::verify_current_layout(&pool)
                     .await
                     .unwrap();
@@ -437,7 +437,7 @@ async fn fresh_and_upgrade_catalogs_match_frozen_cleanup_oracle() {
         "../../../fixtures/db/artifact-cleanup-fences-0045.json"
     ))
     .unwrap();
-    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0052_VERSION);
+    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0053_VERSION);
     for upgrade in [false, true] {
         let expected = expected.clone();
         harness::with_temp_database(
@@ -506,16 +506,16 @@ async fn fresh_and_upgrade_catalogs_match_frozen_cleanup_oracle() {
                 let current = ledger(&client).await;
                 assert_eq!(
                     current.iter().map(|row| row.0).collect::<Vec<_>>(),
-                    (13..=native::NATIVE_0052_VERSION).collect::<Vec<_>>()
+                    (13..=native::NATIVE_0053_VERSION).collect::<Vec<_>>()
                 );
-                assert_eq!(current.last().unwrap().1, native::NATIVE_0052_NAME);
+                assert_eq!(current.last().unwrap().1, native::NATIVE_0053_NAME);
                 assert_eq!(
                     current.last().unwrap().2,
-                    format!("{:x}", Sha256::digest(native::NATIVE_0052_SQL.as_bytes()))
+                    format!("{:x}", Sha256::digest(native::NATIVE_0053_SQL.as_bytes()))
                 );
                 if upgrade {
                     assert_eq!(&current[..old_ledger.len()], old_ledger.as_slice());
-                    assert_eq!(current.len(), old_ledger.len() + 8);
+                    assert_eq!(current.len(), old_ledger.len() + 9);
                     assert_eq!(
                         current[old_ledger.len()..]
                             .iter()
@@ -530,6 +530,7 @@ async fn fresh_and_upgrade_catalogs_match_frozen_cleanup_oracle() {
                             native::NATIVE_0050_VERSION,
                             native::NATIVE_0051_VERSION,
                             native::NATIVE_0052_VERSION,
+                            native::NATIVE_0053_VERSION,
                         ]
                     );
                     assert_eq!(legacy_rows(&client).await, old_rows);
@@ -1298,13 +1299,17 @@ async fn catalog_guard_and_migration_drift_are_rejected_read_only() {
             ] {
                 assert_catalog_drift_refused(&client, ddl).await;
             }
+            let unknown_migration = format!(
+                "INSERT INTO openbot_internal.schema_migrations(version,name,checksum)
+                 VALUES({},'fixture_unknown_migration',repeat('0',64))",
+                native::NATIVE_LATEST_VERSION + 1
+            );
             for mutation in [
                 "UPDATE openbot_internal.schema_migrations SET checksum=repeat('0',64) WHERE version=44",
                 "UPDATE openbot_internal.schema_migrations SET name='fixture_wrong_migration' WHERE version=44",
                 "DELETE FROM openbot_internal.schema_migrations WHERE version=44",
                 "DELETE FROM openbot_internal.schema_migrations WHERE version=43",
-                "INSERT INTO openbot_internal.schema_migrations(version,name,checksum)
-                 VALUES(53,'fixture_unknown_migration',repeat('0',64))",
+                unknown_migration.as_str(),
             ] {
                 assert_ledger_drift_refused(&client, mutation).await;
             }

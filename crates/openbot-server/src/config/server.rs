@@ -222,6 +222,9 @@ impl std::fmt::Debug for ConfiguredServerJournalInstallationId {
 /// Server 启动配置。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
+    /// `WROK_BOT_RECOVERY_CONFIG` as given. Only Server startup reads and
+    /// verifies the file, through [`ServerConfig::load_recovery_host`].
+    pub recovery_host: Option<String>,
     /// 监听端口。缺省 [`DEFAULT_PORT`]。
     pub port: u16,
     /// 部署形态。见 [`DeploymentEnvironment`]。
@@ -363,6 +366,7 @@ impl ServerConfig {
         }
 
         Ok(Self {
+            recovery_host: env::optional(env_map, "WROK_BOT_RECOVERY_CONFIG").map(str::to_owned),
             port,
             deployment_environment,
             deployment_id: env::optional(env_map, "DEPLOYMENT_ID").map(str::to_owned),
@@ -382,6 +386,34 @@ impl ServerConfig {
             package_openai_provider,
             managed_provider,
         })
+    }
+
+    /// Read and verify the owner-held recovery configuration once, at Server
+    /// startup. The Infra producer bounds the read to 1 MiB and checks the
+    /// absolute path, owner, 0600 mode, single link, `O_NOFOLLOW` and closed keys.
+    ///
+    /// # Errors
+    ///
+    /// A missing variable or any rejected file is a `Malformed` problem.
+    #[cfg(unix)]
+    pub fn load_recovery_host(
+        &self,
+    ) -> Result<openbot_infra::recovery_control::VerifiedServiceRecoveryHost, ConfigError> {
+        let malformed = |expectation| {
+            ConfigError::new(vec![ConfigProblem::Malformed {
+                variable: "WROK_BOT_RECOVERY_CONFIG",
+                expectation,
+            }])
+            .expect("one problem is a nonempty list")
+        };
+        let path = self
+            .recovery_host
+            .as_deref()
+            .ok_or_else(|| malformed(Expectation::NonEmptySecret))?;
+        openbot_infra::recovery_control::load_service_recovery_host_from_config(
+            std::path::Path::new(path),
+        )
+        .map_err(|_| malformed(Expectation::ActionPolicyObject))
     }
 
     /// 公共传输的安全档位 —— session cookie 的 `Secure` 与 readiness 的
@@ -554,6 +586,7 @@ mod tests {
         // 没配地址 = 能力未挂载，而不是挂载了但坏着。
         assert_eq!(config.computer, None);
         assert_eq!(config.public_transport(), PublicTransport::Unconfigured);
+        assert_eq!(config.recovery_host, None);
     }
 
     /// 缺省即生产；只有显式 `development` 才是开发态；别的一律拒绝。
@@ -995,5 +1028,108 @@ mod tests {
         assert!(!printed.contains("computer-secret-value"), "{printed}");
         // 正向对照：非机密字段照常可见，否则本条在"Debug 什么都不印"的世界里同样通过。
         assert!(printed.contains("localhost:4300"), "{printed}");
+    }
+
+    /// `load_recovery_host` reads one owner-held 0600 file; every other shape is `Malformed`.
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_host_requires_one_owner_file() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        // The process environment is read only through the env.rs boundary;
+        // the per-user TMPDIR is private, unlike a shared sticky /tmp.
+        let process = crate::config::env::env_map_from_process();
+        let scratch = std::path::Path::new(
+            crate::config::env::optional(&process, "TMPDIR").expect("per-user TMPDIR"),
+        )
+        .join(format!(
+            "wrok-recovery-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&scratch).expect("scratch directory");
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .expect("scratch mode");
+        // The producer opens every ancestor with O_NOFOLLOW, so use the real path.
+        let root = std::fs::canonicalize(&scratch).expect("canonical scratch");
+        let uid = std::fs::metadata(&root).expect("scratch metadata").uid();
+        let document = |extra: &str| {
+            format!(
+                concat!(
+                    r#"{{"version":1,"controlRoot":"{}","hostLimits":{{"maxRequestBytes":65536,"#,
+                    r#""maxActivationBytes":65536,"maxJournalFrameBytes":65536,"maxJournalBytes":1048576,"#,
+                    r#""maxJournalRecords":1024,"maxRuntimeRecordBytes":65536,"maxRegisteredRuntimes":8,"#,
+                    r#""maxRetainedOperations":8,"maxRootEntries":64,"maxTempEntries":8,"maxEvidenceRefs":64,"#,
+                    r#""maxRuntimeResourceFacts":64,"maxIdBytes":256,"maxComponentBytes":255,"#,
+                    r#""maxRelativePathBytes":4096,"maxPathDepth":64,"maxOpenFiles":256,"#,
+                    r#""maxMetadataBytes":67108864,"admissionNs":10000000000}},"#,
+                    r#""ordinaryStartupBounds":{{"effectNs":10000000000,"convergenceNs":10000000000}},"#,
+                    r#""expectedServiceOwner":{{"uid":{},"service":"wrok-bot-server"}},"#,
+                    r#""expectedInstallationBinding":{{"deploymentId":"deployment","tenantId":"tenant","#,
+                    r#""datasetId":"0123456789abcdef0123456789abcdef","sourceInstallationId":"installation","#,
+                    r#""targetInstallationId":"installation"}},"#,
+                    r#""expectedServerDatabase":{{"pgSystemId":1,"databaseOid":1,"pgMajor":17}},"#,
+                    r#""optionalStartupIntent":null{}}}"#
+                ),
+                root.join("control").display(),
+                uid,
+                extra
+            )
+        };
+        let write = |name: &str, bytes: &[u8], mode: u32| {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).expect("write config");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("config mode");
+            path
+        };
+        let load = |path: Option<String>| {
+            ServerConfig {
+                recovery_host: path,
+                ..ServerConfig::from_env_map(&EnvMap::new()).expect("empty environment")
+            }
+            .load_recovery_host()
+        };
+        let reject = |path: Option<String>, expectation: &'static str| {
+            let error = load(path).expect_err("rejected recovery configuration");
+            assert_eq!(
+                codes(&error),
+                vec![("malformed_env_var", "WROK_BOT_RECOVERY_CONFIG")]
+            );
+            assert!(format!("{error}").contains(expectation), "{error}");
+        };
+
+        let valid = write("recovery.json", document("").as_bytes(), 0o600);
+        // Positive control: without it every rejection below passes for a parser that always fails.
+        assert!(load(Some(valid.display().to_string())).is_ok());
+
+        reject(None, "non_empty_secret");
+        reject(Some("recovery.json".to_owned()), "action_policy_object");
+        let open = write("open.json", document("").as_bytes(), 0o644);
+        reject(Some(open.display().to_string()), "action_policy_object");
+        let linked = write("linked.json", document("").as_bytes(), 0o600);
+        std::fs::hard_link(&linked, root.join("second-link.json")).expect("hard link");
+        reject(Some(linked.display().to_string()), "action_policy_object");
+        let symlink = root.join("symlink.json");
+        std::os::unix::fs::symlink(&valid, &symlink).expect("symlink");
+        reject(Some(symlink.display().to_string()), "action_policy_object");
+        let unknown = write(
+            "unknown.json",
+            document(r#","unknownKey":1"#).as_bytes(),
+            0o600,
+        );
+        reject(Some(unknown.display().to_string()), "action_policy_object");
+        let mut oversized = document("").into_bytes();
+        oversized.resize(1_048_577, b' ');
+        let oversized = write("oversized.json", &oversized, 0o600);
+        reject(
+            Some(oversized.display().to_string()),
+            "action_policy_object",
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove scratch");
     }
 }

@@ -141,16 +141,21 @@ pub struct PostgresThreadDirectory {
     runtime: Option<RuntimeLease>,
     model_dataset_binding:
         Option<std::sync::Arc<crate::model_dataset::PostgresModelDatasetBinding>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl PostgresThreadDirectory {
     /// 用共享连接池构造只读/mint 目录；`begin_thread_run` 会 fail-closed。
     #[must_use]
-    pub fn new(pool: crate::db::pool::DatabasePool) -> Self {
+    pub fn new(
+        pool: crate::db::pool::DatabasePool,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
+    ) -> Self {
         Self {
             pool,
             runtime: None,
             model_dataset_binding: None,
+            recovery_gate,
         }
     }
 
@@ -164,6 +169,7 @@ impl PostgresThreadDirectory {
         database: impl Into<ThreadListenerDatabase>,
         owner_id: String,
         duration: Duration,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, ThreadDirectoryError> {
         if owner_id.is_empty() || duration <= Duration::ZERO {
             return Err(ThreadDirectoryError::Corrupt {
@@ -179,6 +185,7 @@ impl PostgresThreadDirectory {
                 duration,
             }),
             model_dataset_binding: None,
+            recovery_gate,
         })
     }
 
@@ -538,6 +545,12 @@ impl PostgresThreadDirectory {
         progress: &V2BeginProgress,
         materials: &[RunInputArtifactMaterial],
     ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        // The worker admission is held from the first read to the Run's COMMIT.
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         let binding = self
             .model_dataset_binding
             .as_ref()
@@ -587,6 +600,9 @@ impl PostgresThreadDirectory {
                 if std::time::Instant::now() >= deadline {
                     return Err(ThreadDirectoryError::Unavailable);
                 }
+                admission
+                    .verify_current_before(deadline)
+                    .map_err(|_| ThreadDirectoryError::Unavailable)?;
                 // This observes entry into the possible COMMIT call, never a wire send or ACK.
                 progress
                     .stage
