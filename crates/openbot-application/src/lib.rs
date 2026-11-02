@@ -89,7 +89,11 @@ pub mod delegation;
 pub mod intelligence_import;
 pub mod mcp_connections;
 pub mod model_connections;
+pub mod pending_input;
 pub mod ports;
+pub use pending_input::{
+    PendingInputConsumer, PendingInputDispatcher, PendingInputWake, VerifiedPendingInput,
+};
 pub mod provider;
 pub mod provider_extensions;
 pub mod remote_interrupt;

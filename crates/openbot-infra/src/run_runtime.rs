@@ -267,6 +267,7 @@ pub struct PostgresRunRuntime {
     claim_duration: Duration,
     delegation_runtime: Option<std::sync::Weak<openbot_application::DelegationRuntime>>,
     terminal_delivery: Option<Arc<crate::run_terminal_delivery::TerminalDelivery>>,
+    pending_inputs: Option<Arc<dyn openbot_application::PendingInputWake>>,
 }
 
 impl core::fmt::Debug for PostgresRunRuntime {
@@ -303,7 +304,18 @@ impl PostgresRunRuntime {
             claim_duration,
             delegation_runtime: None,
             terminal_delivery: None,
+            pending_inputs: None,
         })
+    }
+
+    /// Wake persisted user input after an acknowledged terminal commit.
+    #[must_use]
+    pub fn with_pending_input_dispatcher(
+        mut self,
+        dispatcher: Arc<dyn openbot_application::PendingInputWake>,
+    ) -> Self {
+        self.pending_inputs = Some(dispatcher);
+        self
     }
 
     pub(crate) fn with_delegation_runtime(
@@ -388,6 +400,14 @@ impl PostgresRunRuntime {
         {
             delivery.enqueue(notice);
         }
+        if let Some(dispatcher) = &self.pending_inputs
+            && let Err(error) = dispatcher.wake(lease.thread_id()).await
+        {
+            tracing::warn!(
+                code = error.code().as_str(),
+                "pending input terminal wake unavailable"
+            );
+        }
     }
     pub(crate) async fn fail_confirmed_delegated_callback(
         &self,
@@ -468,6 +488,16 @@ impl PostgresRunRuntime {
 
 #[async_trait]
 impl RunRuntime for PostgresRunRuntime {
+    async fn scan_pending_inputs_at_startup(&self) -> Result<(), RunRuntimeError> {
+        if let Some(dispatcher) = &self.pending_inputs {
+            dispatcher
+                .scan_startup()
+                .await
+                .map_err(|_| RunRuntimeError::Unavailable)?;
+        }
+        Ok(())
+    }
+
     async fn claim_cancellation(&self) -> Result<Option<ClaimedRunCancellation>, RunRuntimeError> {
         let mut client = self.client().await?;
         let transaction = client
@@ -771,6 +801,9 @@ async fn supervise_run_relay(
     mut stop: watch::Receiver<bool>,
     wake: Arc<Notify>,
 ) {
+    if let Err(error) = runtime.scan_pending_inputs_at_startup().await {
+        tracing::warn!(code = %error, "pending input startup scan unavailable");
+    }
     let mut poll = tokio::time::interval(DEFAULT_RUN_RELAY_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

@@ -195,7 +195,7 @@ pub async fn begin_thread_run<D: ThreadDirectory>(
     result.map_err(|error| error.into_app_error())
 }
 
-fn prepare_thread_run_v2(
+pub(crate) fn prepare_thread_run_v2(
     auth: &AuthContext,
     mut command: BeginThreadRunV2,
 ) -> Result<BeginThreadRunV2Request, AppError> {
@@ -431,13 +431,65 @@ fn validate_input_metadata(
     Ok(())
 }
 
-fn input_media_is_text(media_type: &str) -> bool {
+/// Identify text included in ordinary Run input snapshots.
+#[doc(hidden)]
+pub fn input_media_is_text(media_type: &str) -> bool {
     let essence = media_type
         .split(';')
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     essence.starts_with("text/") || essence == "application/json"
+}
+
+/// Check current metadata before either consumer reads artifact bytes.
+#[doc(hidden)]
+pub fn validate_run_input_metadata<'a>(
+    auth: &AuthContext,
+    refs: &[String],
+    records: impl IntoIterator<Item = &'a ArtifactRecordMetadata>,
+) -> Result<(), AppError> {
+    let records: Vec<_> = records.into_iter().collect();
+    if records.len() != refs.len() {
+        return Err(artifact_input_unavailable());
+    }
+    for (id, record) in refs.iter().zip(&records) {
+        validate_input_metadata(auth, id, record)?;
+    }
+    Ok(())
+}
+
+/// Enforce the original per-text and combined text byte budgets before allocation.
+#[doc(hidden)]
+pub fn validate_run_input_text_budget<'a>(
+    records: impl IntoIterator<Item = &'a ArtifactRecordMetadata>,
+) -> Result<(), AppError> {
+    let mut text_bytes = 0_u64;
+    for record in records {
+        if input_media_is_text(&record.media_type) {
+            text_bytes = text_bytes
+                .checked_add(record.byte_length)
+                .ok_or_else(artifact_refs_malformed)?;
+            if record.byte_length > 256 * 1024 || text_bytes > 1024 * 1024 {
+                return Err(artifact_refs_malformed());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode only the complete body matching the original metadata digest and byte length.
+#[doc(hidden)]
+pub fn decode_run_input_text(
+    record: &ArtifactRecordMetadata,
+    bytes: Vec<u8>,
+) -> Result<String, AppError> {
+    if u64::try_from(bytes.len()).ok() != Some(record.byte_length)
+        || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+    {
+        return Err(artifact_input_unavailable());
+    }
+    String::from_utf8(bytes).map_err(|_| artifact_input_unavailable())
 }
 
 async fn preread_artifact_materials(
@@ -466,27 +518,11 @@ async fn preread_artifact_materials(
         };
         observations.push((record, observation.cleanup_armed));
     }
-    // Finish every reference's current visibility/status check before either refusal below.
-    for (id, (record, _)) in refs.iter().zip(&observations) {
-        validate_input_metadata(auth, id, record)?;
-    }
+    validate_run_input_metadata(auth, refs, observations.iter().map(|(record, _)| record))?;
     if observations.iter().any(|(_, armed)| *armed) {
         return Err(artifact_input_unavailable());
     }
-    let mut text_bytes = 0_u64;
-    for (record, _) in &observations {
-        if input_media_is_text(&record.media_type) {
-            if record.byte_length > 256 * 1024 {
-                return Err(artifact_refs_malformed());
-            }
-            text_bytes = text_bytes
-                .checked_add(record.byte_length)
-                .ok_or_else(artifact_refs_malformed)?;
-            if text_bytes > 1024 * 1024 {
-                return Err(artifact_refs_malformed());
-            }
-        }
-    }
+    validate_run_input_text_budget(observations.iter().map(|(record, _)| record))?;
     let mut materials = Vec::with_capacity(observations.len());
     for (record, _) in observations {
         require_preread_time(deadline)?;
@@ -501,12 +537,7 @@ async fn preread_artifact_materials(
             require_preread_time(deadline)?;
             let bytes = result?.handoff(auth)?;
             require_preread_time(deadline)?;
-            if u64::try_from(bytes.len()).ok() != Some(record.byte_length)
-                || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
-            {
-                return Err(artifact_input_unavailable());
-            }
-            let text = String::from_utf8(bytes).map_err(|_| artifact_input_unavailable())?;
+            let text = decode_run_input_text(&record, bytes)?;
             require_preread_time(deadline)?;
             Some(text)
         } else {

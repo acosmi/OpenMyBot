@@ -87,6 +87,19 @@ pub struct RunInputArtifactMetadataObservation {
 /// Shared authenticated port; each implementation owns its current transaction and byte proof.
 #[async_trait]
 pub trait ArtifactAdministration: Send + Sync {
+    /// Prepare frozen Run input inside the verified pending consumer, without a public read grant.
+    /// The caller owns the pending transaction and its current submitting-user authority.
+    async fn preread_pending_input_materials(
+        &self,
+        _auth: &AuthContext,
+        _refs: &[String],
+        _deadline: std::time::Instant,
+    ) -> Result<Vec<crate::RunInputArtifactMaterial>, AppError> {
+        Err(AppError::DependencyUnavailable {
+            dependency: "artifacts",
+        })
+    }
+
     /// Observe current Host/source metadata and valid armed state under the shared preread limit.
     /// Unsupported adapters must not fall back to a save producer or infer an unarmed record.
     async fn observe_run_input_metadata_current(
