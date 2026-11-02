@@ -1580,10 +1580,10 @@ fn compare_registered(
             == hot_comparison_clone(&expected["schema"], &observation["schema"], current52)?,
     )
 }
-/// Require exact current52/40 and the entire independent0052 schema on this same Client.
+/// Require exact current53 and the entire independent0052 schema on this same Client.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0052_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0052_VERSION)?;
+    let ledger = native::validate_known_prefix(client, native::NATIVE_0053_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_0053_VERSION)?;
     verify_schema(client).await
 }
 /// Schema-only helper after the caller proves its original exact native prefix.
