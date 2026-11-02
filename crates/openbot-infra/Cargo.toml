@@ -135,3 +135,294 @@ axum.workspace = true
 [target.'cfg(unix)'.dependencies]
 # Existing locked safe syscall wrapper; descriptor-relative backup IO, no application unsafe.
 rustix.workspace = true
+
+# Integration targets that exercise runtime-gated adapters. Shared Desktop runtime
+# assertions remain in these targets when the runtime feature is enabled.
+
+[[test]]
+name = "agent_callback"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "agent_directory"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "agent_lifecycle"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "anthropic_recorded_trace"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "application_assembly"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "channel_activity"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "channel_create"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "channel_detail"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "channel_repo"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "channel_routing"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "component_catalogue"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "component_human_decisions"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "component_provider_context"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "component_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "credential_admin"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "custom_model_catalog_foundation_postgres"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "custom_model_provider_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "custom_model_run_selection"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "delegated_runs"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "delegated_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "gateway_authority"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "gateway_sdk_transport"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "google_drive_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "intelligence_import"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "mcp_oauth_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "mcp_protocol"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "memory_admin"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "memory_current_authority"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "memory_management_authority"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "memory_provenance"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "memory_recall_authority"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "memory_recall_baseline"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "model_connections"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "native_0016"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "native_0026"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "native_0036"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "oauth_refresh_redirect"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "oidc_session"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "openai_recorded_trace"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "plugin_admin_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "plugin_skill_cas"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "plugin_user_credential"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "policy_store"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "provider_content_guard"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "remember_effect_receipts"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "remote_interrupt"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "repositories"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_cancellation"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_dispatch_ack"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_effect_receipts"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_occupancy"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_positive_recovery"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_reconciliation"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "run_terminal_subscriber"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "sandboxed_cas"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "sandboxed_components"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "sandboxed_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "scoped_egress"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "scoped_egress_enforcement"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "tenant_package"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "thread_begin"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "thread_conversation"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "thread_directory"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "thread_history"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "thread_live"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "tool_application"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "tool_approval_runtime"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "tool_journal_commit"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "tool_journal_fence"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "tool_journal_journey"
+required-features = ["server-runtime"]
+
+[[test]]
+name = "ui_preferences_cas"
+required-features = ["server-runtime"]
