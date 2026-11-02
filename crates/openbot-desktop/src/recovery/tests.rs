@@ -390,6 +390,110 @@ fn malformed_entry_refuses_before_claim_and_keeps_the_request() {
     }
 }
 
+#[test]
+fn t046_02_entry_negative_components_preserve_original_requests_and_operations() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+    use openbot_infra::recovery_control::{OwnedRecoveryRequestFile, RecoveryControl, RecoveryControlFault, VerifiedRecoveryHost};
+    fn tree(path: &std::path::Path, found: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        if !path.exists() { return; }
+        if path.is_dir() {
+            found.insert(path.to_owned(), Vec::new());
+            for child in fs::read_dir(path).unwrap() { tree(&child.unwrap().path(), found); }
+        } else { found.insert(path.to_owned(), fs::read(path).unwrap()); }
+    }
+    for case in ["unknown", "duplicate", "oversized"] {
+        let fixture = EntryFixture::new();
+        let original = fs::read(&fixture.request).unwrap();
+        let bytes = match case {
+            "unknown" => { let mut value = fixture.request_value(); value["unexpected"] = json!(true); serde_json::to_vec(&value).unwrap() },
+            "duplicate" => { let mut bytes = br#"{"formatVersion":1,"#.to_vec(); bytes.extend_from_slice(&original[1..]); bytes },
+            _ => vec![b' '; fixture.host.max_request_bytes as usize + 1],
+        };
+        fs::write(&fixture.request, &bytes).unwrap();
+        let error = fixture.entry().err().expect("malformed real request refused before claim");
+        if case == "oversized" { assert_eq!(error, DesktopRestoreError::CapacityExceeded); }
+        else { assert!(matches!(error, DesktopRestoreError::EntryInvalid | DesktopRestoreError::ControlInvalid), "{case}: {error:?}"); }
+        assert_eq!(fs::read(&fixture.request).unwrap(), bytes);
+        fixture.assert_no_operation_or_application();
+    }
+    // Hold the actual original request FD before changing its named inode.
+    {
+        let fixture = EntryFixture::new();
+        let mut release = fixture.release();
+        let bootstrap = release.recovery.as_ref().unwrap().clone();
+        let program = std::env::current_exe().unwrap();
+        let actual = CurrentOsUserAppDataRoot::from_current_os_user_app_data(&fixture.app).unwrap();
+        let host = VerifiedRecoveryHost::from_local_release(
+            (fs::File::open(program.parent().unwrap()).unwrap(), program.file_name().unwrap().into(), fs::File::open(&program).unwrap()),
+            release.original_release.take().unwrap(), actual.clone(), bootstrap.release_digest,
+            bootstrap.host_limits, bootstrap.bounds, [VAULT_KEY_STORE_SERVICE, POSTGRES_KEY_STORE_SERVICE],
+        ).unwrap();
+        let request = OwnedRecoveryRequestFile::from_held(fs::File::open(fixture.request.parent().unwrap()).unwrap(), fixture.request.file_name().unwrap(), rustix::process::getuid().as_raw()).unwrap();
+        let before = fs::metadata(&fixture.request).unwrap();
+        let bytes = fs::read(&fixture.request).unwrap();
+        let old = fixture.request.with_file_name("original-request.json");
+        fs::rename(&fixture.request, &old).unwrap();
+        fs::write(&fixture.request, &bytes).unwrap();
+        fs::set_permissions(&fixture.request, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_ne!(before.ino(), fs::metadata(&fixture.request).unwrap().ino());
+        let error = RecoveryControl::open_local_restore_before(actual, request, host, Instant::now() + Duration::from_secs(10)).err().expect("held/named inode mismatch refused");
+        assert_eq!(error.fault(), RecoveryControlFault::EntryInvalid);
+        assert_eq!(fs::read(old).unwrap(), bytes);
+        assert_eq!(fs::read(&fixture.request).unwrap(), bytes);
+        fixture.assert_no_operation_or_application();
+    }
+    for version in [1, 2] {
+        let mut fixture = EntryFixture::new();
+        let path = fixture.release.join(RELEASE_MANIFEST_FILE);
+        let mut outer: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        outer["schema_version"] = json!(version);
+        outer.as_object_mut().unwrap().remove("recovery_control");
+        if version == 1 { outer.as_object_mut().unwrap().remove("normal_capture"); }
+        let bytes = serde_json::to_vec(&outer).unwrap();
+        fixture.pin = digest(&bytes);
+        fs::write(path, bytes).unwrap();
+        let _verified_old_release = fixture.release();
+        let original_request = fs::read(&fixture.request).unwrap();
+        assert!(matches!(fixture.entry(), Err(DesktopRestoreError::InitializationRequired)));
+        assert_eq!(fs::read(&fixture.request).unwrap(), original_request);
+        fixture.assert_no_operation_or_application();
+    }
+    // A real first intent exists: the second consumption must preserve it, not erase it.
+    {
+        let fixture = EntryFixture::new();
+        let key_parent = fixture.root.join("key-inputs");
+        DirBuilder::new().mode(0o700).create(&key_parent).unwrap();
+        let key = key_parent.join("key-medium");
+        fs::write(&key, [3u8; 104]).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut request = fixture.request_value();
+        request["trustedInputSelection"]["keyMedium"] = json!({"parent":key_parent,"component":"key-medium"});
+        request["trustedInputSelection"]["target"]["component"] = json!("new-generation");
+        // Same finite total-allocation ceiling as the existing S23 real-program profile;
+        // the entry-only 64MiB ceiling is below this actual test executable's allocation.
+        request["profile"]["capacity"]["maxTotalAllocationBytes"] = json!(1u64 << 32);
+        let profile: RestoreOperationProfile = serde_json::from_value(request["profile"].clone()).unwrap();
+        fixture.write_request(&request);
+        let VerifiedRestoreEntry { mut control, intent, original } = fixture.entry().unwrap();
+        let session = control.claim_restore(intent, profile.clone()).unwrap();
+        drop(session); drop(control); drop(original);
+        let root = fixture.root.join("com.acosmi.wrokbot.restore-control");
+        let mut before = std::collections::BTreeMap::new(); tree(&root, &mut before);
+        assert_eq!(fs::read_dir(root.join("operations")).unwrap().count(), 1);
+        let request_bytes = fs::read(&fixture.request).unwrap();
+        let VerifiedRestoreEntry { mut control, intent, original } = fixture.entry().unwrap();
+        let error = control.claim_restore(intent, profile).err().expect("same requestId cannot be consumed again");
+        assert_eq!(error.fault(), RecoveryControlFault::OwnerBusy);
+        let mut after = std::collections::BTreeMap::new(); tree(&root, &mut after);
+        assert_eq!(after, before);
+        assert_eq!(fs::read(&fixture.request).unwrap(), request_bytes);
+        assert!(!fixture.app.exists());
+        assert!(!fixture.root.join("new-generation").exists());
+        drop(error); drop(control); drop(original);
+    }
+}
+
 #[tokio::test]
 #[ignore = "explicit task CAR; real entry/claim/authenticated staging and FS copy only"]
 async fn s20_authenticated_staging_copies_pg_files_and_closed_configuration() {
