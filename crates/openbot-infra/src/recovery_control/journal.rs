@@ -76,20 +76,9 @@ pub(super) struct Business {
     pub(super) dataset_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct RestoreRequestReference {
-    pub(super) request_id: super::activation::Hex32,
-    pub(super) purpose: super::RecoveryRequestPurpose,
-    pub(super) file: RecoveryFileIdentity,
-    pub(super) length: u64,
-    pub(super) sha256: super::activation::Hex64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct RestoreIntent {
-    pub(super) request: RestoreRequestReference,
     pub(super) profile: RestoreOperationProfile,
     pub(super) input_identities: InputIdentities,
     pub(super) business: Business,
@@ -813,10 +802,6 @@ impl Record {
         match (&self.kind, &self.data) {
             (Kind::OperationIntent, Data::Operation(d)) if self.sequence == 1 => match d {
                 OperationIntent::Restore(v) => {
-                    v.request.file.validate()?;
-                    if v.request.length == 0 || v.request.length > l.max_request_bytes
-                        || !matches!(v.request.purpose, super::RecoveryRequestPurpose::RestoreSameInstallation | super::RecoveryRequestPurpose::RestoreNewInstallation)
-                    { return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)); }
                     v.profile.clone().checked(l)?;
                     v.candidate_plan.validate(l)?;
                     v.input_identities.carrier.file.validate()?;
@@ -1152,9 +1137,9 @@ fn upgrade_names(
 }
 
 impl JournalObservation {
-    pub(super) fn restore_request(&self) -> Option<&RestoreRequestReference> {
+    pub(super) fn restore_candidate_plan(&self) -> Option<&CandidatePlan> {
         match &self.records.first()?.data {
-            Data::Operation(OperationIntent::Restore(intent)) => Some(&intent.request),
+            Data::Operation(OperationIntent::Restore(intent)) => Some(&intent.candidate_plan),
             _ => None,
         }
     }

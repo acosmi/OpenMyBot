@@ -1026,7 +1026,11 @@ pub struct PostgresScramSecret(Arc<SecretBytes>);
 
 #[cfg(feature = "postgres-key-store")]
 impl PostgresScramSecret {
-    fn generate() -> Result<Self, PostgresSecretStoreError> {
+    pub(crate) fn secret_bytes(&self) -> &SecretBytes {
+        &self.0
+    }
+
+    pub(crate) fn generate() -> Result<Self, PostgresSecretStoreError> {
         let mut raw = vec![0_u8; 32];
         getrandom::fill(&mut raw).map_err(|_| PostgresSecretStoreError::Unavailable)?;
         let raw = SecretBytes::new(raw);
@@ -1035,7 +1039,9 @@ impl PostgresScramSecret {
         Self::from_stored(PostgresStoredSecret::from_owned_bytes(encoded))
     }
 
-    fn from_stored(stored: PostgresStoredSecret) -> Result<Self, PostgresSecretStoreError> {
+    pub(crate) fn from_stored(
+        stored: PostgresStoredSecret,
+    ) -> Result<Self, PostgresSecretStoreError> {
         if stored.0.len() != 64
             || !stored
                 .0
@@ -1067,7 +1073,7 @@ impl PostgresStoredSecret {
         Self(SecretBytes::new(bytes))
     }
 
-    fn from_secret_bytes(bytes: SecretBytes) -> Self {
+    pub(crate) fn from_secret_bytes(bytes: SecretBytes) -> Self {
         Self(bytes)
     }
 }

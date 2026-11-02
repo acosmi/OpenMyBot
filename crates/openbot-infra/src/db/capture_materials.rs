@@ -1031,6 +1031,34 @@ pub(crate) async fn verify_restore_catalog_in_transaction(
         _ => return Err(CaptureSqlFailure::UnknownLayout),
     };
     budget.reserve_known(0, 0, memory, clock)?;
+    budget.reserve_known(
+        0,
+        0,
+        2 * std::mem::size_of::<tokio_postgres::Row>() as u64,
+        clock,
+    )?;
+    let field_limit =
+        i64::try_from(budget.limits.max_field_bytes).map_err(|_| CaptureSqlFailure::Bounds)?;
+    let duration = budget.reserve_query(clock)?;
+    let context = tokio::time::timeout(
+        duration,
+        transaction.query_one(
+            "SELECT CASE WHEN octet_length(current_setting('search_path'))<=$1 THEN current_setting('search_path') END, CASE WHEN octet_length(current_setting('TimeZone'))<=$1 THEN current_setting('TimeZone') END",
+            &[&field_limit],
+        ),
+    ).await.map_err(|_| CaptureSqlFailure::Database)?
+        .map_err(|_| CaptureSqlFailure::Database)?;
+    // Borrow the original bounded result through restoration; no caller
+    // setting or unbounded copied String is introduced.
+    let search_path = context
+        .try_get::<_, Option<&str>>(0)
+        .map_err(|_| CaptureSqlFailure::RowInvalid)?
+        .ok_or(CaptureSqlFailure::Bounds)?;
+    let timezone = context
+        .try_get::<_, Option<&str>>(1)
+        .map_err(|_| CaptureSqlFailure::RowInvalid)?
+        .ok_or(CaptureSqlFailure::Bounds)?;
+    budget.reserve_known(0, 1, (search_path.len() + timezone.len()) as u64, clock)?;
     let duration = budget.reserve_query(clock)?;
     tokio::time::timeout(
         duration,
@@ -1048,6 +1076,31 @@ pub(crate) async fn verify_restore_catalog_in_transaction(
         rows.extend(read_projection(transaction, projection, namespace, budget, clock).await?);
     }
     verify_catalog(&rows, oracle, budget, clock)?;
+    // Existing registered schema observers preserve their original deparse
+    // context. The catalog's temporary GUCs must not change their oracle.
+    budget.reserve_known(
+        0,
+        1,
+        std::mem::size_of::<tokio_postgres::Row>() as u64,
+        clock,
+    )?;
+    let duration = budget.reserve_query(clock)?;
+    let restored = tokio::time::timeout(
+        duration,
+        transaction.query_one(
+            "SELECT set_config('search_path',$1,true)=$1 AND set_config('TimeZone',$2,true)=$2",
+            &[&search_path, &timezone],
+        ),
+    )
+    .await
+    .map_err(|_| CaptureSqlFailure::Database)?
+    .map_err(|_| CaptureSqlFailure::Database)?;
+    if !restored
+        .try_get::<_, bool>(0)
+        .map_err(|_| CaptureSqlFailure::RowInvalid)?
+    {
+        return Err(CaptureSqlFailure::Database);
+    }
     budget.remaining(clock)?;
     Ok((budget.rows, budget.metadata))
 }

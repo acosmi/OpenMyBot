@@ -1461,7 +1461,6 @@ pub struct VerifiedRecoveryHostIntent {
     request: OwnedRecoveryRequestFile,
     request_bytes: Vec<u8>,
     control_root: RecoveryFileIdentity,
-    request_digest: [u8; 32],
     decoded: RecoveryRequestV1,
     original_deadline: Instant,
 }
@@ -1903,6 +1902,331 @@ impl crate::backup::whole_pg_capture_stream::CaptureClockCheck for RestoreStages
     }
 }
 
+pub(super) fn claim_restore(
+    owner: &ControlOwner,
+    entry: VerifiedRecoveryHostIntent,
+    profile: super::RestoreOperationProfile,
+) -> Result<RestoreControlSession, RecoveryControlError> {
+    let mut incoming = Some(entry);
+    let result = (|| {
+        let mut state = lock(owner)?;
+        if state.restore_operation.is_some() || state.pending_restore_intent.is_some() {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+        }
+        state.pending_restore_intent = incoming.take();
+        let original = state
+            .pending_restore_intent
+            .as_ref()
+            .ok_or_else(service_invalid)?;
+        let deadline = original.original_deadline;
+        if profile != original.decoded.profile {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::ProfileInvalid,
+            ));
+        }
+        let profile = profile.checked(&state.limits)?;
+        state.acquire_writer_before(deadline)?;
+        let admission = (|| {
+            let expected_root = state
+                .pending_restore_intent
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .control_root;
+            if state.root_identity(deadline)? != expected_root {
+                return Err(service_invalid());
+            }
+            state
+                .pending_restore_intent
+                .as_mut()
+                .ok_or_else(service_invalid)?
+                .host
+                .recheck_original(deadline)?;
+            let head = state.read_head_before(deadline)?;
+            if matches!(head, Head::Unpublished) {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+            }
+            let control = match &head {
+                Head::Published(published) => Some(published.control_id()),
+                _ => None,
+            };
+            state.verify_closed_runtime_receipts(control, deadline)?;
+            // The request ID selects only the original no-replace operation.
+            // Any existing object, including an incomplete one, denies replay.
+            let operation = state
+                .pending_restore_intent
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .decoded
+                .request_id;
+            state.reserve_io(0)?;
+            state.raw.named = Some(rustix::fs::statat(
+                state.directory(Directory::Operations)?,
+                operation.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
+            state.post(deadline)?;
+            match state.raw.named.as_ref() {
+                Some(Err(rustix::io::Errno::NOENT)) => (),
+                Some(Ok(_)) => {
+                    return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+                }
+                _ => return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
+            }
+            let maximum = state.limits.max_retained_operations;
+            let count = state.inventory_count(Directory::Operations, maximum, None, deadline)?;
+            if count >= state.limits.max_retained_operations {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
+            }
+            Ok((head, operation))
+        })();
+        let (head, operation) = match admission {
+            Ok(value) => value,
+            Err(error) => {
+                state.release_writer();
+                return Err(error);
+            }
+        };
+        // All admission/old-runtime Busy checks precede operation/epoch minting.
+        let request_length = state
+            .pending_restore_intent
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .request_bytes
+            .len();
+        let claim_metadata = request_length
+            .checked_mul(32)
+            .and_then(|n| {
+                n.checked_add(
+                    std::mem::size_of::<RestoreOperationOwner>()
+                        + std::mem::size_of::<RestoreControlSession>(),
+                )
+            })
+            .ok_or_else(service_invalid)?;
+        state.prepay(claim_metadata as u64, 0)?;
+        let selections = &state
+            .pending_restore_intent
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .decoded
+            .selection;
+        let selection_paths = [
+            (
+                selections.carrier.parent.clone(),
+                selections.carrier.component.clone(),
+                Some(profile.capacity.max_input_wire_bytes),
+            ),
+            (
+                selections.key_medium.parent.clone(),
+                selections.key_medium.component.clone(),
+                Some(104),
+            ),
+            (
+                selections.target.parent.clone(),
+                selections.target.component.clone(),
+                None,
+            ),
+        ];
+        for (slot, (parent, component, limit)) in selection_paths.iter().enumerate() {
+            state.open_restore_selection(slot, parent, component, *limit, deadline)?;
+        }
+        let carrier_parent = state.restore_selections[0].as_ref()
+            .and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.identity;
+        let key_parent = state.restore_selections[1].as_ref()
+            .and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.identity;
+        if carrier_parent.device == key_parent.device && carrier_parent.inode == key_parent.inode {
+            return Err(RecoveryControlError::new(RecoveryControlFault::InputInvalid));
+        }
+        state.raw_random = Some(getrandom::fill(&mut state.restore_entropy));
+        state.post(deadline)?;
+        if !matches!(state.raw_random, Some(Ok(()))) {
+            return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
+        }
+        let control = match &head {
+            Head::Published(published) => Hex32::parse(published.control_id())?,
+            _ => Hex32::mint(&state.restore_entropy[..16])?,
+        };
+        let nonce = Hex32::mint(&state.restore_entropy[16..32])?;
+        let epoch = Hex64::mint(&state.restore_entropy[32..64])?;
+        let generation = Hex32::mint(&state.restore_entropy[64..80])?;
+        state.pending_restore_clock = Some(super::clock::OperationClock::start(
+            profile.effect_ns,
+            profile.convergence_ns,
+        )?);
+        let clock = state
+            .pending_restore_clock
+            .as_ref()
+            .ok_or_else(service_invalid)?;
+        let effect = clock.effect_before(deadline)?;
+        let (t0_ns, effect_deadline_ns, convergence_deadline_ns) = clock.observations();
+        let (boot_identity, pid, process_start) = state.process_record()?;
+        let owner_clock = super::journal::OwnerClockRecord {
+            clock_kind: "CLOCK_MONOTONIC".to_owned(),
+            boot_identity,
+            pid,
+            process_start,
+            owner_nonce: nonce.as_str().to_owned(),
+            t0_ns,
+            effect_deadline_ns,
+            convergence_deadline_ns,
+        };
+        let original = state
+            .pending_restore_intent
+            .as_ref()
+            .ok_or_else(service_invalid)?;
+        let expected = &original.decoded.expected;
+        let target = state.restore_selections[2]
+            .as_ref()
+            .ok_or_else(service_invalid)?;
+        let parent = target.ancestors.last().ok_or_else(service_invalid)?;
+        let candidate_plan = super::activation::CandidatePlan::local(
+            parent.identity,
+            target.component.clone(),
+            expected.target_installation_id.as_str().to_owned(),
+            generation.as_str().to_owned(),
+        );
+        let carrier = state.restore_selections[0]
+            .as_ref()
+            .and_then(|s| s.stamp)
+            .ok_or_else(service_invalid)?;
+        let key = state.restore_selections[1]
+            .as_ref()
+            .and_then(|s| s.stamp)
+            .ok_or_else(service_invalid)?;
+        let input = super::journal::InputIdentities {
+            carrier: super::journal::FileInput {
+                file: carrier.identity,
+                length: carrier.length,
+            },
+            key_medium: super::journal::FileInput {
+                file: key.identity,
+                length: key.length,
+            },
+        };
+        let first = super::journal::JournalData::restore(super::journal::RestoreIntent {
+            profile: profile.clone(),
+            input_identities: input.clone(),
+            business: super::journal::Business {
+                deployment_id: expected.deployment_id.clone(),
+                tenant_id: expected.tenant_id.clone(),
+                dataset_id: expected.dataset_id.as_str().to_owned(),
+            },
+            source_installation_id: expected.source_installation_id.as_str().to_owned(),
+            target_installation_id: expected.target_installation_id.as_str().to_owned(),
+            candidate_plan: candidate_plan.clone(),
+            owner_clock: owner_clock.clone(),
+        });
+        let profile_bytes =
+            serde_json::to_vec(&profile).map_err(RecoveryControlError::from_json)?;
+        let input_bytes = serde_json::to_vec(&input).map_err(RecoveryControlError::from_json)?;
+        let profile_digest = Hex64::of(&Sha256::digest(&profile_bytes).into());
+        let input_digest = Hex64::of(&Sha256::digest(&input_bytes).into());
+        let mut ledger = super::RestoreCapacityLedger::new(profile.capacity.clone());
+        ledger.admit(
+            super::RestoreCapacityResource::MetadataBytes,
+            state.budget.metadata,
+        )?;
+        ledger.admit(
+            super::RestoreCapacityResource::OpenFiles,
+            state.budget.files,
+        )?;
+        // The candidate gets a linear duplicate of the already verified parent,
+        // never a caller path reopened as authority.
+        ledger.admit(super::RestoreCapacityResource::OpenFiles, 1)?;
+        state.reserve_io(1)?;
+        state.raw.file = Some(
+            state.restore_selections[2]
+                .as_ref()
+                .and_then(|s| s.ancestors.last())
+                .ok_or_else(service_invalid)?
+                .file
+                .try_clone(),
+        );
+        state.post(effect)?;
+        let parent = state.take_opened()?;
+        let original = state
+            .pending_restore_intent
+            .take()
+            .ok_or_else(service_invalid)?;
+        let candidate_plan_output = OwnedRestoreCandidatePlan {
+            parent,
+            parent_path: original.decoded.selection.target.parent.clone(),
+            component: std::ffi::OsString::from(&original.decoded.selection.target.component),
+            generation_id: generation,
+            operation_id: operation,
+            source_installation_id: original.decoded.expected.source_installation_id,
+            target_installation_id: original.decoded.expected.target_installation_id,
+        };
+        state.restore_operation = Some(RestoreOperationOwner {
+            intent: original,
+            operation,
+            epoch,
+            clock: state
+                .pending_restore_clock
+                .take()
+                .ok_or_else(service_invalid)?,
+            profile,
+            ledger,
+            pending: None,
+            pending_stage: None,
+            pending_closing: None,
+            confirmed_stages: Vec::new(),
+            candidate_plan: candidate_plan.clone(),
+            candidate_plan_output: Some(candidate_plan_output),
+        });
+        state.observe_restore_capacity(effect)?;
+        state.begin_journal(&operation, &control, epoch.as_str(), effect)?;
+        let reference = state.append_journal(&operation, &first, effect)?;
+        let pending = super::activation::Pending {
+            operation_id: operation.as_str().to_owned(),
+            epoch: epoch.as_str().to_owned(),
+            profile_digest: profile_digest.as_str().to_owned(),
+            prior_binding: match &head {
+                Head::Published(published) => {
+                    super::RequiredNullable::Value(published.binding().clone())
+                }
+                _ => super::RequiredNullable::Null(()),
+            },
+            candidate_plan,
+            input_plan_digest: input_digest.as_str().to_owned(),
+            owner_clock,
+            journal_prefix: reference,
+        };
+        let record = match &head {
+            Head::Published(published) => published.observation().record.successor(
+                published.digest(),
+                super::activation::ActivationPhase::RestorePending,
+                super::activation::ActivationPayload::Pending(pending),
+            )?,
+            _ => super::activation::ActivationRecord::first_pending(control.as_str(), pending),
+        };
+        let published = state.publish_activation(&record, effect)?;
+        state
+            .restore_operation
+            .as_mut()
+            .ok_or_else(service_invalid)?
+            .pending = Some(published);
+        state.observe_restore_capacity(effect)?;
+        Ok(RestoreControlSession {
+            stages: RestoreStages {
+                owner: Arc::clone(owner),
+                operation,
+            },
+            candidate: None,
+        })
+    })();
+    result.map_err(|mut error: RecoveryControlError| {
+        error.retained_restore_intent = incoming.map(Box::new);
+        if error.fault() != RecoveryControlFault::OwnerBusy {
+            if let Ok(mut state) = lock(owner) {
+                state.latch(error.fault());
+            }
+        }
+        error.retain(owner)
+    })
+}
+
 /// One original restore operation. Its clock, input and journal stay in the
 /// same control owner; the candidate has separate mutable custody.
 pub struct RestoreControlSession {
@@ -1930,6 +2254,248 @@ impl Drop for RestoreControlSession {
 }
 
 impl RestoreControlSession {
+    #[cfg(feature = "server-runtime")]
+    pub(crate) fn input_stages(&mut self) -> &mut RestoreStages {
+        &mut self.stages
+    }
+
+    /// Transfer the original held inputs once, with the same finite operation
+    /// ledger and independent expectations. This does not authenticate a bundle.
+    #[cfg(feature = "server-runtime")]
+    pub fn frozen_input(
+        &mut self,
+    ) -> Result<
+        (
+            crate::backup::whole_pg_restore_stream::FrozenWholePgRestoreInput,
+            crate::backup::whole_pg_restore_stream::ReviewedWholePgRestoreIntent,
+        ),
+        RecoveryControlError,
+    > {
+        use openbot_domain::backup::WholePgCarrierBounds;
+        use openbot_domain::backup::whole_pg_carrier::WholePgManifestExpectation;
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            let operation = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
+            let deadline = operation.clock.convergence_deadline();
+            let effect = operation.clock.effect_before(deadline)?;
+            state.verify_restore_live(self.stages.operation, effect)?;
+            for slot in 0..2 {
+                state.reserve_io(0)?;
+                state.raw.metadata = Some(
+                    state.restore_selections[slot]
+                        .as_ref()
+                        .and_then(|s| s.original.as_ref())
+                        .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::InputInvalid))?
+                        .metadata(),
+                );
+                state.post(effect)?;
+                let selection = state.restore_selections[slot]
+                    .as_ref()
+                    .ok_or_else(service_invalid)?;
+                let original = selection.stamp.ok_or_else(service_invalid)?;
+                let observed = ServiceFileStamp::of(
+                    state
+                        .raw
+                        .metadata
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .ok_or_else(service_invalid)?,
+                    state.uid,
+                ).map_err(|_| RecoveryControlError::new(RecoveryControlFault::InputInvalid))?;
+                if original != observed {
+                    return Err(RecoveryControlError::new(
+                        RecoveryControlFault::InputInvalid,
+                    ));
+                }
+                state.raw.named = Some(rustix::fs::statat(
+                    &selection.ancestors.last().ok_or_else(service_invalid)?.file,
+                    selection.component.as_str(),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                ));
+                state.post(effect)?;
+                let named = state
+                    .raw
+                    .named
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?;
+                if named.st_dev as u64 != original.identity.device
+                    || named.st_ino as u64 != original.identity.inode
+                    || named.st_uid != original.identity.uid
+                    || named.st_size as u64 != original.length
+                    || named.st_nlink != 1
+                    || named.st_mode & 0o7777 != 0o600
+                {
+                    return Err(RecoveryControlError::new(
+                        RecoveryControlFault::InputInvalid,
+                    ));
+                }
+                state.restore_input_metadata[slot] = Some(
+                    state
+                        .raw
+                        .metadata
+                        .take()
+                        .expect("original metadata retained")
+                        .map_err(|_| service_invalid())?,
+                );
+            }
+            let capacity = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .profile
+                .capacity
+                .clone();
+            const FRAME_MAX: u64 = 4 * 1024 * 1024;
+            let frame = capacity
+                .max_manifest_bytes
+                .min(FRAME_MAX)
+                .max(capacity.max_single_material_bytes.min(FRAME_MAX))
+                .max(84);
+            let original = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
+            let expected_strings = [
+                &original.intent.decoded.expected.deployment_id,
+                &original.intent.decoded.expected.tenant_id,
+            ];
+            let structures = std::mem::size_of::<
+                crate::backup::whole_pg_restore_stream::FrozenWholePgRestoreInput,
+            >()
+            .checked_add(std::mem::size_of::<
+                crate::backup::whole_pg_restore_stream::ReviewedWholePgRestoreIntent,
+            >())
+            .and_then(|n| {
+                n.checked_add(
+                    expected_strings
+                        .iter()
+                        .map(|s| s.len())
+                        .sum::<usize>()
+                        .checked_mul(2)?,
+                )
+            })
+            .and_then(|n| n.checked_add(2 * (32 + 64)))
+            .ok_or_else(service_invalid)?;
+            let buffer_ceiling = frame.checked_mul(2).ok_or_else(service_invalid)?;
+            state.prepay(
+                buffer_ceiling
+                    .checked_add(structures as u64)
+                    .ok_or_else(service_invalid)?,
+                0,
+            )?;
+            state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?
+                .ledger
+                .admit(super::RestoreCapacityResource::SecretMemoryBytes, 104 + 96)?;
+            state.restore_input_buffer = Some(zeroize::Zeroizing::new(Vec::new()));
+            let buffer = state
+                .restore_input_buffer
+                .as_mut()
+                .expect("prepaid original buffer");
+            buffer
+                .try_reserve_exact(usize::try_from(frame).map_err(|_| service_invalid())?)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            if buffer.capacity() as u64 > buffer_ceiling {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
+            }
+            let ledger = &state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .ledger;
+            let metadata = ledger
+                .ceiling(super::RestoreCapacityResource::MetadataBytes)
+                .checked_sub(ledger.admitted[super::RestoreCapacityResource::MetadataBytes as usize])
+                .ok_or_else(service_invalid)?;
+            let bounds = WholePgCarrierBounds {
+                max_material_files: capacity.max_material_files,
+                max_directories: capacity.max_material_directories,
+                max_path_bytes: capacity.max_path_bytes,
+                max_path_depth: capacity.max_path_depth,
+                max_single_plain_bytes: capacity
+                    .max_single_material_bytes
+                    .min(capacity.max_material_plain_bytes),
+                max_material_plain_bytes: capacity.max_material_plain_bytes,
+                max_manifest_bytes: capacity.max_manifest_bytes.min(FRAME_MAX),
+                max_header_bytes: 80,
+                max_data_chunks: (capacity.max_input_wire_bytes / 37)
+                    .max(1)
+                    .min(u64::from(u32::MAX - 1)),
+                max_chunk_plain_bytes: capacity.max_single_material_bytes.min(FRAME_MAX),
+                max_wire_bytes: capacity.max_input_wire_bytes,
+                max_metadata_bytes: metadata,
+                max_open_files: capacity.max_open_files,
+                max_snapshot_bytes: capacity.max_material_plain_bytes,
+                max_spool_bytes: capacity.max_spool_bytes,
+                max_retained_prior_bytes: capacity.max_retained_prior_bytes,
+                max_journal_bytes: capacity.max_journal_bytes,
+                max_total_allocation_bytes: capacity.max_total_allocation_bytes,
+                capacity_reserve_bytes: capacity.reserve_bytes,
+                free_floor_bytes: capacity.free_floor_bytes,
+                max_key_medium_allocation_bytes: capacity.max_key_medium_allocation_bytes,
+                key_medium_reserve_bytes: capacity.key_medium_reserve_bytes,
+                key_medium_free_floor_bytes: capacity.key_medium_free_floor_bytes,
+            }
+            .check()
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::ProfileInvalid))?;
+            let original = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
+            let selection = &original.intent.decoded.selection;
+            let expected = WholePgManifestExpectation {
+                bundle_id: *selection.expected_bundle_id.0.as_bytes(),
+                source_operation_id: *selection.expected_source_operation_id.0.as_bytes(),
+                manifest_sha256: super::hex_array(selection.expected_manifest_sha256.as_str()),
+            };
+            let independent = &original.intent.decoded.expected;
+            let deployment = independent.deployment_id.clone();
+            let tenant = independent.tenant_id.clone();
+            let dataset = independent.dataset_id.as_str().to_owned();
+            let source = independent.source_installation_id.as_str().to_owned();
+            state.post(effect)?;
+            let carrier = state.restore_selections[0]
+                .as_mut()
+                .expect("original carrier")
+                .original
+                .take()
+                .expect("held original carrier");
+            let key = state.restore_selections[1]
+                .as_mut()
+                .expect("original key medium")
+                .original
+                .take()
+                .expect("held original key medium");
+            state.restore_input = Some(
+                crate::backup::whole_pg_restore_stream::input::from_original_held(
+                    (carrier, state.restore_input_metadata[0].take().expect("original carrier metadata")),
+                    (key, state.restore_input_metadata[1].take().expect("original key metadata")),
+                    bounds,
+                    state
+                        .restore_input_buffer
+                        .take()
+                        .expect("original prepaid buffer"),
+                    expected,
+                    (deployment, tenant, dataset, source),
+                ),
+            );
+            state.post(effect)?;
+            Ok(state
+                .restore_input
+                .take()
+                .expect("complete original input retained"))
+        })();
+        self.retain_failure(result)
+    }
+
     pub fn admit_new_child_before(&mut self, parent: &File, name: &std::ffi::OsStr, bytes: u64, kind: super::RestoreNewChildKind, deadline: Instant) -> Result<super::RestoreNewChildReservation, RecoveryControlError> {
         let result = (|| {
             let mut state = lock(&self.stages.owner)?;
@@ -2392,14 +2958,6 @@ struct RestoreHeldSelection {
     stamp: Option<ServiceFileStamp>,
 }
 
-struct RestoreIntentReadback {
-    directory: Option<File>,
-    journal: Option<File>,
-    header: [u8; 12],
-    bytes: Vec<u8>,
-    decoded: Option<Result<super::journal::JournalObservation, RecoveryControlError>>,
-}
-
 struct RawIo {
     file: Option<io::Result<File>>,
     metadata: Option<io::Result<Metadata>>,
@@ -2495,8 +3053,14 @@ pub(super) struct ControlFiles {
     restore_operation: Option<RestoreOperationOwner>,
     closing_observation: Option<RestoreClosingAllowance>,
     pending_restore_intent: Option<VerifiedRecoveryHostIntent>,
+    pending_restore_clock: Option<super::clock::OperationClock>,
+    #[cfg(feature = "server-runtime")]
+    restore_input_buffer: Option<zeroize::Zeroizing<Vec<u8>>>,
+    #[cfg(feature = "server-runtime")]
+    restore_input_metadata: [Option<Metadata>; 2],
+    #[cfg(feature = "server-runtime")]
+    restore_input: Option<(crate::backup::whole_pg_restore_stream::FrozenWholePgRestoreInput, crate::backup::whole_pg_restore_stream::ReviewedWholePgRestoreIntent)>,
     restore_selections: [Option<RestoreHeldSelection>; 3],
-    restore_intent_readbacks: Vec<RestoreIntentReadback>,
     restore_entropy: [u8; 96],
 }
 
@@ -2957,9 +3521,16 @@ impl ControlFiles {
         if self.root_identity(deadline)? != expected_root {
             return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
         }
-        self.held_owner_identity(deadline)?;
-        self.held_lock_identity(true, deadline)?;
-        self.held_lock_identity(false, deadline)?;
+        let original_lock = |error: RecoveryControlError| {
+            if error.fault() == RecoveryControlFault::ControlInvalid {
+                RecoveryControlError::new(RecoveryControlFault::OwnerLost)
+            } else {
+                error
+            }
+        };
+        self.held_owner_identity(deadline).map_err(original_lock)?;
+        self.held_lock_identity(true, deadline).map_err(original_lock)?;
+        self.held_lock_identity(false, deadline).map_err(original_lock)?;
         self.restore_operation
             .as_mut()
             .ok_or_else(service_invalid)?
@@ -2987,6 +3558,7 @@ impl ControlFiles {
             restore_journal,
             journal_tail,
             restore_runtime_readbacks,
+            restore_selections,
             restore_operation,
             ..
         } = self;
@@ -3047,6 +3619,13 @@ impl ControlFiles {
             }
             HostOrigin::ServiceConfig(_) => return Err(service_invalid()),
         }
+        for (index, selection) in restore_selections.iter().enumerate() {
+            if let Some(selection) = selection {
+                for ancestor in &selection.ancestors { ledger.observe_file(&ancestor.file, false, deadline)?; }
+                if let Some(file) = &selection.original { ledger.observe_file(file, index == 1, deadline)?; }
+            }
+        }
+        if let Some(plan) = &original.candidate_plan_output { ledger.observe_file(&plan.parent, false, deadline)?; }
         ledger.check_storage()
     }
 
@@ -4283,180 +4862,6 @@ impl ControlFiles {
         self.post(deadline)
     }
 
-    fn verify_request_unused(
-        &mut self,
-        wanted: &super::journal::RestoreRequestReference,
-        control_id: Option<&str>,
-        deadline: Instant,
-    ) -> Result<(), RecoveryControlError> {
-        let maximum =
-            usize::try_from(self.limits.max_retained_operations).map_err(|_| service_invalid())?;
-        let bytes = maximum
-            .checked_mul(
-                2 * (std::mem::size_of::<Hex32>() + std::mem::size_of::<RestoreIntentReadback>()),
-            )
-            .ok_or_else(service_invalid)?;
-        self.prepay(bytes as u64, 0)?;
-        let mut names = Vec::new();
-        names
-            .try_reserve_exact(maximum)
-            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-        self.restore_intent_readbacks
-            .try_reserve_exact(maximum)
-            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-        if names.capacity() > maximum.checked_mul(2).ok_or_else(service_invalid)?
-            || self.restore_intent_readbacks.capacity()
-                > maximum.checked_mul(2).ok_or_else(service_invalid)?
-        {
-            return Err(service_invalid());
-        }
-        self.inventory_count(
-            Directory::Operations,
-            self.limits.max_retained_operations,
-            Some(&mut names),
-            deadline,
-        )?;
-        let mut consumed = None;
-        let count = names.len();
-        for name in names {
-            let index = self.restore_intent_readbacks.len();
-            self.restore_intent_readbacks.push(RestoreIntentReadback {
-                directory: None,
-                journal: None,
-                header: [0; 12],
-                bytes: Vec::new(),
-                decoded: None,
-            });
-            let (directory, _) =
-                self.open_named(Directory::Operations, name.as_str(), true, deadline)?;
-            self.operation_work = Some(directory);
-            let (journal, expected) =
-                self.open_named(Directory::OperationWork, "journal-v1", false, deadline)?;
-            self.raw.file = Some(Ok(journal));
-            self.check_opened(false, deadline)?;
-            let length = self
-                .raw
-                .metadata
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .ok_or_else(service_invalid)?
-                .len();
-            if length < 44 || length > self.limits.max_journal_bytes {
-                return Err(RecoveryControlError::new(
-                    RecoveryControlFault::ControlInvalid,
-                ));
-            }
-            before(deadline)?;
-            self.raw.unit = Some({
-                let Self {
-                    raw,
-                    restore_intent_readbacks,
-                    ..
-                } = self;
-                raw.file
-                    .as_ref()
-                    .and_then(|r| r.as_ref().ok())
-                    .ok_or_else(service_invalid)?
-                    .read_exact_at(&mut restore_intent_readbacks[index].header, 0)
-            });
-            self.post(deadline)?;
-            if !matches!(self.raw.unit, Some(Ok(()))) {
-                return Err(RecoveryControlError::new(
-                    RecoveryControlFault::ControlInvalid,
-                ));
-            }
-            let header = self.restore_intent_readbacks[index].header;
-            let body =
-                u32::from_be_bytes(header[8..12].try_into().expect("fixed frame length")) as u64;
-            let frame_length = body.checked_add(44).ok_or_else(service_invalid)?;
-            if &header[..8] != b"WBRCJ001"
-                || body == 0
-                || body > self.limits.max_journal_frame_bytes
-                || frame_length > length
-            {
-                return Err(RecoveryControlError::new(
-                    RecoveryControlFault::ControlInvalid,
-                ));
-            }
-            self.prepay(frame_length.checked_mul(2).ok_or_else(service_invalid)?, 0)?;
-            let n = usize::try_from(frame_length).map_err(|_| service_invalid())?;
-            let input = &mut self.restore_intent_readbacks[index].bytes;
-            input
-                .try_reserve_exact(n)
-                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-            if input.capacity() > n.checked_mul(2).ok_or_else(service_invalid)? {
-                return Err(service_invalid());
-            }
-            input.resize(n, 0);
-            before(deadline)?;
-            self.raw.unit = Some({
-                let Self {
-                    raw,
-                    restore_intent_readbacks,
-                    ..
-                } = self;
-                raw.file
-                    .as_ref()
-                    .and_then(|r| r.as_ref().ok())
-                    .ok_or_else(service_invalid)?
-                    .read_exact_at(&mut restore_intent_readbacks[index].bytes, 0)
-            });
-            self.post(deadline)?;
-            if !matches!(self.raw.unit, Some(Ok(())))
-                || self.restore_intent_readbacks[index].bytes[..12] != header
-                || self.check_opened(false, deadline)? != expected
-            {
-                return Err(RecoveryControlError::new(
-                    RecoveryControlFault::ControlInvalid,
-                ));
-            }
-            self.named_matches(Directory::OperationWork, "journal-v1", expected, deadline)?;
-            let fee = super::journal::read_metadata_reservation(
-                &self.restore_intent_readbacks[index].bytes,
-                &self.limits,
-            )?;
-            self.prepay(fee, 0)?;
-            self.restore_intent_readbacks[index].decoded = Some(super::journal::observe_chain(
-                &self.restore_intent_readbacks[index].bytes,
-                &self.limits,
-            ));
-            self.post(deadline)?;
-            let decoded = self.restore_intent_readbacks[index]
-                .decoded
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
-            let (original_control, original_operation, _) =
-                decoded.first_context().ok_or_else(service_invalid)?;
-            if Some(original_control) != control_id || original_operation != name.as_str() {
-                return Err(RecoveryControlError::new(
-                    RecoveryControlFault::ControlInvalid,
-                ));
-            }
-            if let Some(reference) = decoded.restore_request() {
-                if reference.request_id == wanted.request_id {
-                    if reference != wanted || consumed.is_some() {
-                        return Err(RecoveryControlError::new(
-                            RecoveryControlFault::ControlInvalid,
-                        ));
-                    }
-                    consumed = Some(name);
-                }
-            }
-            self.restore_intent_readbacks[index].journal = Some(self.take_opened()?);
-            self.restore_intent_readbacks[index].directory = self.operation_work.take();
-        }
-        if consumed.is_some() {
-            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
-        }
-        if count >= maximum {
-            return Err(RecoveryControlError::new(
-                RecoveryControlFault::CapacityExceeded,
-            ));
-        }
-        self.post(deadline)
-    }
-
     fn open_restore_selection(
         &mut self,
         slot: usize,
@@ -4734,23 +5139,8 @@ impl ControlFiles {
                 AtFlags::SYMLINK_NOFOLLOW,
             ));
             self.post(deadline)?;
-            match self.raw.named.as_ref() {
-                Some(Ok(named))
-                    if named.st_uid == self.uid
-                        && named.st_mode & 0o7777 == 0o700
-                        && rustix::fs::FileType::from_raw_mode(named.st_mode)
-                            == rustix::fs::FileType::Directory =>
-                {
-                    ()
-                }
-                Some(Err(rustix::io::Errno::NOENT))
-                    if self.pending_restore_intent.as_ref().is_some_and(|entry| {
-                        entry.decoded.purpose == RecoveryRequestPurpose::RestoreNewInstallation
-                    }) =>
-                {
-                    ()
-                }
-                _ => return Err(service_invalid()),
+            if !matches!(self.raw.named, Some(Err(rustix::io::Errno::NOENT))) {
+                return Err(service_invalid());
             }
         }
         self.post(deadline)
@@ -5842,8 +6232,14 @@ pub(super) fn open_control(
             restore_operation: None,
             closing_observation: None,
             pending_restore_intent: None,
+            pending_restore_clock: None,
+            #[cfg(feature = "server-runtime")]
+            restore_input_buffer: None,
+            #[cfg(feature = "server-runtime")]
+            restore_input_metadata: [None, None],
+            #[cfg(feature = "server-runtime")]
+            restore_input: None,
             restore_selections: std::array::from_fn(|_| None),
-            restore_intent_readbacks: Vec::new(),
             restore_entropy: [0; 96],
         }),
         retired_metadata: 0,
@@ -6397,7 +6793,6 @@ pub(super) fn verify_intent(
         if state.root_identity(deadline)? != current {
             return Err(service_invalid());
         }
-        let request_digest = Sha256::digest(&state.scratch).into();
         let decode_bytes = state
             .scratch
             .len()
@@ -6430,8 +6825,6 @@ pub(super) fn verify_intent(
             HostOrigin::LocalRelease { actual, .. } => {
                 if Some(decoded.selection.target.parent.as_path()) != actual.as_path().parent()
                     || decoded.selection.target.component == state.root_component
-                    || actual.as_path().file_name()
-                        != Some(std::ffi::OsStr::new(&decoded.selection.target.component))
                 {
                     return Err(service_invalid());
                 }
@@ -6453,7 +6846,6 @@ pub(super) fn verify_intent(
             request,
             request_bytes: std::mem::take(&mut state.scratch),
             control_root: current,
-            request_digest,
             decoded: state
                 .raw_request_decode
                 .take()

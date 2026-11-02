@@ -3,6 +3,8 @@
 mod candidate;
 mod entry;
 mod input;
+#[cfg(test)]
+mod tests;
 
 pub use input::VerifiedRestoreEntry;
 

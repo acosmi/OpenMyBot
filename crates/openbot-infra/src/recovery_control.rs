@@ -66,6 +66,7 @@ pub struct RecoveryControlError {
     retained_host: Option<Box<VerifiedRecoveryHost>>,
     retained_request: Option<Box<entry::RequestOpenOwner>>,
     retained_restore_input: Option<Box<OwnedRecoveryRequestFile>>,
+    retained_restore_intent: Option<Box<VerifiedRecoveryHostIntent>>,
 }
 
 impl RecoveryControlError {
@@ -78,6 +79,7 @@ impl RecoveryControlError {
             retained_host: None,
             retained_request: None,
             retained_restore_input: None,
+            retained_restore_intent: None,
         }
     }
 
@@ -90,6 +92,7 @@ impl RecoveryControlError {
             retained_host: None,
             retained_request: None,
             retained_restore_input: None,
+            retained_restore_intent: None,
         }
     }
 
@@ -107,6 +110,7 @@ impl RecoveryControlError {
             retained_host: None,
             retained_request: None,
             retained_restore_input: None,
+            retained_restore_intent: None,
         }
     }
 
@@ -997,6 +1001,15 @@ impl RecoveryControl {
         entry::verify_intent(&self.shared, request, host, deadline)
     }
 
+    /// Claim one original restore request under the exclusive control locks.
+    pub fn claim_restore(
+        &mut self,
+        entry: VerifiedRecoveryHostIntent,
+        profile: RestoreOperationProfile,
+    ) -> Result<RestoreControlSession, RecoveryControlError> {
+        entry::claim_restore(&self.shared, entry, profile)
+    }
+
     /// Ordinary Server startup (S8). One clock read seals the entry intent;
     /// an existing latest head is checked under SH, otherwise the handed-back
     /// intent takes the exclusive writer for Fresh, legacy adoption or a
@@ -1738,4 +1751,442 @@ mod tests {
             Some(RecoveryControlFault::ClosureUnproven)
         );
     }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    struct RestoreEntryFixture {
+        directory: std::path::PathBuf,
+        limits: TrustedHostRecoveryLimits,
+        profile: super::RestoreOperationProfile,
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    impl Drop for RestoreEntryFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    impl RestoreEntryFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            // A private task-owned root below the real checkout avoids the
+            // intentionally world-writable system temporary ancestor.
+            let directory = std::env::current_dir()
+                .unwrap()
+                .join(format!(".restore-046-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(directory.as_path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            std::fs::create_dir(directory.as_path().join("release")).unwrap();
+            for name in ["carrier-medium", "key-medium"] {
+                let path = directory.join(name);
+                std::fs::create_dir(&path).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            for (name, bytes) in [
+                ("program", vec![1]),
+                ("carrier-medium/carrier", vec![2]),
+                ("key-medium/key", vec![3; 104]),
+            ] {
+                std::fs::write(directory.as_path().join(name), bytes).unwrap();
+                std::fs::set_permissions(
+                    directory.as_path().join(name),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+            let mut limits = limits();
+            limits.admission_ns = 30_000_000_000;
+            limits.max_open_files = 4096;
+            limits.max_path_depth = 128;
+            limits.max_relative_path_bytes = 8192;
+            let mut capacity = restore_capacity();
+            capacity.max_open_files = limits.max_open_files;
+            capacity.max_metadata_bytes = limits.max_metadata_bytes;
+            capacity.max_total_allocation_bytes = 1 << 32;
+            capacity.max_key_medium_allocation_bytes = 1 << 30;
+            let profile = super::RestoreOperationProfile {
+                effect_ns: 30_000_000_000,
+                convergence_ns: 30_000_000_000,
+                capacity,
+            };
+            Self {
+                directory,
+                limits,
+                profile,
+            }
+        }
+
+        fn config(&self) -> super::RecoveryControlConfig {
+            super::RecoveryControlConfig::local(
+                    crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(self.directory.as_path().join("old-app")).unwrap(),
+                    self.limits.clone(),
+                ).unwrap()
+        }
+
+        fn open(&self) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
+            self.open_with_key_parent(&self.directory.join("key-medium"))
+        }
+
+        fn open_with_key_parent(&self, key_parent: &std::path::Path) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
+            use std::os::unix::fs::PermissionsExt;
+            let root = self.directory.as_path();
+            let selected = |name: &str| json!({"parent": root, "component": name});
+            let request = json!({"formatVersion": 1, "requestId": OPERATION, "purpose": "restore_same_installation",
+                    "expectedReviewedReleaseDigest": "11".repeat(32), "expectedDeploymentId": "dep", "expectedTenantId": "ten",
+                    "expectedDatasetId": CONTROL, "expectedSourceInstallationId": "22".repeat(32), "expectedTargetInstallationId": "22".repeat(32),
+                    "trustedInputSelection": {"carrier": {"parent": root.join("carrier-medium"), "component": "carrier"}, "keyMedium": {"parent": key_parent, "component": "key"},
+                        "expectedBundleId": "01234567-89ab-4def-8123-456789abcdef", "expectedSourceOperationId": "11234567-89ab-4def-8123-456789abcdef",
+                        "expectedManifestSha256": ZERO64, "target": selected("new-generation")}, "profile": self.profile});
+            std::fs::write(root.join("request"), serde_json::to_vec(&request).unwrap()).unwrap();
+            std::fs::set_permissions(root.join("request"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let host = super::VerifiedRecoveryHost::from_local_release(
+                    (std::fs::File::open(root).unwrap(), "program".into(), std::fs::File::open(root.join("program")).unwrap()),
+                    (std::fs::File::open(root).unwrap(), "release".into(), std::fs::File::open(root.join("release")).unwrap()),
+                    crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(root.join("old-app")).unwrap(),
+                    [0x11; 32], self.limits.clone(),
+                ).unwrap();
+            let request = super::OwnedRecoveryRequestFile::from_held(
+                std::fs::File::open(root).unwrap(),
+                std::ffi::OsStr::new("request"),
+                rustix::process::getuid().as_raw(),
+            )
+            .unwrap();
+            super::RecoveryControl::open_local_restore_before(
+                    crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(root.join("old-app")).unwrap(),
+                    request, host, std::time::Instant::now() + std::time::Duration::from_secs(30),
+                ).unwrap()
+        }
+
+        fn control_root(&self) -> std::path::PathBuf {
+            self.directory
+                .as_path()
+                .join("com.acosmi.wrokbot.restore-control")
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_04_busy_lock_order_creates_no_operation_pending_or_effect() {
+        let fixture = RestoreEntryFixture::new();
+        use std::os::unix::fs::MetadataExt;
+        let carrier_parent = std::fs::metadata(fixture.directory.join("carrier-medium")).unwrap();
+        let key_parent = std::fs::metadata(fixture.directory.join("key-medium")).unwrap();
+        assert_eq!(carrier_parent.dev(), key_parent.dev(), "independent directories on the same device remain supported");
+        assert_ne!(carrier_parent.ino(), key_parent.ino());
+        let reader = super::RecoveryControl::open(fixture.config()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        super::entry::lock(&reader.shared)
+            .unwrap()
+            .acquire_shared_before(deadline)
+            .unwrap();
+        let (mut control, entry) = fixture.open();
+        let error = control
+            .claim_restore(entry, fixture.profile.clone())
+            .err()
+            .expect("runtime SH blocks restore EX");
+        assert_eq!(error.fault(), RecoveryControlFault::OwnerBusy);
+        assert_eq!(
+            std::fs::read_dir(fixture.control_root().join("operations"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!fixture.control_root().join("activation-v1").exists());
+        assert!(!fixture.directory.as_path().join("new-generation").exists());
+        drop(error);
+        drop(control);
+        drop(reader);
+        let (mut control, entry) = fixture.open();
+        let _session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .expect("closed empty runtime inventory admits original restore");
+        let reader = super::RecoveryControl::open(fixture.config()).unwrap();
+        assert_eq!(
+            super::entry::lock(&reader.shared)
+                .unwrap()
+                .acquire_shared_before(deadline)
+                .err()
+                .map(|e| e.fault()),
+            Some(RecoveryControlFault::OwnerBusy)
+        );
+        let bytes = std::fs::read(
+            fixture
+                .control_root()
+                .join("operations")
+                .join(OPERATION)
+                .join("journal-v1"),
+        )
+        .unwrap();
+        let observed = observe_chain(&bytes, &fixture.limits).unwrap();
+        assert_eq!(observed.first_context().unwrap().1, OPERATION);
+        assert_eq!(
+            observed.restore_candidate_plan().unwrap().entry_component,
+            "new-generation"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_03_control_root_is_trusted_sibling_outside_every_write_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = RestoreEntryFixture::new();
+        let config = fixture.config();
+        assert_eq!(config.root, fixture.control_root());
+        assert_ne!(
+            config.root.parent().unwrap(),
+            fixture.directory.as_path().join("old-app")
+        );
+        let control = super::RecoveryControl::open(config).unwrap();
+        assert!(fixture.control_root().is_dir());
+        assert!(!fixture.directory.as_path().join("old-app").exists());
+        drop(control);
+        let link = fixture.directory.as_path().join("linked-parent");
+        std::os::unix::fs::symlink(fixture.directory.as_path(), &link).unwrap();
+        let config = super::RecoveryControlConfig::local(
+                crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(link.join("app")).unwrap(), fixture.limits.clone(),
+            ).unwrap();
+        assert!(
+            super::RecoveryControl::open(config).is_err(),
+            "symlink ancestor cannot seal a control root"
+        );
+        let unsafe_parent = fixture.directory.as_path().join("group-writable");
+        std::fs::create_dir(&unsafe_parent).unwrap();
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let config = super::RecoveryControlConfig::local(
+                crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(unsafe_parent.join("app")).unwrap(), fixture.limits.clone(),
+            ).unwrap();
+        assert!(
+            super::RecoveryControl::open(config).is_err(),
+            "writable ancestor cannot seal a control root"
+        );
+        let mut overlapping = fixture.config();
+        overlapping.root = fixture.directory.as_path().join("old-app").join("control");
+        assert!(
+            super::RecoveryControl::open(overlapping).is_err(),
+            "control inside app-data is outside the admitted sibling location"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn restore_claim_existing_request_directory_never_mints_or_repairs() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = RestoreEntryFixture::new();
+        let (mut control, entry) = fixture.open();
+        let operation = fixture.control_root().join("operations").join(OPERATION);
+        std::fs::create_dir(&operation).unwrap();
+        std::fs::set_permissions(&operation, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = control
+            .claim_restore(entry, fixture.profile.clone())
+            .err()
+            .expect("partial original operation denies reuse");
+        assert_eq!(error.fault(), RecoveryControlFault::OwnerBusy);
+        assert_eq!(std::fs::read_dir(&operation).unwrap().count(), 0);
+        assert!(!fixture.control_root().join("activation-v1").exists());
+        assert_eq!(
+            std::fs::read_dir(fixture.control_root().join("operations"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_12_capacity_plan_and_actual_overflow_keep_material() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut insufficient = RestoreEntryFixture::new();
+        insufficient.profile.capacity.max_metadata_bytes = 1;
+        let (mut control, entry) = insufficient.open();
+        assert_eq!(
+            control
+                .claim_restore(entry, insufficient.profile.clone())
+                .err()
+                .unwrap()
+                .fault(),
+            RecoveryControlFault::CapacityExceeded
+        );
+        assert_eq!(
+            std::fs::read_dir(insufficient.control_root().join("operations"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(!insufficient.control_root().join("activation-v1").exists());
+
+        let fixture = RestoreEntryFixture::new();
+        let (mut control, entry) = fixture.open();
+        let mut session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .unwrap();
+        let plan = session.take_candidate_plan().unwrap();
+        let journal = fixture
+            .control_root()
+            .join("operations")
+            .join(OPERATION)
+            .join("journal-v1");
+        let original_journal = std::fs::read(&journal).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let reservation = session
+            .admit_new_child_before(
+                plan.parent(),
+                std::ffi::OsStr::new("owned-overflow"),
+                1,
+                super::RestoreNewChildKind::File,
+                deadline,
+            )
+            .unwrap();
+        let path = fixture.directory.as_path().join("owned-overflow");
+        let mut random = [0u8; 16384];
+        getrandom::fill(&mut random).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::io::Write::write_all(&mut file, &random).unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            session
+                .settle_new_child_before(reservation, plan.parent(), &file, deadline)
+                .err()
+                .unwrap()
+                .fault(),
+            RecoveryControlFault::CapacityExceeded
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), random);
+        assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
+        let pending: Value = serde_json::from_slice(
+            &std::fs::read(fixture.control_root().join("activation-v1")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending["phase"], "RestorePending");
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "desktop-local",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
+    fn restore_claim_frozen_input_transfers_original_fds_once() {
+        let fixture = RestoreEntryFixture::new();
+        let (mut control, entry) = fixture.open();
+        let mut session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .unwrap();
+        let (_input, _intent) = session
+            .frozen_input()
+            .expect("same original held inputs move once");
+        assert_eq!(
+            session.frozen_input().err().unwrap().fault(),
+            RecoveryControlFault::InputInvalid
+        );
+        let pending: Value = serde_json::from_slice(
+            &std::fs::read(fixture.control_root().join("activation-v1")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending["phase"], "RestorePending");
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "desktop-local",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
+    fn restore_claim_frozen_input_rejects_replaced_key_medium() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = RestoreEntryFixture::new();
+        let (mut control, entry) = fixture.open();
+        let mut session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .unwrap();
+        let replacement = fixture.directory.as_path().join("replacement");
+        std::fs::write(&replacement, [4u8; 104]).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(&replacement, fixture.directory.as_path().join("key-medium/key")).unwrap();
+        assert_eq!(
+            session.frozen_input().err().unwrap().fault(),
+            RecoveryControlFault::InputInvalid
+        );
+        assert_eq!(
+            std::fs::read(fixture.directory.as_path().join("key-medium/key")).unwrap(),
+            [4u8; 104]
+        );
+        assert!(
+            fixture
+                .control_root()
+                .join("operations")
+                .join(OPERATION)
+                .join("journal-v1")
+                .exists()
+        );
+    }
+
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn restore_claim_effect_and_convergence_use_original_clock() {
+        for convergence in [false, true] {
+            let mut fixture = RestoreEntryFixture::new();
+            fixture.profile.effect_ns = 500_000_000;
+            fixture.profile.convergence_ns = 200_000_000;
+            let (mut control, entry) = fixture.open();
+            let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+            let (_, t0, effect, close) = session.original_native_clock().unwrap();
+            assert_eq!(effect - t0, fixture.profile.effect_ns);
+            assert_eq!(close - effect, fixture.profile.convergence_ns);
+            let until = if convergence { close } else { effect };
+            let now = super::clock::monotonic_ns().unwrap();
+            std::thread::sleep(std::time::Duration::from_nanos(until.saturating_sub(now) + 10_000_000));
+            let error = session.admit_capacity(super::RestoreCapacityResource::NativeTasks, 1).err().expect("original deadline denies a new effect");
+            assert_eq!(error.fault(), if convergence { RecoveryControlFault::ConvergenceExpired } else { RecoveryControlFault::EffectExpired });
+            let pending: Value = serde_json::from_slice(&std::fs::read(fixture.control_root().join("activation-v1")).unwrap()).unwrap();
+            assert_eq!(pending["phase"], "RestorePending");
+            assert!(!fixture.directory.as_path().join("new-generation").exists());
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn restore_claim_replaced_owner_lock_cannot_advance_original_journal() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = RestoreEntryFixture::new();
+        let (mut control, entry) = fixture.open();
+        let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+        let root = fixture.control_root();
+        let journal = root.join("operations").join(OPERATION).join("journal-v1");
+        let before = std::fs::read(&journal).unwrap();
+        let descriptor = std::fs::read(root.join("activation-v1")).unwrap();
+        std::fs::rename(root.join("owner.lock"), root.join("old-owner.lock")).unwrap();
+        std::fs::write(root.join("owner.lock"), b"WBRCOWN1").unwrap();
+        std::fs::set_permissions(root.join("owner.lock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(session.check_capacity_before(std::time::Instant::now() + std::time::Duration::from_secs(10)).err().unwrap().fault(), RecoveryControlFault::OwnerLost);
+        assert_eq!(std::fs::read(&journal).unwrap(), before);
+        assert_eq!(std::fs::read(root.join("activation-v1")).unwrap(), descriptor);
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn restore_claim_same_actual_input_parent_is_rejected_before_mint() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = RestoreEntryFixture::new();
+        let shared_parent = fixture.directory.join("carrier-medium");
+        let key = shared_parent.join("key");
+        std::fs::write(&key, [3u8; 104]).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (mut control, entry) = fixture.open_with_key_parent(&shared_parent);
+        assert_eq!(control.claim_restore(entry, fixture.profile.clone()).err().unwrap().fault(), RecoveryControlFault::InputInvalid);
+        assert_eq!(std::fs::read_dir(fixture.control_root().join("operations")).unwrap().count(), 0);
+        assert!(!fixture.control_root().join("activation-v1").exists());
+        assert_eq!(std::fs::read(&key).unwrap(), [3u8; 104]);
+        assert!(!fixture.directory.join("new-generation").exists());
+    }
+
 }
