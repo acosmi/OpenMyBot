@@ -2125,7 +2125,8 @@ async fn apply_submit_input(
            WHERE q.thread_id=$1 AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions c
              WHERE c.operation_id=q.operation_id)) AS clearing,
            (SELECT count(*) FROM openbot_internal.thread_pending_inputs
-             WHERE thread_id=$1 AND state IN ('pending','held')) AS retained",
+             WHERE thread_id=$1 AND state IN ('pending','held')) AS retained,
+           clock_timestamp() AS accepted_at",
         &[&command.thread_id.as_str()],
     ).await.map_err(|error| unavailable("read input admission facts", error))?;
     let retained: i64 = decode(&row, "retained")?;
@@ -2133,7 +2134,9 @@ async fn apply_submit_input(
     if !busy && materials.is_none() && !command.artifact_refs.is_empty() {
         return Ok(SubmissionOutcome::NeedsArtifacts);
     }
-    let now = database_now(tx).await?;
+    // A transaction that waited for this conversation can predate its creation.
+    // Admission timestamps must be observed after the conversation lock was acquired.
+    let now: OffsetDateTime = decode(&row, "accepted_at")?;
     if existing
         .as_ref()
         .is_some_and(|(state, _, _)| state.status == "archived")
@@ -2153,7 +2156,9 @@ async fn apply_submit_input(
         tx.batch_execute("SAVEPOINT pending_input_begin")
             .await
             .map_err(|error| unavailable("save input begin boundary", error))?;
-        match apply_begin_v2_observed(original, runtime, request, materials, &schema).await {
+        match apply_begin_v2_observed(original, runtime, request, materials, &schema, Some(now))
+            .await
+        {
             Ok(BeginOutcome::Created(receipt)) => {
                 return Ok(SubmissionOutcome::Written(ThreadInputOutcome::Started(
                     receipt,
@@ -3110,7 +3115,15 @@ async fn apply_begin_v2(
             },
             error => origin_error(error),
         })?;
-    apply_begin_v2_observed(model_transaction, runtime, request, materials, &schema).await
+    apply_begin_v2_observed(
+        model_transaction,
+        runtime,
+        request,
+        materials,
+        &schema,
+        None,
+    )
+    .await
 }
 
 async fn apply_begin_v2_observed(
@@ -3119,6 +3132,7 @@ async fn apply_begin_v2_observed(
     request: &BeginThreadRunV2Request,
     materials: &[RunInputArtifactMaterial],
     schema: &crate::thread_history_writer::CurrentWriterSchema<'_, '_>,
+    accepted_at: Option<OffsetDateTime>,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     let transaction = model_transaction.as_transaction();
     crate::model_runtime::validate_actor_v2(transaction, request).await?;
@@ -3153,7 +3167,10 @@ async fn apply_begin_v2_observed(
         return Ok(BeginOutcome::Replayed(receipt));
     }
 
-    let now = database_now(transaction).await?;
+    let now = match accepted_at {
+        Some(accepted_at) => accepted_at,
+        None => database_now(transaction).await?,
+    };
     let state = match existing_thread {
         Some(state) => {
             if state.status != "active" {

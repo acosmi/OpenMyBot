@@ -6,6 +6,7 @@ use openbot_contracts::command::{PendingInputState, ThreadInputOutcome};
 use openbot_infra::db::{baseline, native};
 use openbot_infra::run_runtime::{DEFAULT_DISPATCH_CLAIM_DURATION, PostgresRunRuntime};
 
+#[track_caller]
 fn accepted(value: Result<SubmitThreadInputAttempt, ThreadDirectoryError>) -> ThreadInputOutcome {
     match value.unwrap() {
         SubmitThreadInputAttempt::Accepted(outcome) => outcome,
