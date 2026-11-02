@@ -9,7 +9,7 @@ use sha2::Digest as _;
 use super::activation::{
     ActivationBinding, ActivationPayload, ActivationPhase, ActivationRecord, Active, ActualOsOwner,
     ExpectedServerDatabase, Hex32, Hex64, HostBinding, Initializing, JournalPositionRef,
-    JournalReference, OrdinaryMode, OrdinaryStartupBounds, PlannedInstallation,
+    JournalReference, OrdinaryLocalSite, OrdinaryMode, OrdinaryStartupBounds, PlannedInstallation,
     PublishedActivation, ServerDatabaseSite, ServiceConfigRef,
 };
 use super::entry::{self, ControlOwner, Head};
@@ -50,7 +50,17 @@ pub(super) enum SiteExpectation {
         service_config: ServiceConfigRef,
         owner: ActualOsOwner,
     },
-    Local,
+    Local(LocalSiteExpectation),
+}
+
+pub(super) struct LocalSiteExpectation {
+    pub(super) root: Option<RecoveryFileIdentity>,
+    pub(super) parent: RecoveryFileIdentity,
+    pub(super) component: String,
+    pub(super) release: Hex64,
+    pub(super) master_service: String,
+    pub(super) postgres_service: String,
+    pub(super) installation_id: Option<String>,
 }
 
 /// The head a shared-lock branch saw; only that branch rewrites it.
@@ -74,6 +84,8 @@ pub struct VerifiedOrdinaryStartupIntent {
     head: ExpectedHead,
     resource_model: ResourceModel,
     owners: Vec<RuntimeOwner>,
+    #[cfg(feature = "desktop-local")]
+    fresh_installation: Option<crate::auth::single_user::desktop_local::DesktopLocalInstallation>,
 }
 
 fn fault(fault: RecoveryControlFault) -> RecoveryControlError {
@@ -92,6 +104,18 @@ impl VerifiedOrdinaryStartupIntent {
     ) -> Result<Self, RecoveryControlError> {
         let t0 = Instant::now();
         let t0_ns = super::clock::monotonic_ns()?;
+        Self::seal_at(source, site, bounds, admission_ns, owners, t0, t0_ns)
+    }
+
+    pub(super) fn seal_at(
+        source: Option<SealedSource>,
+        site: SiteExpectation,
+        bounds: OrdinaryStartupBounds,
+        admission_ns: u64,
+        owners: &[RuntimeOwner],
+        t0: Instant,
+        t0_ns: u64,
+    ) -> Result<Self, RecoveryControlError> {
         let profile = || fault(RecoveryControlFault::ProfileInvalid);
         let effect = t0
             .checked_add(Duration::from_nanos(bounds.effect_ns.get()))
@@ -117,7 +141,7 @@ impl VerifiedOrdinaryStartupIntent {
         }
         let resource_model = match site {
             SiteExpectation::Server { .. } => ResourceModel::Server,
-            SiteExpectation::Local => ResourceModel::Local,
+            SiteExpectation::Local(_) => ResourceModel::Local,
         };
         Ok(Self {
             source,
@@ -130,6 +154,8 @@ impl VerifiedOrdinaryStartupIntent {
             head: ExpectedHead::Absent,
             resource_model,
             owners: owners.to_vec(),
+            #[cfg(feature = "desktop-local")]
+            fresh_installation: None,
         })
     }
 
@@ -142,7 +168,7 @@ impl VerifiedOrdinaryStartupIntent {
     pub(super) fn server_dataset(&self) -> Result<Hex32, RecoveryControlError> {
         match &self.site {
             SiteExpectation::Server { dataset, .. } => Ok(*dataset),
-            SiteExpectation::Local => Err(fault(RecoveryControlFault::EntryInvalid)),
+            SiteExpectation::Local(_) => Err(fault(RecoveryControlFault::EntryInvalid)),
         }
     }
 
@@ -187,8 +213,9 @@ impl VerifiedOrdinaryStartupIntent {
                     return Err(fault(RecoveryControlFault::EntryInvalid));
                 }
             }
-            SiteExpectation::Local => {
-                if !binding.is_local() {
+            SiteExpectation::Local(expected) => {
+                let actual = binding.ordinary_local()?;
+                if Some(actual.generation_root) != expected.root {
                     return Err(fault(RecoveryControlFault::EntryInvalid));
                 }
             }
@@ -216,8 +243,35 @@ fn initialization_required(intent: Option<VerifiedOrdinaryStartupIntent>) -> Rec
 /// where the exclusive writer is the next step.
 pub(super) fn shared_head(
     control: &ControlOwner,
+    intent: VerifiedOrdinaryStartupIntent,
+    deadline: Instant,
+) -> Result<(PublishedActivation, VerifiedOrdinaryStartupIntent), RecoveryControlError> {
+    shared_head_inner(
+        control,
+        intent,
+        deadline,
+        #[cfg(feature = "desktop-local")]
+        None,
+    )
+}
+
+#[cfg(feature = "desktop-local")]
+pub(super) fn shared_local_head(
+    control: &ControlOwner,
+    intent: VerifiedOrdinaryStartupIntent,
+    deadline: Instant,
+    creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+) -> Result<(PublishedActivation, VerifiedOrdinaryStartupIntent), RecoveryControlError> {
+    shared_head_inner(control, intent, deadline, Some(creator))
+}
+
+fn shared_head_inner(
+    control: &ControlOwner,
     mut intent: VerifiedOrdinaryStartupIntent,
     deadline: Instant,
+    #[cfg(feature = "desktop-local")] creator: Option<
+        &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+    >,
 ) -> Result<(PublishedActivation, VerifiedOrdinaryStartupIntent), RecoveryControlError> {
     let admission = deadline.min(intent.admission);
     let mut files = entry::lock(control)?;
@@ -225,6 +279,21 @@ pub(super) fn shared_head(
     let published = match files.read_head_before(admission) {
         Ok(Head::Published(published)) => published,
         Ok(Head::Absent) => {
+            #[cfg(feature = "desktop-local")]
+            if let (SiteExpectation::Local(local), Some(creator)) = (&mut intent.site, creator) {
+                if local.root.is_none() {
+                    let (installation, root) =
+                        files.create_original_local_installation(creator, intent.effect)?;
+                    local.root = Some(root);
+                    local.installation_id = Some(installation.authority().instance_id().to_owned());
+                    intent.source = Some((
+                        OrdinaryInitializationSource::LocalPhysicalFresh,
+                        Hex32::mint(&mint::<16>()?)?,
+                        root,
+                    ));
+                    intent.fresh_installation = Some(installation);
+                }
+            }
             files.release_registration_attempt();
             return Err(initialization_required(
                 intent.source.is_some().then_some(intent),
@@ -303,7 +372,15 @@ pub struct OrdinaryInitializationSession {
 /// constructible.
 pub enum OrdinaryActivationProof {
     ServerFresh(OrdinaryDatabaseInitializationProof),
+    LocalFresh(LocalFreshProof),
     Legacy(VerifiedOrdinaryLegacyProof),
+}
+
+/// Facts of the original Local Fresh chain, observed after its canary and schema succeed.
+pub struct LocalFreshProof {
+    pub(super) site: OrdinaryLocalSite,
+    pub(super) native_version: u32,
+    pub(super) migration_digest: String,
 }
 
 /// Legacy adoption facts read back after the read-only site checks (S9).
@@ -372,6 +449,15 @@ pub(super) fn begin(
             return Err(fault(RecoveryControlFault::OwnerBusy));
         }
     };
+    #[cfg(feature = "desktop-local")]
+    if let SiteExpectation::Local(local) = &intent.site {
+        files.verify_local_root_before(
+            local
+                .root
+                .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))?,
+            intent.effect,
+        )?;
+    }
     drop(files);
     let (kind, published) = kind;
     Ok(OrdinaryInitializationSession {
@@ -387,6 +473,46 @@ pub(super) fn begin(
 }
 
 impl OrdinaryInitializationSession {
+    /// Whether this original session holds a Local Fresh creation witness.
+    #[cfg(feature = "desktop-local")]
+    pub fn is_local_fresh(&self) -> bool {
+        self.initialization_source() == Some(OrdinaryInitializationSource::LocalPhysicalFresh)
+    }
+
+    /// Consume the original Fresh installation once; upgrades have no new installation.
+    #[cfg(feature = "desktop-local")]
+    pub fn take_fresh_installation(
+        &mut self,
+    ) -> Option<crate::auth::single_user::desktop_local::DesktopLocalInstallation> {
+        self.intent.fresh_installation.take()
+    }
+
+    /// Verify the held Local binding before upgrading its original pool.
+    #[cfg(feature = "desktop-local")]
+    pub async fn verify_local_upgrade_before(
+        &mut self,
+        authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+        database: &crate::db::desktop_local::DesktopLocalDatabase,
+        canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
+    ) -> Result<(), RecoveryControlError> {
+        let SiteExpectation::Local(local) = &self.intent.site else {
+            return Err(fault(RecoveryControlFault::EntryInvalid));
+        };
+        let binding = self
+            .held_binding()
+            .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))?;
+        entry::verify_local_binding_before(
+            &self.control,
+            binding,
+            authority,
+            database,
+            canary,
+            [&local.master_service, &local.postgres_service],
+            self.intent.effect,
+        )
+        .await
+    }
+
     /// The one Server initialization request of this session (S7); scope and
     /// deadline come from the sealed intent, not from the caller.
     #[cfg(feature = "server-runtime")]
@@ -408,7 +534,7 @@ impl OrdinaryInitializationSession {
                 *dataset,
                 self.intent.effect,
             )),
-            SiteExpectation::Local => Err(fault(RecoveryControlFault::EntryInvalid)),
+            SiteExpectation::Local(_) => Err(fault(RecoveryControlFault::EntryInvalid)),
         }
     }
 
@@ -445,7 +571,7 @@ impl OrdinaryInitializationSession {
         if !matches!(self.kind, SessionKind::Initialize) || self.head.is_some() {
             return Err(invalid());
         }
-        let (source, intent_id, intent_file) = self.intent.source.ok_or_else(invalid)?;
+        let (source, _, _) = self.intent.source.ok_or_else(invalid)?;
         let mode = match source {
             OrdinaryInitializationSource::ServerDatabaseFresh => OrdinaryMode::Fresh,
             OrdinaryInitializationSource::LegacyAdoption {
@@ -480,6 +606,43 @@ impl OrdinaryInitializationSession {
             server_database: actual,
             installation_id: ids[3].clone(),
         };
+        let legacy = match mode {
+            OrdinaryMode::Fresh => None,
+            OrdinaryMode::LegacyAdoption => Some((
+                SiteSelection::ServerDatabase {
+                    service_config: service_config.clone(),
+                    expected_server_database: *database,
+                },
+                BusinessAndInstallation {
+                    deployment_id: ids[0].clone(),
+                    tenant_id: ids[1].clone(),
+                    dataset_id: dataset.as_str().to_owned(),
+                    source_installation_id: ids[2].clone(),
+                    target_installation_id: ids[3].clone(),
+                },
+            )),
+        };
+        drop(files);
+        self.seal_site(host, planned, legacy)
+    }
+
+    fn seal_site(
+        &mut self,
+        host: HostBinding,
+        planned: PlannedInstallation,
+        legacy: Option<(SiteSelection, BusinessAndInstallation)>,
+    ) -> Result<(), RecoveryControlError> {
+        let (_, intent_id, intent_file) = self
+            .intent
+            .source
+            .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))?;
+        let mode = if legacy.is_some() {
+            OrdinaryMode::LegacyAdoption
+        } else {
+            OrdinaryMode::Fresh
+        };
+        let effect = self.intent.effect;
+        let mut files = entry::lock(&self.control)?;
         host.validate_plan(&planned, &files.limits)?;
         let control_id = Hex32::mint(&mint::<16>()?)?;
         let operation = Hex32::mint(&mint::<16>()?)?;
@@ -508,8 +671,8 @@ impl OrdinaryInitializationSession {
             self.intent.t0_ns,
             &self.intent.bounds,
         )?;
-        let first = match mode {
-            OrdinaryMode::Fresh => JournalData::fresh_init(
+        let first = match legacy {
+            None => JournalData::fresh_init(
                 host,
                 intent_id.as_str(),
                 planned,
@@ -517,21 +680,12 @@ impl OrdinaryInitializationSession {
                 &digest,
                 clock,
             ),
-            OrdinaryMode::LegacyAdoption => JournalData::legacy_adoption(
+            Some((selection, ids)) => JournalData::legacy_adoption(
                 host,
                 intent_id.as_str(),
                 intent_file,
-                SiteSelection::ServerDatabase {
-                    service_config: service_config.clone(),
-                    expected_server_database: *database,
-                },
-                BusinessAndInstallation {
-                    deployment_id: ids[0].clone(),
-                    tenant_id: ids[1].clone(),
-                    dataset_id: dataset.as_str().to_owned(),
-                    source_installation_id: ids[2].clone(),
-                    target_installation_id: ids[3].clone(),
-                },
+                selection,
+                ids,
                 self.intent.bounds,
                 &digest,
                 clock,
@@ -543,6 +697,150 @@ impl OrdinaryInitializationSession {
         self.head = Some((record, digest));
         self.operation = Some(operation);
         Ok(())
+    }
+
+    /// Seal the original Local Fresh reservation before sidecar initdb or schema effects.
+    #[cfg(feature = "desktop-local")]
+    pub fn seal_local_fresh_before(
+        &mut self,
+        authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+    ) -> Result<(), RecoveryControlError> {
+        let invalid = || fault(RecoveryControlFault::EntryInvalid);
+        if self.initialization_source() != Some(OrdinaryInitializationSource::LocalPhysicalFresh)
+            || self.head.is_some()
+        {
+            return Err(invalid());
+        }
+        let SiteExpectation::Local(local) = &self.intent.site else {
+            return Err(invalid());
+        };
+        if local.installation_id.as_deref() != Some(authority.instance_id()) {
+            return Err(invalid());
+        }
+        let mut files = entry::lock(&self.control)?;
+        files.verify_local_root_before(local.root.ok_or_else(invalid)?, self.intent.effect)?;
+        let host = HostBinding::LocalPhysical {
+            actual_os_owner: ActualOsOwner::LocalUid {
+                uid: local.root.ok_or_else(invalid)?.uid,
+            },
+            app_data_parent: local.parent,
+            control_root: files.root_identity(self.intent.effect)?,
+            reviewed_release_digest: local.release.as_str().to_owned(),
+        };
+        let planned = PlannedInstallation::LocalPhysical {
+            trusted_parent: local.parent,
+            entry_component: local.component.clone(),
+            installation_id: authority.instance_id().to_owned(),
+        };
+        drop(files);
+        self.seal_site(host, planned, None)?;
+        self.intend(OrdinaryStage::Initialize)
+    }
+
+    /// Verify the actual Fresh database, canary and original root, then record the
+    /// observed completion of that chain. Its internal COMMITs are not fabricated ACKs.
+    #[cfg(feature = "desktop-local")]
+    pub async fn verify_local_fresh_before(
+        &mut self,
+        authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+        database: &crate::db::desktop_local::DesktopLocalDatabase,
+        canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
+    ) -> Result<LocalFreshProof, RecoveryControlError> {
+        use super::activation::{KeyKind, KeyReference};
+        let invalid = || fault(RecoveryControlFault::ControlInvalid);
+        if self.initialization_source() != Some(OrdinaryInitializationSource::LocalPhysicalFresh)
+            || database.origin() != crate::db::desktop_local::DesktopLocalDatabaseOrigin::Created
+            || !canary
+                .matches_database(database)
+                .await
+                .map_err(|_| invalid())?
+        {
+            return Err(invalid());
+        }
+        let SiteExpectation::Local(local) = &self.intent.site else {
+            return Err(invalid());
+        };
+        let root = local.root.ok_or_else(invalid)?;
+        if local.installation_id.as_deref() != Some(authority.instance_id())
+            || canary.deployment_id() != authority.auth_context().deployment().as_str()
+            || canary.tenant_id() != authority.auth_context().tenant().as_str()
+        {
+            return Err(invalid());
+        }
+        let client = database.pool().get().await.map_err(|_| invalid())?;
+        native::validate_current(&client)
+            .await
+            .map_err(|_| invalid())?;
+        let version = latest();
+        let migration_digest = ledger_checksum(&client, version).await?;
+        let site = client.query_one(
+            "SELECT pcs.system_identifier::text AS system_identifier, d.oid AS database_oid, current_setting('server_version_num')::int / 10000 AS pg_major FROM pg_control_system() pcs JOIN pg_database d ON d.datname=current_database()",
+            &[],
+        ).await.map_err(|_| invalid())?;
+        let system: String = site.try_get("system_identifier").map_err(|_| invalid())?;
+        let pg_system_id = system
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id != 0)
+            .ok_or_else(invalid)?;
+        let database_oid: u32 = site.try_get("database_oid").map_err(|_| invalid())?;
+        if database_oid == 0 || site.try_get::<_, i32>("pg_major").ok() != Some(17) {
+            return Err(invalid());
+        }
+        let operation = self.operation()?;
+        let installation = authority.instance_id().to_owned();
+        let key =
+            |kind, service: &str, account: String, key_id: String, key_version| KeyReference {
+                kind,
+                reviewed_service: service.to_owned(),
+                account,
+                key_id,
+                key_version,
+                target_installation_id: installation.clone(),
+                operation_id: operation.as_str().to_owned(),
+            };
+        let actual = OrdinaryLocalSite {
+            dataset_id: canary.dataset_id().to_owned(),
+            deployment_id: canary.deployment_id().to_owned(),
+            tenant_id: canary.tenant_id().to_owned(),
+            installation_id: installation.clone(),
+            generation_root: root,
+            pg_system_id,
+            database_oid,
+            master: key(
+                KeyKind::HistoricalMaster,
+                &local.master_service,
+                format!("desktop-vault-master-v1-{installation}"),
+                canary.key_id().to_owned(),
+                u32::try_from(canary.key_version()).map_err(|_| invalid())?,
+            ),
+            postgres: key(
+                KeyKind::PostgresScram,
+                &local.postgres_service,
+                format!("postgresql-17-{installation}"),
+                format!("postgresql-17-{installation}"),
+                1,
+            ),
+        };
+        drop(client);
+        entry::lock(&self.control)?.verify_local_root_before(root, self.intent.convergence)?;
+        let returned = Instant::now();
+        let observed_ns = super::clock::monotonic_ns()?;
+        if !self.observe(
+            Disposition::TaskReturned {
+                original_task_id: "local-fresh-chain".to_owned(),
+                observed_ns,
+            },
+            returned <= self.intent.effect,
+        )? {
+            return Err(fault(RecoveryControlFault::EffectExpired));
+        }
+        entry::lock(&self.control)?.bind_original_local_pool(database.pool());
+        Ok(LocalFreshProof {
+            site: actual,
+            native_version: version,
+            migration_digest,
+        })
     }
 
     /// Append the StageIntent of the next effect (≤E).
@@ -704,37 +1002,56 @@ impl OrdinaryInitializationSession {
             return Err(fault(RecoveryControlFault::ClosureUnproven));
         }
         let operation = self.operation()?;
-        let SiteExpectation::Server {
-            dataset,
-            ids,
-            service_config,
-            ..
-        } = &self.intent.site
-        else {
-            return Err(invalid());
-        };
-        let (site, version, digest, key_id) = match proof {
-            OrdinaryActivationProof::ServerFresh(proof) => {
-                (proof.site, latest(), proof.migration_digest, proof.key_id)
+        let binding = match (&self.intent.site, proof) {
+            (SiteExpectation::Local(_), OrdinaryActivationProof::LocalFresh(proof)) => {
+                ActivationBinding::local(
+                    proof.site,
+                    proof.native_version,
+                    proof.migration_digest,
+                    initializing.initial_epoch.clone(),
+                    operation,
+                )
             }
-            OrdinaryActivationProof::Legacy(proof) => (
+            (
+                SiteExpectation::Server {
+                    dataset,
+                    ids,
+                    service_config,
+                    ..
+                },
+                OrdinaryActivationProof::ServerFresh(proof),
+            ) => ActivationBinding::server(
+                dataset,
+                ids,
+                service_config,
+                proof.site,
+                latest(),
+                &proof.migration_digest,
+                &initializing.initial_epoch,
+                proof.key_id.as_str(),
+                operation.as_str(),
+            ),
+            (
+                SiteExpectation::Server {
+                    dataset,
+                    ids,
+                    service_config,
+                    ..
+                },
+                OrdinaryActivationProof::Legacy(proof),
+            ) => ActivationBinding::server(
+                dataset,
+                ids,
+                service_config,
                 proof.site,
                 proof.native_version,
-                proof.migration_digest,
-                proof.key_id,
+                &proof.migration_digest,
+                &initializing.initial_epoch,
+                proof.key_id.as_str(),
+                operation.as_str(),
             ),
+            _ => return Err(invalid()),
         };
-        let binding = ActivationBinding::server(
-            dataset,
-            ids,
-            service_config,
-            site,
-            version,
-            &digest,
-            &initializing.initial_epoch,
-            key_id.as_str(),
-            operation.as_str(),
-        );
         binding.validate(&entry::lock(&self.control)?.limits)?;
         let evidence = self.evidence.clone();
         self.publish(ActivationPhase::OrdinaryActive, |publish_intent| {

@@ -16,11 +16,13 @@ use openbot_contracts::recovery::{
 };
 use openbot_contracts::request_binding::{HostRequestBindingError, VerifiedHostRequestBinding};
 use rustix::fs::FlockOperation;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::activation::ActivationBinding;
 use super::entry::{self, ControlFiles, ControlOwner, OwnedRecord, RuntimeEntry};
 use super::journal::ProcessStart;
+use super::journal::{NativeExit, PipeJoin};
 use super::{
     RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, hex_array, id,
 };
@@ -39,7 +41,7 @@ pub(super) struct OriginalRuntimeEnrollment {
 
 /// The closed set of original runtime owners that may produce an effect;
 /// each has one fixed id in the enrollment (spec 8364).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RuntimeOwner {
     PostgresSidecar,
@@ -53,7 +55,134 @@ pub enum RuntimeOwner {
     ScreenHub,
 }
 
-#[derive(Clone, Copy, Serialize)]
+/// The observed result of awaiting an original task.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum RuntimeTaskOutcome {
+    Returned,
+    Panicked,
+    JoinUnknown,
+}
+
+/// An original database transaction's acknowledged terminal state.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum RuntimePgAck {
+    CommitAck,
+    RollbackAck,
+}
+
+/// Passive resources whose original adapters have proved no remaining worker.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum PassiveObjectKind {
+    SqlDriver(#[serde(serialize_with = "serialize_destructions")] Vec<crate::db::pool::ConnectionDestruction>),
+    ScreenHub,
+    NeverStarted(RuntimeOwner),
+}
+
+fn serialize_destructions<S: serde::Serializer>(
+    facts: &[crate::db::pool::ConnectionDestruction],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use crate::db::pool::ConnectionDestruction;
+    use serde::ser::SerializeSeq;
+    let mut sequence = serializer.serialize_seq(Some(facts.len()))?;
+    for fact in facts {
+        sequence.serialize_element(match fact {
+            ConnectionDestruction::ConnectingOwnerDestroyedBeforeStart => "connecting_owner_destroyed_before_start",
+            ConnectionDestruction::ConnectingFutureDestroyed => "connecting_future_destroyed",
+            ConnectionDestruction::ConnectionDestroyed => "connection_destroyed",
+        })?;
+    }
+    sequence.end()
+}
+
+/// Original resource observations. A fact is data, never restore authority.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all_fields = "camelCase")]
+pub enum RuntimeCloseFact {
+    NativeWait {
+        original_program_id: RuntimeOwner,
+        original_pid: u32,
+        original_start_identity: ProcessStart,
+        exit: NativeExit,
+        observed_ns: u64,
+        pipes: [PipeJoin; 3],
+    },
+    TaskJoin {
+        original_task_id: RuntimeOwner,
+        outcome: RuntimeTaskOutcome,
+        observed_ns: u64,
+    },
+    PgAck {
+        original_owner: RuntimeOwner,
+        disposition: RuntimePgAck,
+    },
+    PassiveRetirement { object: PassiveObjectKind },
+}
+
+impl RuntimeCloseFact {
+    fn owner(&self) -> RuntimeOwner {
+        match self {
+            Self::NativeWait { original_program_id, .. } => *original_program_id,
+            Self::TaskJoin { original_task_id, .. } => *original_task_id,
+            Self::PgAck { original_owner, .. } => *original_owner,
+            Self::PassiveRetirement { object } => match object {
+                PassiveObjectKind::SqlDriver(_) => RuntimeOwner::SqlDriver,
+                PassiveObjectKind::ScreenHub => RuntimeOwner::ScreenHub,
+                PassiveObjectKind::NeverStarted(owner) => *owner,
+            },
+        }
+    }
+
+    fn observed_closed(&self, now: u64) -> bool {
+        match self {
+            Self::NativeWait { original_pid, original_start_identity, observed_ns, pipes, .. } => {
+                *original_pid != 0 && original_start_identity.nanos < 1_000_000_000
+                    && *observed_ns != 0 && *observed_ns <= now
+                    && pipes.iter().all(|pipe| match pipe {
+                        PipeJoin::Null => true,
+                        PipeJoin::Returned { observed_ns } => *observed_ns != 0 && *observed_ns <= now,
+                        PipeJoin::Panicked { .. } | PipeJoin::JoinUnknown => false,
+                    })
+            }
+            Self::TaskJoin { outcome, observed_ns, .. } => {
+                matches!(outcome, RuntimeTaskOutcome::Returned) && *observed_ns != 0 && *observed_ns <= now
+            }
+            Self::PgAck { .. } | Self::PassiveRetirement { .. } => true,
+        }
+    }
+}
+
+/// The original host's complete owner observations for one runtime.
+pub struct RuntimeCloseResources {
+    facts: Vec<RuntimeCloseFact>,
+}
+
+impl RuntimeCloseResources {
+    /// Preserve the actual adapter results for enrollment reconciliation.
+    pub fn new(facts: Vec<RuntimeCloseFact>) -> Self {
+        Self { facts }
+    }
+}
+
+/// A held, durable close record produced by the original runtime owner.
+pub struct RuntimeCloseReceipt {
+    _record: OwnedRecord,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseRecord<'a> {
+    record_type: &'static str,
+    version: u32,
+    same_identity_tuple: Enrollment<'a>,
+    enrollment_digest: String,
+    original_resource_facts: &'a [RuntimeCloseFact],
+    retained_unknown_effect_refs: [(); 0],
+    clock_observations: [u64; 1],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum ResourceModel {
     Local,
     Server,
@@ -128,6 +257,7 @@ pub(super) struct RuntimeState {
     root: RecoveryFileIdentity,
     runtime_identity: RecoveryFileIdentity,
     handle_alive: Arc<AtomicBool>,
+    close_resources: Option<RuntimeCloseResources>,
 }
 
 pub(super) type RuntimeOwnerBook = Arc<Mutex<Option<RuntimeState>>>;
@@ -208,10 +338,116 @@ struct ServerScope {
 }
 
 impl RecoveryRuntimeOwner {
+    /// Observe the original monotonic clock immediately after an original close result.
+    /// This is observation data only; it does not close an owner or grant a lease.
+    pub fn observe_close_ns(&self) -> Result<u64, RecoveryControlError> {
+        super::clock::monotonic_ns()
+    }
+
+    /// Bind the original ordinary Local pool only after its actual site and canary match.
+    #[cfg(feature = "desktop-local")]
+    pub async fn verify_local_before(
+        &mut self,
+        authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+        database: &crate::db::desktop_local::DesktopLocalDatabase,
+        canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
+        services: [&str; 2],
+    ) -> Result<(), RecoveryControlError> {
+        let (control, binding, deadline) = {
+            let state = lock_runtime(&self.state)?;
+            (Arc::clone(&state.control), state.original.published.binding().clone(), state.original.original_deadline)
+        };
+        entry::verify_local_binding_before(&control, &binding, authority, database, canary, services, deadline).await
+            .map_err(|error| error.retain(&control))
+    }
+
     #[must_use]
     pub fn read_gate(&self) -> RecoveryReadGate {
         RecoveryReadGate {
             source: GateSource::Runtime(Arc::downgrade(&self.state)),
+        }
+    }
+
+    /// Reconcile the original owner results and durably close this exact enrollment.
+    /// Unknown or incomplete observations keep the enrollment and runtime lock resident.
+    pub async fn close_before(
+        &mut self,
+        original: RuntimeCloseResources,
+        deadline: Instant,
+    ) -> Result<RuntimeCloseReceipt, RecoveryControlError> {
+        let mut state = lock_runtime(&self.state)?;
+        let control = Arc::clone(&state.control);
+        let result = (|| {
+            if state.close_resources.is_some() {
+                return Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven));
+            }
+            state.close_resources = Some(original);
+            before(deadline)?;
+            let observed_ns = super::clock::monotonic_ns()?;
+            let facts = &state.close_resources.as_ref().expect("original close facts retained").facts;
+            let owners = &state.original.enrollment.original_owner_set;
+            if facts.len() != owners.len()
+                || owners.iter().any(|owner| facts.iter().filter(|fact| fact.owner() == *owner).count() != 1)
+                || facts.iter().any(|fact| !fact.observed_closed(observed_ns))
+            {
+                return Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven));
+            }
+            self.handle_alive.store(false, Ordering::SeqCst);
+            let mut files = entry::lock(&control)?;
+            files.verify_enrollment_before(&state.original.enrollment, deadline)?;
+            files.verify_runtime_enrollment(
+                &state.runtime_directory,
+                &state.original.runtime_nonce,
+                &state.enrollment_file,
+                deadline,
+            )?;
+            files.pending_owner = Some(files.acquire(
+                "owner.lock", b"WBRCOWN1", FlockOperation::NonBlockingLockExclusive, deadline,
+            )?);
+            files.pending_admission = Some(files.acquire(
+                "admission.lock", b"WBRCADM1", FlockOperation::NonBlockingLockExclusive, deadline,
+            )?);
+            let admission = files.held_lock_identity(true, deadline)?;
+            files.verify_head_digest(state.original.published.digest(), deadline)?;
+            let record = CloseRecord {
+                record_type: "wrokbot-runtime-close",
+                version: 1,
+                same_identity_tuple: enrollment(&state.original, state.root, admission, state.runtime_identity),
+                enrollment_digest: format!("{:x}", Sha256::digest(&state.enrollment_file.bytes)),
+                original_resource_facts: facts,
+                retained_unknown_effect_refs: [],
+                clock_observations: [observed_ns],
+            };
+            let cap = usize::try_from(files.limits.max_runtime_record_bytes)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            let mut count = Count { used: 0, cap };
+            serde_json::to_writer(&mut count, &record)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            let backing = count.used.checked_mul(2)
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            files.prepay(backing as u64, 0)?;
+            let mut output = FixedBytes { bytes: Vec::new(), cap: count.used };
+            output.bytes.try_reserve_exact(count.used)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            serde_json::to_writer(&mut output, &record)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
+            files.runtime_input = output.bytes;
+            files.post(deadline)?;
+            let input = std::mem::take(&mut files.runtime_input);
+            let published = files.publish_runtime_close_record(&state.runtime_directory, &input, deadline);
+            files.runtime_input = input;
+            let receipt = published?;
+            files.pending_admission = None;
+            files.pending_owner = None;
+            files.retained_runtime = None;
+            Ok(RuntimeCloseReceipt { _record: receipt })
+        })();
+        match result {
+            Ok(receipt) => {
+                drop(state.state.take());
+                Ok(receipt)
+            }
+            Err(error) => Err(error.retain(&control)),
         }
     }
 }
@@ -581,6 +817,7 @@ pub(super) fn enter_runtime(
                 root,
                 runtime_identity,
                 handle_alive,
+                close_resources: None,
             }))),
         };
         // Intentional same-owner failure retention, not a global registry or
@@ -627,6 +864,7 @@ struct Admission<'a> {
     original_binding: &'a VerifiedHostRequestBinding,
     original_auth: &'a AuthContext,
     deadline: Instant,
+    purpose: RecoveryAdmissionPurpose,
 }
 
 impl Drop for AdmissionHold {
@@ -642,7 +880,7 @@ impl Drop for AdmissionHold {
 
 impl RecoveryAdmissionWitness for Admission<'_> {
     fn purpose(&self) -> RecoveryAdmissionPurpose {
-        RecoveryAdmissionPurpose::Normal
+        self.purpose
     }
 
     fn verify_current_before(
@@ -856,15 +1094,74 @@ impl RecoveryReadGate {
         }
     }
 
+    /// Match the original pool already bound by this admission source.
+    #[cfg(feature = "server-runtime")]
+    pub(crate) fn matches_pool(&self, pool: &crate::db::pool::DatabasePool) -> bool {
+        if pool.is_closed() {
+            return false;
+        }
+        match &self.source {
+            GateSource::OutsideRecoveryDomain(scope) => {
+                std::ptr::eq(scope.pool.manager(), pool.manager())
+            }
+            GateSource::Runtime(runtime) => {
+                let Some(runtime) = runtime.upgrade() else {
+                    return false;
+                };
+                let Ok(state) = lock_runtime(&runtime) else {
+                    return false;
+                };
+                if !state.handle_alive.load(Ordering::SeqCst) {
+                    return false;
+                }
+                let Ok(files) = entry::lock(&state.control) else {
+                    return false;
+                };
+                files.matches_bound_pool(pool)
+            }
+        }
+    }
+
     pub async fn borrow_before<'a>(
         &'a self,
         binding: &'a VerifiedHostRequestBinding,
         auth: &'a AuthContext,
         deadline: Instant,
     ) -> Result<RecoveryAdmissionLease<'a>, HostRequestBindingError> {
+        self.borrow_with_purpose_before(binding, auth, deadline, RecoveryAdmissionPurpose::Normal)
+            .await
+    }
+
+    /// Borrow the current restored cohort solely for a fresh named confirmation request.
+    /// The actual host and final requirement owner must still be verified by its producer.
+    pub async fn borrow_reconfirmation_before<'a>(
+        &'a self,
+        binding: &'a VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: Instant,
+    ) -> Result<RecoveryAdmissionLease<'a>, HostRequestBindingError> {
+        self.borrow_with_purpose_before(
+            binding,
+            auth,
+            deadline,
+            RecoveryAdmissionPurpose::Reconfirmation,
+        )
+        .await
+    }
+
+    async fn borrow_with_purpose_before<'a>(
+        &'a self,
+        binding: &'a VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: Instant,
+        purpose: RecoveryAdmissionPurpose,
+    ) -> Result<RecoveryAdmissionLease<'a>, HostRequestBindingError> {
         let state = match &self.source {
             GateSource::Runtime(state) => state,
             GateSource::OutsideRecoveryDomain(scope) => {
+                if purpose == RecoveryAdmissionPurpose::Reconfirmation {
+                    return Err(HostRequestBindingError::Unavailable);
+                }
                 if auth.deployment() != &scope.deployment || auth.tenant() != &scope.tenant {
                     return Err(HostRequestBindingError::NotCurrent);
                 }
@@ -898,11 +1195,15 @@ impl RecoveryReadGate {
             .and_then(|n| n.checked_add(std::mem::size_of::<File>()))
             .ok_or(HostRequestBindingError::Unavailable)? as u64;
         let hold = AdmissionHold::acquire(state, reservation, deadline)?;
+        if purpose == RecoveryAdmissionPurpose::Reconfirmation && hold.cohort.is_none() {
+            return Err(HostRequestBindingError::Unavailable);
+        }
         let lease = Admission {
             hold,
             original_binding: binding,
             original_auth: auth,
             deadline,
+            purpose,
         };
         lease.verify_current_before(binding, auth, deadline)?;
         // No upgraded runtime Arc or MutexGuard crosses either original await.

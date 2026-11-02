@@ -224,22 +224,28 @@ pub async fn initialize_owned_before(
     let (deployment, tenant, dataset, effect) = session
         .server_scope()
         .map_err(DatabaseInitializationError::Recovery)?;
-    let mut client = pool
-        .get()
-        .await
-        .map_err(|source| InfraError::connect("check out the Server initialization connection", source))?;
+    let mut client = pool.get().await.map_err(|source| {
+        InfraError::connect("check out the Server initialization connection", source)
+    })?;
     let transaction = client
         .bootstrap_transaction_builder()
         .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
         .start()
         .await
-        .map_err(|source| InfraError::query("begin the Server initialization transaction", source))?;
+        .map_err(|source| {
+            InfraError::query("begin the Server initialization transaction", source)
+        })?;
     native::lock_migrations(&transaction).await?;
     let empty: bool = transaction
         .query_one(FRESH_PRECONDITION_SQL, &[])
         .await
         .and_then(|row| row.try_get(0))
-        .map_err(|source| InfraError::query("recheck the Server Fresh precondition under the lock", source))?;
+        .map_err(|source| {
+            InfraError::query(
+                "recheck the Server Fresh precondition under the lock",
+                source,
+            )
+        })?;
     let identity = transaction
         .query_one(EXISTING_SERVER_IDENTITY_SQL, &[])
         .await
@@ -259,10 +265,9 @@ pub async fn initialize_owned_before(
         })
     })();
     let Some(site) = site.filter(|_| empty) else {
-        transaction
-            .rollback()
-            .await
-            .map_err(|source| InfraError::query("end the Server transaction that cannot initialize", source))?;
+        transaction.rollback().await.map_err(|source| {
+            InfraError::query("end the Server transaction that cannot initialize", source)
+        })?;
         return Ok(OwnedDatabaseInitialization {
             _client: client,
             commit: None,

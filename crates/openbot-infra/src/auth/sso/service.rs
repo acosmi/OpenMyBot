@@ -27,6 +27,7 @@ use crate::auth::oidc::coordinator::{
     DEFAULT_IDP_TIMEOUT, DEFAULT_METADATA_MAX_BYTES, DYNAMIC_SSO_LOGIN_BUDGET,
 };
 use crate::auth::oidc::redirect::HTTPS_OR_HTTP;
+use crate::auth::oidc::session_issuer::{OriginalLoginRequest, VerifiedCurrentFederatedLogin};
 use crate::auth::oidc::{
     CanonicalRedirectUri, FetchBudget, OidcLoginCoordinator, OidcLoginError, OidcProviderConfig,
     OidcProviderRuntime, PostgresLoginAttemptStore, PostgresOidcRateLimiter,
@@ -230,6 +231,7 @@ impl DynamicSsoService {
                 session_lifetime,
                 admin_floor,
                 audit_key,
+                recovery_gate.clone(),
             )
             .map_err(OidcLoginError::from)?,
             rate_limiter: PostgresOidcRateLimiter::new(pool, ephemeral_key, tenant)
@@ -501,12 +503,20 @@ impl DynamicSsoService {
         now: OffsetDateTime,
         peer_ip: &str,
         user_agent: Option<&str>,
+        request: OriginalLoginRequest,
     ) -> Result<crate::auth::oidc::IssuedSession, DynamicSsoError> {
-        let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
+        request.check().map_err(OidcLoginError::from)?;
+        let deadline = request.deadline();
+        let cancel = request.cancellation();
         let coordinator = self.oidc_coordinator([])?;
-        let attempt = coordinator
-            .begin_callback(provider, state, now, peer_ip)
-            .await?;
+        let attempt = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(unavailable()),
+            result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                coordinator.begin_callback(provider, state, now, peer_ip),
+            ) => result.map_err(|_| unavailable())??,
+        };
         let binding = attempt.incarnation();
         let admission = self.admission(deadline).await?;
         let mut client = self.guarded(deadline).await?;
@@ -514,13 +524,23 @@ impl DynamicSsoService {
             .begin_read_committed()
             .await
             .map_err(|_| unavailable())?;
-        let loaded = self
-            .store
-            .load_bound_in_transaction(tx.as_transaction(), provider, &binding, &admission)
-            .await?
-            .ok_or(DynamicSsoError::ProviderUnknown)?;
-        let expected = loaded.internal_id;
-        let runtime = self.discover_loaded_oidc(loaded).await?;
+        let load = async {
+            let loaded = self
+                .store
+                .load_bound_in_transaction(tx.as_transaction(), provider, &binding, &admission)
+                .await?
+                .ok_or(DynamicSsoError::ProviderUnknown)?;
+            let expected = loaded.internal_id;
+            let runtime = self.discover_loaded_oidc(loaded).await?;
+            Ok::<_, DynamicSsoError>((expected, runtime))
+        };
+        let (expected, runtime) = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(unavailable()),
+            result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), load) => {
+                result.map_err(|_| unavailable())??
+            }
+        };
         let callback = dynamic_oidc_callback(&self.public_url, provider)?;
         // After the token/JWKS responses and before the session: the same
         // admission and the locked row's id must still be current.
@@ -551,10 +571,24 @@ impl DynamicSsoService {
                 now,
                 peer_ip,
                 user_agent,
+                request,
+                Some(&admission),
                 recheck,
             )
             .await?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
+        if cancel.is_cancelled() {
+            return Err(unavailable());
+        }
         tx.commit().await.map_err(|_| unavailable())?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
+        if cancel.is_cancelled() {
+            return Err(unavailable());
+        }
         Ok(issued)
     }
 
@@ -568,72 +602,110 @@ impl DynamicSsoService {
         peer_ip: &str,
         user_agent: Option<&str>,
     ) -> Result<crate::auth::oidc::IssuedSession, DynamicSsoError> {
-        let deadline = Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET;
-        if !self
-            .rate_limiter
-            .evaluate(
-                crate::auth::oidc::OidcRateLimitBucket::CallbackIp,
-                peer_ip,
-                SAML_CALLBACK_RATE,
-                now,
-            )
-            .await
-            .map_err(OidcLoginError::from)?
-            .allowed()
-        {
-            return Err(DynamicSsoError::RateLimited);
-        }
-        // RelayState 必须先烧；provider 删除、metadata 坏、签名错都不允许重试同一 request。
-        let attempt = self
-            .saml_attempts
-            .consume(relay_state, provider, now)
-            .await?;
+        let request = OriginalLoginRequest::new(
+            Instant::now() + DYNAMIC_SSO_LOGIN_BUDGET,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let deadline = request.deadline();
+        let cancel = request.cancellation();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let begin = async {
+            if !self
+                .rate_limiter
+                .evaluate(
+                    crate::auth::oidc::OidcRateLimitBucket::CallbackIp,
+                    peer_ip,
+                    SAML_CALLBACK_RATE,
+                    now,
+                )
+                .await
+                .map_err(OidcLoginError::from)?
+                .allowed()
+            {
+                return Err(DynamicSsoError::RateLimited);
+            }
+            // RelayState 必须先烧；provider 删除、metadata 坏、签名错都不允许重试同一 request。
+            self.saml_attempts
+                .consume(relay_state, provider, now)
+                .await
+                .map_err(Into::into)
+        };
+        let attempt = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(unavailable()),
+            result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), begin) => {
+                result.map_err(|_| unavailable())??
+            }
+        };
         let admission = self.admission(deadline).await?;
         let mut client = self.guarded(deadline).await?;
         let tx = client
             .begin_read_committed()
             .await
             .map_err(|_| unavailable())?;
-        let binding = ProviderIncarnationBinding::Dynamic {
-            provider_internal_id: attempt.internal_id,
-        };
-        // The burned binding is compared under the row lock, before the runtime loads.
-        let loaded = self
-            .store
-            .load_bound_in_transaction(tx.as_transaction(), provider, &binding, &admission)
-            .await?
-            .ok_or(DynamicSsoError::ProviderUnknown)?;
-        let runtime = self.saml_runtime(loaded, now)?;
-        let verified = runtime.runtime.verify_response(
-            encoded_response,
-            &attempt.request_id,
-            &attempt.acs_url,
-            now,
-        )?;
-        self.saml_attempts
-            .burn_assertion(
-                provider,
-                &verified.issuer,
-                &verified.assertion_id,
-                verified.assertion_expires_at,
+        let verify = async {
+            let binding = ProviderIncarnationBinding::Dynamic {
+                provider_internal_id: attempt.internal_id,
+            };
+            // The burned binding is compared under the row lock, before the runtime loads.
+            let loaded = self
+                .store
+                .load_bound_in_transaction(tx.as_transaction(), provider, &binding, &admission)
+                .await?
+                .ok_or(DynamicSsoError::ProviderUnknown)?;
+            let runtime = self.saml_runtime(loaded, now)?;
+            let verified = runtime.runtime.verify_response(
+                encoded_response,
+                &attempt.request_id,
+                &attempt.acs_url,
                 now,
-            )
-            .await?;
-        admission
-            .verify_current_before(deadline)
-            .map_err(|_| unavailable())?;
-        let issued = self
-            .sessions
-            .issue_federated(
-                &verified.identity,
-                &verified.provider,
+            )?;
+            self.saml_attempts
+                .burn_assertion(
+                    provider,
+                    &verified.issuer,
+                    &verified.assertion_id,
+                    verified.assertion_expires_at,
+                    now,
+                )
+                .await?;
+            admission
+                .verify_current_before(deadline)
+                .map_err(|_| unavailable())?;
+            Ok::<_, DynamicSsoError>(VerifiedCurrentFederatedLogin::from_saml_callback(
+                verified.identity,
+                verified.provider,
                 now,
                 Some(peer_ip),
                 user_agent,
-            )
+                &admission,
+            ))
+        };
+        let login = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(unavailable()),
+            result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), verify) => {
+                result.map_err(|_| unavailable())??
+            }
+        };
+        let issued = self
+            .sessions
+            .issue_current_login(login, request)
             .await
             .map_err(OidcLoginError::from)?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
+        if cancel.is_cancelled() {
+            return Err(unavailable());
+        }
         tx.commit().await.map_err(|_| unavailable())?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
+        if cancel.is_cancelled() {
+            return Err(unavailable());
+        }
         Ok(issued)
     }
 

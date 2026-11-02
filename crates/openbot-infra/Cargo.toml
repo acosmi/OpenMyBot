@@ -14,7 +14,7 @@ workspace = true
 # Server keeps the complete network + OIDC + SAML surface by default. Desktop Local consumes only
 # database/bootstrap adapters; it must not compile the Server TLS or xmlsec/OpenSSL graphs.
 default = ["server-sso"]
-desktop-local = []
+desktop-local = ["dep:wrok-bot-macos-local-auth"]
 desktop-local-vault = ["desktop-local"]
 server-runtime = [
     "dep:acosmi-sdk",
@@ -136,3 +136,7 @@ axum.workspace = true
 [target.'cfg(unix)'.dependencies]
 # Existing locked safe syscall wrapper; descriptor-relative backup IO, no application unsafe.
 rustix.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The pre-window Current receipt consumes the actual native confirmation and cleanup owners.
+wrok-bot-macos-local-auth = { workspace = true, optional = true }

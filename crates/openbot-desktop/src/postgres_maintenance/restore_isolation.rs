@@ -7,40 +7,40 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use super::super::bundle::{Program, VerifiedMaintenanceBundle};
+use crate::postgres_sidecar::{PostgresProgram, VerifiedPostgresBundle};
 
 /// A borrowed original directory, not an authority reconstructed from a pathname.
-pub(super) struct Directory<'a> {
-    pub(super) path: &'a Path,
-    pub(super) original: &'a File,
+pub(crate) struct Directory<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) original: &'a File,
 }
 
 /// The original producer supplies these exact, independently created generation children.
-pub(super) struct Generation<'a> {
-    pub(super) root: Directory<'a>,
-    pub(super) data: Directory<'a>,
-    pub(super) wal: Directory<'a>,
-    pub(super) temp: Directory<'a>,
-    pub(super) uds: Directory<'a>,
-    pub(super) materials: Directory<'a>,
+pub(crate) struct Generation<'a> {
+    pub(crate) root: Directory<'a>,
+    pub(crate) data: Directory<'a>,
+    pub(crate) wal: Directory<'a>,
+    pub(crate) temp: Directory<'a>,
+    pub(crate) uds: Directory<'a>,
+    pub(crate) materials: Directory<'a>,
 }
 
 /// Only a trusted parent plus one component can name a protected, possibly absent old site.
-pub(super) struct ExcludedLocation<'a> {
-    pub(super) parent: Directory<'a>,
-    pub(super) component: &'a str,
+pub(crate) struct ExcludedLocation<'a> {
+    pub(crate) parent: Directory<'a>,
+    pub(crate) component: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum IsolationFault {
+pub(crate) enum IsolationFault {
     IsolationUnproven,
     CapacityExceeded,
 }
 
 /// Raw IO remains available to the enclosing original owner; formatting is redacted.
-pub(super) struct IsolationFailure {
-    pub(super) fault: IsolationFault,
-    pub(super) original_io: Option<io::Error>,
+pub(crate) struct IsolationFailure {
+    pub(crate) fault: IsolationFault,
+    pub(crate) original_io: Option<io::Error>,
 }
 impl std::fmt::Debug for IsolationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,7 +72,7 @@ impl From<io::Error> for IsolationFailure {
 
 /// Immutable projection inputs stay borrowed from the same resident producer.
 /// No clock, filesystem mutation, secret-store operation or native process is created here.
-pub(super) struct RestoreIsolationPolicy<'a> {
+pub(crate) struct RestoreIsolationPolicy<'a> {
     generation: Generation<'a>,
     excluded: [ExcludedLocation<'a>; 3],
     // Exact OS loader/cache files from the trusted host's closed native input inventory.
@@ -82,7 +82,7 @@ pub(super) struct RestoreIsolationPolicy<'a> {
 }
 
 impl<'a> RestoreIsolationPolicy<'a> {
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         generation: Generation<'a>,
         excluded: [ExcludedLocation<'a>; 3],
         system_loader_files: &'a [&'a Path],
@@ -102,7 +102,7 @@ impl<'a> RestoreIsolationPolicy<'a> {
         Ok(policy)
     }
 
-    pub(super) fn revalidate(&self) -> Result<(), IsolationFailure> {
+    pub(crate) fn revalidate(&self) -> Result<(), IsolationFailure> {
         let g = &self.generation;
         let identity = directory(&g.root, true)?;
         for (child, name) in [
@@ -146,37 +146,37 @@ impl<'a> RestoreIsolationPolicy<'a> {
 
     /// Return the real sandbox-exec Command which the original runner must spawn and wait.
     /// This does not execute it or prove that the current OS supports the complete policy.
-    pub(super) fn checked_postgres_command(
+    pub(crate) fn checked_postgres_command(
         &self,
-        bundle: &VerifiedMaintenanceBundle,
+        bundle: &VerifiedPostgresBundle,
         args: &[std::ffi::OsString],
     ) -> Result<Command, super::RestoreProgramFailure> {
         self.revalidate()
             .map_err(super::RestoreProgramFailure::Isolation)?;
-        let resource = bundle.root().join("postgres-maintenance");
+        let resource = bundle.root();
         for location in &self.excluded {
             let excluded = location.parent.path.join(location.component);
-            if overlaps(&resource, &excluded) {
+            if overlaps(resource, &excluded) {
                 return Err(super::RestoreProgramFailure::Isolation(unproven()));
             }
         }
-        if overlaps(&resource, self.generation.root.path) {
+        if overlaps(resource, self.generation.root.path) {
             return Err(super::RestoreProgramFailure::Isolation(unproven()));
         }
-        let executable = resource.join("bin/postgres");
+        let executable = bundle.postgres();
         let profile = self
-            .render(&resource, &executable)
+            .render(resource, executable)
             .map_err(super::RestoreProgramFailure::Isolation)?;
         // Render first, then recheck the complete original authenticated program
         // and loader tree. The runner repeats directory identity checks at spawn.
         let verified = bundle
-            .checked_command(Program::Postgres)
+            .checked_command(PostgresProgram::Server)
             .map_err(super::RestoreProgramFailure::Bundle)?;
         if verified.as_std().get_program() != executable.as_os_str() {
             return Err(super::RestoreProgramFailure::Isolation(unproven()));
         }
         let mut command = Command::new("/usr/bin/sandbox-exec");
-        command.arg("-p").arg(profile).arg(&executable).args(args);
+        command.arg("-p").arg(profile).arg(executable).args(args);
         command
             .env_clear()
             .env("LC_ALL", "C")
@@ -189,7 +189,7 @@ impl<'a> RestoreIsolationPolicy<'a> {
         Ok(command)
     }
 
-    pub(super) fn generation_identity(&self) -> Result<[u64; 3], IsolationFailure> {
+    pub(crate) fn generation_identity(&self) -> Result<[u64; 3], IsolationFailure> {
         self.revalidate()?;
         let metadata = self.generation.root.original.metadata()?;
         Ok([metadata.dev(), metadata.ino(), u64::from(metadata.uid())])

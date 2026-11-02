@@ -17,6 +17,8 @@ use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::backup::whole_pg_restore_stream::PendingRestoreCandidateAuthority;
+
 use super::activation::{
     ExpectedServerDatabase, Hex32, Hex64, OrdinaryStartupBounds, PublishedActivation,
     ServiceConfigRef,
@@ -966,26 +968,357 @@ pub fn load_service_recovery_host_from_config(
 }
 
 enum HostOrigin {
-    LocalRelease(File),
+    #[cfg(feature = "desktop-local")]
+    LocalRelease {
+        program: (File, std::ffi::OsString, File),
+        release: (File, std::ffi::OsString, File),
+        actual: crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
+        identities: Option<[RecoveryFileIdentity; 4]>,
+        metadata: [Option<io::Result<Metadata>>; 4],
+        named: [Option<rustix::io::Result<rustix::fs::Stat>>; 2],
+    },
     ServiceConfig(File),
 }
 
-enum OriginalRequestPurpose {
-    RestoreSame,
-    RestoreNew,
-    AdoptLegacy,
-    ReconfirmCurrent,
+/// Closed request purpose; observing it grants no operation authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRequestPurpose {
+    RestoreSameInstallation,
+    RestoreNewInstallation,
+    AdoptOrdinaryLegacy,
+    ReconfirmCurrentBinding,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureUuid(uuid::Uuid);
+
+impl<'de> Deserialize<'de> for CaptureUuid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = CaptureUuid;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a canonical lowercase hyphenated capture UUID")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                let parsed =
+                    uuid::Uuid::parse_str(value).map_err(|_| E::custom("invalid capture UUID"))?;
+                let mut canonical = [0u8; 36];
+                if parsed.hyphenated().encode_lower(&mut canonical) != value
+                    || parsed.as_bytes()[6] >> 4 != 4
+                    || parsed.as_bytes()[8] >> 6 != 2
+                {
+                    return Err(E::custom("invalid capture UUID"));
+                }
+                Ok(CaptureUuid(parsed))
+            }
+        }
+        deserializer.deserialize_str(Visitor)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreFileSelection {
+    parent: PathBuf,
+    component: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreInputSelection {
+    carrier: RestoreFileSelection,
+    key_medium: RestoreFileSelection,
+    expected_bundle_id: CaptureUuid,
+    expected_source_operation_id: CaptureUuid,
+    expected_manifest_sha256: Hex64,
+    target: RestoreFileSelection,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreRequestWire {
+    format_version: u32,
+    request_id: Hex32,
+    purpose: RecoveryRequestPurpose,
+    expected_reviewed_release_digest: Hex64,
+    expected_deployment_id: String,
+    expected_tenant_id: String,
+    expected_dataset_id: Hex32,
+    expected_source_installation_id: Hex64,
+    expected_target_installation_id: Hex64,
+    trusted_input_selection: RestoreInputSelection,
+    profile: super::RestoreOperationProfile,
+}
+
+struct RecoveryRequestV1 {
+    request_id: Hex32,
+    purpose: RecoveryRequestPurpose,
+    expected: RecoveryRequestExpected,
+    selection: RestoreInputSelection,
+    profile: super::RestoreOperationProfile,
+}
+
+fn decode_restore_request(
+    raw: &[u8],
+    limits: &TrustedHostRecoveryLimits,
+) -> Result<RecoveryRequestV1, RecoveryControlError> {
+    let wire: RestoreRequestWire =
+        serde_json::from_slice(raw).map_err(RecoveryControlError::from_json)?;
+    if wire.format_version != 1
+        || !matches!(
+            wire.purpose,
+            RecoveryRequestPurpose::RestoreSameInstallation
+                | RecoveryRequestPurpose::RestoreNewInstallation
+        )
+    {
+        return Err(service_invalid());
+    }
+    for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] {
+        super::id(value, limits.max_id_bytes)?;
+    }
+    hex(wire.expected_source_installation_id.as_str(), 64, true)?;
+    hex(wire.expected_target_installation_id.as_str(), 64, true)?;
+    let same = wire.expected_source_installation_id == wire.expected_target_installation_id;
+    if same
+        != matches!(
+            wire.purpose,
+            RecoveryRequestPurpose::RestoreSameInstallation
+        )
+    {
+        return Err(service_invalid());
+    }
+    for selection in [
+        &wire.trusted_input_selection.carrier,
+        &wire.trusted_input_selection.key_medium,
+        &wire.trusted_input_selection.target,
+    ] {
+        service_absolute(&selection.parent)?;
+        component(&selection.component, limits)?;
+        if selection.parent.components().count() as u64 > limits.max_path_depth
+            || selection.parent.as_os_str().len() as u64 > limits.max_relative_path_bytes
+        {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::CapacityExceeded,
+            ));
+        }
+    }
+    Ok(RecoveryRequestV1 {
+        request_id: wire.request_id,
+        purpose: wire.purpose,
+        expected: RecoveryRequestExpected {
+            reviewed_release_digest: wire.expected_reviewed_release_digest,
+            deployment_id: wire.expected_deployment_id,
+            tenant_id: wire.expected_tenant_id,
+            dataset_id: wire.expected_dataset_id,
+            source_installation_id: wire.expected_source_installation_id,
+            target_installation_id: wire.expected_target_installation_id,
+        },
+        selection: wire.trusted_input_selection,
+        profile: wire.profile,
+    })
+}
+
+/// Independent expected identities sealed by the one request parser.
+pub struct RecoveryRequestExpected {
+    reviewed_release_digest: Hex64,
+    deployment_id: String,
+    tenant_id: String,
+    dataset_id: Hex32,
+    source_installation_id: Hex64,
+    target_installation_id: Hex64,
+}
+
+impl RecoveryRequestExpected {
+    pub fn reviewed_release_digest(&self) -> &str {
+        self.reviewed_release_digest.as_str()
+    }
+    pub fn deployment_id(&self) -> &str {
+        &self.deployment_id
+    }
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    pub fn dataset_id(&self) -> &str {
+        self.dataset_id.as_str()
+    }
+    pub fn source_installation_id(&self) -> &str {
+        self.source_installation_id.as_str()
+    }
+    pub fn target_installation_id(&self) -> &str {
+        self.target_installation_id.as_str()
+    }
 }
 
 /// Original live host evidence, never Deserialize/Clone or a supplied digest.
 pub struct VerifiedRecoveryHost {
-    control_root: RecoveryFileIdentity,
-    reviewed_release_digest: String,
+    reviewed_release_digest: [u8; 32],
+    limits: TrustedHostRecoveryLimits,
     uid: u32,
     original: HostOrigin,
-    request_identity: RecoveryFileIdentity,
-    request_digest: [u8; 32],
-    request_purpose: OriginalRequestPurpose,
+}
+
+impl VerifiedRecoveryHost {
+    pub(super) fn trusted_limits(&self) -> &TrustedHostRecoveryLimits { &self.limits }
+    /// Consume the original executable and verified release handles. Request
+    /// facts and the control identity are sealed later by the control owner.
+    #[cfg(feature = "desktop-local")]
+    pub fn from_local_release(
+        program: (File, std::ffi::OsString, File),
+        release: (File, std::ffi::OsString, File),
+        actual: crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
+        reviewed_digest: [u8; 32],
+        limits: TrustedHostRecoveryLimits,
+    ) -> Result<Self, RecoveryControlError> {
+        let mut host = Self {
+            reviewed_release_digest: reviewed_digest,
+            limits,
+            uid: rustix::process::getuid().as_raw(),
+            original: HostOrigin::LocalRelease {
+                program,
+                release,
+                actual,
+                identities: None,
+                metadata: std::array::from_fn(|_| None),
+                named: std::array::from_fn(|_| None),
+            },
+        };
+        let result = (|| {
+            let deadline = Instant::now()
+                .checked_add(Duration::from_nanos(host.limits.admission_ns))
+                .ok_or_else(service_invalid)?;
+            host.limits.clone().checked()?;
+            let (bytes, files) = host.retained_usage()?;
+            if bytes > host.limits.max_metadata_bytes || files > host.limits.max_open_files {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
+            }
+            host.recheck_original(deadline)
+        })();
+        match result {
+            Ok(()) => Ok(host),
+            Err(mut error) => {
+                error.retained_host = Some(Box::new(host));
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
+        let fixed = std::mem::size_of::<Self>() as u64;
+        match &self.original {
+            #[cfg(feature = "desktop-local")]
+            HostOrigin::LocalRelease {
+                program,
+                release,
+                actual,
+                ..
+            } => {
+                let bytes = fixed
+                    .checked_add(program.1.capacity() as u64)
+                    .and_then(|n| n.checked_add(release.1.capacity() as u64))
+                    .and_then(|n| n.checked_add(actual.retained_path_bytes()))
+                    .ok_or_else(|| {
+                        RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                    })?;
+                Ok((bytes, 4))
+            }
+            HostOrigin::ServiceConfig(_) => Ok((fixed, 1)),
+        }
+    }
+
+    fn recheck_original(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        before(deadline)?;
+        if self.uid != rustix::process::getuid().as_raw()
+            || self.uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(service_invalid());
+        }
+        match &mut self.original {
+            #[cfg(feature = "desktop-local")]
+            HostOrigin::LocalRelease {
+                program,
+                release,
+                actual,
+                identities,
+                metadata,
+                named,
+            } => {
+                for name in [&program.1, &release.1] {
+                    component(name.to_str().ok_or_else(service_invalid)?, &self.limits)?;
+                }
+                service_absolute(actual.as_path())?;
+                for (slot, file) in metadata
+                    .iter_mut()
+                    .zip([&program.0, &program.2, &release.0, &release.2])
+                {
+                    *slot = Some(file.metadata());
+                    before(deadline)?;
+                    if !matches!(slot, Some(Ok(_))) {
+                        return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
+                    }
+                }
+                let held = metadata.each_ref().map(|slot| {
+                    slot.as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .expect("checked original metadata")
+                });
+                if !held[0].is_dir()
+                    || !held[1].is_file()
+                    || held[1].nlink() != 1
+                    || !held[2].is_dir()
+                    || !held[3].is_dir()
+                    || held.iter().any(|m| m.uid() != self.uid && m.uid() != 0)
+                {
+                    return Err(service_invalid());
+                }
+                let observed = held.map(identity);
+                if identities
+                    .as_ref()
+                    .is_some_and(|previous| *previous != observed)
+                {
+                    return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+                }
+                named[0] = Some(rustix::fs::statat(
+                    &program.0,
+                    &program.1,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                ));
+                before(deadline)?;
+                named[1] = Some(rustix::fs::statat(
+                    &release.0,
+                    &release.1,
+                    AtFlags::SYMLINK_NOFOLLOW,
+                ));
+                before(deadline)?;
+                for (slot, index, kind) in [
+                    (0, 1, rustix::fs::FileType::RegularFile),
+                    (1, 3, rustix::fs::FileType::Directory),
+                ] {
+                    let n = named[slot]
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .ok_or_else(|| {
+                            RecoveryControlError::new(RecoveryControlFault::IoFailure)
+                        })?;
+                    let h = held[index];
+                    if n.st_dev as u64 != h.dev()
+                        || n.st_ino as u64 != h.ino()
+                        || n.st_uid != h.uid()
+                        || u32::from(n.st_mode) != h.mode()
+                        || rustix::fs::FileType::from_raw_mode(n.st_mode) != kind
+                    {
+                        return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+                    }
+                }
+                *identities = Some(observed);
+                Ok(())
+            }
+            HostOrigin::ServiceConfig(_) => Err(service_invalid()),
+        }
+    }
 }
 
 /// Original private request, held with its named parent and actual identity.
@@ -996,12 +1329,878 @@ pub struct OwnedRecoveryRequestFile {
     identity: RecoveryFileIdentity,
 }
 
+pub(super) struct RequestOpenOwner {
+    parent: Option<File>,
+    component: std::ffi::OsString,
+    file: Option<io::Result<File>>,
+    metadata: Option<io::Result<Metadata>>,
+    named: Option<rustix::io::Result<rustix::fs::Stat>>,
+}
+
+impl OwnedRecoveryRequestFile {
+    pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
+        if self.file.is_none() { return Err(service_invalid()); }
+        let bytes = (std::mem::size_of::<Self>() as u64).checked_add(self.component.capacity() as u64)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        Ok((bytes, 2))
+    }
+    /// Retain one private request selected below the original host-owned parent.
+    /// The caller accounts for these handles under its reviewed host limits before opening;
+    /// bounded bytes, complete readback and the closed request are verified by `verify_intent`.
+    pub fn from_held(
+        parent: File,
+        component: &std::ffi::OsStr,
+        uid: u32,
+    ) -> Result<Self, RecoveryControlError> {
+        let mut original = RequestOpenOwner {
+            parent: Some(parent),
+            component: component.to_os_string(),
+            file: None,
+            metadata: None,
+            named: None,
+        };
+        let result = (|| {
+            let name = original.component.to_str().ok_or_else(service_invalid)?;
+            if uid != rustix::process::getuid().as_raw()
+                || rustix::process::geteuid().as_raw() != uid
+                || name.is_empty()
+                || matches!(name, "." | "..")
+                || name.as_bytes().contains(&b'/')
+                || name.as_bytes().contains(&0)
+            {
+                return Err(service_invalid());
+            }
+            original.metadata = Some(
+                original
+                    .parent
+                    .as_ref()
+                    .ok_or_else(service_invalid)?
+                    .metadata(),
+            );
+            let parent_metadata = original
+                .metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+            if !parent_metadata.is_dir()
+                || parent_metadata.uid() != uid
+                || parent_metadata.mode() & 0o7777 != 0o700
+            {
+                return Err(service_invalid());
+            }
+            original.file = Some(
+                rustix::fs::openat(
+                    original.parent.as_ref().ok_or_else(service_invalid)?,
+                    &original.component,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(io::Error::from),
+            );
+            let file = original
+                .file
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+            original.metadata = Some(file.metadata());
+            let metadata = original
+                .metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+            let stamp = ServiceFileStamp::of(metadata, uid)?;
+            original.named = Some(rustix::fs::statat(
+                original.parent.as_ref().ok_or_else(service_invalid)?,
+                &original.component,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
+            let named = original
+                .named
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+            if named.st_dev as u64 != stamp.identity.device
+                || named.st_ino as u64 != stamp.identity.inode
+                || named.st_uid != uid
+                || named.st_mode & 0o7777 != 0o600
+                || named.st_nlink != 1
+                || rustix::fs::FileType::from_raw_mode(named.st_mode)
+                    != rustix::fs::FileType::RegularFile
+            {
+                return Err(service_invalid());
+            }
+            Ok(stamp.identity)
+        })();
+        match result {
+            Ok(identity) => Ok(Self {
+                file: Some(
+                    original
+                        .file
+                        .take()
+                        .expect("observed original open")
+                        .expect("successful original open"),
+                ),
+                parent: original.parent.take().expect("original parent retained"),
+                component: std::mem::take(&mut original.component)
+                    .into_string()
+                    .expect("checked UTF-8 component"),
+                identity,
+            }),
+            Err(mut error) => {
+                error.retained_request = Some(Box::new(original));
+                Err(error)
+            }
+        }
+    }
+}
+
 /// Once verified input. It does not itself perform or complete a restore.
 pub struct VerifiedRecoveryHostIntent {
     pub(super) host: VerifiedRecoveryHost,
     request: OwnedRecoveryRequestFile,
     request_bytes: Vec<u8>,
+    control_root: RecoveryFileIdentity,
+    request_digest: [u8; 32],
+    decoded: RecoveryRequestV1,
     original_deadline: Instant,
+}
+
+impl VerifiedRecoveryHostIntent {
+    pub fn purpose(&self) -> RecoveryRequestPurpose {
+        self.decoded.purpose
+    }
+    pub fn restore_profile(&self) -> Option<&super::RestoreOperationProfile> {
+        Some(&self.decoded.profile)
+    }
+    pub fn expected(&self) -> &RecoveryRequestExpected {
+        &self.decoded.expected
+    }
+}
+
+struct RestoreOperationOwner {
+    intent: VerifiedRecoveryHostIntent,
+    operation: Hex32,
+    epoch: Hex64,
+    clock: super::clock::OperationClock,
+    profile: super::RestoreOperationProfile,
+    ledger: super::RestoreCapacityLedger,
+    pending: Option<OwnedRecord>,
+    pending_stage: Option<super::activation::JournalReference>,
+    pending_closing: Option<RestoreClosingAllowance>,
+    confirmed_stages: Vec<super::activation::JournalReference>,
+    candidate_plan: super::activation::CandidatePlan,
+    candidate_plan_output: Option<OwnedRestoreCandidatePlan>,
+}
+
+struct RestoreClosingAllowance {
+    metadata_paid: u64,
+    metadata_left: u64,
+    journal_reserved: u64,
+    journal_written: Option<u64>,
+}
+
+struct RestoreClosingAccess<'a> {
+    files: &'a mut ControlFiles,
+}
+impl Deref for RestoreClosingAccess<'_> {
+    type Target = ControlFiles;
+    fn deref(&self) -> &Self::Target { self.files }
+}
+impl DerefMut for RestoreClosingAccess<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target { self.files }
+}
+impl Drop for RestoreClosingAccess<'_> {
+    fn drop(&mut self) {
+        let allowance = self.files.closing_observation.take();
+        if let Some(operation) = &mut self.files.restore_operation {
+            operation.pending_closing = allowance;
+        }
+        if std::thread::panicking() { self.files.latch(RecoveryControlFault::OwnerLost); }
+    }
+}
+
+pub struct OwnedRestoreCandidatePlan {
+    parent: File,
+    parent_path: PathBuf,
+    component: std::ffi::OsString,
+    generation_id: Hex32,
+    operation_id: Hex32,
+    source_installation_id: Hex64,
+    target_installation_id: Hex64,
+}
+
+impl OwnedRestoreCandidatePlan {
+    pub fn parent(&self) -> &File {
+        &self.parent
+    }
+    pub fn parent_path(&self) -> &Path {
+        &self.parent_path
+    }
+    pub fn component(&self) -> &std::ffi::OsStr {
+        &self.component
+    }
+    pub fn generation_id(&self) -> &str {
+        self.generation_id.as_str()
+    }
+    pub fn operation_id(&self) -> &str {
+        self.operation_id.as_str()
+    }
+    pub fn source_installation_id(&self) -> &str {
+        self.source_installation_id.as_str()
+    }
+    pub fn target_installation_id(&self) -> &str {
+        self.target_installation_id.as_str()
+    }
+}
+
+pub(crate) struct RestoreStages {
+    owner: ControlOwner,
+    operation: Hex32,
+}
+
+pub(crate) struct RestoreStageIntent {
+    operation: Hex32,
+    reference: super::activation::JournalReference,
+}
+
+impl RestoreStages {
+    pub(crate) fn check_capacity_before(&self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.owner)?;
+            state.verify_restore_live(self.operation, deadline)?;
+            state.observe_restore_capacity(deadline)
+        })();
+        result.map_err(|error: RecoveryControlError| { self.failure(error.fault()); error.retain(&self.owner) })
+    }
+    pub(crate) fn convergence_deadline(&self) -> Result<Instant, RecoveryControlError> {
+        let mut state = lock(&self.owner)?;
+        let deadline = state
+            .restore_operation
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .clock
+            .convergence_deadline();
+        state.restore_operation.as_ref().ok_or_else(service_invalid)?.clock.require_convergence()?;
+        state.post_original_owner(deadline)?;
+        Ok(deadline)
+    }
+    pub(crate) fn admit_capacity(
+        &mut self,
+        resource: super::RestoreCapacityResource,
+        additional: u64,
+    ) -> Result<super::RestoreCapacityReservation, RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.owner)?;
+            let deadline = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .convergence_deadline();
+            state.verify_restore_live(self.operation, deadline)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation.clock.require_effect()?;
+            operation.ledger.admit(resource, additional)?;
+            Ok(super::RestoreCapacityReservation {
+                operation: self.operation,
+                resource,
+                admitted: additional,
+            })
+        })();
+        result.map_err(|error: RecoveryControlError| {
+            self.failure(error.fault());
+            error.retain(&self.owner)
+        })
+    }
+
+    pub(crate) fn settle_capacity(
+        &mut self,
+        original: super::RestoreCapacityReservation,
+        observed: u64,
+    ) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.owner)?;
+            if original.operation != self.operation {
+                return Err(service_invalid());
+            }
+            let deadline = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .convergence_deadline();
+            state.verify_restore_live(self.operation, deadline)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation
+                .ledger
+                .settle(original.resource, original.admitted, observed)?;
+            operation.clock.require_convergence()
+        })();
+        result.map_err(|error: RecoveryControlError| {
+            self.failure(error.fault());
+            error.retain(&self.owner)
+        })
+    }
+
+    pub(crate) fn begin_stage_before(
+        &mut self,
+        stage: super::RestoreStage,
+        effect_id: &str,
+        deadline: Instant,
+    ) -> Result<RestoreStageIntent, RecoveryControlError> {
+        let result = (|| {
+            let deadline = self.effect_before(deadline)?;
+            let mut state = lock(&self.owner)?;
+            super::id(effect_id, state.limits.max_id_bytes)?;
+            if state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .pending_stage
+                .is_some()
+            {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ClosureUnproven,
+                ));
+            }
+            let bytes = effect_id
+                .len()
+                .checked_mul(2)
+                .and_then(|n| {
+                    n.checked_add(
+                        std::mem::size_of::<super::journal::JournalData>()
+                            + 2 * std::mem::size_of::<super::activation::JournalReference>()
+                            + 256,
+                    )
+                })
+                .ok_or_else(service_invalid)?;
+            state.prepay(bytes as u64, 0)?;
+            let data = super::journal::JournalData::stage_intent(stage, effect_id);
+            let frame_cap = state.limits.max_journal_frame_bytes.checked_add(44).ok_or_else(service_invalid)?;
+            let metadata_paid = frame_cap.checked_mul(16)
+                .and_then(|n| n.checked_add((2 * std::mem::size_of::<super::journal::JournalData>() + 512) as u64))
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            state.prepay(metadata_paid, 0)?;
+            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
+            operation.ledger.admit(super::RestoreCapacityResource::JournalBytes, frame_cap)?;
+            operation.ledger.admit(super::RestoreCapacityResource::JournalRecords, 1)?;
+            operation.pending_closing = Some(RestoreClosingAllowance { metadata_paid, metadata_left: metadata_paid, journal_reserved: frame_cap, journal_written: None });
+            let reference = state.append_journal(&self.operation, &data, deadline)?;
+            state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?
+                .pending_stage = Some(reference.clone());
+            Ok(RestoreStageIntent {
+                operation: self.operation,
+                reference,
+            })
+        })();
+        result.map_err(|error: RecoveryControlError| {
+            self.failure(error.fault());
+            error.retain(&self.owner)
+        })
+    }
+
+    pub(crate) fn observe_stage_before(
+        &mut self,
+        intent: RestoreStageIntent,
+        disposition: super::RestoreDisposition,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.owner)?;
+            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
+            if intent.operation != self.operation || operation.pending_stage.as_ref() != Some(&intent.reference) {
+                return Err(service_invalid());
+            }
+            let allowance = operation.pending_closing.take().ok_or_else(service_invalid)?;
+            state.closing_observation = Some(allowance);
+            let mut closing = RestoreClosingAccess { files: &mut state };
+            closing.verify_restore_live(self.operation, deadline)?;
+            let first_fault = closing.first_fault;
+            let data = super::journal::JournalData::stage_observed(intent.reference.sequence, disposition);
+            let confirmed = data.confirms_effect();
+            let reference = closing.append_journal(&self.operation, &data, deadline)?;
+            let allowance = closing.closing_observation.as_ref().ok_or_else(service_invalid)?;
+            let reserved = allowance.journal_reserved;
+            let written = allowance.journal_written.ok_or_else(service_invalid)?;
+            let metadata_paid = allowance.metadata_paid;
+            {
+                let operation = closing.restore_operation.as_mut().ok_or_else(service_invalid)?;
+                operation.ledger.settle_prepaid_observation(super::RestoreCapacityResource::JournalBytes, reserved, written)?;
+                operation.ledger.settle_prepaid_observation(super::RestoreCapacityResource::JournalRecords, 1, 1)?;
+                if confirmed {
+                    if operation.confirmed_stages.len() as u64 >= operation.profile.capacity.max_journal_records {
+                        return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+                    }
+                    operation.confirmed_stages.try_reserve_exact(1).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+                    operation.confirmed_stages.push(reference);
+                    operation.pending_stage = None;
+                }
+            }
+            // Only the completed serialization/frame/readback workspace retires.
+            // The original failure and persistent evidence remain resident.
+            drop(data);
+            drop(intent);
+            closing.budget.metadata = closing.budget.metadata.checked_sub(metadata_paid).ok_or_else(service_invalid)?;
+            let operation = closing.restore_operation.as_mut().ok_or_else(service_invalid)?;
+            let metadata = &mut operation.ledger.admitted[super::RestoreCapacityResource::MetadataBytes as usize];
+            *metadata = metadata.checked_sub(metadata_paid).ok_or_else(service_invalid)?;
+            closing.closing_observation = None;
+            match (first_fault, confirmed) {
+                (Some(fault), _) => Err(RecoveryControlError::new(fault)),
+                (None, true) => Ok(()),
+                (None, false) => Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)),
+            }
+        })();
+        result.map_err(|error: RecoveryControlError| {
+            self.failure(error.fault());
+            error.retain(&self.owner)
+        })
+    }
+
+    pub(crate) fn failure(&self, fault: RecoveryControlFault) -> RecoveryControlError {
+        if let Ok(mut state) = lock(&self.owner) {
+            state.latch(fault);
+        }
+        RecoveryControlError::with_owner(fault, &self.owner)
+    }
+
+    pub(crate) fn original_native_clock(
+        &self,
+    ) -> Result<(u32, u64, u64, u64), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.owner)?;
+            let deadline = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .convergence_deadline();
+            state.verify_restore_live(self.operation, deadline)?;
+            let raw = state
+                .original_process_evidence
+                .as_ref()
+                .ok_or_else(service_invalid)?;
+            let pid = u32::from_be_bytes(
+                raw[..4]
+                    .try_into()
+                    .expect("original fixed process evidence"),
+            );
+            let (t0, effect, convergence) = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .observations();
+            Ok((pid, t0, effect, convergence))
+        })();
+        result.map_err(|error: RecoveryControlError| {
+            self.failure(error.fault());
+            error.retain(&self.owner)
+        })
+    }
+
+    pub(crate) fn effect_before(&self, deadline: Instant) -> Result<Instant, RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.owner)?;
+            state.verify_restore_live(self.operation, deadline)?;
+            state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .effect_before(deadline)
+        })();
+        result.map_err(|error: RecoveryControlError| {
+            self.failure(error.fault());
+            error.retain(&self.owner)
+        })
+    }
+
+    pub(crate) fn capacity_available(
+        &self,
+        resource: super::RestoreCapacityResource,
+    ) -> Result<u64, RecoveryControlError> {
+        let state = lock(&self.owner)?;
+        let ledger = &state
+            .restore_operation
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .ledger;
+        ledger
+            .ceiling(resource)
+            .checked_sub(ledger.admitted[resource as usize])
+            .ok_or_else(|| {
+                RecoveryControlError::with_owner(
+                    RecoveryControlFault::CapacityExceeded,
+                    &self.owner,
+                )
+            })
+    }
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl crate::backup::whole_pg_capture_stream::CaptureClockCheck for RestoreStages {
+    fn require_effect(
+        &self,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        self.effect_remaining_ns().map(|_| ())
+    }
+    fn require_closing(
+        &self,
+    ) -> Result<(), openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        self.closing_remaining_ns().map(|_| ())
+    }
+    fn effect_remaining_ns(
+        &self,
+    ) -> Result<u64, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        let (_, _, effect, _) = self.original_native_clock().map_err(|_| {
+            openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::ClockUnavailable
+        })?;
+        effect
+            .checked_sub(self.observed_ns()?)
+            .filter(|n| *n > 0)
+            .ok_or(openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::DeadlineExpired)
+    }
+    fn closing_remaining_ns(
+        &self,
+    ) -> Result<u64, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        let (_, _, _, convergence) = self.original_native_clock().map_err(|_| {
+            openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::ClockUnavailable
+        })?;
+        convergence
+            .checked_sub(self.observed_ns()?)
+            .filter(|n| *n > 0)
+            .ok_or(openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::DeadlineExpired)
+    }
+    fn observed_ns(
+        &self,
+    ) -> Result<u64, openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault> {
+        let mut state = lock(&self.owner).map_err(|_| {
+            openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::ClockUnavailable
+        })?;
+        let deadline = state
+            .restore_operation
+            .as_ref()
+            .ok_or(openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::ClockUnavailable)?
+            .clock
+            .convergence_deadline();
+        state
+            .verify_restore_live(self.operation, deadline)
+            .map_err(|_| {
+                openbot_domain::backup::whole_pg_carrier::WholePgCarrierFault::ClockUnavailable
+            })?;
+        Ok(state.process_monotonic_ns)
+    }
+}
+
+/// One original restore operation. Its clock, input and journal stay in the
+/// same control owner; the candidate has separate mutable custody.
+pub struct RestoreControlSession {
+    stages: RestoreStages,
+    candidate: Option<PendingRestoreCandidateAuthority>,
+}
+
+impl Drop for RestoreControlSession {
+    fn drop(&mut self) {
+        let Some(candidate) = self.candidate.take() else {
+            return;
+        };
+        let mut book = match self.stages.owner.lock() {
+            Ok(book) => book,
+            Err(poisoned) => {
+                let mut book = poisoned.into_inner();
+                book.fault.get_or_insert(RecoveryControlFault::OwnerLost);
+                book
+            }
+        };
+        // There is one non-Clone session for this original operation. A
+        // dropped caller cannot convert its still-owned candidate to closure.
+        book.retained_candidate = Some(candidate);
+    }
+}
+
+impl RestoreControlSession {
+    pub fn admit_new_child_before(&mut self, parent: &File, name: &std::ffi::OsStr, bytes: u64, kind: super::RestoreNewChildKind, deadline: Instant) -> Result<super::RestoreNewChildReservation, RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            component(name.to_str().ok_or_else(service_invalid)?, &state.limits)?;
+            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
+            operation.clock.require_effect()?;
+            let ledger = &mut operation.ledger;
+            ledger.observe_file(parent, false, deadline)?;
+            let metadata = ledger.raw_metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
+            if !metadata.is_dir() || bytes == 0 { return Err(service_invalid()); }
+            let parent = identity(metadata);
+            let fee = name.len().checked_mul(2).and_then(|n| n.checked_add(std::mem::size_of::<super::RestoreNewChildReservation>() + 2 * std::mem::size_of::<super::RestoreInodeUse>())).ok_or_else(service_invalid)?;
+            ledger.admit(super::RestoreCapacityResource::MetadataBytes, fee as u64)?;
+            ledger.admit(super::RestoreCapacityResource::OpenFiles, 1)?;
+            let old = ledger.inodes.capacity();
+            let additional = old.checked_add(1).and_then(|n| n.checked_sub(ledger.inodes.len())).ok_or_else(service_invalid)?;
+            ledger.inodes.try_reserve_exact(additional).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            if ledger.inodes.capacity().saturating_sub(old) > 2 { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); }
+            let device = ledger.devices.iter_mut().find(|device| device.device == parent.device).ok_or_else(service_invalid)?;
+            device.pending_new = device.pending_new.checked_add(bytes).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            ledger.check_storage()?;
+            Ok(super::RestoreNewChildReservation { operation: self.stages.operation, parent, component: name.to_os_string(), bytes, kind })
+        })();
+        self.retain_failure(result)
+    }
+
+    pub fn settle_new_child_before(&mut self, original: super::RestoreNewChildReservation, parent: &File, child: &File, deadline: Instant) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            if original.operation != self.stages.operation { return Err(service_invalid()); }
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            let uid = state.uid;
+            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
+            let ledger = &mut operation.ledger;
+            before(deadline)?;
+            ledger.raw_metadata = Some(parent.metadata());
+            operation.clock.require_convergence()?;
+            if identity(ledger.raw_metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?) != original.parent { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)); }
+            ledger.raw_metadata = Some(child.metadata());
+            operation.clock.require_convergence()?;
+            let metadata = ledger.raw_metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
+            let actual = identity(metadata);
+            let allocated = metadata.blocks().checked_mul(512).ok_or_else(service_invalid)?;
+            let valid_type = match original.kind {
+                super::RestoreNewChildKind::Directory => metadata.is_dir() && metadata.mode() & 0o7777 == 0o700,
+                super::RestoreNewChildKind::File => metadata.is_file() && metadata.mode() & 0o7777 == 0o600 && metadata.nlink() == 1,
+            };
+            if !valid_type || actual.device != original.parent.device || actual.uid != uid || allocated > original.bytes { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); }
+            ledger.raw_named = Some(rustix::fs::statat(parent, &original.component, AtFlags::SYMLINK_NOFOLLOW));
+            operation.clock.require_convergence()?;
+            let named = ledger.raw_named.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
+            if named.st_dev as u64 != actual.device || named.st_ino as u64 != actual.inode || named.st_uid != actual.uid || u32::from(named.st_mode) != metadata.mode() { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)); }
+            let device = ledger.devices.iter_mut().find(|device| device.device == actual.device).ok_or_else(service_invalid)?;
+            device.pending_new = device.pending_new.checked_sub(original.bytes).ok_or_else(service_invalid)?;
+            let observed = ledger.observe_file(child, false, deadline);
+            if observed.is_err() {
+                if let Some(device) = ledger.devices.iter_mut().find(|device| device.device == actual.device) { device.pending_new = device.pending_new.checked_add(original.bytes).ok_or_else(service_invalid)?; }
+            }
+            observed?;
+            operation.clock.require_convergence()
+        })();
+        self.retain_failure(result)
+    }
+
+    pub fn take_candidate_plan(
+        &mut self,
+    ) -> Result<OwnedRestoreCandidatePlan, RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            let deadline = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .convergence_deadline();
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation.clock.require_effect()?;
+            operation
+                .candidate_plan_output
+                .take()
+                .ok_or_else(service_invalid)
+        })();
+        self.retain_failure(result)
+    }
+    pub fn operation_id(&self) -> &str {
+        self.stages.operation.as_str()
+    }
+
+    /// Observe the original live pid/t0/E/C after the native owner and its
+    /// held locks have been rechecked. Serialized records cannot call this.
+    pub fn original_native_clock(&mut self) -> Result<(u32, u64, u64, u64), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            let deadline = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .convergence_deadline();
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            let raw = state
+                .original_process_evidence
+                .as_ref()
+                .ok_or_else(service_invalid)?;
+            let pid = u32::from_be_bytes(
+                raw[..4]
+                    .try_into()
+                    .expect("original fixed process evidence"),
+            );
+            let operation = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
+            let (t0, effect, convergence) = operation.clock.observations();
+            Ok((pid, t0, effect, convergence))
+        })();
+        self.retain_failure(result)
+    }
+
+    /// Check original ownership and actual retained storage under C. This is
+    /// the runner's observation callback; it does not authorize another effect.
+    pub fn check_capacity_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            state.observe_restore_capacity(deadline)
+        })();
+        self.retain_failure(result)
+    }
+
+    /// Admit explicit additional resources before their allocation or effect.
+    pub fn admit_capacity(
+        &mut self,
+        resource: super::RestoreCapacityResource,
+        additional: u64,
+    ) -> Result<super::RestoreCapacityReservation, RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            let deadline = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .convergence_deadline();
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation.clock.require_effect()?;
+            operation.ledger.admit(resource, additional)?;
+            Ok(super::RestoreCapacityReservation {
+                operation: self.stages.operation,
+                resource,
+                admitted: additional,
+            })
+        })();
+        self.retain_failure(result)
+    }
+
+    /// Merge an actual post-effect observation. Unknown work leaves its
+    /// reservation resident and never calls this with an invented zero.
+    pub fn settle_capacity(
+        &mut self,
+        original: super::RestoreCapacityReservation,
+        observed_additional: u64,
+    ) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            if original.operation != self.stages.operation {
+                return Err(service_invalid());
+            }
+            let deadline = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .clock
+                .convergence_deadline();
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation
+                .ledger
+                .settle(original.resource, original.admitted, observed_additional)?;
+            operation.clock.require_convergence()
+        })();
+        self.retain_failure(result)
+    }
+
+    pub fn admit_storage_before(
+        &mut self,
+        file: &File,
+        bytes: u64,
+        kind: super::RestoreStorageKind,
+        deadline: Instant,
+    ) -> Result<super::RestoreStorageReservation, RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation.clock.require_effect()?;
+            let ledger = &mut operation.ledger;
+            let key_medium = kind == super::RestoreStorageKind::KeyMedium;
+            ledger.observe_file(file, key_medium, deadline)?;
+            let metadata = ledger
+                .raw_metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+            let identity = identity(metadata);
+            let allocated_before = metadata
+                .blocks()
+                .checked_mul(512)
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            ledger.admit_disk_growth(identity, bytes)?;
+            Ok(super::RestoreStorageReservation {
+                operation: self.stages.operation,
+                identity,
+                allocated_before,
+                bytes,
+                kind,
+            })
+        })();
+        self.retain_failure(result)
+    }
+
+    pub fn settle_storage_before(
+        &mut self,
+        original: super::RestoreStorageReservation,
+        file: &File,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let mut state = lock(&self.stages.owner)?;
+            if original.operation != self.stages.operation {
+                return Err(service_invalid());
+            }
+            state.verify_restore_live(self.stages.operation, deadline)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation
+                .ledger
+                .settle_disk_growth(original, file, deadline)?;
+            operation.clock.require_convergence()
+        })();
+        self.retain_failure(result)
+    }
+
+    fn retain_failure<T>(
+        &self,
+        result: Result<T, RecoveryControlError>,
+    ) -> Result<T, RecoveryControlError> {
+        result.map_err(|error| {
+            if let Ok(mut state) = lock(&self.stages.owner) {
+                state.latch(error.fault());
+            }
+            error.retain(&self.stages.owner)
+        })
+    }
 }
 
 /// A verified published head with this process's enrollment input; only an
@@ -1018,6 +2217,187 @@ pub(super) struct OwnedRecord {
     pub(super) file: File,
     pub(super) identity: RecoveryFileIdentity,
     pub(super) bytes: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreRuntimeLocks {
+    control_root: RecoveryFileIdentity,
+    admission_lock: RecoveryFileIdentity,
+    runtime_lock: RecoveryFileIdentity,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreRuntimeEnrollment {
+    record_type: String,
+    version: u32,
+    control_id: Hex32,
+    nonce: Hex32,
+    boot_identity: String,
+    pid: u32,
+    process_start: super::journal::ProcessStart,
+    activation_digest: Hex64,
+    authorization_epoch: Hex64,
+    business_install_binding: super::activation::ActivationBinding,
+    root_and_lock_identities: RestoreRuntimeLocks,
+    resource_model: super::runtime::ResourceModel,
+    original_owner_set: Vec<super::runtime::RuntimeOwner>,
+}
+
+impl RestoreRuntimeEnrollment {
+    fn matches(&self, other: &Self) -> bool {
+        self.record_type == other.record_type
+            && self.version == other.version
+            && self.control_id == other.control_id
+            && self.nonce == other.nonce
+            && self.boot_identity == other.boot_identity
+            && self.pid == other.pid
+            && self.process_start.seconds == other.process_start.seconds
+            && self.process_start.nanos == other.process_start.nanos
+            && self.activation_digest == other.activation_digest
+            && self.authorization_epoch == other.authorization_epoch
+            && self.business_install_binding == other.business_install_binding
+            && self.root_and_lock_identities.control_root
+                == other.root_and_lock_identities.control_root
+            && self.root_and_lock_identities.admission_lock
+                == other.root_and_lock_identities.admission_lock
+            && self.root_and_lock_identities.runtime_lock
+                == other.root_and_lock_identities.runtime_lock
+            && self.resource_model == other.resource_model
+            && self.original_owner_set == other.original_owner_set
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RestoreConnectionDestruction {
+    ConnectingOwnerDestroyedBeforeStart,
+    ConnectingFutureDestroyed,
+    ConnectionDestroyed,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "data", deny_unknown_fields)]
+enum RestorePassiveRetirement {
+    SqlDriver(Vec<RestoreConnectionDestruction>),
+    ScreenHub,
+    NeverStarted(super::runtime::RuntimeOwner),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all_fields = "camelCase", deny_unknown_fields)]
+enum RestoreRuntimeFact {
+    NativeWait {
+        original_program_id: super::runtime::RuntimeOwner,
+        original_pid: u32,
+        original_start_identity: super::journal::ProcessStart,
+        exit: super::journal::NativeExit,
+        observed_ns: u64,
+        pipes: [super::journal::PipeJoin; 3],
+    },
+    TaskJoin {
+        original_task_id: super::runtime::RuntimeOwner,
+        outcome: super::runtime::RuntimeTaskOutcome,
+        observed_ns: u64,
+    },
+    PgAck {
+        original_owner: super::runtime::RuntimeOwner,
+        disposition: super::runtime::RuntimePgAck,
+    },
+    PassiveRetirement {
+        object: RestorePassiveRetirement,
+    },
+}
+
+impl RestoreRuntimeFact {
+    fn closed_owner(&self, observed: u64) -> Option<super::runtime::RuntimeOwner> {
+        use super::journal::{NativeExit, PipeJoin};
+        use super::runtime::{RuntimeOwner, RuntimePgAck, RuntimeTaskOutcome};
+        match self {
+            Self::NativeWait {
+                original_program_id,
+                original_pid,
+                original_start_identity,
+                exit,
+                observed_ns,
+                pipes,
+            } => {
+                if *original_pid == 0
+                    || original_start_identity.nanos >= 1_000_000_000
+                    || *observed_ns == 0
+                    || *observed_ns > observed
+                    || !matches!(exit, NativeExit::Code { .. } | NativeExit::Signal { .. })
+                    || pipes.iter().any(|pipe| match pipe {
+                        PipeJoin::Null => false,
+                        PipeJoin::Returned { observed_ns } => {
+                            *observed_ns == 0 || *observed_ns > observed
+                        }
+                        PipeJoin::Panicked { .. } | PipeJoin::JoinUnknown => true,
+                    })
+                {
+                    None
+                } else {
+                    Some(*original_program_id)
+                }
+            }
+            Self::TaskJoin {
+                original_task_id,
+                outcome: RuntimeTaskOutcome::Returned,
+                observed_ns,
+            } if *observed_ns != 0 && *observed_ns <= observed => Some(*original_task_id),
+            Self::PgAck {
+                original_owner,
+                disposition: RuntimePgAck::CommitAck | RuntimePgAck::RollbackAck,
+            } => Some(*original_owner),
+            Self::PassiveRetirement { object } => Some(match object {
+                RestorePassiveRetirement::SqlDriver(destructions) => {
+                    // Each closed value is one original adapter destruction;
+                    // an empty set is the registered never-connected case.
+                    let _ = destructions.len();
+                    RuntimeOwner::SqlDriver
+                }
+                RestorePassiveRetirement::ScreenHub => RuntimeOwner::ScreenHub,
+                RestorePassiveRetirement::NeverStarted(owner) => *owner,
+            }),
+            Self::TaskJoin { .. } => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreRuntimeReceipt {
+    record_type: String,
+    version: u32,
+    same_identity_tuple: RestoreRuntimeEnrollment,
+    enrollment_digest: Hex64,
+    original_resource_facts: Vec<RestoreRuntimeFact>,
+    retained_unknown_effect_refs: [(); 0],
+    clock_observations: [u64; 1],
+}
+
+struct RestoreRuntimeReadback {
+    directory: Option<File>,
+    enrollment: Option<OwnedRecord>,
+    receipt: Option<OwnedRecord>,
+    decoded_enrollment: Option<Result<RestoreRuntimeEnrollment, serde_json::Error>>,
+    decoded_receipt: Option<Result<RestoreRuntimeReceipt, serde_json::Error>>,
+}
+
+struct RestoreHeldSelection {
+    ancestors: Vec<ServiceAncestor>,
+    component: String,
+    original: Option<File>,
+    stamp: Option<ServiceFileStamp>,
+}
+
+struct RestoreIntentReadback {
+    directory: Option<File>,
+    journal: Option<File>,
+    header: [u8; 12],
+    bytes: Vec<u8>,
+    decoded: Option<Result<super::journal::JournalObservation, RecoveryControlError>>,
 }
 
 struct RawIo {
@@ -1077,6 +2457,20 @@ pub(super) struct ControlFiles {
     publication_chain: Option<Result<super::journal::JournalObservation, RecoveryControlError>>,
     publication_seal: Option<Result<super::journal::VerifiedPublication, RecoveryControlError>>,
     existing_server: Option<crate::db::initialization::OwnedExistingServerDatabase>,
+    #[cfg(feature = "desktop-local")]
+    local_root: Option<File>,
+    #[cfg(feature = "desktop-local")]
+    local_creation: Option<
+        Result<
+            (
+                crate::auth::single_user::desktop_local::DesktopLocalInstallation,
+                Option<crate::auth::single_user::desktop_local::OriginalFreshRoot>,
+            ),
+            crate::auth::single_user::desktop_local::DesktopLocalAuthorityError,
+        >,
+    >,
+    #[cfg(feature = "desktop-local")]
+    existing_local_pool: Option<crate::db::pool::DatabasePool>,
     existing_read_locks: bool,
     runtime_entropy: [u8; 16],
     raw_random: Option<Result<(), getrandom::Error>>,
@@ -1085,6 +2479,8 @@ pub(super) struct ControlFiles {
     pub(super) pending_owner: Option<File>,
     pending_request: Option<OwnedRecoveryRequestFile>,
     pending_host: Option<VerifiedRecoveryHost>,
+    raw_request_decode: Option<Result<RecoveryRequestV1, RecoveryControlError>>,
+    preheld_restore_usage: Option<(u64, u64)>,
     service_source: Option<VerifiedServiceRecoveryHost>,
     pub(super) runtime_record: Option<OwnedRecord>,
     pub(super) pending_startup: Option<RuntimeEntry>,
@@ -1095,6 +2491,13 @@ pub(super) struct ControlFiles {
     writer_held: bool,
     restore_journal: Option<Arc<OwnedRecord>>,
     restore_chain: Option<Result<super::journal::JournalObservation, RecoveryControlError>>,
+    restore_runtime_readbacks: Vec<RestoreRuntimeReadback>,
+    restore_operation: Option<RestoreOperationOwner>,
+    closing_observation: Option<RestoreClosingAllowance>,
+    pending_restore_intent: Option<VerifiedRecoveryHostIntent>,
+    restore_selections: [Option<RestoreHeldSelection>; 3],
+    restore_intent_readbacks: Vec<RestoreIntentReadback>,
+    restore_entropy: [u8; 96],
 }
 
 pub(super) struct ControlBook {
@@ -1102,6 +2505,7 @@ pub(super) struct ControlBook {
     retired_metadata: u64,
     retired_files: u64,
     fault: Option<RecoveryControlFault>,
+    retained_candidate: Option<PendingRestoreCandidateAuthority>,
 }
 pub(super) type ControlOwner = Arc<Mutex<ControlBook>>;
 
@@ -1257,17 +2661,190 @@ impl ControlFiles {
         let Some(Ok(observation)) = &self.activation_observation else {
             return false;
         };
-        let Ok((binding, _)) = observation.ordinary_active() else {
-            return false;
+        let binding = match observation.record.data() {
+            super::activation::ActivationPayload::Active(active) => &active.binding,
+            super::activation::ActivationPayload::Current(current) => &current.binding,
+            _ => return false,
         };
-        let Ok(binding) = binding.ordinary_server() else {
-            return false;
+        binding.scope() == (deployment, tenant) && self.matches_bound_pool(pool)
+    }
+
+    pub(super) fn matches_bound_pool(&self, pool: &crate::db::pool::DatabasePool) -> bool {
+        if self
+            .existing_server_pool()
+            .is_ok_and(|actual| std::ptr::eq(actual.manager(), pool.manager()))
+        {
+            return true;
+        }
+        #[cfg(feature = "desktop-local")]
+        if self
+            .existing_local_pool
+            .as_ref()
+            .is_some_and(|actual| std::ptr::eq(actual.manager(), pool.manager()))
+        {
+            return true;
+        }
+        false
+    }
+
+    #[cfg(feature = "desktop-local")]
+    pub(super) fn bind_original_local_pool(&mut self, pool: &crate::db::pool::DatabasePool) {
+        self.existing_local_pool = Some(pool.clone());
+    }
+
+    #[cfg(feature = "desktop-local")]
+    fn observe_local_root(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(Option<RecoveryFileIdentity>, RecoveryFileIdentity, String), RecoveryControlError>
+    {
+        let component = self
+            .app_component
+            .as_ref()
+            .and_then(|s| s.to_str())
+            .ok_or_else(service_invalid)?
+            .to_owned();
+        self.reserve_io(0)?;
+        self.raw.metadata = Some(self.parent.as_ref().ok_or_else(service_invalid)?.metadata());
+        self.post(deadline)?;
+        let parent = identity(
+            self.raw
+                .metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?,
+        );
+        self.reserve_io(1)?;
+        self.raw.file = Some(
+            rustix::fs::openat(
+                self.parent.as_ref().ok_or_else(service_invalid)?,
+                component.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from),
+        );
+        self.post(deadline)?;
+        let root = if self.raw.file.as_ref().is_some_and(|r| {
+            r.as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        }) {
+            None
+        } else {
+            let actual = self.check_opened(true, deadline)?;
+            self.local_root = Some(self.take_opened()?);
+            self.verify_local_root_before(actual, deadline)?;
+            Some(actual)
         };
-        binding.deployment_id == deployment
-            && binding.tenant_id == tenant
-            && self
-                .existing_server_pool()
-                .is_ok_and(|actual| std::ptr::eq(actual.manager(), pool.manager()))
+        Ok((root, parent, component))
+    }
+
+    #[cfg(feature = "desktop-local")]
+    pub(super) fn verify_local_root_before(
+        &mut self,
+        expected: RecoveryFileIdentity,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.reserve_io(0)?;
+        self.raw.metadata = Some(
+            self.local_root
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .metadata(),
+        );
+        self.post(deadline)?;
+        let meta = self
+            .raw
+            .metadata
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(service_invalid)?;
+        self.valid_meta(meta, true)?;
+        if identity(meta) != expected {
+            return Err(service_invalid());
+        }
+        self.reserve_io(0)?;
+        self.raw.named = Some(rustix::fs::statat(
+            self.parent.as_ref().ok_or_else(service_invalid)?,
+            self.app_component
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .as_os_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ));
+        self.post(deadline)?;
+        let named = self
+            .raw
+            .named
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(service_invalid)?;
+        if named.st_dev as u64 != expected.device
+            || named.st_ino as u64 != expected.inode
+            || named.st_uid != expected.uid
+            || named.st_mode & 0o7777 != 0o700
+            || rustix::fs::FileType::from_raw_mode(named.st_mode) != rustix::fs::FileType::Directory
+        {
+            return Err(service_invalid());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "desktop-local")]
+    pub(super) fn create_original_local_installation(
+        &mut self,
+        creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+        deadline: Instant,
+    ) -> Result<
+        (
+            crate::auth::single_user::desktop_local::DesktopLocalInstallation,
+            RecoveryFileIdentity,
+        ),
+        RecoveryControlError,
+    > {
+        let expected_path = self
+            .root_path
+            .parent()
+            .ok_or_else(service_invalid)?
+            .join(self.app_component.as_ref().ok_or_else(service_invalid)?);
+        if creator.original_app_data_root() != expected_path {
+            return Err(service_invalid());
+        }
+        self.reserve_io(1)?;
+        before(deadline)?;
+        self.local_creation = Some(creator.load_or_create_installation_for_recovery());
+        self.post(deadline)?;
+        let (installation, fresh) = match self.local_creation.take() {
+            Some(Ok(created)) => created,
+            other => {
+                self.local_creation = other;
+                return Err(service_invalid());
+            }
+        };
+        self.local_root = Some(
+            fresh
+                .ok_or_else(service_invalid)?
+                .into_root_for(installation.authority())
+                .map_err(|_| service_invalid())?,
+        );
+        self.reserve_io(0)?;
+        self.raw.metadata = Some(
+            self.local_root
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .metadata(),
+        );
+        self.post(deadline)?;
+        let root = identity(
+            self.raw
+                .metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?,
+        );
+        self.verify_local_root_before(root, deadline)?;
+        Ok((installation, root))
     }
 
     fn registration_free(&self) -> Result<(), RecoveryControlError> {
@@ -1359,6 +2936,118 @@ impl ControlFiles {
             && self.pending_owner.is_some()
             && self.pending_admission.is_some()
             && self.pending_runtime.is_some()
+    }
+
+    fn verify_restore_live(
+        &mut self,
+        operation_id: Hex32,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let operation = self
+            .restore_operation
+            .as_ref()
+            .ok_or_else(service_invalid)?;
+        if operation.operation != operation_id || !self.holds_writer() {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+        }
+        operation.clock.require_convergence()?;
+        let deadline = deadline.min(operation.clock.convergence_deadline());
+        let expected_root = operation.intent.control_root;
+        self.post(deadline)?;
+        if self.root_identity(deadline)? != expected_root {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+        }
+        self.held_owner_identity(deadline)?;
+        self.held_lock_identity(true, deadline)?;
+        self.held_lock_identity(false, deadline)?;
+        self.restore_operation
+            .as_mut()
+            .ok_or_else(service_invalid)?
+            .intent
+            .host
+            .recheck_original(deadline)?;
+        self.post(deadline)
+    }
+
+    fn observe_restore_capacity(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        let Self {
+            root,
+            parent,
+            ancestors,
+            operations,
+            runtimes,
+            operation_work,
+            runtime_work,
+            pending_owner,
+            pending_admission,
+            pending_runtime,
+            raw,
+            activation_source,
+            publication_journal,
+            restore_journal,
+            journal_tail,
+            restore_runtime_readbacks,
+            restore_operation,
+            ..
+        } = self;
+        let original = restore_operation.as_mut().ok_or_else(service_invalid)?;
+        let RestoreOperationOwner {
+            ledger,
+            intent,
+            pending,
+            ..
+        } = original;
+        for file in [
+            root.as_ref(),
+            parent.as_ref(),
+            operations.as_ref(),
+            runtimes.as_ref(),
+            operation_work.as_ref(),
+            runtime_work.as_ref(),
+            pending_owner.as_ref(),
+            pending_admission.as_ref(),
+            pending_runtime.as_ref(),
+            raw.file.as_ref().and_then(|r| r.as_ref().ok()),
+            activation_source.as_ref().map(|r| &r.file),
+            publication_journal.as_ref().map(|r| &r.file),
+            restore_journal.as_ref().map(|r| &r.file),
+            journal_tail.as_ref().map(|tail| &tail.file),
+            pending.as_ref().map(|r| &r.file),
+            intent.request.file.as_ref(),
+            Some(&intent.request.parent),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ledger.observe_file(file, false, deadline)?;
+        }
+        for file in ancestors {
+            ledger.observe_file(file, false, deadline)?;
+        }
+        for readback in restore_runtime_readbacks {
+            for file in [
+                readback.directory.as_ref(),
+                readback.enrollment.as_ref().map(|r| &r.file),
+                readback.receipt.as_ref().map(|r| &r.file),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                ledger.observe_file(file, false, deadline)?;
+            }
+        }
+        match &intent.host.original {
+            #[cfg(feature = "desktop-local")]
+            HostOrigin::LocalRelease {
+                program, release, ..
+            } => {
+                for file in [&program.0, &program.2, &release.0, &release.2] {
+                    ledger.observe_file(file, false, deadline)?;
+                }
+            }
+            HostOrigin::ServiceConfig(_) => return Err(service_invalid()),
+        }
+        ledger.check_storage()
     }
 
     /// Drop the writer's locks and open journal; written files stay.
@@ -1549,8 +3238,14 @@ impl ControlFiles {
         // Ordinary expiry alone is not permanent owner loss. Actual native
         // process/boot/clock drift is; raw IO and results remain resident.
         if let Some(fault) = self.first_fault {
-            return Err(RecoveryControlError::new(fault));
+            if self.closing_observation.is_none() || fault == RecoveryControlFault::OwnerLost {
+                return Err(RecoveryControlError::new(fault));
+            }
         }
+        self.post_original_owner(deadline)
+    }
+
+    fn post_original_owner(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
         before(deadline)?;
         self.process_clock_before(deadline)?;
         let original = match self.original_process.as_ref() {
@@ -1634,8 +3329,19 @@ impl ControlFiles {
     }
 
     pub(super) fn prepay(&mut self, bytes: u64, files: u64) -> Result<(), RecoveryControlError> {
+        if let Some(allowance) = &mut self.closing_observation {
+            if files != 0 || bytes > allowance.metadata_left {
+                return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+            }
+            allowance.metadata_left -= bytes;
+            return Ok(());
+        }
         if let Some(fault) = self.first_fault {
             return Err(RecoveryControlError::new(fault));
+        }
+        if let Some(operation) = &mut self.restore_operation {
+            operation.ledger.admit(super::RestoreCapacityResource::MetadataBytes, bytes)?;
+            operation.ledger.admit(super::RestoreCapacityResource::OpenFiles, files)?;
         }
         self.budget.charge(bytes, files)
     }
@@ -2403,6 +4109,653 @@ impl ControlFiles {
         Ok(held)
     }
 
+    /// Read every immutable enrollment and its exact original close receipt
+    /// while holding all three writer locks. Absence is Busy, never closure.
+    fn verify_closed_runtime_receipts(
+        &mut self,
+        control_id: Option<&str>,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        if !self.holds_writer() {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+        }
+        let maximum = usize::try_from(self.limits.max_registered_runtimes)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        let reservation = maximum
+            .checked_mul(2 * std::mem::size_of::<Hex32>())
+            .and_then(|n| {
+                n.checked_add(
+                    maximum.checked_mul(2 * std::mem::size_of::<RestoreRuntimeReadback>())?,
+                )
+            })
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.prepay(reservation as u64, 0)?;
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(maximum)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.restore_runtime_readbacks
+            .try_reserve_exact(maximum)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        if names.capacity() > maximum.checked_mul(2).ok_or_else(service_invalid)?
+            || self.restore_runtime_readbacks.capacity()
+                > maximum.checked_mul(2).ok_or_else(service_invalid)?
+        {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::CapacityExceeded,
+            ));
+        }
+        self.inventory_count(
+            Directory::Runtimes,
+            self.limits.max_registered_runtimes,
+            Some(&mut names),
+            deadline,
+        )?;
+        let root = self.root_identity(deadline)?;
+        let admission = self.held_lock_identity(true, deadline)?;
+        let runtime = self.held_lock_identity(false, deadline)?;
+        let cap = self.limits.max_runtime_record_bytes;
+        for nonce in names {
+            let index = self.restore_runtime_readbacks.len();
+            self.restore_runtime_readbacks.push(RestoreRuntimeReadback {
+                directory: None,
+                enrollment: None,
+                receipt: None,
+                decoded_enrollment: None,
+                decoded_receipt: None,
+            });
+            let (directory, _) =
+                self.open_named(Directory::Runtimes, nonce.as_str(), true, deadline)?;
+            self.runtime_work = Some(directory);
+            self.restore_runtime_readbacks[index].enrollment =
+                Some(self.read_record(Directory::RuntimeWork, "enrollment-v1", cap, deadline)?);
+            self.reserve_io(0)?;
+            before(deadline)?;
+            self.raw.named = Some(rustix::fs::statat(
+                self.directory(Directory::RuntimeWork)?,
+                "receipt-v1",
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
+            self.post(deadline)?;
+            if matches!(self.raw.named, Some(Err(rustix::io::Errno::NOENT))) {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+            }
+            self.restore_runtime_readbacks[index].receipt =
+                Some(self.read_record(Directory::RuntimeWork, "receipt-v1", cap, deadline)?);
+            let readback = &self.restore_runtime_readbacks[index];
+            let wire_bytes = readback
+                .enrollment
+                .as_ref()
+                .expect("original enrollment retained")
+                .bytes
+                .len()
+                .checked_add(
+                    readback
+                        .receipt
+                        .as_ref()
+                        .expect("original receipt retained")
+                        .bytes
+                        .len(),
+                )
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            // Closed values have bounded scalar, string and vector headers;
+            // include pinned serde escape scratch before decoding either copy.
+            let decode = wire_bytes
+                .checked_mul(32)
+                .and_then(|n| n.checked_add(std::mem::size_of::<RestoreRuntimeEnrollment>()))
+                .and_then(|n| n.checked_add(std::mem::size_of::<RestoreRuntimeReceipt>() + 1024))
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            self.prepay(decode as u64, 0)?;
+            let readback = &mut self.restore_runtime_readbacks[index];
+            readback.decoded_enrollment = Some(serde_json::from_slice(
+                &readback
+                    .enrollment
+                    .as_ref()
+                    .expect("retained enrollment")
+                    .bytes,
+            ));
+            readback.decoded_receipt = Some(serde_json::from_slice(
+                &readback.receipt.as_ref().expect("retained receipt").bytes,
+            ));
+            self.post(deadline)?;
+            let readback = &self.restore_runtime_readbacks[index];
+            let enrollment = readback
+                .decoded_enrollment
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
+            let receipt = readback
+                .decoded_receipt
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
+            let owners = &enrollment.original_owner_set;
+            let observed = receipt.clock_observations[0];
+            enrollment.business_install_binding.validate(&self.limits)?;
+            if enrollment.record_type != "wrokbot-runtime-enrollment"
+                || enrollment.version != 1
+                || Some(enrollment.control_id.as_str()) != control_id
+                || enrollment.nonce != nonce
+                || enrollment.pid == 0
+                || enrollment.process_start.nanos >= 1_000_000_000
+                || enrollment.root_and_lock_identities.control_root != root
+                || enrollment.root_and_lock_identities.admission_lock != admission
+                || enrollment.root_and_lock_identities.runtime_lock != runtime
+                || enrollment.authorization_epoch.as_str()
+                    != enrollment.business_install_binding.authorization_epoch()
+                || owners.is_empty()
+                || owners.len() as u64 > self.limits.max_runtime_resource_facts
+                || owners
+                    .iter()
+                    .enumerate()
+                    .any(|(i, owner)| owners[..i].contains(owner))
+                || receipt.record_type != "wrokbot-runtime-close"
+                || receipt.version != 1
+                || !enrollment.matches(&receipt.same_identity_tuple)
+                || !super::journal::hex_matches(
+                    &Sha256::digest(
+                        &readback
+                            .enrollment
+                            .as_ref()
+                            .expect("retained enrollment")
+                            .bytes,
+                    )
+                    .into(),
+                    receipt.enrollment_digest.as_str(),
+                )
+                || observed == 0
+                || !receipt.retained_unknown_effect_refs.is_empty()
+                || receipt.original_resource_facts.len() != owners.len()
+                || owners.iter().any(|owner| {
+                    receipt
+                        .original_resource_facts
+                        .iter()
+                        .filter(|fact| fact.closed_owner(observed) == Some(*owner))
+                        .count()
+                        != 1
+                })
+            {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+            }
+            super::id(&enrollment.boot_identity, self.limits.max_id_bytes)?;
+            self.restore_runtime_readbacks[index].directory = self.runtime_work.take();
+        }
+        self.post(deadline)
+    }
+
+    fn verify_request_unused(
+        &mut self,
+        wanted: &super::journal::RestoreRequestReference,
+        control_id: Option<&str>,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let maximum =
+            usize::try_from(self.limits.max_retained_operations).map_err(|_| service_invalid())?;
+        let bytes = maximum
+            .checked_mul(
+                2 * (std::mem::size_of::<Hex32>() + std::mem::size_of::<RestoreIntentReadback>()),
+            )
+            .ok_or_else(service_invalid)?;
+        self.prepay(bytes as u64, 0)?;
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(maximum)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.restore_intent_readbacks
+            .try_reserve_exact(maximum)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        if names.capacity() > maximum.checked_mul(2).ok_or_else(service_invalid)?
+            || self.restore_intent_readbacks.capacity()
+                > maximum.checked_mul(2).ok_or_else(service_invalid)?
+        {
+            return Err(service_invalid());
+        }
+        self.inventory_count(
+            Directory::Operations,
+            self.limits.max_retained_operations,
+            Some(&mut names),
+            deadline,
+        )?;
+        let mut consumed = None;
+        let count = names.len();
+        for name in names {
+            let index = self.restore_intent_readbacks.len();
+            self.restore_intent_readbacks.push(RestoreIntentReadback {
+                directory: None,
+                journal: None,
+                header: [0; 12],
+                bytes: Vec::new(),
+                decoded: None,
+            });
+            let (directory, _) =
+                self.open_named(Directory::Operations, name.as_str(), true, deadline)?;
+            self.operation_work = Some(directory);
+            let (journal, expected) =
+                self.open_named(Directory::OperationWork, "journal-v1", false, deadline)?;
+            self.raw.file = Some(Ok(journal));
+            self.check_opened(false, deadline)?;
+            let length = self
+                .raw
+                .metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?
+                .len();
+            if length < 44 || length > self.limits.max_journal_bytes {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ControlInvalid,
+                ));
+            }
+            before(deadline)?;
+            self.raw.unit = Some({
+                let Self {
+                    raw,
+                    restore_intent_readbacks,
+                    ..
+                } = self;
+                raw.file
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?
+                    .read_exact_at(&mut restore_intent_readbacks[index].header, 0)
+            });
+            self.post(deadline)?;
+            if !matches!(self.raw.unit, Some(Ok(()))) {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ControlInvalid,
+                ));
+            }
+            let header = self.restore_intent_readbacks[index].header;
+            let body =
+                u32::from_be_bytes(header[8..12].try_into().expect("fixed frame length")) as u64;
+            let frame_length = body.checked_add(44).ok_or_else(service_invalid)?;
+            if &header[..8] != b"WBRCJ001"
+                || body == 0
+                || body > self.limits.max_journal_frame_bytes
+                || frame_length > length
+            {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ControlInvalid,
+                ));
+            }
+            self.prepay(frame_length.checked_mul(2).ok_or_else(service_invalid)?, 0)?;
+            let n = usize::try_from(frame_length).map_err(|_| service_invalid())?;
+            let input = &mut self.restore_intent_readbacks[index].bytes;
+            input
+                .try_reserve_exact(n)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            if input.capacity() > n.checked_mul(2).ok_or_else(service_invalid)? {
+                return Err(service_invalid());
+            }
+            input.resize(n, 0);
+            before(deadline)?;
+            self.raw.unit = Some({
+                let Self {
+                    raw,
+                    restore_intent_readbacks,
+                    ..
+                } = self;
+                raw.file
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?
+                    .read_exact_at(&mut restore_intent_readbacks[index].bytes, 0)
+            });
+            self.post(deadline)?;
+            if !matches!(self.raw.unit, Some(Ok(())))
+                || self.restore_intent_readbacks[index].bytes[..12] != header
+                || self.check_opened(false, deadline)? != expected
+            {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ControlInvalid,
+                ));
+            }
+            self.named_matches(Directory::OperationWork, "journal-v1", expected, deadline)?;
+            let fee = super::journal::read_metadata_reservation(
+                &self.restore_intent_readbacks[index].bytes,
+                &self.limits,
+            )?;
+            self.prepay(fee, 0)?;
+            self.restore_intent_readbacks[index].decoded = Some(super::journal::observe_chain(
+                &self.restore_intent_readbacks[index].bytes,
+                &self.limits,
+            ));
+            self.post(deadline)?;
+            let decoded = self.restore_intent_readbacks[index]
+                .decoded
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
+            let (original_control, original_operation, _) =
+                decoded.first_context().ok_or_else(service_invalid)?;
+            if Some(original_control) != control_id || original_operation != name.as_str() {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ControlInvalid,
+                ));
+            }
+            if let Some(reference) = decoded.restore_request() {
+                if reference.request_id == wanted.request_id {
+                    if reference != wanted || consumed.is_some() {
+                        return Err(RecoveryControlError::new(
+                            RecoveryControlFault::ControlInvalid,
+                        ));
+                    }
+                    consumed = Some(name);
+                }
+            }
+            self.restore_intent_readbacks[index].journal = Some(self.take_opened()?);
+            self.restore_intent_readbacks[index].directory = self.operation_work.take();
+        }
+        if consumed.is_some() {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+        }
+        if count >= maximum {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::CapacityExceeded,
+            ));
+        }
+        self.post(deadline)
+    }
+
+    fn open_restore_selection(
+        &mut self,
+        slot: usize,
+        parent: &Path,
+        component: &str,
+        limit: Option<u64>,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let depth = parent.components().count();
+        let metadata = depth
+            .checked_mul(2 * std::mem::size_of::<ServiceAncestor>())
+            .and_then(|n| n.checked_add(parent.as_os_str().len().checked_mul(4)?))
+            .and_then(|n| n.checked_add(component.len().checked_mul(2)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<RestoreHeldSelection>()))
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.prepay(metadata as u64, 0)?;
+        if self.restore_selections[slot].is_some() {
+            return Err(service_invalid());
+        }
+        self.restore_selections[slot] = Some(RestoreHeldSelection {
+            ancestors: Vec::new(),
+            component: component.to_owned(),
+            original: None,
+            stamp: None,
+        });
+        let selection = self.restore_selections[slot]
+            .as_mut()
+            .expect("original selection retained");
+        selection
+            .ancestors
+            .try_reserve_exact(depth)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        if selection.ancestors.capacity() > depth.checked_mul(2).ok_or_else(service_invalid)? {
+            return Err(service_invalid());
+        }
+        self.reserve_io(1)?;
+        before(deadline)?;
+        self.raw.file = Some(
+            rustix::fs::open(
+                "/",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from),
+        );
+        self.post(deadline)?;
+        self.raw.metadata = Some(
+            self.raw
+                .file
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?
+                .metadata(),
+        );
+        self.post(deadline)?;
+        let root = service_directory(
+            self.raw
+                .metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?,
+            self.uid,
+        )?;
+        let file = self.take_opened()?;
+        self.restore_selections[slot]
+            .as_mut()
+            .expect("retained selection")
+            .ancestors
+            .push(ServiceAncestor {
+                file,
+                identity: root,
+                component: None,
+            });
+        for part in parent.components() {
+            let Component::Normal(name) = part else {
+                if matches!(part, Component::RootDir) {
+                    continue;
+                }
+                return Err(service_invalid());
+            };
+            self.reserve_io(1)?;
+            before(deadline)?;
+            let directory = &self.restore_selections[slot]
+                .as_ref()
+                .expect("retained selection")
+                .ancestors
+                .last()
+                .ok_or_else(service_invalid)?
+                .file;
+            self.raw.file = Some(
+                rustix::fs::openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY
+                        | OFlags::DIRECTORY
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC
+                        | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(io::Error::from),
+            );
+            self.post(deadline)?;
+            self.raw.metadata = Some(
+                self.raw
+                    .file
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?
+                    .metadata(),
+            );
+            self.post(deadline)?;
+            let actual = service_directory(
+                self.raw
+                    .metadata
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?,
+                self.uid,
+            )?;
+            let directory = &self.restore_selections[slot]
+                .as_ref()
+                .expect("retained selection")
+                .ancestors
+                .last()
+                .ok_or_else(service_invalid)?
+                .file;
+            self.raw.named = Some(rustix::fs::statat(
+                directory,
+                name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
+            self.post(deadline)?;
+            let named = self
+                .raw
+                .named
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?;
+            if named.st_dev as u64 != actual.device
+                || named.st_ino as u64 != actual.inode
+                || named.st_uid != actual.uid
+                || rustix::fs::FileType::from_raw_mode(named.st_mode)
+                    != rustix::fs::FileType::Directory
+                || actual
+                    == self
+                        .pending_restore_intent
+                        .as_ref()
+                        .ok_or_else(service_invalid)?
+                        .control_root
+            {
+                return Err(service_invalid());
+            }
+            let file = self.take_opened()?;
+            self.restore_selections[slot]
+                .as_mut()
+                .expect("retained selection")
+                .ancestors
+                .push(ServiceAncestor {
+                    file,
+                    identity: actual,
+                    component: Some(name.to_os_string()),
+                });
+        }
+        if let Some(limit) = limit {
+            let parent_metadata = self
+                .raw
+                .metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?;
+            if parent_metadata.uid() != self.uid || parent_metadata.mode() & 0o7777 != 0o700 {
+                return Err(service_invalid());
+            }
+            self.reserve_io(1)?;
+            before(deadline)?;
+            let directory = &self.restore_selections[slot]
+                .as_ref()
+                .expect("retained selection")
+                .ancestors
+                .last()
+                .ok_or_else(service_invalid)?
+                .file;
+            self.raw.file = Some(
+                rustix::fs::openat(
+                    directory,
+                    component,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(io::Error::from),
+            );
+            self.post(deadline)?;
+            self.raw.metadata = Some(
+                self.raw
+                    .file
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?
+                    .metadata(),
+            );
+            self.post(deadline)?;
+            let stamp = ServiceFileStamp::of(
+                self.raw
+                    .metadata
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?,
+                self.uid,
+            )?;
+            if stamp.length == 0 || stamp.length > limit || (slot == 1 && stamp.length != 104) {
+                return Err(service_invalid());
+            }
+            let directory = &self.restore_selections[slot]
+                .as_ref()
+                .expect("retained selection")
+                .ancestors
+                .last()
+                .ok_or_else(service_invalid)?
+                .file;
+            self.raw.named = Some(rustix::fs::statat(
+                directory,
+                component,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
+            self.post(deadline)?;
+            let named = self
+                .raw
+                .named
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?;
+            if named.st_dev as u64 != stamp.identity.device
+                || named.st_ino as u64 != stamp.identity.inode
+                || named.st_uid != self.uid
+                || named.st_size as u64 != stamp.length
+                || named.st_nlink != 1
+                || named.st_mode & 0o7777 != 0o600
+            {
+                return Err(service_invalid());
+            }
+            let file = self.take_opened()?;
+            let selection = self.restore_selections[slot]
+                .as_mut()
+                .expect("retained selection");
+            selection.stamp = Some(stamp);
+            selection.original = Some(file);
+        } else {
+            self.reserve_io(0)?;
+            before(deadline)?;
+            self.raw.metadata = Some(self.parent.as_ref().ok_or_else(service_invalid)?.metadata());
+            self.post(deadline)?;
+            let actual_parent = identity(
+                self.raw
+                    .metadata
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?,
+            );
+            let selected = self.restore_selections[slot]
+                .as_ref()
+                .expect("retained selection")
+                .ancestors
+                .last()
+                .ok_or_else(service_invalid)?;
+            if selected.identity != actual_parent {
+                return Err(service_invalid());
+            }
+            self.raw.named = Some(rustix::fs::statat(
+                &selected.file,
+                component,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
+            self.post(deadline)?;
+            match self.raw.named.as_ref() {
+                Some(Ok(named))
+                    if named.st_uid == self.uid
+                        && named.st_mode & 0o7777 == 0o700
+                        && rustix::fs::FileType::from_raw_mode(named.st_mode)
+                            == rustix::fs::FileType::Directory =>
+                {
+                    ()
+                }
+                Some(Err(rustix::io::Errno::NOENT))
+                    if self.pending_restore_intent.as_ref().is_some_and(|entry| {
+                        entry.decoded.purpose == RecoveryRequestPurpose::RestoreNewInstallation
+                    }) =>
+                {
+                    ()
+                }
+                _ => return Err(service_invalid()),
+            }
+        }
+        self.post(deadline)
+    }
+
     /// Only the pre-effect nonblocking registration failure uses this passive
     /// release. It is never a resource-close, stop, ACK or wait receipt.
     pub(super) fn release_registration_attempt(&mut self) {
@@ -2825,6 +5178,24 @@ impl ControlFiles {
 
     /// The known enrollment/receipt name is published without replacement.
     /// Every temporary FD and full result remains in this owner on failure.
+    pub(super) fn publish_runtime_close_record(
+        &mut self,
+        original_directory: &File,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<OwnedRecord, RecoveryControlError> {
+        self.reserve_io(1)?;
+        before(deadline)?;
+        self.raw.file = Some(original_directory.try_clone());
+        self.post(deadline)?;
+        self.runtime_work = Some(self.take_opened()?);
+        self.publish_runtime_record("receipt-v1", bytes, deadline)?;
+        self.runtime_work = None;
+        self.runtime_record
+            .take()
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ClosureUnproven))
+    }
+
     pub(super) fn publish_runtime_record(
         &mut self,
         name: &str,
@@ -3078,6 +5449,118 @@ pub(super) fn server_intent(
     )
 }
 
+/// Seal the Local producer's expected original host before any installation write.
+#[cfg(feature = "desktop-local")]
+pub(super) fn local_intent(
+    owner: &ControlOwner,
+    creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+    release: [u8; 32],
+    services: [&str; 2],
+    bounds: OrdinaryStartupBounds,
+    owners: &[super::runtime::RuntimeOwner],
+) -> Result<super::ordinary::VerifiedOrdinaryStartupIntent, RecoveryControlError> {
+    use super::ordinary::{LocalSiteExpectation, SiteExpectation, VerifiedOrdinaryStartupIntent};
+    let t0 = Instant::now();
+    let t0_ns = super::clock::monotonic_ns()?;
+    let mut files = lock(owner)?;
+    let admission_ns = files.limits.admission_ns;
+    let deadline = t0
+        .checked_add(std::time::Duration::from_nanos(
+            admission_ns.min(bounds.effect_ns.get()),
+        ))
+        .ok_or_else(service_invalid)?;
+    let expected_path = files
+        .root_path
+        .parent()
+        .ok_or_else(service_invalid)?
+        .join(files.app_component.as_ref().ok_or_else(service_invalid)?);
+    if creator.original_app_data_root() != expected_path {
+        return Err(service_invalid());
+    }
+    let (root, parent, component) = files.observe_local_root(deadline)?;
+    let site = SiteExpectation::Local(LocalSiteExpectation {
+        root,
+        parent,
+        component,
+        release: Hex64::of(&release),
+        master_service: services[0].to_owned(),
+        postgres_service: services[1].to_owned(),
+        installation_id: None,
+    });
+    drop(files);
+    VerifiedOrdinaryStartupIntent::seal_at(None, site, bounds, admission_ns, owners, t0, t0_ns)
+}
+
+#[cfg(feature = "desktop-local")]
+pub(super) async fn verify_local_binding_before(
+    control: &ControlOwner,
+    binding: &super::ActivationBinding,
+    authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+    database: &crate::db::desktop_local::DesktopLocalDatabase,
+    canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
+    services: [&str; 2],
+    deadline: Instant,
+) -> Result<(), RecoveryControlError> {
+    before(deadline)?;
+    let expected = binding.ordinary_local()?;
+    if !canary
+        .matches_database(database)
+        .await
+        .map_err(|_| service_invalid())?
+        || expected.installation_id != authority.instance_id()
+        || expected.dataset_id != canary.dataset_id()
+        || expected.deployment_id != authority.auth_context().deployment().as_str()
+        || expected.tenant_id != authority.auth_context().tenant().as_str()
+        || expected.deployment_id != canary.deployment_id()
+        || expected.tenant_id != canary.tenant_id()
+        || expected.master.reviewed_service != services[0]
+        || expected.postgres.reviewed_service != services[1]
+        || expected.master.account != format!("desktop-vault-master-v1-{}", authority.instance_id())
+        || expected.master.key_id != canary.key_id()
+        || i64::from(expected.master.key_version) != i64::from(canary.key_version())
+        || expected.postgres.account != format!("postgresql-17-{}", authority.instance_id())
+        || expected.postgres.key_id != expected.postgres.account
+        || expected.postgres.key_version != 1
+    {
+        return Err(service_invalid());
+    }
+    let client = database.pool().get().await.map_err(|_| service_invalid())?;
+    let row = client.query_one(
+        "SELECT pcs.system_identifier::text AS system_identifier, d.oid AS database_oid, current_setting('server_version_num')::int / 10000 AS pg_major FROM pg_control_system() pcs JOIN pg_database d ON d.datname=current_database()",
+        &[],
+    ).await.map_err(|_| service_invalid())?;
+    if row
+        .try_get::<_, String>("system_identifier")
+        .ok()
+        .and_then(|id| id.parse::<u64>().ok())
+        != Some(expected.pg_system_id)
+        || row.try_get::<_, u32>("database_oid").ok() != Some(expected.database_oid)
+        || row.try_get::<_, i32>("pg_major").ok() != Some(17)
+    {
+        return Err(service_invalid());
+    }
+    let layout = crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(&client)
+        .await
+        .map_err(|_| service_invalid())?;
+    let native_version = i32::try_from(binding.native_version()).map_err(|_| service_invalid())?;
+    let digest: String = client
+        .query_one(
+            "SELECT checksum FROM openbot_internal.schema_migrations WHERE version = $1",
+            &[&native_version],
+        )
+        .await
+        .and_then(|row| row.try_get(0))
+        .map_err(|_| service_invalid())?;
+    if layout.native_version() != native_version || binding.migration_digest() != digest {
+        return Err(service_invalid());
+    }
+    drop(client);
+    let mut files = lock(control)?;
+    files.verify_local_root_before(expected.generation_root, deadline)?;
+    files.bind_original_local_pool(database.pool());
+    Ok(())
+}
+
 /// Connect the bootstrap Pool for this Server site and keep it, with its first
 /// client, in the control owner for the runtime read gate.
 #[cfg(feature = "server-runtime")]
@@ -3259,6 +5742,7 @@ pub(super) fn open_control(
     let deadline = Instant::now()
         .checked_add(Duration::from_nanos(config.limits.admission_ns))
         .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ProfileInvalid))?;
+    let deadline = config.original_admission_deadline.map_or(deadline, |original| original.min(deadline));
     let mut budget = ControlBudget {
         metadata: 0,
         files: 0,
@@ -3279,6 +5763,7 @@ pub(super) fn open_control(
         )
         .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
     budget.charge(fixed as u64, u64::from(config.service_source.is_some()))?;
+    if let Some((bytes, files)) = config.preheld_restore_usage { budget.charge(bytes, files)?; }
     // The original fixed fee contains the source object's inline storage and
     // one configuration FD. Its actual additional retained backing/FDs remain
     // in the same original control budget; they are never counted as zero.
@@ -3327,6 +5812,12 @@ pub(super) fn open_control(
             publication_chain: None,
             publication_seal: None,
             existing_server: None,
+            #[cfg(feature = "desktop-local")]
+            local_root: None,
+            #[cfg(feature = "desktop-local")]
+            local_creation: None,
+            #[cfg(feature = "desktop-local")]
+            existing_local_pool: None,
             existing_read_locks: false,
             runtime_entropy: [0; 16],
             raw_random: None,
@@ -3335,6 +5826,8 @@ pub(super) fn open_control(
             pending_owner: None,
             pending_request: None,
             pending_host: None,
+            raw_request_decode: None,
+            preheld_restore_usage: config.preheld_restore_usage,
             service_source: config.service_source,
             runtime_record: None,
             pending_startup: None,
@@ -3345,10 +5838,18 @@ pub(super) fn open_control(
             writer_held: false,
             restore_journal: None,
             restore_chain: None,
+            restore_runtime_readbacks: Vec::new(),
+            restore_operation: None,
+            closing_observation: None,
+            pending_restore_intent: None,
+            restore_selections: std::array::from_fn(|_| None),
+            restore_intent_readbacks: Vec::new(),
+            restore_entropy: [0; 96],
         }),
         retired_metadata: 0,
         retired_files: 0,
         fault: None,
+        retained_candidate: None,
     }));
     let result = (|| {
         let mut state = lock(&shared)?;
@@ -3650,28 +6151,44 @@ pub(super) fn verify_intent(
         state.pending_host = Some(host);
         before(deadline)?;
         let current = state.root_identity(deadline)?;
+        state
+            .pending_host
+            .as_mut()
+            .ok_or_else(service_invalid)?
+            .recheck_original(deadline)?;
         let h = state
             .pending_host
             .as_ref()
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?;
-        if h.control_root != current || h.uid != state.uid {
+        if h.uid != state.uid {
             return Err(RecoveryControlError::new(
                 RecoveryControlFault::EntryInvalid,
             ));
         }
-        hex(&h.reviewed_release_digest, 64, false)?;
-        if matches!(&h.original, HostOrigin::ServiceConfig(_))
-            && matches!(
-                h.request_purpose,
-                OriginalRequestPurpose::RestoreSame | OriginalRequestPurpose::RestoreNew
-            )
-        {
-            return Err(RecoveryControlError::new(
-                RecoveryControlFault::EntryInvalid,
-            ));
+        match &h.original {
+            #[cfg(feature = "desktop-local")]
+            HostOrigin::LocalRelease { actual, .. } => {
+                if actual.as_path().parent() != state.root_path.parent()
+                    || actual.as_path().file_name() != state.app_component.as_deref()
+                {
+                    return Err(service_invalid());
+                }
+            }
+            HostOrigin::ServiceConfig(_) => return Err(service_invalid()),
         }
-        let original_identity = h.request_identity;
-        let original_digest = h.request_digest;
+        let (host_bytes, host_files) = h.retained_usage()?;
+        let request = state.pending_request.as_ref().ok_or_else(service_invalid)?;
+        let original_identity = request.identity;
+        let input_bytes = host_bytes
+            .checked_add(std::mem::size_of::<OwnedRecoveryRequestFile>() as u64)
+            .and_then(|n| n.checked_add(request.component.capacity() as u64))
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        let usage = (input_bytes, host_files.checked_add(2).ok_or_else(service_invalid)?);
+        match state.preheld_restore_usage.take() {
+            Some(original) if original == usage => (),
+            Some(_) => return Err(service_invalid()),
+            None => state.prepay(usage.0, usage.1)?,
+        }
         state.reserve_io(0)?;
         before(deadline)?;
         state.raw.metadata = Some(
@@ -3721,7 +6238,16 @@ pub(super) fn verify_intent(
             .and_then(|r| r.as_ref().ok())
             .map(Metadata::len)
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
-        if length == 0 || length > state.limits.max_request_bytes {
+        if length == 0
+            || length > state.limits.max_request_bytes
+            || length
+                > state
+                    .pending_host
+                    .as_ref()
+                    .ok_or_else(service_invalid)?
+                    .limits
+                    .max_request_bytes
+        {
             return Err(RecoveryControlError::new(
                 RecoveryControlFault::CapacityExceeded,
             ));
@@ -3788,6 +6314,38 @@ pub(super) fn verify_intent(
             ));
         }
         state.scratch.truncate(offset);
+        // Complete second read from the same FD, not a digest supplied by the
+        // request producer. The original raw result remains resident before
+        // each deadline/identity observation.
+        let mut offset = 0usize;
+        while offset < state.scratch.len() {
+            let end = state.scratch.len().min(offset + 8);
+            state.reserve_io(0)?;
+            before(deadline)?;
+            let result = {
+                let ControlFiles { raw, .. } = &mut *state;
+                raw.file
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?
+                    .read_at(&mut raw.small[..end - offset], offset as u64)
+            };
+            state.raw.count = Some(result);
+            state.post(deadline)?;
+            let n = *state
+                .raw
+                .count
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+            if n == 0
+                || n > end - offset
+                || state.raw.small[..n] != state.scratch[offset..offset + n]
+            {
+                return Err(service_invalid());
+            }
+            offset += n;
+        }
         if state.check_opened(false, deadline)? != original_identity
             || state
                 .raw
@@ -3821,13 +6379,65 @@ pub(super) fn verify_intent(
             || named.st_ino as u64 != original_identity.inode
             || named.st_uid != original_identity.uid
             || named.st_size as u64 != length
-            || Sha256::digest(&state.scratch).as_slice() != original_digest
+            || named.st_mode & 0o7777 != 0o600
+            || named.st_nlink != 1
+            || rustix::fs::FileType::from_raw_mode(named.st_mode)
+                != rustix::fs::FileType::RegularFile
         {
             return Err(RecoveryControlError::new(
                 RecoveryControlFault::EntryInvalid,
             ));
         }
         state.post(deadline)?;
+        state
+            .pending_host
+            .as_mut()
+            .ok_or_else(service_invalid)?
+            .recheck_original(deadline)?;
+        if state.root_identity(deadline)? != current {
+            return Err(service_invalid());
+        }
+        let request_digest = Sha256::digest(&state.scratch).into();
+        let decode_bytes = state
+            .scratch
+            .len()
+            .checked_mul(32)
+            .and_then(|n| {
+                n.checked_add(
+                    std::mem::size_of::<RestoreRequestWire>()
+                        + std::mem::size_of::<RecoveryRequestV1>()
+                        + 1024,
+                )
+            })
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        state.prepay(decode_bytes as u64, 0)?;
+        state.raw_request_decode = Some(decode_restore_request(&state.scratch, &state.limits));
+        state.post(deadline)?;
+        let decoded = match state.raw_request_decode.as_ref() {
+            Some(Ok(decoded)) => decoded,
+            Some(Err(error)) => return Err(RecoveryControlError::new(error.fault())),
+            None => return Err(service_invalid()),
+        };
+        let host = state.pending_host.as_ref().ok_or_else(service_invalid)?;
+        if !super::journal::hex_matches(
+            &host.reviewed_release_digest,
+            decoded.expected.reviewed_release_digest.as_str(),
+        ) {
+            return Err(service_invalid());
+        }
+        match &host.original {
+            #[cfg(feature = "desktop-local")]
+            HostOrigin::LocalRelease { actual, .. } => {
+                if Some(decoded.selection.target.parent.as_path()) != actual.as_path().parent()
+                    || decoded.selection.target.component == state.root_component
+                    || actual.as_path().file_name()
+                        != Some(std::ffi::OsStr::new(&decoded.selection.target.component))
+                {
+                    return Err(service_invalid());
+                }
+            }
+            HostOrigin::ServiceConfig(_) => return Err(service_invalid()),
+        }
         let file = state.take_opened()?;
         let mut request = state
             .pending_request
@@ -3842,6 +6452,13 @@ pub(super) fn verify_intent(
             host,
             request,
             request_bytes: std::mem::take(&mut state.scratch),
+            control_root: current,
+            request_digest,
+            decoded: state
+                .raw_request_decode
+                .take()
+                .expect("original decode retained")
+                .expect("successful closed request decode"),
             original_deadline: deadline,
         })
     })();

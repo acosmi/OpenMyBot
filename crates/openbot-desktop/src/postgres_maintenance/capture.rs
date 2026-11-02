@@ -109,7 +109,7 @@ struct ClosedMaintenanceSource {
 /// The private constructor will consume only a real post-stop consumer permit.
 /// Every original source task remains in this owner or its one resident awaited future.
 pub(crate) struct CaptureSourceOwner {
-    permit: CaptureStartPermit,
+    pub(crate) permit: CaptureStartPermit,
     operation: Arc<CaptureOperation>,
     profile: MaintenanceProfile,
     work_path: PathBuf,

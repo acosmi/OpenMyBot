@@ -4352,7 +4352,7 @@ async fn require_credential<C: tokio_postgres::GenericClient + Sync>(
         crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
             McpConnectionError::NotVisible
         }
-        crate::restore_reconfirmation::RestoreReconfirmationError::Unavailable => {
+        _ => {
             McpConnectionError::Unavailable
         }
     })

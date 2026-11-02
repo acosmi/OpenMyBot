@@ -6,6 +6,7 @@
 //! notarization remain release gates; a matching digest is not a claim that those gates passed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -19,14 +20,15 @@ use openbot_application::tenant::package::{
 };
 use openbot_contracts::engine::ENGINE_RELEASE_EPOCH;
 use openbot_domain::vault::SecretBytes;
-use serde::{Deserialize, Serialize};
+use openbot_infra::recovery_control::{OrdinaryStartupBounds, TrustedHostRecoveryLimits};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::postgres_sidecar::{
     PostgresBundleDigest, ReviewedPostgresKeyStoreService, ReviewedPostgresSigningIdentity,
     VerifiedPostgresBundle,
 };
-use crate::tauri_background::DesktopUiResource;
+use crate::tauri_background::{DesktopRecoveryBootstrap, DesktopUiResource};
 use crate::tauri_host::{VerifiedUiAssets, static_asset_max_bytes};
 use crate::{
     DesktopAgentBudgets, DesktopLocalApplicationInput, DesktopLocalReleaseInput,
@@ -137,6 +139,30 @@ struct ReleaseManifest {
     agent_budgets: AgentBudgets,
     #[serde(default)]
     normal_capture: CaptureField,
+    #[serde(default)]
+    recovery_control: RecoveryControlField,
+}
+
+/// Schema 3 carries the recovery control of the release; schemas 1 and 2 omit the key.
+#[derive(Default)]
+enum RecoveryControlField {
+    #[default]
+    Missing,
+    Present(RecoveryControlRelease),
+}
+
+impl<'de> Deserialize<'de> for RecoveryControlField {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        RecoveryControlRelease::deserialize(d).map(Self::Present)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RecoveryControlRelease {
+    version: u32,
+    host_limits: TrustedHostRecoveryLimits,
+    ordinary_startup_bounds: OrdinaryStartupBounds,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -187,8 +213,22 @@ impl ReleaseManifest {
             serde_json::from_slice(bytes).map_err(|_| DesktopReleaseError::Manifest)?;
         if manifest.schema != "wrok-bot-desktop-release"
             || !matches!(
-                (&manifest.schema_version, &manifest.normal_capture),
-                (1, CaptureField::Missing) | (2, CaptureField::Null | CaptureField::Request(_))
+                (
+                    &manifest.schema_version,
+                    &manifest.normal_capture,
+                    &manifest.recovery_control
+                ),
+                (1, CaptureField::Missing, RecoveryControlField::Missing)
+                    | (
+                        2,
+                        CaptureField::Null | CaptureField::Request(_),
+                        RecoveryControlField::Missing
+                    )
+                    | (
+                        3,
+                        CaptureField::Null | CaptureField::Request(_),
+                        RecoveryControlField::Present(_)
+                    )
             )
             || manifest.product_name != PRODUCT_NAME
             || manifest.bundle_identifier != BUNDLE_IDENTIFIER
@@ -209,6 +249,11 @@ impl ReleaseManifest {
         }
         if let CaptureField::Request(request) = &manifest.normal_capture {
             request.validate()?;
+        }
+        if let RecoveryControlField::Present(recovery) = &manifest.recovery_control {
+            if recovery.version != 1 || recovery.host_limits.clone().checked().is_err() {
+                return Err(DesktopReleaseError::Manifest);
+            }
         }
         manifest.ui.inventory(static_asset_max_bytes)?;
         let tenant_inventory = manifest.tenant.inventory(|_| TENANT_FILE_MAX_BYTES)?;
@@ -295,10 +340,12 @@ impl ResourceTree {
 /// Desktop Local authority. The type deliberately exposes no raw path or signer accessor.
 pub struct VerifiedDesktopRelease {
     ui: VerifiedUiAssets,
-    postgres: VerifiedPostgresBundle,
+    pub(crate) postgres: VerifiedPostgresBundle,
     application: DesktopLocalApplicationInput,
     tenant: VerifiedTenantTemplate,
     capture: Option<ReviewedNormalCaptureRequest>,
+    pub(crate) recovery: Option<DesktopRecoveryBootstrap>,
+    pub(crate) original_release: Option<(File, OsString, File)>,
 }
 
 impl core::fmt::Debug for VerifiedDesktopRelease {
@@ -320,12 +367,42 @@ impl VerifiedDesktopRelease {
             return Err(DesktopReleaseError::Resource);
         }
         require_directory(root)?;
+        let parent_path = root.parent().ok_or(DesktopReleaseError::Resource)?;
+        let component = root
+            .file_name()
+            .ok_or(DesktopReleaseError::Resource)?
+            .to_os_string();
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let parent = rustix::fs::open(parent_path, flags, rustix::fs::Mode::empty())
+            .map(File::from)
+            .map_err(|_| DesktopReleaseError::Resource)?;
+        let held_parent = parent
+            .metadata()
+            .map_err(|_| DesktopReleaseError::Resource)?;
+        let original_root =
+            rustix::fs::openat(&parent, &component, flags, rustix::fs::Mode::empty())
+                .map(File::from)
+                .map_err(|_| DesktopReleaseError::Resource)?;
+        let held_root = original_root
+            .metadata()
+            .map_err(|_| DesktopReleaseError::Resource)?;
         let bytes = read_file(&root.join(RELEASE_MANIFEST_FILE), MANIFEST_MAX_BYTES)?;
         if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected.0 {
             return Err(DesktopReleaseError::Digest);
         }
         let manifest = ReleaseManifest::parse(&bytes)?;
         let application = manifest.application_input()?;
+        let recovery = match manifest.recovery_control {
+            RecoveryControlField::Present(recovery) => Some(DesktopRecoveryBootstrap {
+                host_limits: recovery.host_limits,
+                bounds: recovery.ordinary_startup_bounds,
+                release_digest: expected.0,
+            }),
+            RecoveryControlField::Missing => None,
+        };
         let mut capture = match manifest.normal_capture {
             CaptureField::Request(request) => Some(request.verify(root, expected.0)?),
             CaptureField::Missing | CaptureField::Null => None,
@@ -364,12 +441,31 @@ impl VerifiedDesktopRelease {
                 manifest.agent_budgets,
             )?;
         }
+        let named_parent =
+            fs::symlink_metadata(parent_path).map_err(|_| DesktopReleaseError::Resource)?;
+        let named_root =
+            rustix::fs::statat(&parent, &component, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| DesktopReleaseError::Resource)?;
+        if !named_parent.is_dir()
+            || named_parent.file_type().is_symlink()
+            || (named_parent.dev(), named_parent.ino(), named_parent.uid())
+                != (held_parent.dev(), held_parent.ino(), held_parent.uid())
+            || (
+                named_root.st_dev as u64,
+                named_root.st_ino as u64,
+                named_root.st_uid,
+            ) != (held_root.dev(), held_root.ino(), held_root.uid())
+        {
+            return Err(DesktopReleaseError::Resource);
+        }
         Ok(Self {
             ui,
             postgres,
             application,
             tenant,
             capture,
+            recovery,
+            original_release: Some((parent, component, original_root)),
         })
     }
 
@@ -406,6 +502,10 @@ impl VerifiedDesktopRelease {
             tenant.bind(authority.auth_context().tenant().as_str())
         })
         .with_reviewed_normal_capture(self.capture);
+        let runtime = match self.recovery {
+            Some(bootstrap) => runtime.with_recovery_bootstrap(bootstrap),
+            None => runtime,
+        };
         Ok(match fixture_binding {
             Some(binding) => runtime.with_self_owned_capture_fixture(binding),
             None => runtime,

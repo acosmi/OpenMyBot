@@ -16,21 +16,27 @@ mod journal;
 mod ordinary;
 mod runtime;
 
-pub use activation::{ActivationBinding, ActivationPhase};
+pub use activation::{ActivationBinding, ActivationPhase, OrdinaryStartupBounds};
+pub use journal::{NativeExit, PipeJoin, ProcessStart};
 pub(crate) use activation::{Hex32, ServerDatabaseSite};
 pub use entry::{
-    OwnedRecoveryRequestFile, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
+    OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
     VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
 };
 pub(crate) use ordinary::OrdinaryStage;
+pub(crate) use entry::{RestoreStageIntent, RestoreStages};
+pub(crate) use journal::{Stage as RestoreStage, Disposition as RestoreDisposition, CommitAck as RestoreCommitAck, RollbackAck as RestoreRollbackAck};
 pub use ordinary::{
-    OrdinaryActivationProof, OrdinaryDatabaseInitializationProof, OrdinaryInitializationSession,
+    LocalFreshProof, OrdinaryActivationProof, OrdinaryDatabaseInitializationProof, OrdinaryInitializationSession,
     VerifiedOrdinaryLegacyProof, VerifiedOrdinaryStartupIntent,
 };
 #[cfg(feature = "server-runtime")]
 pub use runtime::AuthorizationPurpose;
 pub(crate) use runtime::RecoveryWorkerLease;
-pub use runtime::{RecoveryReadGate, RecoveryRuntimeOwner, RuntimeOwner};
+pub use runtime::{
+    PassiveObjectKind, RecoveryReadGate, RecoveryRuntimeOwner, RuntimeCloseFact,
+    RuntimeCloseReceipt, RuntimeCloseResources, RuntimeOwner, RuntimePgAck, RuntimeTaskOutcome,
+};
 
 /// Redacted closed failure class; original IO stays with its original owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +51,7 @@ pub enum RecoveryControlFault {
     EffectExpired,
     ConvergenceExpired,
     OwnerLost,
+    DatabaseUnknown,
     ClosureUnproven,
     IoFailure,
     KeyUnverified,
@@ -56,6 +63,9 @@ pub struct RecoveryControlError {
     retained: Option<entry::ControlOwner>,
     original_json_error: Option<serde_json::Error>,
     unconsumed: Option<Box<VerifiedOrdinaryStartupIntent>>,
+    retained_host: Option<Box<VerifiedRecoveryHost>>,
+    retained_request: Option<Box<entry::RequestOpenOwner>>,
+    retained_restore_input: Option<Box<OwnedRecoveryRequestFile>>,
 }
 
 impl RecoveryControlError {
@@ -65,6 +75,9 @@ impl RecoveryControlError {
             retained: None,
             original_json_error: None,
             unconsumed: None,
+            retained_host: None,
+            retained_request: None,
+            retained_restore_input: None,
         }
     }
 
@@ -74,6 +87,9 @@ impl RecoveryControlError {
             retained: Some(Arc::clone(owner)),
             original_json_error: None,
             unconsumed: None,
+            retained_host: None,
+            retained_request: None,
+            retained_restore_input: None,
         }
     }
 
@@ -88,6 +104,9 @@ impl RecoveryControlError {
             retained: None,
             original_json_error: Some(error),
             unconsumed: None,
+            retained_host: None,
+            retained_request: None,
+            retained_restore_input: None,
         }
     }
 
@@ -109,7 +128,7 @@ impl fmt::Debug for RecoveryControlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoveryControlError")
             .field("fault", &self.fault)
-            .field("retains_original_owner", &self.retained.is_some())
+            .field("retains_original_owner", &(self.retained.is_some() || self.retained_host.is_some() || self.retained_request.is_some()))
             .finish()
     }
 }
@@ -218,7 +237,7 @@ impl TrustedHostRecoveryLimits {
 }
 
 /// One explicitly chosen restore operation's capacity, never a global quota.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreOperationCapacity {
     pub max_input_wire_bytes: u64,
@@ -254,7 +273,7 @@ pub struct RestoreOperationCapacity {
 }
 
 /// Effect/convergence apply once to the same original live operation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreOperationProfile {
     pub effect_ns: u64,
@@ -324,6 +343,491 @@ impl RestoreOperationProfile {
     }
 }
 
+/// Explicit operation resources. Values are observations/reservations, never
+/// an alternative source of limits or restore authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum RestoreCapacityResource {
+    InputWireBytes,
+    ManifestBytes,
+    MaterialFiles,
+    MaterialDirectories,
+    SingleMaterialBytes,
+    MaterialPlainBytes,
+    PathBytes,
+    PathDepth,
+    CandidateDataBytes,
+    CandidateWalBytes,
+    CandidateTempBytes,
+    SpoolBytes,
+    RetainedPriorBytes,
+    JournalBytes,
+    JournalRecords,
+    MetadataBytes,
+    OpenFiles,
+    NativeTasks,
+    PgConnections,
+    PgTransactions,
+    PgRows,
+    ReconfirmRequirements,
+    SecretMemoryBytes,
+    SecretStructureBytes,
+    TotalAllocationBytes,
+    KeyMediumAllocationBytes,
+}
+
+pub struct RestoreCapacityReservation {
+    operation: activation::Hex32,
+    resource: RestoreCapacityResource,
+    admitted: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreStorageKind {
+    Working,
+    KeyMedium,
+}
+
+/// One admitted write against an already held original inode. This is not a
+/// filesystem quota or a fresh operation capability.
+pub struct RestoreStorageReservation {
+    operation: activation::Hex32,
+    identity: RecoveryFileIdentity,
+    allocated_before: u64,
+    bytes: u64,
+    kind: RestoreStorageKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreNewChildKind { Directory, File }
+
+pub struct RestoreNewChildReservation {
+    operation: activation::Hex32,
+    parent: RecoveryFileIdentity,
+    component: std::ffi::OsString,
+    bytes: u64,
+    kind: RestoreNewChildKind,
+}
+
+/// One live operation's ledger. Unknown effects keep their admitted charge;
+/// only an actual observation may settle it. Inode accounting never replaces
+/// the separate per-handle OpenFiles count.
+struct RestoreCapacityLedger {
+    limits: RestoreOperationCapacity,
+    admitted: [u64; 26],
+    actual: [u64; 26],
+    inodes: Vec<RestoreInodeUse>,
+    devices: Vec<RestoreDeviceUse>,
+    raw_metadata: Option<std::io::Result<std::fs::Metadata>>,
+    raw_space: Option<rustix::io::Result<rustix::fs::StatVfs>>,
+    raw_named: Option<rustix::io::Result<rustix::fs::Stat>>,
+    fault: Option<RecoveryControlFault>,
+}
+
+struct RestoreInodeUse {
+    device: u64,
+    inode: u64,
+    allocated: u64,
+    key_medium: bool,
+    planned_ceiling: Option<u64>,
+}
+
+struct RestoreDeviceUse {
+    device: u64,
+    available: u64,
+    has_key_medium: bool,
+    has_working: bool,
+    pending_new: u64,
+}
+
+impl RestoreCapacityLedger {
+    fn new(limits: RestoreOperationCapacity) -> Self {
+        Self {
+            limits,
+            admitted: [0; 26],
+            actual: [0; 26],
+            inodes: Vec::new(),
+            devices: Vec::new(),
+            raw_metadata: None,
+            raw_space: None,
+            raw_named: None,
+            fault: None,
+        }
+    }
+
+    fn ceiling(&self, resource: RestoreCapacityResource) -> u64 {
+        use RestoreCapacityResource as R;
+        let c = &self.limits;
+        match resource {
+            R::InputWireBytes => c.max_input_wire_bytes,
+            R::ManifestBytes => c.max_manifest_bytes,
+            R::MaterialFiles => c.max_material_files,
+            R::MaterialDirectories => c.max_material_directories,
+            R::SingleMaterialBytes => c.max_single_material_bytes,
+            R::MaterialPlainBytes => c.max_material_plain_bytes,
+            R::PathBytes => c.max_path_bytes,
+            R::PathDepth => c.max_path_depth,
+            R::CandidateDataBytes => c.max_candidate_data_bytes,
+            R::CandidateWalBytes => c.max_candidate_wal_bytes,
+            R::CandidateTempBytes => c.max_candidate_temp_bytes,
+            R::SpoolBytes => c.max_spool_bytes,
+            R::RetainedPriorBytes => c.max_retained_prior_bytes,
+            R::JournalBytes => c.max_journal_bytes,
+            R::JournalRecords => c.max_journal_records,
+            R::MetadataBytes => c.max_metadata_bytes,
+            R::OpenFiles => c.max_open_files,
+            R::NativeTasks => c.max_native_tasks,
+            R::PgConnections => c.max_pg_connections,
+            R::PgTransactions => c.max_pg_transactions,
+            R::PgRows => c.max_pg_rows,
+            R::ReconfirmRequirements => c.max_reconfirm_requirements,
+            R::SecretMemoryBytes => c.max_secret_memory_bytes,
+            R::SecretStructureBytes => c.max_secret_structure_bytes,
+            R::TotalAllocationBytes => c.max_total_allocation_bytes,
+            R::KeyMediumAllocationBytes => c.max_key_medium_allocation_bytes,
+        }
+    }
+
+    fn admit(
+        &mut self,
+        resource: RestoreCapacityResource,
+        additional: u64,
+    ) -> Result<(), RecoveryControlError> {
+        if let Some(fault) = self.fault {
+            return Err(RecoveryControlError::new(fault));
+        }
+        let index = resource as usize;
+        let amount = if matches!(
+            resource,
+            RestoreCapacityResource::SingleMaterialBytes
+                | RestoreCapacityResource::PathBytes
+                | RestoreCapacityResource::PathDepth
+        ) {
+            Some(self.admitted[index].max(additional))
+        } else {
+            self.admitted[index].checked_add(additional)
+        };
+        match amount {
+            Some(amount) if amount <= self.ceiling(resource) => {
+                self.admitted[index] = amount;
+                Ok(())
+            }
+            _ => {
+                self.fault = Some(RecoveryControlFault::CapacityExceeded);
+                Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ))
+            }
+        }
+    }
+
+    fn settle(
+        &mut self,
+        resource: RestoreCapacityResource,
+        reserved: u64,
+        observed: u64,
+    ) -> Result<(), RecoveryControlError> {
+        self.settle_prepaid_observation(resource, reserved, observed)?;
+        match self.fault {
+            Some(fault) => Err(RecoveryControlError::new(fault)),
+            None => Ok(()),
+        }
+    }
+
+    fn settle_prepaid_observation(&mut self, resource: RestoreCapacityResource, reserved: u64, observed: u64) -> Result<(), RecoveryControlError> {
+        let index = resource as usize;
+        let peak = matches!(
+            resource,
+            RestoreCapacityResource::SingleMaterialBytes
+                | RestoreCapacityResource::PathBytes
+                | RestoreCapacityResource::PathDepth
+        );
+        let actual = if peak {
+            Some(self.actual[index].max(observed))
+        } else {
+            self.actual[index].checked_add(observed)
+        };
+        let admitted = if peak {
+            Some(self.admitted[index].max(observed))
+        } else {
+            self.admitted[index]
+                .checked_sub(reserved)
+                .and_then(|n| n.checked_add(observed))
+        };
+        if observed > reserved
+            || actual.is_none()
+            || admitted.is_none()
+            || admitted.is_some_and(|n| n > self.ceiling(resource))
+        {
+            self.fault
+                .get_or_insert(RecoveryControlFault::CapacityExceeded);
+            return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+        } else {
+            self.actual[index] = actual.expect("checked actual addition");
+            self.admitted[index] = admitted.expect("checked reserved settlement");
+        }
+        Ok(())
+    }
+
+    fn observe_file(
+        &mut self,
+        file: &std::fs::File,
+        key_medium: bool,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        use std::os::unix::fs::MetadataExt;
+        before(deadline)?;
+        self.raw_metadata = Some(file.metadata());
+        before(deadline)?;
+        let metadata = self
+            .raw_metadata
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        let device = metadata.dev();
+        let inode = metadata.ino();
+        let allocated = metadata
+            .blocks()
+            .checked_mul(512)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        if let Some(held) = self
+            .inodes
+            .iter_mut()
+            .find(|held| held.device == device && held.inode == inode)
+        {
+            held.allocated = allocated;
+            held.key_medium |= key_medium;
+        } else {
+            if self.inodes.len() == self.inodes.capacity() {
+                self.admit(
+                RestoreCapacityResource::MetadataBytes,
+                2 * std::mem::size_of::<RestoreInodeUse>() as u64,
+                )?;
+                let old = self.inodes.capacity();
+                self.inodes
+                .try_reserve_exact(1)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+                if self.inodes.capacity().saturating_sub(old) > 2 {
+                    return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                    ));
+                }
+            }
+            self.inodes.push(RestoreInodeUse {
+                device,
+                inode,
+                allocated,
+                key_medium,
+                planned_ceiling: None,
+            });
+        }
+        self.raw_space = Some(rustix::fs::fstatvfs(file));
+        before(deadline)?;
+        let space = self
+            .raw_space
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        let available = space
+            .f_bavail
+            .checked_mul(space.f_frsize)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        if let Some(held) = self.devices.iter_mut().find(|held| held.device == device) {
+            held.available = available;
+            held.has_key_medium |= key_medium;
+            held.has_working |= !key_medium;
+        } else {
+            self.admit(
+                RestoreCapacityResource::MetadataBytes,
+                2 * std::mem::size_of::<RestoreDeviceUse>() as u64,
+            )?;
+            let old = self.devices.capacity();
+            self.devices
+                .try_reserve_exact(1)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            if self.devices.capacity().saturating_sub(old) > 2 {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
+            }
+            self.devices.push(RestoreDeviceUse {
+                device,
+                available,
+                has_key_medium: key_medium,
+                has_working: !key_medium,
+                pending_new: 0,
+            });
+        }
+        self.check_storage()
+    }
+
+    fn admit_disk_growth(
+        &mut self,
+        identity: RecoveryFileIdentity,
+        bytes: u64,
+    ) -> Result<(), RecoveryControlError> {
+        let held = self
+            .inodes
+            .iter_mut()
+            .find(|held| held.device == identity.device && held.inode == identity.inode)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::InputInvalid))?;
+        if held.planned_ceiling.is_some() {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+        }
+        held.planned_ceiling =
+            Some(held.allocated.checked_add(bytes).ok_or_else(|| {
+                RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+            })?);
+        self.check_storage()
+    }
+
+    fn settle_disk_growth(
+        &mut self,
+        original: RestoreStorageReservation,
+        file: &std::fs::File,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        use std::os::unix::fs::MetadataExt;
+        before(deadline)?;
+        self.raw_metadata = Some(file.metadata());
+        before(deadline)?;
+        let metadata = self
+            .raw_metadata
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        if metadata.dev() != original.identity.device
+            || metadata.ino() != original.identity.inode
+            || metadata.uid() != original.identity.uid
+        {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+        }
+        let allocated = metadata
+            .blocks()
+            .checked_mul(512)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        if allocated.saturating_sub(original.allocated_before) > original.bytes {
+            self.fault
+                .get_or_insert(RecoveryControlFault::CapacityExceeded);
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::CapacityExceeded,
+            ));
+        }
+        self.raw_space = Some(rustix::fs::fstatvfs(file));
+        before(deadline)?;
+        let space = self
+            .raw_space
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        let available = space
+            .f_bavail
+            .checked_mul(space.f_frsize)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        let device = self
+            .devices
+            .iter_mut()
+            .find(|held| held.device == original.identity.device)
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::OwnerLost))?;
+        device.available = available;
+        let inode = self
+            .inodes
+            .iter_mut()
+            .find(|held| {
+                held.device == original.identity.device && held.inode == original.identity.inode
+            })
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::OwnerLost))?;
+        if inode.planned_ceiling != original.allocated_before.checked_add(original.bytes)
+            || inode.key_medium != (original.kind == RestoreStorageKind::KeyMedium)
+        {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::ControlInvalid,
+            ));
+        }
+        inode.allocated = allocated;
+        inode.planned_ceiling = None;
+        self.check_storage()
+    }
+
+    fn check_storage(&mut self) -> Result<(), RecoveryControlError> {
+        let result = (|| {
+            let overflow = || RecoveryControlError::new(RecoveryControlFault::CapacityExceeded);
+            let mut total = 0u64;
+            let mut key = 0u64;
+            for inode in &self.inodes {
+                if inode
+                    .planned_ceiling
+                    .is_some_and(|ceiling| inode.allocated > ceiling)
+                {
+                    return Err(overflow());
+                }
+                total = total.checked_add(inode.allocated).ok_or_else(overflow)?;
+                if inode.key_medium {
+                    key = key.checked_add(inode.allocated).ok_or_else(overflow)?;
+                }
+            }
+            self.actual[RestoreCapacityResource::TotalAllocationBytes as usize] = total;
+            self.actual[RestoreCapacityResource::KeyMediumAllocationBytes as usize] = key;
+            for device in &self.devices {
+                let mut planned = device.pending_new;
+                let mut planned_key = 0u64;
+                for inode in self
+                    .inodes
+                    .iter()
+                    .filter(|inode| inode.device == device.device)
+                {
+                    let remaining = inode
+                        .planned_ceiling
+                        .map_or(0, |ceiling| ceiling.saturating_sub(inode.allocated));
+                    planned = planned.checked_add(remaining).ok_or_else(overflow)?;
+                    if inode.key_medium {
+                        planned_key = planned_key.checked_add(remaining).ok_or_else(overflow)?;
+                    }
+                }
+                total = total.checked_add(planned).ok_or_else(overflow)?;
+                key = key.checked_add(planned_key).ok_or_else(overflow)?;
+                let reserve = if device.has_working {
+                    self.limits.reserve_bytes
+                } else {
+                    0
+                }
+                .max(if device.has_key_medium {
+                    self.limits.key_medium_reserve_bytes
+                } else {
+                    0
+                });
+                let floor = if device.has_working {
+                    self.limits.free_floor_bytes
+                } else {
+                    0
+                }
+                .max(if device.has_key_medium {
+                    self.limits.key_medium_free_floor_bytes
+                } else {
+                    0
+                });
+                let needed = planned
+                    .checked_add(reserve)
+                    .and_then(|n| n.checked_add(floor))
+                    .ok_or_else(overflow)?;
+                if needed > device.available {
+                    return Err(overflow());
+                }
+            }
+            if total > self.limits.max_total_allocation_bytes
+                || key > self.limits.max_key_medium_allocation_bytes
+            {
+                return Err(overflow());
+            }
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            self.fault.get_or_insert(error.fault());
+        }
+        result
+    }
+}
+
 /// Configuration consumes the real original host source, not a raw path.
 pub struct RecoveryControlConfig {
     root: std::path::PathBuf,
@@ -331,6 +835,8 @@ pub struct RecoveryControlConfig {
     uid: u32,
     limits: TrustedHostRecoveryLimits,
     service_source: Option<VerifiedServiceRecoveryHost>,
+    preheld_restore_usage: Option<(u64, u64)>,
+    original_admission_deadline: Option<Instant>,
 }
 
 impl RecoveryControlConfig {
@@ -359,6 +865,8 @@ impl RecoveryControlConfig {
             uid: rustix::process::getuid().as_raw(),
             limits: limits.checked()?,
             service_source: None,
+            preheld_restore_usage: None,
+            original_admission_deadline: None,
         })
     }
 
@@ -380,6 +888,8 @@ impl RecoveryControlConfig {
             uid,
             limits: limits.checked()?,
             service_source: Some(actual),
+            preheld_restore_usage: None,
+            original_admission_deadline: None,
         })
     }
 }
@@ -434,6 +944,43 @@ pub struct RecoveryControl {
 }
 
 impl RecoveryControl {
+    /// Admit the already held Local request/release resources in the same
+    /// control budget before bootstrap opens any additional descriptor.
+    #[cfg(feature = "desktop-local")]
+    pub fn open_local_restore_before(
+        actual: crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
+        request: OwnedRecoveryRequestFile,
+        host: VerifiedRecoveryHost,
+        deadline: Instant,
+    ) -> Result<(Self, VerifiedRecoveryHostIntent), RecoveryControlError> {
+        let mut original_request = Some(request);
+        let mut original_host = Some(host);
+        let result = (|| {
+            let host = original_host.as_ref().expect("original host retained");
+            let request = original_request.as_ref().expect("original request retained");
+            let (host_bytes, host_files) = host.retained_usage()?;
+            let (request_bytes, request_files) = request.retained_usage()?;
+            let usage = (host_bytes.checked_add(request_bytes), host_files.checked_add(request_files));
+            let (Some(bytes), Some(files)) = usage else { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); };
+            let mut config = RecoveryControlConfig::local(actual, host.trusted_limits().clone())?;
+            config.preheld_restore_usage = Some((bytes, files));
+            config.original_admission_deadline = Some(deadline);
+            before(deadline)?;
+            let control = Self::open(config)?;
+            let intent = control.verify_host_intent_before(
+                original_request.take().expect("original request moved once"),
+                original_host.take().expect("original host moved once"),
+                deadline,
+            )?;
+            Ok((control, intent))
+        })();
+        result.map_err(|mut error: RecoveryControlError| {
+            error.retained_host = original_host.take().map(Box::new);
+            error.retained_restore_input = original_request.take().map(Box::new);
+            error
+        })
+    }
+
     /// Open/authenticate the external root. Missing head remains missing.
     pub fn open(config: RecoveryControlConfig) -> Result<Self, RecoveryControlError> {
         entry::open_control(config).map(|shared| Self { shared })
@@ -542,6 +1089,25 @@ impl RecoveryControl {
     /// Shared-lock ordinary startup: a published head at the latest native
     /// version enrolls this runtime; otherwise `InitializationRequired`, with
     /// the intent handed back where the exclusive writer is the next step.
+    #[cfg(feature = "desktop-local")]
+    pub fn open_local_before(
+        &self,
+        creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+        release: [u8; 32],
+        services: [&str; 2],
+        bounds: OrdinaryStartupBounds,
+        owners: &[RuntimeOwner],
+    ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
+        let result = (|| {
+            let intent = entry::local_intent(&self.shared, creator, release, services, bounds, owners)?;
+            let admission = intent.admission_deadline();
+            let (published, intent) = ordinary::shared_local_head(&self.shared, intent, admission, creator)?;
+            ordinary::enroll(&self.shared, published, &intent)
+        })();
+        result.map_err(|error| error.retain(&self.shared))
+    }
+
+    /// The ordinary shared-lock entry never creates a missing Local installation.
     pub fn enter_runtime_before(
         &self,
         intent: VerifiedOrdinaryStartupIntent,
@@ -659,6 +1225,150 @@ mod tests {
             max_metadata_bytes: 1 << 24,
             admission_ns: 1_000_000_000,
         }
+    }
+
+    fn restore_capacity() -> super::RestoreOperationCapacity {
+        super::RestoreOperationCapacity {
+            max_input_wire_bytes: 1 << 20,
+            max_manifest_bytes: 1 << 16,
+            max_material_files: 64,
+            max_material_directories: 16,
+            max_single_material_bytes: 1 << 20,
+            max_material_plain_bytes: 1 << 20,
+            max_path_bytes: 1024,
+            max_path_depth: 16,
+            max_candidate_data_bytes: 1 << 20,
+            max_candidate_wal_bytes: 1 << 20,
+            max_candidate_temp_bytes: 1 << 20,
+            max_spool_bytes: 1 << 20,
+            max_retained_prior_bytes: 1 << 20,
+            max_journal_bytes: 1 << 20,
+            max_journal_records: 64,
+            max_metadata_bytes: 1 << 20,
+            max_open_files: 64,
+            max_native_tasks: 8,
+            max_pg_connections: 4,
+            max_pg_transactions: 4,
+            max_pg_rows: 64,
+            max_reconfirm_requirements: 64,
+            max_secret_memory_bytes: 1 << 20,
+            max_secret_structure_bytes: 1 << 16,
+            max_total_allocation_bytes: 200,
+            reserve_bytes: 1,
+            free_floor_bytes: 1,
+            max_key_medium_allocation_bytes: 200,
+            key_medium_reserve_bytes: 1,
+            key_medium_free_floor_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn restore_ledger_unknown_reservation_is_not_refunded() {
+        use super::RestoreCapacityResource as R;
+        let mut ledger = super::RestoreCapacityLedger::new(restore_capacity());
+        ledger
+            .admit(R::OpenFiles, 63)
+            .expect("reserve original handles");
+        assert_eq!(
+            ledger.admit(R::OpenFiles, 2).err().map(|e| e.fault()),
+            Some(RecoveryControlFault::CapacityExceeded)
+        );
+        assert_eq!(ledger.admitted[R::OpenFiles as usize], 63);
+        assert_eq!(
+            ledger.admit(R::OpenFiles, 0).err().map(|e| e.fault()),
+            Some(RecoveryControlFault::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn restore_ledger_settles_only_the_original_admitted_delta() {
+        use super::RestoreCapacityResource as R;
+        let mut ledger = super::RestoreCapacityLedger::new(restore_capacity());
+        ledger
+            .admit(R::OpenFiles, 10)
+            .expect("other original handles");
+        ledger
+            .admit(R::OpenFiles, 4)
+            .expect("new handle reservation");
+        ledger
+            .settle(R::OpenFiles, 4, 3)
+            .expect("three actually opened");
+        assert_eq!(ledger.admitted[R::OpenFiles as usize], 13);
+        assert_eq!(ledger.actual[R::OpenFiles as usize], 3);
+        ledger
+            .admit(R::OpenFiles, 1)
+            .expect("another original effect");
+        assert_eq!(
+            ledger.settle(R::OpenFiles, 1, 2).err().map(|e| e.fault()),
+            Some(RecoveryControlFault::CapacityExceeded)
+        );
+        assert_eq!(ledger.admitted[R::OpenFiles as usize], 14);
+    }
+
+    #[test]
+    fn restore_ledger_inflight_growth_is_counted_once() {
+        let mut ledger = super::RestoreCapacityLedger::new(restore_capacity());
+        ledger.inodes.push(super::RestoreInodeUse {
+            device: 7,
+            inode: 11,
+            allocated: 80,
+            key_medium: false,
+            planned_ceiling: Some(180),
+        });
+        ledger.devices.push(super::RestoreDeviceUse {
+            device: 7,
+            available: 1024,
+            has_key_medium: false,
+            has_working: true,
+            pending_new: 0,
+        });
+        ledger.check_storage().expect("80 actual plus 100 planned");
+        ledger.inodes[0].allocated = 160;
+        ledger
+            .check_storage()
+            .expect("160 actual plus 20 still planned");
+        ledger.inodes[0].allocated = 181;
+        assert_eq!(
+            ledger.check_storage().err().map(|e| e.fault()),
+            Some(RecoveryControlFault::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn restore_ledger_reserve_and_floor_apply_together() {
+        let mut ledger = super::RestoreCapacityLedger::new(restore_capacity());
+        ledger.devices.push(super::RestoreDeviceUse {
+            device: 7,
+            available: 1,
+            has_key_medium: true,
+            has_working: true,
+            pending_new: 0,
+        });
+        assert_eq!(
+            ledger.check_storage().err().map(|e| e.fault()),
+            Some(RecoveryControlFault::CapacityExceeded)
+        );
+    }
+
+    #[test]
+    fn restore_ledger_path_limits_are_per_path() {
+        use super::RestoreCapacityResource as R;
+        let mut ledger = super::RestoreCapacityLedger::new(restore_capacity());
+        ledger.admit(R::PathDepth, 12).expect("first depth");
+        ledger
+            .settle(R::PathDepth, 12, 12)
+            .expect("observed first path");
+        ledger
+            .admit(R::PathDepth, 12)
+            .expect("second path has the same depth");
+        ledger
+            .settle(R::PathDepth, 12, 12)
+            .expect("observed second path");
+        assert_eq!(ledger.actual[R::PathDepth as usize], 12);
+        assert_eq!(
+            ledger.admit(R::PathDepth, 17).err().map(|e| e.fault()),
+            Some(RecoveryControlFault::CapacityExceeded)
+        );
     }
 
     fn file(inode: u64) -> Value {

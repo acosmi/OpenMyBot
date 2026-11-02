@@ -321,9 +321,11 @@ BEGIN
    WHERE r.operation_id=operation.operation_id AND r.source_kind=requirement.source_kind
     AND r.source_ref=requirement.source_ref AND r.binding_generation>requirement.binding_generation) OR
    NEW.confirmed_by IS DISTINCT FROM requirement.owner_id OR
-   NEW.proof_kind IS DISTINCT FROM (CASE requirement.owner_kind
+   (NEW.proof_kind IS DISTINCT FROM (CASE requirement.owner_kind
      WHEN 'actor' THEN 'fresh_actor' WHEN 'installation' THEN 'fresh_local_os'
-     WHEN 'service' THEN 'fresh_service_operator' END) OR
+     WHEN 'service' THEN 'fresh_service_operator' END) AND NOT (
+      requirement.owner_kind='actor' AND requirement.source_kind='subject'
+      AND NEW.proof_kind IS NOT DISTINCT FROM 'fresh_local_os')) OR
    (requirement.source_kind='subject' AND NEW.confirmed_by IS DISTINCT FROM requirement.source_ref) THEN
    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='restore_pg_confirmation_invalid';
   END IF;

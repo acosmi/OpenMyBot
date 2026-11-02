@@ -22,9 +22,12 @@ use openbot_infra::db::desktop_local::{
 use openbot_infra::db::desktop_vault_canary::VerifiedDesktopVaultCanary;
 use openbot_infra::db::initialization::DatabaseOrigin;
 use openbot_infra::db::pool::DatabasePool;
+use openbot_infra::db::pool::{ConnectionDestruction, ConnectionObservation};
 use openbot_infra::thread_listener::ThreadListenerDatabase;
 
-use crate::postgres_sidecar::{PostgresSidecarOrigin, RunningPostgresSidecar};
+use crate::postgres_sidecar::{
+    PostgresSidecarOrigin, RunningPostgresSidecar, SidecarExit, SidecarOutcome,
+};
 
 #[cfg(all(
     feature = "desktop-launcher",
@@ -43,6 +46,100 @@ enum StartupDriverCustody {
         target_os = "macos"
     ))]
     Armed(DesktopLocalDriverCustody),
+}
+
+/// Original application-pool resources retained for runtime-close observation.
+#[derive(Debug)]
+pub enum SqlDriverOutcome {
+    /// This startup never constructed the application pool or one of its drivers.
+    NeverStarted,
+    /// Retained original drivers were joined and their destruction was observed.
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    Joined(Vec<ConnectionDestruction>),
+    /// The pool's original observations, to be awaited within the close deadline.
+    Observed(Vec<ConnectionObservation>),
+    /// A driver may have existed without an observed join or destruction.
+    Unknown,
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) fn sidecar_close_fact(
+    result: Result<SidecarExit, SidecarOutcome>,
+) -> Option<openbot_infra::recovery_control::RuntimeCloseFact> {
+    use openbot_infra::recovery_control::{
+        NativeExit, PassiveObjectKind, PipeJoin, ProcessStart, RuntimeCloseFact, RuntimeOwner,
+    };
+    use std::os::unix::process::ExitStatusExt;
+    let (evidence, status, observed_ns) = match result {
+        Ok(exit) => {
+            let (evidence, status, _, _, observed_ns) = exit.original_wait();
+            (evidence?, status, observed_ns?)
+        }
+        Err(SidecarOutcome::NeverSpawned) => {
+            return Some(RuntimeCloseFact::PassiveRetirement {
+                object: PassiveObjectKind::NeverStarted(RuntimeOwner::PostgresSidecar),
+            });
+        }
+        Err(SidecarOutcome::Exited {
+            start_evidence,
+            status,
+            observed_ns,
+            ..
+        }) => (start_evidence, status, observed_ns?),
+        Err(SidecarOutcome::Unknown) => return None,
+    };
+    let exit = match status.code() {
+        Some(value) => NativeExit::Code { value },
+        None => NativeExit::Signal {
+            value: status.signal()?,
+        },
+    };
+    Some(RuntimeCloseFact::NativeWait {
+        original_program_id: RuntimeOwner::PostgresSidecar,
+        original_pid: u32::from_be_bytes(evidence[..4].try_into().expect("fixed process pid")),
+        original_start_identity: ProcessStart {
+            seconds: u64::from_be_bytes(evidence[4..12].try_into().expect("fixed process seconds")),
+            nanos: u32::from_be_bytes(
+                evidence[12..16]
+                    .try_into()
+                    .expect("fixed process microseconds"),
+            )
+            .checked_mul(1_000)?,
+        },
+        exit,
+        observed_ns,
+        pipes: [PipeJoin::Null, PipeJoin::Null, PipeJoin::Null],
+    })
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) async fn sql_driver_close_fact(
+    result: SqlDriverOutcome,
+    deadline: std::time::Instant,
+) -> Option<openbot_infra::recovery_control::RuntimeCloseFact> {
+    use openbot_infra::recovery_control::{PassiveObjectKind, RuntimeCloseFact, RuntimeOwner};
+    let object = match result {
+        SqlDriverOutcome::NeverStarted => PassiveObjectKind::NeverStarted(RuntimeOwner::SqlDriver),
+        SqlDriverOutcome::Joined(facts) => PassiveObjectKind::SqlDriver(facts),
+        SqlDriverOutcome::Observed(observations) => {
+            let mut facts = Vec::with_capacity(observations.len());
+            for observation in observations {
+                facts.push(
+                    observation
+                        .wait_for_destruction_before(deadline)
+                        .await
+                        .ok()?,
+                );
+            }
+            PassiveObjectKind::SqlDriver(facts)
+        }
+        SqlDriverOutcome::Unknown => return None,
+    };
+    Some(RuntimeCloseFact::PassiveRetirement { object })
 }
 
 const STARTUP_DB_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -233,23 +330,60 @@ impl RunningDesktopLocalDataPlane {
 
     /// Close the application pool, then stop the exact child through its verified `pg_ctl` before
     /// releasing the single-instance lock.
-    pub async fn shutdown(mut self) -> Result<(), DesktopLocalCompositionError> {
+    pub async fn shutdown(
+        mut self,
+    ) -> Result<
+        (SidecarExit, Vec<ConnectionObservation>),
+        (
+            DesktopLocalCompositionError,
+            Result<SidecarExit, SidecarOutcome>,
+            SqlDriverOutcome,
+        ),
+    > {
+        let observations = self.database.pool().connection_observations();
         self.database.close();
         #[cfg(all(
             feature = "desktop-launcher",
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
-        if let Some(custody) = self.capture_custody.as_mut() {
-            close_startup_original_drivers(custody).await;
-        }
-        let Some(sidecar) = self.sidecar.take() else {
-            return Err(DesktopLocalCompositionError::SidecarShutdown);
+        let retired = match self.capture_custody.as_mut() {
+            Some(custody) => close_startup_original_drivers(custody).await.is_some(),
+            None => true,
         };
-        sidecar
-            .shutdown()
-            .await
-            .map_err(|_| DesktopLocalCompositionError::SidecarShutdown)
+        #[cfg(not(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        )))]
+        let retired = true;
+        let sql = if retired {
+            SqlDriverOutcome::Observed(observations)
+        } else {
+            SqlDriverOutcome::Unknown
+        };
+        let Some(sidecar) = self.sidecar.take() else {
+            return Err((
+                DesktopLocalCompositionError::SidecarShutdown,
+                Err(SidecarOutcome::Unknown),
+                sql,
+            ));
+        };
+        match sidecar.shutdown().await {
+            Ok(exit) => match sql {
+                SqlDriverOutcome::Observed(observations) => Ok((exit, observations)),
+                unknown => Err((
+                    DesktopLocalCompositionError::SidecarShutdown,
+                    Ok(exit),
+                    unknown,
+                )),
+            },
+            Err((_, outcome)) => Err((
+                DesktopLocalCompositionError::SidecarShutdown,
+                Err(outcome),
+                sql,
+            )),
+        }
     }
 }
 
@@ -328,7 +462,14 @@ impl PreparedDesktopLocalDataPlane {
         database_origin: DatabaseOrigin,
         proof: &VerifiedDesktopVaultCanary,
         audit_checkpoint_key: &[u8],
-    ) -> Result<RunningDesktopLocalDataPlane, DesktopLocalCompositionError> {
+    ) -> Result<
+        RunningDesktopLocalDataPlane,
+        (
+            DesktopLocalCompositionError,
+            Result<SidecarExit, SidecarOutcome>,
+            SqlDriverOutcome,
+        ),
+    > {
         if let Err(error) = self.ensure_owner_current() {
             return Err(self.cleanup_with(error).await);
         }
@@ -358,10 +499,11 @@ impl PreparedDesktopLocalDataPlane {
         // V6-PR-020/024: matching required → bump once per epoch (applied witness), then clear required.
         #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
         {
-            let sidecar = self
-                .sidecar
-                .as_ref()
-                .ok_or(DesktopLocalCompositionError::SidecarShutdown)?;
+            let sidecar = self.sidecar.as_ref().ok_or((
+                DesktopLocalCompositionError::SidecarShutdown,
+                Err(SidecarOutcome::Unknown),
+                SqlDriverOutcome::Unknown,
+            ))?;
             let outstanding = match sidecar.auth_invalidation_outstanding() {
                 Ok(value) => value,
                 Err(_) => {
@@ -505,45 +647,75 @@ impl PreparedDesktopLocalDataPlane {
         })
     }
 
-    pub(crate) async fn shutdown(mut self) -> Result<(), DesktopLocalCompositionError> {
+    pub(crate) async fn shutdown(
+        mut self,
+    ) -> Result<
+        (SidecarExit, Vec<ConnectionObservation>),
+        (
+            DesktopLocalCompositionError,
+            Result<SidecarExit, SidecarOutcome>,
+            SqlDriverOutcome,
+        ),
+    > {
+        let observations = self.database.pool().connection_observations();
         self.database.close();
         #[cfg(all(
             feature = "desktop-launcher",
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
-        if let Some(custody) = self.capture_custody.as_mut() {
-            close_startup_original_drivers(custody).await;
+        let retired = match self.capture_custody.as_mut() {
+            Some(custody) => close_startup_original_drivers(custody).await.is_some(),
+            None => true,
+        };
+        #[cfg(not(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        )))]
+        let retired = true;
+        let sql = if retired {
+            SqlDriverOutcome::Observed(observations)
+        } else {
+            SqlDriverOutcome::Unknown
+        };
+        let Some(sidecar) = self.sidecar.take() else {
+            return Err((
+                DesktopLocalCompositionError::SidecarShutdown,
+                Err(SidecarOutcome::Unknown),
+                sql,
+            ));
+        };
+        match sidecar.shutdown().await {
+            Ok(exit) => match sql {
+                SqlDriverOutcome::Observed(observations) => Ok((exit, observations)),
+                unknown => Err((
+                    DesktopLocalCompositionError::SidecarShutdown,
+                    Ok(exit),
+                    unknown,
+                )),
+            },
+            Err((_, outcome)) => Err((
+                DesktopLocalCompositionError::SidecarShutdown,
+                Err(outcome),
+                sql,
+            )),
         }
-        self.sidecar
-            .take()
-            .ok_or(DesktopLocalCompositionError::SidecarShutdown)?
-            .shutdown()
-            .await
-            .map_err(|_| DesktopLocalCompositionError::SidecarShutdown)
     }
 
     async fn cleanup_with(
-        mut self,
+        self,
         original: DesktopLocalCompositionError,
-    ) -> DesktopLocalCompositionError {
-        self.database.close();
-        #[cfg(all(
-            feature = "desktop-launcher",
-            feature = "postgres-maintenance",
-            target_os = "macos"
-        ))]
-        if let Some(custody) = self.capture_custody.as_mut() {
-            close_startup_original_drivers(custody).await;
-        }
-        let result = match self.sidecar.take() {
-            Some(sidecar) => sidecar.shutdown().await,
-            None => return DesktopLocalCompositionError::FailureCleanup,
-        };
-        if result.is_ok() {
-            original
-        } else {
-            DesktopLocalCompositionError::FailureCleanup
+    ) -> (
+        DesktopLocalCompositionError,
+        Result<SidecarExit, SidecarOutcome>,
+        SqlDriverOutcome,
+    ) {
+        match self.shutdown().await {
+            Ok((exit, observations)) => {
+                (original, Ok(exit), SqlDriverOutcome::Observed(observations))
+            }
+            Err((_, sidecar, sql)) => (DesktopLocalCompositionError::FailureCleanup, sidecar, sql),
         }
     }
 }
@@ -610,6 +782,7 @@ pub async fn prepare_running_sidecar(
         StartupDriverCustody::Ordinary,
     )
     .await
+    .map_err(|(error, ..)| error)
 }
 
 #[cfg(all(
@@ -621,13 +794,23 @@ pub(crate) async fn prepare_running_sidecar_retained(
     installation: DesktopLocalInstallation,
     sidecar: RunningPostgresSidecar,
     package: &LoadedTenantPackage,
-    custody: DesktopLocalDriverCustody,
-) -> Result<PreparedDesktopLocalDataPlane, DesktopLocalCompositionError> {
+    custody: Option<DesktopLocalDriverCustody>,
+) -> Result<
+    PreparedDesktopLocalDataPlane,
+    (
+        DesktopLocalCompositionError,
+        Result<SidecarExit, SidecarOutcome>,
+        SqlDriverOutcome,
+    ),
+> {
     prepare_running_sidecar_inner(
         installation,
         sidecar,
         package,
-        StartupDriverCustody::Armed(custody),
+        match custody {
+            Some(custody) => StartupDriverCustody::Armed(custody),
+            None => StartupDriverCustody::Ordinary,
+        },
     )
     .await
 }
@@ -637,31 +820,41 @@ async fn prepare_running_sidecar_inner(
     sidecar: RunningPostgresSidecar,
     package: &LoadedTenantPackage,
     mut custody: StartupDriverCustody,
-) -> Result<PreparedDesktopLocalDataPlane, DesktopLocalCompositionError> {
+) -> Result<
+    PreparedDesktopLocalDataPlane,
+    (
+        DesktopLocalCompositionError,
+        Result<SidecarExit, SidecarOutcome>,
+        SqlDriverOutcome,
+    ),
+> {
     if sidecar.data_dir() != installation.sidecar_data_dir() {
-        return Err(cleanup_after_failure_with_custody(
+        let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
         )
-        .await);
+        .await;
+        return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
     if let Err(error) = installation.validate_package_scope(package) {
-        return Err(cleanup_after_failure_with_custody(
+        let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::PackageScope(error),
             &mut custody,
         )
-        .await);
+        .await;
+        return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
 
     if sidecar.ensure_owner_current().is_err() {
-        return Err(cleanup_after_failure_with_custody(
+        let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
         )
-        .await);
+        .await;
+        return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
 
     let (port, password) = {
@@ -691,21 +884,23 @@ async fn prepare_running_sidecar_inner(
     let admin = match admin {
         Ok(admin) => admin,
         Err(error) => {
-            return Err(cleanup_after_failure_with_custody(
+            let (error, sidecar, _) = cleanup_after_failure_with_custody(
                 sidecar,
                 DesktopLocalCompositionError::Database(error),
                 &mut custody,
             )
-            .await);
+            .await;
+            return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
         }
     };
     if sidecar.ensure_owner_current().is_err() {
-        return Err(cleanup_after_failure_with_custody(
+        let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
         )
-        .await);
+        .await;
+        return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
     let admin = match tokio::time::timeout(
         STARTUP_DB_STEP_TIMEOUT,
@@ -717,21 +912,23 @@ async fn prepare_running_sidecar_inner(
     {
         Ok(admin) => admin,
         Err(error) => {
-            return Err(cleanup_after_failure_with_custody(
+            let (error, sidecar, _) = cleanup_after_failure_with_custody(
                 sidecar,
                 DesktopLocalCompositionError::Bootstrap(error),
                 &mut custody,
             )
-            .await);
+            .await;
+            return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
         }
     };
     if sidecar.ensure_owner_current().is_err() {
-        return Err(cleanup_after_failure_with_custody(
+        let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
         )
-        .await);
+        .await;
+        return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
     let allow_create = sidecar.origin() == PostgresSidecarOrigin::Fresh;
     let database = match tokio::time::timeout(
@@ -744,22 +941,67 @@ async fn prepare_running_sidecar_inner(
     {
         Ok(database) => database,
         Err(error) => {
-            return Err(cleanup_after_failure_with_custody(
+            let never_started = matches!(
+                error,
+                DesktopLocalDatabaseError::Missing
+                    | DesktopLocalDatabaseError::Inspect(_)
+                    | DesktopLocalDatabaseError::Create(_)
+            );
+            let (error, sidecar, joined) = cleanup_after_failure_with_custody(
                 sidecar,
                 DesktopLocalCompositionError::Database(error),
                 &mut custody,
             )
-            .await);
+            .await;
+            let sql = if never_started {
+                SqlDriverOutcome::NeverStarted
+            } else {
+                match joined {
+                    #[cfg(all(
+                        feature = "desktop-launcher",
+                        feature = "postgres-maintenance",
+                        target_os = "macos"
+                    ))]
+                    Some(destructions) => SqlDriverOutcome::Joined(destructions),
+                    _ => SqlDriverOutcome::Unknown,
+                }
+            };
+            return Err((error, sidecar, sql));
         }
     };
     if sidecar.ensure_owner_current().is_err() {
+        let observations = database.pool().connection_observations();
         database.close();
-        return Err(cleanup_after_failure_with_custody(
+        let (error, sidecar, joined) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
         )
-        .await);
+        .await;
+        #[cfg(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        ))]
+        let retired = !matches!(custody, StartupDriverCustody::Armed(_)) || joined.is_some();
+        #[cfg(not(all(
+            feature = "desktop-launcher",
+            feature = "postgres-maintenance",
+            target_os = "macos"
+        )))]
+        let retired = {
+            let _ = joined;
+            true
+        };
+        return Err((
+            error,
+            sidecar,
+            if retired {
+                SqlDriverOutcome::Observed(observations)
+            } else {
+                SqlDriverOutcome::Unknown
+            },
+        ));
     }
     Ok(PreparedDesktopLocalDataPlane {
         database,
@@ -783,17 +1025,31 @@ async fn cleanup_after_failure_with_custody(
     sidecar: RunningPostgresSidecar,
     original: DesktopLocalCompositionError,
     custody: &mut StartupDriverCustody,
-) -> DesktopLocalCompositionError {
+) -> (
+    DesktopLocalCompositionError,
+    Result<SidecarExit, SidecarOutcome>,
+    Option<Vec<ConnectionDestruction>>,
+) {
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",
         target_os = "macos"
     ))]
-    if let StartupDriverCustody::Armed(retained) = custody {
-        close_startup_original_drivers(retained).await;
-    }
-    let _ = custody;
-    cleanup_after_failure(sidecar, original).await
+    let joined = match custody {
+        StartupDriverCustody::Armed(retained) => close_startup_original_drivers(retained).await,
+        StartupDriverCustody::Ordinary => None,
+    };
+    #[cfg(not(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    )))]
+    let joined = {
+        let _ = custody;
+        None
+    };
+    let (error, outcome) = cleanup_after_failure(sidecar, original).await;
+    (error, outcome, joined)
 }
 
 #[cfg(all(
@@ -801,17 +1057,16 @@ async fn cleanup_after_failure_with_custody(
     feature = "postgres-maintenance",
     target_os = "macos"
 ))]
-async fn close_startup_original_drivers(custody: &mut DesktopLocalDriverCustody) {
+async fn close_startup_original_drivers(
+    custody: &mut DesktopLocalDriverCustody,
+) -> Option<Vec<ConnectionDestruction>> {
     // No capture operation exists on this path. Only original startup resources are closed.
     let mut drivers = match custody.freeze() {
         Ok(drivers) => drivers,
-        Err(_) => {
-            std::future::pending::<()>().await;
-            let _keep_original_custody = custody;
-            return;
-        }
+        Err(_) => return None,
     };
     let mut actual_facts_ok = true;
+    let mut destructions = Vec::new();
     while let Some(retirement) = drivers.next_retirement() {
         retirement.request();
     }
@@ -819,6 +1074,9 @@ async fn close_startup_original_drivers(custody: &mut DesktopLocalDriverCustody)
         match drivers.join_next_original().await {
             Some(fact) => {
                 actual_facts_ok &= fact.destruction().is_some();
+                if let Some(destruction) = fact.destruction() {
+                    destructions.push(destruction);
+                }
             }
             None => {
                 actual_facts_ok = false;
@@ -835,18 +1093,21 @@ async fn close_startup_original_drivers(custody: &mut DesktopLocalDriverCustody)
         || drivers.original_destructions_missing() != 0
         || drivers.live_proxy_future_count() != 0
     {
-        std::future::pending::<()>().await;
-        drop(drivers);
+        return None;
     }
+    Some(destructions)
 }
 
 async fn cleanup_after_failure(
     sidecar: RunningPostgresSidecar,
     original: DesktopLocalCompositionError,
-) -> DesktopLocalCompositionError {
+) -> (
+    DesktopLocalCompositionError,
+    Result<SidecarExit, SidecarOutcome>,
+) {
     match sidecar.shutdown().await {
-        Ok(()) => original,
-        Err(_) => DesktopLocalCompositionError::FailureCleanup,
+        Ok(exit) => (original, Ok(exit)),
+        Err((_, outcome)) => (DesktopLocalCompositionError::FailureCleanup, Err(outcome)),
     }
 }
 

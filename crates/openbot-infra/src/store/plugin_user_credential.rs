@@ -564,7 +564,7 @@ impl PluginUserCredentialStore {
                 crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
                     UserCredentialSelectionError::Refused(UserCredentialRefusal::ReconnectRequired)
                 }
-                crate::restore_reconfirmation::RestoreReconfirmationError::Unavailable => {
+                _ => {
                     UserCredentialSelectionError::Unavailable
                 }
             })?;

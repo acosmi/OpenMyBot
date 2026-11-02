@@ -67,7 +67,10 @@ use openbot_infra::provider::openai::{
     OpenAiApiKey, OpenAiProtocol, OpenAiProvider, OpenAiProviderConfig,
 };
 use openbot_infra::recovery_control::AuthorizationPurpose;
-use openbot_infra::recovery_control::{RecoveryControl, RecoveryControlConfig, RuntimeOwner};
+use openbot_infra::recovery_control::{
+    PassiveObjectKind, RecoveryControl, RecoveryControlConfig, RuntimeCloseFact,
+    RuntimeCloseResources, RuntimeOwner, RuntimeTaskOutcome,
+};
 use openbot_infra::remote_agui::SafeRemoteAguiTransport;
 use openbot_infra::run_runtime::RunRelay;
 use openbot_infra::sandboxed_components::PostgresSandboxedComponentAdministration;
@@ -187,6 +190,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let tenant = TenantId::new(&tenant_package.package.tenant_id);
     let recovery_host = server.load_recovery_host()?;
+    let runtime_close_duration = Duration::from_nanos(recovery_host.ordinary_startup_bounds().1);
     let limits = recovery_host.host_limits().clone();
     let mut recovery_control =
         RecoveryControl::open(RecoveryControlConfig::server(recovery_host, limits)?)?;
@@ -199,7 +203,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if requires_agent_runtime {
         runtime_owners.push(RuntimeOwner::BuiltInAgent);
     }
-    let (pool, recovery_runtime_owner) = recovery_control
+    let (pool, mut recovery_runtime_owner) = recovery_control
         .open_server_before(
             &database,
             &key_encryption,
@@ -328,6 +332,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         resolver
             .install_recovery_read_gate(recovery_read_gate.clone())
             .map_err(|_| startup_error("recovery_host_gate_unavailable"))?;
+        resolver
+            .install_restore_reconfirmation(
+                openbot_domain::vault::SecretBytes::new(audit_key.expose().to_vec()),
+                model_credential_vault.clone(),
+            )
+            .map_err(|_| startup_error("restore_reconfirmation_unavailable"))?;
         let sensitive =
             SensitiveWriteSecurity::new(config.session_lifetime, config.trusted_origins.clone());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -732,7 +742,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_insecure_transport(server.public_transport().insecure_transport())
         .with_remote_callback_authenticator(remote_callback_auth)
         .with_remote_callback_tools(remote_callback_tools)
-        .with_screen_hub(screen_hub)
+        .with_screen_hub(screen_hub.clone())
         .with_readiness_probe(Arc::new(db_probe));
     if let Some(dist) = server.app_dist_dir.as_deref() {
         builder = builder.with_static_app(StaticApp::open(dist)?);
@@ -795,6 +805,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     })
     .await;
+    let closing_deadline = std::time::Instant::now().checked_add(runtime_close_duration);
     // A serving error or normal completion also closes the owner before other resources stop.
     auth_owner.close_request_bindings();
     if let Some((runtime, _)) = &gateway_authorization_journal {
@@ -815,16 +826,86 @@ async fn main() -> Result<(), Box<dyn Error>> {
         facts.close();
         facts.drain().await;
     }
-    run_relay.stop().await;
-    if let Some(agent) = built_in_agent {
-        agent.stop().await;
+    let mut close_facts = Vec::new();
+    if screen_hub.retire_original().await {
+        close_facts.push(RuntimeCloseFact::PassiveRetirement {
+            object: PassiveObjectKind::ScreenHub,
+        });
     }
-    mcp_revocation_reconciler.stop().await;
+    let mut run_relay = run_relay;
+    let relay_result = run_relay.stop_for_capture().await;
+    let relay_observed = recovery_runtime_owner.observe_close_ns();
+    drop(run_relay);
+    if let Ok(observed_ns) = relay_observed {
+        use openbot_infra::run_runtime::RunRelayStopFailure;
+        close_facts.push(RuntimeCloseFact::TaskJoin {
+            original_task_id: RuntimeOwner::RunRelay,
+            outcome: match relay_result {
+                Ok(()) => RuntimeTaskOutcome::Returned,
+                Err(RunRelayStopFailure::Cancelled) => RuntimeTaskOutcome::JoinUnknown,
+                Err(RunRelayStopFailure::Panicked) => RuntimeTaskOutcome::Panicked,
+            },
+            observed_ns,
+        });
+    }
+    if let Some(mut agent) = built_in_agent {
+        let _agent_result = agent.stop_for_capture().await;
+        let agent_observed = recovery_runtime_owner.observe_close_ns();
+        drop(agent);
+        if let Ok(observed_ns) = agent_observed {
+            close_facts.push(RuntimeCloseFact::TaskJoin {
+                original_task_id: RuntimeOwner::BuiltInAgent,
+                // The supervisor's returned value is distinct from its original join.
+                outcome: RuntimeTaskOutcome::Returned,
+                observed_ns,
+            });
+        }
+    }
+    let mut mcp_revocation_reconciler = mcp_revocation_reconciler;
+    let reconciler_result = mcp_revocation_reconciler.stop_for_capture().await;
+    let reconciler_observed = recovery_runtime_owner.observe_close_ns();
+    drop(mcp_revocation_reconciler);
+    if let Ok(observed_ns) = reconciler_observed {
+        use openbot_infra::mcp_connections::McpReconcilerStopFailure;
+        close_facts.push(RuntimeCloseFact::TaskJoin {
+            original_task_id: RuntimeOwner::McpRevocationReconciler,
+            outcome: match reconciler_result {
+                Ok(()) => RuntimeTaskOutcome::Returned,
+                Err(McpReconcilerStopFailure::Cancelled) => RuntimeTaskOutcome::JoinUnknown,
+                Err(McpReconcilerStopFailure::Panicked) => RuntimeTaskOutcome::Panicked,
+            },
+            observed_ns,
+        });
+    }
     policy_listener.stop().await;
     drop(artifact_datasets);
     drop(gateway_authorization_journal);
-    serve_result?;
+    let sql_observations = pool.connection_observations();
     pool.close();
+    if let Some(deadline) = closing_deadline {
+        let mut sql_facts = Vec::with_capacity(sql_observations.len());
+        let mut sql_known = true;
+        for observation in sql_observations {
+            match observation.wait_for_destruction_before(deadline).await {
+                Ok(fact) => sql_facts.push(fact),
+                Err(_) => {
+                    sql_known = false;
+                    break;
+                }
+            }
+        }
+        if sql_known {
+            close_facts.push(RuntimeCloseFact::PassiveRetirement {
+                object: PassiveObjectKind::SqlDriver(sql_facts),
+            });
+        }
+        if let Err(error) = recovery_runtime_owner
+            .close_before(RuntimeCloseResources::new(close_facts), deadline).await
+        {
+            tracing::warn!(fault = ?error.fault(), "runtime closure remains unproven");
+        }
+    }
+    serve_result?;
     Ok(())
 }
 
@@ -1188,6 +1269,7 @@ async fn build_oidc_login(
         config.session_lifetime,
         config.admin_floor.clone(),
         audit_key,
+        recovery_gate.clone(),
     )?;
     let rate_limiter = PostgresOidcRateLimiter::new(
         pool.clone(),

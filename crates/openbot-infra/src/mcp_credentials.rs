@@ -219,7 +219,7 @@ impl PostgresMcpCredentialBroker {
                 crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
                     McpCredentialError::AuthRequired
                 }
-                crate::restore_reconfirmation::RestoreReconfirmationError::Unavailable => {
+                _ => {
                     McpCredentialError::Unavailable
                 }
             })?;

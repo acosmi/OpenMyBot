@@ -24,6 +24,21 @@ pub(crate) fn monotonic_ns() -> Result<u64, MaintenanceError> {
 }
 
 impl OperationClock {
+    #[cfg(feature = "desktop-launcher")]
+    pub(crate) fn from_restore_session(
+        session: &mut openbot_infra::recovery_control::RestoreControlSession,
+    ) -> Result<Self, MaintenanceError> {
+        let (owner_pid, t0, effect, convergence) = session
+            .original_native_clock()
+            .map_err(|_| MaintenanceError::ClockUnavailable)?;
+        Ok(Self {
+            owner_pid,
+            t0,
+            effect,
+            convergence,
+        })
+    }
+
     pub(crate) fn start(effect_ns: u64, convergence_ns: u64) -> Result<Self, MaintenanceError> {
         if effect_ns == 0 || convergence_ns == 0 {
             return Err(MaintenanceError::ProfileInvalid);

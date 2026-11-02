@@ -89,7 +89,7 @@ impl ReviewedDesktopVaultKeyStoreService {
         Ok(Self(Arc::from(value)))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -183,6 +183,8 @@ pub(crate) struct VaultReadyDesktopMaterial {
         target_os = "macos"
     ))]
     retained_capture: Option<ArmedCaptureVault>,
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    retained_master: Option<DesktopVaultMasterKey>,
 }
 
 /// The original master and its original confirmed journal, retained only for an armed request.
@@ -327,6 +329,38 @@ enum MasterRetention {
 }
 
 impl VaultReadyDesktopMaterial {
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(crate) fn canary(&self) -> &VerifiedDesktopVaultCanary {
+        &self.proof
+    }
+
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(crate) fn bind_recovery_runtime(
+        &mut self,
+        runtime: &openbot_infra::recovery_control::RecoveryRuntimeOwner,
+    ) -> Result<(), DesktopVaultKeyError> {
+        use openbot_infra::recovery_control::AuthorizationPurpose;
+        let master = match (&self.retained_capture, &self.retained_master) {
+            (Some(armed), None) => &armed.master,
+            (None, Some(master)) => master,
+            _ => return Err(DesktopVaultKeyError::MaterialInvalid),
+        };
+        let assertion = runtime
+            .derive_authorization_key(AuthorizationPurpose::RunAssertion, master.0.expose())
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        let mcp_parent = derive_application_key(&master.0, ApplicationKeyPurpose::McpOauthState)
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        let mcp_state = runtime
+            .derive_authorization_key(AuthorizationPurpose::McpState, mcp_parent.expose())
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        let assertions = RemoteRunAssertionSigner::new(assertion.expose().to_vec())
+            .map_err(|_| DesktopVaultKeyError::MaterialInvalid)?;
+        self.material.remote_assertions = Arc::new(assertions);
+        self.material.mcp_oauth_state_key = mcp_state;
+        drop(self.retained_master.take());
+        Ok(())
+    }
+
     #[cfg(any(
         test,
         not(all(
@@ -553,22 +587,22 @@ impl PreparedDesktopLocalDataPlane {
             feature = "postgres-maintenance",
             target_os = "macos"
         ))]
-        let retained_capture = match retention {
-            MasterRetention::Armed => Some(ArmedCaptureVault {
-                dataset_id: proof.dataset_id().to_owned(),
-                deployment_id: proof.deployment_id().to_owned(),
-                tenant_id: proof.tenant_id().to_owned(),
-                key_id: proof.key_id().to_owned(),
-                key_version: proof.key_version(),
-                master,
-                journal: journal
-                    .take()
-                    .ok_or(DesktopVaultKeyError::ReconciliationRequired)?,
-            }),
-            MasterRetention::Ordinary => {
-                drop(master);
-                None
-            }
+        let (retained_capture, retained_master) = match retention {
+            MasterRetention::Armed => (
+                Some(ArmedCaptureVault {
+                    dataset_id: proof.dataset_id().to_owned(),
+                    deployment_id: proof.deployment_id().to_owned(),
+                    tenant_id: proof.tenant_id().to_owned(),
+                    key_id: proof.key_id().to_owned(),
+                    key_version: proof.key_version(),
+                    master,
+                    journal: journal
+                        .take()
+                        .ok_or(DesktopVaultKeyError::ReconciliationRequired)?,
+                }),
+                None,
+            ),
+            MasterRetention::Ordinary => (None, Some(master)),
         };
         #[cfg(not(all(
             feature = "desktop-launcher",
@@ -589,6 +623,8 @@ impl PreparedDesktopLocalDataPlane {
                 target_os = "macos"
             ))]
             retained_capture,
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            retained_master,
         })
     }
 }

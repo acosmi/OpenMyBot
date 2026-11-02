@@ -4,9 +4,9 @@
 //! generate, repair, or normalize an expected schema. The wire relay and event trigger are
 //! private controls in a newly created test database, never application extension points.
 
+mod harness;
 #[path = "support/recovery_admission.rs"]
 mod recovery_admission;
-mod harness;
 
 use std::future::Future;
 use std::sync::Arc;

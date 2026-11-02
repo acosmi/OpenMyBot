@@ -600,7 +600,7 @@ async fn unconfirmed_sources<C: tokio_postgres::GenericClient + Sync>(
     let unconfirmed = |result: Result<(), RestoreReconfirmationError>| match result {
         Ok(()) => Ok(false),
         Err(RestoreReconfirmationError::NotConfirmed) => Ok(true),
-        Err(RestoreReconfirmationError::Unavailable) => Err(Error::Unavailable),
+        Err(_) => Err(Error::Unavailable),
     };
     let credentials: Value = row
         .try_get("default_credentials")

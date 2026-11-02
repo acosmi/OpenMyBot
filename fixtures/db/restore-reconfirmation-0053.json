@@ -1,10 +1,10 @@
 {
   "format": "restore-reconfirmation-oracle-v1",
   "nativeVersion": 53,
-  "migrationSha256": "6b55f76cc52b0b9e34af1afb278691b1c9abea4d7ac77225855a724cf5a7c24a",
+  "migrationSha256": "0c534a7b05266f0a8e877f30a2f922e667a08e8a7d7191a9db21caf50b41f413",
   "schema": {
     "functions": [
-      ["restore53_guard_insert", "6800894e870698cd10cd40bf064b7ad961c4514ff30997f997b5d1f71cd4929c"],
+      ["restore53_guard_insert", "823e78f7ddb4b01eefd091b6e69507935bc8256256cfbdc95290df9337dad3f7"],
       ["restore53_reject_mutation", "e476b418fdfb229e240b764c852e0d9c6d58d90a7b5c8855a33fb10a2f5148a5"]
     ],
     "tables": [

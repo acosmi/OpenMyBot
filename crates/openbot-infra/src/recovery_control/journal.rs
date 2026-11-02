@@ -16,9 +16,11 @@ const MAGIC: &[u8; 8] = b"WBRCJ001";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct ProcessStart {
-    pub(super) seconds: u64,
-    pub(super) nanos: u32,
+pub struct ProcessStart {
+    /// Original operating-system process-birth seconds.
+    pub seconds: u64,
+    /// Original process-birth nanoseconds within the second.
+    pub nanos: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,34 +58,45 @@ impl OwnerClockRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FileInput {
-    file: RecoveryFileIdentity,
-    length: u64,
+pub(super) struct FileInput {
+    pub(super) file: RecoveryFileIdentity,
+    pub(super) length: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct InputIdentities {
-    carrier: FileInput,
-    key_medium: FileInput,
+pub(super) struct InputIdentities {
+    pub(super) carrier: FileInput,
+    pub(super) key_medium: FileInput,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Business {
-    deployment_id: String,
-    tenant_id: String,
-    dataset_id: String,
+pub(super) struct Business {
+    pub(super) deployment_id: String,
+    pub(super) tenant_id: String,
+    pub(super) dataset_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct RestoreRequestReference {
+    pub(super) request_id: super::activation::Hex32,
+    pub(super) purpose: super::RecoveryRequestPurpose,
+    pub(super) file: RecoveryFileIdentity,
+    pub(super) length: u64,
+    pub(super) sha256: super::activation::Hex64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RestoreIntent {
-    profile: RestoreOperationProfile,
-    input_identities: InputIdentities,
-    business: Business,
-    source_installation_id: String,
-    target_installation_id: String,
-    candidate_plan: CandidatePlan,
-    owner_clock: OwnerClockRecord,
+pub(super) struct RestoreIntent {
+    pub(super) request: RestoreRequestReference,
+    pub(super) profile: RestoreOperationProfile,
+    pub(super) input_identities: InputIdentities,
+    pub(super) business: Business,
+    pub(super) source_installation_id: String,
+    pub(super) target_installation_id: String,
+    pub(super) candidate_plan: CandidatePlan,
+    pub(super) owner_clock: OwnerClockRecord,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -222,7 +235,7 @@ enum OperationIntent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Stage {
+pub(crate) enum Stage {
     Import,
     Isolation,
     PgUpgrade,
@@ -238,33 +251,34 @@ pub(super) enum Stage {
     OrdinaryVerify,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) enum CommitAck {
+pub(crate) enum CommitAck {
     TimelyAck,
     AcknowledgedAfterDeadline,
     CommitUnknown,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) enum RollbackAck {
+pub(crate) enum RollbackAck {
     TimelyAck,
     AcknowledgedAfterDeadline,
     RollbackUnproven,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", deny_unknown_fields)]
-pub(super) enum NativeExit {
+pub enum NativeExit {
     Code { value: i32 },
     Signal { value: i32 },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", deny_unknown_fields)]
-pub(super) enum PipeJoin {
+pub enum PipeJoin {
     Returned { observed_ns: u64 },
     Panicked { observed_ns: u64 },
     JoinUnknown,
+    Null,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", deny_unknown_fields)]
-pub(super) enum Disposition {
+pub(crate) enum Disposition {
     PgCommit(CommitAck),
     PgRollback(RollbackAck),
     NativeWait {
@@ -478,7 +492,9 @@ impl Disposition {
                 exit_code_or_signal: NativeExit::Code { value: 0 },
                 pipes,
                 ..
-            } => pipes.iter().all(|p| matches!(p, PipeJoin::Returned { .. })),
+            } => pipes
+                .iter()
+                .all(|p| matches!(p, PipeJoin::Returned { .. } | PipeJoin::Null)),
             _ => false,
         }
     }
@@ -571,6 +587,9 @@ pub(super) struct JournalFrame {
 }
 
 impl JournalData {
+    pub(super) fn restore(intent: RestoreIntent) -> Self {
+        Self { kind: Kind::OperationIntent, data: Data::Operation(OperationIntent::Restore(intent)) }
+    }
     pub(super) fn fresh_init(
         host_binding: HostBinding,
         original_startup_intent: &str,
@@ -794,6 +813,10 @@ impl Record {
         match (&self.kind, &self.data) {
             (Kind::OperationIntent, Data::Operation(d)) if self.sequence == 1 => match d {
                 OperationIntent::Restore(v) => {
+                    v.request.file.validate()?;
+                    if v.request.length == 0 || v.request.length > l.max_request_bytes
+                        || !matches!(v.request.purpose, super::RecoveryRequestPurpose::RestoreSameInstallation | super::RecoveryRequestPurpose::RestoreNewInstallation)
+                    { return Err(RecoveryControlError::new(RecoveryControlFault::ControlInvalid)); }
                     v.profile.clone().checked(l)?;
                     v.candidate_plan.validate(l)?;
                     v.input_identities.carrier.file.validate()?;
@@ -1129,6 +1152,17 @@ fn upgrade_names(
 }
 
 impl JournalObservation {
+    pub(super) fn restore_request(&self) -> Option<&RestoreRequestReference> {
+        match &self.records.first()?.data {
+            Data::Operation(OperationIntent::Restore(intent)) => Some(&intent.request),
+            _ => None,
+        }
+    }
+
+    pub(super) fn first_context(&self) -> Option<(&str, &str, &str)> {
+        let first = self.records.first()?;
+        Some((&first.control_id, &first.operation_id, &first.epoch))
+    }
     /// Whether this operation is a restore (its first record's mode).
     pub(super) fn is_restore(&self) -> bool {
         matches!(

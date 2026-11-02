@@ -40,13 +40,22 @@ CAPTURE_RETURN = "        return;\n    }\n    let DesktopLocalClosingJob {"
 STARTUP_OK = "        startup_ok: authority_ok && state_install_ok,"
 SPAWN = "    tauri::async_runtime::spawn(run_owned_local_closing_job(job));\n"
 DEADLINE = "let deadline = started + crate::cancel::SHUTDOWN_DEADLINE;"
-INNER_JOIN = "        let (transport, (), (), ()) = tokio::join!("
-STAGE_RESULT = "        transport.within_deadline\n"
+INNER_JOIN = """        let (transport, agent, assembly, ()): (
+            _,
+            Option<AgentCloseObservation>,
+            Option<AssemblyCloseObservation>,
+            (),
+        ) = tokio::join!("""
+STAGE_RESULT = "        (transport.within_deadline, agent, assembly)\n"
 OUTER_JOIN = "    let (non_database, drain) = tokio::join!("
 TIMEOUT = "tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), non_database)"
-DATABASE = """    let database_ok = match owner.data_plane.take() {
-        Some(data_plane) => data_plane.shutdown().await.is_ok(),
-        None => false,
+DATABASE = """    let database_result = match owner.data_plane.take() {
+        Some(data_plane) => data_plane.shutdown().await,
+        None => Err((
+            DesktopLocalCompositionError::SidecarShutdown,
+            Err(crate::postgres_sidecar::SidecarOutcome::Unknown),
+            crate::desktop_local_bootstrap::SqlDriverOutcome::Unknown,
+        )),
     };
 """
 SUCCESS = "        startup_ok && observations_ok && non_database_ok && drain_in_deadline && database_ok,"
@@ -55,12 +64,12 @@ REPLY = """    let _observer_received = reply.send(if succeeded {
     } else {
         Err(DesktopLocalRuntimeError::Shutdown)
     });"""
-PROJECTION = """    let non_database_ok = match non_database {
-        Ok(true) => {
+PROJECTION = """    let non_database_ok = match &non_database {
+        Ok((true, ..)) => {
             observe_exit("non_database", "ok");
             true
         }
-        Ok(false) => {
+        Ok((false, ..)) => {
             observe_exit("non_database", "failed");
             false
         }
@@ -69,11 +78,14 @@ PROJECTION = """    let non_database_ok = match non_database {
             false
         }
     };"""
-HELPER = "async fn finish_shutdown_stages("
+HELPER = "async fn finish_shutdown_stages<N, D, E>("
+HELPER_NON_DATABASE = """    let (non_database_ok, original) =
+        match tokio::time::timeout(non_database_window, non_database).await {"""
+HELPER_DATABASE = "    let database = database.await;"
 STARTED = "    let started = Instant::now();\n    " + DEADLINE + "\n"
 FINISH = "    let succeeded = completion.finish(\n"
 STAGE_START = "    let non_database = async {\n"
-STAGE_END = "        transport.within_deadline\n    };\n"
+STAGE_END = STAGE_RESULT + "    };\n"
 
 
 def stage_block(source: str) -> str:
@@ -84,12 +96,12 @@ def stage_block(source: str) -> str:
 def dead_stage_before_join(source: str) -> str:
     block = stage_block(source)
     dead = "    if false {\n" + block + "    }\n"
-    return replace_once(source, block, "    let non_database = async { true };\n" + dead)
+    return replace_once(source, block, "    let non_database = async { (true, None, None) };\n" + dead)
 
 
 def dead_stage_after_database(source: str) -> str:
     block = stage_block(source)
-    source = replace_once(source, block, "    let non_database = async { true };\n")
+    source = replace_once(source, block, "    let non_database = async { (true, None, None) };\n")
     return replace_once(source, FINISH, "    if false {\n" + block + "    }\n" + FINISH)
 
 
@@ -119,7 +131,11 @@ REVIEWED_MUTATIONS = {
             "            owner.lifecycle.wait_local_confirmation_stopped(),\n        );",
             "        );",
         ),
-        (INNER_JOIN, "        let (transport, (), ()) = tokio::join!("),
+        (
+            INNER_JOIN,
+            "        let (transport, agent, assembly): (_, Option<AgentCloseObservation>, "
+            "Option<AssemblyCloseObservation>) = tokio::join!(",
+        ),
     ],
     "M08 serial before join": [
         (
@@ -127,7 +143,9 @@ REVIEWED_MUTATIONS = {
             "        owner.lifecycle.wait_local_confirmation_stopped().await;\n" + INNER_JOIN,
         )
     ],
-    "M09 transport not gating": [(STAGE_RESULT, "        let _ = transport;\n        true\n")],
+    "M09 transport not gating": [
+        (STAGE_RESULT, "        let _ = transport;\n        (true, agent, assembly)\n")
+    ],
     "M10 timeout false as success": [
         (
             PROJECTION,
@@ -146,9 +164,11 @@ REVIEWED_MUTATIONS = {
     "M12 database conditional": [
         (
             DATABASE,
-            "    let database_ok = if non_database_ok {\n"
-            + DATABASE.replace("    let database_ok = ", "").replace("};\n", "}\n")
-            + "    } else {\n        false\n    };\n",
+            "    let database_result = if non_database_ok {\n"
+            + DATABASE.replace("    let database_result = ", "").replace("};\n", "}\n")
+            + "    } else {\n        Err((DesktopLocalCompositionError::SidecarShutdown, "
+            "Err(crate::postgres_sidecar::SidecarOutcome::Unknown), "
+            "crate::desktop_local_bootstrap::SqlDriverOutcome::Unknown))\n    };\n",
         )
     ],
     "M13 early return before database": [
@@ -159,9 +179,8 @@ REVIEWED_MUTATIONS = {
     ],
     "M14 database result ignored": [
         (
-            "        Some(data_plane) => data_plane.shutdown().await.is_ok(),\n        None => false,\n    };\n    if database_ok",
-            "        Some(data_plane) => { let _ = data_plane.shutdown().await; true }\n"
-            "        None => false,\n    };\n    if database_ok",
+            "    let database_ok = database_result.is_ok();",
+            "    let database_ok = { let _ = &database_result; true };",
         )
     ],
     "M15 success without database": [
@@ -190,8 +209,8 @@ REVIEWED_MUTATIONS = {
     ],
     "M20 helper success widened": [
         (
-            "    if non_database_ok && database_ok {\n        Ok(())",
-            "    if non_database_ok || database_ok {\n        Ok(())",
+            "    let outcome = if non_database_ok && database_ok {\n        Ok(())",
+            "    let outcome = if non_database_ok || database_ok {\n        Ok(())",
         )
     ],
     # Review v1: stage results are identified by binding position, not by name.
@@ -212,9 +231,9 @@ REVIEWED_MUTATIONS = {
     "M27 dead same-name stage after the database stage": [dead_stage_after_database],
     "M28 timeout result rebound before projection": [
         (
-            "    let non_database_ok = match non_database {\n",
-            "    let non_database = Ok::<bool, ()>(true);\n"
-            "    let non_database_ok = match non_database {\n",
+            "    let non_database_ok = match &non_database {\n",
+            "    let non_database = Ok::<_, tokio::time::error::Elapsed>((true, None, None));\n"
+            "    let non_database_ok = match &non_database {\n",
         )
     ],
     "M29 transport result rebound after the join": [
@@ -247,7 +266,11 @@ REVIEWED_MUTATIONS = {
     # Review v2: the timeout result name cannot be rebound at all, and macro call groups are
     # transparent to the enclosing scope.
     "M34 timeout result replaced through an alias": [
-        (OUTER_JOIN, "    let fake_result = Ok::<bool, ()>(true);\n" + OUTER_JOIN),
+        (
+            OUTER_JOIN,
+            "    let fake_result = Ok::<_, tokio::time::error::Elapsed>((true, None, None));\n"
+            + OUTER_JOIN,
+        ),
         (PROJECTION, "    let non_database = fake_result;\n" + PROJECTION),
     ],
     "M35 database result shadowed inside a statement macro": [
@@ -317,35 +340,72 @@ class AssemblyGuardTests(unittest.TestCase):
         )
         source = replace_once(
             source,
-            "if let Some(host) = agent_host {",
-            "if let Some(host_alias) = agent_worker {",
+            "let agent_started = agent_host.as_ref().map(DesktopAgentHost::agent_started);",
+            "let agent_started = agent_worker.as_ref().map(DesktopAgentHost::agent_started);",
         )
-        source = replace_once(source, "host.stop().await;", "host_alias.stop().await;")
-        original = """        let (transport, (), (), ()) = tokio::join!(
+        source = replace_once(source, "match agent_host {", "match agent_worker {")
+        source = replace_once(source, "Some(mut host) => {", "Some(mut host_alias) => {")
+        source = replace_once(
+            source,
+            "let result = host.stop_for_capture().await;",
+            "let result = host_alias.stop_for_capture().await;",
+        )
+        source = replace_once(source, "drop(host);", "drop(host_alias);")
+        original = INNER_JOIN + """
             owner.transport.shutdown(),
             async {
-                if let Some(host_alias) = agent_worker {
-                    host_alias.stop().await;
+                match agent_worker {
+                    Some(mut host_alias) => {
+                        let result = host_alias.stop_for_capture().await;
+                        let observed_ns = close_observed_ns();
+                        drop(host_alias);
+                        Some((
+                            agent_started.expect("the same original agent host"),
+                            result,
+                            observed_ns,
+                        ))
+                    }
+                    None => None,
                 }
             },
             async {
-                if let Some(assembly) = assembly {
-                    assembly.shutdown().await;
+                match assembly {
+                    Some(mut assembly) => {
+                        let result = assembly.stop_for_capture().await;
+                        let observed_ns = close_observed_ns();
+                        drop(assembly);
+                        Some((result, observed_ns))
+                    }
+                    None => None,
                 }
             },
             owner.lifecycle.wait_local_confirmation_stopped(),
         );"""
-        reordered = """        let ((), (), (), transport) = tokio::join!(
+        reordered = """        let ((), assembly, agent, transport): (
+            (), Option<AssemblyCloseObservation>, Option<AgentCloseObservation>, _,
+        ) = tokio::join!(
             /* native confirmation branch may be listed first */
             owner.lifecycle.wait_local_confirmation_stopped(),
             async {
-                if let Some(assembly_alias) = assembly {
-                    assembly_alias.shutdown().await;
+                match assembly {
+                    Some(mut assembly_alias) => {
+                        let result = assembly_alias.stop_for_capture().await;
+                        let observed_ns = close_observed_ns();
+                        drop(assembly_alias);
+                        Some((result, observed_ns))
+                    }
+                    None => None,
                 }
             },
             async {
-                if let Some(host_alias) = agent_worker {
-                    host_alias.stop().await;
+                match agent_worker {
+                    Some(mut host_alias) => {
+                        let result = host_alias.stop_for_capture().await;
+                        let observed_ns = close_observed_ns();
+                        drop(host_alias);
+                        Some((agent_started.expect("the same original agent host"), result, observed_ns))
+                    }
+                    None => None,
                 }
             },
             owner.transport.shutdown(),
@@ -368,16 +428,17 @@ class AssemblyGuardTests(unittest.TestCase):
         source = replace_after(
             source,
             HELPER,
-            "    let non_database_ok = match tokio::time::timeout(non_database_window, non_database).await {",
+            HELPER_NON_DATABASE,
             """    let window_alias = non_database_window;
     let non_database_alias = non_database;
-    let non_database_ok = match tokio::time::timeout(window_alias, non_database_alias).await {""",
+    let (non_database_ok, original) =
+        match tokio::time::timeout(window_alias, non_database_alias).await {""",
         )
         source = replace_after(
             source,
             HELPER,
-            "    let database_ok = database.await;",
-            "    let database_alias = database;\n    let database_ok = database_alias.await;",
+            HELPER_DATABASE,
+            "    let database_alias = database;\n    let database = database_alias.await;",
         )
         check_source(source)
 
@@ -386,7 +447,7 @@ class AssemblyGuardTests(unittest.TestCase):
             self.source,
             STAGE_RESULT,
             "        let transport_result_alias = transport.within_deadline;\n"
-            "        transport_result_alias\n",
+            "        (transport_result_alias, agent, assembly)\n",
         )
         source = replace_once(
             source, AUTHORITY, AUTHORITY + "    let authority_result_alias = authority_ok;\n"
@@ -408,19 +469,19 @@ class AssemblyGuardTests(unittest.TestCase):
         source = replace_after(
             source,
             HELPER,
-            "    if non_database_ok && database_ok {",
+            "    let outcome = if non_database_ok && database_ok {",
             """    let non_database_result_alias = non_database_ok;
     let database_result_alias = database_ok;
-    if database_result_alias && non_database_result_alias {""",
+    let outcome = if database_result_alias && non_database_result_alias {""",
         )
         check_source(source)
 
     def test_each_required_concurrent_stop_is_required_in_the_production_join(self) -> None:
         mutations = [
-            ("host.stop().await;", "drop(host);"),
+            ("let result = host.stop_for_capture().await;", "let result = Ok(());"),
             (
-                "                    assembly.shutdown().await;",
-                "                    drop(assembly);",
+                "                        let result = assembly.stop_for_capture().await;",
+                "                        let result = Ok(());",
             ),
             (
                 "owner.transport.shutdown(),",
@@ -438,18 +499,18 @@ class AssemblyGuardTests(unittest.TestCase):
     def test_comment_or_test_only_stop_cannot_replace_production_agent_stop(self) -> None:
         source = replace_once(
             self.source,
-            "host.stop().await;",
-            "// host.stop().await;\n                    drop(host);",
+            "let result = host.stop_for_capture().await;",
+            "// let result = host.stop_for_capture().await;\n                        let result = Ok(());",
         )
-        source += "\n#[cfg(test)] mod fake_guard_evidence { fn only_test() { agent_host.stop(); } }\n"
+        source += "\n#[cfg(test)] mod fake_guard_evidence { fn only_test() { agent_host.stop_for_capture(); } }\n"
         self.assert_rejected(source)
 
     def test_async_stop_method_names_without_await_are_not_evidence(self) -> None:
         for old, new in [
-            ("host.stop().await;", "let _unpolled = host.stop();"),
+            ("let result = host.stop_for_capture().await;", "let result = host.stop_for_capture();"),
             (
-                "                    assembly.shutdown().await;",
-                "                    let _unpolled = assembly.shutdown();",
+                "                        let result = assembly.stop_for_capture().await;",
+                "                        let result = assembly.stop_for_capture();",
             ),
         ]:
             with self.subTest(unpolled=old):
@@ -457,15 +518,15 @@ class AssemblyGuardTests(unittest.TestCase):
         self.assert_rejected(
             replace_once(
                 self.source,
-                "host.stop().await;",
-                "let _nested = async { host.stop().await; };",
+                "let result = host.stop_for_capture().await;",
+                "let result = async { host.stop_for_capture().await };",
             )
         )
         self.assert_rejected(
             replace_once(
                 self.source,
-                "host.stop().await;",
-                "return; host.stop().await;",
+                "let result = host.stop_for_capture().await;",
+                "return None; let result = host.stop_for_capture().await;",
             )
         )
 
@@ -490,31 +551,33 @@ class AssemblyGuardTests(unittest.TestCase):
             replace_once(
                 self.source,
                 DATABASE,
-                "    let database_ok = if non_database_ok {\n"
-                + DATABASE.replace("    let database_ok = ", "").replace("};\n", "}\n")
-                + "    } else {\n        false\n    };\n",
+                "    let database_result = if non_database_ok {\n"
+                + DATABASE.replace("    let database_result = ", "").replace("};\n", "}\n")
+                + "    } else {\n        Err((DesktopLocalCompositionError::SidecarShutdown, "
+                "Err(crate::postgres_sidecar::SidecarOutcome::Unknown), "
+                "crate::desktop_local_bootstrap::SqlDriverOutcome::Unknown))\n    };\n",
             )
         )
         marker = HELPER
         pg_first = replace_after(
             self.source,
             marker,
-            "    let non_database_ok = match tokio::time::timeout(non_database_window, non_database).await {",
-            "    let database_ok = database.await;\n    let non_database_ok = match tokio::time::timeout(non_database_window, non_database).await {",
+            HELPER_DATABASE + "\n",
+            "",
         )
         pg_first = replace_after(
             pg_first,
             marker,
-            "    let database_ok = database.await;\n    observe_exit(\"postgresql\"",
-            "    observe_exit(\"postgresql\"",
+            HELPER_NON_DATABASE,
+            HELPER_DATABASE + "\n" + HELPER_NON_DATABASE,
         )
         self.assert_rejected(pg_first)
         self.assert_rejected(
             replace_after(
                 self.source,
                 marker,
-                "    let database_ok = database.await;",
-                "    let database_ok = if non_database_ok { database.await } else { false };",
+                HELPER_DATABASE,
+                "    let database = if non_database_ok { database.await } else { unreachable!() };",
             )
         )
 
@@ -591,28 +654,28 @@ class AssemblyGuardTests(unittest.TestCase):
             replace_after(
                 self.source,
                 HELPER,
-                """    if non_database_ok && database_ok {
+                """    let outcome = if non_database_ok && database_ok {
         Ok(())
     } else {
         Err(DesktopLocalRuntimeError::Shutdown)
-    }""",
+    };""",
                 """    let _ignored = if non_database_ok && database_ok {
         Ok(())
     } else {
         Err(DesktopLocalRuntimeError::Shutdown)
     };
-    Ok(())""",
+    let outcome = Ok(());""",
             )
         )
         self.assert_rejected(
             replace_after(
                 self.source,
                 HELPER,
-                "    let database_ok = database.await;",
+                HELPER_DATABASE,
                 """    if !non_database_ok {
         return Err(DesktopLocalRuntimeError::Shutdown);
     }
-    let database_ok = database.await;""",
+    let database = database.await;""",
             )
         )
 
@@ -625,6 +688,10 @@ class AssemblyGuardTests(unittest.TestCase):
                 self.assert_rejected(
                     replace_once(self.source, PROJECTION, PROJECTION.replace(old, new))
                 )
+        for old, new in [
+            ("(succeeded, Some(original))", "(true, Some(original))"),
+            ("(false, None)", "(true, None)"),
+        ]:
             with self.subTest(helper_arm=old):
                 self.assert_rejected(replace_after(self.source, HELPER, old, new))
 
@@ -644,10 +711,10 @@ class AssemblyGuardTests(unittest.TestCase):
         with self.subTest(shadow="database owner"):
             source = replace_once(
                 self.source,
-                "    let database_ok = match owner.data_plane.take() {",
+                "    let database_result = match owner.data_plane.take() {",
                 "    let database_owner = owner.data_plane.take();\n"
                 "    let database_owner: Option<RunningDesktopLocalDataPlane> = None;\n"
-                "    let database_ok = match database_owner {",
+                "    let database_result = match database_owner {",
             )
             self.assert_rejected(source)
 
@@ -656,9 +723,9 @@ class AssemblyGuardTests(unittest.TestCase):
             replace_after(
                 self.source,
                 HELPER,
-                "    let database_ok = database.await;",
-                """    let database = async { true };
-    let database_ok = database.await;""",
+                HELPER_DATABASE,
+                """    let database = async { Ok::<(), ()>(()) };
+    let database = database.await;""",
             )
         )
 
@@ -666,20 +733,20 @@ class AssemblyGuardTests(unittest.TestCase):
         self.assert_rejected(
             replace_once(
                 self.source,
-                "Some(data_plane) => data_plane.shutdown().await.is_ok(),",
-                "Some(data_plane) => { drop(data_plane); true },",
+                "Some(data_plane) => data_plane.shutdown().await,",
+                "Some(data_plane) => { drop(data_plane); Ok(()) },",
             )
         )
         self.assert_rejected(
             replace_once(
                 self.source,
-                "Some(data_plane) => data_plane.shutdown().await.is_ok(),",
-                "Some(data_plane) => { let _ignored = data_plane.shutdown().await; true },",
+                "Some(data_plane) => data_plane.shutdown().await,",
+                "Some(data_plane) => { let _ignored = data_plane.shutdown().await; Ok(()) },",
             )
         )
         self.assert_rejected(
             replace_once(
-                self.source, DATABASE, DATABASE.replace("None => false,", "None => true,")
+                self.source, DATABASE, DATABASE.replace("None => Err((", "None => Ok((")
             )
         )
 
@@ -713,14 +780,14 @@ class AssemblyGuardTests(unittest.TestCase):
     def test_database_owner_and_some_binding_aliases_are_accepted(self) -> None:
         source = replace_once(
             self.source,
-            "    let database_ok = match owner.data_plane.take() {",
+            "    let database_result = match owner.data_plane.take() {",
             "    let database_owner = owner.data_plane.take();\n"
-            "    let database_ok = match database_owner {",
+            "    let database_result = match database_owner {",
         )
         source = replace_once(
             source,
-            "Some(data_plane) => data_plane.shutdown().await.is_ok(),",
-            "Some(running_database) => running_database.shutdown().await.is_ok(),",
+            "Some(data_plane) => data_plane.shutdown().await,",
+            "Some(running_database) => running_database.shutdown().await,",
         )
         check_source(source)
 

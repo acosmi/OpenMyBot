@@ -5,7 +5,6 @@
 //! that root with a no-clobber hard-link transaction. The resulting deployment/tenant plus the
 //! single local actor form the identity described by v4 §6.1.
 
-#[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
@@ -108,6 +107,10 @@ impl CurrentOsUserAppDataRoot {
     #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.0
+    }
+
+    pub(crate) fn retained_path_bytes(&self) -> u64 {
+        self.0.capacity() as u64
     }
 }
 
@@ -317,6 +320,31 @@ pub struct DesktopLocalInstallation {
     sidecar_data_dir: PathBuf,
 }
 
+/// The original app-data directory created by this installation attempt.
+/// Only a successful exclusive leaf creation can produce this non-Clone witness.
+pub struct OriginalFreshRoot {
+    root: File,
+    instance_id: Arc<str>,
+}
+
+impl core::fmt::Debug for OriginalFreshRoot {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("OriginalFreshRoot(<original held directory>)")
+    }
+}
+
+impl OriginalFreshRoot {
+    pub(crate) fn into_root_for(
+        self,
+        authority: &DesktopLocalAuthority,
+    ) -> Result<File, DesktopLocalAuthorityError> {
+        if self.instance_id != authority.instance_id {
+            return Err(DesktopLocalAuthorityError::Corrupt);
+        }
+        Ok(self.root)
+    }
+}
+
 impl core::fmt::Debug for DesktopLocalInstallation {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -521,6 +549,10 @@ struct StoreInner {
 }
 
 impl DesktopLocalAuthorityStore {
+    pub(crate) fn original_app_data_root(&self) -> &Path {
+        self.inner.root.as_path()
+    }
+
     /// Bind to one host-asserted current-user app-data root.
     #[must_use]
     pub fn new(root: CurrentOsUserAppDataRoot) -> Self {
@@ -539,7 +571,7 @@ impl DesktopLocalAuthorityStore {
             .mutation
             .lock()
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
-        self.load_or_create_locked()
+        self.load_or_create_locked().map(|(authority, _)| authority)
     }
 
     /// Load/elect the authority and reserve its direct private PostgreSQL 17 data directory.
@@ -550,22 +582,41 @@ impl DesktopLocalAuthorityStore {
     pub fn load_or_create_installation(
         &self,
     ) -> Result<DesktopLocalInstallation, DesktopLocalAuthorityError> {
+        self.load_or_create_installation_for_recovery()
+            .map(|(installation, _)| installation)
+    }
+
+    /// Load the same installation and carry the original exclusive root-creation witness.
+    /// A pre-existing directory, including an empty one, never produces Fresh evidence.
+    pub fn load_or_create_installation_for_recovery(
+        &self,
+    ) -> Result<(DesktopLocalInstallation, Option<OriginalFreshRoot>), DesktopLocalAuthorityError>
+    {
         let _guard = self
             .inner
             .mutation
             .lock()
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
-        let authority = self.load_or_create_locked()?;
+        let (authority, root) = self.load_or_create_locked()?;
         let sidecar_data_dir =
             prepare_sidecar_data_dir(self.inner.root.as_path(), authority.instance_id())?;
-        Ok(DesktopLocalInstallation {
-            authority,
-            sidecar_data_dir,
-        })
+        let fresh = root.map(|root| OriginalFreshRoot {
+            root,
+            instance_id: Arc::clone(&authority.instance_id),
+        });
+        Ok((
+            DesktopLocalInstallation {
+                authority,
+                sidecar_data_dir,
+            },
+            fresh,
+        ))
     }
 
-    fn load_or_create_locked(&self) -> Result<DesktopLocalAuthority, DesktopLocalAuthorityError> {
-        prepare_root(self.inner.root.as_path())?;
+    fn load_or_create_locked(
+        &self,
+    ) -> Result<(DesktopLocalAuthority, Option<File>), DesktopLocalAuthorityError> {
+        let original_root = prepare_root(self.inner.root.as_path())?;
         let path = self.inner.root.as_path().join(FILE_NAME);
         let instance = match read_instance(&path)? {
             Some(instance) => {
@@ -574,7 +625,7 @@ impl DesktopLocalAuthorityStore {
             }
             None => elect_instance(self.inner.root.as_path(), &path)?,
         };
-        Ok(authority(instance))
+        Ok((authority(instance), original_root))
     }
 }
 
@@ -745,25 +796,54 @@ fn listen_addresses_are_local(value: &str) -> bool {
         .all(|address| matches!(address.trim(), "" | "127.0.0.1" | "::1"))
 }
 
-fn prepare_root(root: &Path) -> Result<(), DesktopLocalAuthorityError> {
-    match fs::symlink_metadata(root) {
+fn prepare_root(root: &Path) -> Result<Option<File>, DesktopLocalAuthorityError> {
+    let created = match fs::symlink_metadata(root) {
         Ok(metadata) => {
             if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
                 return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
             }
+            false
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(root).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+            let parent = root
+                .parent()
+                .ok_or(DesktopLocalAuthorityError::InvalidAppDataRoot)?;
+            fs::create_dir_all(parent).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            match builder.create(root) {
+                Ok(()) => true,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(root)
+                        .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+                    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                        return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+                    }
+                    false
+                }
+                Err(_) => return Err(DesktopLocalAuthorityError::Unavailable),
+            }
         }
         Err(_) => return Err(DesktopLocalAuthorityError::Unavailable),
-    }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        if created {
+            return crate::artifact_store::open_trusted_host_root(root)
+                .map(Some)
+                .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot);
+        }
     }
-    Ok(())
+    #[cfg(not(unix))]
+    let _ = created;
+    Ok(None)
 }
 
 fn read_instance(path: &Path) -> Result<Option<[u8; INSTANCE_BYTES]>, DesktopLocalAuthorityError> {
@@ -1119,6 +1199,60 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_fresh_root_witness_requires_exclusive_leaf_creation() {
+        use std::os::unix::fs::MetadataExt as _;
+        let fresh_path = root("ordinary-fresh-witness");
+        let (installation, fresh) = store(&fresh_path)
+            .load_or_create_installation_for_recovery()
+            .unwrap();
+        let held = fresh
+            .expect("this call created the original leaf")
+            .into_root_for(installation.authority())
+            .unwrap();
+        assert_eq!(
+            held.metadata().unwrap().ino(),
+            fs::metadata(&fresh_path).unwrap().ino()
+        );
+        let (again, reused) = store(&fresh_path)
+            .load_or_create_installation_for_recovery()
+            .unwrap();
+        assert!(reused.is_none());
+        assert_eq!(installation, again);
+        drop(held);
+        fs::remove_dir_all(fresh_path).unwrap();
+
+        let existing_path = root("ordinary-existing-empty");
+        fs::create_dir_all(&existing_path).unwrap();
+        let (_, fresh) = store(&existing_path)
+            .load_or_create_installation_for_recovery()
+            .unwrap();
+        assert!(fresh.is_none(), "an existing empty leaf is not Fresh");
+        fs::remove_dir_all(existing_path).unwrap();
+
+        let raced_path = root("ordinary-raced-leaf");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = raced_path.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_root(&path).unwrap()
+            }));
+        }
+        let first_fresh = workers.remove(0).join().unwrap();
+        let second_fresh = workers.remove(0).join().unwrap();
+        assert_eq!(
+            usize::from(first_fresh.is_some()) + usize::from(second_fresh.is_some()),
+            1,
+            "only the exclusive leaf creator receives the witness"
+        );
+        drop((first_fresh, second_fresh));
+        fs::remove_dir_all(raced_path).unwrap();
     }
 
     #[cfg(unix)]

@@ -165,6 +165,34 @@ impl AuthorityInner {
                     if connection.pending_operation_id.is_some() {
                         return Err(GatewayAuthorityError::Corrupt);
                     }
+                    {
+                        let client = active
+                            .session
+                            .lock_client(&self.scope.cancel, self.scope.deadline)
+                            .await?;
+                        let client = client.as_ref().ok_or(GatewayAuthorityError::Unavailable)?;
+                        let source_ref = self.scope.connection_id.to_string();
+                        tokio::select! {
+                            biased;
+                            () = self.scope.cancel.cancelled() => {
+                                return Err(GatewayAuthorityError::Cancelled);
+                            }
+                            result = crate::restore_reconfirmation::require_confirmed_before(
+                                &**client,
+                                crate::restore_reconfirmation::RequirementSource {
+                                    cohort: admission.restore_cohort(),
+                                    kind: crate::restore_reconfirmation::RequirementKind::SdkSecret,
+                                    source_ref: &source_ref,
+                                },
+                                self.scope.deadline.into_std(),
+                            ) => result.map_err(|error| match error {
+                                crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+                                    GatewayAuthorityError::ReconciliationRequired
+                                }
+                                _ => GatewayAuthorityError::Unavailable,
+                            })?,
+                        }
+                    }
                     let encrypted = store::load_secret(
                         &active.session,
                         &self.scope,

@@ -614,6 +614,10 @@ async fn dynamic_oidc_registration_start_and_cross_replica_callback_share_the_sa
                     now,
                     "203.0.113.7",
                     Some("integration-agent"),
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -636,6 +640,10 @@ async fn dynamic_oidc_registration_start_and_cross_replica_callback_share_the_sa
                     now,
                     "203.0.113.7",
                     None,
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await;
             if replay.is_ok() {

@@ -7,6 +7,7 @@ mod enrollment;
 pub(crate) use enrollment::EnrollmentAdoption;
 mod fence;
 mod store;
+pub(crate) use store::reconfirm_ready_binding;
 mod strict;
 
 use std::fmt;

@@ -162,6 +162,19 @@ pub trait AuthResolver: Send + Sync {
     /// 在一堆"用户登录失败"里找不到真正的故障。
     async fn resolve(&self, parts: &Parts) -> Result<AuthContext, AppError>;
 
+    /// Confirm one named restored binding through the installed real session producer only.
+    async fn confirm_restore_requirement(
+        &self,
+        _auth: &AuthContext,
+        _requirement_id: uuid::Uuid,
+        _request: openbot_infra::restore_reconfirmation::OriginalReconfirmationRequest,
+    ) -> Result<
+        openbot_infra::restore_reconfirmation::ReconfirmationCommitFact,
+        openbot_infra::restore_reconfirmation::RestoreReconfirmationError,
+    > {
+        Err(openbot_infra::restore_reconfirmation::RestoreReconfirmationError::Unavailable)
+    }
+
     /// 同一次认证附带 live-session assurance；普通实现缺省只有身份，敏感写会 fail-closed。
     async fn resolve_with_assurance(&self, parts: &Parts) -> Result<ResolvedAuth, AppError> {
         self.resolve(parts).await.map(ResolvedAuth::without_session)
@@ -557,6 +570,8 @@ impl Drop for ServerSessionBindingOwner {
 
 struct ServerSessionProbeState {
     recovery_read_gate: std::sync::OnceLock<openbot_infra::recovery_control::RecoveryReadGate>,
+    restore_reconfirmation:
+        std::sync::OnceLock<Arc<openbot_infra::restore_reconfirmation::RestoreReconfirmation>>,
     pool: openbot_infra::db::pool::DatabasePool,
     lifetime: SessionLifetimePolicy,
     deployment: DeploymentId,
@@ -772,6 +787,44 @@ const CURRENT_SESSION_SQL: &str = "SELECT s.id,s.user_id,s.token,s.expires_at,s.
     WHERE s.id=$1 AND s.user_id=$2 AND s.token=$3 AND s.created_at=$4 AND s.auth_generation=$5";
 
 impl HostRequestBindingGuard for ServerSessionCurrentGuard {
+    fn borrow_restore_reconfirmation_before<'a>(
+        &'a self,
+        binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: std::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if auth != &self.original || !self.owner.is_current() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
+            let probe = self
+                .probe
+                .upgrade()
+                .ok_or(HostRequestBindingError::NotCurrent)?;
+            if OffsetDateTime::now_utc() - self.row.created_at > probe.lifetime.fresh() {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
+            self.issuer
+                .borrow_server_session_epoch(binding.identity())?;
+            let gate = self
+                .recovery_read_gate
+                .as_ref()
+                .ok_or(HostRequestBindingError::Unavailable)?;
+            gate.borrow_reconfirmation_before(binding, auth, deadline)
+                .await
+        })
+    }
+
     fn borrow_recovery_admission_before<'a>(
         &'a self,
         binding: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
@@ -1943,6 +1996,35 @@ impl ServerSessionCurrentGuard {
 }
 
 impl PostgresSessionAuthResolver {
+    /// Install the actual same-pool reconfirmation adapter and retain its strong owner.
+    pub fn install_restore_reconfirmation(
+        &self,
+        audit_key: openbot_domain::vault::SecretBytes,
+        vault: openbot_infra::vault::CredentialRecordVault,
+    ) -> Result<(), HostRequestBindingError> {
+        let probe = &self.binding_owner.probe;
+        let gate = probe
+            .recovery_read_gate
+            .get()
+            .cloned()
+            .ok_or(HostRequestBindingError::Unavailable)?;
+        let adapter = openbot_infra::restore_reconfirmation::RestoreReconfirmation::new(
+            self.pool.clone(),
+            self.deployment.clone(),
+            self.tenant.clone(),
+            self.lifetime,
+            audit_key,
+            vault,
+            &gate,
+        )
+        .map_err(|_| HostRequestBindingError::Unavailable)?;
+        adapter.enroll_host_issuer(&self.binding_owner.issuer)?;
+        probe
+            .restore_reconfirmation
+            .set(Arc::new(adapter))
+            .map_err(|_| HostRequestBindingError::Unavailable)
+    }
+
     /// Attach the original runtime's weak recovery gate once to this live issuer.
     /// Reject a different pool or namespace, a retired issuer or a repeated attachment.
     pub fn install_recovery_read_gate(
@@ -2056,6 +2138,7 @@ impl PostgresSessionAuthResolver {
             RequestBindingOwnerLease::for_trusted_host(HostRequestBindingKind::ServerSession);
         let probe = Arc::new(ServerSessionProbeState {
             recovery_read_gate: std::sync::OnceLock::new(),
+            restore_reconfirmation: std::sync::OnceLock::new(),
             pool: pool.clone(),
             lifetime,
             deployment: deployment.clone(),
@@ -2319,6 +2402,29 @@ impl core::fmt::Debug for PostgresSessionAuthResolver {
 
 #[async_trait]
 impl AuthResolver for PostgresSessionAuthResolver {
+    async fn confirm_restore_requirement(
+        &self,
+        auth: &AuthContext,
+        requirement_id: uuid::Uuid,
+        request: openbot_infra::restore_reconfirmation::OriginalReconfirmationRequest,
+    ) -> Result<
+        openbot_infra::restore_reconfirmation::ReconfirmationCommitFact,
+        openbot_infra::restore_reconfirmation::RestoreReconfirmationError,
+    > {
+        let adapter = self
+            .binding_owner
+            .probe
+            .restore_reconfirmation
+            .get()
+            .ok_or(
+                openbot_infra::restore_reconfirmation::RestoreReconfirmationError::Unavailable,
+            )?;
+        let confirmation = adapter
+            .prepare_server_confirmation(auth, requirement_id, request.deadline())
+            .await?;
+        adapter.confirm_current_binding(confirmation, request).await
+    }
+
     fn runtime_capability_factory(
         &self,
         sso: Option<ReadOnlySsoCapabilitySource>,

@@ -356,9 +356,7 @@ impl ModelConnectionAdministration for PostgresModelConnections {
             crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
                 Error::NotVisible
             }
-            crate::restore_reconfirmation::RestoreReconfirmationError::Unavailable => {
-                Error::Unavailable
-            }
+            _ => Error::Unavailable,
         })?;
         current(&admission, binding, auth, deadline)?;
         self.check_current_secret(&tx, auth, id, old_secret).await?;
@@ -368,8 +366,17 @@ impl ModelConnectionAdministration for PostgresModelConnections {
             None => old_secret,
         };
         let revision = previous.revision.checked_add(1).ok_or(Error::Conflict)?;
-        tx.execute("UPDATE public.model_connections SET name=$2,protocol=$3,endpoint=$4,model=$5,enabled=$6,revision=$7,current_secret_id=$8,updated_at=$9 WHERE id=$1",
-            &[&id,&config.name,&config.protocol.as_str(),&config.endpoint,&config.model,&config.enabled,&revision,&secret,&now]).await.map_err(unavailable)?;
+        // Semantic configuration changes form a new incarnation under this original owner/CAS.
+        let birth = if previous.protocol != config.protocol
+            || previous.endpoint != config.endpoint
+            || previous.model != config.model
+        {
+            now
+        } else {
+            previous.created_at
+        };
+        tx.execute("UPDATE public.model_connections SET name=$2,protocol=$3,endpoint=$4,model=$5,enabled=$6,revision=$7,current_secret_id=$8,updated_at=$9,created_at=$10 WHERE id=$1",
+            &[&id,&config.name,&config.protocol.as_str(),&config.endpoint,&config.model,&config.enabled,&revision,&secret,&now,&birth]).await.map_err(unavailable)?;
         if secret != old_secret {
             tx.execute("UPDATE public.model_connection_secrets SET retired_at=$2 WHERE id=$1 AND retired_at IS NULL", &[&old_secret,&now]).await.map_err(unavailable)?;
         }

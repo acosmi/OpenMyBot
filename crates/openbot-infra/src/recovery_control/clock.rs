@@ -154,4 +154,8 @@ impl OperationClock {
     pub(super) fn observations(&self) -> (u64, u64, u64) {
         (self.t0_ns, self.effect_ns, self.convergence_ns)
     }
+
+    pub(super) fn convergence_deadline(&self) -> Instant {
+        self.convergence
+    }
 }

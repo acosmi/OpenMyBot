@@ -225,6 +225,11 @@ pub(crate) enum DesktopAgentStopFailure {
 }
 
 impl DesktopAgentHost {
+    /// Whether this host actually constructed an agent worker.
+    pub(crate) fn agent_started(&self) -> bool {
+        self.agent.is_some()
+    }
+
     pub(crate) async fn stop(mut self) {
         let _ = self.stop_for_capture().await;
     }

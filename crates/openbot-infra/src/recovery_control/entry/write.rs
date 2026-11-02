@@ -19,7 +19,7 @@ pub(in super::super) struct JournalTail {
     operation: OpId,
     control_id: String,
     epoch: String,
-    file: File,
+    pub(super) file: File,
     sequence: u64,
     digest: [u8; 32],
     length: u64,
@@ -109,6 +109,12 @@ impl ControlFiles {
             &self.limits,
         )?;
         let frame_length = u64::try_from(frame.bytes.len()).map_err(|_| capacity())?;
+        if let Some(allowance) = &self.closing_observation {
+            if allowance.journal_written.is_some() || frame_length > allowance.journal_reserved { return Err(capacity()); }
+        } else if let Some(original) = &mut self.restore_operation {
+            original.ledger.admit(super::super::RestoreCapacityResource::JournalBytes, frame_length)?;
+            original.ledger.admit(super::super::RestoreCapacityResource::JournalRecords, 1)?;
+        }
         let length = tail.length.checked_add(frame_length).ok_or_else(capacity)?;
         if length > self.limits.max_journal_bytes || sequence > self.limits.max_journal_records {
             return Err(capacity());
@@ -172,6 +178,7 @@ impl ControlFiles {
         tail.sequence = sequence;
         tail.digest = frame.digest;
         tail.length = length;
+        if let Some(allowance) = &mut self.closing_observation { allowance.journal_written = Some(frame_length); }
         Ok(JournalReference {
             context_id: operation.as_str().to_owned(),
             sequence,

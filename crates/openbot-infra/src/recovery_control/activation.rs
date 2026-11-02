@@ -208,7 +208,7 @@ impl ExpectedServerDatabase {
 /// The one ordinary startup E/C bound pair; zero is rejected when decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct OrdinaryStartupBounds {
+pub struct OrdinaryStartupBounds {
     pub(super) effect_ns: std::num::NonZeroU64,
     pub(super) convergence_ns: std::num::NonZeroU64,
 }
@@ -267,6 +267,31 @@ pub(super) struct OrdinaryServerBinding<'a> {
     pub(super) server_database: &'a ServerDatabaseSite,
     pub(super) master: &'a KeyReference,
     pub(super) postgres: &'a KeyReference,
+}
+
+pub(super) struct OrdinaryLocalBinding<'a> {
+    pub(super) dataset_id: &'a str,
+    pub(super) deployment_id: &'a str,
+    pub(super) tenant_id: &'a str,
+    pub(super) installation_id: &'a str,
+    pub(super) generation_root: RecoveryFileIdentity,
+    pub(super) pg_system_id: u64,
+    pub(super) database_oid: u32,
+    pub(super) master: &'a KeyReference,
+    pub(super) postgres: &'a KeyReference,
+}
+
+/// Actual Local site observations made by the ordinary initialization owner.
+pub(super) struct OrdinaryLocalSite {
+    pub(super) dataset_id: String,
+    pub(super) deployment_id: String,
+    pub(super) tenant_id: String,
+    pub(super) installation_id: String,
+    pub(super) generation_root: RecoveryFileIdentity,
+    pub(super) pg_system_id: u64,
+    pub(super) database_oid: u32,
+    pub(super) master: KeyReference,
+    pub(super) postgres: KeyReference,
 }
 
 impl ActivationBinding {
@@ -354,6 +379,62 @@ impl ActivationBinding {
     }
     pub(super) fn is_local(&self) -> bool {
         matches!(self.site, ActivationSiteBinding::LocalPhysical { .. })
+    }
+
+    pub(super) fn ordinary_local(&self) -> Result<OrdinaryLocalBinding<'_>, RecoveryControlError> {
+        match &self.site {
+            ActivationSiteBinding::LocalPhysical {
+                dataset_id,
+                deployment_id,
+                tenant_id,
+                target_installation_id,
+                generation_root,
+                pg_system_id,
+                database_oid,
+                key_refs,
+                ..
+            } => Ok(OrdinaryLocalBinding {
+                dataset_id,
+                deployment_id,
+                tenant_id,
+                installation_id: target_installation_id,
+                generation_root: *generation_root,
+                pg_system_id: *pg_system_id,
+                database_oid: *database_oid,
+                master: &key_refs[0],
+                postgres: &key_refs[1],
+            }),
+            _ => Err(invalid()),
+        }
+    }
+
+    pub(super) fn local(
+        mut actual: OrdinaryLocalSite,
+        native_version: u32,
+        migration_digest: String,
+        authorization_epoch: String,
+        operation: Hex32,
+    ) -> Self {
+        actual.master.operation_id = operation.as_str().to_owned();
+        actual.postgres.operation_id = operation.as_str().to_owned();
+        Self {
+            site: ActivationSiteBinding::LocalPhysical {
+                dataset_id: actual.dataset_id,
+                deployment_id: actual.deployment_id,
+                tenant_id: actual.tenant_id,
+                source_installation_id: actual.installation_id.clone(),
+                target_installation_id: actual.installation_id,
+                generation_id: operation.as_str().to_owned(),
+                generation_root: actual.generation_root,
+                pg_system_id: actual.pg_system_id,
+                database_oid: actual.database_oid,
+                pg_major: 17,
+                native_version,
+                migration_digest,
+                authorization_epoch,
+                key_refs: vec![actual.master, actual.postgres],
+            },
+        }
     }
 
     /// Server binding of a sealed ordinary operation: keyRefs[0] is the KEK
@@ -708,6 +789,9 @@ pub(super) struct CandidatePlan {
     pub(super) generation_id: String,
 }
 impl CandidatePlan {
+    pub(super) fn local(trusted_parent: RecoveryFileIdentity, entry_component: String, installation_id: String, generation_id: String) -> Self {
+        Self { site_kind: LocalPhysicalSiteKind::LocalPhysical, trusted_parent, entry_component, installation_id, generation_id }
+    }
     pub(super) fn validate(
         &self,
         l: &TrustedHostRecoveryLimits,
@@ -746,14 +830,14 @@ pub(super) struct Active {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Pending {
-    operation_id: String,
-    epoch: String,
-    profile_digest: String,
-    prior_binding: RequiredNullable<ActivationBinding>,
-    candidate_plan: CandidatePlan,
-    input_plan_digest: String,
-    owner_clock: super::journal::OwnerClockRecord,
-    journal_prefix: JournalReference,
+    pub(super) operation_id: String,
+    pub(super) epoch: String,
+    pub(super) profile_digest: String,
+    pub(super) prior_binding: RequiredNullable<ActivationBinding>,
+    pub(super) candidate_plan: CandidatePlan,
+    pub(super) input_plan_digest: String,
+    pub(super) owner_clock: super::journal::OwnerClockRecord,
+    pub(super) journal_prefix: JournalReference,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -814,6 +898,14 @@ pub(super) struct PublishedActivation {
 }
 
 impl ActivationRecord {
+    pub(super) fn first_pending(control_id: &str, pending: Pending) -> Self {
+        Self {
+            record_type: "wrokbot-recovery-activation".to_owned(), version: 1,
+            control_id: control_id.to_owned(), revision: 1,
+            previous_digest: RequiredNullable::Null(()),
+            phase: ActivationPhase::RestorePending, data: ActivationPayload::Pending(pending),
+        }
+    }
     /// Revision 1 of a new control root.
     pub(super) fn first(control_id: &str, initializing: Initializing) -> Self {
         Self {

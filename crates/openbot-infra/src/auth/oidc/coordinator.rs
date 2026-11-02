@@ -32,7 +32,10 @@ use super::ratelimit::RateLimitPolicy;
 use super::ratelimit_postgres::{
     OidcRateLimitBucket, PostgresOidcRateLimiter, PostgresRateLimitError,
 };
-use super::session_issuer::{IssuedSession, PostgresOidcSessionIssuer, SessionIssueError};
+use super::session_issuer::{
+    IssuedSession, OriginalLoginRequest, PostgresOidcSessionIssuer, SessionIssueError,
+    VerifiedCurrentFederatedLogin,
+};
 use super::token::{exchange_authorization_code, untrusted_key_id};
 use super::token_transport::SafeOauthHttpClient;
 use crate::net::safe_http::{SafeDialer, SafeHttpBudget, SafeHttpRequest, SchemePolicy};
@@ -335,10 +338,18 @@ impl OidcLoginCoordinator {
         now: OffsetDateTime,
         peer_ip: &str,
         user_agent: Option<&str>,
+        request: OriginalLoginRequest,
     ) -> Result<IssuedSession, OidcLoginError> {
-        let attempt = self
-            .begin_callback(provider_id, state, now, peer_ip)
-            .await?;
+        request.check()?;
+        let deadline = tokio::time::Instant::from_std(request.deadline());
+        let cancel = request.cancellation();
+        let attempt = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(SessionIssueError::DependencyUnavailable.into()),
+            result = tokio::time::timeout_at(deadline, self.begin_callback(provider_id, state, now, peer_ip)) => {
+                result.map_err(|_| SessionIssueError::DependencyUnavailable)??
+            }
+        };
         let runtime = self
             .providers
             .get(provider_id)
@@ -351,6 +362,8 @@ impl OidcLoginCoordinator {
             now,
             peer_ip,
             user_agent,
+            request,
+            None,
             std::future::ready(Ok(())),
         )
         .await
@@ -392,85 +405,104 @@ impl OidcLoginCoordinator {
         now: OffsetDateTime,
         peer_ip: &str,
         user_agent: Option<&str>,
+        request: OriginalLoginRequest,
+        admission: Option<&crate::recovery_control::RecoveryWorkerLease<'_>>,
         before_issue: impl Future<Output = Result<(), OidcLoginError>> + Send,
     ) -> Result<IssuedSession, OidcLoginError> {
-        if attempt.provider() != runtime.config.id() || attempt.incarnation() != runtime.incarnation
-        {
-            return Err(PostgresAttemptError::ProviderMismatch.into());
-        }
-        attempt
-            .redirect_uri()
-            .assert_exact_match(received_redirect_uri)?;
-        runtime
-            .config
-            .redirect_uri()
-            .assert_exact_match(received_redirect_uri)?;
-        if code.is_empty() || code.len() > MAX_AUTHORIZATION_CODE_BYTES || !code.is_ascii() {
-            return Err(OidcError::TokenExchangeRejected.into());
-        }
-        let (nonce, verifier) = attempt.into_nonce_and_verifier();
-        let token_endpoint = runtime
-            .metadata
-            .token_endpoint()
-            .ok_or(OidcError::TokenEndpointMissing)?;
-        let http = SafeOauthHttpClient::new(self.dialer.clone(), token_endpoint, self.token_budget)
-            .map_err(|_| OidcError::MetadataEndpointRejected)?;
-        // 长寿命 runtime 只持有会 zeroize 且不可 Clone 的 SecretBytes；协议库要求的
-        // ClientSecret 仅在这一次 callback 栈帧内临时物化。
-        let client_secret = materialize_client_secret(runtime.client_secret.as_ref())?;
-        let raw_id_token = exchange_authorization_code(
-            &runtime.metadata,
-            &runtime.config,
-            client_secret.as_ref(),
-            AuthorizationCode::new(code.to_owned()),
-            verifier,
-            &http,
-        )
-        .await?;
-        let kid = untrusted_key_id(&raw_id_token)?;
-        let (keys, key_issuer) = {
-            let mut cache = runtime.jwks.lock().await;
-            let keys = cache
-                .key_set_for(
-                    kid.as_ref(),
-                    &self.dialer,
-                    self.fetch_budget,
-                    self.jwks_policy,
-                    now,
-                )
-                .await?
-                .clone();
-            let key_issuer = kid
-                .as_ref()
-                .and_then(|kid| cache.key_issuer(kid))
-                .map(str::to_owned);
-            (keys, key_issuer)
-        };
-        let verified_provider =
-            bind_entra_token_issuer(&runtime.config, &raw_id_token, key_issuer.as_deref())?;
-        let verifier = build_verifier_at(
-            &verified_provider,
-            client_secret.as_ref(),
-            keys,
-            DEFAULT_ID_TOKEN_SIGNING_ALGS,
-            now,
-        )?;
-        let identity = verify_with_group_mapping(
-            &raw_id_token,
-            &verifier,
-            &verified_provider,
-            &nonce,
-            runtime.group_mapping.as_ref(),
-        )?;
-        before_issue.await?;
-        self.sessions
-            .issue(
-                &identity,
+        request.check()?;
+        let deadline = tokio::time::Instant::from_std(request.deadline());
+        let cancel = request.cancellation();
+        let verify = async {
+            if attempt.provider() != runtime.config.id()
+                || attempt.incarnation() != runtime.incarnation
+            {
+                return Err(PostgresAttemptError::ProviderMismatch.into());
+            }
+            attempt
+                .redirect_uri()
+                .assert_exact_match(received_redirect_uri)?;
+            runtime
+                .config
+                .redirect_uri()
+                .assert_exact_match(received_redirect_uri)?;
+            if code.is_empty() || code.len() > MAX_AUTHORIZATION_CODE_BYTES || !code.is_ascii() {
+                return Err(OidcError::TokenExchangeRejected.into());
+            }
+            let (nonce, verifier) = attempt.into_nonce_and_verifier();
+            let token_endpoint = runtime
+                .metadata
+                .token_endpoint()
+                .ok_or(OidcError::TokenEndpointMissing)?;
+            let http =
+                SafeOauthHttpClient::new(self.dialer.clone(), token_endpoint, self.token_budget)
+                    .map_err(|_| OidcError::MetadataEndpointRejected)?;
+            // 长寿命 runtime 只持有会 zeroize 且不可 Clone 的 SecretBytes；协议库要求的
+            // ClientSecret 仅在这一次 callback 栈帧内临时物化。
+            let client_secret = materialize_client_secret(runtime.client_secret.as_ref())?;
+            let raw_id_token = exchange_authorization_code(
+                &runtime.metadata,
+                &runtime.config,
+                client_secret.as_ref(),
+                AuthorizationCode::new(code.to_owned()),
+                verifier,
+                &http,
+            )
+            .await?;
+            let kid = untrusted_key_id(&raw_id_token)?;
+            let (keys, key_issuer) = {
+                let mut cache = runtime.jwks.lock().await;
+                let keys = cache
+                    .key_set_for(
+                        kid.as_ref(),
+                        &self.dialer,
+                        self.fetch_budget,
+                        self.jwks_policy,
+                        now,
+                    )
+                    .await?
+                    .clone();
+                let key_issuer = kid
+                    .as_ref()
+                    .and_then(|kid| cache.key_issuer(kid))
+                    .map(str::to_owned);
+                (keys, key_issuer)
+            };
+            let verified_provider =
+                bind_entra_token_issuer(&runtime.config, &raw_id_token, key_issuer.as_deref())?;
+            let verifier = build_verifier_at(
+                &verified_provider,
+                client_secret.as_ref(),
+                keys,
+                DEFAULT_ID_TOKEN_SIGNING_ALGS,
+                now,
+            )?;
+            let identity = verify_with_group_mapping(
+                &raw_id_token,
+                &verifier,
+                &verified_provider,
+                &nonce,
+                runtime.group_mapping.as_ref(),
+            )?;
+            before_issue.await?;
+            request.check()?;
+            Ok::<_, OidcLoginError>(VerifiedCurrentFederatedLogin::from_oidc_callback(
+                identity,
                 &verified_provider,
                 now,
                 Some(peer_ip),
                 user_agent,
-            )
+                admission,
+            ))
+        };
+        let login = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(SessionIssueError::DependencyUnavailable.into()),
+            result = tokio::time::timeout_at(deadline, verify) => {
+                result.map_err(|_| SessionIssueError::DependencyUnavailable)??
+            }
+        };
+        self.sessions
+            .issue_current_login(login, request)
             .await
             .map_err(Into::into)
     }

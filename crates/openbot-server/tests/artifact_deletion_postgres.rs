@@ -167,6 +167,11 @@ impl Fixture {
             direct,
             "artifact-deletion-owned-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &admin,
+                &DeploymentId::new("outside"),
+                &TenantId::new("outside"),
+            ),
         )
         .map_err(text)?
         .begin_thread_run(begin.clone())
@@ -211,6 +216,15 @@ impl Fixture {
         resolver
             .install_artifact_read_authority(&actual.read_authority())
             .map_err(|_| "artifact authority installation refused")?;
+        resolver
+            .install_recovery_read_gate(
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEPLOYMENT),
+                    &TenantId::new(TENANT),
+                ),
+            )
+            .map_err(text)?;
         let application: Arc<dyn ApplicationService> = Arc::new(
             openbot_application::OpenBotApplication::new(
                 openbot_infra::repo::channels::ChannelRepo::new(pool.clone()),
@@ -396,6 +410,103 @@ async fn artifact_deletion_http_overlapping_owner_deletes_complete_then_conflict
     harness::with_temp_database(&harness::admin_config(tag), tag, |config| async move {
         let f = Fixture::new(config).await?;
         let outcome = exercise(&f).await;
+        f.finish();
+        outcome
+    })
+    .await;
+}
+
+/// A production resolver without a recovery gate: its guard has no admission, so the public
+/// deletion refuses before the arm and leaves no fence and an unchanged record.
+async fn refuse_without_admission(f: &Fixture) -> Result {
+    let receipt = f.save().await?;
+    let id = receipt.artifact_id.as_str();
+    let record = || async move {
+        f.admin
+            .get()
+            .await
+            .map_err(text)?
+            .query_one(
+                "SELECT to_jsonb(r)::text FROM openbot_internal.artifact_records r WHERE r.artifact_id=$1",
+                &[&id],
+            )
+            .await
+            .map_err(text)
+            .map(|row| row.get::<_, String>(0))
+    };
+    let before = record().await?;
+    let ungated = PostgresSessionAuthResolver::new(
+        f.pool.clone(),
+        SESSION_KEY,
+        default_session_lifetime(),
+        DeploymentId::new(DEPLOYMENT),
+        TenantId::new(TENANT),
+    )
+    .map_err(text)?;
+    ungated
+        .install_artifact_read_authority(&f._actual.read_authority())
+        .map_err(|_| "artifact authority installation refused")?;
+    let refused = match resolve(&ungated, OWNER).await {
+        Ok(ctx) => Ok(f
+            .application
+            .execute(
+                ctx,
+                AppCommand::DeleteArtifact {
+                    artifact_id: id.to_owned(),
+                },
+            )
+            .await),
+        Err(error) => Err(error),
+    };
+    ungated.close_request_bindings();
+    check(
+        matches!(
+            refused?,
+            Err(openbot_contracts::error::AppError::DependencyUnavailable {
+                dependency: "artifacts"
+            })
+        ),
+        "the deletion without recovery admission was not refused closed",
+    )?;
+    let fences: i64 = f
+        .admin
+        .get()
+        .await
+        .map_err(text)?
+        .query_one(
+            "SELECT count(*) FROM openbot_internal.artifact_cleanup_fences WHERE artifact_id=$1",
+            &[&id],
+        )
+        .await
+        .map_err(text)?
+        .get(0);
+    check(fences == 0, "the refused deletion armed a fence")?;
+    check(
+        record().await? == before,
+        "the refused deletion changed the record",
+    )?;
+    // The gated router still deletes the same artifact.
+    let (mut status, _) = f.delete(OWNER, id).await?;
+    let mut resends = 0;
+    while status == StatusCode::ACCEPTED {
+        check(resends < RESENDS, "the deletion never completed")?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        status = f.delete(OWNER, id).await?.0;
+        resends += 1;
+    }
+    check(
+        status == StatusCode::OK,
+        &format!("the gated deletion answered {status}"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicitly owned loopback PostgreSQL17.11"]
+async fn t046_58_public_artifact_delete_without_recovery_admission_refuses_closed_with_no_effect() {
+    let tag = "t046_58";
+    harness::with_temp_database(&harness::admin_config(tag), tag, |config| async move {
+        let f = Fixture::new(config).await?;
+        let outcome = refuse_without_admission(&f).await;
         f.finish();
         outcome
     })

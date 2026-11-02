@@ -1327,7 +1327,7 @@ pub(crate) async fn validate_custom_model_v2_in_transaction(
 /// One ledger walk for both observers: the strict prior layout (latest 52,
 /// 40 rows) and the current layout (latest 53, 41 rows). Only the current
 /// layout also carries the additive restore catalog.
-async fn validate_custom_model_v2_layout_in_transaction(
+pub(crate) async fn validate_custom_model_v2_layout_in_transaction(
     tx: &tokio_postgres::Transaction<'_>,
     latest: i32,
     count: usize,
@@ -2172,7 +2172,7 @@ mod tests {
         assert_ne!(native_0052_checksum(), native_0053_checksum());
         assert_eq!(
             native_0053_checksum(),
-            "6b55f76cc52b0b9e34af1afb278691b1c9abea4d7ac77225855a724cf5a7c24a",
+            "0c534a7b05266f0a8e877f30a2f922e667a08e8a7d7191a9db21caf50b41f413",
         );
         assert_eq!(NATIVE_MIGRATION_COUNT, 41);
         assert_eq!(MIGRATIONS[40].version, NATIVE_LATEST_VERSION);
@@ -2190,7 +2190,7 @@ mod tests {
         assert_eq!(native_0053_checksum(), hex(NATIVE_0053_SQL.as_bytes()));
         assert_eq!(
             native_0053_checksum(),
-            "6b55f76cc52b0b9e34af1afb278691b1c9abea4d7ac77225855a724cf5a7c24a"
+            "0c534a7b05266f0a8e877f30a2f922e667a08e8a7d7191a9db21caf50b41f413"
         );
         assert_eq!(MIGRATIONS.len(), 41);
         assert_eq!(MIGRATIONS[40].name, NATIVE_0053_NAME);

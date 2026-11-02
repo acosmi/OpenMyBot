@@ -29,17 +29,19 @@ use super::bundle::{self, Program, VerifiedMaintenanceBundle};
 use super::clock::{self, OperationClock};
 use super::limits::{self, CapacityObservation, MaintenanceProfile, MaterialCounters};
 use super::protocol::{self, StatusRecord, StatusTrail};
+#[cfg(feature = "postgres-supervisor")]
+use crate::postgres_sidecar::{PostgresProgram, PostgresSidecarError, VerifiedPostgresBundle};
 
 #[cfg(feature = "postgres-supervisor")]
 #[path = "restore_isolation.rs"]
-mod restore_isolation;
+pub(crate) mod restore_isolation;
 
 #[cfg(feature = "postgres-supervisor")]
 use restore_isolation::{IsolationFailure, RestoreIsolationPolicy};
 
 // No child exists on these failures. Legacy maintenance callers retain their
 // original closed mapping; the restore owner additionally keeps native spawn IO.
-struct NativeSpawnFailure {
+pub(crate) struct NativeSpawnFailure {
     fault: MaintenanceError,
     original_io: Option<std::io::Error>,
 }
@@ -60,9 +62,9 @@ impl From<std::io::Error> for NativeSpawnFailure {
     }
 }
 #[cfg(feature = "postgres-supervisor")]
-enum RestoreProgramFailure {
+pub(crate) enum RestoreProgramFailure {
     Isolation(IsolationFailure),
-    Bundle(MaintenanceError),
+    Bundle(PostgresSidecarError),
     OriginalSpawn(NativeSpawnFailure),
     Identity(wrok_bot_macos_process::ProcessObservationError),
     ClosingGate(MaintenanceError),
@@ -70,12 +72,12 @@ enum RestoreProgramFailure {
 }
 
 #[cfg(feature = "postgres-supervisor")]
-enum RestoreStopState {
+pub(crate) enum RestoreStopState {
     Entered,
     Returned(Result<(), std::io::Error>),
 }
 #[cfg(feature = "postgres-supervisor")]
-struct RestoreProgramOwner {
+pub(crate) struct RestoreProgramOwner {
     original: ProgramOwner,
     identity: Result<
         wrok_bot_macos_process::ProcessIdentity,
@@ -84,15 +86,23 @@ struct RestoreProgramOwner {
     generation: [u64; 3],
     stop: Option<RestoreStopState>,
     post_directories: Result<(), IsolationFailure>,
-    post_software: Result<(), MaintenanceError>,
+    post_software: Result<(), PostgresSidecarError>,
+}
+
+#[cfg(feature = "postgres-supervisor")]
+impl RestoreProgramOwner {
+    /// Borrow the one retained original child for the candidate identity check.
+    pub(crate) fn original_child(&self) -> &Child {
+        &self.original.child
+    }
 }
 
 // The full restore session/candidate/config producer is a separately registered
 // dependency. This adapter mints no authority and never starts a replacement clock.
 #[cfg(feature = "postgres-supervisor")]
-fn spawn_restore_program(
+pub(crate) fn spawn_restore_program(
     policy: &RestoreIsolationPolicy<'_>,
-    bundle: &VerifiedMaintenanceBundle,
+    bundle: &VerifiedPostgresBundle,
     authenticated_config_args: &[OsString],
     clock: &OperationClock,
     secret: Arc<SecretBytes>,
@@ -120,7 +130,7 @@ fn spawn_restore_program(
     // No fallible return drops a spawned Child. Capture failure remains resident
     // with that owner and cannot authorize another native request.
     let identity = wrok_bot_macos_process::ProcessIdentity::capture(original.pid);
-    let post_software = bundle.checked_command(Program::Postgres).map(|_| ());
+    let post_software = bundle.checked_command(PostgresProgram::Server).map(|_| ());
     let post_directories = policy.revalidate();
     // Post-check failure stays WITH the original Child and raw identity outcome.
     // The only remaining operations are original-resource stop/wait; no grant is
@@ -136,7 +146,7 @@ fn spawn_restore_program(
 }
 
 #[cfg(feature = "postgres-supervisor")]
-fn request_restore_stop(
+pub(crate) fn request_restore_stop(
     owner: &mut RestoreProgramOwner,
     clock: &OperationClock,
 ) -> Result<(), RestoreProgramFailure> {
@@ -182,7 +192,7 @@ fn request_restore_stop(
 }
 
 #[cfg(feature = "postgres-supervisor")]
-struct RestoreProgramResult {
+pub(crate) struct RestoreProgramResult {
     tool: Result<ToolResult, MaintenanceError>,
     identity: Result<
         wrok_bot_macos_process::ProcessIdentity,
@@ -191,12 +201,13 @@ struct RestoreProgramResult {
     generation: [u64; 3],
     stop: Option<RestoreStopState>,
     post_directories: Result<(), IsolationFailure>,
-    post_software: Result<(), MaintenanceError>,
+    post_software: Result<(), PostgresSidecarError>,
 }
 #[cfg(feature = "postgres-supervisor")]
-async fn wait_restore_program(
+pub(crate) async fn wait_restore_program(
     owner: RestoreProgramOwner,
-    capacity: &mut CapacityMonitor<'_>,
+    clock: &OperationClock,
+    observe_capacity: impl FnMut() -> Result<(), MaintenanceError>,
     closing: bool,
 ) -> RestoreProgramResult {
     // Capturing a birth or requesting TERM never substitutes for this original
@@ -213,7 +224,7 @@ async fn wait_restore_program(
     // original wait's optional deadline TERM is disabled, so Unknown cannot send
     // another native request. It still waits the same Child and joins all pipes.
     RestoreProgramResult {
-        tool: wait_program(original, capacity, closing, false).await,
+        tool: wait_program_with_capacity(original, clock, observe_capacity, closing, false).await,
         identity,
         generation,
         stop,

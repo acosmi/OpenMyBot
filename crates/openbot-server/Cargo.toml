@@ -82,6 +82,7 @@ uuid.workspace = true
 # production session resolver/main 需要墙钟与 Tokio runtime。
 time.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 ring.workspace = true
 zeroize.workspace = true
 
