@@ -163,6 +163,9 @@ pub async fn list(
         | AppReply::Tool(_)
         | AppReply::ThreadMinted(_)
         | AppReply::ThreadStatus(_)
+        | AppReply::ThreadInputOutcome(_)
+        | AppReply::PendingInputs(_)
+        | AppReply::PendingInputState(_)
         | AppReply::ThreadRunStarted(_)
         | AppReply::ThreadRunCancellation(_)
         | AppReply::ThreadHistoryDeletion(_)
@@ -265,6 +268,9 @@ pub async fn get(
         | AppReply::Tool(_)
         | AppReply::ThreadMinted(_)
         | AppReply::ThreadStatus(_)
+        | AppReply::ThreadInputOutcome(_)
+        | AppReply::PendingInputs(_)
+        | AppReply::PendingInputState(_)
         | AppReply::ThreadRunStarted(_)
         | AppReply::ThreadRunCancellation(_)
         | AppReply::ThreadHistoryDeletion(_)
@@ -373,6 +379,9 @@ pub async fn create(
         | AppReply::Tool(_)
         | AppReply::ThreadMinted(_)
         | AppReply::ThreadStatus(_)
+        | AppReply::ThreadInputOutcome(_)
+        | AppReply::PendingInputs(_)
+        | AppReply::PendingInputState(_)
         | AppReply::ThreadRunStarted(_)
         | AppReply::ThreadRunCancellation(_)
         | AppReply::ThreadHistoryDeletion(_)
@@ -726,6 +735,92 @@ mod tests {
 
         fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn work_replies_are_rejected_by_existing_channel_routes() {
+        struct WrongReply(fn() -> AppReply);
+        #[async_trait]
+        impl openbot_application::ApplicationService for WrongReply {
+            async fn execute(
+                &self,
+                _auth: AuthContext,
+                command: AppCommand,
+            ) -> Result<AppReply, AppError> {
+                assert!(matches!(
+                    command,
+                    AppCommand::ListVisibleChannels { .. }
+                        | AppCommand::GetVisibleChannel { .. }
+                        | AppCommand::CreateChannel { .. }
+                ));
+                Ok((self.0)())
+            }
+            async fn subscribe(
+                &self,
+                _auth: AuthContext,
+                _request: SubscriptionRequest,
+            ) -> Result<AppEventStream, AppError> {
+                Err(AppError::DependencyUnavailable {
+                    dependency: "unused_test_subscription",
+                })
+            }
+        }
+        let replies: [fn() -> AppReply; 3] = [
+            || {
+                AppReply::ThreadInputOutcome(
+                    openbot_contracts::command::ThreadInputOutcome::Queued {
+                        run_id: openbot_contracts::ids::RunId::new("input-1"),
+                        position: 1,
+                    },
+                )
+            },
+            || AppReply::PendingInputs(openbot_contracts::command::PendingInputs::default()),
+            || {
+                AppReply::PendingInputState(openbot_contracts::command::PendingInputReceipt {
+                    run_id: openbot_contracts::ids::RunId::new("input-1"),
+                    state: openbot_contracts::command::PendingInputState::Withdrawn,
+                })
+            },
+        ];
+        for reply in replies {
+            let router = ServerBuilder::new(
+                Arc::new(WrongReply(reply)),
+                Arc::new(FixedAuthResolver::granting(auth("u1"))),
+            )
+            .with_sensitive_write_security(SensitiveWriteSecurity::new(
+                default_session_lifetime(),
+                TrustedOrigins::from_configured(["https://app.example.test"]).unwrap(),
+            ))
+            .into_router();
+            for (method, uri, body) in [
+                (Method::GET, "/api/channels", ""),
+                (Method::GET, "/api/channels/channel-1", ""),
+                (Method::POST, "/api/channels", r#"{"agentIds":["bot-1"]}"#),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .header("origin", "https://app.example.test")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                        .unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({"code":"dependency_unavailable"}),
+                    "{uri}"
+                );
+            }
         }
     }
 

@@ -790,6 +790,14 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/api/threads/{thread_id}/runs", post(threads::begin_run))
         .route(
+            "/api/threads/{thread_id}/inputs",
+            get(threads::pending_inputs).post(threads::submit_input),
+        )
+        .route(
+            "/api/threads/{thread_id}/inputs/{run_id}/withdraw",
+            post(threads::withdraw_input),
+        )
+        .route(
             "/api/threads/{thread_id}/runs/{run_id}/cancel",
             post(threads::cancel_run),
         )

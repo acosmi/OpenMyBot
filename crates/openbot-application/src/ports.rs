@@ -591,6 +591,15 @@ impl AgentDirectory for NoAgentDirectory {
 /// Native thread 目录端口错误；不携带随机源或数据库的原始错误文本。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ThreadDirectoryError {
+    /// A visible channel conversation cannot use a direct Bot operation.
+    #[error("anchor_unsupported")]
+    AnchorUnsupported,
+    /// The per-conversation pending and held budget is full.
+    #[error("pending_input_limit")]
+    PendingInputLimit,
+    /// This input has already become a Run.
+    #[error("pending_input_state")]
+    PendingInputState,
     /// OS CSPRNG 或 PostgreSQL 当前不可用。
     #[error("thread_directory_unavailable")]
     Unavailable,
@@ -631,6 +640,9 @@ impl ThreadDirectoryError {
     #[must_use]
     pub const fn into_app_error(self) -> AppError {
         match self {
+            Self::AnchorUnsupported => AppError::AnchorUnsupported,
+            Self::PendingInputLimit => AppError::PendingInputLimit,
+            Self::PendingInputState => AppError::PendingInputState,
             Self::Unavailable | Self::Corrupt { .. } => AppError::DependencyUnavailable {
                 dependency: "thread_directory",
             },
@@ -643,6 +655,15 @@ impl ThreadDirectoryError {
             }
         }
     }
+}
+
+/// A submission either committed or needs the existing authorized artifact preread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmitThreadInputAttempt {
+    /// Durable acceptance using the original request identity.
+    Accepted(openbot_contracts::command::ThreadInputOutcome),
+    /// No mutation occurred; an idle start needs its original artifact materials.
+    NeedsArtifacts,
 }
 
 /// application 已把权威 scope 与封闭 command 合并后的事务请求。
@@ -793,6 +814,34 @@ pub type RunEffectReceiptsRequest = RunReconciliationRequest;
 /// 不同”，防止状态接口枚举别人的 thread。
 #[async_trait]
 pub trait ThreadDirectory: Send + Sync {
+    /// Atomically accept a frozen input or start its original v2 Run.
+    async fn submit_thread_input(
+        &self,
+        _request: BeginThreadRunV2Request,
+        _materials: Option<Vec<RunInputArtifactMaterial>>,
+    ) -> Result<SubmitThreadInputAttempt, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Read only pending and held inputs after current conversation authorization.
+    async fn list_pending_inputs(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _thread_id: &ThreadId,
+    ) -> Result<openbot_contracts::command::PendingInputs, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Withdraw an input while it is pending or held.
+    async fn withdraw_pending_input(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _thread_id: &ThreadId,
+        _run_id: &openbot_contracts::ids::RunId,
+    ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
     /// 以 OS CSPRNG 铸造当前 deployment 的 UUIDv8 thread ID。
     async fn mint_thread_id(
         &self,

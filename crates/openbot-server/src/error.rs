@@ -124,6 +124,9 @@ impl IntoResponse for HttpError {
             | AppError::ForbiddenRole { .. }
             | AppError::NotVisible
             | AppError::MalformedPayload { .. }
+            | AppError::AnchorUnsupported
+            | AppError::PendingInputLimit
+            | AppError::PendingInputState
             | AppError::DependencyUnavailable { .. }
             | AppError::VendorFailure { .. }
             | AppError::StaleGeneration { .. }

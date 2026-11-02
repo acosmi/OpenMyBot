@@ -3,6 +3,8 @@
 #![cfg(feature = "server-runtime")]
 
 mod harness;
+#[path = "custom_model_v2_dataset/pending_inputs.rs"]
+mod pending_inputs;
 
 use async_trait::async_trait;
 use openbot_application::model_connections::ModelConnectionAdministration;

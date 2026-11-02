@@ -142,7 +142,7 @@ fn subscriptions() -> [SubscriptionRequest; 4] {
 }
 
 // Fixed independent expected inventory; no wildcard in the typed projection below.
-const EXPECTED_COMMANDS: [&str; 99] = [
+const EXPECTED_COMMANDS: [&str; 102] = [
     "GetRuntimeCapabilities",
     "SaveRunMessageTextArtifact",
     "GetArtifactMetadata",
@@ -198,6 +198,9 @@ const EXPECTED_COMMANDS: [&str; 99] = [
     "InvokeTool",
     "MintThreadId",
     "GetThreadStatus",
+    "SubmitThreadInput",
+    "ListPendingInputs",
+    "WithdrawPendingInput",
     "BeginThreadRun",
     "BeginThreadRunV2",
     "CancelThreadRun",
@@ -301,6 +304,9 @@ fn variant_name(command: &AppCommand) -> &'static str {
         AppCommand::InvokeTool(..) => "InvokeTool",
         AppCommand::MintThreadId => "MintThreadId",
         AppCommand::GetThreadStatus { .. } => "GetThreadStatus",
+        AppCommand::SubmitThreadInput(..) => "SubmitThreadInput",
+        AppCommand::ListPendingInputs { .. } => "ListPendingInputs",
+        AppCommand::WithdrawPendingInput { .. } => "WithdrawPendingInput",
         AppCommand::BeginThreadRun(..) => "BeginThreadRun",
         AppCommand::BeginThreadRunV2(..) => "BeginThreadRunV2",
         AppCommand::CancelThreadRun(..) => "CancelThreadRun",
@@ -550,6 +556,30 @@ fn commands() -> Vec<AppCommand> {
         AppCommand::MintThreadId,
         AppCommand::GetThreadStatus {
             thread_id: ThreadId::new(""),
+        },
+        AppCommand::SubmitThreadInput(BeginThreadRunV2 {
+            model_selection: RunModelSelectionV2::new(
+                ModelSelectionIntentSource::Custom,
+                "01901000-0000-7000-8000-000000000001".into(),
+                1,
+                "fixture".into(),
+                1,
+            )
+            .unwrap(),
+            thread_id: ThreadId::new(""),
+            run_id: RunId::new(""),
+            bot_id: BotId::new(""),
+            anchor: ThreadRunAnchor::DirectBot,
+            message: String::new(),
+            selected_skill_slugs: vec![],
+            artifact_refs: vec![],
+        }),
+        AppCommand::ListPendingInputs {
+            thread_id: ThreadId::new(""),
+        },
+        AppCommand::WithdrawPendingInput {
+            thread_id: ThreadId::new(""),
+            run_id: RunId::new(""),
         },
         AppCommand::BeginThreadRun(BeginThreadRun {
             model_selection: None,
@@ -1071,7 +1101,7 @@ fn assert_untouched(app: &Guarded, poison: &Poison) {
 async fn every_command_variant_refuses_unbound_delegation_before_dispatch() {
     let (app, poison) = guarded();
     let inventory = commands();
-    assert_eq!(inventory.len(), 99);
+    assert_eq!(inventory.len(), 102);
     assert_eq!(
         inventory.iter().map(variant_name).collect::<Vec<_>>(),
         EXPECTED_COMMANDS

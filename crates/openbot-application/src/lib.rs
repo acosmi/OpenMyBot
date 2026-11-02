@@ -188,9 +188,9 @@ pub use ports::{
     OwnedCredentialRetirementError, OwnedCredentialRetirer, PeopleAdministration,
     PeoplePageRequest, PeoplePortError, PolicyAdministration, PolicyAdministrationError, PortError,
     RecallMemoriesRequest, RememberMemoryRequest, RoutingAuditRecord, RunEffectReceiptsRequest,
-    RunInputArtifactMaterial, RunReconciliationRequest, ThreadConversationRequest, ThreadDirectory,
-    ThreadDirectoryError, ThreadEventSubscription, ThreadHistoryDeletion, ThreadHistoryRequest,
-    UpdateMemoryControlRequest,
+    RunInputArtifactMaterial, RunReconciliationRequest, SubmitThreadInputAttempt,
+    ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription,
+    ThreadHistoryDeletion, ThreadHistoryRequest, UpdateMemoryControlRequest,
 };
 pub use provider::{
     AgentAudit, AgentAuditError, AgentAuditKind, AgentAuthorizationError, AgentAuthorizationSource,
