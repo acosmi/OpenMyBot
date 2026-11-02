@@ -378,6 +378,8 @@ impl AgentToolGateway {
                 | AppReply::ActionPolicy { .. }
                 | AppReply::ThreadMinted(_)
                 | AppReply::ThreadStatus(_)
+                | AppReply::BotThreadPage(_)
+                | AppReply::ThreadTitleSet(_)
                 | AppReply::ThreadRunStarted(_)
                 | AppReply::ThreadRunCancellation(_)
                 | AppReply::ThreadHistoryDeletion(_)
@@ -606,6 +608,7 @@ impl AuthorizedAgentToolGateway {
             }
             Err(
                 AppError::Unauthenticated
+                | AppError::AnchorUnsupported
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -689,6 +692,7 @@ impl AuthorizedAgentToolGateway {
             }
             Err(
                 AppError::Unauthenticated
+                | AppError::AnchorUnsupported
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -756,6 +760,7 @@ impl AuthorizedAgentToolGateway {
             }
             Err(
                 AppError::Unauthenticated
+                | AppError::AnchorUnsupported
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -879,6 +884,7 @@ fn map_application_reply(
         }
         Err(
             AppError::Unauthenticated
+            | AppError::AnchorUnsupported
             | AppError::ArtifactGone { .. }
             | AppError::DependencyUnavailable { .. }
             | AppError::VendorFailure { .. }
@@ -994,7 +1000,7 @@ mod tests {
 
     struct FakeApplication {
         calls: Mutex<Vec<(ActorId, ToolInvocation)>>,
-        wrong_reply: bool,
+        wrong_reply: Mutex<Option<AppReply>>,
     }
 
     struct ComponentApplication {
@@ -1139,8 +1145,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((auth.actor().clone(), invocation.clone()));
-            if self.wrong_reply {
-                return Ok(AppReply::Health(health()));
+            if let Some(reply) = self.wrong_reply.lock().unwrap().take() {
+                return Ok(reply);
             }
             Ok(AppReply::Tool(ToolResult {
                 call_id: invocation.call_id,
@@ -1174,10 +1180,45 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn work_replies_and_errors_do_not_become_tool_success() {
+        for reply in [
+            AppReply::BotThreadPage(openbot_contracts::command::BotThreadPage {
+                threads: vec![],
+                next_cursor: None,
+            }),
+            AppReply::ThreadTitleSet(openbot_contracts::command::ThreadTitleSet {
+                thread_id: ThreadId::new("thread-1"),
+                title: "work".into(),
+            }),
+        ] {
+            let application = Arc::new(FakeApplication {
+                calls: Mutex::new(Vec::new()),
+                wrong_reply: Mutex::new(Some(reply)),
+            });
+            let gateway = AgentToolGateway::new(application);
+            let error = gateway
+                .invoke(
+                    auth("actor-1"),
+                    RunId::new("run-1"),
+                    BotId::new("bot-1"),
+                    "computer.write",
+                    json!({}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code().as_str(), "dependency_unavailable");
+        }
+        assert!(matches!(
+            map_application_reply(ToolCallId::new("call-1"), Err(AppError::AnchorUnsupported)),
+            Err(AgentToolInvokeError::Unavailable)
+        ));
+    }
+
     fn fake(wrong_reply: bool) -> Arc<FakeApplication> {
         Arc::new(FakeApplication {
             calls: Mutex::new(Vec::new()),
-            wrong_reply,
+            wrong_reply: Mutex::new(wrong_reply.then(|| AppReply::Health(health()))),
         })
     }
 

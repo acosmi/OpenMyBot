@@ -519,6 +519,8 @@ fn http_route_of(command: &AppCommand) -> Option<String> {
         | AppCommand::SetActionPolicy { .. }
         | AppCommand::InvokeTool(_)
         | AppCommand::MintThreadId
+        | AppCommand::ListBotThreads { .. }
+        | AppCommand::SetThreadTitle { .. }
         | AppCommand::GetThreadStatus { .. }
         | AppCommand::BeginThreadRun(_)
         | AppCommand::BeginThreadRunV2(_)

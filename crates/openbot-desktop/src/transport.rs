@@ -917,7 +917,7 @@ impl InProcessTransport {
     /// then its upstream pump is cancelled. Returning `true` therefore proves that the route is no
     /// longer eligible for delivery; callers do not need to wait for another upstream event.
     pub fn close_session(&self, label: &WindowLabel) -> bool {
-        let (mut pumps, poisoned) = match self.pumps.lock() {
+        let (pumps, poisoned) = match self.pumps.lock() {
             Ok(pumps) => (pumps, false),
             Err(poisoned) => (poisoned.into_inner(), true),
         };
@@ -927,6 +927,7 @@ impl InProcessTransport {
             target_os = "macos"
         ))]
         if pumps.capture_requested {
+            let mut pumps = pumps;
             if poisoned {
                 fail_capture(&mut pumps, CaptureTransportFault::Poisoned);
             }

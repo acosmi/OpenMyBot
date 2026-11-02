@@ -142,7 +142,7 @@ fn subscriptions() -> [SubscriptionRequest; 4] {
 }
 
 // Fixed independent expected inventory; no wildcard in the typed projection below.
-const EXPECTED_COMMANDS: [&str; 99] = [
+const EXPECTED_COMMANDS: [&str; 101] = [
     "GetRuntimeCapabilities",
     "SaveRunMessageTextArtifact",
     "GetArtifactMetadata",
@@ -198,6 +198,8 @@ const EXPECTED_COMMANDS: [&str; 99] = [
     "InvokeTool",
     "MintThreadId",
     "GetThreadStatus",
+    "ListBotThreads",
+    "SetThreadTitle",
     "BeginThreadRun",
     "BeginThreadRunV2",
     "CancelThreadRun",
@@ -301,6 +303,8 @@ fn variant_name(command: &AppCommand) -> &'static str {
         AppCommand::InvokeTool(..) => "InvokeTool",
         AppCommand::MintThreadId => "MintThreadId",
         AppCommand::GetThreadStatus { .. } => "GetThreadStatus",
+        AppCommand::ListBotThreads { .. } => "ListBotThreads",
+        AppCommand::SetThreadTitle { .. } => "SetThreadTitle",
         AppCommand::BeginThreadRun(..) => "BeginThreadRun",
         AppCommand::BeginThreadRunV2(..) => "BeginThreadRunV2",
         AppCommand::CancelThreadRun(..) => "CancelThreadRun",
@@ -550,6 +554,16 @@ fn commands() -> Vec<AppCommand> {
         AppCommand::MintThreadId,
         AppCommand::GetThreadStatus {
             thread_id: ThreadId::new(""),
+        },
+        AppCommand::ListBotThreads {
+            bot_id: BotId::new(""),
+            status: None,
+            cursor: None,
+            limit: None,
+        },
+        AppCommand::SetThreadTitle {
+            thread_id: ThreadId::new(""),
+            title: String::new(),
         },
         AppCommand::BeginThreadRun(BeginThreadRun {
             model_selection: None,
@@ -1071,7 +1085,7 @@ fn assert_untouched(app: &Guarded, poison: &Poison) {
 async fn every_command_variant_refuses_unbound_delegation_before_dispatch() {
     let (app, poison) = guarded();
     let inventory = commands();
-    assert_eq!(inventory.len(), 99);
+    assert_eq!(inventory.len(), 101);
     assert_eq!(
         inventory.iter().map(variant_name).collect::<Vec<_>>(),
         EXPECTED_COMMANDS

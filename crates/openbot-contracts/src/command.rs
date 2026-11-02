@@ -407,6 +407,25 @@ pub enum AppCommand {
     /// 没有 deployment/actor 输入字段：二者只能来自权威 [`crate::auth::AuthContext`]。
     MintThreadId,
 
+    /// List the current actor's direct conversations with one visible Bot.
+    ListBotThreads {
+        /// Selected Bot whose visibility is checked by the application.
+        bot_id: BotId,
+        /// Omission selects active conversations.
+        status: Option<ThreadStatusFilter>,
+        /// Opaque position in the most recently updated ordering.
+        cursor: Option<String>,
+        /// Requested page size, from one through one hundred.
+        limit: Option<u32>,
+    },
+    /// Rename one visible direct conversation without changing its identity.
+    SetThreadTitle {
+        /// Existing native conversation.
+        thread_id: ThreadId,
+        /// User-supplied title, normalized at the application boundary.
+        title: String,
+    },
+
     /// 查询当前 actor 是否仍可见一条 native thread。
     GetThreadStatus {
         /// 兼容端接受任意既有 [`ThreadId`] 字符串；application 再按固定路由契约检查 UUID
@@ -736,6 +755,10 @@ pub enum AppReply {
     Tool(ToolResult),
     /// [`AppCommand::MintThreadId`] 的应答。
     ThreadMinted(ThreadMinted),
+    /// Current actor's requested page of direct conversations.
+    BotThreadPage(BotThreadPage),
+    /// Committed normalized conversation title.
+    ThreadTitleSet(ThreadTitleSet),
     /// [`AppCommand::GetThreadStatus`] 的应答。
     ThreadStatus(ThreadStatus),
     /// [`AppCommand::BeginThreadRun`] 的 durable receipt。
@@ -842,6 +865,96 @@ pub struct ThreadMinted {
 pub struct ThreadStatus {
     /// 当前权威 scope 能否产生这条 thread。
     pub known: bool,
+}
+
+/// Supported visible conversation states for the direct Bot directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStatusFilter {
+    /// Open work, including conversations with a current foreground run.
+    #[default]
+    Active,
+    /// Work explicitly marked complete.
+    Archived,
+}
+
+impl ThreadStatusFilter {
+    /// Return the existing database spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+/// Shared query shape for the direct Bot directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotThreadListQuery {
+    /// Omission selects active work.
+    pub status: Option<ThreadStatusFilter>,
+    /// Opaque keyset position returned by the preceding page.
+    pub cursor: Option<String>,
+    /// Omission selects fifty rows.
+    pub limit: Option<u32>,
+}
+
+/// Foreground identity and state read from the durable occupancy projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotThreadForeground {
+    /// Existing closed foreground state.
+    pub state: ThreadForegroundRunState,
+    /// Run holding this conversation's foreground slot.
+    pub run_id: RunId,
+}
+
+/// One visible direct conversation in the Bot directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotThreadSummary {
+    /// Stable conversation identity.
+    pub thread_id: ThreadId,
+    /// Older conversations may not yet have received a title.
+    pub title: Option<String>,
+    /// Existing active or archived state.
+    pub status: ThreadStatusFilter,
+    /// Authoritative most recent conversation write.
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    /// Current foreground occupancy, if present.
+    pub foreground: Option<BotThreadForeground>,
+    /// Number of accepted inputs still pending or held.
+    pub pending_inputs: u32,
+}
+
+/// One keyset page of the current actor's direct conversations.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotThreadPage {
+    /// Rows in descending update time and ascending identity order.
+    pub threads: Vec<BotThreadSummary>,
+    /// Position after the final returned row when more rows exist.
+    pub next_cursor: Option<String>,
+}
+
+/// Closed HTTP body for a conversation rename.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetThreadTitleBody {
+    /// Untrusted title validated by the shared application entry.
+    pub title: String,
+}
+
+/// Committed result of a conversation rename.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadTitleSet {
+    /// Conversation whose title changed.
+    pub thread_id: ThreadId,
+    /// Normalized title stored by the transaction.
+    pub title: String,
 }
 
 /// 一次新 thread/run 的 anchor；不能同时自报 channel 与 direct Bot。

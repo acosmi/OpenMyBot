@@ -785,6 +785,11 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/api/threads/mint", post(threads::mint))
         .route(
+            "/api/agents/{agent_id}/threads",
+            get(threads::list_bot_threads),
+        )
+        .route("/api/threads/{thread_id}/title", post(threads::set_title))
+        .route(
             "/api/threads/{thread_id}/conversation",
             get(threads::conversation),
         )
