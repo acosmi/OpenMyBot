@@ -469,6 +469,18 @@ impl VerifiedDesktopRelease {
         })
     }
 
+    /// Carry one original launcher request to the existing pre-window Manager entry.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub fn into_runtime_config_with_request(
+        mut self,
+        program: std::path::PathBuf,
+        request: std::path::PathBuf,
+    ) -> Result<DesktopLocalRuntimeConfig, DesktopReleaseError> {
+        let input = crate::recovery::input::RestoreEntryInput::from_release(&mut self, &program, &request)
+            .map_err(|_| DesktopReleaseError::Application)?;
+        Ok(self.into_runtime_config()?.with_recovery_request(input))
+    }
+
     /// Reuse the existing authority → real PG/SCRAM → current PG actor → OS Vault → Agent → window
     /// assembly. The lazy real Keychain adapter is first touched by that background assembly.
     pub fn into_runtime_config(self) -> Result<DesktopLocalRuntimeConfig, DesktopReleaseError> {

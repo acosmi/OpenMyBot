@@ -688,6 +688,19 @@ pub enum DesktopLocalRuntimeError {
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     #[error(transparent)]
     RecoveryControl(#[from] openbot_infra::recovery_control::RecoveryControlError),
+    /// Original request verification failed while retaining its actual FD/results owner.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    #[error("desktop_local_recovery_entry_failed")]
+    RecoveryEntry {
+        /// Fixed classification of the original verification failure.
+        fault: crate::recovery::DesktopRestoreError,
+        /// Original held files and complete verification results.
+        original: Box<crate::recovery::input::RestoreEntryInput>,
+    },
+    /// Failed original Local adoption, retaining its session and actual cleanup results.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    #[error("desktop_local_legacy_execution_failed")]
+    LocalLegacyExecution(Box<LocalLegacyExecution>),
     /// Caller-supplied scheme, window label, or Desktop network policy was outside the closed shape.
     #[error("desktop_local_runtime_configuration_invalid")]
     Configuration,
@@ -751,6 +764,9 @@ pub enum DesktopLocalRuntimeError {
     /// Local bundle/protocol/window construction failed after application assembly.
     #[error("desktop_local_runtime_host_failed")]
     Host,
+    /// The actual complete SQL-driver inventory has not been proven closed.
+    #[error("recovery_control_ClosureUnproven")]
+    ClosureUnproven,
     /// Startup failed after a child existed and verified cleanup could not complete.
     #[error("desktop_local_runtime_failure_cleanup_failed")]
     FailureCleanup,
@@ -769,8 +785,13 @@ impl DesktopLocalRuntimeError {
     fn code(&self) -> &'static str {
         match self {
             Self::InitializationRequired => "recovery_control_InitializationRequired",
+            Self::ClosureUnproven => "recovery_control_ClosureUnproven",
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             Self::RecoveryControl(_) => "desktop_local_runtime_recovery_control_failed",
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            Self::LocalLegacyExecution(owner) => owner.original.as_ref().map_or("desktop_local_legacy_execution_failed", |error| error.code()),
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            Self::RecoveryEntry { .. } => "desktop_local_recovery_entry_failed",
             Self::Configuration => "desktop_local_runtime_configuration_invalid",
             Self::AppData => "desktop_local_runtime_app_data_unavailable",
             Self::Authority => "desktop_local_runtime_authority_failed",
@@ -993,6 +1014,7 @@ impl core::fmt::Debug for DesktopLocalApplicationInput {
 
 /// Limits and provenance retained from the verified release's recovery bootstrap.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[derive(Clone)]
 pub(crate) struct DesktopRecoveryBootstrap {
     pub(crate) host_limits: openbot_infra::recovery_control::TrustedHostRecoveryLimits,
     pub(crate) bounds: openbot_infra::recovery_control::OrdinaryStartupBounds,
@@ -1011,6 +1033,8 @@ pub struct DesktopLocalRuntimeConfig {
     recovery_runtime: Option<openbot_infra::recovery_control::RecoveryRuntimeOwner>,
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     recovery_fresh: Option<openbot_infra::recovery_control::OrdinaryInitializationSession>,
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    recovery_request: Option<crate::recovery::input::RestoreEntryInput>,
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     self_owned_capture_fixture: Option<SelfOwnedCaptureFixtureBinding>,
     #[cfg(all(
@@ -1045,6 +1069,8 @@ impl DesktopLocalRuntimeConfig {
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             recovery_fresh: None,
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            recovery_request: None,
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             self_owned_capture_fixture: None,
             #[cfg(all(
                 feature = "desktop-launcher",
@@ -1053,6 +1079,12 @@ impl DesktopLocalRuntimeConfig {
             ))]
             capture_request: None,
         }
+    }
+
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(crate) fn with_recovery_request(mut self, input: crate::recovery::input::RestoreEntryInput) -> Self {
+        self.recovery_request = Some(input);
+        self
     }
 
     #[cfg(all(
@@ -1626,6 +1658,52 @@ type DatabaseShutdown = Result<
     ),
 >;
 
+/// Original Local adoption resources retained after a failed pre-window execution.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub struct LocalLegacyExecution {
+    session: Option<openbot_infra::recovery_control::OrdinaryInitializationSession>,
+    original: Option<Box<DesktopLocalRuntimeError>>,
+    startup: Option<(PostgresSidecarError, crate::postgres_sidecar::SidecarOutcome)>,
+    preparation: Option<(DesktopLocalCompositionError, Result<crate::postgres_sidecar::SidecarExit, crate::postgres_sidecar::SidecarOutcome>, crate::desktop_local_bootstrap::SqlDriverOutcome)>,
+    vault: Option<crate::desktop_vault::DesktopVaultKeyError>,
+    shutdown: Option<DatabaseShutdown>,
+    stopped: Option<Result<crate::postgres_sidecar::SidecarExit, crate::postgres_sidecar::SidecarOutcome>>,
+    sql: Option<crate::desktop_local_bootstrap::SqlDriverOutcome>,
+    admin_observations: Option<Vec<openbot_infra::db::pool::ConnectionObservation>>,
+    runtime: Option<openbot_infra::recovery_control::RecoveryRuntimeOwner>,
+    close: Option<Result<openbot_infra::recovery_control::RuntimeCloseReceipt, openbot_infra::recovery_control::RecoveryControlError>>,
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl LocalLegacyExecution {
+    fn new(session: openbot_infra::recovery_control::OrdinaryInitializationSession) -> Self {
+        Self { session: Some(session), original: None, startup: None, preparation: None, vault: None, shutdown: None, stopped: None, sql: None, admin_observations: None, runtime: None, close: None }
+    }
+
+    fn fail(mut self, original: DesktopLocalRuntimeError) -> DesktopLocalRuntimeError {
+        self.original = Some(Box::new(original));
+        DesktopLocalRuntimeError::LocalLegacyExecution(Box::new(self))
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl std::fmt::Debug for LocalLegacyExecution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("LocalLegacyExecution")
+            .field("original", &self.original.as_ref().map(|error| error.code()))
+            .field("retains_legacy_owner", &self.session.as_ref().is_some_and(|session| session.is_local_legacy()))
+            .field("retains_startup", &self.startup.is_some())
+            .field("retains_preparation", &self.preparation.is_some())
+            .field("retains_vault", &self.vault.is_some())
+            .field("retains_shutdown", &self.shutdown.is_some())
+            .field("retains_stopped", &self.stopped.is_some())
+            .field("retains_sql", &self.sql.is_some())
+            .field("retains_admin_observations", &self.admin_observations.is_some())
+            .field("retains_runtime", &self.runtime.is_some())
+            .field("retains_close", &self.close.is_some()).finish()
+    }
+}
+
 pub(super) fn close_observed_ns() -> Option<u64> {
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     {
@@ -2190,6 +2268,22 @@ pub fn register_desktop_local_runtime(
                     exit_if_live(&setup_state, &app_handle, 0);
                     return;
                 }
+                #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+                if config.recovery_request.is_some() {
+                    let completed = report_preparation_result(execute_local_legacy_adoption(app_data_root, config).await);
+                    match completed {
+                        Ok(_receipt) => {
+                            setup_state.finish_shutdown(true);
+                            println!("wrok_bot_ordinary_legacy_adopted");
+                            exit_if_live(&setup_state, &app_handle, 0);
+                        }
+                        Err(_) => {
+                            setup_state.fail_startup();
+                            exit_if_live(&setup_state, &app_handle, 1);
+                        }
+                    }
+                    return;
+                }
                 let prepared = report_preparation_result(
                     prepare_desktop_local_runtime(app_data_root, config).await,
                 );
@@ -2545,11 +2639,133 @@ const fn phase_code(phase: DesktopLocalRuntimePhase) -> &'static str {
     }
 }
 
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+async fn execute_local_legacy_adoption(
+    app_data_root: CurrentOsUserAppDataRoot,
+    mut config: DesktopLocalRuntimeConfig,
+) -> Result<openbot_infra::recovery_control::RuntimeCloseReceipt, DesktopLocalRuntimeError> {
+    use crate::desktop_local_bootstrap::{sidecar_close_fact_ref, sql_driver_close_fact_ref, SqlDriverOutcome};
+    use openbot_infra::recovery_control::{OrdinaryActivationProof, RecoveryRequestPurpose, RuntimeOwner, RuntimeCloseFact, RuntimeCloseResources, PassiveObjectKind};
+    let mut input = config.recovery_request.take().ok_or(DesktopLocalRuntimeError::Configuration)?;
+    let (mut control, intent) = match input.verify_held(app_data_root.clone()) {
+        Ok(entry) => entry,
+        Err(fault) => return Err(DesktopLocalRuntimeError::RecoveryEntry { fault, original: Box::new(input) }),
+    };
+    if intent.purpose() != RecoveryRequestPurpose::AdoptOrdinaryLegacy {
+        // The other purposes have not yet been connected to their actual driver.
+        return Err(DesktopLocalRuntimeError::RecoveryRequired);
+    }
+    let intent = intent.into_ordinary_legacy_intent(&control, &[
+        RuntimeOwner::PostgresSidecar, RuntimeOwner::SqlDriver,
+        RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay, RuntimeOwner::DesktopAgent,
+    ])?;
+    let admission = intent.admission_deadline();
+    let session = control.begin_ordinary_initialization_before(intent, admission)?;
+    let mut owner = LocalLegacyExecution::new(session);
+    let session = owner.session.as_mut().expect("original legacy owner");
+    if let Err(error) = session.seal_local_legacy_before() { return Err(owner.fail(error.into())); }
+    let installation = match session.load_local_legacy_installation_before(&DesktopLocalAuthorityStore::new(app_data_root.clone())) {
+        Ok(installation) => installation,
+        Err(error) => return Err(owner.fail(error.into())),
+    };
+    let package = match (config.package_factory)(installation.authority()) {
+        Ok(package) => package,
+        Err(_) => return Err(owner.fail(DesktopLocalRuntimeError::Package)),
+    };
+    let convergence = session.convergence_deadline();
+    let DesktopLocalReleaseInput { postgres_bundle, postgres_key_store_service, vault_key_store_service, secret_store, .. } = config.release;
+    let started = PostgresSidecarSupervisor::start_with_capture_limits(
+        postgres_bundle, app_data_root.as_path(), installation.authority().instance_id(),
+        installation.sidecar_data_dir(), secret_store.as_ref(), &postgres_key_store_service,
+        None, owner.session.as_ref(),
+    ).await;
+    let sidecar = match started {
+        Ok(sidecar) => sidecar,
+        Err(actual) => {
+            owner.startup = Some(actual);
+            return Err(owner.fail(DesktopLocalRuntimeError::Sidecar));
+        }
+    };
+    let prepared = crate::desktop_local_bootstrap::prepare_running_sidecar_retained(
+        installation, sidecar, &package, None, owner.session.as_ref(),
+    ).await;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(actual) => {
+            owner.preparation = Some(actual);
+            return Err(owner.fail(DesktopLocalRuntimeError::DataPlane));
+        }
+    };
+    let vault = prepared.verify_application_key_material(secret_store.as_ref(), &vault_key_store_service, &package).await;
+    let vault = match vault {
+        Ok(vault) => vault,
+        Err(actual) => {
+            owner.vault = Some(actual);
+            owner.shutdown = Some(prepared.shutdown().await);
+            return Err(owner.fail(DesktopLocalRuntimeError::Vault));
+        }
+    };
+    let verified = owner.session.as_mut().expect("original legacy owner")
+        .verify_local_legacy_before(prepared.authority(), prepared.database(), vault.canary()).await;
+    let proof = match verified {
+        Ok(proof) => proof,
+        Err(error) => {
+            drop(vault);
+            owner.shutdown = Some(prepared.shutdown().await);
+            return Err(owner.fail(error.into()));
+        }
+    };
+    if let Err(error) = owner.session.as_mut().expect("original legacy owner")
+        .publish_active(OrdinaryActivationProof::Legacy(proof)) {
+        drop(vault);
+        owner.shutdown = Some(prepared.shutdown().await);
+        return Err(owner.fail(error.into()));
+    }
+    let enrolled = owner.session.take().expect("published original legacy owner").into_runtime_before();
+    match enrolled {
+        Ok(runtime) => owner.runtime = Some(runtime),
+        Err(error) => {
+            drop(vault);
+            owner.shutdown = Some(prepared.shutdown().await);
+            return Err(owner.fail(error.into()));
+        }
+    }
+    // Adoption ends here: no principal/package synchronization, application, Agent or window.
+    drop(vault);
+    owner.shutdown = Some(prepared.shutdown().await);
+    // The current producer retained only application-pool observations. Missing admin
+    // observations cannot certify the original SqlDriver owner or consume a close attempt.
+    if owner.admin_observations.as_ref().is_none_or(|observations| observations.is_empty()) {
+        return Err(owner.fail(DesktopLocalRuntimeError::ClosureUnproven));
+    }
+    if Instant::now() >= convergence || !matches!(owner.shutdown.as_ref(), Some(Ok(_))) {
+        return Err(owner.fail(DesktopLocalRuntimeError::FailureCleanup));
+    }
+    let Some(Ok((exit, mut observations))) = owner.shutdown.take() else { unreachable!("checked actual shutdown") };
+    observations.extend(owner.admin_observations.take().expect("original admin observations retained"));
+    owner.stopped = Some(Ok(exit));
+    owner.sql = Some(SqlDriverOutcome::Observed(observations));
+    let mut facts: Vec<_> = [RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay, RuntimeOwner::DesktopAgent]
+        .into_iter().map(|runtime_owner| RuntimeCloseFact::PassiveRetirement { object: PassiveObjectKind::NeverStarted(runtime_owner) }).collect();
+    let Some(sidecar_fact) = sidecar_close_fact_ref(owner.stopped.as_ref().expect("original wait retained")) else {
+        return Err(owner.fail(DesktopLocalRuntimeError::FailureCleanup));
+    };
+    facts.push(sidecar_fact);
+    let sql_fact = sql_driver_close_fact_ref(owner.sql.as_ref().expect("original observations retained"), convergence).await;
+    let Some(sql_fact) = sql_fact else { return Err(owner.fail(DesktopLocalRuntimeError::FailureCleanup)); };
+    facts.push(sql_fact);
+    owner.close = Some(owner.runtime.as_mut().expect("original runtime enrolled").close_before(RuntimeCloseResources::new(facts), convergence).await);
+    if !matches!(owner.close.as_ref(), Some(Ok(_))) { return Err(owner.fail(DesktopLocalRuntimeError::FailureCleanup)); }
+    let Some(Ok(receipt)) = owner.close.take() else { unreachable!("checked original close receipt") };
+    Ok(receipt)
+}
+
 pub(crate) async fn prepare_desktop_local_runtime(
     app_data_root: CurrentOsUserAppDataRoot,
     config: DesktopLocalRuntimeConfig,
 ) -> Result<PreparedDesktopLocalRuntime, DesktopLocalRuntimeError> {
     let authority_store = DesktopLocalAuthorityStore::new(app_data_root.clone());
+
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     let config = {
         use openbot_infra::recovery_control::{
@@ -2610,6 +2826,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
         mut recovery_runtime,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         mut recovery_fresh,
+        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+        recovery_request: _,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         mut self_owned_capture_fixture,
         #[cfg(all(
@@ -2953,6 +3171,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 secret_store.as_ref(),
                 &postgres_key_store_service,
                 capture_limits,
+                None,
             )
             .await;
         }
@@ -3010,11 +3229,13 @@ pub(crate) async fn prepare_desktop_local_runtime(
             sidecar,
             &package,
             capture_custody,
+            None,
         )
         .await
         {
             Ok(prepared) => prepared,
             Err((error, sidecar, sql)) => {
+
                 use openbot_infra::recovery_control::{
                     PassiveObjectKind, RuntimeCloseFact, RuntimeOwner,
                 };
@@ -3143,6 +3364,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
         }
         .await;
         if let Err(original) = bound {
+
             use crate::desktop_local_bootstrap::SqlDriverOutcome;
             use openbot_infra::recovery_control::{
                 PassiveObjectKind, RuntimeCloseFact, RuntimeOwner,
@@ -4470,6 +4692,7 @@ fn map_os_secret_store_error(error: OsSecretStoreError) -> DesktopLocalRuntimeEr
 fn map_data_plane_error(error: DesktopLocalCompositionError) -> DesktopLocalRuntimeError {
     match error {
         DesktopLocalCompositionError::FailureCleanup
+        | DesktopLocalCompositionError::LegacySidecarShutdown { .. }
         | DesktopLocalCompositionError::SidecarShutdown => DesktopLocalRuntimeError::FailureCleanup,
         DesktopLocalCompositionError::Database(DesktopLocalDatabaseError::Missing) => {
             DesktopLocalRuntimeError::RecoveryRequired

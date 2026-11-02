@@ -95,6 +95,26 @@ impl RestoreProgramOwner {
     pub(crate) fn original_child(&self) -> &Child {
         &self.original.child
     }
+
+    pub(crate) fn original_identity(&self) -> &Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError> {
+        &self.identity
+    }
+
+    pub(crate) fn generation_identity(&self) -> &[u64; 3] {
+        &self.generation
+    }
+
+    pub(crate) fn post_directories(&self) -> &Result<(), IsolationFailure> {
+        &self.post_directories
+    }
+
+    pub(crate) fn post_software(&self) -> &Result<(), PostgresSidecarError> {
+        &self.post_software
+    }
+
+    pub(crate) fn original_stop(&self) -> Option<&RestoreStopState> {
+        self.stop.as_ref()
+    }
 }
 
 // The full restore session/candidate/config producer is a separately registered
@@ -194,6 +214,7 @@ pub(crate) fn request_restore_stop(
 #[cfg(feature = "postgres-supervisor")]
 pub(crate) struct RestoreProgramResult {
     tool: Result<ToolResult, MaintenanceError>,
+    joins: RestorePipeJoins,
     identity: Result<
         wrok_bot_macos_process::ProcessIdentity,
         wrok_bot_macos_process::ProcessObservationError,
@@ -202,6 +223,31 @@ pub(crate) struct RestoreProgramResult {
     stop: Option<RestoreStopState>,
     post_directories: Result<(), IsolationFailure>,
     post_software: Result<(), PostgresSidecarError>,
+}
+
+// Two SHA-256 strings copied into the restore ToolObservation while the
+// original reports remain in the original task results. The original stdout
+// preview also remains resident: spawn accepts preview=true, bounded at 512 B.
+pub(crate) const RESTORE_JOIN_RETAINED_BYTES: usize = 2 * 64 + 512;
+
+struct RestorePipeJoins {
+    stdin: Option<Result<Result<(), MaintenanceError>, tokio::task::JoinError>>,
+    stdout: Option<Result<Result<DrainResult, MaintenanceError>, tokio::task::JoinError>>,
+    stderr: Option<Result<Result<DrainResult, MaintenanceError>, tokio::task::JoinError>>,
+}
+
+#[cfg(feature = "postgres-supervisor")]
+impl RestoreProgramResult {
+    pub(crate) fn retained_join_bytes(&self) -> Option<usize> {
+        let reports = self.tool.as_ref().ok().map_or(Some(0usize), |tool| {
+            tool.observation.stdout.as_ref().map_or(0, |report| report.sha256.capacity())
+                .checked_add(tool.observation.stderr.as_ref().map_or(0, |report| report.sha256.capacity()))
+        })?;
+        [&self.joins.stdout, &self.joins.stderr].iter().try_fold(reports, |bytes, join| {
+            let preview = join.as_ref().and_then(|join| join.as_ref().ok()).and_then(|task| task.as_ref().ok()).map_or(0, |result| result.preview.capacity());
+            bytes.checked_add(preview)
+        })
+    }
 }
 #[cfg(feature = "postgres-supervisor")]
 pub(crate) async fn wait_restore_program(
@@ -223,8 +269,11 @@ pub(crate) async fn wait_restore_program(
     // Only request_restore_stop may issue this restore owner's one TERM. The
     // original wait's optional deadline TERM is disabled, so Unknown cannot send
     // another native request. It still waits the same Child and joins all pipes.
+    let mut joins = RestorePipeJoins { stdin: None, stdout: None, stderr: None };
+    let tool = wait_program_with_capacity(original, clock, observe_capacity, closing, false, Some(&mut joins)).await;
     RestoreProgramResult {
-        tool: wait_program_with_capacity(original, clock, observe_capacity, closing, false).await,
+        tool,
+        joins,
         identity,
         generation,
         stop,
@@ -2455,6 +2504,7 @@ async fn wait_program(
         || capacity_monitor.observe(0),
         closing,
         term_on_deadline,
+        None,
     )
     .await
 }
@@ -2473,6 +2523,7 @@ pub(super) async fn wait_capture_program(
         || source.native_capacity_check(),
         closing,
         term_on_deadline,
+        None,
     )
     .await
 }
@@ -2483,6 +2534,7 @@ async fn wait_program_with_capacity(
     mut observe_capacity: impl FnMut() -> Result<(), MaintenanceError>,
     closing: bool,
     term_on_deadline: bool,
+    restore_joins: Option<&mut RestorePipeJoins>,
 ) -> Result<ToolResult, MaintenanceError> {
     let bound = if closing {
         clock.convergence()
@@ -2561,18 +2613,12 @@ async fn wait_program_with_capacity(
     let input_joined = input.as_ref().map(|r| r.is_ok());
     let output_joined = output.as_ref().is_some_and(Result::is_ok);
     let stderr_joined = stderr.as_ref().is_some_and(Result::is_ok);
-    let output = match output {
-        Some(Ok(Ok(r))) => Some(r),
-        _ => None,
-    };
-    let stderr = match stderr {
-        Some(Ok(Ok(r))) => Some(r),
-        _ => None,
-    };
-    let bad_secret = output.as_ref().is_some_and(|r| r.report.secret_found)
-        || stderr.as_ref().is_some_and(|r| r.report.secret_found);
-    let capacity = output.as_ref().is_some_and(|r| r.report.limit_exceeded)
-        || stderr.as_ref().is_some_and(|r| r.report.limit_exceeded);
+    let output_result = output.as_ref().and_then(|join| join.as_ref().ok()).and_then(|task| task.as_ref().ok());
+    let stderr_result = stderr.as_ref().and_then(|join| join.as_ref().ok()).and_then(|task| task.as_ref().ok());
+    let bad_secret = output_result.is_some_and(|r| r.report.secret_found)
+        || stderr_result.is_some_and(|r| r.report.secret_found);
+    let capacity = output_result.is_some_and(|r| r.report.limit_exceeded)
+        || stderr_result.is_some_and(|r| r.report.limit_exceeded);
     let input_ok = input.as_ref().is_none_or(|r| matches!(r, Ok(Ok(()))));
     let failed = if bad_secret {
         Some(MaintenanceError::SecretInvalid)
@@ -2580,7 +2626,7 @@ async fn wait_program_with_capacity(
         Some(MaintenanceError::CapacityExceeded)
     } else if capacity_error.is_some() {
         capacity_error
-    } else if owner.setup_error || output.is_none() || stderr.is_none() || !input_ok {
+    } else if owner.setup_error || output_result.is_none() || stderr_result.is_none() || !input_ok {
         Some(MaintenanceError::PipeJoinUnknown)
     } else if now.is_err() {
         Some(MaintenanceError::ClockUnavailable)
@@ -2593,10 +2639,22 @@ async fn wait_program_with_capacity(
     } else {
         None
     };
-    let preview = output
-        .as_ref()
+    let preview = output_result
         .map(|r| r.preview.clone())
         .unwrap_or_default();
+    let (stdout_report, stderr_report) = if let Some(joins) = restore_joins {
+        let stdout_report = output_result.map(|r| r.report.clone());
+        let stderr_report = stderr_result.map(|r| r.report.clone());
+        joins.stdin = input;
+        joins.stdout = output;
+        joins.stderr = stderr;
+        (stdout_report, stderr_report)
+    } else {
+        // The normal maintenance/capture path still moves its original reports
+        // into the same observation and allocates no additional report copies.
+        (output.and_then(|join| join.ok()).and_then(|task| task.ok()).map(|r| r.report),
+         stderr.and_then(|join| join.ok()).and_then(|task| task.ok()).map(|r| r.report))
+    };
     // A clock failure retains an absent timestamp; it never fabricates an on-time observation.
     let observed = now.ok();
     Ok(ToolResult {
@@ -2615,8 +2673,8 @@ async fn wait_program_with_capacity(
             original_wait_errors: initial_error.saturating_add(additional_errors),
             deadline_expired: late,
             secret_absent_from_argv_env: owner.args_env_clean,
-            stdout: output.map(|r| r.report),
-            stderr: stderr.map(|r| r.report),
+            stdout: stdout_report,
+            stderr: stderr_report,
         },
         preview,
         error: failed,
@@ -3860,4 +3918,82 @@ pub(super) async fn owned_test_case(
         String::from_utf8(encoded).map_err(|_| MaintenanceError::IoFailure)?
     );
     Ok(observation)
+}
+
+#[cfg(all(test, feature = "postgres-supervisor"))]
+mod restore_pipe_tests {
+    use super::*;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn restore_original_pipe_results_survive_task_error_and_panic() {
+        let clock = OperationClock::start(5_000_000_000, 5_000_000_000).expect("real component clock");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf pipe-output; printf pipe-error >&2"])
+            .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let clean = command_secret_absent(&command, b"component-secret");
+        let mut child = command.spawn().expect("original native component child");
+        let pid = child.id().expect("actual component pid");
+        let mut stdin = child.stdin.take().expect("original stdin");
+        let stdout = child.stdout.take().expect("original stdout");
+        let stderr = child.stderr.take().expect("original stderr");
+        let owner = ProgramOwner {
+            role: "restore_pipe_component", child, pid,
+            started: clock.observed().expect("original clock observation"),
+            setup_error: false, args_env_clean: clean,
+            input: Some(tokio::spawn(async move {
+                stdin.shutdown().await.map_err(|_| MaintenanceError::IoFailure)?;
+                Err(MaintenanceError::ProtocolInvalid)
+            })),
+            output: Some(tokio::spawn(async move {
+                let _original = drain_pipe(stdout, 1024, None, false).await?;
+                panic!("injected original reader task panic");
+            })),
+            error: Some(tokio::spawn(async move {
+                let _original = drain_pipe(stderr, 1024, None, false).await?;
+                Err(MaintenanceError::ProtocolInvalid)
+            })),
+        };
+        let mut joins = RestorePipeJoins { stdin: None, stdout: None, stderr: None };
+        let tool = wait_program_with_capacity(owner, &clock, || Ok(()), false, false, Some(&mut joins))
+            .await.unwrap_or_else(|_| panic!("original wait failed"));
+        assert!(matches!(tool.error, Some(MaintenanceError::PipeJoinUnknown)));
+        assert!(tool.observation.original_child_wait);
+        assert!(matches!(joins.stdin, Some(Ok(Err(MaintenanceError::ProtocolInvalid)))));
+        assert!(matches!(joins.stderr, Some(Ok(Err(MaintenanceError::ProtocolInvalid)))));
+        assert!(joins.stdout.as_ref().is_some_and(|result| result.as_ref().is_err_and(|error| error.is_panic())));
+    }
+
+    #[tokio::test]
+    async fn restore_success_keeps_original_reports_and_capture_projection() {
+        for (retain, preview) in [(false, false), (true, false), (true, true)] {
+            let clock = OperationClock::start(5_000_000_000, 5_000_000_000).expect("real component clock");
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", "/bin/cat >/dev/null; printf pipe-output; printf pipe-error >&2"])
+                .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let owner = spawn_program_retaining_io(command, "restore_pipe_component", &clock,
+                Arc::new(SecretBytes::new(b"component-secret".to_vec())), true, (1024, 1024, preview), false)
+                .unwrap_or_else(|_| panic!("original native spawn failed"));
+            let mut joins = RestorePipeJoins { stdin: None, stdout: None, stderr: None };
+            let sink = if retain { Some(&mut joins) } else { None };
+            let tool = wait_program_with_capacity(owner, &clock, || Ok(()), false, false, sink)
+                .await.unwrap_or_else(|_| panic!("original wait failed"));
+            assert!(tool.error.is_none());
+            assert_eq!(tool.observation.stdin_writer_joined, Some(true));
+            assert_eq!(tool.observation.stdout.as_ref().expect("stdout report").bytes, 11);
+            assert_eq!(tool.observation.stderr.as_ref().expect("stderr report").bytes, 10);
+            if retain {
+                assert!(matches!(joins.stdin, Some(Ok(Ok(())))));
+                let output = joins.stdout.as_ref().and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok()).expect("original stdout task result");
+                let error = joins.stderr.as_ref().and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok()).expect("original stderr task result");
+                assert_eq!(output.report.sha256, tool.observation.stdout.as_ref().expect("stdout observation").sha256);
+                assert_eq!(error.report.sha256, tool.observation.stderr.as_ref().expect("stderr observation").sha256);
+                assert_eq!(output.preview.len(), if preview { 11 } else { 0 });
+                assert_eq!(tool.preview, output.preview);
+                assert!(output.preview.capacity() <= 512);
+            } else {
+                assert!(joins.stdin.is_none() && joins.stdout.is_none() && joins.stderr.is_none());
+            }
+        }
+    }
 }

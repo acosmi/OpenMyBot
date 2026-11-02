@@ -5,7 +5,7 @@ use std::fs::{File, Metadata};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use openbot_infra::auth::single_user::desktop_local::CurrentOsUserAppDataRoot;
@@ -33,7 +33,10 @@ impl std::fmt::Debug for VerifiedRestoreEntry {
 }
 
 /// Until the Infra owner takes each source, failures keep the original raw results here.
-pub(super) struct RestoreEntryInput {
+pub struct RestoreEntryInput {
+    release: Option<(File, OsString, File)>,
+    bootstrap: Option<crate::tauri_background::DesktopRecoveryBootstrap>,
+    paths: Option<(PathBuf, PathBuf)>,
     parent: Option<File>,
     opened: Option<io::Result<File>>,
     metadata: Option<io::Result<Metadata>>,
@@ -44,9 +47,18 @@ pub(super) struct RestoreEntryInput {
     control_error: Option<RecoveryControlError>,
 }
 
+impl std::fmt::Debug for RestoreEntryInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RestoreEntryInput(<original-release-request-results>)")
+    }
+}
+
 impl RestoreEntryInput {
     pub(super) fn new() -> Self {
         Self {
+            release: None,
+            bootstrap: None,
+            paths: None,
             parent: None,
             opened: None,
             metadata: None,
@@ -65,14 +77,42 @@ impl RestoreEntryInput {
         program_path: &Path,
         request_path: &Path,
     ) -> Result<(RecoveryControl, VerifiedRecoveryHostIntent), DesktopRestoreError> {
-        let bootstrap = release
-            .recovery
-            .as_ref()
-            .ok_or(DesktopRestoreError::InitializationRequired)?;
-        let limits = &bootstrap.host_limits;
-        if release.original_release.is_none() {
-            return Err(DesktopRestoreError::EntryInvalid);
+        *self = Self::from_release(release, program_path, request_path)?;
+        self.verify_held(actual)
+    }
+
+    pub(crate) fn from_release(
+        release: &mut VerifiedDesktopRelease,
+        program: &Path,
+        request: &Path,
+    ) -> Result<Self, DesktopRestoreError> {
+        let bootstrap = release.recovery.as_ref()
+            .ok_or(DesktopRestoreError::InitializationRequired)?.clone();
+        let held_path_bytes = program.as_os_str().len().checked_add(request.as_os_str().len())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(DesktopRestoreError::CapacityExceeded)?;
+        if held_path_bytes as u64 > bootstrap.host_limits.max_metadata_bytes {
+            return Err(DesktopRestoreError::CapacityExceeded);
         }
+        let original = release.original_release.take().ok_or(DesktopRestoreError::EntryInvalid)?;
+        let mut owner = Self::new();
+        owner.release = Some(original);
+        owner.bootstrap = Some(bootstrap);
+        owner.paths = Some((program.to_owned(), request.to_owned()));
+        Ok(owner)
+    }
+
+    pub(crate) fn verify_held(
+        &mut self,
+        actual: CurrentOsUserAppDataRoot,
+    ) -> Result<(RecoveryControl, VerifiedRecoveryHostIntent), DesktopRestoreError> {
+        let bootstrap = self.bootstrap.as_ref().ok_or(DesktopRestoreError::EntryInvalid)?.clone();
+        let (program_path, request_path) = self.paths.as_ref().ok_or(DesktopRestoreError::EntryInvalid)?.clone();
+        let program_path = program_path.as_path();
+        let request_path = request_path.as_path();
+        let limits = &bootstrap.host_limits;
+        if self.release.is_none() { return Err(DesktopRestoreError::EntryInvalid); }
         let deadline = Instant::now()
             .checked_add(Duration::from_nanos(limits.admission_ns))
             .ok_or(DesktopRestoreError::ProfileInvalid)?;
@@ -163,8 +203,8 @@ impl RestoreEntryInput {
         before(deadline)?;
         let host = VerifiedRecoveryHost::from_local_release(
             self.program.take().expect("original program retained"),
-            release
-                .original_release
+            self
+                .release
                 .take()
                 .expect("original release retained before source transfer"),
             actual.clone(),

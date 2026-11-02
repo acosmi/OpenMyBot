@@ -20,7 +20,7 @@ pub use activation::{ActivationBinding, ActivationPhase, OrdinaryStartupBounds};
 pub use journal::{NativeExit, PipeJoin, ProcessStart};
 pub(crate) use activation::{Hex32, ServerDatabaseSite};
 pub use entry::{
-    OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
+    OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
     VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
 };
 pub(crate) use ordinary::OrdinaryStage;
@@ -67,6 +67,7 @@ pub struct RecoveryControlError {
     retained_request: Option<Box<entry::RequestOpenOwner>>,
     retained_restore_input: Option<Box<OwnedRecoveryRequestFile>>,
     retained_restore_intent: Option<Box<VerifiedRecoveryHostIntent>>,
+    retained_ordinary: Option<Box<OrdinaryInitializationSession>>,
 }
 
 impl RecoveryControlError {
@@ -80,6 +81,7 @@ impl RecoveryControlError {
             retained_request: None,
             retained_restore_input: None,
             retained_restore_intent: None,
+            retained_ordinary: None,
         }
     }
 
@@ -93,6 +95,7 @@ impl RecoveryControlError {
             retained_request: None,
             retained_restore_input: None,
             retained_restore_intent: None,
+            retained_ordinary: None,
         }
     }
 
@@ -111,6 +114,7 @@ impl RecoveryControlError {
             retained_request: None,
             retained_restore_input: None,
             retained_restore_intent: None,
+            retained_ordinary: None,
         }
     }
 
@@ -132,7 +136,7 @@ impl fmt::Debug for RecoveryControlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoveryControlError")
             .field("fault", &self.fault)
-            .field("retains_original_owner", &(self.retained.is_some() || self.retained_host.is_some() || self.retained_request.is_some()))
+            .field("retains_original_owner", &(self.retained.is_some() || self.retained_host.is_some() || self.retained_request.is_some() || self.retained_ordinary.is_some()))
             .finish()
     }
 }

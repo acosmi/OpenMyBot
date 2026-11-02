@@ -28,7 +28,7 @@ fn run() -> Result<(), String> {
     match args.mode {
         Mode::Help => {
             println!(
-                "Wrok Bot\n\nUsage: wrok-bot [--resource-root PATH] [--check-release]\n       wrok-bot --help\n       wrok-bot --version\n\nRelease resources must match the reviewed digest bound into this core build.\n--check-release verifies resources without opening Keychain, PostgreSQL, or windows."
+                "Wrok Bot\n\nUsage: wrok-bot [--resource-root PATH] [--check-release] [--restore-request PATH]\n       wrok-bot --help\n       wrok-bot --version\n\nRelease resources must match the reviewed digest bound into this core build.\n--check-release verifies resources without opening Keychain, PostgreSQL, or windows."
             );
             return Ok(());
         }
@@ -54,9 +54,12 @@ fn run() -> Result<(), String> {
     }
     let context = product_context();
     validate_product_context(&context).map_err(|error| error.to_string())?;
-    let config = release
-        .into_runtime_config()
-        .map_err(|error| error.to_string())?;
+    let config = match args.restore_request {
+        Some(request) => release.into_runtime_config_with_request(
+            std::env::current_exe().map_err(|_| "wrok_bot_program_unavailable".to_owned())?, request,
+        ),
+        None => release.into_runtime_config(),
+    }.map_err(|error| error.to_string())?;
     register_desktop_local_runtime(tauri::Builder::default(), config)
         .map_err(|error| error.to_string())?
         .run(context)
@@ -81,6 +84,7 @@ enum Mode {
 struct Args {
     mode: Mode,
     resource_root: Option<std::path::PathBuf>,
+    restore_request: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -89,11 +93,12 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
     let mut parsed = Args {
         mode: Mode::Launch,
         resource_root: None,
+        restore_request: None,
     };
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--help" | "--version")
-                if parsed.mode == Mode::Launch && parsed.resource_root.is_none() =>
+                if parsed.mode == Mode::Launch && parsed.resource_root.is_none() && parsed.restore_request.is_none() =>
             {
                 parsed.mode = if arg == "--help" {
                     Mode::Help
@@ -106,6 +111,12 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
                 return Ok(parsed);
             }
             Some("--check-release") if parsed.mode == Mode::Launch => parsed.mode = Mode::Check,
+            Some("--restore-request") if parsed.restore_request.is_none() && parsed.mode == Mode::Launch => {
+                let path = args.next().map(std::path::PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .ok_or_else(|| "wrok_bot_arguments_invalid".to_owned())?;
+                parsed.restore_request = Some(path);
+            }
             Some("--resource-root") if parsed.resource_root.is_none() => {
                 let path = args
                     .next()
@@ -117,6 +128,7 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
             _ => return Err("wrok_bot_arguments_invalid".to_owned()),
         }
     }
+    if parsed.mode != Mode::Launch && parsed.restore_request.is_some() { return Err("wrok_bot_arguments_invalid".to_owned()); }
     Ok(parsed)
 }
 
@@ -170,6 +182,23 @@ mod tests {
             args.resource_root.unwrap(),
             std::path::Path::new("/absolute")
         );
+    }
+
+    #[test]
+    fn cli_restore_request_is_one_absolute_path_for_launch_only() {
+        let parsed = parse_args(["--restore-request".into(), "/request".into()]).unwrap();
+        assert_eq!(parsed.mode, Mode::Launch);
+        assert_eq!(parsed.restore_request.as_deref(), Some(std::path::Path::new("/request")));
+        for args in [
+            vec!["--restore-request"],
+            vec!["--restore-request", "relative"],
+            vec!["--restore-request", "/a", "--restore-request", "/b"],
+            vec!["--restore-request", "/a", "--check-release"],
+            vec!["--check-release", "--restore-request", "/a"],
+            vec!["--restore-request", "/a", "--help"],
+        ] {
+            assert!(parse_args(args.into_iter().map(Into::into)).is_err());
+        }
     }
 
     #[test]

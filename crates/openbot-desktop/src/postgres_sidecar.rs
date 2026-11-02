@@ -1401,7 +1401,20 @@ impl RunningPostgresSidecar {
 
     /// Stop through the verified `pg_ctl`, then wait for the exact owned child before releasing
     /// the start lock. Failure preserves a stale lock and kills the child best-effort.
-    pub async fn shutdown(mut self) -> Result<SidecarExit, (PostgresSidecarError, SidecarOutcome)> {
+    pub async fn shutdown(self) -> Result<SidecarExit, (PostgresSidecarError, SidecarOutcome)> {
+        self.shutdown_inner(None).await
+    }
+
+    /// Retire this original child within the initialization owner's original convergence cap.
+    pub(crate) async fn shutdown_before(self, convergence: Instant) -> Result<SidecarExit, (PostgresSidecarError, SidecarOutcome)> {
+        self.shutdown_inner(Some(convergence)).await
+    }
+
+    async fn shutdown_inner(mut self, convergence: Option<Instant>) -> Result<SidecarExit, (PostgresSidecarError, SidecarOutcome)> {
+        if convergence.is_some_and(|cap| Instant::now() >= cap) {
+            self.preserve_lock();
+            return Err((PostgresSidecarError::ShutdownFailed, SidecarOutcome::Unknown));
+        }
         let ownership = if self.lock.is_some() {
             self.ensure_owner_current()
         } else {
@@ -1410,7 +1423,7 @@ impl RunningPostgresSidecar {
         if let Err(error) = ownership {
             self.preserve_lock();
             let terminated = match self.child.as_mut() {
-                Some(child) => terminate_child(child).await,
+                Some(child) => terminate_child_before(child, convergence).await,
                 None => Err(PostgresSidecarError::ShutdownFailed),
             };
             return match terminated {
@@ -1431,7 +1444,7 @@ impl RunningPostgresSidecar {
         ))?) {
             self.preserve_lock();
             let terminated = match self.child.as_mut() {
-                Some(child) => terminate_child(child).await,
+                Some(child) => terminate_child_before(child, convergence).await,
                 None => Err(PostgresSidecarError::ShutdownFailed),
             };
             return match terminated {
@@ -1448,12 +1461,12 @@ impl RunningPostgresSidecar {
                 )),
             };
         }
-        let stop_status = match run_pg_ctl_stop(&self.bundle, &self.data_dir).await {
+        let stop_status = match run_pg_ctl_stop_before(&self.bundle, &self.data_dir, convergence).await {
             Ok(status) if status.success() => status,
             _ => {
                 self.preserve_lock();
                 let outcome = match self.child.as_mut() {
-                    Some(child) => match terminate_child(child).await {
+                    Some(child) => match terminate_child_before(child, convergence).await {
                         Ok(status) => SidecarOutcome::exited(self.start_evidence, status),
                         Err(_) => SidecarOutcome::Unknown,
                     },
@@ -1470,9 +1483,11 @@ impl RunningPostgresSidecar {
                 SidecarOutcome::Unknown,
             ));
         };
-        let waited = tokio::time::timeout(SHUTDOWN_DEADLINE, child.wait()).await;
+        let deadline = convergence.map(tokio::time::Instant::from_std)
+            .map_or(tokio::time::Instant::now() + SHUTDOWN_DEADLINE, |cap| cap.min(tokio::time::Instant::now() + SHUTDOWN_DEADLINE));
+        let waited = tokio::time::timeout_at(deadline, child.wait()).await;
         match waited {
-            Ok(Ok(status)) if status.success() => {
+            Ok(Ok(status)) if status.success() && convergence.is_none_or(|cap| Instant::now() < cap) => {
                 let observed = Instant::now();
                 let observed_ns = wait_observed_ns();
                 #[cfg(target_os = "macos")]
@@ -1518,7 +1533,7 @@ impl RunningPostgresSidecar {
             }
             _ => {
                 self.preserve_lock();
-                let outcome = match terminate_child(&mut child).await {
+                let outcome = match terminate_child_before(&mut child, convergence).await {
                     Ok(status) => SidecarOutcome::exited(self.start_evidence, status),
                     Err(_) => SidecarOutcome::Unknown,
                 };
@@ -1866,6 +1881,7 @@ impl PostgresSidecarSupervisor {
             store,
             service,
             StartControlInspection::Ordinary,
+            None,
         )
         .await
         .map_err(|(error, _)| error)
@@ -1884,6 +1900,7 @@ impl PostgresSidecarSupervisor {
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
         limits: Option<crate::tauri_background::capture::control::Limits>,
+        legacy: Option<&openbot_infra::recovery_control::OrdinaryInitializationSession>,
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
         Self::start_inner(
             bundle,
@@ -1896,6 +1913,7 @@ impl PostgresSidecarSupervisor {
                 Some(limits) => StartControlInspection::Reviewed(limits),
                 None => StartControlInspection::Ordinary,
             },
+            legacy.map(|owner| (owner.effect_deadline(), owner.convergence_deadline())),
         )
         .await
     }
@@ -1908,7 +1926,11 @@ impl PostgresSidecarSupervisor {
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
         control_inspection: StartControlInspection,
+        legacy: Option<(std::time::Instant, std::time::Instant)>,
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err((PostgresSidecarError::ReadyTimeout, SidecarOutcome::NeverSpawned));
+        }
         validate_supervisor_paths(app_data_root, instance_id, data_dir)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
@@ -1962,7 +1984,7 @@ impl PostgresSidecarSupervisor {
             .map_err(map_helper_journal_error)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(target_os = "macos")]
-        verify_program_versions_with_helper(&bundle, &mut lock, &mut helper_journal)
+        verify_program_versions_with_helper(&bundle, &mut lock, &mut helper_journal, legacy)
             .await
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(not(target_os = "macos"))]
@@ -1982,6 +2004,10 @@ impl PostgresSidecarSupervisor {
         let disposition = lock
             .inspect_data_directory(data_dir)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
+        // Adoption can never initialize an empty legacy directory or create its SCRAM key.
+        if legacy.is_some() && !disposition.is_existing() {
+            return Err((PostgresSidecarError::StartupJournalRecoveryRequired, SidecarOutcome::NeverSpawned));
+        }
         #[cfg(target_os = "macos")]
         if startup_preparation.requires_existing_data() && !disposition.is_existing() {
             return Err((
@@ -1995,6 +2021,9 @@ impl PostgresSidecarSupervisor {
                 .mark_complete(&lock)
                 .map_err(map_helper_journal_error)
                 .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
+        }
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err((PostgresSidecarError::ReadyTimeout, SidecarOutcome::NeverSpawned));
         }
         let secret = lock
             .load_or_create_scram_secret(store, service, &disposition)
@@ -2029,8 +2058,14 @@ impl PostgresSidecarSupervisor {
         }
         lock.ensure_current()
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err((PostgresSidecarError::ReadyTimeout, SidecarOutcome::NeverSpawned));
+        }
         let port =
             reserve_loopback_port().map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err((PostgresSidecarError::ReadyTimeout, SidecarOutcome::NeverSpawned));
+        }
         write_runtime_configuration(data_dir, port)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         lock.ensure_current()
@@ -2045,6 +2080,9 @@ impl PostgresSidecarSupervisor {
             .revalidate(&lock)
             .map_err(map_helper_journal_error)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err((PostgresSidecarError::ReadyTimeout, SidecarOutcome::NeverSpawned));
+        }
         // V6-PR-022: Existing clusters may keep a stale postmaster.pid after crash. With Empty
         // openers re-checked here, remove only that pid file so PG can run its own recovery.
         // Never delete PG_VERSION / pg_wal / base.
@@ -2062,6 +2100,9 @@ impl PostgresSidecarSupervisor {
             .begin_spawn(&lock)
             .map_err(map_startup_journal_error)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err((PostgresSidecarError::ReadyTimeout, SidecarOutcome::NeverSpawned));
+        }
         let mut child = spawn_postgres(&bundle, data_dir)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(target_os = "macos")]
@@ -2075,7 +2116,7 @@ impl PostgresSidecarSupervisor {
             Ok(identity) => identity,
             Err(error) => {
                 lock.preserve_on_drop();
-                return if terminate_child(&mut child).await.is_ok() {
+                return if terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await.is_ok() {
                     Err((error, SidecarOutcome::Unknown))
                 } else {
                     Err((
@@ -2096,19 +2137,22 @@ impl PostgresSidecarSupervisor {
                 SidecarOutcome::Unknown,
             ),
         };
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err(failed(PostgresSidecarError::ReadyTimeout, terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await));
+        }
         #[cfg(target_os = "macos")]
         if let Err(error) = startup_journal.record_child(&lock, &process_identity) {
             return Err(failed(
                 map_startup_journal_error(error),
-                terminate_child(&mut child).await,
+                terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await,
             ));
         }
         if let Err(error) = lock.ensure_current() {
             lock.preserve_on_drop();
-            return Err(failed(error, terminate_child(&mut child).await));
+            return Err(failed(error, terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await));
         }
-        if let Err(error) = wait_until_ready(&mut child, port, &secret).await {
-            let terminated = terminate_child(&mut child).await;
+        if let Err(error) = wait_until_ready(&mut child, port, &secret, legacy.map(|(effect, _)| effect)).await {
+            let terminated = terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await;
             if terminated.is_err() {
                 lock.preserve_on_drop();
                 #[cfg(target_os = "macos")]
@@ -2135,33 +2179,39 @@ impl PostgresSidecarSupervisor {
             lock.preserve_on_drop();
             return Err(failed(
                 PostgresSidecarError::ProcessIdentityInvalid,
-                terminate_child(&mut child).await,
+                terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await,
             ));
+        }
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err(failed(PostgresSidecarError::ReadyTimeout, terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await));
         }
         #[cfg(target_os = "macos")]
         if let Err(error) = startup_journal.mark_ready(&lock) {
             return Err(failed(
                 map_startup_journal_error(error),
-                terminate_child(&mut child).await,
+                terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await,
             ));
         }
         #[cfg(target_os = "macos")]
         if process_identity.revalidate().is_err() {
             return Err(failed(
                 PostgresSidecarError::ProcessIdentityInvalid,
-                terminate_child(&mut child).await,
+                terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await,
             ));
         }
         #[cfg(target_os = "macos")]
         if let Err(error) = startup_journal.revalidate(&lock) {
             return Err(failed(
                 map_startup_journal_error(error),
-                terminate_child(&mut child).await,
+                terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await,
             ));
         }
         if let Err(error) = lock.ensure_current() {
             lock.preserve_on_drop();
-            return Err(failed(error, terminate_child(&mut child).await));
+            return Err(failed(error, terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await));
+        }
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err(failed(PostgresSidecarError::ReadyTimeout, terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await));
         }
         Ok(RunningPostgresSidecar {
             child: Some(child),
@@ -2296,6 +2346,7 @@ async fn verify_program_versions_with_helper(
     bundle: &VerifiedPostgresBundle,
     lock: &mut PostgresStartLock,
     helper_journal: &mut HelperJournal,
+    legacy: Option<(std::time::Instant, std::time::Instant)>,
 ) -> Result<(), PostgresSidecarError> {
     use tokio::io::AsyncReadExt as _;
 
@@ -2313,6 +2364,9 @@ async fn verify_program_versions_with_helper(
         ),
     ];
     for (program, label, next_kind) in programs {
+        if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err(PostgresSidecarError::VersionMismatch);
+        }
         if let Some(kind) = next_kind {
             helper_journal
                 .begin_next_helper(lock, kind)
@@ -2341,23 +2395,25 @@ async fn verify_program_versions_with_helper(
             Ok(identity) => identity,
             Err(error) => {
                 lock.preserve_on_drop();
-                let _ = terminate_child(&mut child).await;
+                let _ = terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await;
                 return Err(error);
             }
         };
         if process_identity.revalidate().is_err() {
             lock.preserve_on_drop();
-            let _ = terminate_child(&mut child).await;
+            let _ = terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await;
             return Err(PostgresSidecarError::ProcessIdentityInvalid);
         }
         if let Err(error) = helper_journal.record_child(lock, &process_identity) {
             lock.preserve_on_drop();
-            let _ = terminate_child(&mut child).await;
+            let _ = terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await;
             return Err(map_helper_journal_error(error));
         }
         // Keep the owned Child outside the timed future so every read/wait failure can clean up
         // that exact handle. The extra byte detects overflow without collecting an unbounded stream.
-        let waited = tokio::time::timeout(VERSION_DEADLINE, async {
+        let deadline = legacy.map(|(effect, _)| tokio::time::Instant::from_std(effect))
+            .map_or(tokio::time::Instant::now() + VERSION_DEADLINE, |effect| effect.min(tokio::time::Instant::now() + VERSION_DEADLINE));
+        let waited = tokio::time::timeout_at(deadline, async {
             let mut stdout = child
                 .stdout
                 .take()
@@ -2387,11 +2443,12 @@ async fn verify_program_versions_with_helper(
             Ok(bytes[..length].to_vec())
         })
         .await;
+        let timely = legacy.is_none_or(|(effect, _)| std::time::Instant::now() < effect);
         let output = match waited {
-            Ok(Ok(output)) => output,
+            Ok(Ok(output)) if timely => output,
             _ => {
                 lock.preserve_on_drop();
-                let _ = terminate_child(&mut child).await;
+                let _ = terminate_child_before(&mut child, legacy.map(|(_, convergence)| convergence)).await;
                 return Err(PostgresSidecarError::VersionMismatch);
             }
         };
@@ -2684,8 +2741,10 @@ async fn wait_until_ready(
     child: &mut Child,
     port: u16,
     secret: &PostgresScramSecret,
+    original_effect: Option<std::time::Instant>,
 ) -> Result<(), PostgresSidecarError> {
-    let deadline = tokio::time::Instant::now() + READY_DEADLINE;
+    let deadline = original_effect.map(tokio::time::Instant::from_std)
+        .map_or(tokio::time::Instant::now() + READY_DEADLINE, |effect| effect.min(tokio::time::Instant::now() + READY_DEADLINE));
     loop {
         if child
             .try_wait()
@@ -2694,7 +2753,8 @@ async fn wait_until_ready(
         {
             return Err(PostgresSidecarError::ExitedBeforeReady);
         }
-        if postgres_ready(port, secret).await {
+        let ready = postgres_ready(port, secret).await;
+        if ready && tokio::time::Instant::now() < deadline {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2739,6 +2799,15 @@ async fn run_pg_ctl_stop(
     bundle: &VerifiedPostgresBundle,
     data_dir: &Path,
 ) -> Result<std::process::ExitStatus, PostgresSidecarError> {
+    run_pg_ctl_stop_before(bundle, data_dir, None).await
+}
+
+#[cfg(feature = "postgres-supervisor")]
+async fn run_pg_ctl_stop_before(
+    bundle: &VerifiedPostgresBundle,
+    data_dir: &Path,
+    convergence: Option<Instant>,
+) -> Result<std::process::ExitStatus, PostgresSidecarError> {
     let mut command = bundle.checked_command(PostgresProgram::Control)?;
     command
         .arg("-D")
@@ -2748,7 +2817,9 @@ async fn run_pg_ctl_stop(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    tokio::time::timeout(SHUTDOWN_DEADLINE + Duration::from_secs(1), command.status())
+    let deadline = convergence.map(tokio::time::Instant::from_std)
+        .map_or(tokio::time::Instant::now() + SHUTDOWN_DEADLINE + Duration::from_secs(1), |cap| cap.min(tokio::time::Instant::now() + SHUTDOWN_DEADLINE + Duration::from_secs(1)));
+    tokio::time::timeout_at(deadline, command.status())
         .await
         .map_err(|_| PostgresSidecarError::ShutdownFailed)?
         .map_err(|_| PostgresSidecarError::ShutdownFailed)
@@ -2756,6 +2827,11 @@ async fn run_pg_ctl_stop(
 
 #[cfg(feature = "postgres-supervisor")]
 async fn terminate_child(child: &mut Child) -> Result<ExitStatus, PostgresSidecarError> {
+    terminate_child_before(child, None).await
+}
+
+#[cfg(feature = "postgres-supervisor")]
+async fn terminate_child_before(child: &mut Child, convergence: Option<Instant>) -> Result<ExitStatus, PostgresSidecarError> {
     if let Some(status) = child
         .try_wait()
         .map_err(|_| PostgresSidecarError::ShutdownFailed)?
@@ -2765,7 +2841,9 @@ async fn terminate_child(child: &mut Child) -> Result<ExitStatus, PostgresSideca
     child
         .start_kill()
         .map_err(|_| PostgresSidecarError::ShutdownFailed)?;
-    tokio::time::timeout(SHUTDOWN_DEADLINE, child.wait())
+    let deadline = convergence.map(tokio::time::Instant::from_std)
+        .map_or(tokio::time::Instant::now() + SHUTDOWN_DEADLINE, |cap| cap.min(tokio::time::Instant::now() + SHUTDOWN_DEADLINE));
+    tokio::time::timeout_at(deadline, child.wait())
         .await
         .map_err(|_| PostgresSidecarError::ShutdownFailed)?
         .map_err(|_| PostgresSidecarError::ShutdownFailed)
@@ -4044,7 +4122,7 @@ mod tests {
             VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
         assert!(matches!(
             PostgresSidecarSupervisor::start_with_capture_limits(
-                bundle, &app_root, &instance, &data_dir, &store, &service, None,
+                bundle, &app_root, &instance, &data_dir, &store, &service, None, None,
             )
             .await,
             Err((
@@ -4102,7 +4180,7 @@ mod tests {
         )
         .unwrap();
         let (error, outcome) = match PostgresSidecarSupervisor::start_with_capture_limits(
-            bundle, &app_root, &instance, &data_dir, &store, &service, None,
+            bundle, &app_root, &instance, &data_dir, &store, &service, None, None,
         )
         .await
         {
@@ -4245,6 +4323,7 @@ mod tests {
             running,
             &fixture.package,
             None,
+            None,
         )
         .await
         {
@@ -4372,6 +4451,7 @@ mod tests {
                 running,
                 &fixture.package,
                 custody,
+                None,
             )
             .await
             {
@@ -4459,6 +4539,7 @@ mod tests {
             running,
             &fixture.package,
             Some(custody),
+            None,
         )
         .await
         .unwrap();
@@ -4915,6 +4996,7 @@ mod tests {
                 running,
                 &fixture.package,
                 Some(custody),
+                None,
             )
             .await
             .unwrap();

@@ -613,6 +613,27 @@ impl DesktopLocalAuthorityStore {
         ))
     }
 
+    /// Read the existing installation without electing an identity or creating a directory.
+    pub fn load_existing_installation(
+        &self,
+    ) -> Result<DesktopLocalInstallation, DesktopLocalAuthorityError> {
+        let _guard = self.inner.mutation.lock()
+            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        let root = self.inner.root.as_path();
+        // The recovery owner has already checked the held root; this reader never repairs it.
+        let metadata = fs::symlink_metadata(root)
+            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+        }
+        let instance = read_instance(&root.join(FILE_NAME))?
+            .ok_or(DesktopLocalAuthorityError::Corrupt)?;
+        let authority = authority(instance);
+        let sidecar_data_dir = root.join(format!("{SIDECAR_DATA_PREFIX}{}", authority.instance_id()));
+        validate_existing_sidecar_data_dir(root, &sidecar_data_dir)?;
+        Ok(DesktopLocalInstallation { authority, sidecar_data_dir })
+    }
+
     fn load_or_create_locked(
         &self,
     ) -> Result<(DesktopLocalAuthority, Option<File>), DesktopLocalAuthorityError> {
@@ -642,18 +663,7 @@ fn prepare_sidecar_data_dir(
     }
     let path = root.join(format!("{SIDECAR_DATA_PREFIX}{instance_id}"));
     match fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(DesktopLocalAuthorityError::SidecarPermissionsInsecure);
-                }
-            }
-        }
+        Ok(_) => {},
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let builder = fs::DirBuilder::new();
             #[cfg(unix)]
@@ -670,6 +680,22 @@ fn prepare_sidecar_data_dir(
         }
         Err(_) => return Err(DesktopLocalAuthorityError::Unavailable),
     }
+    validate_existing_sidecar_data_dir(root, &path)?;
+    Ok(path)
+}
+
+fn validate_existing_sidecar_data_dir(root: &Path, path: &Path) -> Result<(), DesktopLocalAuthorityError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(DesktopLocalAuthorityError::SidecarPermissionsInsecure);
+        }
+    }
     let canonical_root =
         fs::canonicalize(root).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
     let canonical_path =
@@ -677,7 +703,7 @@ fn prepare_sidecar_data_dir(
     if canonical_path.parent() != Some(canonical_root.as_path()) {
         return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
     }
-    Ok(path)
+    Ok(())
 }
 
 async fn verify_postgres_sidecar(
@@ -1069,6 +1095,30 @@ mod tests {
         DesktopLocalAuthorityStore::new(
             CurrentOsUserAppDataRoot::from_current_os_user_app_data(path).unwrap(),
         )
+    }
+
+    #[test]
+    fn existing_installation_reader_never_elects_or_creates_missing_inputs() {
+        let missing = root("existing-reader-missing");
+        assert!(store(&missing).load_existing_installation().is_err());
+        assert!(!missing.exists());
+        let fixture_name = root("existing-reader-positive");
+        let existing = fs::canonicalize(std::env::temp_dir()).unwrap()
+            .join(fixture_name.file_name().unwrap());
+        let installation = store(&existing).load_or_create_installation().unwrap();
+        let bytes = fs::read(existing.join(FILE_NAME)).unwrap();
+        let observed = store(&existing).load_existing_installation().unwrap();
+        assert_eq!(observed.authority(), installation.authority());
+        assert_eq!(observed.sidecar_data_dir(), installation.sidecar_data_dir());
+        assert_eq!(fs::read(existing.join(FILE_NAME)).unwrap(), bytes);
+        fs::remove_dir(installation.sidecar_data_dir()).unwrap();
+        assert!(store(&existing).load_existing_installation().is_err());
+        assert!(!installation.sidecar_data_dir().exists());
+        assert_eq!(fs::read(existing.join(FILE_NAME)).unwrap(), bytes);
+        fs::remove_file(existing.join(FILE_NAME)).unwrap();
+        assert!(store(&existing).load_existing_installation().is_err());
+        assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
+        fs::remove_dir(existing).unwrap();
     }
 
     #[test]

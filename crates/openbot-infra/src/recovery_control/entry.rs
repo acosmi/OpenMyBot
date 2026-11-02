@@ -1612,6 +1612,43 @@ impl Drop for RestoreClosingAccess<'_> {
     }
 }
 
+/// Owned copies of the original exclusion descriptors and finite profile DATA.
+/// This projection is neither a candidate authority nor an isolation observation.
+pub struct RestoreCandidateIsolationInput {
+    parents: [File; 3],
+    parent_paths: [PathBuf; 3],
+    components: [std::ffi::OsString; 3],
+    profile: super::RestoreOperationProfile,
+    operation: Hex32,
+    epoch: Hex64,
+    generation: String,
+}
+
+impl RestoreCandidateIsolationInput {
+    /// The original operation's checked finite profile, without a new ledger.
+    pub fn profile(&self) -> &super::RestoreOperationProfile { &self.profile }
+    /// Original Manager site, control root and key medium, in that order.
+    pub fn excluded_locations(&self) -> [(&File, &Path, &std::ffi::OsStr); 3] {
+        std::array::from_fn(|index| (&self.parents[index], self.parent_paths[index].as_path(), self.components[index].as_os_str()))
+    }
+    /// Original operation DATA; this identifier is not authority.
+    pub fn operation_id(&self) -> &str { self.operation.as_str() }
+    /// Original authorization epoch DATA, without a new clock or grant.
+    pub fn authorization_epoch(&self) -> &str { self.epoch.as_str() }
+    /// The original candidate generation DATA.
+    pub fn generation_id(&self) -> &str { &self.generation }
+}
+
+struct RestoreCandidateIsolationWork {
+    parents: [Option<io::Result<File>>; 3],
+    parent_paths: [PathBuf; 3],
+    components: [std::ffi::OsString; 3],
+    profile: super::RestoreOperationProfile,
+    operation: Hex32,
+    epoch: Hex64,
+    generation: String,
+}
+
 pub struct OwnedRestoreCandidatePlan {
     parent: File,
     parent_path: PathBuf,
@@ -2316,6 +2353,7 @@ pub(super) fn claim_restore(
                 operation,
             },
             candidate: None,
+            isolation_intent: None,
         })
     })();
     result.map_err(|mut error: RecoveryControlError| {
@@ -2334,6 +2372,7 @@ pub(super) fn claim_restore(
 pub struct RestoreControlSession {
     stages: RestoreStages,
     candidate: Option<PendingRestoreCandidateAuthority>,
+    isolation_intent: Option<RestoreStageIntent>,
 }
 
 impl Drop for RestoreControlSession {
@@ -2356,6 +2395,86 @@ impl Drop for RestoreControlSession {
 }
 
 impl RestoreControlSession {
+    /// Begin the original Isolation stage once before the first candidate write.
+    /// The stage intent remains private; only original owned resource copies leave.
+    #[cfg(feature = "server-runtime")]
+    pub fn begin_candidate_isolation_before(
+        &mut self,
+        staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging,
+        deadline: Instant,
+    ) -> Result<RestoreCandidateIsolationInput, RecoveryControlError> {
+        let result = (|| {
+            if self.isolation_intent.is_some() { return Err(service_invalid()); }
+            let effect = self.stages.effect_before(deadline)?;
+            {
+                let state = lock(&self.stages.owner)?;
+                let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+                if staging.candidate_plan().operation_id() != self.operation_id()
+                    || staging.candidate_plan().generation_id() != operation.candidate_plan.generation_id
+                    || state.restore_isolation_work.is_some()
+                { return Err(service_invalid()); }
+            }
+            self.isolation_intent = Some(self.stages.begin_stage_before(
+                super::RestoreStage::Isolation, "candidate_isolation", effect,
+            )?);
+            let mut state = lock(&self.stages.owner)?;
+            state.verify_restore_live(self.stages.operation, effect)?;
+            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let key = &operation.intent.decoded.selection.key_medium;
+            let parent = state.root_path.parent().ok_or_else(service_invalid)?;
+            let app = state.app_component.as_ref().ok_or_else(service_invalid)?;
+            let allocation = parent.as_os_str().len().checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(key.parent.as_os_str().len()))
+                .and_then(|bytes| bytes.checked_add(app.len()))
+                .and_then(|bytes| bytes.checked_add(state.root_component.len()))
+                .and_then(|bytes| bytes.checked_add(key.component.len()))
+                .and_then(|bytes| bytes.checked_add(operation.candidate_plan.generation_id.len()))
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RestoreCandidateIsolationInput>()))
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            state.prepay(allocation as u64, 3)?;
+            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let key = &operation.intent.decoded.selection.key_medium;
+            let parent = state.root_path.parent().ok_or_else(service_invalid)?;
+            state.restore_isolation_work = Some(RestoreCandidateIsolationWork {
+                parents: std::array::from_fn(|_| None),
+                parent_paths: [parent.to_owned(), parent.to_owned(), key.parent.clone()],
+                components: [state.app_component.as_ref().ok_or_else(service_invalid)?.clone(), state.root_component.clone().into(), key.component.clone().into()],
+                profile: operation.profile.clone(), operation: operation.operation, epoch: operation.epoch,
+                generation: operation.candidate_plan.generation_id.clone(),
+            });
+            for index in 0..3 {
+                let original = if index < 2 {
+                    state.parent.as_ref().ok_or_else(service_invalid)?
+                } else {
+                    &state.restore_selections[1].as_ref().and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.file
+                };
+                let copied = original.try_clone();
+                state.restore_isolation_work.as_mut().expect("original projection retained").parents[index] = Some(copied);
+                state.post(effect)?;
+                if !matches!(state.restore_isolation_work.as_ref().and_then(|work| work.parents[index].as_ref()), Some(Ok(_))) {
+                    return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
+                }
+            }
+            let work = state.restore_isolation_work.as_ref().expect("original projection retained");
+            let observed = work.parent_paths.iter().map(|path| path.capacity()).chain(work.components.iter().map(|component| component.capacity()))
+                .try_fold(std::mem::size_of::<RestoreCandidateIsolationInput>(), |bytes, capacity| bytes.checked_add(capacity))
+                .and_then(|bytes| bytes.checked_add(work.generation.capacity()))
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            state.restore_operation.as_mut().ok_or_else(service_invalid)?.ledger.settle(
+                super::RestoreCapacityResource::MetadataBytes, allocation as u64, observed as u64,
+            )?;
+            state.post(effect)?;
+            let work = state.restore_isolation_work.take().expect("original projection retained");
+            Ok(RestoreCandidateIsolationInput {
+                parents: work.parents.map(|result| result.expect("original duplicate result").expect("checked original duplicate")),
+                parent_paths: work.parent_paths, components: work.components,
+                profile: work.profile, operation: work.operation, epoch: work.epoch, generation: work.generation,
+            })
+        })();
+        self.retain_failure(result)
+    }
+
     #[cfg(feature = "server-runtime")]
     pub(crate) fn input_stages(&mut self) -> &mut RestoreStages {
         &mut self.stages
@@ -3162,6 +3281,7 @@ pub(super) struct ControlFiles {
     #[cfg(feature = "server-runtime")]
     restore_input: Option<(crate::backup::whole_pg_restore_stream::FrozenWholePgRestoreInput, crate::backup::whole_pg_restore_stream::ReviewedWholePgRestoreIntent)>,
     restore_selections: [Option<RestoreHeldSelection>; 3],
+    restore_isolation_work: Option<RestoreCandidateIsolationWork>,
     restore_entropy: [u8; 96],
 }
 
@@ -6403,6 +6523,7 @@ pub(super) fn open_control(
             #[cfg(feature = "server-runtime")]
             restore_input: None,
             restore_selections: std::array::from_fn(|_| None),
+            restore_isolation_work: None,
             restore_entropy: [0; 96],
         }),
         retired_metadata: 0,

@@ -2,7 +2,7 @@
 
 mod candidate;
 mod entry;
-mod input;
+pub(crate) mod input;
 #[cfg(test)]
 mod tests;
 

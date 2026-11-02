@@ -494,6 +494,23 @@ impl OrdinaryInitializationSession {
         self.initialization_source() == Some(OrdinaryInitializationSource::LocalPhysicalFresh)
     }
 
+    /// Read the selected existing installation under this original legacy owner.
+    #[cfg(feature = "desktop-local")]
+    pub fn load_local_legacy_installation_before(
+        &self,
+        store: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+    ) -> Result<crate::auth::single_user::desktop_local::DesktopLocalInstallation, RecoveryControlError> {
+        let invalid = || fault(RecoveryControlFault::EntryInvalid);
+        if !self.is_local_legacy() || self.head.is_none() { return Err(invalid()); }
+        let SiteExpectation::Local(expected) = &self.intent.site else { return Err(invalid()); };
+        let installation = store.load_existing_installation().map_err(|_| invalid())?;
+        entry::lock(&self.control)?.verify_local_root_before(expected.root.ok_or_else(invalid)?, self.intent.effect)?;
+        if expected.installation_id.as_deref() != Some(installation.authority().instance_id()) {
+            return Err(invalid());
+        }
+        Ok(installation)
+    }
+
     /// Consume the original Fresh installation once.
     #[cfg(feature = "desktop-local")]
     pub fn take_fresh_installation(
@@ -525,6 +542,17 @@ impl OrdinaryInitializationSession {
             )),
             SiteExpectation::Local(_) => Err(fault(RecoveryControlFault::EntryInvalid)),
         }
+    }
+
+    /// Original effect deadline; borrowing it never renews this initialization.
+    pub fn effect_deadline(&self) -> Instant { self.intent.effect }
+
+    /// Original convergence deadline for retiring this owner's resources.
+    pub fn convergence_deadline(&self) -> Instant { self.intent.convergence }
+
+    /// Whether this owner consumed a Local legacy adoption request.
+    pub fn is_local_legacy(&self) -> bool {
+        self.initialization_source() == Some(OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical })
     }
 
     /// The sealed source of this original initialization session.
@@ -1336,6 +1364,7 @@ impl OrdinaryInitializationSession {
     /// release ownerEX/admissionEX (spec 8073). The held head must be at the
     /// latest native version.
     pub fn into_runtime_before(self) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
+        let result = (|| {
         let latest_head = self
             .head
             .as_ref()
@@ -1362,6 +1391,11 @@ impl OrdinaryInitializationSession {
             files.runtime_entry(published, &self.intent)?
         };
         runtime::enter_runtime(&self.control, entry, effect)
+        })();
+        result.map_err(|mut error: RecoveryControlError| {
+            error.retained_ordinary = Some(Box::new(self));
+            error
+        })
     }
 }
 

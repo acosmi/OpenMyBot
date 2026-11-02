@@ -70,6 +70,13 @@ pub enum SqlDriverOutcome {
 pub(crate) fn sidecar_close_fact(
     result: Result<SidecarExit, SidecarOutcome>,
 ) -> Option<openbot_infra::recovery_control::RuntimeCloseFact> {
+    sidecar_close_fact_ref(&result)
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) fn sidecar_close_fact_ref(
+    result: &Result<SidecarExit, SidecarOutcome>,
+) -> Option<openbot_infra::recovery_control::RuntimeCloseFact> {
     use openbot_infra::recovery_control::{
         NativeExit, PassiveObjectKind, PipeJoin, ProcessStart, RuntimeCloseFact, RuntimeOwner,
     };
@@ -89,7 +96,7 @@ pub(crate) fn sidecar_close_fact(
             status,
             observed_ns,
             ..
-        }) => (start_evidence, status, observed_ns?),
+        }) => (*start_evidence, *status, (*observed_ns)?),
         Err(SidecarOutcome::Unknown) => return None,
     };
     let exit = match status.code() {
@@ -121,10 +128,18 @@ pub(crate) async fn sql_driver_close_fact(
     result: SqlDriverOutcome,
     deadline: std::time::Instant,
 ) -> Option<openbot_infra::recovery_control::RuntimeCloseFact> {
+    sql_driver_close_fact_ref(&result, deadline).await
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) async fn sql_driver_close_fact_ref(
+    result: &SqlDriverOutcome,
+    deadline: std::time::Instant,
+) -> Option<openbot_infra::recovery_control::RuntimeCloseFact> {
     use openbot_infra::recovery_control::{PassiveObjectKind, RuntimeCloseFact, RuntimeOwner};
     let object = match result {
         SqlDriverOutcome::NeverStarted => PassiveObjectKind::NeverStarted(RuntimeOwner::SqlDriver),
-        SqlDriverOutcome::Joined(facts) => PassiveObjectKind::SqlDriver(facts),
+        SqlDriverOutcome::Joined(facts) => PassiveObjectKind::SqlDriver(facts.clone()),
         SqlDriverOutcome::Observed(observations) => {
             let mut facts = Vec::with_capacity(observations.len());
             for observation in observations {
@@ -166,6 +181,7 @@ pub struct RunningDesktopLocalDataPlane {
 
 /// PG-attested data plane that exposes no runtime authority before Vault canary verification.
 pub struct PreparedDesktopLocalDataPlane {
+    initialization_deadlines: Option<(std::time::Instant, std::time::Instant)>,
     database: DesktopLocalDatabase,
     sidecar: Option<RunningPostgresSidecar>,
     installation: DesktopLocalInstallation,
@@ -413,6 +429,9 @@ impl PreparedDesktopLocalDataPlane {
     }
 
     pub(crate) fn ensure_owner_current(&self) -> Result<(), DesktopLocalCompositionError> {
+        if self.initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+            return Err(DesktopLocalCompositionError::InstallationMismatch);
+        }
         self.sidecar
             .as_ref()
             .ok_or(DesktopLocalCompositionError::InstallationMismatch)?
@@ -686,7 +705,11 @@ impl PreparedDesktopLocalDataPlane {
                 sql,
             ));
         };
-        match sidecar.shutdown().await {
+        let stopped = match self.initialization_deadlines {
+            Some((_, convergence)) => sidecar.shutdown_before(convergence).await,
+            None => sidecar.shutdown().await,
+        };
+        match stopped {
             Ok(exit) => match sql {
                 SqlDriverOutcome::Observed(observations) => Ok((exit, observations)),
                 unknown => Err((
@@ -695,8 +718,10 @@ impl PreparedDesktopLocalDataPlane {
                     unknown,
                 )),
             },
-            Err((_, outcome)) => Err((
-                DesktopLocalCompositionError::SidecarShutdown,
+            Err((error, outcome)) => Err((
+                if self.initialization_deadlines.is_some() {
+                    DesktopLocalCompositionError::LegacySidecarShutdown { original: None, error }
+                } else { DesktopLocalCompositionError::SidecarShutdown },
                 Err(outcome),
                 sql,
             )),
@@ -763,6 +788,14 @@ pub enum DesktopLocalCompositionError {
     /// Explicit clean shutdown did not complete through verified `pg_ctl` and exact-child wait.
     #[error("desktop_local_sidecar_shutdown_failed")]
     SidecarShutdown,
+    /// Original adoption cleanup failed; preserve both startup and exact sidecar error.
+    #[error("desktop_local_legacy_sidecar_shutdown_failed")]
+    LegacySidecarShutdown {
+        /// Original startup failure retained alongside its cleanup failure.
+        original: Option<Box<DesktopLocalCompositionError>>,
+        /// Exact error returned while stopping the original sidecar.
+        error: crate::postgres_sidecar::PostgresSidecarError,
+    },
     /// Dedicated PostgreSQL LISTEN configuration could not be built from the owned sidecar.
     #[error("desktop_local_listener_configuration_failed")]
     ListenerConfiguration,
@@ -780,6 +813,7 @@ pub async fn prepare_running_sidecar(
         sidecar,
         package,
         StartupDriverCustody::Ordinary,
+        None,
     )
     .await
     .map_err(|(error, ..)| error)
@@ -795,6 +829,7 @@ pub(crate) async fn prepare_running_sidecar_retained(
     sidecar: RunningPostgresSidecar,
     package: &LoadedTenantPackage,
     custody: Option<DesktopLocalDriverCustody>,
+    legacy: Option<&openbot_infra::recovery_control::OrdinaryInitializationSession>,
 ) -> Result<
     PreparedDesktopLocalDataPlane,
     (
@@ -811,6 +846,7 @@ pub(crate) async fn prepare_running_sidecar_retained(
             Some(custody) => StartupDriverCustody::Armed(custody),
             None => StartupDriverCustody::Ordinary,
         },
+        legacy.map(|owner| (owner.effect_deadline(), owner.convergence_deadline())),
     )
     .await
 }
@@ -820,6 +856,7 @@ async fn prepare_running_sidecar_inner(
     sidecar: RunningPostgresSidecar,
     package: &LoadedTenantPackage,
     mut custody: StartupDriverCustody,
+    initialization_deadlines: Option<(std::time::Instant, std::time::Instant)>,
 ) -> Result<
     PreparedDesktopLocalDataPlane,
     (
@@ -828,11 +865,14 @@ async fn prepare_running_sidecar_inner(
         SqlDriverOutcome,
     ),
 > {
+    let step_deadline = || initialization_deadlines.map(|(effect, _)| tokio::time::Instant::from_std(effect))
+        .map_or(tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT, |effect| effect.min(tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT));
     if sidecar.data_dir() != installation.sidecar_data_dir() {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
+            initialization_deadlines.map(|(_, convergence)| convergence),
         )
         .await;
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
@@ -842,16 +882,18 @@ async fn prepare_running_sidecar_inner(
             sidecar,
             DesktopLocalCompositionError::PackageScope(error),
             &mut custody,
+            initialization_deadlines.map(|(_, convergence)| convergence),
         )
         .await;
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
 
-    if sidecar.ensure_owner_current().is_err() {
+    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
+            initialization_deadlines.map(|(_, convergence)| convergence),
         )
         .await;
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
@@ -877,7 +919,7 @@ async fn prepare_running_sidecar_inner(
             }
         }
     };
-    let admin = tokio::time::timeout(STARTUP_DB_STEP_TIMEOUT, connect)
+    let admin = tokio::time::timeout_at(step_deadline(), connect)
         .await
         .map_err(|_| DesktopLocalDatabaseError::ShapeInvalid)
         .and_then(std::convert::identity);
@@ -888,22 +930,24 @@ async fn prepare_running_sidecar_inner(
                 sidecar,
                 DesktopLocalCompositionError::Database(error),
                 &mut custody,
+                initialization_deadlines.map(|(_, convergence)| convergence),
             )
             .await;
             return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
         }
     };
-    if sidecar.ensure_owner_current().is_err() {
+    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
+            initialization_deadlines.map(|(_, convergence)| convergence),
         )
         .await;
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
-    let admin = match tokio::time::timeout(
-        STARTUP_DB_STEP_TIMEOUT,
+    let admin = match tokio::time::timeout_at(
+        step_deadline(),
         installation.attest_postgres_admin(admin),
     )
     .await
@@ -916,23 +960,25 @@ async fn prepare_running_sidecar_inner(
                 sidecar,
                 DesktopLocalCompositionError::Bootstrap(error),
                 &mut custody,
+                initialization_deadlines.map(|(_, convergence)| convergence),
             )
             .await;
             return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
         }
     };
-    if sidecar.ensure_owner_current().is_err() {
+    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
+            initialization_deadlines.map(|(_, convergence)| convergence),
         )
         .await;
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
     let allow_create = sidecar.origin() == PostgresSidecarOrigin::Fresh;
-    let database = match tokio::time::timeout(
-        STARTUP_DB_STEP_TIMEOUT,
+    let database = match tokio::time::timeout_at(
+        step_deadline(),
         admin.connect_application(allow_create),
     )
     .await
@@ -951,6 +997,7 @@ async fn prepare_running_sidecar_inner(
                 sidecar,
                 DesktopLocalCompositionError::Database(error),
                 &mut custody,
+                initialization_deadlines.map(|(_, convergence)| convergence),
             )
             .await;
             let sql = if never_started {
@@ -969,13 +1016,14 @@ async fn prepare_running_sidecar_inner(
             return Err((error, sidecar, sql));
         }
     };
-    if sidecar.ensure_owner_current().is_err() {
+    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
         let observations = database.pool().connection_observations();
         database.close();
         let (error, sidecar, joined) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
             &mut custody,
+            initialization_deadlines.map(|(_, convergence)| convergence),
         )
         .await;
         #[cfg(all(
@@ -1004,6 +1052,7 @@ async fn prepare_running_sidecar_inner(
         ));
     }
     Ok(PreparedDesktopLocalDataPlane {
+        initialization_deadlines,
         database,
         sidecar: Some(sidecar),
         installation,
@@ -1025,6 +1074,7 @@ async fn cleanup_after_failure_with_custody(
     sidecar: RunningPostgresSidecar,
     original: DesktopLocalCompositionError,
     custody: &mut StartupDriverCustody,
+    convergence: Option<std::time::Instant>,
 ) -> (
     DesktopLocalCompositionError,
     Result<SidecarExit, SidecarOutcome>,
@@ -1048,7 +1098,7 @@ async fn cleanup_after_failure_with_custody(
         let _ = custody;
         None
     };
-    let (error, outcome) = cleanup_after_failure(sidecar, original).await;
+    let (error, outcome) = cleanup_after_failure(sidecar, original, convergence).await;
     (error, outcome, joined)
 }
 
@@ -1101,13 +1151,23 @@ async fn close_startup_original_drivers(
 async fn cleanup_after_failure(
     sidecar: RunningPostgresSidecar,
     original: DesktopLocalCompositionError,
+    convergence: Option<std::time::Instant>,
 ) -> (
     DesktopLocalCompositionError,
     Result<SidecarExit, SidecarOutcome>,
 ) {
-    match sidecar.shutdown().await {
+    let stopped = match convergence {
+        Some(cap) => sidecar.shutdown_before(cap).await,
+        None => sidecar.shutdown().await,
+    };
+    match stopped {
         Ok(exit) => (original, Ok(exit)),
-        Err((_, outcome)) => (DesktopLocalCompositionError::FailureCleanup, Err(outcome)),
+        Err((error, outcome)) => (
+            if convergence.is_some() {
+                DesktopLocalCompositionError::LegacySidecarShutdown { original: Some(Box::new(original)), error }
+            } else { DesktopLocalCompositionError::FailureCleanup },
+            Err(outcome),
+        ),
     }
 }
 
