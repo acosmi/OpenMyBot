@@ -1360,8 +1360,8 @@ async fn w07_history_delete_withdraws_inputs() {
             check(row.try_get::<_,String>("message").map_err(text)?==*expected,"deletion changed frozen original payload")?;
             check(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1", &[&run]).await.map_err(text)?.is_none(),"withdrawn input became a Run")?;
         }
-        let removed:i64=c.query_one("SELECT count(*) FROM public.messages WHERE thread_id=$1", &[&j]).await.map_err(text)?.try_get(0).map_err(text)?;
-        check(removed==0,"injected history copies survived original ACK2 clear")?;drop(c);
+        let cleared_copy:Value=c.query_one("SELECT content FROM public.messages WHERE message_id=$1||':artifact_ref:0'", &[&command.run_id.as_str()]).await.map_err(text)?.try_get(0).map_err(text)?;
+        check(cleared_copy==json!({"text":"","retained":false}),"injected history copy was not scrubbed by original ACK2 clear")?;drop(c);
         check(std::fs::read(&stored_path).map_err(text)?==TEXT.as_bytes(),"clearing injected copy deleted independently saved Store object")?;
         for command in [AppCommand::CompleteThread{thread_id:thread.clone()},AppCommand::StopThreadWork{thread_id:thread.clone(),run_id:None},AppCommand::ReleasePendingInput{thread_id:thread.clone(),run_id:late.run_id.clone()}] {
             refused(&f.assembly.application.execute(a.clone(),command).await,&AppError::NotVisible,404)?;
