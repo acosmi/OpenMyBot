@@ -54,6 +54,10 @@ impl ErrorCode {
     pub const MALFORMED_PAYLOAD: Self = Self("malformed_payload");
     /// This command only supports direct Bot conversations.
     pub const ANCHOR_UNSUPPORTED: Self = Self("anchor_unsupported");
+    /// A conversation already holds twenty pending or held inputs.
+    pub const PENDING_INPUT_LIMIT: Self = Self("pending_input_limit");
+    /// The input has become a Run and cannot be withdrawn as pending.
+    pub const PENDING_INPUT_STATE: Self = Self("pending_input_state");
     /// policy 拒绝（403），必带 rule id。
     pub const POLICY_REFUSED: Self = Self("policy_refused");
     /// 依赖不可用（503）。
@@ -298,6 +302,12 @@ pub enum AppError {
     /// The visible conversation has an unsupported channel anchor (400).
     #[error("anchor_unsupported")]
     AnchorUnsupported,
+    /// The pending and held input budget is exhausted (429).
+    #[error("pending_input_limit")]
+    PendingInputLimit,
+    /// An already dispatched input cannot be withdrawn (409).
+    #[error("pending_input_state")]
+    PendingInputState,
     /// 未登录（401）。
     #[error("unauthenticated")]
     Unauthenticated,
@@ -422,6 +432,8 @@ impl AppError {
             Self::ArtifactGone { .. } => ErrorCode::ARTIFACT_GONE,
             Self::MalformedPayload { .. } => ErrorCode::MALFORMED_PAYLOAD,
             Self::AnchorUnsupported => ErrorCode::ANCHOR_UNSUPPORTED,
+            Self::PendingInputLimit => ErrorCode::PENDING_INPUT_LIMIT,
+            Self::PendingInputState => ErrorCode::PENDING_INPUT_STATE,
             Self::PolicyRefused { .. } => ErrorCode::POLICY_REFUSED,
             Self::DependencyUnavailable { .. } => ErrorCode::DEPENDENCY_UNAVAILABLE,
             Self::VendorFailure { .. } => ErrorCode::VENDOR_FAILURE,
@@ -448,6 +460,8 @@ impl AppError {
             Self::NotVisible => 404,
             Self::ArtifactGone { .. } => 410,
             Self::MalformedPayload { .. } | Self::AnchorUnsupported => 400,
+            Self::PendingInputLimit => 429,
+            Self::PendingInputState => 409,
             Self::DependencyUnavailable { .. } => 503,
             Self::VendorFailure { .. } => 502,
             Self::StaleGeneration { .. }
@@ -475,7 +489,10 @@ impl AppError {
             Self::ForbiddenRole { .. } => AuditKind::AuthorizationDenied,
             Self::NotVisible => AuditKind::ResourceNotVisible,
             Self::ArtifactGone { .. } => AuditKind::ResourceGone,
-            Self::MalformedPayload { .. } | Self::AnchorUnsupported => AuditKind::InputRejected,
+            Self::MalformedPayload { .. } | Self::AnchorUnsupported | Self::PendingInputLimit => {
+                AuditKind::InputRejected
+            }
+            Self::PendingInputState => AuditKind::ConcurrencyConflict,
             Self::PolicyRefused { .. } => AuditKind::PolicyRefusal,
             Self::DependencyUnavailable { .. } => AuditKind::DependencyFailure,
             Self::VendorFailure { .. } => AuditKind::VendorFailure,
@@ -497,7 +514,7 @@ impl AppError {
 /// §15.3 允许出现的全部 HTTP 状态码（含成功侧的 200：空 thread history 是 200 + 空列表）。
 ///
 /// 任何落在此集合之外的状态码都说明有人在错误映射里发明了新语义。
-pub const HTTP_STATUS_DOMAIN: &[u16] = &[200, 202, 400, 401, 403, 404, 409, 410, 502, 503];
+pub const HTTP_STATUS_DOMAIN: &[u16] = &[200, 202, 400, 401, 403, 404, 409, 410, 429, 502, 503];
 
 impl From<crate::request_binding::ArtifactReadCurrentError> for AppError {
     fn from(error: crate::request_binding::ArtifactReadCurrentError) -> Self {
@@ -521,6 +538,19 @@ impl From<crate::request_binding::ArtifactReadCurrentError> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_input_errors_keep_stable_status_and_codes() {
+        for (error, status, code) in [
+            (AppError::AnchorUnsupported, 400, "anchor_unsupported"),
+            (AppError::PendingInputLimit, 429, "pending_input_limit"),
+            (AppError::PendingInputState, 409, "pending_input_state"),
+        ] {
+            assert_eq!(error.http_status(), status);
+            assert_eq!(error.code().as_str(), code);
+            assert!(HTTP_STATUS_DOMAIN.contains(&status));
+        }
+    }
     use crate::ids::{ComputerGeneration, DocumentGeneration};
     use std::collections::BTreeSet;
 
@@ -538,7 +568,7 @@ mod tests {
 
     /// 变体总数。新增变体必须同 PR 改这里 —— 它与 [`variant_index`] 和
     /// [`all_variants_for_test`] 三者互相咬合，见下方三条测试。
-    const VARIANT_COUNT: usize = 15;
+    const VARIANT_COUNT: usize = 17;
 
     /// 无通配 `_` 的穷举 match：**新增变体在这里编译失败**，逼作者同 PR 更新下面的变体台账。
     ///
@@ -562,6 +592,8 @@ mod tests {
             AppError::ReconciliationRequired { .. } => 12,
             AppError::ArtifactGone { .. } => 13,
             AppError::AnchorUnsupported => 14,
+            AppError::PendingInputLimit => 15,
+            AppError::PendingInputState => 16,
         }
     }
 
@@ -576,6 +608,8 @@ mod tests {
     fn all_variants_for_test() -> Vec<AppError> {
         vec![
             AppError::AnchorUnsupported,
+            AppError::PendingInputLimit,
+            AppError::PendingInputState,
             AppError::Unauthenticated,
             AppError::ForbiddenRole {
                 required: Role::Admin,
@@ -679,6 +713,8 @@ mod tests {
     fn http_status_matches_plan_section_15_3() {
         let cases: Vec<(AppError, u16)> = vec![
             (AppError::AnchorUnsupported, 400),
+            (AppError::PendingInputLimit, 429),
+            (AppError::PendingInputState, 409),
             (AppError::Unauthenticated, 401),
             (
                 AppError::ForbiddenRole {

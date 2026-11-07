@@ -195,13 +195,10 @@ pub async fn begin_thread_run<D: ThreadDirectory>(
     result.map_err(|error| error.into_app_error())
 }
 
-/// 核验 v2 原值、消息及技能预算，再交唯一真实事务端口；不降为 v1。
-pub async fn begin_thread_run_v2<D: ThreadDirectory>(
-    directory: &D,
-    artifacts: &dyn ArtifactAdministration,
+fn prepare_thread_run_v2(
     auth: &AuthContext,
     mut command: BeginThreadRunV2,
-) -> Result<ThreadRunStarted, AppError> {
+) -> Result<BeginThreadRunV2Request, AppError> {
     if !ThreadIdentity::is_plausible(&command.thread_id) {
         return Err(AppError::MalformedPayload { field: "thread_id" });
     }
@@ -246,6 +243,17 @@ pub async fn begin_thread_run_v2<D: ThreadDirectory>(
         actor: auth.actor().clone(),
         command,
     };
+    Ok(request)
+}
+
+/// 核验 v2 原值、消息及技能预算，再交唯一真实事务端口；不降为 v1。
+pub async fn begin_thread_run_v2<D: ThreadDirectory>(
+    directory: &D,
+    artifacts: &dyn ArtifactAdministration,
+    auth: &AuthContext,
+    command: BeginThreadRunV2,
+) -> Result<ThreadRunStarted, AppError> {
+    let request = prepare_thread_run_v2(auth, command)?;
     if request.command.artifact_refs.is_empty() {
         return directory
             .begin_thread_run_v2(request)
@@ -265,6 +273,92 @@ pub async fn begin_thread_run_v2<D: ThreadDirectory>(
         .await;
     require_current_request_binding(auth).await?;
     result.map_err(|error| error.into_app_error())
+}
+
+/// Accept a direct Bot input through one transaction, retaining the original artifact read authority.
+pub async fn submit_thread_input<D: ThreadDirectory>(
+    directory: &D,
+    artifacts: &dyn ArtifactAdministration,
+    auth: &AuthContext,
+    command: BeginThreadRunV2,
+) -> Result<openbot_contracts::command::ThreadInputOutcome, AppError> {
+    use crate::SubmitThreadInputAttempt;
+    let request = prepare_thread_run_v2(auth, command)?;
+    if !matches!(request.command.anchor, ThreadRunAnchor::DirectBot) {
+        return Err(AppError::AnchorUnsupported);
+    }
+    let has_artifacts = !request.command.artifact_refs.is_empty();
+    if has_artifacts {
+        require_current_request_binding(auth).await?;
+    }
+    let first = directory.submit_thread_input(request.clone(), None).await;
+    if has_artifacts {
+        require_current_request_binding(auth).await?;
+    }
+    if let SubmitThreadInputAttempt::Accepted(outcome) =
+        first.map_err(|error| error.into_app_error())?
+    {
+        return Ok(outcome);
+    }
+    let materials =
+        match preread_artifact_materials(artifacts, auth, &request.command.artifact_refs).await {
+            Ok(materials) => materials,
+            Err(read_error) => {
+                // A foreground run may have started during the preread. In that case admission
+                // retains the input and defers material availability to its eventual dispatch.
+                require_current_request_binding(auth).await?;
+                let current = directory.submit_thread_input(request, None).await;
+                require_current_request_binding(auth).await?;
+                return match current.map_err(|error| error.into_app_error())? {
+                    SubmitThreadInputAttempt::Accepted(outcome) => Ok(outcome),
+                    SubmitThreadInputAttempt::NeedsArtifacts => Err(read_error),
+                };
+            }
+        };
+    let result = directory
+        .submit_thread_input(request, Some(materials))
+        .await;
+    require_current_request_binding(auth).await?;
+    match result.map_err(|error| error.into_app_error())? {
+        SubmitThreadInputAttempt::Accepted(outcome) => Ok(outcome),
+        SubmitThreadInputAttempt::NeedsArtifacts => Err(AppError::DependencyUnavailable {
+            dependency: "thread_submission",
+        }),
+    }
+}
+
+/// Read the current conversation's bounded pending and held inputs.
+pub async fn list_pending_inputs<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+) -> Result<openbot_contracts::command::PendingInputs, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    directory
+        .list_pending_inputs(auth, &thread_id)
+        .await
+        .map_err(|error| error.into_app_error())
+}
+
+/// Withdraw one not-yet-dispatched input under the current conversation authority.
+pub async fn withdraw_pending_input<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    run_id: openbot_contracts::ids::RunId,
+) -> Result<openbot_contracts::command::PendingInputReceipt, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    if run_id.as_str().is_empty() {
+        return Err(AppError::MalformedPayload { field: "run_id" });
+    }
+    directory
+        .withdraw_pending_input(auth, &thread_id, &run_id)
+        .await
+        .map_err(|error| error.into_app_error())
 }
 
 fn artifact_refs_malformed() -> AppError {

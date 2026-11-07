@@ -955,6 +955,30 @@ where
             AppCommand::MintThreadId => Ok(AppReply::ThreadMinted(
                 mint_thread_id(&self.threads, auth).await?,
             )),
+            AppCommand::SubmitThreadInput(command) => Ok(AppReply::ThreadInputOutcome(
+                crate::use_cases::thread::submit_thread_input(
+                    &self.threads,
+                    self.artifacts.as_ref(),
+                    auth,
+                    command,
+                )
+                .await?,
+            )),
+            AppCommand::ListPendingInputs { thread_id } => Ok(AppReply::PendingInputs(
+                crate::use_cases::thread::list_pending_inputs(&self.threads, auth, thread_id)
+                    .await?,
+            )),
+            AppCommand::WithdrawPendingInput { thread_id, run_id } => {
+                Ok(AppReply::PendingInputState(
+                    crate::use_cases::thread::withdraw_pending_input(
+                        &self.threads,
+                        auth,
+                        thread_id,
+                        run_id,
+                    )
+                    .await?,
+                ))
+            }
             AppCommand::ListBotThreads {
                 bot_id,
                 status,

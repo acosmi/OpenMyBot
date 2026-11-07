@@ -418,6 +418,20 @@ pub enum AppCommand {
     ///
     /// 没有 deployment/actor 输入字段：二者只能来自权威 [`crate::auth::AuthContext`]。
     MintThreadId,
+    /// Admit one frozen direct Bot input, starting immediately or recording it durably.
+    SubmitThreadInput(BeginThreadRunV2),
+    /// List the current conversation's pending and held inputs.
+    ListPendingInputs {
+        /// Visible direct Bot conversation.
+        thread_id: ThreadId,
+    },
+    /// Withdraw an input that has not become a Run.
+    WithdrawPendingInput {
+        /// Visible direct Bot conversation.
+        thread_id: ThreadId,
+        /// Original input identity and eventual begin idempotency key.
+        run_id: RunId,
+    },
 
     /// List the current actor's direct conversations with one visible Bot.
     ListBotThreads {
@@ -769,6 +783,12 @@ pub enum AppReply {
     Tool(ToolResult),
     /// [`AppCommand::MintThreadId`] 的应答。
     ThreadMinted(ThreadMinted),
+    /// Durable admission of one frozen direct Bot input.
+    ThreadInputOutcome(ThreadInputOutcome),
+    /// Pending and held inputs visible in the current conversation.
+    PendingInputs(PendingInputs),
+    /// Committed state of an individually addressed input.
+    PendingInputState(PendingInputReceipt),
     /// Current actor's requested page of direct conversations.
     BotThreadPage(BotThreadPage),
     /// Committed normalized conversation title.
@@ -1104,6 +1124,131 @@ pub struct ThreadRunStarted {
     pub event_sequence: u64,
     /// `true` 表示完全相同的 run_id 请求已提交过，本次没有新增行/通知。
     pub replayed: bool,
+}
+
+/// Maximum number of pending and held human inputs in one conversation.
+pub const THREAD_PENDING_INPUTS_MAX: u32 = 20;
+
+/// Durable acceptance either started the original Run or retained its frozen input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ThreadInputOutcomeWire", into = "ThreadInputOutcomeWire")]
+pub enum ThreadInputOutcome {
+    /// The existing begin transaction has committed.
+    Started(ThreadRunStarted),
+    /// The input is durably queued; a Run has not started.
+    Queued {
+        /// Original caller-minted identity.
+        run_id: RunId,
+        /// One plus the number of earlier pending inputs.
+        position: u32,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ThreadInputOutcomeWire {
+    Started {
+        run: ThreadRunStarted,
+    },
+    Queued {
+        #[serde(rename = "runId")]
+        run_id: RunId,
+        position: u32,
+    },
+}
+
+impl From<ThreadInputOutcomeWire> for ThreadInputOutcome {
+    fn from(value: ThreadInputOutcomeWire) -> Self {
+        match value {
+            ThreadInputOutcomeWire::Started { run } => Self::Started(run),
+            ThreadInputOutcomeWire::Queued { run_id, position } => {
+                Self::Queued { run_id, position }
+            }
+        }
+    }
+}
+
+impl From<ThreadInputOutcome> for ThreadInputOutcomeWire {
+    fn from(value: ThreadInputOutcome) -> Self {
+        match value {
+            ThreadInputOutcome::Started(run) => Self::Started { run },
+            ThreadInputOutcome::Queued { run_id, position } => Self::Queued { run_id, position },
+        }
+    }
+}
+
+/// Closed lifecycle of a durable human input, separate from Run status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingInputState {
+    /// Eligible for the foreground dispatcher.
+    Pending,
+    /// Requires explicit user action before dispatch.
+    Held,
+    /// The original input has become a Run.
+    Dispatched,
+    /// The user or conversation deletion withdrew the input.
+    Withdrawn,
+}
+
+/// Closed reasons for retaining an input without dispatching it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingInputHeldReason {
+    /// The user stopped the conversation's work.
+    StoppedByUser,
+    /// The submitting actor's authority generation changed.
+    AuthorityStale,
+    /// Current actor, Bot or material authority is unavailable.
+    AuthorityUnavailable,
+    /// The frozen request was rejected by the begin path.
+    DispatchRejected,
+}
+
+/// One pending or held frozen input returned to its conversation owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingInput {
+    /// Original request identity.
+    pub run_id: RunId,
+    /// Current durable input state.
+    pub state: PendingInputState,
+    /// Present exactly for a held input.
+    pub held_reason: Option<PendingInputHeldReason>,
+    /// Last stable dispatch or lifecycle code, if any.
+    pub last_error: Option<String>,
+    /// Original acceptance time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub submitted_at: OffsetDateTime,
+    /// Current FIFO position time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub queued_at: OffsetDateTime,
+    /// Exact user message accepted with this identity.
+    pub message: String,
+    /// Frozen ordered skill selection.
+    pub selected_skill_slugs: Vec<String>,
+    /// Frozen model selection, never a credential.
+    pub model_selection: crate::versioned_model_selection::RunModelSelectionV2,
+    /// Frozen ordered artifact references.
+    pub artifact_refs: Vec<String>,
+}
+
+/// All pending and held inputs in one visible conversation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingInputs {
+    /// At most twenty entries; dispatched and withdrawn records are omitted.
+    pub items: Vec<PendingInput>,
+}
+
+/// Committed state acknowledgement for an addressed pending input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingInputReceipt {
+    /// Original request identity.
+    pub run_id: RunId,
+    /// Current durable input state.
+    pub state: PendingInputState,
 }
 
 /// Minimal input for durable foreground-run cancellation.
@@ -1534,6 +1679,45 @@ pub struct ThreadRunEvent {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn pending_input_outcome_wire_is_closed() {
+        let run = ThreadRunStarted {
+            thread_id: ThreadId::new("thread"),
+            run_id: RunId::new("run"),
+            message_sequence: 4,
+            event_sequence: 9,
+            replayed: false,
+        };
+        for (value, wire) in [
+            (
+                ThreadInputOutcome::Started(run.clone()),
+                serde_json::json!({"outcome":"started","run":run}),
+            ),
+            (
+                ThreadInputOutcome::Queued {
+                    run_id: RunId::new("queued"),
+                    position: 3,
+                },
+                serde_json::json!({"outcome":"queued","runId":"queued","position":3}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&value).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ThreadInputOutcome>(wire.clone()).unwrap(),
+                value
+            );
+            let mut extra = wire;
+            extra["unexpected"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<ThreadInputOutcome>(extra).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ThreadInputOutcome>(serde_json::json!({
+                "outcome":"queued","run":{"runId":"queued","position":3}
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn artifact_refs_dtos_preserve_omitted_empty_and_ordered_wire() {

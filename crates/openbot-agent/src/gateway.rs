@@ -378,6 +378,9 @@ impl AgentToolGateway {
                 | AppReply::ActionPolicy { .. }
                 | AppReply::ThreadMinted(_)
                 | AppReply::ThreadStatus(_)
+                | AppReply::ThreadInputOutcome(_)
+                | AppReply::PendingInputs(_)
+                | AppReply::PendingInputState(_)
                 | AppReply::BotThreadPage(_)
                 | AppReply::ThreadTitleSet(_)
                 | AppReply::ThreadRunStarted(_)
@@ -610,6 +613,8 @@ impl AuthorizedAgentToolGateway {
             Err(
                 AppError::Unauthenticated
                 | AppError::AnchorUnsupported
+                | AppError::PendingInputLimit
+                | AppError::PendingInputState
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -694,6 +699,8 @@ impl AuthorizedAgentToolGateway {
             Err(
                 AppError::Unauthenticated
                 | AppError::AnchorUnsupported
+                | AppError::PendingInputLimit
+                | AppError::PendingInputState
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -762,6 +769,8 @@ impl AuthorizedAgentToolGateway {
             Err(
                 AppError::Unauthenticated
                 | AppError::AnchorUnsupported
+                | AppError::PendingInputLimit
+                | AppError::PendingInputState
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -886,6 +895,8 @@ fn map_application_reply(
         Err(
             AppError::Unauthenticated
             | AppError::AnchorUnsupported
+            | AppError::PendingInputLimit
+            | AppError::PendingInputState
             | AppError::ArtifactGone { .. }
             | AppError::DependencyUnavailable { .. }
             | AppError::VendorFailure { .. }
@@ -1184,6 +1195,15 @@ mod tests {
     #[tokio::test]
     async fn work_replies_and_errors_do_not_become_tool_success() {
         for reply in [
+            AppReply::ThreadInputOutcome(openbot_contracts::command::ThreadInputOutcome::Queued {
+                run_id: RunId::new("input-1"),
+                position: 1,
+            }),
+            AppReply::PendingInputs(openbot_contracts::command::PendingInputs::default()),
+            AppReply::PendingInputState(openbot_contracts::command::PendingInputReceipt {
+                run_id: RunId::new("input-1"),
+                state: openbot_contracts::command::PendingInputState::Withdrawn,
+            }),
             AppReply::BotThreadPage(openbot_contracts::command::BotThreadPage {
                 threads: vec![],
                 next_cursor: None,
@@ -1210,10 +1230,16 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code().as_str(), "dependency_unavailable");
         }
-        assert!(matches!(
-            map_application_reply(ToolCallId::new("call-1"), Err(AppError::AnchorUnsupported)),
-            Err(AgentToolInvokeError::Unavailable)
-        ));
+        for error in [
+            AppError::AnchorUnsupported,
+            AppError::PendingInputLimit,
+            AppError::PendingInputState,
+        ] {
+            assert!(matches!(
+                map_application_reply(ToolCallId::new("call-1"), Err(error)),
+                Err(AgentToolInvokeError::Unavailable)
+            ));
+        }
     }
 
     fn fake(wrong_reply: bool) -> Arc<FakeApplication> {

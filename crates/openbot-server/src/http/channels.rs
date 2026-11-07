@@ -163,6 +163,9 @@ pub async fn list(
         | AppReply::Tool(_)
         | AppReply::ThreadMinted(_)
         | AppReply::ThreadStatus(_)
+        | AppReply::ThreadInputOutcome(_)
+        | AppReply::PendingInputs(_)
+        | AppReply::PendingInputState(_)
         | AppReply::BotThreadPage(_)
         | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
@@ -268,6 +271,9 @@ pub async fn get(
         | AppReply::Tool(_)
         | AppReply::ThreadMinted(_)
         | AppReply::ThreadStatus(_)
+        | AppReply::ThreadInputOutcome(_)
+        | AppReply::PendingInputs(_)
+        | AppReply::PendingInputState(_)
         | AppReply::BotThreadPage(_)
         | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
@@ -379,6 +385,9 @@ pub async fn create(
         | AppReply::Tool(_)
         | AppReply::ThreadMinted(_)
         | AppReply::ThreadStatus(_)
+        | AppReply::ThreadInputOutcome(_)
+        | AppReply::PendingInputs(_)
+        | AppReply::PendingInputState(_)
         | AppReply::BotThreadPage(_)
         | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
@@ -766,7 +775,22 @@ mod tests {
                 })
             }
         }
-        let replies: [fn() -> AppReply; 2] = [
+        let replies: [fn() -> AppReply; 5] = [
+            || {
+                AppReply::ThreadInputOutcome(
+                    openbot_contracts::command::ThreadInputOutcome::Queued {
+                        run_id: openbot_contracts::ids::RunId::new("input-1"),
+                        position: 1,
+                    },
+                )
+            },
+            || AppReply::PendingInputs(openbot_contracts::command::PendingInputs::default()),
+            || {
+                AppReply::PendingInputState(openbot_contracts::command::PendingInputReceipt {
+                    run_id: openbot_contracts::ids::RunId::new("input-1"),
+                    state: openbot_contracts::command::PendingInputState::Withdrawn,
+                })
+            },
             || {
                 AppReply::BotThreadPage(openbot_contracts::command::BotThreadPage {
                     threads: vec![],
