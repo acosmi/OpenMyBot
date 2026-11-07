@@ -823,6 +823,20 @@ pub type RunEffectReceiptsRequest = RunReconciliationRequest;
 /// 不同”，防止状态接口枚举别人的 thread。
 #[async_trait]
 pub trait ThreadDirectory: Send + Sync {
+    /// Consume at most one pending row under its database transaction.
+    async fn dispatch_pending_input(
+        &self,
+        _thread: &ThreadId,
+        _consumer: &dyn crate::PendingInputConsumer,
+    ) -> Result<(), ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Read idle conversations with pending input once at host startup.
+    async fn pending_input_threads(&self) -> Result<Vec<ThreadId>, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
     /// Atomically accept a frozen input or start its original v2 Run.
     async fn submit_thread_input(
         &self,

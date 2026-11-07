@@ -3,6 +3,8 @@
 #![cfg(feature = "server-runtime")]
 
 mod harness;
+#[path = "custom_model_v2_dataset/pending_input_dispatcher.rs"]
+mod pending_input_dispatcher;
 #[path = "custom_model_v2_dataset/pending_inputs.rs"]
 mod pending_inputs;
 
@@ -71,6 +73,24 @@ fn auth() -> AuthContext {
     .with_roles([Role::User])
     .build()
 }
+struct W02ArtifactRoot(std::path::PathBuf);
+impl W02ArtifactRoot {
+    fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let path = std::env::temp_dir().join(format!("openbot-w02-{}", Uuid::now_v7()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        Self(std::fs::canonicalize(path).unwrap())
+    }
+}
+impl Drop for W02ArtifactRoot {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
 struct Fixture {
     pool: pool::DatabasePool,
     config: pool::DatabaseConfig,
@@ -79,9 +99,18 @@ struct Fixture {
     binding: Arc<PostgresModelDatasetBinding>,
     directory: PostgresThreadDirectory,
     models: PostgresModelConnections,
+    artifact_administration:
+        Option<Arc<openbot_infra::artifact_administration::PostgresArtifactAdministration>>,
+    artifact_root: Option<W02ArtifactRoot>,
 }
 impl Fixture {
     async fn new(config: pool::DatabaseConfig, size: usize) -> Self {
+        Self::new_inner(config, size, false).await
+    }
+    async fn new_with_artifacts(config: pool::DatabaseConfig, size: usize) -> Self {
+        Self::new_inner(config, size, true).await
+    }
+    async fn new_inner(config: pool::DatabaseConfig, size: usize, with_artifacts: bool) -> Self {
         let config = config.with_max_pool_size(size);
         let p = pool::connect(&config).await.unwrap();
         let mut c = p.get().await.unwrap();
@@ -108,6 +137,30 @@ impl Fixture {
             .await
             .unwrap(),
         );
+        let artifact_root = with_artifacts.then(W02ArtifactRoot::new);
+        let artifact_administration = if let Some(root) = &artifact_root {
+            let policy = openbot_domain::artifact::ArtifactQuotaPolicy::default();
+            let store = Arc::new(
+                openbot_infra::artifact_store::DatasetBoundArtifactStore::bind_host_root(
+                    std::fs::File::open(&root.0).unwrap(),
+                    registry.clone(),
+                    policy,
+                )
+                .await
+                .unwrap(),
+            );
+            Some(Arc::new(
+                openbot_infra::artifact_administration::PostgresArtifactAdministration::new(
+                    registry.clone(),
+                    store,
+                    policy,
+                    SecretBytes::new(vec![0x65; 32]),
+                )
+                .unwrap(),
+            ))
+        } else {
+            None
+        };
         let policy_store = PolicyStore::postgres(p.clone(), None);
         policy_store.load().await.unwrap();
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
@@ -126,7 +179,9 @@ impl Fixture {
             policy_store,
             ui_preferences: Arc::new(openbot_application::NoUiPreferenceAdministration),
             screen_sessions: Arc::new(openbot_application::NoScreenSessionAdministration),
-            artifacts: None,
+            artifacts: artifact_administration.clone().map(|administration| {
+                administration as Arc<dyn openbot_application::artifacts::ArtifactAdministration>
+            }),
             runtime_capabilities: None,
             remote_agent_probe: Arc::new(ClosedProbe),
             managed_slot_available: false,
@@ -172,6 +227,8 @@ impl Fixture {
             binding,
             directory,
             models,
+            artifact_administration,
+            artifact_root,
         }
     }
     async fn model(&self, protocol: CustomModelProtocol) -> ModelConnection {
@@ -258,6 +315,8 @@ impl Fixture {
         drop(self.models);
         drop(self.binding);
         drop(self.registry);
+        drop(self.artifact_administration);
+        drop(self.artifact_root);
         let observations = self.pool.connection_observations();
         self.pool.close();
         let deadline = Instant::now() + Duration::from_secs(10);
