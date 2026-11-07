@@ -177,7 +177,7 @@ pub use mcp_connections::{
 pub use ports::{
     AgentAdministration, AgentAdministrationError, AgentAdministrationScope, AgentDirectory,
     AgentReachability, AgentReadScope, AuditPageRequest, AuditReadError, AuditReader,
-    BeginThreadRunRequest, BeginThreadRunV2Request, CancelThreadRunRequest,
+    BeginThreadRunRequest, BeginThreadRunV2Request, BotThreadCursor, CancelThreadRunRequest,
     ChannelActivitySubscription, ChannelAdministration, ChannelAdministrationError,
     ChannelCreateRequest, ChannelCreateScope, ChannelReadScope, ChannelReader,
     ChannelRoutingBackend, ChannelRoutingBackendError, CorrectMemoryRequest, MemoryAdministration,

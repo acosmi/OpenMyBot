@@ -223,6 +223,8 @@ pub const fn command_kind(command: &AppCommand) -> &'static str {
         AppCommand::SetActionPolicy { .. } => "set_action_policy",
         AppCommand::InvokeTool(_) => "invoke_tool",
         AppCommand::MintThreadId => "mint_thread_id",
+        AppCommand::ListBotThreads { .. } => "list_bot_threads",
+        AppCommand::SetThreadTitle { .. } => "set_thread_title",
         AppCommand::GetThreadStatus { .. } => "get_thread_status",
         AppCommand::BeginThreadRun(_) => "begin_thread_run",
         AppCommand::BeginThreadRunV2(_) => "begin_thread_run_v2",

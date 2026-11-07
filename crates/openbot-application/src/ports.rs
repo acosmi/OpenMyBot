@@ -591,6 +591,9 @@ impl AgentDirectory for NoAgentDirectory {
 /// Native thread 目录端口错误；不携带随机源或数据库的原始错误文本。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ThreadDirectoryError {
+    /// A visible channel conversation cannot use a direct Bot operation.
+    #[error("anchor_unsupported")]
+    AnchorUnsupported,
     /// OS CSPRNG 或 PostgreSQL 当前不可用。
     #[error("thread_directory_unavailable")]
     Unavailable,
@@ -631,6 +634,7 @@ impl ThreadDirectoryError {
     #[must_use]
     pub const fn into_app_error(self) -> AppError {
         match self {
+            Self::AnchorUnsupported => AppError::AnchorUnsupported,
             Self::Unavailable | Self::Corrupt { .. } => AppError::DependencyUnavailable {
                 dependency: "thread_directory",
             },
@@ -643,6 +647,15 @@ impl ThreadDirectoryError {
             }
         }
     }
+}
+
+/// Parsed position in the direct Bot conversation ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotThreadCursor {
+    /// Authoritative update time carried by the preceding page.
+    pub updated_at: time::OffsetDateTime,
+    /// Stable tie breaker within that update time.
+    pub thread_id: ThreadId,
 }
 
 /// application 已把权威 scope 与封闭 command 合并后的事务请求。
@@ -793,6 +806,27 @@ pub type RunEffectReceiptsRequest = RunReconciliationRequest;
 /// 不同”，防止状态接口枚举别人的 thread。
 #[async_trait]
 pub trait ThreadDirectory: Send + Sync {
+    /// Read a bounded, actor-scoped direct conversation page.
+    async fn list_bot_threads(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _bot_id: &BotId,
+        _status: openbot_contracts::command::ThreadStatusFilter,
+        _cursor: Option<BotThreadCursor>,
+        _limit: u32,
+    ) -> Result<openbot_contracts::command::BotThreadPage, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
+
+    /// Store an application-validated title and update the conversation's recency.
+    async fn set_thread_title(
+        &self,
+        _auth: &openbot_contracts::auth::AuthContext,
+        _thread_id: &ThreadId,
+        _title: String,
+    ) -> Result<openbot_contracts::command::ThreadTitleSet, ThreadDirectoryError> {
+        Err(ThreadDirectoryError::Unavailable)
+    }
     /// 以 OS CSPRNG 铸造当前 deployment 的 UUIDv8 thread ID。
     async fn mint_thread_id(
         &self,
