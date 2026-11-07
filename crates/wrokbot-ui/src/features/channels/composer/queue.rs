@@ -116,6 +116,7 @@ mod tests {
                 connection_id: "01991389-7380-7000-8000-000000000001".into(),
                 expected_revision: revision,
             }),
+            model_selection_v2: None,
         }
     }
 

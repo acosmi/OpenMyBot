@@ -200,6 +200,7 @@ pub(crate) async fn execute_start_attempt(
         message: attempt.message.clone(),
         selected_skill_slugs: attempt.selected_skill_slugs.clone(),
         model_selection: attempt.model_selection.clone(),
+        model_selection_v2: None,
     };
     let recovery = RunRecovery {
         source: attempt.source,

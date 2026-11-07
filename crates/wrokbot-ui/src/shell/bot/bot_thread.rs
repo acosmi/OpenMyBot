@@ -20,6 +20,13 @@ pub(super) fn bot_thread_key(agent_id: &str) -> String {
     format!("{BOT_THREAD_KEY_PREFIX}.{agent_id}")
 }
 
+/// The single browser entry written when a conversation is opened or minted. There is one key
+/// per assistant, so opening another conversation replaces it: only the most recently opened one
+/// is remembered, and its value is the identity the Server's list or mint returned.
+pub(super) fn remembered_entry(agent_id: &str, opened: &ThreadId) -> (String, String) {
+    (bot_thread_key(agent_id), opened.as_str().to_owned())
+}
+
 /// Reject damaged browser state before it can become a native thread authority input.
 pub(super) fn plausible_remembered_thread(value: &str) -> Option<ThreadId> {
     (value.len() <= 64 && uuid::Uuid::parse_str(value).is_ok()).then(|| ThreadId::new(value))
@@ -100,6 +107,19 @@ mod tests {
             RememberedThreadDecision::Fresh
         );
         assert_eq!(thread_to_use(None, None), RememberedThreadDecision::Fresh);
+    }
+
+    #[test]
+    fn opening_a_row_remembers_only_that_row_under_the_single_assistant_key() {
+        let first = remembered_entry("bot-a", &thread("550e8400-e29b-81d4-a716-446655440001"));
+        let second = remembered_entry("bot-a", &thread("550e8400-e29b-81d4-a716-446655440002"));
+        // One key per assistant: the later open replaces the earlier one.
+        assert_eq!(first.0, second.0);
+        assert_eq!(second.1, "550e8400-e29b-81d4-a716-446655440002");
+        assert_ne!(
+            remembered_entry("bot-b", &thread("550e8400-e29b-81d4-a716-446655440002")).0,
+            second.0
+        );
     }
 
     #[test]
