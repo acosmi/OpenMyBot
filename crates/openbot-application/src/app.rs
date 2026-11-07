@@ -979,6 +979,33 @@ where
                     .await?,
                 ))
             }
+            AppCommand::StopThreadWork { thread_id, run_id } => Ok(AppReply::ThreadWorkStopped(
+                crate::use_cases::thread::stop_thread_work(&self.threads, auth, thread_id, run_id)
+                    .await?,
+            )),
+            AppCommand::CompleteThread { thread_id } => Ok(AppReply::ThreadCompleted(
+                crate::use_cases::thread::complete_thread(&self.threads, auth, thread_id).await?,
+            )),
+            AppCommand::ReleasePendingInput { thread_id, run_id } => {
+                let receipt = crate::use_cases::thread::release_pending_input(
+                    &self.threads,
+                    auth,
+                    thread_id.clone(),
+                    run_id,
+                )
+                .await?;
+                let dispatcher = crate::PendingInputDispatcher::new(
+                    &self.threads,
+                    std::sync::Arc::clone(&self.artifacts),
+                );
+                if let Err(error) = crate::PendingInputWake::wake(&dispatcher, &thread_id).await {
+                    tracing::warn!(
+                        code = error.code().as_str(),
+                        "released input wake unavailable"
+                    );
+                }
+                Ok(AppReply::PendingInputState(receipt))
+            }
             AppCommand::ListBotThreads {
                 bot_id,
                 status,

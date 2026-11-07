@@ -1,6 +1,6 @@
 use super::*;
 use openbot_application::artifacts::NoArtifactAdministration;
-use openbot_application::{PendingInputDispatcher, RunRuntime};
+use openbot_application::{PendingInputDispatcher, PendingInputWake, RunRuntime};
 
 #[tokio::test]
 #[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
@@ -115,7 +115,8 @@ async fn dispatch_errors_preserve_or_hold_inputs() {
             let row = c.query_one("SELECT state,held_reason,last_error,message FROM openbot_internal.thread_pending_inputs WHERE run_id=$1", &[&input.command.run_id.as_str()]).await.unwrap();
             assert_eq!(row.get::<_, String>(0), state);
             assert_eq!(row.get::<_, Option<String>>(1).as_deref(), reason);
-            assert_eq!(row.get::<_, String>(2), code);
+            // last_error is written only for 503; a lease conflict leaves the row unchanged.
+            assert_eq!(row.get::<_, Option<String>>(2), (code != "lease_conflict").then_some(code));
             assert_eq!(row.get::<_, String>(3), input.command.message);
             assert!(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1", &[&input.command.run_id.as_str()]).await.unwrap().is_none());
         }
@@ -180,6 +181,41 @@ async fn startup_scan_dispatches_idle_threads_once() {
             }
         }
         drop(c);
+        f.finish().await;
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
+async fn wake_waits_for_a_submit_holding_the_conversation_lock() {
+    harness::with_temp_database(&harness::admin_config("pending_lock_wait"), "pendinglockwait", |config| async move {
+        let f = Fixture::new(config, 8).await;
+        let model = f.model(CustomModelProtocol::OpenaiResponses).await;
+        let input = queue_idle(&f, 1, &model).await;
+        let dispatcher = PendingInputDispatcher::new(Arc::new(f.directory.clone()), Arc::new(NoArtifactAdministration));
+        // Hold the conversation lock exactly as an in-flight SubmitThreadInput does.
+        let mut holder = f.pool.get().await.unwrap();
+        let tx = holder.transaction().await.unwrap();
+        tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", &[&input.command.thread_id.as_str()]).await.unwrap();
+        let observer = f.pool.get().await.unwrap();
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while observer.query_one("SELECT count(*) FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_database d ON d.oid=l.database WHERE d.datname=current_database() AND l.locktype='advisory' AND NOT l.granted", &[]).await.unwrap().get::<_, i64>(0) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("wake returned without waiting for the held conversation lock");
+            tx.commit().await.unwrap();
+        };
+        let (woken, ()) = tokio::join!(dispatcher.wake(&input.command.thread_id), release);
+        woken.unwrap();
+        drop(observer);
+        drop(holder);
+        let c = f.pool.get().await.unwrap();
+        assert_eq!(c.query_one("SELECT state FROM openbot_internal.thread_pending_inputs WHERE run_id=$1", &[&input.command.run_id.as_str()]).await.unwrap().get::<_, String>(0), "dispatched");
+        assert!(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1", &[&input.command.run_id.as_str()]).await.unwrap().is_some());
+        drop(c);
+        drop(dispatcher);
         f.finish().await;
         Ok(())
     }).await;

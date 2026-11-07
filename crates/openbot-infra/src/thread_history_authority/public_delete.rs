@@ -145,6 +145,7 @@ impl PostgresThreadHistoryAuthority {
         let now = OffsetDateTime::now_utc();
         let at = tokio::time::Instant::from_std(deadline);
         let result = async {
+            tokio::time::timeout_at(at, tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", &[&thread])).await.map_err(|_| StopError::Unavailable)?.map_err(|_| StopError::Unavailable)?;
             let updated = tokio::time::timeout_at(
                 at,
                 tx.execute(
@@ -156,6 +157,7 @@ impl PostgresThreadHistoryAuthority {
             .map_err(|_| StopError::Unavailable)?
             .map_err(|_| StopError::Unavailable)?;
             if updated == 1 {
+                tokio::time::timeout_at(at, tx.execute("UPDATE openbot_internal.thread_pending_inputs SET state='withdrawn',held_reason=NULL,last_error='thread_deleted',state_changed_at=$2 WHERE thread_id=$1 AND state IN ('pending','held')", &[&thread, &now])).await.map_err(|_| StopError::Unavailable)?.map_err(|_| StopError::Unavailable)?;
                 return Ok(());
             }
             let row = tokio::time::timeout_at(

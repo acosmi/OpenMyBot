@@ -117,6 +117,18 @@ impl IntoResponse for HttpError {
             return response;
         }
 
+        if let AppError::ThreadNotIdle {
+            foreground,
+            pending_inputs,
+        } = &self.0
+        {
+            let mut response = (status, Json(serde_json::json!({"code":self.0.code().as_str(),"foreground":foreground,"pendingInputs":pending_inputs}))).into_response();
+            response.headers_mut().insert(
+                http::header::CACHE_CONTROL,
+                http::HeaderValue::from_static("no-store"),
+            );
+            return response;
+        }
         let (rule, gone_status) = match &self.0 {
             AppError::PolicyRefused { rule, .. } => (Some(rule.as_str()), None),
             AppError::ArtifactGone { status } => (None, Some(*status)),
@@ -127,6 +139,7 @@ impl IntoResponse for HttpError {
             | AppError::AnchorUnsupported
             | AppError::PendingInputLimit
             | AppError::PendingInputState
+            | AppError::ThreadNotIdle { .. }
             | AppError::DependencyUnavailable { .. }
             | AppError::VendorFailure { .. }
             | AppError::StaleGeneration { .. }
@@ -183,6 +196,10 @@ mod tests {
     /// `into_response` 的穷举 match 里先编译失败，这里只负责断言运行期行为。
     fn all_variants() -> Vec<AppError> {
         vec![
+            AppError::ThreadNotIdle {
+                foreground: None,
+                pending_inputs: 1,
+            },
             AppError::Unauthenticated,
             AppError::ForbiddenRole {
                 required: Role::Admin,

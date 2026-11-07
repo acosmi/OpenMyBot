@@ -328,7 +328,7 @@ impl PostgresThreadHistoryAuthority {
     }
 
     /// The transaction body. The writer schema proof precedes the first row lock. After it the
-    /// actor row is the only wait before J0; the lazy H insert and the Q insert may then wait on
+    /// conversation lock precedes the actor row before J0; the lazy H insert and Q insert may wait on
     /// their unique keys. Every other lock is NOWAIT and J2 follows every possible wait.
     async fn stop_clear_original(
         &self,
@@ -349,6 +349,14 @@ impl PostgresThreadHistoryAuthority {
             .await?
             .map_err(schema_error)?;
         current.check_attachment(deadline)?;
+        // Pending consumption takes this same conversation lock before its input and Thread rows.
+        rows(
+            tx,
+            deadline,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread.as_str()],
+        )
+        .await?;
         self.lock_current_positive(current, tx, thread, deadline)
             .await?;
         // J0: nothing below touches H unless the Thread is currently managed by this creator.
@@ -368,6 +376,16 @@ impl PostgresThreadHistoryAuthority {
                     .await?
             }
         };
+        if matches!(decision, Decision::Closed(_)) {
+            execute(tx, deadline, "UPDATE openbot_internal.thread_pending_inputs SET state='withdrawn',held_reason=NULL,last_error='thread_deleted',state_changed_at=clock_timestamp() WHERE thread_id=$1 AND state IN ('pending','held')", &[&thread.as_str()]).await?;
+            execute(
+                tx,
+                deadline,
+                "UPDATE public.threads SET updated_at=clock_timestamp() WHERE thread_id=$1",
+                &[&thread.as_str()],
+            )
+            .await?;
+        }
         current.check_attachment(deadline)?;
         // J2: a new statement after the lazy H and Q unique waits and every write, before the
         // terminal. It covers rows these locks do not hold, such as a new deny.

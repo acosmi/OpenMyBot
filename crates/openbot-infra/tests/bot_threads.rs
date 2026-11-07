@@ -177,6 +177,14 @@ async fn thread_titles_default_and_rename_bounds() {
         // Historical null titles can have an injected user-role artifact frame before the input.
         let (legacy, legacy_lease) = begin(&directory, &runtime, &actor, 12, "bot", "Human task title\nDetails", ThreadRunAnchor::DirectBot).await;
         runtime.finish_run(&legacy_lease, 1, RunTerminal::Failed(RunFailureCode::ProviderUnavailable)).await.unwrap();
+        // A blank first line falls back to the trimmed text; blank text never stores an empty title.
+        for (entropy, text, title) in [(13, "\n \t\nSecond line title\nDetails", Some("Second line title")), (14, " \n\t ", None)] {
+            let (blank, blank_lease) = begin(&directory, &runtime, &actor, entropy, "bot", text, ThreadRunAnchor::DirectBot).await;
+            runtime.finish_run(&blank_lease, 1, RunTerminal::Failed(RunFailureCode::ProviderUnavailable)).await.unwrap();
+            let client = pool.get().await.unwrap();
+            assert_eq!(client.query_one("SELECT title FROM public.threads WHERE thread_id=$1", &[&blank.command.thread_id.as_str()]).await.unwrap().get::<_, Option<String>>(0).as_deref(), title);
+            drop(client);
+        }
         let mut client = pool.get().await.unwrap();
         let tx = client.transaction().await.unwrap();
         let input_id = format!("{}:input", legacy.command.run_id);

@@ -254,6 +254,16 @@ enum ThreadRoute<'a> {
     Inputs {
         raw_thread_id: &'a str,
     },
+    Stop {
+        raw_thread_id: &'a str,
+    },
+    Complete {
+        raw_thread_id: &'a str,
+    },
+    ReleaseInput {
+        raw_thread_id: &'a str,
+        raw_run_id: &'a str,
+    },
     WithdrawInput {
         raw_thread_id: &'a str,
         raw_run_id: &'a str,
@@ -341,7 +351,10 @@ impl<'a> ThreadRoute<'a> {
             | Self::Reconciliation { raw_thread_id, .. }
             | Self::HistoryDeletion { raw_thread_id }
             | Self::Inputs { raw_thread_id }
-            | Self::WithdrawInput { raw_thread_id, .. } => raw_thread_id,
+            | Self::WithdrawInput { raw_thread_id, .. }
+            | Self::ReleaseInput { raw_thread_id, .. }
+            | Self::Stop { raw_thread_id }
+            | Self::Complete { raw_thread_id } => raw_thread_id,
         }
     }
 }
@@ -352,6 +365,20 @@ fn thread_route(path: &str) -> Option<ThreadRoute<'_>> {
         .split('/')
         .collect::<Vec<_>>();
     match segments.as_slice() {
+        [raw_thread_id, "stop"] if !raw_thread_id.is_empty() => {
+            Some(ThreadRoute::Stop { raw_thread_id })
+        }
+        [raw_thread_id, "complete"] if !raw_thread_id.is_empty() => {
+            Some(ThreadRoute::Complete { raw_thread_id })
+        }
+        [raw_thread_id, "inputs", raw_run_id, "release"]
+            if !raw_thread_id.is_empty() && !raw_run_id.is_empty() =>
+        {
+            Some(ThreadRoute::ReleaseInput {
+                raw_thread_id,
+                raw_run_id,
+            })
+        }
         [raw_thread_id, "inputs"] if !raw_thread_id.is_empty() => {
             Some(ThreadRoute::Inputs { raw_thread_id })
         }
@@ -2905,6 +2932,9 @@ impl DesktopTauriProtocol {
                 | (ThreadRoute::Cancel { .. }, &Method::POST)
                 | (ThreadRoute::Inputs { .. }, &Method::GET | &Method::POST)
                 | (ThreadRoute::WithdrawInput { .. }, &Method::POST)
+                | (ThreadRoute::ReleaseInput { .. }, &Method::POST)
+                | (ThreadRoute::Stop { .. }, &Method::POST)
+                | (ThreadRoute::Complete { .. }, &Method::POST)
                 | (ThreadRoute::Title { .. }, &Method::POST)
         );
         if !supported {
@@ -2971,6 +3001,48 @@ impl DesktopTauriProtocol {
                     },
                 )
                 .await
+            }
+            (ThreadRoute::ReleaseInput { raw_run_id, .. }, &Method::POST) => {
+                if !request.body().is_empty() {
+                    request.body_mut().fill(0);
+                    return error_response(AppError::MalformedPayload { field: "body" });
+                }
+                let Some(run_id) = percent_decode_segment(raw_run_id) else {
+                    return error_response(AppError::MalformedPayload { field: "run_id" });
+                };
+                self.thread_command(
+                    authority.auth,
+                    AppCommand::ReleasePendingInput {
+                        thread_id,
+                        run_id: RunId::new(run_id),
+                    },
+                )
+                .await
+            }
+            (ThreadRoute::Stop { .. }, &Method::POST) => {
+                let body = match parse_sensitive_body::<
+                    openbot_contracts::command::StopThreadWorkBody,
+                >(&mut request, CHANNEL_THREAD_BODY_MAX_BYTES)
+                {
+                    Ok(body) => body,
+                    Err(error) => return sensitive_body_error_response(error),
+                };
+                self.thread_command(
+                    authority.auth,
+                    AppCommand::StopThreadWork {
+                        thread_id,
+                        run_id: body.run_id,
+                    },
+                )
+                .await
+            }
+            (ThreadRoute::Complete { .. }, &Method::POST) => {
+                if !request.body().is_empty() {
+                    request.body_mut().fill(0);
+                    return error_response(AppError::MalformedPayload { field: "body" });
+                }
+                self.thread_command(authority.auth, AppCommand::CompleteThread { thread_id })
+                    .await
             }
             (ThreadRoute::Title { .. }, &Method::POST) => {
                 let body = match parse_sensitive_body::<
@@ -3062,6 +3134,8 @@ impl DesktopTauriProtocol {
             Ok(AppReply::ThreadInputOutcome(outcome)) => json_response(&outcome),
             Ok(AppReply::PendingInputs(inputs)) => json_response(&inputs),
             Ok(AppReply::PendingInputState(receipt)) => json_response(&receipt),
+            Ok(AppReply::ThreadWorkStopped(receipt)) => json_response(&receipt),
+            Ok(AppReply::ThreadCompleted(receipt)) => json_response(&receipt),
             Ok(AppReply::ThreadTitleSet(receipt)) => json_response(&receipt),
             Ok(AppReply::ThreadStatus(status)) => json_response(&status),
             Ok(AppReply::ThreadConversation(snapshot)) => json_response(&snapshot),
@@ -4251,6 +4325,7 @@ fn sensitive_body_error_response(error: SensitiveBodyError) -> Response<Vec<u8>>
 
 fn error_response(error: AppError) -> Response<Vec<u8>> {
     let body = match &error {
+        AppError::ThreadNotIdle {foreground,pending_inputs} => serde_json::to_vec(&json!({"code":error.code().as_str(),"foreground":foreground,"pendingInputs":pending_inputs})),
         AppError::StaleGeneration {
             subject: openbot_contracts::error::StaleGenerationSubject::Configuration { snapshot },
         } => serde_json::to_vec(snapshot),
@@ -5257,6 +5332,60 @@ mod tests {
 
     #[async_trait]
     impl ThreadDirectory for FakeChannelRuntime {
+        async fn stop_thread_work(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            run_id: Option<&RunId>,
+        ) -> Result<openbot_contracts::command::ThreadWorkStopped, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            Ok(openbot_contracts::command::ThreadWorkStopped {
+                held: 2,
+                cancellation: run_id.map(|run_id| {
+                    openbot_contracts::command::ThreadRunCancellation {
+                        thread_id: thread_id.clone(),
+                        run_id: run_id.clone(),
+                        state: openbot_contracts::command::ThreadRunCancellationState::Requested,
+                    }
+                }),
+            })
+        }
+        async fn release_pending_input(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            run_id: &RunId,
+        ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            if run_id.as_str() == "dispatched" {
+                return Err(ThreadDirectoryError::PendingInputState);
+            }
+            if run_id.as_str() == "unavailable" {
+                return Err(ThreadDirectoryError::Unavailable);
+            }
+            Ok(openbot_contracts::command::PendingInputReceipt {
+                run_id: run_id.clone(),
+                state: openbot_contracts::command::PendingInputState::Pending,
+            })
+        }
+        async fn complete_thread(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+        ) -> Result<openbot_contracts::command::ThreadCompleted, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            if thread_id.as_str().ends_with("003") {
+                return Err(ThreadDirectoryError::ThreadNotIdle {
+                    foreground: Some(
+                        openbot_contracts::command::ThreadForegroundRunState::Cancelling,
+                    ),
+                    pending_inputs: 2,
+                });
+            }
+            Ok(openbot_contracts::command::ThreadCompleted {
+                status: openbot_contracts::command::ThreadStatusFilter::Archived,
+            })
+        }
         async fn submit_thread_input(
             &self,
             request: openbot_application::BeginThreadRunV2Request,
@@ -6813,6 +6942,120 @@ mod tests {
             (
                 Method::POST,
                 format!("/api/threads/{thread}/inputs/input-1/withdraw"),
+                "{}".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+        ] {
+            let response = protocol
+                .handle(
+                    "pending-inputs",
+                    Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header("content-type", "application/json")
+                        .body(body.into_bytes())
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(response.status().as_u16(), status, "{uri}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{uri}");
+            let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(body, expected, "{uri}");
+        }
+        protocol.unbind_window("pending-inputs").unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_control_protocol_commands_preserve_inputs_and_errors() {
+        use serde_json::json;
+        let (protocol, root) = protocol();
+        protocol
+            .bind_window("pending-inputs", auth(), None)
+            .unwrap();
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for (method, uri, body, status, expected) in [
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                "{}".into(),
+                200,
+                json!({"held":2,"cancellation":null}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                json!({"runId":"opaque/run?1"}).to_string(),
+                200,
+                json!({"held":2,"cancellation":{"threadId":thread,"runId":"opaque/run?1","state":"requested"}}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                json!({"runId":"r","actor":"spoof"}).to_string(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input%2Fone/release"),
+                String::new(),
+                200,
+                json!({"runId":"input/one","state":"pending"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/dispatched/release"),
+                String::new(),
+                409,
+                json!({"code":"pending_input_state"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/unavailable/release"),
+                String::new(),
+                503,
+                json!({"code":"dependency_unavailable"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input-1/release"),
+                "{}".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/complete"),
+                String::new(),
+                200,
+                json!({"status":"archived"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440003/complete".into(),
+                String::new(),
+                409,
+                json!({"code":"thread_not_idle","foreground":"cancelling","pendingInputs":2}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440001/complete".into(),
+                String::new(),
+                404,
+                json!({"code":"not_visible"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440002/stop".into(),
+                "{}".into(),
+                400,
+                json!({"code":"anchor_unsupported"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/complete"),
                 "{}".into(),
                 400,
                 json!({"code":"malformed_payload"}),

@@ -1846,44 +1846,33 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
         validate_run_input_text_budget(observations.iter().map(|r| &r.metadata_snapshot))?;
         let mut materials = Vec::with_capacity(observations.len());
         for observation in observations {
-            if std::time::Instant::now() >= deadline {
-                return Err(unavailable());
-            }
             let metadata = observation.metadata_snapshot.clone();
             let body = if input_media_is_text(&metadata.media_type) {
                 let store = Arc::clone(&self.store);
                 let length = usize::try_from(metadata.byte_length).map_err(|_| unavailable())?;
-                let bytes = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    tokio::task::spawn_blocking(move || {
-                        // The blocking job owns the real snapshot, FD and cleanup read lease until exit.
+                // The dispatcher bounds the whole preread with one timeout. A blocking job cannot
+                // be cancelled, so only its read loop rechecks the same deadline.
+                let bytes = tokio::task::spawn_blocking(move || {
+                    // The blocking job owns the real snapshot, FD and cleanup read lease until exit.
+                    let mut reader = store.open_observed_record(observation).map_err(|_| ())?;
+                    let mut bytes = vec![0; length];
+                    let mut offset = 0;
+                    while offset < length {
                         if std::time::Instant::now() >= deadline {
                             return Err(());
                         }
-                        let mut reader = store.open_observed_record(observation).map_err(|_| ())?;
-                        let mut bytes = vec![0; length];
-                        let mut offset = 0;
-                        while offset < length {
-                            if std::time::Instant::now() >= deadline {
-                                return Err(());
-                            }
-                            let read = reader
-                                .read_observed_chunk(&mut bytes[offset..])
-                                .map_err(|_| ())?;
-                            if read == 0 {
-                                return Err(());
-                            }
-                            offset += read;
-                        }
-                        reader.verify_physical_current().map_err(|_| ())?;
-                        if std::time::Instant::now() >= deadline {
+                        let read = reader
+                            .read_observed_chunk(&mut bytes[offset..])
+                            .map_err(|_| ())?;
+                        if read == 0 {
                             return Err(());
                         }
-                        Ok(bytes)
-                    }),
-                )
+                        offset += read;
+                    }
+                    reader.verify_physical_current().map_err(|_| ())?;
+                    Ok(bytes)
+                })
                 .await
-                .map_err(|_| unavailable())?
                 .map_err(|_| unavailable())?
                 .map_err(|_| unavailable())?;
                 Some(decode_run_input_text(&metadata, bytes)?)
@@ -1900,9 +1889,6 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
                 source_run_id: metadata.source_run_id,
                 body,
             });
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(unavailable());
         }
         Ok(materials)
     }

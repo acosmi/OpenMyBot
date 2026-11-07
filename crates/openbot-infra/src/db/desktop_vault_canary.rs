@@ -739,6 +739,8 @@ fn registered_public_schema(native_version: i32) -> Result<SchemaFacts, InfraErr
         native::NATIVE_0050_VERSION => PUBLIC_0050,
         native::NATIVE_0051_VERSION => PUBLIC_0051,
         native::NATIVE_0052_VERSION => PUBLIC_0052,
+        //0053 adds only the internal pending-input table; public remains0052.
+        native::NATIVE_0053_VERSION => PUBLIC_0052,
         _ => {
             return Err(InfraError::repository_invariant(
                 "desktop_vault_native_schema_unregistered",

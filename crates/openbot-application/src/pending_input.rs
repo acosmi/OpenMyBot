@@ -6,7 +6,7 @@ use openbot_contracts::auth::{AuthContextBuilder, AuthGeneration, Role};
 use openbot_contracts::command::BeginThreadRunV2;
 use openbot_contracts::error::AppError;
 use openbot_contracts::ids::{ActorId, DeploymentId, TenantId, ThreadId};
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 /// Current database authority and frozen payload, verified inside the pending row transaction.
 pub struct VerifiedPendingInput {
@@ -46,28 +46,35 @@ pub trait PendingInputWake: Send + Sync {
     /// Attempt one pending row for this conversation.
     async fn wake(&self, thread: &ThreadId) -> Result<(), AppError>;
     /// Scan once after the host has enrolled its original dataset.
-    async fn scan_startup(&self) -> Result<(), AppError> {
-        Ok(())
-    }
+    async fn scan_startup(&self) -> Result<(), AppError>;
 }
 
 /// The sole consumer of durable direct conversation input.
-pub struct PendingInputDispatcher<D: ThreadDirectory> {
-    directory: Arc<D>,
+pub struct PendingInputDispatcher<D> {
+    directory: D,
     artifacts: Arc<dyn ArtifactAdministration>,
 }
 
-impl<D: ThreadDirectory> PendingInputDispatcher<D> {
+impl<D: Deref + Send + Sync> PendingInputDispatcher<D>
+where
+    D::Target: ThreadDirectory,
+{
     /// Use the same thread and artifact authorities as ordinary BeginV2.
-    pub fn new(directory: Arc<D>, artifacts: Arc<dyn ArtifactAdministration>) -> Self {
+    pub fn new(directory: D, artifacts: Arc<dyn ArtifactAdministration>) -> Self {
         Self {
             directory,
             artifacts,
         }
     }
+}
 
+#[async_trait]
+impl<D: Deref + Send + Sync> PendingInputWake for PendingInputDispatcher<D>
+where
+    D::Target: ThreadDirectory,
+{
     /// Attempt exactly one row; occupancy and pending state remain database facts.
-    pub async fn wake(&self, thread: &ThreadId) -> Result<(), AppError> {
+    async fn wake(&self, thread: &ThreadId) -> Result<(), AppError> {
         self.directory
             .dispatch_pending_input(thread, self)
             .await
@@ -75,7 +82,7 @@ impl<D: ThreadDirectory> PendingInputDispatcher<D> {
     }
 
     /// Scan each currently idle conversation once, without a timer or persistent worker.
-    pub async fn scan_startup(&self) -> Result<(), AppError> {
+    async fn scan_startup(&self) -> Result<(), AppError> {
         for thread in self
             .directory
             .pending_input_threads()
@@ -94,17 +101,10 @@ impl<D: ThreadDirectory> PendingInputDispatcher<D> {
 }
 
 #[async_trait]
-impl<D: ThreadDirectory> PendingInputWake for PendingInputDispatcher<D> {
-    async fn wake(&self, thread: &ThreadId) -> Result<(), AppError> {
-        self.wake(thread).await
-    }
-    async fn scan_startup(&self) -> Result<(), AppError> {
-        self.scan_startup().await
-    }
-}
-
-#[async_trait]
-impl<D: ThreadDirectory> PendingInputConsumer for PendingInputDispatcher<D> {
+impl<D: Deref + Send + Sync> PendingInputConsumer for PendingInputDispatcher<D>
+where
+    D::Target: ThreadDirectory,
+{
     async fn begin(
         &self,
         input: VerifiedPendingInput,

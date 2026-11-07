@@ -805,6 +805,12 @@ pub fn router(state: ServerState) -> Router {
             post(threads::withdraw_input),
         )
         .route(
+            "/api/threads/{thread_id}/inputs/{run_id}/release",
+            post(threads::release_input),
+        )
+        .route("/api/threads/{thread_id}/stop", post(threads::stop_work))
+        .route("/api/threads/{thread_id}/complete", post(threads::complete))
+        .route(
             "/api/threads/{thread_id}/runs/{run_id}/cancel",
             post(threads::cancel_run),
         )

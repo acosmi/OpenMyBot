@@ -400,6 +400,93 @@ pub async fn withdraw_input(
     }
 }
 
+/// Release a held input at the tail under the current generation.
+pub async fn release_input(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path((thread_id, run_id)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, HttpError> {
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::ReleasePendingInput {
+                thread_id: ThreadId::new(thread_id),
+                run_id: RunId::new(run_id),
+            },
+        )
+        .await?
+    {
+        AppReply::PendingInputState(receipt) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Stop pending work and optionally cancel the current foreground Run.
+pub async fn stop_work(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    body: Result<Json<openbot_contracts::command::StopThreadWorkBody>, JsonRejection>,
+) -> Result<Response, HttpError> {
+    let Json(body) = body.map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::StopThreadWork {
+                thread_id: ThreadId::new(thread_id),
+                run_id: body.run_id,
+            },
+        )
+        .await?
+    {
+        AppReply::ThreadWorkStopped(receipt) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Archive a direct conversation after its work has settled.
+pub async fn complete(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    request: Request,
+) -> Result<Response, HttpError> {
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::CompleteThread {
+                thread_id: ThreadId::new(thread_id),
+            },
+        )
+        .await?
+    {
+        AppReply::ThreadCompleted(receipt) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
 /// `POST /api/threads/{thread_id}/runs`; native durable first-turn framing.
 pub async fn begin_run(
     State(state): State<ServerState>,
@@ -957,6 +1044,60 @@ mod tests {
 
     #[async_trait]
     impl ThreadDirectory for FakeThreadDirectory {
+        async fn stop_thread_work(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            run_id: Option<&RunId>,
+        ) -> Result<openbot_contracts::command::ThreadWorkStopped, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            Ok(openbot_contracts::command::ThreadWorkStopped {
+                held: 2,
+                cancellation: run_id.map(|run_id| {
+                    openbot_contracts::command::ThreadRunCancellation {
+                        thread_id: thread_id.clone(),
+                        run_id: run_id.clone(),
+                        state: openbot_contracts::command::ThreadRunCancellationState::Requested,
+                    }
+                }),
+            })
+        }
+        async fn release_pending_input(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            run_id: &RunId,
+        ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            if run_id.as_str() == "dispatched" {
+                return Err(ThreadDirectoryError::PendingInputState);
+            }
+            if run_id.as_str() == "unavailable" {
+                return Err(ThreadDirectoryError::Unavailable);
+            }
+            Ok(openbot_contracts::command::PendingInputReceipt {
+                run_id: run_id.clone(),
+                state: openbot_contracts::command::PendingInputState::Pending,
+            })
+        }
+        async fn complete_thread(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+        ) -> Result<openbot_contracts::command::ThreadCompleted, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            if thread_id.as_str().ends_with("003") {
+                return Err(ThreadDirectoryError::ThreadNotIdle {
+                    foreground: Some(
+                        openbot_contracts::command::ThreadForegroundRunState::Cancelling,
+                    ),
+                    pending_inputs: 2,
+                });
+            }
+            Ok(openbot_contracts::command::ThreadCompleted {
+                status: openbot_contracts::command::ThreadStatusFilter::Archived,
+            })
+        }
         async fn submit_thread_input(
             &self,
             request: openbot_application::BeginThreadRunV2Request,
@@ -1304,6 +1445,120 @@ mod tests {
             (
                 Method::POST,
                 format!("/api/threads/{thread}/inputs/input-1/withdraw"),
+                "{}".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+        ] {
+            let response = app(
+                FakeThreadDirectory::new(Ok(true)),
+                FixedAuthResolver::granting(auth("u1")),
+            )
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .header("origin", "https://app.example.test")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{uri}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{uri}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body, expected, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn work_control_http_commands_preserve_inputs_and_errors() {
+        use serde_json::json;
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for (method, uri, body, status, expected) in [
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                "{}".into(),
+                200,
+                json!({"held":2,"cancellation":null}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                json!({"runId":"opaque/run?1"}).to_string(),
+                200,
+                json!({"held":2,"cancellation":{"threadId":thread,"runId":"opaque/run?1","state":"requested"}}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                json!({"runId":"r","actor":"spoof"}).to_string(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input%2Fone/release"),
+                String::new(),
+                200,
+                json!({"runId":"input/one","state":"pending"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/dispatched/release"),
+                String::new(),
+                409,
+                json!({"code":"pending_input_state"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/unavailable/release"),
+                String::new(),
+                503,
+                json!({"code":"dependency_unavailable"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input-1/release"),
+                "{}".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/complete"),
+                String::new(),
+                200,
+                json!({"status":"archived"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440003/complete".into(),
+                String::new(),
+                409,
+                json!({"code":"thread_not_idle","foreground":"cancelling","pendingInputs":2}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440001/complete".into(),
+                String::new(),
+                404,
+                json!({"code":"not_visible"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440002/stop".into(),
+                "{}".into(),
+                400,
+                json!({"code":"anchor_unsupported"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/complete"),
                 "{}".into(),
                 400,
                 json!({"code":"malformed_payload"}),

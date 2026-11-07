@@ -166,6 +166,8 @@ pub async fn list(
         | AppReply::ThreadInputOutcome(_)
         | AppReply::PendingInputs(_)
         | AppReply::PendingInputState(_)
+        | AppReply::ThreadWorkStopped(_)
+        | AppReply::ThreadCompleted(_)
         | AppReply::BotThreadPage(_)
         | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
@@ -274,6 +276,8 @@ pub async fn get(
         | AppReply::ThreadInputOutcome(_)
         | AppReply::PendingInputs(_)
         | AppReply::PendingInputState(_)
+        | AppReply::ThreadWorkStopped(_)
+        | AppReply::ThreadCompleted(_)
         | AppReply::BotThreadPage(_)
         | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
@@ -388,6 +392,8 @@ pub async fn create(
         | AppReply::ThreadInputOutcome(_)
         | AppReply::PendingInputs(_)
         | AppReply::PendingInputState(_)
+        | AppReply::ThreadWorkStopped(_)
+        | AppReply::ThreadCompleted(_)
         | AppReply::BotThreadPage(_)
         | AppReply::ThreadTitleSet(_)
         | AppReply::ThreadRunStarted(_)
@@ -775,7 +781,7 @@ mod tests {
                 })
             }
         }
-        let replies: [fn() -> AppReply; 5] = [
+        let replies: [fn() -> AppReply; 7] = [
             || {
                 AppReply::ThreadInputOutcome(
                     openbot_contracts::command::ThreadInputOutcome::Queued {
@@ -783,6 +789,17 @@ mod tests {
                         position: 1,
                     },
                 )
+            },
+            || {
+                AppReply::ThreadWorkStopped(openbot_contracts::command::ThreadWorkStopped {
+                    held: 1,
+                    cancellation: None,
+                })
+            },
+            || {
+                AppReply::ThreadCompleted(openbot_contracts::command::ThreadCompleted {
+                    status: openbot_contracts::command::ThreadStatusFilter::Archived,
+                })
             },
             || AppReply::PendingInputs(openbot_contracts::command::PendingInputs::default()),
             || {

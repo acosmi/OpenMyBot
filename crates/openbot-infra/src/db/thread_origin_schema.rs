@@ -954,10 +954,10 @@ fn compare_registered(observation: &ThreadOriginSchemaFacts) -> Result<(), Infra
 pub async fn capture(client: &Client) -> Result<ThreadOriginSchemaFacts, InfraError> {
     observation_on(client).await
 }
-/// Require the exact current native52 prefix, original origin oracle and history admission schema.
+/// Require the exact current native53 prefix, original origin oracle and history admission schema.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0052_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0052_VERSION)?;
+    let ledger = native::validate_known_prefix(client, native::NATIVE_0053_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_0053_VERSION)?;
     compare_registered(&observation_on(client).await?)?;
     super::thread_history_admission_schema::verify_schema(client).await
 }

@@ -137,6 +137,41 @@ async fn w07_pending_capacity_and_withdrawal() {
 
 #[tokio::test]
 #[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
+async fn w01_held_rows_do_not_block_direct_start() {
+    harness::with_temp_database(&harness::admin_config("pending_held_only"), "pendingheldonly", |config| async move {
+        let f=Fixture::new(config,8).await;
+        let model=f.model(CustomModelProtocol::OpenaiResponses).await;
+        let first=f.request(1,false,&model);
+        assert!(matches!(accepted(f.directory.submit_thread_input(first.clone(),None).await),ThreadInputOutcome::Started(_)));
+        let mut held=first.clone();held.command.run_id=RunId::new("held-only-input");
+        assert!(matches!(accepted(f.directory.submit_thread_input(held.clone(),None).await),ThreadInputOutcome::Queued {position:1,..}));
+        assert_eq!(f.directory.stop_thread_work(&auth(),&first.command.thread_id,None).await.unwrap().held,1);
+        let runtime=PostgresRunRuntime::new(f.pool.clone(),"owned-v2-runtime".into(),time::Duration::seconds(30),DEFAULT_DISPATCH_CLAIM_DURATION).unwrap();
+        let claim=runtime.claim_dispatch().await.unwrap().unwrap();
+        assert_eq!(claim.lease().run_id(),&first.command.run_id);
+        let lease=runtime.acknowledge_dispatch(&claim).await.unwrap();
+        runtime.finish_run(&lease,1,openbot_application::RunTerminal::Failed(openbot_application::RunFailureCode::ProviderUnavailable)).await.unwrap();
+        let held_row="SELECT state,held_reason,queued_at,state_changed_at FROM openbot_internal.thread_pending_inputs WHERE run_id=$1";
+        let c=f.pool.get().await.unwrap();
+        assert_eq!(c.query_one("SELECT count(*) FROM public.thread_run_occupancy WHERE thread_id=$1",&[&first.command.thread_id.as_str()]).await.unwrap().get::<_,i64>(0),0);
+        let before=c.query_one(held_row,&[&held.command.run_id.as_str()]).await.unwrap();drop(c);
+        let mut next=first.clone();next.command.run_id=RunId::new("after-held-only");next.command.message="Continue after stopping".into();
+        let ThreadInputOutcome::Started(started)=accepted(f.directory.submit_thread_input(next.clone(),None).await)
+            else {panic!("an idle conversation with only held rows must start directly")};
+        assert_eq!(started.run_id,next.command.run_id);
+        let c=f.pool.get().await.unwrap();
+        let after=c.query_one(held_row,&[&held.command.run_id.as_str()]).await.unwrap();
+        assert_eq!(after.get::<_,String>(0),"held");assert_eq!(after.get::<_,String>(1),"stopped_by_user");
+        assert_eq!(after.get::<_,time::OffsetDateTime>(2),before.get::<_,time::OffsetDateTime>(2));
+        assert_eq!(after.get::<_,time::OffsetDateTime>(3),before.get::<_,time::OffsetDateTime>(3));
+        assert!(c.query_opt("SELECT 1 FROM openbot_internal.thread_pending_inputs WHERE run_id=$1",&[&next.command.run_id.as_str()]).await.unwrap().is_none());
+        assert!(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1",&[&next.command.run_id.as_str()]).await.unwrap().is_some());
+        drop(c);drop(runtime);f.finish().await;Ok(())
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
 async fn pending_input_migration_and_visibility() {
     harness::with_temp_database(&harness::admin_config("pending_upgrade"), "pendingupgrade", |config| async move {
         let p=pool::connect(&config).await.unwrap();let mut c=p.get().await.unwrap();
@@ -171,10 +206,10 @@ async fn pending_input_migration_and_visibility() {
         assert!(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1",&[&next.command.run_id.as_str()]).await.unwrap().is_none());
         c.execute("UPDATE public.thread_leases SET expires_at=clock_timestamp() WHERE thread_id=$1",&[&first.command.thread_id.as_str()]).await.unwrap();
         c.execute("UPDATE openbot_internal.thread_pending_inputs SET state='held',held_reason='stopped_by_user' WHERE run_id=$1",&[&next.command.run_id.as_str()]).await.unwrap();drop(c);
+        // Held rows do not block a direct start on an idle conversation.
         let mut held_follower=first.clone();held_follower.command.run_id=RunId::new("behind-held");
-        assert!(matches!(accepted(f.directory.submit_thread_input(held_follower.clone(),None).await),ThreadInputOutcome::Queued {position:1,..}));
+        assert!(matches!(accepted(f.directory.submit_thread_input(held_follower.clone(),None).await),ThreadInputOutcome::Started(_)));
         f.directory.withdraw_pending_input(&auth(),&first.command.thread_id,&next.command.run_id).await.unwrap();
-        f.directory.withdraw_pending_input(&auth(),&first.command.thread_id,&held_follower.command.run_id).await.unwrap();
         let mut c=f.pool.get().await.unwrap();
         let tx=c.transaction().await.unwrap();
         let operation=Uuid::now_v7().to_string();let request_id=Uuid::now_v7().to_string();
