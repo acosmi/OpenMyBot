@@ -352,7 +352,7 @@ pub async fn withdraw_pending_input<D: ThreadDirectory>(
     if !ThreadIdentity::is_plausible(&thread_id) {
         return Err(AppError::MalformedPayload { field: "thread_id" });
     }
-    if run_id.as_str().is_empty() {
+    if run_id.as_str().is_empty() || run_id.as_str().as_bytes().contains(&0) {
         return Err(AppError::MalformedPayload { field: "run_id" });
     }
     directory
@@ -371,7 +371,10 @@ pub async fn stop_thread_work<D: ThreadDirectory>(
     if !ThreadIdentity::is_plausible(&thread_id) {
         return Err(AppError::MalformedPayload { field: "thread_id" });
     }
-    if run_id.as_ref().is_some_and(|run| run.as_str().is_empty()) {
+    if run_id
+        .as_ref()
+        .is_some_and(|run| run.as_str().is_empty() || run.as_str().as_bytes().contains(&0))
+    {
         return Err(AppError::MalformedPayload { field: "run_id" });
     }
     directory
@@ -390,7 +393,7 @@ pub async fn release_pending_input<D: ThreadDirectory>(
     if !ThreadIdentity::is_plausible(&thread_id) {
         return Err(AppError::MalformedPayload { field: "thread_id" });
     }
-    if run_id.as_str().is_empty() {
+    if run_id.as_str().is_empty() || run_id.as_str().as_bytes().contains(&0) {
         return Err(AppError::MalformedPayload { field: "run_id" });
     }
     directory

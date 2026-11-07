@@ -2626,16 +2626,17 @@ async fn initial_thread_title(
         .map(|value| history_text(&value).ok_or(ThreadDirectoryError::Corrupt { field: "content" }))
         .transpose()?;
     let message = first.as_deref().unwrap_or(incoming_message);
-    Ok(Some(
-        message
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .chars()
-            .take(120)
-            .collect(),
-    ))
+    // A blank first line falls back to the trimmed text's first line; blank text keeps NULL.
+    let title: String = message
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(120)
+        .collect();
+    Ok((!title.is_empty()).then_some(title))
 }
 
 enum SubmissionOutcome {
