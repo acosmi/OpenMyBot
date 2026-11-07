@@ -152,8 +152,11 @@ async fn w04_stop_holds_and_cancels_atomically() {
         let bare = runtime(&f);
         finish(&bare, &first.command.run_id, RunTerminal::Completed).await;
         f.directory.dispatch_pending_input(&first.command.thread_id, &RejectPayload).await.unwrap();
+        // Held rows do not block a direct start; queue one more input behind that new Run.
         let mut next = rejected.clone(); next.command.run_id = RunId::new("after-held-rejection");
-        f.directory.submit_thread_input(next, None).await.unwrap();
+        assert!(matches!(f.directory.submit_thread_input(next, None).await.unwrap(), openbot_application::SubmitThreadInputAttempt::Accepted(openbot_contracts::command::ThreadInputOutcome::Started(_))));
+        let mut behind = rejected.clone(); behind.command.run_id = RunId::new("behind-held-rejection");
+        f.directory.submit_thread_input(behind, None).await.unwrap();
         let stopped=f.directory.stop_thread_work(&auth(), &first.command.thread_id, Some(&first.command.run_id)).await.unwrap();
         assert_eq!(stopped.held,1);assert!(stopped.cancellation.is_none());
         let c=f.pool.get().await.unwrap();

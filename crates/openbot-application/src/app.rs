@@ -998,7 +998,7 @@ where
                     &self.threads,
                     std::sync::Arc::clone(&self.artifacts),
                 );
-                if let Err(error) = dispatcher.wake(&thread_id).await {
+                if let Err(error) = crate::PendingInputWake::wake(&dispatcher, &thread_id).await {
                     tracing::warn!(
                         code = error.code().as_str(),
                         "released input wake unavailable"

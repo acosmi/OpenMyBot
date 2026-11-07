@@ -684,18 +684,14 @@ impl ThreadDirectory for PostgresThreadDirectory {
             .await
             .map_err(|_| ThreadDirectoryError::Unavailable)?;
         // Use the original begin's transaction and lock order; no second connection waits
-        // on a conversation lock while this transaction holds its pending row.
-        let locked = tx
-            .query_one(
-                "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS locked",
-                &[&thread.as_str()],
-            )
-            .await
-            .map_err(|_| ThreadDirectoryError::Unavailable)?;
-        if !decode::<bool>(&locked, "locked")? {
-            original.rollback().await.map_err(map_v2_begin_error)?;
-            return Ok(());
-        }
+        // on a conversation lock while this transaction holds its pending row. A submit that
+        // holds the lock at wake time is waited for, so its retained input is still seen.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread.as_str()],
+        )
+        .await
+        .map_err(|_| ThreadDirectoryError::Unavailable)?;
         let row = tx.query_opt(
             "SELECT p.*,t.deployment_id,t.tenant_id FROM openbot_internal.thread_pending_inputs p
              JOIN public.threads t ON t.thread_id=p.thread_id
@@ -811,6 +807,10 @@ impl ThreadDirectory for PostgresThreadDirectory {
                 };
                 match outcome {
                     Ok(()) => dispatched = true,
+                    // Occupied again: the row stays pending and unchanged until the next wake.
+                    Err(openbot_contracts::error::AppError::LeaseConflict { .. }) => {
+                        return original.rollback().await.map_err(map_v2_begin_error);
+                    }
                     Err(error) => {
                         tx.batch_execute("ROLLBACK TO SAVEPOINT pending_dispatch_begin")
                             .await
@@ -818,7 +818,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
                         let code = error.code().as_str();
                         last_error = Some(code.to_owned());
                         held = match (error.http_status(), code) {
-                            (409, "lease_conflict") | (503, _) => None,
+                            (503, _) => None,
                             (403 | 404, _) => Some("authority_unavailable"),
                             _ => Some("dispatch_rejected"),
                         };
@@ -2626,16 +2626,17 @@ async fn initial_thread_title(
         .map(|value| history_text(&value).ok_or(ThreadDirectoryError::Corrupt { field: "content" }))
         .transpose()?;
     let message = first.as_deref().unwrap_or(incoming_message);
-    Ok(Some(
-        message
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .chars()
-            .take(120)
-            .collect(),
-    ))
+    // A blank first line falls back to the trimmed text's first line; blank text keeps NULL.
+    let title: String = message
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(120)
+        .collect();
+    Ok((!title.is_empty()).then_some(title))
 }
 
 enum SubmissionOutcome {
@@ -2695,9 +2696,6 @@ async fn apply_submit_input(
         .map_err(origin_error)?;
     crate::model_runtime::validate_actor_v2(tx, request).await?;
     let command = &request.command;
-    if !matches!(command.anchor, ThreadRunAnchor::DirectBot) {
-        return Err(ThreadDirectoryError::AnchorUnsupported);
-    }
     // One submission identity spans the pending and Run tables, including different threads.
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended('pending_input:' || $1::text,0))",
@@ -2790,11 +2788,15 @@ async fn apply_submit_input(
              WHERE c.operation_id=q.operation_id)) AS clearing,
            (SELECT count(*) FROM openbot_internal.thread_pending_inputs
              WHERE thread_id=$1 AND state IN ('pending','held')) AS retained,
+           (SELECT count(*) FROM openbot_internal.thread_pending_inputs
+             WHERE thread_id=$1 AND state='pending') AS waiting,
            clock_timestamp() AS accepted_at",
         &[&command.thread_id.as_str()],
     ).await.map_err(|error| unavailable("read input admission facts", error))?;
     let retained: i64 = decode(&row, "retained")?;
-    let busy = occupied || decode::<bool>(&row, "clearing")? || retained != 0;
+    // Held rows count toward capacity but do not block a direct start; only Release requeues them.
+    let busy =
+        occupied || decode::<bool>(&row, "clearing")? || decode::<i64>(&row, "waiting")? != 0;
     if !busy && materials.is_none() && !command.artifact_refs.is_empty() {
         return Ok(SubmissionOutcome::NeedsArtifacts);
     }

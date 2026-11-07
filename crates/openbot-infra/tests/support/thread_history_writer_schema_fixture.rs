@@ -37,12 +37,12 @@ async fn writer_check(c: &Client) -> TestResult {
         .await
         .map_err(|e| e.to_string())?;
     origin_schema::verify(c).await.map_err(|e| e.to_string())?;
-    let ledger = native::validate_known_prefix(c, 52)
+    let ledger = native::validate_known_prefix(c, native::NATIVE_0053_VERSION)
         .await
         .map_err(|e| e.to_string())?;
     require(
-        ledger.latest_version() == 52,
-        "current prefix not exact0052",
+        ledger.latest_version() == native::NATIVE_0053_VERSION,
+        "current prefix not exact0053",
     )?;
     Ok(())
 }
