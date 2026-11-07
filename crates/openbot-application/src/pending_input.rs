@@ -46,9 +46,7 @@ pub trait PendingInputWake: Send + Sync {
     /// Attempt one pending row for this conversation.
     async fn wake(&self, thread: &ThreadId) -> Result<(), AppError>;
     /// Scan once after the host has enrolled its original dataset.
-    async fn scan_startup(&self) -> Result<(), AppError> {
-        Ok(())
-    }
+    async fn scan_startup(&self) -> Result<(), AppError>;
 }
 
 /// The sole consumer of durable direct conversation input.
@@ -68,9 +66,15 @@ where
             artifacts,
         }
     }
+}
 
+#[async_trait]
+impl<D: Deref + Send + Sync> PendingInputWake for PendingInputDispatcher<D>
+where
+    D::Target: ThreadDirectory,
+{
     /// Attempt exactly one row; occupancy and pending state remain database facts.
-    pub async fn wake(&self, thread: &ThreadId) -> Result<(), AppError> {
+    async fn wake(&self, thread: &ThreadId) -> Result<(), AppError> {
         self.directory
             .dispatch_pending_input(thread, self)
             .await
@@ -78,7 +82,7 @@ where
     }
 
     /// Scan each currently idle conversation once, without a timer or persistent worker.
-    pub async fn scan_startup(&self) -> Result<(), AppError> {
+    async fn scan_startup(&self) -> Result<(), AppError> {
         for thread in self
             .directory
             .pending_input_threads()
@@ -93,19 +97,6 @@ where
             }
         }
         Ok(())
-    }
-}
-
-#[async_trait]
-impl<D: Deref + Send + Sync> PendingInputWake for PendingInputDispatcher<D>
-where
-    D::Target: ThreadDirectory,
-{
-    async fn wake(&self, thread: &ThreadId) -> Result<(), AppError> {
-        self.wake(thread).await
-    }
-    async fn scan_startup(&self) -> Result<(), AppError> {
-        self.scan_startup().await
     }
 }
 
