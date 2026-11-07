@@ -2240,6 +2240,7 @@ mod tests {
             message: " 你好\n".into(),
             selected_skill_slugs: Vec::new(),
             model_selection: None,
+            model_selection_v2: None,
         }
     }
 

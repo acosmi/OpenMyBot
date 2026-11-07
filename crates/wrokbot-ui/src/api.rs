@@ -68,7 +68,13 @@ use openbot_contracts::command::MAX_CHANNEL_ROUTING_REASON_CODE_POINTS;
 use openbot_contracts::command::ThreadRunCancellationState;
 #[cfg(target_arch = "wasm32")]
 use openbot_contracts::command::{
-    BeginThreadRunBody, CreateChannelRequest, RouteChannelRequest, ThreadMinted, ThreadStatus,
+    BeginThreadRunBody, CreateChannelRequest, PendingInputReceipt, PendingInputState,
+    RouteChannelRequest, SetThreadTitleBody, StopThreadWorkBody, ThreadCompleted, ThreadMinted,
+    ThreadStatus, ThreadTitleSet,
+};
+use openbot_contracts::command::{
+    BeginThreadRunV2Body, BotThreadPage, PendingInputs, ThreadForegroundRunState,
+    ThreadInputOutcome, ThreadStatusFilter, ThreadWorkStopped,
 };
 use openbot_contracts::command::{
     ChannelDetail, ChannelPage, ChannelRoutingDecision, MAX_THREAD_MESSAGE_BYTES,
@@ -92,6 +98,7 @@ use openbot_contracts::components::{
     ComponentRecords, GrantedCompiledComponents, MAX_COMPONENT_DESCRIPTION_BYTES,
     PendingComponentHumanDecisions, compiled_component_manifest, component_data_function_manifest,
 };
+use openbot_contracts::custom_model_catalog::CustomModelCatalogPage;
 #[cfg(target_arch = "wasm32")]
 use openbot_contracts::identity_provider::{IdentityProviderRemoved, IdentityProvidersResponse};
 use openbot_contracts::identity_provider::{
@@ -159,6 +166,20 @@ pub enum ApiError {
     Server,
     /// The browser-only API was called by a non-WASM target.
     Unavailable,
+    /// The conversation still holds foreground work or retained inputs (409).
+    ThreadNotIdle {
+        /// Foreground projection reported by the Server, when one occupies the conversation.
+        foreground: Option<ThreadForegroundRunState>,
+        /// Pending and held input count reported by the Server.
+        pending_inputs: u32,
+    },
+    /// The conversation already holds the full pending and held budget (429).
+    PendingInputLimit,
+    /// The addressed input is not in the state the command needs (409): a dispatched input
+    /// cannot be withdrawn, and only a held input can be released.
+    PendingInputState,
+    /// The conversation anchor does not support this command (400).
+    AnchorUnsupported,
 }
 
 // Only pure preflight call sites use this classification. HTTP receipts never do.
@@ -1340,6 +1361,320 @@ pub async fn begin_channel_run(
         message,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Direct-Bot continuous work (spec revision R484).
+//
+// The eight closed commands below are the only write path of the `/bot` entry.
+// Every reply is read from the Server's own body; nothing here invents a state.
+// ---------------------------------------------------------------------------
+
+/// Direct-Bot work-list page size; the application owns the authoritative clamp.
+pub const BOT_THREAD_PAGE_SIZE: u32 = 20;
+
+/// Read one page of the current actor's direct conversations with one Bot.
+pub async fn list_bot_threads(
+    agent_id: &BotId,
+    status: ThreadStatusFilter,
+    cursor: Option<&str>,
+) -> Result<BotThreadPage, ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::api::request::Request;
+
+        let path = bot_thread_list_path(agent_id.as_str(), status, cursor)?;
+        let response = Request::send(Request::get(&path)).await?;
+        if response.status() != 200 {
+            return Err(status_error(response.status()));
+        }
+        crate::api::request::Request::decode::<BotThreadPage>(&response)
+            .await
+            .map_err(|_| ApiError::InvalidResponse)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (agent_id, status, cursor);
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Rename one visible direct conversation.
+pub async fn set_thread_title(thread_id: &ThreadId, title: &str) -> Result<(), ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::api::request::Request;
+
+        let path = thread_work_path(thread_id.as_str(), "title")?;
+        let request = Request::post(&path)
+            .json(&SetThreadTitleBody {
+                title: title.to_owned(),
+            })
+            .map_err(|_| ApiError::InvalidResponse)?;
+        let response = Request::send(request).await?;
+        if response.status() != 200 {
+            return Err(status_error(response.status()));
+        }
+        let receipt = crate::api::request::Request::decode::<ThreadTitleSet>(&response)
+            .await
+            .map_err(|_| ApiError::InvalidResponse)?;
+        if receipt.thread_id != *thread_id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (thread_id, title);
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Accept one direct-Bot input; the Server either starts the Run or retains it durably.
+pub async fn submit_thread_input(
+    thread_id: &ThreadId,
+    body: &BeginThreadRunV2Body,
+) -> Result<ThreadInputOutcome, ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::api::request::Request;
+
+        let path = thread_work_path(thread_id.as_str(), "inputs")?;
+        let request = Request::post(&path)
+            .json(body)
+            .map_err(|_| ApiError::InvalidResponse)?;
+        let response = Request::send(request).await?;
+        let status = response.status();
+        if status != 200 {
+            return Err(command_error(
+                status,
+                &response.text().await.unwrap_or_default(),
+            ));
+        }
+        let outcome = crate::api::request::Request::decode::<ThreadInputOutcome>(&response)
+            .await
+            .map_err(|_| ApiError::InvalidResponse)?;
+        // The receipt is for this conversation and this caller-minted identity, or it is not ours.
+        let ours = match &outcome {
+            ThreadInputOutcome::Started(started) => {
+                started.thread_id == *thread_id && started.run_id == body.run_id
+            }
+            ThreadInputOutcome::Queued { run_id, .. } => *run_id == body.run_id,
+        };
+        if !ours {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(outcome)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (thread_id, body);
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Read the conversation's bounded pending and held inputs.
+pub async fn list_pending_inputs(thread_id: &ThreadId) -> Result<PendingInputs, ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::api::request::Request;
+
+        let path = thread_work_path(thread_id.as_str(), "inputs")?;
+        let response = Request::send(Request::get(&path)).await?;
+        if response.status() != 200 {
+            return Err(status_error(response.status()));
+        }
+        let inputs = crate::api::request::Request::decode::<PendingInputs>(&response)
+            .await
+            .map_err(|_| ApiError::InvalidResponse)?;
+        if inputs.items.len() > openbot_contracts::command::THREAD_PENDING_INPUTS_MAX as usize {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(inputs)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = thread_id;
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Withdraw one retained input that has not become a Run.
+pub async fn withdraw_pending_input(thread_id: &ThreadId, run_id: &RunId) -> Result<(), ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let path = format!("{}/withdraw", thread_input_path(thread_id, run_id)?);
+        pending_input_receipt(&path, run_id, PendingInputState::Withdrawn).await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (thread_id, run_id);
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Release one held input back to the tail of the queue.
+pub async fn release_pending_input(thread_id: &ThreadId, run_id: &RunId) -> Result<(), ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let path = format!("{}/release", thread_input_path(thread_id, run_id)?);
+        pending_input_receipt(&path, run_id, PendingInputState::Pending).await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (thread_id, run_id);
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Hold pending work and optionally request cancellation of the current foreground Run.
+pub async fn stop_thread_work(
+    thread_id: &ThreadId,
+    run_id: Option<&RunId>,
+) -> Result<ThreadWorkStopped, ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::api::request::Request;
+
+        let path = thread_work_path(thread_id.as_str(), "stop")?;
+        let request = Request::post(&path)
+            .json(&StopThreadWorkBody {
+                run_id: run_id.cloned(),
+            })
+            .map_err(|_| ApiError::InvalidResponse)?;
+        let response = Request::send(request).await?;
+        if response.status() != 200 {
+            return Err(status_error(response.status()));
+        }
+        let stopped = crate::api::request::Request::decode::<ThreadWorkStopped>(&response)
+            .await
+            .map_err(|_| ApiError::InvalidResponse)?;
+        // A cancellation receipt exists only for the exact foreground Run this request named.
+        if stopped.cancellation.as_ref().is_some_and(|cancellation| {
+            cancellation.thread_id != *thread_id || Some(&cancellation.run_id) != run_id
+        }) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(stopped)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (thread_id, run_id);
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Archive one idle direct conversation.
+pub async fn complete_thread(thread_id: &ThreadId) -> Result<(), ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::api::request::Request;
+
+        let path = thread_work_path(thread_id.as_str(), "complete")?;
+        let response = Request::send(Request::post(&path)).await?;
+        let status = response.status();
+        if status != 200 {
+            return Err(command_error(
+                status,
+                &response.text().await.unwrap_or_default(),
+            ));
+        }
+        let completed = crate::api::request::Request::decode::<ThreadCompleted>(&response)
+            .await
+            .map_err(|_| ApiError::InvalidResponse)?;
+        if completed.status != ThreadStatusFilter::Archived {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = thread_id;
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Read the first page of the owner's custom model catalog; each entry carries the frozen v2
+/// selection values. Decoding the page already checks every entry, the order and the cursor.
+pub async fn list_custom_model_catalog() -> Result<CustomModelCatalogPage, ApiError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use crate::api::request::Request;
+
+        let response = Request::send(Request::get("/api/me/custom-model-catalog")).await?;
+        if response.status() != 200 {
+            return Err(status_error(response.status()));
+        }
+        crate::api::request::Request::decode::<CustomModelCatalogPage>(&response)
+            .await
+            .map_err(|_| ApiError::InvalidResponse)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Err(ApiError::Unavailable)
+    }
+}
+
+/// Send one withdraw or release and accept only the receipt for the same input and state.
+#[cfg(target_arch = "wasm32")]
+async fn pending_input_receipt(
+    path: &str,
+    run_id: &RunId,
+    expected: PendingInputState,
+) -> Result<(), ApiError> {
+    use crate::api::request::Request;
+
+    let response = Request::send(Request::post(path)).await?;
+    let status = response.status();
+    if status != 200 {
+        return Err(command_error(
+            status,
+            &response.text().await.unwrap_or_default(),
+        ));
+    }
+    let receipt = crate::api::request::Request::decode::<PendingInputReceipt>(&response)
+        .await
+        .map_err(|_| ApiError::InvalidResponse)?;
+    if receipt.run_id != *run_id || receipt.state != expected {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(())
+}
+
+/// Classify one R484 command refusal from its status and body.
+///
+/// Only the stable codes that carry a fact the UI must show get their own error. A
+/// `thread_not_idle` body that does not decode into both facts is an invalid reply, never an
+/// idle foreground or an empty count; every other refusal keeps the generic classification.
+#[cfg(any(target_arch = "wasm32", test))]
+fn command_error(status: u16, body: &str) -> ApiError {
+    #[derive(serde::Deserialize)]
+    struct Refusal {
+        code: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NotIdle {
+        foreground: Option<ThreadForegroundRunState>,
+        pending_inputs: u32,
+    }
+    let Ok(Refusal { code }) = serde_json::from_str(body) else {
+        return status_error(status);
+    };
+    match (status, code.as_str()) {
+        (409, "thread_not_idle") => {
+            serde_json::from_str::<NotIdle>(body).map_or(ApiError::InvalidResponse, |reply| {
+                ApiError::ThreadNotIdle {
+                    foreground: reply.foreground,
+                    pending_inputs: reply.pending_inputs,
+                }
+            })
+        }
+        (409, "pending_input_state") => ApiError::PendingInputState,
+        (429, "pending_input_limit") => ApiError::PendingInputLimit,
+        (400, "anchor_unsupported") => ApiError::AnchorUnsupported,
+        _ => status_error(status),
+    }
 }
 
 /// Persist cancellation for the exact active native run; terminal still arrives via snapshot/SSE.
@@ -4017,6 +4352,47 @@ fn thread_status_path(thread_id: &str) -> Result<String, ApiError> {
     Ok(format!("/api/threads/{}", encode_url_component(thread_id)))
 }
 
+/// One direct-Bot work command below a validated conversation identity.
+#[cfg(target_arch = "wasm32")]
+fn thread_work_path(thread_id: &str, command: &str) -> Result<String, ApiError> {
+    validate_thread_id(thread_id)?;
+    Ok(format!(
+        "/api/threads/{}/{command}",
+        encode_url_component(thread_id)
+    ))
+}
+
+/// One retained input of a validated conversation.
+#[cfg(target_arch = "wasm32")]
+fn thread_input_path(thread_id: &ThreadId, run_id: &RunId) -> Result<String, ApiError> {
+    validate_run_id(run_id.as_str())?;
+    Ok(format!(
+        "{}/{}",
+        thread_work_path(thread_id.as_str(), "inputs")?,
+        encode_url_component(run_id.as_str())
+    ))
+}
+
+/// One work-list page of one Bot; the cursor is the Server's opaque keyset position.
+#[cfg(any(target_arch = "wasm32", test))]
+fn bot_thread_list_path(
+    agent_id: &str,
+    status: ThreadStatusFilter,
+    cursor: Option<&str>,
+) -> Result<String, ApiError> {
+    validate_agent_id(agent_id)?;
+    let mut path = format!(
+        "/api/agents/{}/threads?status={}&limit={BOT_THREAD_PAGE_SIZE}",
+        encode_url_component(agent_id),
+        status.as_str()
+    );
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=");
+        path.push_str(&encode_url_component(cursor));
+    }
+    Ok(path)
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 fn thread_cancel_path(thread_id: &str, run_id: &str) -> Result<String, ApiError> {
     validate_thread_id(thread_id)?;
@@ -5084,5 +5460,77 @@ mod tests {
             agent_profile_href("bad\nagent").unwrap_err(),
             ApiError::InvalidResponse
         );
+    }
+
+    #[test]
+    fn the_work_list_request_names_the_filter_and_the_opaque_cursor() {
+        assert_eq!(
+            bot_thread_list_path("bot/one", ThreadStatusFilter::Active, None).unwrap(),
+            "/api/agents/bot%2Fone/threads?status=active&limit=20"
+        );
+        assert_eq!(
+            bot_thread_list_path("bot/one", ThreadStatusFilter::Archived, Some("k+1=")).unwrap(),
+            "/api/agents/bot%2Fone/threads?status=archived&limit=20&cursor=k%2B1%3D"
+        );
+        assert_eq!(
+            bot_thread_list_path("", ThreadStatusFilter::Active, None).unwrap_err(),
+            ApiError::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn work_command_refusals_keep_the_servers_facts_and_never_invent_them() {
+        assert_eq!(
+            command_error(
+                409,
+                r#"{"code":"thread_not_idle","foreground":"cancelling","pendingInputs":2}"#
+            ),
+            ApiError::ThreadNotIdle {
+                foreground: Some(ThreadForegroundRunState::Cancelling),
+                pending_inputs: 2,
+            }
+        );
+        assert_eq!(
+            command_error(
+                409,
+                r#"{"code":"thread_not_idle","foreground":null,"pendingInputs":1}"#
+            ),
+            ApiError::ThreadNotIdle {
+                foreground: None,
+                pending_inputs: 1,
+            }
+        );
+        // A body without both facts is not read as an idle foreground or an empty count.
+        for body in [
+            r#"{"code":"thread_not_idle","foreground":"paused","pendingInputs":1}"#,
+            r#"{"code":"thread_not_idle","foreground":null,"pendingInputs":-1}"#,
+            r#"{"code":"thread_not_idle","foreground":null}"#,
+        ] {
+            assert_eq!(
+                command_error(409, body),
+                ApiError::InvalidResponse,
+                "{body}"
+            );
+        }
+        // Withdrawing a dispatched input and releasing an input that is not held share one code.
+        assert_eq!(
+            command_error(409, r#"{"code":"pending_input_state"}"#),
+            ApiError::PendingInputState
+        );
+        assert_eq!(
+            command_error(429, r#"{"code":"pending_input_limit"}"#),
+            ApiError::PendingInputLimit
+        );
+        assert_eq!(
+            command_error(400, r#"{"code":"anchor_unsupported"}"#),
+            ApiError::AnchorUnsupported
+        );
+        // Every other refusal keeps the generic classification; a bare 429 is no budget fact.
+        assert_eq!(
+            command_error(409, r#"{"code":"lease_conflict"}"#),
+            ApiError::Conflict
+        );
+        assert_eq!(command_error(429, ""), ApiError::Server);
+        assert_eq!(status_error(429), ApiError::Server);
     }
 }
