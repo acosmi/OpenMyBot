@@ -2695,9 +2695,6 @@ async fn apply_submit_input(
         .map_err(origin_error)?;
     crate::model_runtime::validate_actor_v2(tx, request).await?;
     let command = &request.command;
-    if !matches!(command.anchor, ThreadRunAnchor::DirectBot) {
-        return Err(ThreadDirectoryError::AnchorUnsupported);
-    }
     // One submission identity spans the pending and Run tables, including different threads.
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended('pending_input:' || $1::text,0))",
@@ -2790,11 +2787,15 @@ async fn apply_submit_input(
              WHERE c.operation_id=q.operation_id)) AS clearing,
            (SELECT count(*) FROM openbot_internal.thread_pending_inputs
              WHERE thread_id=$1 AND state IN ('pending','held')) AS retained,
+           (SELECT count(*) FROM openbot_internal.thread_pending_inputs
+             WHERE thread_id=$1 AND state='pending') AS waiting,
            clock_timestamp() AS accepted_at",
         &[&command.thread_id.as_str()],
     ).await.map_err(|error| unavailable("read input admission facts", error))?;
     let retained: i64 = decode(&row, "retained")?;
-    let busy = occupied || decode::<bool>(&row, "clearing")? || retained != 0;
+    // Held rows count toward capacity but do not block a direct start; only Release requeues them.
+    let busy =
+        occupied || decode::<bool>(&row, "clearing")? || decode::<i64>(&row, "waiting")? != 0;
     if !busy && materials.is_none() && !command.artifact_refs.is_empty() {
         return Ok(SubmissionOutcome::NeedsArtifacts);
     }
