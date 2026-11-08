@@ -268,14 +268,18 @@ Phase 8 completion point: V7-IMPL-047 (#233) is merged together with V7-COMP-026
 | Ledger sync | Record the testkit binding and desktop test-stack repairs while retaining open implementation and owner checks | [#272](https://github.com/acosmi/OpenMyBot/pull/272) | [9a361a0af6](https://github.com/acosmi/OpenMyBot/commit/9a361a0af61fb82d0a19d54c84c0c949e8a36ada) | 2026-11-02 |
 | FIX-NATIVE0021-FEATURE-GATE | Require server-runtime for the native 0021 integration test target | [#274](https://github.com/acosmi/OpenMyBot/pull/274) | [5558540a0b](https://github.com/acosmi/OpenMyBot/commit/5558540a0b8c997e6b5f03b26d4c46088f930040) | 2026-11-02 |
 | FIX-INFRA-TEST-FEATURES | Declare server-runtime requirements for 72 integration test targets while retaining shared tests in supported builds | [#276](https://github.com/acosmi/OpenMyBot/pull/276) | [d8bbda0ebf](https://github.com/acosmi/OpenMyBot/commit/d8bbda0ebf7ed9b1d6c4b8d4e289e06b3b741717) | 2026-11-02 |
+| V7-IMPL-048 | List Bot work and maintain conversation titles | [#273](https://github.com/acosmi/OpenMyBot/pull/273) | [4d23c18d42](https://github.com/acosmi/OpenMyBot/commit/4d23c18d42f323353f7f1b46ec3dffbede054ac7) | 2026-11-07 |
+| V7-IMPL-049 | Persist direct-assistant inputs as durable pending rows | [#275](https://github.com/acosmi/OpenMyBot/pull/275) | [4eceb76a69](https://github.com/acosmi/OpenMyBot/commit/4eceb76a69e52b06ee01c858124a3fb012abdb61) | 2026-11-07 |
+| V7-IMPL-050 | Dispatch durable pending inputs in FIFO order after the foreground terminal | [#278](https://github.com/acosmi/OpenMyBot/pull/278) | [ff25e7c4b0](https://github.com/acosmi/OpenMyBot/commit/ff25e7c4b00e7d3e507c6c8b3abfd5dd2425a3fe) | 2026-11-07 |
+| V7-IMPL-051 | Stop, release and complete direct work; held rows do not block a direct start | [#279](https://github.com/acosmi/OpenMyBot/pull/279) | [f139bb06b2](https://github.com/acosmi/OpenMyBot/commit/f139bb06b2af1dad851c2536a447c69974f58e83) | 2026-11-07 |
+| V7-IMPL-052 | Wire the direct-assistant work list, acceptance and stop flows in the UI | [#280](https://github.com/acosmi/OpenMyBot/pull/280) | [d6396f2ed5](https://github.com/acosmi/OpenMyBot/commit/d6396f2ed5b805cf9b5787c8399e355f2f602b51) | 2026-11-07 |
+| V7-IMPL-053 | Two-work journey acceptance tests; catalog GET accepts same-origin reads without Origin (FIX-053-1), the stop request keeps its owner (FIX-053-2), an unsaved work shows no pending-input error (FIX-053-3) | [#281](https://github.com/acosmi/OpenMyBot/pull/281) | [987915210f](https://github.com/acosmi/OpenMyBot/commit/987915210f2929f2936bdbce49bb73f27048e189) | 2026-11-08 |
 
 ## Open
 
 | Task | Status | PR |
 |---|---|---|
 | V7-IMPL-046 | Draft PR, open: bounded whole-PostgreSQL restore | [#226](https://github.com/acosmi/OpenMyBot/pull/226) |
-| V7-IMPL-048 | Draft PR, open: Bot work listing and conversation titles | [#273](https://github.com/acosmi/OpenMyBot/pull/273) |
-| V7-IMPL-049 | Draft PR, open: persistent direct-assistant inputs | [#275](https://github.com/acosmi/OpenMyBot/pull/275) |
 | V6-PR-048 | Closed unmerged 2026-10-12; the naming unification moves to a separate compatibility migration | [#59](https://github.com/acosmi/OpenMyBot/pull/59) |
 | V6-PR-054 | Closed unmerged 2026-10-12; skip-link keyboard focus carried as a UI accessibility item | [#70](https://github.com/acosmi/OpenMyBot/pull/70) |
 | V6-PR-059 | Not approved: SDK own-login contract draft; no PR | none |
