@@ -3,6 +3,8 @@
 #![cfg(feature = "server-runtime")]
 
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 
 use async_trait::async_trait;
 use openbot_application::AgentContextSource;
@@ -1163,7 +1165,7 @@ async fn o06_later_member_and_v1_to_v2_keep_original_creator() {
             f.directory.begin_thread_run(later.clone()).await.map_err(|e|e.to_string())?;
             settle(&p,later.command.run_id.as_str()).await?;
             let b_auth=current_owned_auth(&p,"origin-b").await?;
-            let model=f.models.create(&b_auth,&CreateModelConnection{name:"Owned later B".into(),protocol:CustomModelProtocol::OpenaiChatCompletions,endpoint:"https://owned-origin.example.test/v1".into(),model:"owned-later-model".into(),enabled:true,api_key:ModelApiKey::new(Zeroizing::new("OWNED_ORIGIN_LATER_B_KEY".into())).map_err(|e|e.to_string())?}).await.map_err(|e|e.to_string())?;
+            let model=f.models.create(&recovery_admission::outside_domain(b_auth.clone()),&CreateModelConnection{name:"Owned later B".into(),protocol:CustomModelProtocol::OpenaiChatCompletions,endpoint:"https://owned-origin.example.test/v1".into(),model:"owned-later-model".into(),enabled:true,api_key:ModelApiKey::new(Zeroizing::new("OWNED_ORIGIN_LATER_B_KEY".into())).map_err(|e|e.to_string())?}).await.map_err(|e|e.to_string())?;
             let mut v2=f.request(603,false,&model);v2.actor=ActorId::new("origin-b");v2.command.thread_id=first.command.thread_id.clone();
             f.directory.begin_thread_run_v2(v2.clone()).await.map_err(|e|e.to_string())?;
             require(f.directory.begin_thread_run_v2(v2.clone()).await.map_err(|e|e.to_string())?.replayed,"exact later B V2 did not replay")?;
@@ -1305,7 +1307,8 @@ impl ModelFixture {
     async fn model(&self, protocol: CustomModelProtocol) -> ModelConnection {
         self.models
             .create(
-                &auth(),
+                // Creation needs a request binding outside every recovery domain.
+                &recovery_admission::outside_domain(auth()),
                 &CreateModelConnection {
                     name: "Owned choice".into(),
                     protocol,

@@ -10,6 +10,8 @@
 ))]
 
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -865,7 +867,8 @@ impl V2 {
     ) -> TestResult<ModelConnection> {
         self.models
             .create(
-                &auth(),
+                // Creation needs a request binding outside every recovery domain.
+                &recovery_admission::outside_domain(auth()),
                 &CreateModelConnection {
                     name: "Owned choice".into(),
                     protocol,

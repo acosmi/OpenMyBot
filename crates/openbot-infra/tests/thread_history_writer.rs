@@ -740,7 +740,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
 #[tokio::test]
 #[ignore = "requires explicitly owned loopback SCRAM PostgreSQL17.11"]
 async fn w12_current51_explicit50_and_original_host_id_regression() {
-    for version in [47, 48, 49, 50, 51, 52] {
+    for version in [47, 48, 49, 50, 51, 52, 53, native::NATIVE_LATEST_VERSION] {
         owned(&format!("writer51boundary{version}"),move|p,_|async move{
             initialize(&p,version).await?;
             let mut c=p.get().await.map_err(|e|e.to_string())?;
@@ -753,7 +753,7 @@ async fn w12_current51_explicit50_and_original_host_id_regression() {
                 require(admission_schema::verify(&c).await.is_err(),"explicit0050 current consumer bypassed new whole0052")?;
             }
             if version==51 { writer_check_legacy51(&mut c).await?; }
-            if version<52 {native::apply(&mut c).await.map_err(|e|e.to_string())?;}
+            if version<native::NATIVE_LATEST_VERSION {native::apply(&mut c).await.map_err(|e|e.to_string())?;}
             writer_check(&c).await?;
             raw_thread(&c,"writer-original-permanent-id").await?;
             close_writer_head(&c,"writer-original-permanent-id").await?;
