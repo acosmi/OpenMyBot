@@ -874,7 +874,7 @@ pub(super) async fn run(config: pool::DatabaseConfig) -> Result<(), String> {
         let package:Arc<dyn ProviderAdapter>=Arc::new(CountingProvider{inner:Arc::new(OpenAiProvider::new_with_credential_source(OpenAiProviderConfig::new(
             Url::parse(&format!("{}/v1/responses",view.origin())).map_err(|_|"owned_package_endpoint")?,"unused-default-model".to_owned(),OpenAiProtocol::Responses,budget,None)
             .map_err(|_|"owned_package_config")?,package_credentials,view.dialer()?)),counters:counters.clone(),kind:0});
-        let custom:Arc<dyn ProviderAdapter>=Arc::new(CountingCustom{inner:Arc::new(PostgresCustomModelProvider::new(application_pool.clone(),vault.clone(),deployment.clone(),tenant.clone(),view.dialer()?,budget,None)
+        let custom:Arc<dyn ProviderAdapter>=Arc::new(CountingCustom{inner:Arc::new(PostgresCustomModelProvider::new(application_pool.clone(),vault.clone(),deployment.clone(),tenant.clone(),view.dialer()?,budget,None, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&application_pool, &deployment, &tenant))
             .map_err(|_|"owned_actual_custom")?),counters:counters.clone()});
         let provider=Arc::new(RetryingProvider::new(Arc::new(ProviderRouter::new(package,managed).with_custom(custom)
             .with_remote_agui(Arc::new(CountingProvider{inner:Arc::new(RemoteAguiProvider::new(remote)),counters:counters.clone(),kind:2}))),RetryingProviderConfig::default()).map_err(|_|"owned_retry_provider")?);

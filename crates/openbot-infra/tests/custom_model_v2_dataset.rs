@@ -7,6 +7,8 @@ mod harness;
 mod pending_input_dispatcher;
 #[path = "custom_model_v2_dataset/pending_inputs.rs"]
 mod pending_inputs;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 #[path = "custom_model_v2_dataset/work_control.rs"]
 mod work_control;
 
@@ -65,15 +67,18 @@ impl RemoteAguiTransport for ClosedProbe {
     }
 }
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    // This owned database is outside every recovery domain (spec revision R484 S12).
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct W02ArtifactRoot(std::path::PathBuf);
 impl W02ArtifactRoot {

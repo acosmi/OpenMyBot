@@ -271,6 +271,12 @@ impl ServerFixture {
                 max_output_tokens: 1024,
             },
             custom_model_dialer: Some(tls.dialer()?),
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
         })
         .map_err(|e| e.to_string())
     }

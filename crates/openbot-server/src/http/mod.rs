@@ -1046,6 +1046,15 @@ mod tests {
     use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
     use tracing_subscriber::registry::Registry;
 
+    /// Card section 5.2 R4 (spec revision R484 S12): the owned case lives
+    /// with the SingleUser artifact fixture it reuses.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires owned PostgreSQL, canonical SingleUser owner and actual artifact store"]
+    async fn outside_recovery_domain_admission_lets_single_user_consumers_run() {
+        super::artifact_reads::tests::outside_recovery_domain_single_user_case().await;
+    }
+
     // -----------------------------------------------------------------------
     // 测试替身
     // -----------------------------------------------------------------------

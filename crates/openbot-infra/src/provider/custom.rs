@@ -39,6 +39,7 @@ pub struct PostgresCustomModelProvider {
     connect_budget: SafeHttpBudget,
     stall_timeout: Option<Duration>,
     model_dataset_binding: Option<Arc<crate::model_dataset::PostgresModelDatasetBinding>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
     #[cfg(test)]
     v2_vault_opens: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -46,6 +47,8 @@ pub struct PostgresCustomModelProvider {
 }
 impl PostgresCustomModelProvider {
     /// Bind only trusted host infrastructure. URL/model/key are never accepted by this factory.
+    /// The recovery gate is required, so a host cannot assemble an ungated model consumer.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: crate::db::pool::DatabasePool,
         vault: CredentialRecordVault,
@@ -54,6 +57,7 @@ impl PostgresCustomModelProvider {
         dialer: SafeDialer,
         connect_budget: SafeHttpBudget,
         stall_timeout: Option<Duration>,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, ProviderPortError> {
         if deployment.as_str().is_empty()
             || tenant.as_str().is_empty()
@@ -72,6 +76,7 @@ impl PostgresCustomModelProvider {
             connect_budget,
             stall_timeout,
             model_dataset_binding: None,
+            recovery_gate,
             #[cfg(test)]
             v2_vault_opens: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -97,6 +102,7 @@ impl PostgresCustomModelProvider {
         &self,
         request: ProviderRequest,
         deadline: std::time::Instant,
+        admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
     ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
         let binding = self
             .model_dataset_binding
@@ -132,6 +138,7 @@ impl PostgresCustomModelProvider {
                 if loaded.binding!=*expected{return Err(invalid("custom_model_binding"));}
                 if loaded.has_cost_cap{return Err(invalid("custom_model_unpriced"));}
                 let secret_id=Uuid::parse_str(loaded.binding.secret_id()).map_err(|_|invalid("custom_model_credential"))?;
+                require_model_confirmed(transaction.as_transaction(),loaded.binding.connection_id(),admission).await?;
                 // An outer timeout cannot preempt this synchronous continuation when a
                 // Ready SQL future consumes the last budget in the same poll.
                 if std::time::Instant::now()>=deadline{return Err(ProviderPortError::Unavailable);}
@@ -166,6 +173,7 @@ impl PostgresCustomModelProvider {
                 // Synchronous Vault/configuration work also shares the original budget.
                 // Refuse before declaring any possible adapter/network effect.
                 if std::time::Instant::now()>=deadline{return Err(ProviderPortError::Unavailable);}
+                admission.verify_current_before(deadline).map_err(|_|ProviderPortError::Unavailable)?;
                 // This is a conservative may-have-effect fence, not a remote-send or ACK.
                 progress.network_started.store(true,Ordering::SeqCst);
                 adapter.start(request).await
@@ -209,6 +217,7 @@ impl PostgresCustomModelProvider {
         client: &mut crate::db::pool::PooledClient,
         request: ProviderRequest,
         progress: &StartProgress,
+        admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
     ) -> Attempt {
         let tx = match client.transaction().await {
             Ok(tx) => tx,
@@ -250,6 +259,7 @@ impl PostgresCustomModelProvider {
             }
             let secret_id = Uuid::parse_str(loaded.binding.secret_id())
                 .map_err(|_| invalid("custom_model_credential"))?;
+            require_model_confirmed(&tx, loaded.binding.connection_id(), admission).await?;
             let opened = self
                 .vault
                 .open(
@@ -308,6 +318,9 @@ impl PostgresCustomModelProvider {
                     Box::new(AnthropicProvider::new(config, self.dialer.clone()))
                 }
             };
+            admission
+                .verify_current_before(admission.deadline())
+                .map_err(|_| ProviderPortError::Unavailable)?;
             progress.network_started.store(true, Ordering::SeqCst);
             // Existing transport errors do not identify the redirect hop. A 303/307 POST may
             // already have happened before a later DNS/connect error, so never retry that error.
@@ -342,7 +355,8 @@ impl ProviderAdapter for PostgresCustomModelProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
-        let v2_deadline = std::time::Instant::now() + self.connect_budget.timeout();
+        // One entry clock for the admission, both starts and their final recheck.
+        let deadline = std::time::Instant::now() + self.connect_budget.timeout();
         super::common::validate_request(&request)?;
         let ProviderRoute::CustomModel(binding) = &request.route else {
             return Err(invalid("custom_model_route"));
@@ -353,10 +367,15 @@ impl ProviderAdapter for PostgresCustomModelProvider {
         if request.rate_card.is_some() || request.cost_cap.is_some() {
             return Err(invalid("custom_model_unpriced"));
         }
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ProviderPortError::Unavailable)?;
         if binding.v2_snapshot().is_some() {
-            return self.start_v2(request, v2_deadline).await;
+            return self.start_v2(request, deadline, &admission).await;
         }
-        let deadline = tokio::time::Instant::now() + self.connect_budget.timeout();
+        let deadline = tokio::time::Instant::from_std(deadline);
         let client = tokio::time::timeout_at(deadline, self.pool.get())
             .await
             .map_err(|_| ProviderPortError::Unavailable)?
@@ -373,6 +392,7 @@ impl ProviderAdapter for PostgresCustomModelProvider {
                 connection.client.as_mut().expect("owned start connection"),
                 request,
                 &progress,
+                &admission,
             ),
         )
         .await;
@@ -395,6 +415,33 @@ impl ProviderAdapter for PostgresCustomModelProvider {
                 })),
         }
     }
+}
+
+/// Both starts: no Vault-open of a restored connection before its receipt.
+async fn require_model_confirmed(
+    tx: &tokio_postgres::Transaction<'_>,
+    connection: &str,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
+) -> Result<(), ProviderPortError> {
+    crate::restore_reconfirmation::require_confirmed_before(
+        tx,
+        crate::restore_reconfirmation::RequirementSource {
+            cohort: admission.restore_cohort(),
+            kind: crate::restore_reconfirmation::RequirementKind::ModelSecret,
+            source_ref: connection,
+        },
+        admission.deadline(),
+    )
+    .await
+    .map_err(|error| match error {
+        crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+            invalid("custom_model_credential")
+        }
+        _ => ProviderPortError::Unavailable,
+    })?;
+    admission
+        .verify_current_before(admission.deadline())
+        .map_err(|_| ProviderPortError::Unavailable)
 }
 
 fn invalid(field: &'static str) -> ProviderPortError {
@@ -611,7 +658,7 @@ mod v2_vault_tests {
                 let dns=Arc::new(CountedDns(AtomicUsize::new(0)));
                 let dialer=SafeDialer::with_resolver(crate::net::safe_http::EgressPolicy::default(),dns.clone());
                 let adapter=PostgresCustomModelProvider::new(p.clone(),vault.clone(),DeploymentId::new(DEP),TenantId::new(TENANT),dialer,
-                    SafeHttpBudget::new(64*1024*1024,Duration::from_secs(5)).unwrap(),Some(Duration::from_secs(2))).unwrap()
+                    SafeHttpBudget::new(64*1024*1024,Duration::from_secs(5)).unwrap(),Some(Duration::from_secs(2)), crate::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &DeploymentId::new(DEP), &TenantId::new(TENANT))).unwrap()
                     .with_model_dataset_binding(binding.clone()).unwrap();
                 assert_eq!(adapter.v2_vault_opens.load(Ordering::SeqCst),0);
                 let c=p.get().await.unwrap();let id=Uuid::parse_str(&model.id).unwrap();let run=req.command.run_id.as_str();
@@ -844,6 +891,11 @@ mod v2_vault_tests {
                 dialer,
                 SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).unwrap(),
                 Some(Duration::from_secs(2)),
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    self.auth.deployment(),
+                    self.auth.tenant(),
+                ),
             )
             .unwrap()
             .with_model_dataset_binding(self.binding.clone())
@@ -1003,6 +1055,11 @@ mod v2_vault_tests {
                             ),
                             SafeHttpBudget::new(64 * 1024 * 1024, timeout).unwrap(),
                             Some(Duration::from_secs(2)),
+                            crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                                &f.pool,
+                                f.auth.deployment(),
+                                f.auth.tenant(),
+                            ),
                         )
                         .unwrap()
                         .with_model_dataset_binding(f.binding.clone())

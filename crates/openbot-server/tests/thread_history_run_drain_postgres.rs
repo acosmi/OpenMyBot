@@ -1817,6 +1817,7 @@ async fn thread_history_run_drain_streaming_and_custom_v2_start_window_terminate
                 ),
                 SafeHttpBudget::new(64 * 1024 * 1024, START_BUDGET).map_err(text)?,
                 Some(Duration::from_secs(2)),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &DeploymentId::new(DEP), &TenantId::new(TENANT)),
             )
             .map_err(text)?
             .with_model_dataset_binding(Arc::clone(&binding))

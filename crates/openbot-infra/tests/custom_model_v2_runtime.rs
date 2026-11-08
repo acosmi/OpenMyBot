@@ -230,6 +230,11 @@ impl Fixture {
             dialer,
             SafeHttpBudget::new(64 * 1024 * 1024, timeout).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(self.binding.clone())
@@ -1184,6 +1189,11 @@ async fn unconfigured_constructor_closes_v2_and_keeps_actual_legacy_v1_route() {
             tls.dialer(),
             SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &f.pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap();
         refused(old_provider.start(request).await);

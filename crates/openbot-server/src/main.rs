@@ -130,6 +130,7 @@ struct BuiltInAgentAssemblyInput {
     components: Arc<PostgresComponentAdministration>,
     sandboxed_components: Arc<PostgresSandboxedComponentAdministration>,
     budgets: AgentBudgets,
+    recovery_gate: openbot_infra::recovery_control::RecoveryReadGate,
 }
 
 #[tokio::main]
@@ -701,6 +702,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         components,
         sandboxed_components,
         budgets: server.agent_budgets,
+        recovery_gate: recovery_read_gate.clone(),
     })?;
     let built_in_agent_ready = built_in_agent.is_some() || !requires_agent_runtime;
     let run_relay = RunRelay::start_with_database(
@@ -934,6 +936,7 @@ fn build_built_in_agent(input: BuiltInAgentAssemblyInput) -> Result<AgentAssembl
         components,
         sandboxed_components,
         budgets,
+        recovery_gate,
     } = input;
     if !required {
         return Ok((Arc::new(NoRunDispatchConsumer), None));
@@ -1005,6 +1008,7 @@ fn build_built_in_agent(input: BuiltInAgentAssemblyInput) -> Result<AgentAssembl
             custom_model_dialer,
             SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(30))?,
             budgets.stall_timeout,
+            recovery_gate,
         )?
         .with_model_dataset_binding(Arc::clone(&model_dataset_binding))?,
     );

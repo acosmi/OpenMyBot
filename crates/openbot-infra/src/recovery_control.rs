@@ -2491,4 +2491,75 @@ pub(crate) mod tests {
         }
     }
 
+
+    /// Class 7 (spec revision R484): the RunAssertion key is HKDF-keyed by the
+    /// published epoch, so a still-unexpired assertion signed under epoch A is
+    /// refused by the epoch B runtime; the signed payload keeps its field set.
+    #[cfg(feature = "server-runtime")]
+    #[test]
+    fn t046_28_old_epoch_run_assertion_is_rejected_within_ttl() {
+        use openbot_contracts::ids::{ActorId, BotId, DeploymentId, RunId, TenantId};
+        use openbot_domain::remote_callback::{
+            RUN_ASSERTION_TTL_MILLIS, RemoteRunAssertionSigner, RemoteRunScope, RemoteToolSet,
+        };
+        let binding = |epoch: &str| -> super::activation::ActivationBinding {
+            let mut value = binding();
+            value["authorizationEpoch"] = json!(epoch);
+            serde_json::from_value(value).expect("closed binding")
+        };
+        let master = [0x5au8; 32];
+        let signer = |epoch: &str| {
+            let key = super::runtime::authorization_key(
+                &binding(epoch),
+                super::AuthorizationPurpose::RunAssertion,
+                &master,
+            );
+            RemoteRunAssertionSigner::new(key.expose().to_vec()).expect("signer")
+        };
+        let epoch_a = signer(EPOCH);
+        let epoch_b = signer(&"22".repeat(32));
+        let scope = RemoteRunScope {
+            deployment: DeploymentId::new("dep"),
+            tenant: TenantId::new("ten"),
+            bot: BotId::new("bot"),
+            actor: ActorId::new("actor"),
+            run: RunId::new("run"),
+        };
+        let tools = RemoteToolSet::new(["remember"]).expect("tools");
+        let issued = 1_700_000_000_000i64;
+        let signed = epoch_a.mint(scope, &tools, issued).expect("mint under epoch A");
+        let within_ttl = issued + RUN_ASSERTION_TTL_MILLIS / 2;
+        // Positive control: the same epoch verifies inside the TTL.
+        epoch_a.verify(&signed, within_ttl).expect("epoch A verifies its own assertion");
+        assert!(epoch_b.verify(&signed, within_ttl).is_err(), "old epoch assertion accepted");
+        // The same master under the same epoch derives the same key; only the epoch moved.
+        signer(EPOCH).verify(&signed, within_ttl).expect("same epoch is stable");
+        let payload = signed.split_once('.').expect("value.signature").0;
+        let payload: Value = serde_json::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+                .expect("payload base64"),
+        )
+        .expect("payload json");
+        let mut fields: Vec<&str> = payload
+            .as_object()
+            .expect("payload object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "actorId",
+                "botId",
+                "deploymentId",
+                "exp",
+                "iat",
+                "runId",
+                "tenantId",
+                "toolSetHash",
+                "version"
+            ]
+        );
+    }
 }

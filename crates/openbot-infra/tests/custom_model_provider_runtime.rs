@@ -134,6 +134,11 @@ impl Fixture {
             dialer,
             SafeHttpBudget::new(64 * 1024 * 1024, timeout).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap()
     }
@@ -983,6 +988,11 @@ async fn lost_rollback_ack_after_headers_is_unknown_without_http_replay() {
             tls.dialer(),
             SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(3)).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap();
         assert!(matches!(
@@ -1286,7 +1296,7 @@ async fn deployment_tenant_owner_current_reference_and_valid_legacy_cipher_are_n
         let legacy_vault=CredentialRecordVault::single_key(TenantId::new(TENANT),KeyVersion::new(1),WrappingKey::from_bytes((0_u8..32).collect()).unwrap());
         assert!(legacy_vault.open(&secret,SecretKind::Model,SecretPrincipal::Actor(ActorId::new("alice")),SecretPrincipal::Service(ServiceId::new(&model.id)),LEGACY).unwrap().needs_migration());
         c.execute("UPDATE public.model_connection_secrets SET encrypted_value=$1 WHERE id=$2",&[&LEGACY,&secret]).await.unwrap();
-        let adapter=PostgresCustomModelProvider::new(f.pool.clone(),legacy_vault,DeploymentId::new(DEP),TenantId::new(TENANT),tls.dialer(),SafeHttpBudget::new(64*1024*1024,Duration::from_secs(3)).unwrap(),Some(Duration::from_secs(2))).unwrap();
+        let adapter=PostgresCustomModelProvider::new(f.pool.clone(),legacy_vault,DeploymentId::new(DEP),TenantId::new(TENANT),tls.dialer(),SafeHttpBudget::new(64*1024*1024,Duration::from_secs(3)).unwrap(),Some(Duration::from_secs(2)), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &DeploymentId::new(DEP), &TenantId::new(TENANT))).unwrap();
         closed(adapter.start(request).await);assert_eq!(tls.count(),0);
         drop(c);tls.stop().await;f.pool.close();Ok(())
     }).await;

@@ -56,7 +56,7 @@ impl RefreshSendFence for OperationSendFence<'_> {
         let result = match current(self.admission) {
             Ok(()) => {
                 self.store
-                    .admit_refresh(self.prepared, self.operation)
+                    .admit_refresh(self.prepared, self.operation, self.admission)
                     .await
             }
             Err(error) => Err(error),
@@ -68,9 +68,11 @@ impl RefreshSendFence for OperationSendFence<'_> {
 }
 
 impl PluginUserCredentialStore {
+    /// Claims under the caller's held worker admission, rechecked before COMMIT.
     pub(super) async fn claim_refresh(
         &self,
         prepared: &PreparedUserOAuthCredential,
+        admission: &RecoveryWorkerLease<'_>,
     ) -> Result<RefreshOperation, UserCredentialSelectionError> {
         if self.rotation_checkpoint_key.is_none() {
             return Err(UserCredentialSelectionError::Corrupt {
@@ -118,16 +120,20 @@ impl PluginUserCredentialStore {
             "INSERT INTO public.oauth_refresh_operations(operation_id,credential_id,generation,actor_id,auth_generation,server_id,client_credential_id,server_generation,server_updated_at,client_updated_at,resource,transport,egress_allow_cidrs,granted_scope,state,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',clock_timestamp())",
             &[&operation.id,&prepared.user_credential_id,&operation.generation,&prepared.actor.as_str(),&prepared.auth_generation,&prepared.server_id,&prepared.deployment_credential_id,&prepared.server_generation,&prepared.server_updated_at,&prepared.client_updated_at,&prepared.endpoint,&prepared.transport,&prepared.egress_allow_cidrs,&prepared.scope],
         ).await.map_err(|_| UserCredentialSelectionError::Unavailable)?;
+        current(admission)?;
         tx.commit()
             .await
             .map_err(|_| UserCredentialSelectionError::CommitUnknown)?;
         Ok(operation)
     }
 
+    /// The durable send admission: the same worker admission is rechecked
+    /// before its COMMIT, the last step before the token POST.
     async fn admit_refresh(
         &self,
         prepared: &PreparedUserOAuthCredential,
         operation: &RefreshOperation,
+        admission: &RecoveryWorkerLease<'_>,
     ) -> Result<(), UserCredentialSelectionError> {
         let mut client = self
             .pool
@@ -152,6 +158,7 @@ impl PluginUserCredentialStore {
         if changed != 1 {
             return Err(UserCredentialSelectionError::RotationPending);
         }
+        current(admission)?;
         tx.commit()
             .await
             .map_err(|_| UserCredentialSelectionError::CommitUnknown)

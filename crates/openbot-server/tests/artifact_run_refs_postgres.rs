@@ -1253,6 +1253,7 @@ async fn artifact_refs_v2_custom_selection_follows_same_rules() {
                 f.pool.clone(), vault, DeploymentId::new(DEP), TenantId::new(TENANT),
                 SafeDialer::with_resolver(EgressPolicy::default(), dns.clone()),
                 SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).map_err(text)?, Some(Duration::from_secs(2)),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &DeploymentId::new(DEP), &TenantId::new(TENANT)),
             ).map_err(text)?.with_model_dataset_binding(binding).map_err(text)?;
             let valid = context.load(&lease).await.map_err(text)?;
             check(valid.messages.iter().any(|m| m.content.contains(TEXT)), "actual V2 context lost untrusted material text")?;

@@ -4041,6 +4041,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
         provider,
         remote_transport: remote_agent_probe,
         budgets,
+        recovery_gate: recovery_gate.clone(),
     }) {
         Ok(host) => host,
         Err(_) => {

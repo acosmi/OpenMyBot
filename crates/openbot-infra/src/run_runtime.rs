@@ -403,13 +403,19 @@ impl PostgresRunRuntime {
         {
             delivery.enqueue(notice);
         }
-        if let Some(dispatcher) = &self.pending_inputs
-            && let Err(error) = dispatcher.wake(lease.thread_id()).await
-        {
-            tracing::warn!(
-                code = error.code().as_str(),
-                "pending input terminal wake unavailable"
-            );
+        // The same host guard as any thread entry; a closed gate skips the wake.
+        if let Some(dispatcher) = &self.pending_inputs {
+            match self.admission().await {
+                Ok(_admission) => {
+                    if let Err(error) = dispatcher.wake(lease.thread_id()).await {
+                        tracing::warn!(
+                            code = error.code().as_str(),
+                            "pending input terminal wake unavailable"
+                        );
+                    }
+                }
+                Err(_) => tracing::warn!("pending input terminal wake refused by recovery gate"),
+            }
         }
     }
     pub(crate) async fn fail_confirmed_delegated_callback(
@@ -513,6 +519,8 @@ impl PostgresRunRuntime {
 impl RunRuntime for PostgresRunRuntime {
     async fn scan_pending_inputs_at_startup(&self) -> Result<(), RunRuntimeError> {
         if let Some(dispatcher) = &self.pending_inputs {
+            // A closed gate refuses the whole scan; the relay logs it and dispatches nothing.
+            let _admission = self.admission().await?;
             dispatcher
                 .scan_startup()
                 .await

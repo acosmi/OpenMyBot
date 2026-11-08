@@ -502,40 +502,54 @@ impl RecoveryRuntimeOwner {
         if !state.handle_alive.load(Ordering::SeqCst) {
             return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
         }
-        let binding = state.original.published.binding();
-        let epoch: [u8; 32] = hex_array(binding.authorization_epoch());
-        let label: &[u8] = match purpose {
-            AuthorizationPurpose::Session => b"session",
-            AuthorizationPurpose::OidcState => b"oidc-state",
-            AuthorizationPurpose::SsoState => b"sso-state",
-            AuthorizationPurpose::McpState => b"mcp-state",
-            AuthorizationPurpose::RunAssertion => b"run-assertion",
-        };
-        let (deployment, tenant) = binding.scope();
-        // Descriptor decoding bounds deployment/tenant to u16 lengths.
-        let length = |bytes: &[u8]| {
-            u16::try_from(bytes.len())
-                .expect("decoded ID fits u16")
-                .to_be_bytes()
-        };
-        let mut key = zeroize::Zeroizing::new([0u8; 32]);
-        hkdf::Hkdf::<sha2::Sha256>::new(Some(&epoch), parent)
-            .expand_multi_info(
-                &[
-                    b"wrokbot.restore.authorization.v1",
-                    &1u16.to_be_bytes(),
-                    &length(label),
-                    label,
-                    &length(deployment.as_bytes()),
-                    deployment.as_bytes(),
-                    &length(tenant.as_bytes()),
-                    tenant.as_bytes(),
-                ],
-                &mut key[..],
-            )
-            .expect("HKDF-SHA256 expands 32 bytes");
-        Ok(openbot_domain::vault::SecretBytes::new(key.to_vec()))
+        Ok(authorization_key(
+            state.original.published.binding(),
+            purpose,
+            parent,
+        ))
     }
+}
+
+/// The published binding's epoch and scope key the five short-lived purposes;
+/// a key derived under another epoch never verifies here (spec revision R484 class 7).
+#[cfg(feature = "server-runtime")]
+pub(super) fn authorization_key(
+    binding: &super::activation::ActivationBinding,
+    purpose: AuthorizationPurpose,
+    parent: &[u8],
+) -> openbot_domain::vault::SecretBytes {
+    let epoch: [u8; 32] = hex_array(binding.authorization_epoch());
+    let label: &[u8] = match purpose {
+        AuthorizationPurpose::Session => b"session",
+        AuthorizationPurpose::OidcState => b"oidc-state",
+        AuthorizationPurpose::SsoState => b"sso-state",
+        AuthorizationPurpose::McpState => b"mcp-state",
+        AuthorizationPurpose::RunAssertion => b"run-assertion",
+    };
+    let (deployment, tenant) = binding.scope();
+    // Descriptor decoding bounds deployment/tenant to u16 lengths.
+    let length = |bytes: &[u8]| {
+        u16::try_from(bytes.len())
+            .expect("decoded ID fits u16")
+            .to_be_bytes()
+    };
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(&epoch), parent)
+        .expand_multi_info(
+            &[
+                b"wrokbot.restore.authorization.v1",
+                &1u16.to_be_bytes(),
+                &length(label),
+                label,
+                &length(deployment.as_bytes()),
+                deployment.as_bytes(),
+                &length(tenant.as_bytes()),
+                tenant.as_bytes(),
+            ],
+            &mut key[..],
+        )
+        .expect("HKDF-SHA256 expands 32 bytes");
+    openbot_domain::vault::SecretBytes::new(key.to_vec())
 }
 
 impl Drop for RecoveryRuntimeOwner {

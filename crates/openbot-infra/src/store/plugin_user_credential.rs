@@ -666,7 +666,7 @@ impl PluginUserCredentialStore {
             .map_err(UserOAuthAccessError::Selection)?;
         current(admission).map_err(UserOAuthAccessError::Selection)?;
         let operation = self
-            .claim_refresh(&prepared)
+            .claim_refresh(&prepared, admission)
             .await
             .map_err(UserOAuthAccessError::Selection)?;
         let fence = OperationSendFence::new(self, &prepared, &operation, admission);

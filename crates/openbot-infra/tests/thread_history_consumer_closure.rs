@@ -1571,6 +1571,11 @@ async fn consumer_closure_custom_start_refuses_closed_history_before_send() {
                     tls.dialer(),
                     budget,
                     Some(Duration::from_secs(2)),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &p,
+                        &DeploymentId::new(DEP),
+                        &TenantId::new(TENANT),
+                    ),
                 )
                 .unwrap()
                 .with_model_dataset_binding(v2.binding.clone())
@@ -2986,6 +2991,11 @@ async fn not_closed_case(
         tls.dialer(),
         budget,
         Some(Duration::from_secs(2)),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &p,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?
     .with_model_dataset_binding(v2.binding.clone())
@@ -3187,6 +3197,11 @@ async fn legacy_start_query_failure(
         tls.dialer(),
         budget,
         Some(Duration::from_secs(2)),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &starter_pool,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?;
     let sends = tls.requests();
@@ -3266,6 +3281,11 @@ async fn v2_start_early_dataset_query_failure(
         tls.dialer(),
         SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(20)).map_err(text)?,
         Some(Duration::from_secs(2)),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &starter_pool,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?
     .with_model_dataset_binding(original.binding.clone())
