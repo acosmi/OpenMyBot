@@ -332,7 +332,7 @@ impl VerifiedPostgresBundle {
 
     /// The server program's actual Mach-O dynamic linker and system imports,
     /// read from this verified bundle where the restore sandbox admits exactly
-    /// these loader paths (spec revision R484 ¶7970).
+    /// these loader paths (spec revision R484 ¶8008).
     #[cfg(all(feature = "postgres-maintenance", target_os = "macos"))]
     pub(crate) fn system_loader_files(
         &self,

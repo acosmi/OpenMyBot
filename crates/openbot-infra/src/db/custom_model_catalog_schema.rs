@@ -19,7 +19,7 @@ const REGISTERED_NATIVE_FLOOR: i32 = native::NATIVE_0046_VERSION;
 const REGISTERED_SCHEMA: &str =
     include_str!("../../../../fixtures/db/custom-model-catalogs-0046.json");
 /// The registered oracle tree, parsed once per process and borrowed by every
-/// observation (spec revision R484 ¶8040).
+/// observation (spec revision R484 ¶7984).
 static REGISTERED: std::sync::LazyLock<Option<Value>> =
     std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 const CAPTURE_SQL: &str = r####"WITH

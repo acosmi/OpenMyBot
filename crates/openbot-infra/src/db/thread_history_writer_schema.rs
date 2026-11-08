@@ -12,7 +12,7 @@ const REGISTERED_SCHEMA: &str =
 const LEGACY0051_SCHEMA: &str =
     include_str!("../../../../fixtures/db/thread-history-writer-0051.json");
 /// The registered oracle tree, parsed once per process and borrowed by every
-/// observation (spec revision R484 ¶8040); the legacy oracle stays on demand.
+/// observation (spec revision R484 ¶7984); the legacy oracle stays on demand.
 static REGISTERED: std::sync::LazyLock<Option<Value>> =
     std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 

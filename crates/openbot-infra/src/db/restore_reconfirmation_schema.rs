@@ -161,7 +161,7 @@ fn invalid() -> InfraError {
 }
 
 /// The validated oracle tree, parsed once per process and borrowed by every
-/// observation (spec revision R484 ¶8040).
+/// observation (spec revision R484 ¶7984).
 static EXPECTED: std::sync::LazyLock<Option<Value>> =
     std::sync::LazyLock::new(|| parse_expected().ok());
 

@@ -2490,7 +2490,7 @@ pub struct RestoreControlSession {
 }
 
 /// The candidate stages borrow the session's stages and its separately held
-/// candidate authority (spec revision R484 ¶7972, ¶7991–8003 and ¶8092).
+/// candidate authority (spec revision R484 ¶8010, ¶8029–8041 and ¶8130).
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 impl RestoreControlSession {
     /// Bind the resident original candidate Child, held data directory and

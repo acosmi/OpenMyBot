@@ -472,7 +472,7 @@ impl CandidateGeneration {
     }
 
     /// Start the authenticated `postgres` under the original restore sandbox
-    /// on this generation (spec revision R484 ¶7968–7970). Unsupported or
+    /// on this generation (spec revision R484 ¶8006–8008). Unsupported or
     /// refused isolation stays IsolationUnproven; there is no fallback.
     pub(super) fn start_postgres(
         &mut self,

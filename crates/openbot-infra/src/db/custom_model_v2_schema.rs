@@ -10,7 +10,7 @@ pub type CustomModelV2SchemaFacts = Value;
 const REGISTERED_SCHEMA: &str =
     include_str!("../../../../fixtures/db/custom-model-v2-snapshots-0047.json");
 /// The registered oracle tree, parsed once per process and borrowed by every
-/// observation (spec revision R484 ¶8040).
+/// observation (spec revision R484 ¶7984).
 static REGISTERED: std::sync::LazyLock<Option<Value>> =
     std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 

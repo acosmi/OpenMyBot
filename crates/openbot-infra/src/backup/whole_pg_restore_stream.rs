@@ -73,7 +73,7 @@ pub(crate) struct PendingRestoreCandidateAuthority {
 /// the runner's startup identity evidence, the authenticated executable and
 /// the held generation data directory. These facts are not authority; only
 /// [`crate::recovery_control::RestoreControlSession::bind_candidate_before`]
-/// can bind them to the real candidate database (spec revision R484 ¶7972).
+/// can bind them to the real candidate database (spec revision R484 ¶8010).
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub struct CandidateProgramIdentity {
     startup: [u8; 32],
@@ -3801,7 +3801,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         stages.settle_capacity(reserved_allocation, used_memory)?;
         // The registered schema observers below parse their payloads; each run
         // pays those measured texts before it allocates (spec revision R484
-        // ¶8040). The additive restore catalog exists only at the latest layout.
+        // ¶7984). The additive restore catalog exists only at the latest layout.
         raw.layout_measure = Some(tokio::time::timeout_at(
             tokio::time::Instant::from_std(stages.effect_before(deadline)?),
             async {
@@ -4588,7 +4588,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
     // BEGIN S22 original closed-history adapter
     /// Reuse the original clear algorithm on this candidate's guarded connection.
     /// Only timely original transaction acknowledgements advance the cursor.
-    /// Spec revision R484 ¶8092: the original closed history clear request.
+    /// Spec revision R484 ¶8130: the original closed history clear request.
     pub struct RestoredClosedHistoryRequest {
         deadline: Instant,
     }
@@ -5114,7 +5114,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
     }
 
     // Independent post-start readback of the candidate's identity and every
-    // closed configuration value (spec revision R484 ¶7968 and ¶7972). Each
+    // closed configuration value (spec revision R484 ¶8006 and ¶8010). Each
     // text field is bounded in SQL before it reaches this process.
     // With archive_mode off, PostgreSQL 17 reports archive_command as
     // "(disabled)" and never runs it, so the mode itself is the check.
@@ -5211,7 +5211,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             })
             .ok_or_else(invalid_candidate)?;
         // The origin, writer and restore oracle trees every schema observation
-        // borrows are paid once per operation, here (spec revision R484 ¶8040).
+        // borrows are paid once per operation, here (spec revision R484 ¶7984).
         let oracle = crate::thread_history_writer::CurrentWriterSchema::ORACLE_BYTES;
         let oracle_metadata = stages.admit_capacity(Capacity::MetadataBytes, oracle)?;
         let oracle_allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, oracle)?;
