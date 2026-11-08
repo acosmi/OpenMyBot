@@ -524,6 +524,7 @@ pub struct ObservedArtifactReadRecord {
     auth_snapshot: AuthContext,
     source_snapshot: ArtifactRegistrationReceipt,
     workspace_snapshot: ArtifactWorkspaceKey,
+    metadata_snapshot: ArtifactRecordMetadata,
 }
 
 impl core::fmt::Debug for ObservedArtifactReadRecord {
@@ -906,7 +907,11 @@ impl PostgresArtifactAdministration {
             parse_digest(&sha256)?,
         )
         .map_err(|_| corrupt("read_blob_binding"))?;
+        let ArtifactMetadata::Available(metadata) = decode_metadata(row)? else {
+            return Err(ArtifactAdministrationError::NotVisible);
+        };
         Ok(ObservedArtifactReadRecord {
+            metadata_snapshot: metadata,
             store: Arc::clone(&self.store),
             blob,
             auth_snapshot: auth.clone(),
@@ -1817,6 +1822,89 @@ impl PostgresArtifactAdministration {
 
 #[async_trait]
 impl ArtifactAdministration for PostgresArtifactAdministration {
+    async fn preread_pending_input_materials(
+        &self,
+        auth: &AuthContext,
+        refs: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<
+        Vec<openbot_application::RunInputArtifactMaterial>,
+        openbot_contracts::error::AppError,
+    > {
+        use openbot_application::use_cases::thread::{
+            decode_run_input_text, input_media_is_text, validate_run_input_metadata,
+            validate_run_input_text_budget,
+        };
+        use openbot_contracts::error::AppError;
+        let unavailable = || AppError::DependencyUnavailable {
+            dependency: "artifacts",
+        };
+        let mut observations = Vec::with_capacity(refs.len());
+        for id in refs {
+            let record = self
+                .observe_read_record_before_inner(auth, id, deadline)
+                .await
+                .map_err(|failure| match failure.error {
+                    ArtifactAdministrationError::Gone { .. } => AppError::NotVisible,
+                    error => error.into_app_error(),
+                })?;
+            observations.push(record);
+        }
+        validate_run_input_metadata(
+            auth,
+            refs,
+            observations.iter().map(|r| &r.metadata_snapshot),
+        )?;
+        validate_run_input_text_budget(observations.iter().map(|r| &r.metadata_snapshot))?;
+        let mut materials = Vec::with_capacity(observations.len());
+        for observation in observations {
+            let metadata = observation.metadata_snapshot.clone();
+            let body = if input_media_is_text(&metadata.media_type) {
+                let store = Arc::clone(&self.store);
+                let length = usize::try_from(metadata.byte_length).map_err(|_| unavailable())?;
+                // The dispatcher bounds the whole preread with one timeout. A blocking job cannot
+                // be cancelled, so only its read loop rechecks the same deadline.
+                let bytes = tokio::task::spawn_blocking(move || {
+                    // The blocking job owns the real snapshot, FD and cleanup read lease until exit.
+                    let mut reader = store.open_observed_record(observation).map_err(|_| ())?;
+                    let mut bytes = vec![0; length];
+                    let mut offset = 0;
+                    while offset < length {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(());
+                        }
+                        let read = reader
+                            .read_observed_chunk(&mut bytes[offset..])
+                            .map_err(|_| ())?;
+                        if read == 0 {
+                            return Err(());
+                        }
+                        offset += read;
+                    }
+                    reader.verify_physical_current().map_err(|_| ())?;
+                    Ok(bytes)
+                })
+                .await
+                .map_err(|_| unavailable())?
+                .map_err(|_| unavailable())?;
+                Some(decode_run_input_text(&metadata, bytes)?)
+            } else {
+                None
+            };
+            materials.push(openbot_application::RunInputArtifactMaterial {
+                artifact_id: metadata.artifact_id,
+                dataset_id: metadata.dataset_id,
+                sha256: metadata.sha256,
+                media_type: metadata.media_type,
+                byte_length: metadata.byte_length,
+                source_thread_id: metadata.source_thread_id,
+                source_run_id: metadata.source_run_id,
+                body,
+            });
+        }
+        Ok(materials)
+    }
+
     async fn observe_run_input_metadata_current(
         &self,
         auth: &AuthContext,

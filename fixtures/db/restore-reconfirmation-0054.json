@@ -1,11 +1,11 @@
 {
   "format": "restore-reconfirmation-oracle-v1",
-  "nativeVersion": 53,
-  "migrationSha256": "0c534a7b05266f0a8e877f30a2f922e667a08e8a7d7191a9db21caf50b41f413",
+  "nativeVersion": 54,
+  "migrationSha256": "26d8c0afb492881f5617e2a1071d04b2f416ca3e6639662c300471a7a7d99f00",
   "schema": {
     "functions": [
-      ["restore53_guard_insert", "823e78f7ddb4b01eefd091b6e69507935bc8256256cfbdc95290df9337dad3f7"],
-      ["restore53_reject_mutation", "e476b418fdfb229e240b764c852e0d9c6d58d90a7b5c8855a33fb10a2f5148a5"]
+      ["restore54_guard_insert", "823e78f7ddb4b01eefd091b6e69507935bc8256256cfbdc95290df9337dad3f7"],
+      ["restore54_reject_mutation", "e476b418fdfb229e240b764c852e0d9c6d58d90a7b5c8855a33fb10a2f5148a5"]
     ],
     "tables": [
       {
@@ -36,9 +36,9 @@
           "CREATE UNIQUE INDEX restore_pg_batches_xact_action_key ON openbot_internal.restore_pg_batches USING btree (operation_id, xact_id, action)"
         ],
         "triggers": [
-          ["restore_pg_batches_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
-          ["restore_pg_batches_insert", 7, "openbot_internal", "restore53_guard_insert"],
-          ["restore_pg_batches_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+          ["restore_pg_batches_immutable", 27, "openbot_internal", "restore54_reject_mutation"],
+          ["restore_pg_batches_insert", 7, "openbot_internal", "restore54_guard_insert"],
+          ["restore_pg_batches_no_truncate", 34, "openbot_internal", "restore54_reject_mutation"]
         ]
       },
       {
@@ -81,9 +81,9 @@
           "CREATE UNIQUE INDEX restore_pg_operations_pkey ON openbot_internal.restore_pg_operations USING btree (operation_id)"
         ],
         "triggers": [
-          ["restore_pg_operations_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
-          ["restore_pg_operations_insert", 7, "openbot_internal", "restore53_guard_insert"],
-          ["restore_pg_operations_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+          ["restore_pg_operations_immutable", 27, "openbot_internal", "restore54_reject_mutation"],
+          ["restore_pg_operations_insert", 7, "openbot_internal", "restore54_guard_insert"],
+          ["restore_pg_operations_no_truncate", 34, "openbot_internal", "restore54_reject_mutation"]
         ]
       },
       {
@@ -109,9 +109,9 @@
           "CREATE UNIQUE INDEX restore_pg_seals_pkey ON openbot_internal.restore_pg_seals USING btree (operation_id)"
         ],
         "triggers": [
-          ["restore_pg_seals_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
-          ["restore_pg_seals_insert", 7, "openbot_internal", "restore53_guard_insert"],
-          ["restore_pg_seals_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+          ["restore_pg_seals_immutable", 27, "openbot_internal", "restore54_reject_mutation"],
+          ["restore_pg_seals_insert", 7, "openbot_internal", "restore54_guard_insert"],
+          ["restore_pg_seals_no_truncate", 34, "openbot_internal", "restore54_reject_mutation"]
         ]
       },
       {
@@ -145,9 +145,9 @@
           "CREATE UNIQUE INDEX restore_reconfirm_receipts_proof_key ON openbot_internal.restore_reconfirm_receipts USING btree (operation_id, proof_ref)"
         ],
         "triggers": [
-          ["restore_reconfirm_receipts_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
-          ["restore_reconfirm_receipts_insert", 7, "openbot_internal", "restore53_guard_insert"],
-          ["restore_reconfirm_receipts_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+          ["restore_reconfirm_receipts_immutable", 27, "openbot_internal", "restore54_reject_mutation"],
+          ["restore_reconfirm_receipts_insert", 7, "openbot_internal", "restore54_guard_insert"],
+          ["restore_reconfirm_receipts_no_truncate", 34, "openbot_internal", "restore54_reject_mutation"]
         ]
       },
       {
@@ -193,9 +193,9 @@
           "CREATE INDEX restore_reconfirm_requirements_source_idx ON openbot_internal.restore_reconfirm_requirements USING btree (operation_id, source_kind, source_ref, binding_generation DESC)"
         ],
         "triggers": [
-          ["restore_reconfirm_requirements_immutable", 27, "openbot_internal", "restore53_reject_mutation"],
-          ["restore_reconfirm_requirements_insert", 7, "openbot_internal", "restore53_guard_insert"],
-          ["restore_reconfirm_requirements_no_truncate", 34, "openbot_internal", "restore53_reject_mutation"]
+          ["restore_reconfirm_requirements_immutable", 27, "openbot_internal", "restore54_reject_mutation"],
+          ["restore_reconfirm_requirements_insert", 7, "openbot_internal", "restore54_guard_insert"],
+          ["restore_reconfirm_requirements_no_truncate", 34, "openbot_internal", "restore54_reject_mutation"]
         ]
       },
       {

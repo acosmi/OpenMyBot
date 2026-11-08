@@ -180,15 +180,15 @@ where
 }
 async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     let mut c = p.get().await.map_err(|e| e.to_string())?;
-    if version == 53 {
+    if version == native::NATIVE_LATEST_VERSION {
         require(
             fresh::apply(&mut c).await.map_err(|e| e.to_string())?
                 == fresh::FreshApplyOutcome::Applied(native::ApplyOutcome::Applied),
-            "fresh53 not applied",
+            "fresh latest not applied",
         )?;
     } else {
         require(
-            matches!(version, 47..=52),
+            matches!(version, 47..=53),
             "unregistered historical fixture",
         )?;
         baseline::apply(&c).await.map_err(|e| e.to_string())?;

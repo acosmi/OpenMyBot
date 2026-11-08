@@ -3675,6 +3675,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         let count = match version {
             52 => 40_i64,
             53 => 41_i64,
+            54 => 42_i64,
             _ => {
                 return Err(RecoveryControlError::new(
                     RecoveryControlFault::InputInvalid,
@@ -3780,7 +3781,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         }
         let repeated = candidate.sql.schema == StageResult::Acknowledged;
         let version = if repeated {
-            53
+            54
         } else {
             candidate.binding.native_version
         };
@@ -3801,7 +3802,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             .as_mut()
             .and_then(|r| r.as_mut().ok())
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
-        let owner = match if version == 53 {
+        let owner = match if version == 54 {
             client.begin_read_committed_read_only().await
         } else {
             client.begin_read_committed().await
@@ -3827,19 +3828,31 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             raw.validation.as_ref().and_then(|r| r.as_ref().ok())
                 .and_then(|r| r.as_ref().ok()).ok_or_else(|| infra_observation_error(raw.validation.as_ref()))?;
             verify_layout(raw, stages, transaction, &candidate.binding, version, deadline).await?;
-            if version == 52 {
+            // A strict prior source (52 or 53) upgrades through every registered increment up to
+            // the current layout; a current source only observes.
+            let pending: &[(i32, &str, &str, fn() -> String)] = match version {
+                52 => &[
+                    (native::NATIVE_0053_VERSION, native::NATIVE_0053_NAME, native::NATIVE_0053_SQL, native::native_0053_checksum),
+                    (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                ],
+                53 => &[
+                    (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                ],
+                _ => &[],
+            };
+            for (next, name, sql, checksum) in pending {
                 raw.unit = Some(tokio::time::timeout_at(
                     tokio::time::Instant::from_std(stages.effect_before(deadline)?),
-                    transaction.batch_execute(native::NATIVE_0053_SQL),
+                    transaction.batch_execute(sql),
                 ).await);
                 stages.effect_before(deadline)?;
                 raw.unit.as_ref().and_then(|r| r.as_ref().ok())
                     .and_then(|r| r.as_ref().ok()).ok_or_else(|| sql_observation_error(raw.unit.as_ref()))?;
                 execute(raw, stages, transaction,
                     "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES($1,$2,$3)",
-                    &[&native::NATIVE_0053_VERSION, &native::NATIVE_0053_NAME, &native::native_0053_checksum()],
+                    &[next, name, &checksum()],
                     deadline).await?;
-                verify_layout(raw, stages, transaction, &candidate.binding, 53, deadline).await?;
+                verify_layout(raw, stages, transaction, &candidate.binding, u32::try_from(*next).map_err(|_| invalid_candidate())?, deadline).await?;
             }
             Ok(())
         }.await;
@@ -4876,10 +4889,10 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                 ),
             ).await,
             None => {
-                let checksum = native::native_0053_checksum();
+                let checksum = native::native_0054_checksum();
                 tokio::time::timeout_at(tokio::time::Instant::from_std(closing),
                     client.as_client().query(
-                        "SELECT EXISTS(SELECT 1 FROM openbot_internal.schema_migrations WHERE version=53 AND checksum=$1),(SELECT system_identifier::text FROM pg_catalog.pg_control_system())=$2,(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())=$3",
+                        "SELECT EXISTS(SELECT 1 FROM openbot_internal.schema_migrations WHERE version=54 AND checksum=$1),(SELECT system_identifier::text FROM pg_catalog.pg_control_system())=$2,(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())=$3",
                         &[&checksum,&binding.pg_system_identifier,&binding.candidate_database_oid],
                     ),
                 ).await

@@ -378,6 +378,13 @@ impl AgentToolGateway {
                 | AppReply::ActionPolicy { .. }
                 | AppReply::ThreadMinted(_)
                 | AppReply::ThreadStatus(_)
+                | AppReply::ThreadInputOutcome(_)
+                | AppReply::PendingInputs(_)
+                | AppReply::PendingInputState(_)
+                | AppReply::ThreadWorkStopped(_)
+                | AppReply::ThreadCompleted(_)
+                | AppReply::BotThreadPage(_)
+                | AppReply::ThreadTitleSet(_)
                 | AppReply::ThreadRunStarted(_)
                 | AppReply::ThreadRunCancellation(_)
                 | AppReply::ThreadHistoryDeletion(_)
@@ -607,6 +614,10 @@ impl AuthorizedAgentToolGateway {
             }
             Err(
                 AppError::Unauthenticated
+                | AppError::AnchorUnsupported
+                | AppError::PendingInputLimit
+                | AppError::PendingInputState
+                | AppError::ThreadNotIdle { .. }
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -690,6 +701,10 @@ impl AuthorizedAgentToolGateway {
             }
             Err(
                 AppError::Unauthenticated
+                | AppError::AnchorUnsupported
+                | AppError::PendingInputLimit
+                | AppError::PendingInputState
+                | AppError::ThreadNotIdle { .. }
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -757,6 +772,10 @@ impl AuthorizedAgentToolGateway {
             }
             Err(
                 AppError::Unauthenticated
+                | AppError::AnchorUnsupported
+                | AppError::PendingInputLimit
+                | AppError::PendingInputState
+                | AppError::ThreadNotIdle { .. }
                 | AppError::ArtifactGone { .. }
                 | AppError::DependencyUnavailable { .. }
                 | AppError::VendorFailure { .. }
@@ -880,6 +899,10 @@ fn map_application_reply(
         }
         Err(
             AppError::Unauthenticated
+            | AppError::AnchorUnsupported
+            | AppError::PendingInputLimit
+            | AppError::PendingInputState
+            | AppError::ThreadNotIdle { .. }
             | AppError::ArtifactGone { .. }
             | AppError::DependencyUnavailable { .. }
             | AppError::VendorFailure { .. }
@@ -995,7 +1018,7 @@ mod tests {
 
     struct FakeApplication {
         calls: Mutex<Vec<(ActorId, ToolInvocation)>>,
-        wrong_reply: bool,
+        wrong_reply: Mutex<Option<AppReply>>,
     }
 
     struct ComponentApplication {
@@ -1140,8 +1163,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((auth.actor().clone(), invocation.clone()));
-            if self.wrong_reply {
-                return Ok(AppReply::Health(health()));
+            if let Some(reply) = self.wrong_reply.lock().unwrap().take() {
+                return Ok(reply);
             }
             Ok(AppReply::Tool(ToolResult {
                 call_id: invocation.call_id,
@@ -1175,10 +1198,71 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn work_replies_and_errors_do_not_become_tool_success() {
+        for reply in [
+            AppReply::ThreadInputOutcome(openbot_contracts::command::ThreadInputOutcome::Queued {
+                run_id: RunId::new("input-1"),
+                position: 1,
+            }),
+            AppReply::ThreadWorkStopped(openbot_contracts::command::ThreadWorkStopped {
+                held: 1,
+                cancellation: None,
+            }),
+            AppReply::ThreadCompleted(openbot_contracts::command::ThreadCompleted {
+                status: openbot_contracts::command::ThreadStatusFilter::Archived,
+            }),
+            AppReply::PendingInputs(openbot_contracts::command::PendingInputs::default()),
+            AppReply::PendingInputState(openbot_contracts::command::PendingInputReceipt {
+                run_id: RunId::new("input-1"),
+                state: openbot_contracts::command::PendingInputState::Withdrawn,
+            }),
+            AppReply::BotThreadPage(openbot_contracts::command::BotThreadPage {
+                threads: vec![],
+                next_cursor: None,
+            }),
+            AppReply::ThreadTitleSet(openbot_contracts::command::ThreadTitleSet {
+                thread_id: ThreadId::new("thread-1"),
+                title: "work".into(),
+            }),
+        ] {
+            let application = Arc::new(FakeApplication {
+                calls: Mutex::new(Vec::new()),
+                wrong_reply: Mutex::new(Some(reply)),
+            });
+            let gateway = AgentToolGateway::new(application);
+            let error = gateway
+                .invoke(
+                    auth("actor-1"),
+                    RunId::new("run-1"),
+                    BotId::new("bot-1"),
+                    "computer.write",
+                    json!({}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code().as_str(), "dependency_unavailable");
+        }
+        for error in [
+            AppError::AnchorUnsupported,
+            AppError::PendingInputLimit,
+            AppError::PendingInputState,
+            AppError::ThreadNotIdle {
+                foreground: None,
+                pending_inputs: 1,
+            },
+        ] {
+            assert!(matches!(
+                map_application_reply(ToolCallId::new("call-1"), Err(error)),
+                Err(AgentToolInvokeError::Unavailable)
+            ));
+        }
+    }
+
     fn fake(wrong_reply: bool) -> Arc<FakeApplication> {
         Arc::new(FakeApplication {
             calls: Mutex::new(Vec::new()),
-            wrong_reply,
+            wrong_reply: Mutex::new(wrong_reply.then(|| AppReply::Health(health()))),
         })
     }
 

@@ -250,7 +250,7 @@ impl DesktopTauriProtocol {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "desktop-local-runtime", target_os = "macos"))]
     pub(super) fn source_run_artifact_ids_binding_current_for_test(
         &self,
         label: &str,

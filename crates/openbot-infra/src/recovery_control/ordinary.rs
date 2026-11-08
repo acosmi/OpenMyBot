@@ -837,7 +837,7 @@ impl OrdinaryInitializationSession {
             .and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok())
             .ok_or_else(invalid)?
             .native_version();
-        if version != native::NATIVE_0052_VERSION && version != native::NATIVE_LATEST_VERSION {
+        if version != native::NATIVE_0052_VERSION && version != native::NATIVE_0053_VERSION && version != native::NATIVE_LATEST_VERSION {
             return Err(invalid());
         }
         let mut client = self
@@ -861,8 +861,11 @@ impl OrdinaryInitializationSession {
                         self.local_effect_before()?;
                         if !matches!(self.local_sql.validation, Some(Ok(Ok(())))) { return Err(invalid()); }
                         self.local_sql.validation = Some(tokio::time::timeout_at(end, async {
-                            if version == native::NATIVE_0052_VERSION { native::validate_custom_model_v2_layout_in_transaction(transaction, native::NATIVE_0052_VERSION, 40).await }
-                            else { native::validate_custom_model_v2_in_transaction(transaction).await }
+                            match version {
+                                native::NATIVE_0052_VERSION => native::validate_custom_model_v2_layout_in_transaction(transaction, native::NATIVE_0052_VERSION, 40).await,
+                                native::NATIVE_0053_VERSION => native::validate_custom_model_v2_layout_in_transaction(transaction, native::NATIVE_0053_VERSION, 41).await,
+                                _ => native::validate_custom_model_v2_in_transaction(transaction).await,
+                            }
                         }).await);
                         self.local_effect_before()?;
                         if !matches!(self.local_sql.validation, Some(Ok(Ok(())))) { return Err(invalid()); }
@@ -874,20 +877,31 @@ impl OrdinaryInitializationSession {
                             self.local_effect_before()?;
                             if self.local_sql.row.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.as_ref().ok()).ok_or_else(invalid)?.try_get::<_,bool>(0).map_err(|_| invalid())? { return Err(invalid()); }
                         }
-                        if version == native::NATIVE_0052_VERSION {
+                        // A strict prior layout (52 or 53) upgrades through every registered increment.
+                        let pending: &[(i32, &str, &str, fn() -> String)] = match version {
+                            native::NATIVE_0052_VERSION => &[
+                                (native::NATIVE_0053_VERSION, native::NATIVE_0053_NAME, native::NATIVE_0053_SQL, native::native_0053_checksum),
+                                (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                            ],
+                            native::NATIVE_0053_VERSION => &[
+                                (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                            ],
+                            _ => &[],
+                        };
+                        for (next, name, sql, checksum) in pending {
                             self.local_effect_before()?;
-                            self.local_sql.statement = Some(tokio::time::timeout_at(end, transaction.batch_execute(native::NATIVE_0053_SQL)).await);
+                            self.local_sql.statement = Some(tokio::time::timeout_at(end, transaction.batch_execute(sql)).await);
                             self.local_effect_before()?;
                             if !matches!(self.local_sql.statement, Some(Ok(Ok(())))) { return Err(invalid()); }
-                            let checksum = native::native_0053_checksum();
-                            self.local_sql.count = Some(tokio::time::timeout_at(end, transaction.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES($1,$2,$3)", &[&native::NATIVE_0053_VERSION, &native::NATIVE_0053_NAME, &checksum])).await);
+                            let checksum = checksum();
+                            self.local_sql.count = Some(tokio::time::timeout_at(end, transaction.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES($1,$2,$3)", &[next, name, &checksum])).await);
                             self.local_effect_before()?;
                             if !matches!(self.local_sql.count, Some(Ok(Ok(1)))) { return Err(invalid()); }
                         }
                         self.local_sql.validation = Some(tokio::time::timeout_at(end, native::validate_custom_model_v2_in_transaction(transaction)).await);
                         self.local_effect_before()?;
                         if !matches!(self.local_sql.validation, Some(Ok(Ok(())))) { return Err(invalid()); }
-                        Ok(version == native::NATIVE_0052_VERSION)
+                        Ok(version != native::NATIVE_LATEST_VERSION)
                     }.await;
                     self.local_sql.terminal = Some(if matches!(verified, Ok(true)) {
                         LocalLegacyTerminal::Commit(owner.commit_before(self.intent.effect).await)
@@ -1002,7 +1016,7 @@ impl OrdinaryInitializationSession {
         let row = self.local_sql.row.as_ref().and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok()).ok_or_else(invalid)?;
         let actual_version: i32 = row.try_get("version").map_err(|_| invalid())?;
         let migration_digest: String = row.try_get("checksum").map_err(|_| invalid())?;
-        if actual_version != native::NATIVE_LATEST_VERSION || migration_digest != native::native_0053_checksum() { return Err(invalid()); }
+        if actual_version != native::NATIVE_LATEST_VERSION || migration_digest != native::native_0054_checksum() { return Err(invalid()); }
         Ok(VerifiedOrdinaryLegacyProof {
             operation,
             site: LegacySite::Local(OrdinaryLocalSite {

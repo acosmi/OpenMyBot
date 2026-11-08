@@ -11,10 +11,11 @@ use std::collections::BTreeMap;
 use leptos::prelude::*;
 use openbot_contracts::agent::AgentProfile;
 #[cfg(target_arch = "wasm32")]
-use openbot_contracts::command::{AppEvent, SubscriptionRequest, ThreadRunCancellationState};
+use openbot_contracts::command::{AppEvent, SubscriptionRequest, ThreadInputOutcome};
 use openbot_contracts::command::{
-    ChannelDetail, ThreadConversationSnapshot, ThreadForegroundRunState, ThreadHistoryMessage,
-    ThreadHistoryRole, ThreadRunAnchor, ThreadRunEvent, ThreadRunEventKind,
+    ChannelDetail, PendingInput, PendingInputState, ThreadConversationSnapshot,
+    ThreadForegroundRunState, ThreadHistoryMessage, ThreadHistoryRole, ThreadRunAnchor,
+    ThreadRunCancellationState, ThreadRunEvent, ThreadRunEventKind,
 };
 use openbot_contracts::components::compiled_component_parameter_schema;
 #[cfg(test)]
@@ -33,12 +34,24 @@ use crate::api::desktop_transport::{
 use crate::api::mint_run_id;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{
-    begin_thread_run_with_skills_and_model, cancel_thread_run, load_agent,
-    load_thread_conversation, mint_thread_id, thread_event_stream_path,
+    begin_thread_run_with_skills_and_model, cancel_thread_run, list_pending_inputs, load_agent,
+    load_thread_conversation, mint_thread_id, stop_thread_work, submit_thread_input,
+    thread_event_stream_path,
 };
 use crate::features::agents::{AgentPresence, AgentPresenceState};
 #[cfg(target_arch = "wasm32")]
+use crate::features::bot_threads::attention::read_attention_index;
+use crate::features::bot_threads::model::{ModelComposerV2, ModelPickerV2};
+use crate::features::bot_threads::pending::PendingInputsPanel;
+#[cfg(target_arch = "wasm32")]
+use crate::features::bot_threads::pending::pending_position;
+use crate::features::bot_threads::submit::{AcceptedInput, v2_body};
+#[cfg(target_arch = "wasm32")]
+use crate::features::bot_threads::submit::{DirectSubmissionOutcome, submit_direct_input};
+#[cfg(target_arch = "wasm32")]
 use crate::features::channels::composer::model_intents::SubmissionSource;
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::features::channels::composer::model_intents::is_definite_rejection;
 use crate::features::channels::composer::model_intents::{
     RunIntent, RunRecovery, RunSubmissionActions,
 };
@@ -54,13 +67,13 @@ use crate::features::gallery::ConversationComponent;
 use crate::features::memory::remember::{RememberDialog, RememberReview, RememberTarget};
 use crate::features::threads::tool_name::read_tool_name;
 use crate::features::threads::tool_result::for_display;
-use crate::i18n::{t, t_string, use_i18n};
+use crate::i18n::{Locale, t, t_string, td_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Avatar, AvatarSize, Bubble, BubbleKind, Button, ButtonSize, ButtonVariant, IconSize, IconView,
-    Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageHeader,
-    MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem,
-    MessageScrollerViewport, Textarea,
+    Avatar, AvatarSize, Badge, BadgeTone, Bubble, BubbleKind, Button, ButtonSize, ButtonVariant,
+    IconSize, IconView, Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter,
+    MessageHeader, MessageScroller, MessageScrollerButton, MessageScrollerContent,
+    MessageScrollerItem, MessageScrollerViewport, Textarea,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -247,6 +260,98 @@ fn action_read_allows_stop(snapshot: &ThreadConversationSnapshot, run: &RunId) -
     snapshot.active_run_id.as_ref() == Some(run)
         && snapshot.active_run_state == Some(ThreadForegroundRunState::Running)
         && snapshot.active_run_cancellable
+}
+
+/// The notice a refused direct-Bot submission leaves. An unknown receipt has none: it stays
+/// behind the app-owned barrier, whose single alert offers the exact retry.
+#[cfg(any(target_arch = "wasm32", test))]
+fn direct_notice_for(error: crate::api::ApiError) -> Option<DirectNotice> {
+    match error {
+        crate::api::ApiError::PendingInputLimit => Some(DirectNotice::InputLimit),
+        error if is_definite_rejection(error) => Some(DirectNotice::Rejected),
+        _ => None,
+    }
+}
+
+/// The notice a failed "stop and take over" leaves. Only a definite refusal says nothing was
+/// paused or cancelled; any other failure leaves the stop unconfirmed.
+#[cfg(any(target_arch = "wasm32", test))]
+fn stop_notice_for(error: crate::api::ApiError) -> DirectNotice {
+    if is_definite_rejection(error) {
+        DirectNotice::StopRejected
+    } else {
+        DirectNotice::StopUnconfirmed
+    }
+}
+
+/// The closed text of one direct-Bot notice.
+fn direct_notice_text(locale: Locale, notice: DirectNotice) -> String {
+    match notice {
+        DirectNotice::ModelRequired => td_string!(locale, bot_work.model_required),
+        DirectNotice::InputLimit => td_string!(locale, bot_work.input_limit),
+        DirectNotice::Rejected => td_string!(locale, channels.submit_rejected),
+        DirectNotice::StopRejected => td_string!(locale, bot_work.stop_rejected),
+        DirectNotice::StopUnconfirmed => td_string!(locale, channels.cancel_error),
+    }
+    .to_owned()
+}
+
+/// The receipt of one "stop and take over".
+///
+/// The held count and the cancellation receipt come from one Server transaction, so they are
+/// shown together. A recorded cancellation is only a request: the foreground stays observed
+/// until its own terminal state.
+fn stop_receipt_text(locale: Locale, receipt: StopReceipt) -> String {
+    let held = td_string!(locale, bot_work.stop_held, count = receipt.held);
+    let outcome = match receipt.cancellation {
+        None => return held,
+        Some(
+            ThreadRunCancellationState::Requested | ThreadRunCancellationState::AlreadyRequested,
+        ) => td_string!(locale, bot_work.stop_cancelled),
+        Some(ThreadRunCancellationState::AlreadyTerminal) => {
+            td_string!(locale, bot_work.stop_already_terminal)
+        }
+    };
+    td_string!(
+        locale,
+        bot_work.stop_receipt,
+        held = held,
+        outcome = outcome
+    )
+}
+
+/// Whether "stop and take over" has something to stop: this actor's running foreground Run, or
+/// an accepted input still waiting for dispatch. A foreground that is already cancelling is
+/// observed until its terminal state and never offered as actionable again.
+fn work_stop_offered(
+    cancellable: bool,
+    run_state: Option<ThreadForegroundRunState>,
+    items: &[PendingInput],
+) -> bool {
+    run_state != Some(ThreadForegroundRunState::Cancelling)
+        && (cancellable
+            || items
+                .iter()
+                .any(|item| item.state == PendingInputState::Pending))
+}
+
+/// Read one direct-Bot submission back by its run id (§7.4): a row in the conversation's pending
+/// list means the Server accepted it, and the foreground Run being it means it started. Anything
+/// else stays unconfirmed.
+#[cfg(target_arch = "wasm32")]
+async fn read_back_direct_input(thread: &ThreadId, run_id: &RunId) -> Option<AcceptedInput> {
+    if let Ok(page) = list_pending_inputs(thread).await
+        && page.items.iter().any(|item| &item.run_id == run_id)
+    {
+        return Some(AcceptedInput::Queued {
+            run_id: run_id.clone(),
+            position: pending_position(&page.items, run_id),
+        });
+    }
+    let snapshot = load_thread_conversation(thread).await.ok()?;
+    (snapshot.active_run_id.as_ref() == Some(run_id)).then(|| AcceptedInput::Started {
+        run_id: run_id.clone(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -777,6 +882,7 @@ pub fn ChannelConversation(
             anchor=ThreadRunAnchor::Channel { channel_id: channel.id }
             fresh_thread=false
             agent_profile=None
+            direct_work=None
         />
     }
 }
@@ -790,10 +896,16 @@ pub fn DirectBotConversation(
     agent: AgentProfile,
     /// The Server minted this identity, but no first run has persisted it yet.
     fresh: bool,
+    /// Tell the work list that this conversation's work changed.
+    on_work_changed: UnsyncCallback<()>,
 ) -> impl IntoView {
     let agent_id = agent.id.clone();
     let agent_name = agent.name.clone();
     let agent_seed = agent.avatar_seed.clone();
+    let direct_work = DirectWork {
+        thread: thread.clone(),
+        on_changed: on_work_changed,
+    };
     view! {
         <ConversationSurface
             thread=Some(thread)
@@ -804,8 +916,43 @@ pub fn DirectBotConversation(
             anchor=ThreadRunAnchor::DirectBot
             fresh_thread=fresh
             agent_profile=Some(agent)
+            direct_work=Some(direct_work)
         />
     }
+}
+
+/// What only the direct-assistant entry has: its fixed conversation, which accepts input through
+/// `SubmitThreadInput`, and the work list that shows it.
+#[derive(Clone)]
+struct DirectWork {
+    /// The conversation this mount shows; a direct mount never changes it.
+    thread: ThreadId,
+    /// Ask the work list to read its first page again.
+    on_changed: UnsyncCallback<()>,
+}
+
+/// Why a direct-Bot submission or stop did not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectNotice {
+    /// No usable catalog entry is chosen, so the Server would refuse the body.
+    ModelRequired,
+    /// The conversation already holds the full pending and held budget.
+    InputLimit,
+    /// The Server refused the submission; nothing was accepted.
+    Rejected,
+    /// The Server refused the stop; nothing was held or cancelled.
+    StopRejected,
+    /// The stop reply was lost; whether anything was held or cancelled is not known.
+    StopUnconfirmed,
+}
+
+/// The receipt of one "stop and take over".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StopReceipt {
+    /// How many pending inputs the Server held.
+    held: u32,
+    /// The cancellation receipt for the foreground Run, when the request named one.
+    cancellation: Option<ThreadRunCancellationState>,
 }
 
 #[component]
@@ -818,8 +965,12 @@ fn ConversationSurface(
     anchor: ThreadRunAnchor,
     fresh_thread: bool,
     agent_profile: Option<AgentProfile>,
+    /// Present exactly for the direct assistant, which accepts input through `SubmitThreadInput`.
+    direct_work: Option<DirectWork>,
 ) -> impl IntoView {
     let i18n = use_i18n();
+    let direct = direct_work.is_some();
+    let direct_work = StoredValue::new(direct_work);
     let identity_profile = RwSignal::new(agent_profile.clone());
     let run_anchor = StoredValue::new(anchor);
     #[cfg(not(target_arch = "wasm32"))]
@@ -901,6 +1052,35 @@ fn ConversationSurface(
         Signal::derive(move || model_support.get() == Some(true)),
         Signal::derive(move || agent_id.get_value()),
     );
+    // The direct assistant submits through `SubmitThreadInput`, which accepts only a v2 body
+    // with a `custom` selection. Its choice comes from the owner's custom model catalog and is
+    // never the channel picker's v1 selection.
+    let direct_model = ModelComposerV2::new(Signal::derive(move || {
+        direct && model_support.get() == Some(true)
+    }));
+    // The Server's acceptance receipt for the last direct-Bot submission. A queued receipt is
+    // shown as "accepted, waiting to be handled"; a started one needs no line, because the
+    // conversation itself becomes that Run. It is dropped by the next submission and whenever
+    // the foreground Run changes, after which the Server's pending list is the only account.
+    let accepted_input = RwSignal::new(None::<AcceptedInput>);
+    // Why the last direct-Bot submission or stop did not complete.
+    let direct_notice = RwSignal::new(None::<DirectNotice>);
+    // The receipt of the last "stop and take over", dropped like the acceptance receipt.
+    let stop_receipt = RwSignal::new(None::<StopReceipt>);
+    // Whether a "stop and take over" request is in flight.
+    let work_stopping = RwSignal::new(false);
+    // The retained inputs of this conversation, read from the Server; a closed window loses
+    // nothing.
+    let pending_items = RwSignal::new(Vec::<PendingInput>::new());
+    let pending_loading = RwSignal::new(true);
+    let pending_failed = RwSignal::new(false);
+    let pending_generation = RwSignal::new(0_u64);
+    // How many listed approvals, decisions and interrupts name this conversation's foreground
+    // Run: the same client-side count the work list shows on the conversation's row.
+    let attention_count = RwSignal::new(0_usize);
+    // The local item of a direct-Bot submission whose acceptance receipt has not arrived. Its
+    // title stays "waiting to send" until the Server accepts it.
+    let direct_local_item = RwSignal::new(None::<RunIntent>);
     let queued = RwSignal::new(Vec::<QueuedMessage>::new());
     let queue_skills_invalid = Signal::derive(move || {
         queued.get().iter().any(|item| {
@@ -918,6 +1098,8 @@ fn ConversationSurface(
     let resumable = RwSignal::new(None::<PendingTurn>);
     let resumable_recovery = RwSignal::new(None::<RunRecovery>);
     let submissions = expect_context::<RunSubmissionActions>();
+    // Direct input recovery uses the same app-owned barrier as the other send entries.
+    let direct_retry = Signal::derive(move || if direct { resumable.get() } else { None });
     Effect::new(move |_| {
         if submitting.get() {
             return;
@@ -941,10 +1123,15 @@ fn ConversationSurface(
         skill_composer
             .selected
             .set(intent.selected_skill_slugs.clone());
-        model_composer.restore_selection(
-            intent.model_selection.clone(),
-            Some(intent.agent_id.clone()),
-        );
+        if direct {
+            direct_model.selected.set(intent.model_selection_v2.clone());
+            direct_local_item.set(Some(intent.clone()));
+        } else {
+            model_composer.restore_selection(
+                intent.model_selection.clone(),
+                Some(intent.agent_id.clone()),
+            );
+        }
         resumable_recovery.set(Some(recovery));
         resumable.set(Some(intent));
         begin_unknown.set(true);
@@ -966,13 +1153,69 @@ fn ConversationSurface(
             resumable.set(None);
             resumable_recovery.set(None);
             skill_composer.clear();
+            direct_local_item.set(None);
             begin_unknown.set(false);
             send_notice.set(None);
         }
     });
+    // The retained inputs and the attention count are read from the Server on mount, after
+    // every action, on every snapshot reload and whenever the foreground Run changes: the
+    // dispatcher turns a pending input into a Run without any action on this page.
+    let active_run = Memo::new(move |_| state.with(|state| state.active_run_id.clone()));
+    if let Some(work) = direct_work.get_value() {
+        Effect::new(move |previous: Option<Option<RunId>>| {
+            pending_generation.track();
+            reload_generation.track();
+            let run = active_run.get();
+            if previous.is_some_and(|previous| previous != run) {
+                accepted_input.set(None);
+                stop_receipt.set(None);
+                work.on_changed.run(());
+            }
+            pending_loading.set(true);
+            pending_failed.set(false);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let thread = work.thread.clone();
+                let attention_run = run.clone();
+                leptos::task::spawn_local_scoped_with_cancellation(async move {
+                    let result = list_pending_inputs(&thread).await;
+                    let index = read_attention_index().await;
+                    match result {
+                        Ok(page) => pending_items.set(page.items),
+                        Err(_) => pending_failed.set(true),
+                    }
+                    attention_count.set(index.count_for(attention_run.as_ref()));
+                    pending_loading.set(false);
+                });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_loading.set(false);
+            run
+        });
+    }
+    // Read the retained inputs again and tell the work list, whose row counts them.
+    let refresh_pending = UnsyncCallback::new(move |_| {
+        pending_generation.update(|value| *value = value.saturating_add(1));
+        if let Some(work) = direct_work.get_value() {
+            work.on_changed.run(());
+        }
+    });
     let busy = Signal::derive(move || state.get().active_run_id.is_some() || submitting.get());
+    let can_stop_work = Signal::derive(move || {
+        direct
+            && !work_stopping.get()
+            && state.with(|state| {
+                pending_items.with(|items| {
+                    work_stop_offered(state.active_run_cancellable, state.active_run_state, items)
+                })
+            })
+    });
     let input_locked = Signal::derive(move || {
-        submitting.get() || resumable.get().is_some() || submission_blocked.get()
+        submitting.get()
+            || resumable.get().is_some()
+            || submission_blocked.get()
+            || (direct && submissions.has_barrier())
     });
     let textarea_disabled = Signal::derive(move || input_locked.get() || !channel_active);
     let send_disabled = Signal::derive(move || {
@@ -985,6 +1228,7 @@ fn ConversationSurface(
             trim_ecmascript(&draft.get()).is_empty(),
             resumable.get().is_some(),
         ) || submission_blocked.get()
+            || (direct && (submissions.has_barrier() || !direct_model.supports_explicit.get()))
             || (resumable.get().is_none()
                 && (skill_composer.invalid.get() || queue_skills_invalid.get()))
     });
@@ -1001,7 +1245,10 @@ fn ConversationSurface(
         }
     });
     let can_stop = Signal::derive(move || stop_control.get().enabled());
-    let show_stop = Signal::derive(move || stop_control.get().visible());
+    // The direct entry never hides its send button behind the composer's stop control: the
+    // Server retains the input while a Run is active, and the work-level stop is a separate
+    // action that also holds the retained inputs.
+    let show_stop = Signal::derive(move || !direct && stop_control.get().visible());
     let stop_disabled = Signal::derive(move || !can_stop.get());
     let send_now = UnsyncCallback::new(move |requested: RunIntent| {
         if submitting.get_untracked()
@@ -1312,7 +1559,118 @@ fn ConversationSurface(
             message,
             selected_skill_slugs: Vec::new(),
             model_selection: None,
+            model_selection_v2: None,
         });
+    });
+    // The direct assistant accepts its input through `SubmitThreadInput`, not `BeginThreadRun`.
+    // The receipt decides what the user sees: `started` enters the subscription, `queued` is
+    // shown as "accepted, waiting to be handled" and read back from the Server's pending list.
+    // A busy conversation is not refused here: the Server retains the input durably.
+    let direct_submit = UnsyncCallback::new(move |(attempt, retry_unknown): (RunIntent, bool)| {
+        // Every direct intent carries its frozen v2 selection; a channel mount has no work here.
+        let (Some(work), Some(selection)) =
+            (direct_work.get_value(), attempt.model_selection_v2.clone())
+        else {
+            return;
+        };
+        if submitting.get_untracked() || loading.get_untracked() || snapshot_error.get_untracked() {
+            return;
+        }
+        submitting.set(true);
+        direct_notice.set(None);
+        accepted_input.set(None);
+        stop_receipt.set(None);
+        let body = v2_body(
+            &attempt.run_id,
+            &attempt.agent_id,
+            &attempt.message,
+            &attempt.selected_skill_slugs,
+            &selection,
+        );
+        artifact_source.stage_begin(&attempt);
+        #[cfg(target_arch = "wasm32")]
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            let recovery = RunRecovery {
+                source: SubmissionSource::Conversation,
+                intent: attempt.clone(),
+                channel: None,
+            };
+            let result = submit_direct_input(
+                submissions,
+                &recovery,
+                retry_unknown,
+                async {
+                    let result = submit_thread_input(&work.thread, &body).await;
+                    // A queued receipt has no Run yet, so the artifact join has nothing to observe.
+                    artifact_source.begin_reply(
+                        &attempt.run_id,
+                        match &result {
+                            Ok(ThreadInputOutcome::Started(started)) => Ok(started),
+                            _ => Err(()),
+                        },
+                    );
+                    result.map(|outcome| AcceptedInput::from_outcome(&outcome))
+                },
+                read_back_direct_input(&work.thread, &attempt.run_id),
+            )
+            .await;
+            submitting.set(false);
+            match result {
+                DirectSubmissionOutcome::Accepted(accepted) => {
+                    // The Server now holds the conversation; read it and subscribe to it.
+                    allow_missing_snapshot.set(false);
+                    if let AcceptedInput::Started { run_id } = &accepted {
+                        state.update(|state| state.accepted_run(run_id.clone()));
+                    }
+                    accepted_input.set(Some(accepted));
+                    direct_local_item.set(None);
+                    resumable.set(None);
+                    resumable_recovery.set(None);
+                    begin_unknown.set(false);
+                    if draft.get_untracked() == attempt.message
+                        && skill_composer.selected.get_untracked() == attempt.selected_skill_slugs
+                    {
+                        skill_composer.clear();
+                    }
+                    // A first input lists the conversation; an archived one returns to active.
+                    work.on_changed.run(());
+                    reload_generation.update(|value| *value = value.saturating_add(1));
+                }
+                DirectSubmissionOutcome::Failed(error) => {
+                    // An unknown receipt stays behind the app-owned barrier with its full intent.
+                    if let Some(notice) = direct_notice_for(error) {
+                        direct_notice.set(Some(notice));
+                        direct_local_item.set(None);
+                        resumable.set(None);
+                        resumable_recovery.set(None);
+                        begin_unknown.set(false);
+                        // A refused selection may be stale: read the catalog again.
+                        direct_model.reload();
+                    }
+                }
+                DirectSubmissionOutcome::Blocked => {
+                    // Another write holds the barrier, so a new input was never sent.
+                    if !retry_unknown {
+                        direct_local_item.set(None);
+                    }
+                    submission_blocked.set(true);
+                }
+            }
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (work, body, retry_unknown);
+            submitting.set(false);
+            direct_notice.set(Some(DirectNotice::Rejected));
+        }
+    });
+    // Retry an unconfirmed direct-Bot submission with the very same intent, so the Server
+    // replays it instead of creating a second input.
+    let retry_direct = UnsyncCallback::new(move |_| {
+        let Some(attempt) = direct_retry.get_untracked() else {
+            return;
+        };
+        direct_submit.run((attempt, true));
     });
     let submit = UnsyncCallback::new(move |_| {
         if send_disabled.get_untracked() {
@@ -1329,6 +1687,31 @@ fn ConversationSurface(
         let Some(requested_agent) = agent_id.get_value() else {
             return;
         };
+        if direct {
+            // The direct assistant submits through `SubmitThreadInput`. Its body must carry the
+            // frozen v2 catalog selection, so the channel picker's v1 selection is not used here
+            // and no field is dropped, replaced, or downgraded. A remote assistant never gets
+            // here: its send control stays disabled next to the reason.
+            let Some(selection) = direct_model.freeze() else {
+                direct_notice.set(Some(DirectNotice::ModelRequired));
+                return;
+            };
+            let intent = RunIntent {
+                thread_id: thread_id.get_untracked(),
+                run_id: mint_run_id(),
+                agent_id: requested_agent,
+                anchor: run_anchor.get_value(),
+                message: composer_draft.text,
+                selected_skill_slugs: composer_draft.command_ids,
+                model_selection: None,
+                model_selection_v2: Some(selection),
+            };
+            // The local item appears before the acceptance receipt arrives. Its title stays
+            // "waiting to send" until the Server accepts the input.
+            direct_local_item.set(Some(intent.clone()));
+            direct_submit.run((intent, false));
+            return;
+        }
         if let Some(model_notice) = model_notice(model_composer.selection_status()) {
             send_notice.set(Some(model_notice));
             return;
@@ -1348,6 +1731,7 @@ fn ConversationSurface(
             message: composer_draft.text,
             selected_skill_slugs: composer_draft.command_ids,
             model_selection,
+            model_selection_v2: None,
         };
         let current = queued.get_untracked();
         let transition = reduce_queue(
@@ -1367,6 +1751,64 @@ fn ConversationSurface(
         }
         if let Some(run) = run {
             send_now.run(run);
+        }
+    });
+    // "Stop and take over": hold every retained input and record the cancellation of the
+    // foreground Run in one transaction. Only this actor's running foreground can take a
+    // cancellation; otherwise the request names no Run and only holds the waiting inputs.
+    let stop_work = UnsyncCallback::new(move |_| {
+        let Some(work) = direct_work.get_value() else {
+            return;
+        };
+        if !can_stop_work.get_untracked() {
+            return;
+        }
+        let run = state.with_untracked(|state| {
+            state
+                .active_run_id
+                .clone()
+                .filter(|_| state.active_run_cancellable)
+        });
+        work_stopping.set(true);
+        direct_notice.set(None);
+        #[cfg(target_arch = "wasm32")]
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            let result = stop_thread_work(&work.thread, run.as_ref()).await;
+            work_stopping.set(false);
+            match result {
+                Ok(stopped) => {
+                    let cancellation = stopped.cancellation.map(|cancellation| cancellation.state);
+                    if let (
+                        Some(run),
+                        Some(
+                            ThreadRunCancellationState::Requested
+                            | ThreadRunCancellationState::AlreadyRequested,
+                        ),
+                    ) = (&run, cancellation)
+                    {
+                        // A recorded request is not a stop: observe the foreground as cancelling
+                        // until its terminal state arrives.
+                        state.update(|state| {
+                            if state.active_run_id.as_ref() == Some(run) {
+                                state.active_run_state = Some(ThreadForegroundRunState::Cancelling);
+                                state.active_run_cancellable = false;
+                            }
+                        });
+                    }
+                    stop_receipt.set(Some(StopReceipt {
+                        held: stopped.held,
+                        cancellation,
+                    }));
+                    work.on_changed.run(());
+                    reload_generation.update(|value| *value = value.saturating_add(1));
+                }
+                Err(error) => direct_notice.set(Some(stop_notice_for(error))),
+            }
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (work, run);
+            work_stopping.set(false);
         }
     });
     let stop = UnsyncCallback::new(move |_| {
@@ -1526,6 +1968,13 @@ fn ConversationSurface(
                 compact=Signal::derive(move || !state.get().messages.is_empty() || !state.get().streaming_text.is_empty())
                 description=move || if busy.get() { t_string!(i18n, channels.tool_running).to_owned() } else { t_string!(i18n, home.model_preset_note).to_owned() }
             />
+            <Show when=move || direct && attention_count.get() != 0>
+                <div class="ob-bot-attention">
+                    <Badge tone=BadgeTone::Caution>
+                        {move || t_string!(i18n, bot_work.attention_count, count = attention_count.get()).to_owned()}
+                    </Badge>
+                </div>
+            </Show>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
@@ -1639,11 +2088,15 @@ fn ConversationSurface(
                                 )
                         }>
                             <p class="ob-conversation-cancelling" role="status">
-                                {move || t!(i18n, channels.cancelling)}
+                                {move || if direct {
+                                    t_string!(i18n, bot_work.stop_cancelling).to_owned()
+                                } else {
+                                    t_string!(i18n, channels.cancelling).to_owned()
+                                }}
                             </p>
                         </Show>
                         <Show when=move || state.get().terminal_notice.is_some()>
-                            <p class="ob-alert" role="status">{move || terminal_text(i18n, state.get().terminal_notice)}</p>
+                            <p class="ob-alert" role="status">{move || state.get().terminal_notice.map(|notice| terminal_text(i18n.get_locale(), notice, direct))}</p>
                         </Show>
                         <Show when=move || !queued.get().is_empty()><h2 class="ob-queue-heading">{move || t!(i18n, channels.queued_status)}</h2></Show>
                         <For
@@ -1703,6 +2156,63 @@ fn ConversationSurface(
                                 }
                             }
                         />
+                    <Show when=move || direct_local_item.get().is_some()>
+                        <h2 class="ob-queue-heading">{move || t!(i18n, channels.queued_status)}</h2>
+                        <For
+                            each=move || direct_local_item.get().into_iter()
+                            key=|intent| intent.run_id.as_str().to_owned()
+                            children=move |intent| {
+                                let text = intent.message.clone();
+                                let visible_text = text.clone();
+                                view! {
+                                    <MessageScrollerItem
+                                        message_id=transcript_dom_id(&format!("direct-local:{}", intent.run_id.as_str()))
+                                    >
+                                        <div class="ob-queued-message" data-queued-message="">
+                                            <Message
+                                                align=MessageAlign::End
+                                                aria_label=move || t_string!(i18n, channels.queued_message_label).to_owned()
+                                            >
+                                                <MessageContent>
+                                                    <Bubble kind=BubbleKind::User>
+                                                        <div class="ob-skill-chips">{intent.selected_skill_slugs.into_iter().map(|slug| view! { <code>{format!("/{slug}")}</code> }).collect_view()}</div>
+                                                        <p class="ob-transcript-text">{visible_text}</p>
+                                                    </Bubble>
+                                                    <MessageFooter>
+                                                        <span role="status">{move || t!(i18n, channels.queued_status)}</span>
+                                                    </MessageFooter>
+                                                </MessageContent>
+                                            </Message>
+                                        </div>
+                                    </MessageScrollerItem>
+                                }
+                            }
+                        />
+                    </Show>
+                    <Show when=move || matches!(accepted_input.get(), Some(AcceptedInput::Queued { .. }))>
+                        <p class="ob-alert" role="status">
+                            {move || {
+                                let accepted = t_string!(i18n, bot_work.pending_accepted).to_owned();
+                                match accepted_input.get() {
+                                    Some(AcceptedInput::Queued { position: Some(position), .. }) => format!(
+                                        "{accepted} · {}",
+                                        t_string!(i18n, bot_work.pending_position, position = position)
+                                    ),
+                                    _ => accepted,
+                                }
+                            }}
+                        </p>
+                    </Show>
+                    {direct_work.get_value().map(|work| view! {
+                        <PendingInputsPanel
+                            thread=work.thread
+                            assistant=agent_name.clone()
+                            items=Signal::derive(move || pending_items.get())
+                            loading=Signal::derive(move || pending_loading.get())
+                            failed=Signal::derive(move || pending_failed.get())
+                            on_changed=refresh_pending
+                        />
+                    })}
                     </MessageScrollerContent>
                 </MessageScrollerViewport>
                 <MessageScrollerButton
@@ -1738,7 +2248,12 @@ fn ConversationSurface(
                 <Show when=move || queue_skills_invalid.get()><p class="ob-alert" role="alert">{move || t!(i18n, skills.selection_limit)}</p></Show>
                 </div>
                 <div class="ob-chat-controls">
-                <ModelPicker state=model_composer disabled=textarea_disabled/>
+                <Show
+                    when=move || direct
+                    fallback=move || view! { <ModelPicker state=model_composer disabled=textarea_disabled/> }
+                >
+                    <ModelPickerV2 state=direct_model disabled=textarea_disabled/>
+                </Show>
                 <SkillPicker state=skill_composer disabled=textarea_disabled/>
                 <span class="ob-chat-send">
                 <Show
@@ -1789,11 +2304,43 @@ fn ConversationSurface(
                     <super::composer::presentation::DraftSuggestions disabled=textarea_disabled on_choose=UnsyncCallback::new(move |text| { if !textarea_disabled.get_untracked() { draft.set(text); } })/>
                 </Show>
             </div>
+            <Show when=move || direct && (can_stop_work.get() || matches!(state.get().active_run_state, Some(ThreadForegroundRunState::Cancelling)))>
+                <div class="ob-bot-work-actions">
+                    <Button
+                        variant=ButtonVariant::Ghost
+                        size=ButtonSize::Small
+                        disabled=Signal::derive(move || !can_stop_work.get())
+                        loading=work_stopping
+                        on_activate=stop_work
+                    >
+                        <IconView icon=Icon::CircleStop size=IconSize::Inline />
+                        <span>{move || t!(i18n, bot_work.stop_and_take_over)}</span>
+                    </Button>
+                </div>
+            </Show>
+            <Show when=move || stop_receipt.get().is_some()>
+                <p class="ob-alert" role="status">{move || stop_receipt.get().map(|receipt| stop_receipt_text(i18n.get_locale(), receipt))}</p>
+            </Show>
+            <Show when=move || direct_notice.get().is_some()>
+                <p class="ob-alert" role="alert">{move || direct_notice.get().map(|notice| direct_notice_text(i18n.get_locale(), notice))}</p>
+            </Show>
+            // The direct entry's one alert for an unknown receipt carries its exact retry.
+            <Show when=move || direct_retry.get().is_some()>
+                <p class="ob-alert" role="alert">
+                    <span>{move || t!(i18n, channels.begin_unknown)}</span>
+                    <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry_direct>
+                        {move || t!(i18n, common.retry)}
+                    </Button>
+                </p>
+            </Show>
+            <Show when=move || direct && matches!(state.get().active_run_state, Some(ThreadForegroundRunState::ReconciliationRequired))>
+                <p class="ob-alert" role="status">{move || t!(i18n, bot_work.reconciliation_pending_hold)}</p>
+            </Show>
             <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_agent_conflict)}</p></Show>
             <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_selection_unavailable)}</p></Show>
             <Show when=move || send_notice.get()==Some(SubmissionNotice::Conflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_conflict)}</p></Show>
             <Show when=move || send_notice.get()==Some(SubmissionNotice::Rejected)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_rejected)}</p></Show>
-            <Show when=move || begin_unknown.get()>
+            <Show when=move || begin_unknown.get() && !direct>
                 <p class="ob-alert" role="alert">{move || t!(i18n, channels.begin_unknown)}</p>
             </Show>
             <Show when=move || submission_blocked.get()>
@@ -1958,18 +2505,22 @@ fn transcript_dom_id(source: &str) -> String {
     id
 }
 
-fn terminal_text(
-    i18n: leptos_i18n::I18nContext<crate::i18n::Locale>,
-    notice: Option<TerminalNotice>,
-) -> String {
-    match notice {
-        Some(TerminalNotice::Failed) => t_string!(i18n, channels.run_failed).to_owned(),
-        Some(TerminalNotice::Cancelled) => t_string!(i18n, channels.run_cancelled).to_owned(),
-        Some(TerminalNotice::ReconciliationRequired) => {
-            t_string!(i18n, channels.run_reconciliation).to_owned()
+fn terminal_text(locale: Locale, notice: TerminalNotice, direct: bool) -> String {
+    match (notice, direct) {
+        (TerminalNotice::Failed, _) => td_string!(locale, channels.run_failed),
+        (TerminalNotice::Cancelled, false) => td_string!(locale, channels.run_cancelled),
+        (TerminalNotice::ReconciliationRequired, false) => {
+            td_string!(locale, channels.run_reconciliation)
         }
-        None => String::new(),
+        // The direct entry's two stop outcomes (§7.4). Both let the user act, and a new input is
+        // accepted either way; an unreconciled Run also keeps its slot, its effects stay unknown
+        // and held inputs are not dispatched.
+        (TerminalNotice::Cancelled, true) => td_string!(locale, bot_work.stopped_actionable),
+        (TerminalNotice::ReconciliationRequired, true) => {
+            td_string!(locale, bot_work.reconciliation_actionable)
+        }
     }
+    .to_owned()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2283,6 +2834,140 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+
+    #[test]
+    fn direct_submission_notices_distinguish_rejection_from_unknown_receipts() {
+        use crate::api::ApiError;
+
+        assert_eq!(
+            direct_notice_for(ApiError::PendingInputLimit),
+            Some(DirectNotice::InputLimit)
+        );
+        for error in [
+            ApiError::PendingInputState,
+            ApiError::Conflict,
+            ApiError::AnchorUnsupported,
+            ApiError::Unauthorized,
+            ApiError::Forbidden,
+            ApiError::NotFound,
+        ] {
+            assert_eq!(direct_notice_for(error), Some(DirectNotice::Rejected));
+        }
+        // An unknown receipt has no notice of its own: its one alert is the exact retry.
+        for error in [
+            ApiError::Network,
+            ApiError::InvalidResponse,
+            ApiError::Server,
+            ApiError::ReconciliationRequired,
+        ] {
+            assert_eq!(direct_notice_for(error), None);
+        }
+    }
+
+    #[test]
+    fn only_a_definite_refusal_says_the_stop_paused_and_cancelled_nothing() {
+        use crate::api::ApiError;
+
+        for error in [ApiError::Conflict, ApiError::Forbidden, ApiError::NotFound] {
+            assert_eq!(stop_notice_for(error), DirectNotice::StopRejected);
+        }
+        for error in [
+            ApiError::Network,
+            ApiError::InvalidResponse,
+            ApiError::Server,
+        ] {
+            assert_eq!(stop_notice_for(error), DirectNotice::StopUnconfirmed);
+        }
+    }
+
+    #[test]
+    fn a_stop_shows_the_held_count_together_with_its_cancellation_receipt() {
+        let text =
+            |held, cancellation| stop_receipt_text(Locale::en, StopReceipt { held, cancellation });
+        assert_eq!(
+            text(2, Some(ThreadRunCancellationState::Requested)),
+            "Paused waiting inputs: 2. Cancellation request recorded."
+        );
+        assert_eq!(
+            text(0, Some(ThreadRunCancellationState::AlreadyRequested)),
+            "Paused waiting inputs: 0. Cancellation request recorded."
+        );
+        assert_eq!(
+            text(1, Some(ThreadRunCancellationState::AlreadyTerminal)),
+            "Paused waiting inputs: 1. The run had already ended."
+        );
+        assert_eq!(text(3, None), "Paused waiting inputs: 3.");
+    }
+
+    #[test]
+    fn a_cancelling_foreground_never_offers_stop_and_take_over() {
+        let pending = PendingInput {
+            run_id: RunId::new("pending"),
+            state: PendingInputState::Pending,
+            held_reason: None,
+            last_error: None,
+            submitted_at: time::OffsetDateTime::UNIX_EPOCH,
+            queued_at: time::OffsetDateTime::UNIX_EPOCH,
+            message: "next".to_owned(),
+            selected_skill_slugs: Vec::new(),
+            model_selection: openbot_contracts::versioned_model_selection::RunModelSelectionV2::new(
+                openbot_contracts::versioned_model_selection::ModelSelectionIntentSource::Custom,
+                "01991389-7380-7000-8000-000000000004".to_owned(),
+                3,
+                "custom:01991389-7380-7000-8000-000000000004".to_owned(),
+                7,
+            )
+            .expect("catalog selection assembles"),
+            artifact_refs: Vec::new(),
+        };
+        let mut held = pending.clone();
+        held.state = PendingInputState::Held;
+        held.held_reason = Some(openbot_contracts::command::PendingInputHeldReason::StoppedByUser);
+        let running = Some(ThreadForegroundRunState::Running);
+        let cancelling = Some(ThreadForegroundRunState::Cancelling);
+
+        assert!(work_stop_offered(true, running, &[]));
+        assert!(work_stop_offered(
+            false,
+            None,
+            std::slice::from_ref(&pending)
+        ));
+        // Cancelling is observed, not actionable, even with a waiting input behind it.
+        assert!(!work_stop_offered(
+            false,
+            cancelling,
+            std::slice::from_ref(&pending)
+        ));
+        // Held inputs are not revived by another stop, and a Run this actor cannot cancel
+        // gives the stop nothing to do.
+        assert!(!work_stop_offered(false, None, &[held]));
+        assert!(!work_stop_offered(
+            false,
+            Some(ThreadForegroundRunState::Queued),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn the_two_direct_stop_outcomes_say_differently_when_the_user_may_take_over() {
+        let cancelled = terminal_text(Locale::en, TerminalNotice::Cancelled, true);
+        let unreconciled = terminal_text(Locale::en, TerminalNotice::ReconciliationRequired, true);
+        assert_eq!(cancelled, "The run stopped. You can take over now.");
+        assert_eq!(
+            unreconciled,
+            "You can take over, but this run's effects are unknown, its slot stays occupied, \
+             and paused inputs are not dispatched."
+        );
+        // The channel copy that forbids the next message never reaches the direct entry.
+        assert_ne!(
+            unreconciled,
+            terminal_text(Locale::en, TerminalNotice::ReconciliationRequired, false)
+        );
+        assert_eq!(
+            terminal_text(Locale::en, TerminalNotice::Cancelled, false),
+            "The run was stopped."
+        );
+    }
 
     fn current_snapshot(run: Option<RunId>, text: &str) -> ThreadConversationSnapshot {
         ThreadConversationSnapshot {
@@ -2757,6 +3442,7 @@ mod tests {
             message: "Exact follow-up".to_owned(),
             selected_skill_slugs: vec!["review".to_owned()],
             model_selection: None,
+            model_selection_v2: None,
         };
         assert_eq!(pending.agent_id.as_str(), "bot-from-component");
         assert_eq!(pending.message, "Exact follow-up");

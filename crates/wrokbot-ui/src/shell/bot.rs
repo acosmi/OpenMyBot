@@ -14,11 +14,13 @@ use openbot_contracts::ids::{BotId, ThreadId};
 
 #[cfg(target_arch = "wasm32")]
 use self::bot_thread::{
-    RememberedThreadDecision, bot_thread_key, plausible_remembered_thread, thread_to_use,
+    RememberedThreadDecision, bot_thread_key, plausible_remembered_thread, remembered_entry,
+    thread_to_use,
 };
 use crate::api::bot_chat_href;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{list_agents, load_agent, load_thread_status, mint_thread_id};
+use crate::features::bot_threads::BotWorkList;
 use crate::features::channels::RecipientField;
 use crate::features::channels::conversation::DirectBotConversation;
 use crate::features::layout::{PageShell, PageWidth};
@@ -120,6 +122,8 @@ fn BotThreadPane(agent: AgentProfile) -> impl IntoView {
     let new_pending = RwSignal::new(false);
     let new_error = RwSignal::new(false);
     let reload_generation = RwSignal::new(0_u64);
+    // Bumped by the open conversation whenever its work changed, so the list reads it again.
+    let work_changes = RwSignal::new(0_u64);
 
     install_bot_thread_resolver(
         agent_id.get_value(),
@@ -134,6 +138,18 @@ fn BotThreadPane(agent: AgentProfile) -> impl IntoView {
         loading.set(true);
         reload_generation.update(|generation| *generation = generation.saturating_add(1));
     };
+    // Opening a row writes the remembered thread: the browser keeps only the most recently
+    // opened conversation, and the Server's list stays the work identity.
+    let open_work = UnsyncCallback::new(move |selected: ThreadId| {
+        #[cfg(target_arch = "wasm32")]
+        remember_thread(&agent_id.get_value(), &selected);
+        thread.set(Some(ResolvedBotThread {
+            id: selected,
+            fresh: false,
+        }));
+        history_unavailable.set(false);
+        thread_error.set(false);
+    });
     let start_new = move |_| {
         if new_pending.get_untracked() {
             return;
@@ -163,6 +179,12 @@ fn BotThreadPane(agent: AgentProfile) -> impl IntoView {
     };
 
     view! {
+        <BotWorkList
+            agent_id=agent_id.get_value()
+            selected=Signal::derive(move || thread.get().map(|thread| thread.id))
+            on_select=open_work
+            refresh=work_changes
+        />
         <div class="ob-bot-thread-toolbar">
             <Button
                 variant=ButtonVariant::Ghost
@@ -200,6 +222,9 @@ fn BotThreadPane(agent: AgentProfile) -> impl IntoView {
                     thread=thread.id
                     agent=agent_for_conversation.get_value()
                     fresh=thread.fresh
+                    on_work_changed=UnsyncCallback::new(move |_| {
+                        work_changes.update(|value| *value = value.saturating_add(1));
+                    })
                 />
             }
         />
@@ -364,5 +389,6 @@ fn remember_thread(agent_id: &BotId, thread: &ThreadId) {
     else {
         return;
     };
-    _ = storage.set_item(&bot_thread_key(agent_id.as_str()), thread.as_str());
+    let (key, value) = remembered_entry(agent_id.as_str(), thread);
+    _ = storage.set_item(&key, &value);
 }

@@ -519,6 +519,18 @@ fn http_route_of(command: &AppCommand) -> Option<String> {
         | AppCommand::SetActionPolicy { .. }
         | AppCommand::InvokeTool(_)
         | AppCommand::MintThreadId
+        // Direct Bot work commands are covered by openbot-server
+        // http::threads::tests::{bot_thread,pending_input,work_control}_http_commands_preserve_inputs_and_errors
+        // and openbot-desktop
+        // tauri_host::tests::{bot_thread,pending_input,work_control}_protocol_commands_preserve_inputs_and_errors.
+        | AppCommand::SubmitThreadInput(_)
+        | AppCommand::ListPendingInputs { .. }
+        | AppCommand::WithdrawPendingInput { .. }
+        | AppCommand::ReleasePendingInput { .. }
+        | AppCommand::StopThreadWork { .. }
+        | AppCommand::CompleteThread { .. }
+        | AppCommand::ListBotThreads { .. }
+        | AppCommand::SetThreadTitle { .. }
         | AppCommand::GetThreadStatus { .. }
         | AppCommand::BeginThreadRun(_)
         | AppCommand::BeginThreadRunV2(_)

@@ -955,6 +955,77 @@ where
             AppCommand::MintThreadId => Ok(AppReply::ThreadMinted(
                 mint_thread_id(&self.threads, auth).await?,
             )),
+            AppCommand::SubmitThreadInput(command) => Ok(AppReply::ThreadInputOutcome(
+                crate::use_cases::thread::submit_thread_input(
+                    &self.threads,
+                    self.artifacts.as_ref(),
+                    auth,
+                    command,
+                )
+                .await?,
+            )),
+            AppCommand::ListPendingInputs { thread_id } => Ok(AppReply::PendingInputs(
+                crate::use_cases::thread::list_pending_inputs(&self.threads, auth, thread_id)
+                    .await?,
+            )),
+            AppCommand::WithdrawPendingInput { thread_id, run_id } => {
+                Ok(AppReply::PendingInputState(
+                    crate::use_cases::thread::withdraw_pending_input(
+                        &self.threads,
+                        auth,
+                        thread_id,
+                        run_id,
+                    )
+                    .await?,
+                ))
+            }
+            AppCommand::StopThreadWork { thread_id, run_id } => Ok(AppReply::ThreadWorkStopped(
+                crate::use_cases::thread::stop_thread_work(&self.threads, auth, thread_id, run_id)
+                    .await?,
+            )),
+            AppCommand::CompleteThread { thread_id } => Ok(AppReply::ThreadCompleted(
+                crate::use_cases::thread::complete_thread(&self.threads, auth, thread_id).await?,
+            )),
+            AppCommand::ReleasePendingInput { thread_id, run_id } => {
+                let receipt = crate::use_cases::thread::release_pending_input(
+                    &self.threads,
+                    auth,
+                    thread_id.clone(),
+                    run_id,
+                )
+                .await?;
+                let dispatcher = crate::PendingInputDispatcher::new(
+                    &self.threads,
+                    std::sync::Arc::clone(&self.artifacts),
+                );
+                if let Err(error) = crate::PendingInputWake::wake(&dispatcher, &thread_id).await {
+                    tracing::warn!(
+                        code = error.code().as_str(),
+                        "released input wake unavailable"
+                    );
+                }
+                Ok(AppReply::PendingInputState(receipt))
+            }
+            AppCommand::ListBotThreads {
+                bot_id,
+                status,
+                cursor,
+                limit,
+            } => Ok(AppReply::BotThreadPage(
+                crate::use_cases::thread::list_bot_threads(
+                    &self.threads,
+                    auth,
+                    bot_id,
+                    status,
+                    cursor,
+                    limit,
+                )
+                .await?,
+            )),
+            AppCommand::SetThreadTitle { thread_id, title } => Ok(AppReply::ThreadTitleSet(
+                crate::use_cases::thread::set_thread_title(&self.threads, auth, thread_id, title)
+                    .await?,
+            )),
             AppCommand::GetThreadStatus { thread_id } => Ok(AppReply::ThreadStatus(
                 get_thread_status(&self.threads, auth, &thread_id).await?,
             )),

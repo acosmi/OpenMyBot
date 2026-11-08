@@ -8,13 +8,15 @@ use async_trait::async_trait;
 use futures_core::Stream;
 use openbot_application::{
     AppEventStream, BeginThreadRunRequest, BeginThreadRunV2Request, CancelThreadRunRequest,
-    ChannelActivitySubscription, RunInputArtifactMaterial, ThreadConversationRequest,
-    ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription, ThreadHistoryRequest,
+    ChannelActivitySubscription, RunInputArtifactMaterial, SubmitThreadInputAttempt,
+    ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription,
+    ThreadHistoryRequest,
 };
 use openbot_contracts::command::{
     AppEvent, ChannelActivityEvent, ThreadConversationSnapshot, ThreadForegroundRunState,
-    ThreadHistory, ThreadHistoryMessage, ThreadHistoryRole, ThreadRunAnchor, ThreadRunCancellation,
-    ThreadRunCancellationState, ThreadRunEvent, ThreadRunEventKind, ThreadRunStarted,
+    ThreadHistory, ThreadHistoryMessage, ThreadHistoryRole, ThreadInputOutcome, ThreadRunAnchor,
+    ThreadRunCancellation, ThreadRunCancellationState, ThreadRunEvent, ThreadRunEventKind,
+    ThreadRunStarted,
 };
 use openbot_contracts::ids::thread::ThreadIdentity;
 use openbot_contracts::ids::{ActorId, BotId, DeploymentId, TenantId, ThreadId};
@@ -646,6 +648,830 @@ impl PostgresThreadDirectory {
 
 #[async_trait]
 impl ThreadDirectory for PostgresThreadDirectory {
+    async fn pending_input_threads(&self) -> Result<Vec<ThreadId>, ThreadDirectoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let rows = client.query(
+            "SELECT DISTINCT p.thread_id FROM openbot_internal.thread_pending_inputs p
+             JOIN public.threads t ON t.thread_id=p.thread_id
+             WHERE p.state='pending' AND t.status<>'deleted'
+               AND NOT EXISTS(SELECT 1 FROM public.thread_run_occupancy o WHERE o.thread_id=p.thread_id)
+               AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_intents q WHERE q.thread_id=p.thread_id
+                 AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions c WHERE c.operation_id=q.operation_id))
+             ORDER BY p.thread_id", &[]).await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+        rows.iter()
+            .map(|row| decode::<String>(row, "thread_id").map(ThreadId::new))
+            .collect()
+    }
+
+    async fn dispatch_pending_input(
+        &self,
+        thread: &ThreadId,
+        consumer: &dyn openbot_application::PendingInputConsumer,
+    ) -> Result<(), ThreadDirectoryError> {
+        use openbot_contracts::auth::{AuthGeneration, Role};
+        use openbot_contracts::command::BeginThreadRunV2;
+        use openbot_contracts::ids::RunId;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(ThreadDirectoryError::Unavailable)?;
+        let binding = self
+            .model_dataset_binding
+            .as_ref()
+            .ok_or(ThreadDirectoryError::Unavailable)?;
+        let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
+        let mut checkout = binding
+            .checkout(deadline)
+            .await
+            .map_err(map_dataset_error)?;
+        let original = checkout
+            .begin_read_committed()
+            .await
+            .map_err(map_v2_begin_error)?;
+        let tx = original.as_transaction();
+        let schema = crate::thread_history_writer::CurrentWriterSchema::observe(tx)
+            .await
+            .map_err(origin_error)?;
+        tx.batch_execute("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='5s'")
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        // Use the original begin's transaction and lock order; no second connection waits
+        // on a conversation lock while this transaction holds its pending row. A submit that
+        // holds the lock at wake time is waited for, so its retained input is still seen.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread.as_str()],
+        )
+        .await
+        .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let row = tx.query_opt(
+            "SELECT p.*,t.deployment_id,t.tenant_id FROM openbot_internal.thread_pending_inputs p
+             JOIN public.threads t ON t.thread_id=p.thread_id
+             WHERE p.thread_id=$1 AND p.state='pending'
+               AND NOT EXISTS(SELECT 1 FROM public.thread_run_occupancy o WHERE o.thread_id=p.thread_id)
+               AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_intents q WHERE q.thread_id=p.thread_id
+                 AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions c WHERE c.operation_id=q.operation_id))
+             ORDER BY p.queued_at,p.run_id LIMIT 1 FOR UPDATE OF p SKIP LOCKED", &[&thread.as_str()])
+            .await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let Some(row) = row else {
+            original.rollback().await.map_err(map_v2_begin_error)?;
+            return Ok(());
+        };
+        let actor: String = decode(&row, "actor_id")?;
+        let saved_generation: i64 = decode(&row, "auth_generation")?;
+        let run: String = decode(&row, "run_id")?;
+        let user = tx.query_opt("SELECT coalesce(u.auth_generation,0) AS generation,
+             NOT EXISTS(SELECT 1 FROM public.revoked_access ra WHERE ra.email=lower(u.email)) AS allowed
+             FROM public.users u WHERE u.id=$1 FOR SHARE OF u", &[&actor])
+            .await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let mut held = None;
+        let mut last_error = None;
+        let mut dispatched = false;
+        let current_user = user
+            .as_ref()
+            .map(|u| {
+                Ok::<_, ThreadDirectoryError>((
+                    decode::<i64>(u, "generation")?,
+                    decode::<bool>(u, "allowed")?,
+                ))
+            })
+            .transpose()?;
+        if current_user.is_some_and(|(generation, _)| generation != saved_generation) {
+            held = Some("authority_stale");
+        } else {
+            let roles = tx
+                .query(
+                    "SELECT role::text AS role FROM public.user_roles WHERE user_id=$1 FOR SHARE",
+                    &[&actor],
+                )
+                .await
+                .map_err(|_| ThreadDirectoryError::Unavailable)?;
+            let roles: Vec<Role> = roles
+                .iter()
+                .map(|r| {
+                    decode::<String>(r, "role")?.parse().map_err(|_| {
+                        ThreadDirectoryError::Corrupt {
+                            field: "pending_actor_role",
+                        }
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            if current_user.is_none_or(|(_, allowed)| !allowed)
+                || !roles.iter().any(|r| matches!(r, Role::User | Role::Admin))
+            {
+                held = Some("authority_unavailable");
+                last_error = Some("not_visible".to_owned());
+            } else {
+                let command = BeginThreadRunV2 {
+                    thread_id: thread.clone(),
+                    run_id: RunId::new(&run),
+                    bot_id: BotId::new(decode::<String>(&row, "bot_id")?),
+                    anchor: ThreadRunAnchor::DirectBot,
+                    message: decode(&row, "message")?,
+                    selected_skill_slugs: decode(&row, "selected_skill_slugs")?,
+                    model_selection: serde_json::from_value(decode(&row, "model_selection")?)
+                        .map_err(|_| ThreadDirectoryError::Corrupt {
+                            field: "pending_input_model",
+                        })?,
+                    artifact_refs: decode(&row, "artifact_refs")?,
+                };
+                let generation =
+                    u64::try_from(saved_generation).map_err(|_| ThreadDirectoryError::Corrupt {
+                        field: "pending_auth_generation",
+                    })?;
+                let prepared = consumer
+                    .begin(openbot_application::VerifiedPendingInput {
+                        actor: ActorId::new(actor),
+                        deployment: DeploymentId::new(decode::<String>(&row, "deployment_id")?),
+                        tenant: TenantId::new(decode::<String>(&row, "tenant_id")?),
+                        auth_generation: AuthGeneration::new(generation),
+                        roles,
+                        command,
+                    })
+                    .await;
+                tx.batch_execute("SAVEPOINT pending_dispatch_begin")
+                    .await
+                    .map_err(|_| ThreadDirectoryError::Unavailable)?;
+                let outcome = match prepared {
+                    Ok((request, materials)) => {
+                        if !binding.matches_pool_scope(
+                            &self.pool,
+                            &request.deployment,
+                            &request.tenant,
+                        ) {
+                            Err(ThreadDirectoryError::Unavailable.into_app_error())
+                        } else {
+                            match artifact_refs::validate_materials(
+                                &request.command.artifact_refs,
+                                &materials,
+                            ) {
+                                Ok(()) => apply_begin_v2_observed(
+                                    &original, runtime, &request, &materials, &schema, None,
+                                )
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.into_app_error()),
+                                Err(error) => Err(error.into_app_error()),
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                match outcome {
+                    Ok(()) => dispatched = true,
+                    // Occupied again: the row stays pending and unchanged until the next wake.
+                    Err(openbot_contracts::error::AppError::LeaseConflict { .. }) => {
+                        return original.rollback().await.map_err(map_v2_begin_error);
+                    }
+                    Err(error) => {
+                        tx.batch_execute("ROLLBACK TO SAVEPOINT pending_dispatch_begin")
+                            .await
+                            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+                        let code = error.code().as_str();
+                        last_error = Some(code.to_owned());
+                        held = match (error.http_status(), code) {
+                            (503, _) => None,
+                            (403 | 404, _) => Some("authority_unavailable"),
+                            _ => Some("dispatch_rejected"),
+                        };
+                    }
+                }
+            }
+        }
+        let state = if dispatched {
+            "dispatched"
+        } else if held.is_some() {
+            "held"
+        } else {
+            "pending"
+        };
+        tx.execute("UPDATE openbot_internal.thread_pending_inputs SET state=$2,held_reason=$3,last_error=$4,
+            state_changed_at=CASE WHEN state<>$2 THEN clock_timestamp() ELSE state_changed_at END WHERE run_id=$1",
+            &[&run,&state,&held,&last_error]).await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+        original.commit().await.map_err(map_v2_commit_end_error)
+    }
+
+    async fn list_bot_threads(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        bot_id: &BotId,
+        status: openbot_contracts::command::ThreadStatusFilter,
+        cursor: Option<openbot_application::BotThreadCursor>,
+        limit: u32,
+    ) -> Result<openbot_contracts::command::BotThreadPage, ThreadDirectoryError> {
+        use openbot_contracts::command::{BotThreadForeground, BotThreadPage, BotThreadSummary};
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        crate::thread_origin::current_native_actor(
+            &tx,
+            auth.actor().as_str(),
+            auth.auth_generation(),
+        )
+        .await
+        .map_err(origin_error)?
+        .ok_or(ThreadDirectoryError::NotVisible)?;
+        let after_time = cursor.as_ref().map(|position| position.updated_at);
+        let after_id = cursor.as_ref().map(|position| position.thread_id.as_str());
+        let sql = format!(
+            "WITH visible_bot AS (SELECT EXISTS(
+               SELECT 1 FROM public.agents a JOIN public.agent_profiles p ON p.agent_id=a.id
+               LEFT JOIN public.deployment_packages dp ON dp.id=a.package_id
+               WHERE p.agent_id=$1 AND p.deleted_at IS NULL
+                 AND (a.package_id IS NULL OR dp.tenant_id=$4)
+                 AND (p.visibility='public' OR p.owner_user_id=$2 OR EXISTS(
+                   SELECT 1 FROM public.user_roles ur WHERE ur.user_id=$2 AND ur.role='admin'))
+             ) AS visible), candidates AS (
+               SELECT t.thread_id,t.title,t.status,t.updated_at
+               FROM public.threads t CROSS JOIN visible_bot b
+               WHERE b.visible AND t.created_by=$2 AND t.deployment_id=$3 AND t.tenant_id=$4
+                 AND t.anchor_kind='direct_bot' AND t.anchor_id=$1
+                 AND t.status=$5 AND t.deleted_at IS NULL
+                 AND EXISTS(SELECT 1 FROM public.thread_memberships tm
+                   WHERE tm.thread_id=t.thread_id AND tm.user_id=$2)
+                 AND ($6::timestamptz IS NULL OR t.updated_at<$6
+                   OR (t.updated_at=$6 AND t.thread_id>$7))
+               ORDER BY t.updated_at DESC,t.thread_id ASC LIMIT $8
+             ), occupancy_scope AS (SELECT thread_id FROM candidates)
+             {}
+             SELECT b.visible,t.thread_id,t.title,t.updated_at,i.bad_occupancy,
+               r.run_id,r.status AS run_status,
+               (SELECT count(*) FROM openbot_internal.thread_pending_inputs p
+                 WHERE p.thread_id=t.thread_id AND p.state IN ('pending','held')) AS pending_inputs,
+               EXISTS(SELECT 1 FROM public.outbox o WHERE o.aggregate_id=r.run_id
+                 AND o.destination=$9 AND o.status<>'dead_letter') AS cancel_requested
+             FROM visible_bot b LEFT JOIN candidates t ON true
+             LEFT JOIN occupancy_integrity i ON i.thread_id=t.thread_id
+             LEFT JOIN public.thread_run_occupancy slot ON slot.thread_id=t.thread_id
+             LEFT JOIN public.runs r ON r.run_id=slot.run_id AND r.thread_id=t.thread_id
+             ORDER BY t.updated_at DESC,t.thread_id ASC",
+            occupancy::INTEGRITY_CTE,
+        );
+        let rows = tx
+            .query(
+                &sql,
+                &[
+                    &bot_id.as_str(),
+                    &auth.actor().as_str(),
+                    &auth.deployment().as_str(),
+                    &auth.tenant().as_str(),
+                    &status.as_str(),
+                    &after_time,
+                    &after_id,
+                    &(i64::from(limit) + 1),
+                    &RUN_CANCEL_DESTINATION,
+                ],
+            )
+            .await
+            .map_err(|error| unavailable("read Bot conversations", error))?;
+        let mut threads = Vec::new();
+        for row in &rows {
+            if !decode::<bool>(row, "visible")? {
+                return Err(ThreadDirectoryError::NotVisible);
+            }
+            let Some(thread_id) = decode::<Option<String>>(row, "thread_id")? else {
+                continue;
+            };
+            if decode::<bool>(row, "bad_occupancy")? {
+                return Err(ThreadDirectoryError::Corrupt {
+                    field: "thread_run_occupancy",
+                });
+            }
+            let run_id = decode::<Option<String>>(row, "run_id")?;
+            let run_status = decode::<Option<String>>(row, "run_status")?;
+            let cancellation = decode::<bool>(row, "cancel_requested")?;
+            let foreground = match (run_id, run_status.as_deref(), cancellation) {
+                (None, None, false) => None,
+                (Some(id), Some(value), cancellation) => {
+                    let state = match (value, cancellation) {
+                        ("queued", false) => ThreadForegroundRunState::Queued,
+                        ("running", false) => ThreadForegroundRunState::Running,
+                        ("queued" | "running", true) => ThreadForegroundRunState::Cancelling,
+                        ("reconciliation_required", false) => {
+                            ThreadForegroundRunState::ReconciliationRequired
+                        }
+                        _ => {
+                            return Err(ThreadDirectoryError::Corrupt {
+                                field: "active_run_state",
+                            });
+                        }
+                    };
+                    Some(BotThreadForeground {
+                        state,
+                        run_id: openbot_contracts::ids::RunId::new(id),
+                    })
+                }
+                _ => {
+                    return Err(ThreadDirectoryError::Corrupt {
+                        field: "active_foreground",
+                    });
+                }
+            };
+            threads.push(BotThreadSummary {
+                thread_id: ThreadId::new(thread_id),
+                title: decode(row, "title")?,
+                status,
+                updated_at: decode(row, "updated_at")?,
+                foreground,
+                pending_inputs: decode::<i64>(row, "pending_inputs")? as u32,
+            });
+        }
+        let has_more = threads.len() > limit as usize;
+        threads.truncate(limit as usize);
+        let next_cursor = if has_more {
+            threads.last().map(|last| {
+                format!(
+                    "{}:{}",
+                    last.updated_at.unix_timestamp_nanos(),
+                    last.thread_id.as_str()
+                )
+            })
+        } else {
+            None
+        };
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        Ok(BotThreadPage {
+            threads,
+            next_cursor,
+        })
+    }
+
+    async fn set_thread_title(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+        title: String,
+    ) -> Result<openbot_contracts::command::ThreadTitleSet, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let schema = crate::thread_history_writer::CurrentWriterSchema::observe(&tx)
+            .await
+            .map_err(origin_error)?;
+        crate::thread_origin::current_native_actor(
+            &tx,
+            auth.actor().as_str(),
+            auth.auth_generation(),
+        )
+        .await
+        .map_err(origin_error)?
+        .ok_or(ThreadDirectoryError::NotVisible)?;
+        let row = tx.query_opt(
+            "SELECT t.anchor_kind,t.anchor_id,CASE WHEN t.anchor_kind='channel' THEN EXISTS(
+               SELECT 1 FROM public.channel_memberships cm WHERE cm.channel_id=t.anchor_id AND cm.user_id=$2
+             ) ELSE EXISTS(SELECT 1 FROM public.thread_memberships tm
+               WHERE tm.thread_id=t.thread_id AND tm.user_id=$2) END AS member
+             FROM public.threads t WHERE t.thread_id=$1 AND t.deployment_id=$3 AND t.tenant_id=$4
+               AND t.status<>'deleted' AND t.deleted_at IS NULL FOR UPDATE OF t",
+            &[&thread_id.as_str(), &auth.actor().as_str(), &auth.deployment().as_str(), &auth.tenant().as_str()],
+        ).await.map_err(|error| unavailable("read conversation for rename", error))?
+            .ok_or(ThreadDirectoryError::NotVisible)?;
+        if !decode::<bool>(&row, "member")? {
+            return Err(ThreadDirectoryError::NotVisible);
+        }
+        if decode::<String>(&row, "anchor_kind")? != "direct_bot" {
+            return Err(ThreadDirectoryError::AnchorUnsupported);
+        }
+        let bot_id: String = decode(&row, "anchor_id")?;
+        let visible: bool = tx
+            .query_one(
+            "SELECT EXISTS(SELECT 1 FROM public.agents a JOIN public.agent_profiles p ON p.agent_id=a.id
+               LEFT JOIN public.deployment_packages dp ON dp.id=a.package_id WHERE p.agent_id=$1
+               AND (a.package_id IS NULL OR dp.tenant_id=$3)
+               AND p.deleted_at IS NULL AND (p.visibility='public' OR p.owner_user_id=$2 OR EXISTS(
+                 SELECT 1 FROM public.user_roles ur WHERE ur.user_id=$2 AND ur.role='admin')))",
+            &[&bot_id, &auth.actor().as_str(), &auth.tenant().as_str()],
+            )
+            .await
+            .map_err(|error| unavailable("authorize conversation rename", error))?
+            .try_get(0)
+            .map_err(|_| ThreadDirectoryError::Corrupt {
+                field: "target_visible",
+            })?;
+        if !visible {
+            return Err(ThreadDirectoryError::NotVisible);
+        }
+        schema
+            .require_open(&tx, thread_id)
+            .await
+            .map_err(writer_error)?;
+        let now = database_now(&tx).await?;
+        tx.execute(
+            "UPDATE public.threads SET title=$2,updated_at=$3 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &title, &now],
+        )
+        .await
+        .map_err(|error| write_error("rename conversation", error))?;
+        tx.commit()
+            .await
+            .map_err(|error| write_error("commit conversation rename", error))?;
+        Ok(openbot_contracts::command::ThreadTitleSet {
+            thread_id: thread_id.clone(),
+            title,
+        })
+    }
+
+    async fn list_pending_inputs(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+    ) -> Result<openbot_contracts::command::PendingInputs, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        let rows = tx
+            .query(
+                "SELECT run_id,state,held_reason,last_error,submitted_at,queued_at,message,
+                    selected_skill_slugs,model_selection,artifact_refs
+             FROM openbot_internal.thread_pending_inputs
+             WHERE thread_id=$1 AND state IN ('pending','held') ORDER BY queued_at,run_id",
+                &[&thread_id.as_str()],
+            )
+            .await
+            .map_err(|error| unavailable("read pending inputs", error))?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let state: String = decode(&row, "state")?;
+            let held_reason: Option<String> = decode(&row, "held_reason")?;
+            items.push(openbot_contracts::command::PendingInput {
+                run_id: openbot_contracts::ids::RunId::new(decode::<String>(&row, "run_id")?),
+                state: serde_json::from_value(json!(state)).map_err(|_| {
+                    ThreadDirectoryError::Corrupt {
+                        field: "pending_input_state",
+                    }
+                })?,
+                held_reason: serde_json::from_value(json!(held_reason)).map_err(|_| {
+                    ThreadDirectoryError::Corrupt {
+                        field: "pending_input_held_reason",
+                    }
+                })?,
+                last_error: decode(&row, "last_error")?,
+                submitted_at: decode(&row, "submitted_at")?,
+                queued_at: decode(&row, "queued_at")?,
+                message: decode(&row, "message")?,
+                selected_skill_slugs: decode(&row, "selected_skill_slugs")?,
+                model_selection: serde_json::from_value(decode(&row, "model_selection")?).map_err(
+                    |_| ThreadDirectoryError::Corrupt {
+                        field: "pending_input_model",
+                    },
+                )?,
+                artifact_refs: decode(&row, "artifact_refs")?,
+            });
+        }
+        tx.rollback()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        Ok(openbot_contracts::command::PendingInputs { items })
+    }
+
+    async fn stop_thread_work(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+        run_id: Option<&openbot_contracts::ids::RunId>,
+    ) -> Result<openbot_contracts::command::ThreadWorkStopped, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread_id.as_str()],
+        )
+        .await
+        .map_err(|e| unavailable("lock work conversation", e))?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        let now = database_now(&tx).await?;
+        let held = tx.execute("UPDATE openbot_internal.thread_pending_inputs SET state='held',held_reason='stopped_by_user',state_changed_at=$2 WHERE thread_id=$1 AND state='pending'", &[&thread_id.as_str(), &now]).await.map_err(|e| write_error("hold stopped inputs",e))?;
+        let mut cancellation = None;
+        if let Some(run_id) = run_id {
+            checked_thread_occupancy(&tx, thread_id).await?;
+            let current = tx
+                .query_opt(
+                    "SELECT run_id FROM public.thread_run_occupancy WHERE thread_id=$1",
+                    &[&thread_id.as_str()],
+                )
+                .await
+                .map_err(|e| unavailable("read stopped foreground", e))?;
+            if current
+                .as_ref()
+                .map(|row| decode::<String>(row, "run_id"))
+                .transpose()?
+                .as_deref()
+                == Some(run_id.as_str())
+            {
+                if self.runtime.is_none() {
+                    return Err(ThreadDirectoryError::Unavailable);
+                }
+                let request = CancelThreadRunRequest {
+                    deployment: auth.deployment().clone(),
+                    tenant: auth.tenant().clone(),
+                    actor: auth.actor().clone(),
+                    command: openbot_contracts::command::CancelThreadRun {
+                        thread_id: thread_id.clone(),
+                        run_id: run_id.clone(),
+                    },
+                };
+                cancellation = Some(match request_run_cancellation(&tx, &request).await? {
+                    CancelRequestOutcome::Created(reply)
+                    | CancelRequestOutcome::Observed(reply) => reply,
+                });
+            }
+        }
+        tx.execute(
+            "UPDATE public.threads SET updated_at=$2 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|e| write_error("touch stopped conversation", e))?;
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
+        Ok(openbot_contracts::command::ThreadWorkStopped {
+            held: u32::try_from(held).map_err(|_| ThreadDirectoryError::Corrupt {
+                field: "pending_inputs",
+            })?,
+            cancellation,
+        })
+    }
+
+    async fn release_pending_input(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+        run_id: &openbot_contracts::ids::RunId,
+    ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread_id.as_str()],
+        )
+        .await
+        .map_err(|e| unavailable("lock work conversation", e))?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        let row = tx.query_opt("SELECT state FROM openbot_internal.thread_pending_inputs WHERE thread_id=$1 AND run_id=$2 FOR UPDATE", &[&thread_id.as_str(), &run_id.as_str()]).await.map_err(|e| unavailable("read released input",e))?.ok_or(ThreadDirectoryError::NotVisible)?;
+        if decode::<String>(&row, "state")? != "held" {
+            return Err(ThreadDirectoryError::PendingInputState);
+        }
+        let generation = i64::try_from(auth.auth_generation().get()).map_err(|_| {
+            ThreadDirectoryError::InvalidInput {
+                field: "auth_generation",
+            }
+        })?;
+        let now = database_now(&tx).await?;
+        tx.execute("UPDATE openbot_internal.thread_pending_inputs SET state='pending',queued_at=$3,auth_generation=$4,held_reason=NULL,last_error=NULL,state_changed_at=$3 WHERE thread_id=$1 AND run_id=$2", &[&thread_id.as_str(), &run_id.as_str(), &now, &generation]).await.map_err(|e| write_error("release held input",e))?;
+        tx.execute(
+            "UPDATE public.threads SET updated_at=$2 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|e| write_error("touch released conversation", e))?;
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
+        Ok(openbot_contracts::command::PendingInputReceipt {
+            run_id: run_id.clone(),
+            state: openbot_contracts::command::PendingInputState::Pending,
+        })
+    }
+
+    async fn complete_thread(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+    ) -> Result<openbot_contracts::command::ThreadCompleted, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            &[&thread_id.as_str()],
+        )
+        .await
+        .map_err(|e| unavailable("lock work conversation", e))?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        checked_thread_occupancy(&tx, thread_id).await?;
+        let row = tx.query_one("SELECT r.status AS run_status, EXISTS(SELECT 1 FROM public.outbox o WHERE o.aggregate_id=r.run_id AND o.destination=$2 AND o.status<>'dead_letter') AS cancel_requested, (SELECT count(*) FROM openbot_internal.thread_pending_inputs p WHERE p.thread_id=$1 AND p.state IN ('pending','held')) AS pending_inputs, EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_intents q WHERE q.thread_id=$1 AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions c WHERE c.operation_id=q.operation_id)) AS clearing FROM (SELECT $1::text AS thread_id) t LEFT JOIN public.thread_run_occupancy slot ON slot.thread_id=t.thread_id LEFT JOIN public.runs r ON r.run_id=slot.run_id AND r.thread_id=t.thread_id", &[&thread_id.as_str(), &RUN_CANCEL_DESTINATION]).await.map_err(|e| unavailable("read conversation completion facts",e))?;
+        let foreground = match (
+            decode::<Option<String>>(&row, "run_status")?.as_deref(),
+            decode::<bool>(&row, "cancel_requested")?,
+        ) {
+            (None, false) => None,
+            (Some("queued"), false) => Some(ThreadForegroundRunState::Queued),
+            (Some("running"), false) => Some(ThreadForegroundRunState::Running),
+            (Some("queued" | "running"), true) => Some(ThreadForegroundRunState::Cancelling),
+            (Some("reconciliation_required"), false) => {
+                Some(ThreadForegroundRunState::ReconciliationRequired)
+            }
+            _ => {
+                return Err(ThreadDirectoryError::Corrupt {
+                    field: "active_run_state",
+                });
+            }
+        };
+        let pending_inputs =
+            u32::try_from(decode::<i64>(&row, "pending_inputs")?).map_err(|_| {
+                ThreadDirectoryError::Corrupt {
+                    field: "pending_inputs",
+                }
+            })?;
+        if foreground.is_some() || pending_inputs != 0 || decode::<bool>(&row, "clearing")? {
+            return Err(ThreadDirectoryError::ThreadNotIdle {
+                foreground,
+                pending_inputs,
+            });
+        }
+        let now = database_now(&tx).await?;
+        tx.execute(
+            "UPDATE public.threads SET status='archived',updated_at=$2 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|e| write_error("archive conversation", e))?;
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
+        Ok(openbot_contracts::command::ThreadCompleted {
+            status: openbot_contracts::command::ThreadStatusFilter::Archived,
+        })
+    }
+
+    async fn withdraw_pending_input(
+        &self,
+        auth: &openbot_contracts::auth::AuthContext,
+        thread_id: &ThreadId,
+        run_id: &openbot_contracts::ids::RunId,
+    ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        authorize_pending_thread(&tx, auth, thread_id).await?;
+        let row = tx.query_opt(
+            "SELECT state FROM openbot_internal.thread_pending_inputs WHERE thread_id=$1 AND run_id=$2 FOR UPDATE",
+            &[&thread_id.as_str(),&run_id.as_str()],
+        ).await.map_err(|error| unavailable("read withdrawal input", error))?
+            .ok_or(ThreadDirectoryError::NotVisible)?;
+        let state: String = decode(&row, "state")?;
+        if state == "dispatched" {
+            return Err(ThreadDirectoryError::PendingInputState);
+        }
+        let now = database_now(&tx).await?;
+        if state != "withdrawn" {
+            tx.execute(
+                "UPDATE openbot_internal.thread_pending_inputs
+                 SET state='withdrawn',held_reason=NULL,state_changed_at=$3 WHERE thread_id=$1 AND run_id=$2",
+                &[&thread_id.as_str(),&run_id.as_str(),&now],
+            ).await.map_err(|error| write_error("withdraw pending input", error))?;
+        }
+        tx.execute(
+            "UPDATE public.threads SET updated_at=$2 WHERE thread_id=$1",
+            &[&thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|error| write_error("touch withdrawn conversation", error))?;
+        tx.commit()
+            .await
+            .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
+        Ok(openbot_contracts::command::PendingInputReceipt {
+            run_id: run_id.clone(),
+            state: openbot_contracts::command::PendingInputState::Withdrawn,
+        })
+    }
+
+    async fn submit_thread_input(
+        &self,
+        request: BeginThreadRunV2Request,
+        materials: Option<Vec<RunInputArtifactMaterial>>,
+    ) -> Result<SubmitThreadInputAttempt, ThreadDirectoryError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(ThreadDirectoryError::Unavailable)?;
+        let binding = self
+            .model_dataset_binding
+            .as_ref()
+            .ok_or(ThreadDirectoryError::Unavailable)?;
+        if !binding.matches_pool_scope(&self.pool, &request.deployment, &request.tenant) {
+            return Err(ThreadDirectoryError::Corrupt {
+                field: "model_dataset_binding",
+            });
+        }
+        let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
+        let progress = V2BeginProgress::default();
+        let work = async {
+            let mut checkout = binding
+                .checkout(deadline)
+                .await
+                .map_err(map_dataset_error)?;
+            let original = checkout
+                .begin_read_committed()
+                .await
+                .map_err(map_v2_begin_error)?;
+            let remaining = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .max(1)
+                .to_string();
+            original.as_transaction().query_one(
+                "SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)",
+                &[&remaining],
+            ).await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+            match apply_submit_input(&original, runtime, &request, materials.as_deref()).await {
+                Ok(SubmissionOutcome::Written(outcome)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ThreadDirectoryError::Unavailable);
+                    }
+                    progress
+                        .stage
+                        .store(V2_COMMIT_ENTERED, std::sync::atomic::Ordering::SeqCst);
+                    original.commit().await.map_err(map_v2_commit_end_error)?;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ThreadDirectoryError::AcknowledgedAfterDeadline);
+                    }
+                    Ok(SubmitThreadInputAttempt::Accepted(outcome))
+                }
+                Ok(SubmissionOutcome::Replayed(outcome)) => {
+                    progress
+                        .stage
+                        .store(V2_REPLAY_VERIFIED, std::sync::atomic::Ordering::SeqCst);
+                    original.rollback().await.map_err(map_v2_replay_end_error)?;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(ThreadDirectoryError::AcknowledgedAfterDeadline);
+                    }
+                    Ok(SubmitThreadInputAttempt::Accepted(outcome))
+                }
+                Ok(SubmissionOutcome::NeedsArtifacts) => {
+                    original.rollback().await.map_err(map_v2_begin_error)?;
+                    Ok(SubmitThreadInputAttempt::NeedsArtifacts)
+                }
+                Err(error) => {
+                    original.rollback().await.map_err(map_v2_begin_error)?;
+                    Err(error)
+                }
+            }
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), work).await {
+            Ok(result) => result,
+            Err(_) => Err(
+                match progress.stage.load(std::sync::atomic::Ordering::SeqCst) {
+                    V2_REPLAY_VERIFIED => ThreadDirectoryError::ReplayClosureUnproven,
+                    V2_COMMIT_ENTERED => ThreadDirectoryError::CommitUnknown,
+                    _ => ThreadDirectoryError::Unavailable,
+                },
+            ),
+        }
+    }
+
     async fn begin_thread_run_v2(
         &self,
         request: BeginThreadRunV2Request,
@@ -1796,6 +2622,282 @@ enum BeginOutcome {
     Created(ThreadRunStarted),
 }
 
+async fn initial_thread_title(
+    transaction: &Transaction<'_>,
+    thread_id: &ThreadId,
+    incoming_message: &str,
+) -> Result<Option<String>, ThreadDirectoryError> {
+    let row = transaction
+        .query_opt(
+            "SELECT (SELECT m.content FROM public.messages m WHERE m.thread_id=t.thread_id
+           AND m.role='user' AND m.content->'artifactRef' IS NULL ORDER BY m.seq LIMIT 1) AS first_message
+         FROM public.threads t WHERE t.thread_id=$1 AND t.title IS NULL",
+            &[&thread_id.as_str()],
+        )
+        .await
+        .map_err(|error| unavailable("read initial conversation title", error))?;
+    let Some(row) = row else { return Ok(None) };
+    let first: Option<Value> = decode(&row, "first_message")?;
+    let first = first
+        .map(|value| history_text(&value).ok_or(ThreadDirectoryError::Corrupt { field: "content" }))
+        .transpose()?;
+    let message = first.as_deref().unwrap_or(incoming_message);
+    // A blank first line falls back to the trimmed text's first line; blank text keeps NULL.
+    let title: String = message
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(120)
+        .collect();
+    Ok((!title.is_empty()).then_some(title))
+}
+
+enum SubmissionOutcome {
+    Written(ThreadInputOutcome),
+    Replayed(ThreadInputOutcome),
+    NeedsArtifacts,
+}
+
+async fn authorize_pending_thread(
+    tx: &Transaction<'_>,
+    auth: &openbot_contracts::auth::AuthContext,
+    thread_id: &ThreadId,
+) -> Result<(), ThreadDirectoryError> {
+    crate::thread_origin::current_native_actor(tx, auth.actor().as_str(), auth.auth_generation())
+        .await
+        .map_err(origin_error)?
+        .ok_or(ThreadDirectoryError::NotVisible)?;
+    let (state, kind, bot) = load_visible_thread(
+        tx,
+        auth.deployment(),
+        auth.tenant(),
+        auth.actor(),
+        thread_id,
+    )
+    .await?
+    .ok_or(ThreadDirectoryError::NotVisible)?;
+    if state.status == "deleted" {
+        return Err(ThreadDirectoryError::NotVisible);
+    }
+    if kind != "direct_bot" {
+        return Err(ThreadDirectoryError::AnchorUnsupported);
+    }
+    let visible: bool = tx.query_one(
+        "SELECT EXISTS(SELECT 1 FROM public.agents a JOIN public.agent_profiles p ON p.agent_id=a.id
+         LEFT JOIN public.deployment_packages dp ON dp.id=a.package_id
+         WHERE a.id=$1 AND p.deleted_at IS NULL AND (a.package_id IS NULL OR dp.tenant_id=$3)
+           AND (p.visibility='public' OR p.owner_user_id=$2 OR EXISTS(
+             SELECT 1 FROM public.user_roles ur WHERE ur.user_id=$2 AND ur.role='admin')))",
+        &[&bot,&auth.actor().as_str(),&auth.tenant().as_str()],
+    ).await.map_err(|error| unavailable("authorize pending input Bot", error))?
+        .try_get(0).map_err(|_| ThreadDirectoryError::Corrupt {field:"target_visible"})?;
+    if !visible {
+        return Err(ThreadDirectoryError::NotVisible);
+    }
+    Ok(())
+}
+
+async fn apply_submit_input(
+    original: &crate::model_dataset::ModelDatasetTransaction<'_>,
+    runtime: &RuntimeLease,
+    request: &BeginThreadRunV2Request,
+    materials: Option<&[RunInputArtifactMaterial]>,
+) -> Result<SubmissionOutcome, ThreadDirectoryError> {
+    let tx = original.as_transaction();
+    let schema = crate::thread_history_writer::CurrentWriterSchema::observe(tx)
+        .await
+        .map_err(origin_error)?;
+    crate::model_runtime::validate_actor_v2(tx, request).await?;
+    let command = &request.command;
+    // One submission identity spans the pending and Run tables, including different threads.
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('pending_input:' || $1::text,0))",
+        &[&command.run_id.as_str()],
+    )
+    .await
+    .map_err(|error| unavailable("lock submitted input identity", error))?;
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+        &[&command.thread_id.as_str()],
+    )
+    .await
+    .map_err(|error| unavailable("lock input conversation", error))?;
+    let existing = load_visible_thread(
+        tx,
+        &request.deployment,
+        &request.tenant,
+        &request.actor,
+        &command.thread_id,
+    )
+    .await?;
+    if let Some((state, kind, bot)) = &existing {
+        if state.status == "deleted" {
+            return Err(ThreadDirectoryError::NotVisible);
+        }
+        if kind != "direct_bot" {
+            return Err(ThreadDirectoryError::AnchorUnsupported);
+        }
+        if bot != command.bot_id.as_str() {
+            return Err(ThreadDirectoryError::RequestConflict);
+        }
+        crate::thread_origin::observe_on(tx, command.thread_id.as_str())
+            .await
+            .map_err(origin_error)?;
+        crate::model_runtime::validate_thread_v2(tx, request).await?;
+    } else if !ThreadIdentity::new(&request.deployment).owns(&command.thread_id) {
+        return Err(ThreadDirectoryError::InvalidInput { field: "thread_id" });
+    }
+    crate::model_runtime::validate_target_v2(tx, request).await?;
+    if let Some(receipt) = replay_existing_v2(original, request).await? {
+        checked_thread_occupancy(tx, &command.thread_id).await?;
+        return Ok(SubmissionOutcome::Replayed(ThreadInputOutcome::Started(
+            receipt,
+        )));
+    }
+    let model = serde_json::to_value(&command.model_selection).map_err(|_| {
+        ThreadDirectoryError::InvalidInput {
+            field: "model_selection",
+        }
+    })?;
+    let prior = tx.query_opt(
+        "SELECT thread_id,actor_id,bot_id,anchor_kind,message,selected_skill_slugs,model_selection,artifact_refs,queued_at
+         FROM openbot_internal.thread_pending_inputs WHERE run_id=$1 FOR UPDATE",
+        &[&command.run_id.as_str()],
+    ).await.map_err(|error| unavailable("read submitted input identity", error))?;
+    if let Some(row) = prior {
+        if decode::<String>(&row, "thread_id")? != command.thread_id.as_str()
+            || decode::<String>(&row, "actor_id")? != request.actor.as_str()
+            || decode::<String>(&row, "bot_id")? != command.bot_id.as_str()
+            || decode::<String>(&row, "anchor_kind")? != "direct_bot"
+            || decode::<String>(&row, "message")? != command.message
+            || decode::<Vec<String>>(&row, "selected_skill_slugs")? != command.selected_skill_slugs
+            || decode::<Value>(&row, "model_selection")? != model
+            || decode::<Vec<String>>(&row, "artifact_refs")? != command.artifact_refs
+        {
+            return Err(ThreadDirectoryError::RequestConflict);
+        }
+        let queued_at: OffsetDateTime = decode(&row, "queued_at")?;
+        let position: i64 = tx
+            .query_one(
+                "SELECT count(*)+1 FROM openbot_internal.thread_pending_inputs
+             WHERE thread_id=$1 AND state='pending' AND queued_at<$2",
+                &[&command.thread_id.as_str(), &queued_at],
+            )
+            .await
+            .map_err(|error| unavailable("read submitted input position", error))?
+            .try_get(0)
+            .map_err(|_| ThreadDirectoryError::Corrupt {
+                field: "pending_input_position",
+            })?;
+        return Ok(SubmissionOutcome::Replayed(ThreadInputOutcome::Queued {
+            run_id: command.run_id.clone(),
+            position: position as u32,
+        }));
+    }
+    let occupied = checked_thread_occupancy(tx, &command.thread_id).await?;
+    let row = tx.query_one(
+        "SELECT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_intents q
+           WHERE q.thread_id=$1 AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions c
+             WHERE c.operation_id=q.operation_id)) AS clearing,
+           (SELECT count(*) FROM openbot_internal.thread_pending_inputs
+             WHERE thread_id=$1 AND state IN ('pending','held')) AS retained,
+           (SELECT count(*) FROM openbot_internal.thread_pending_inputs
+             WHERE thread_id=$1 AND state='pending') AS waiting,
+           clock_timestamp() AS accepted_at",
+        &[&command.thread_id.as_str()],
+    ).await.map_err(|error| unavailable("read input admission facts", error))?;
+    let retained: i64 = decode(&row, "retained")?;
+    // Held rows count toward capacity but do not block a direct start; only Release requeues them.
+    let busy =
+        occupied || decode::<bool>(&row, "clearing")? || decode::<i64>(&row, "waiting")? != 0;
+    if !busy && materials.is_none() && !command.artifact_refs.is_empty() {
+        return Ok(SubmissionOutcome::NeedsArtifacts);
+    }
+    // A transaction that waited for this conversation can predate its creation.
+    // Admission timestamps must be observed after the conversation lock was acquired.
+    let now: OffsetDateTime = decode(&row, "accepted_at")?;
+    if existing
+        .as_ref()
+        .is_some_and(|(state, _, _)| state.status == "archived")
+    {
+        tx.execute(
+            "UPDATE public.threads SET status='active',updated_at=$2 WHERE thread_id=$1",
+            &[&command.thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|error| write_error("reopen submitted conversation", error))?;
+    }
+    if !busy {
+        let materials = materials.unwrap_or(&[]);
+        artifact_refs::validate_materials(&command.artifact_refs, materials)?;
+        // A failed begin may already have inserted its Thread or lease. Roll those writes
+        // back on the original transaction before retaining this same input instead.
+        tx.batch_execute("SAVEPOINT pending_input_begin")
+            .await
+            .map_err(|error| unavailable("save input begin boundary", error))?;
+        match apply_begin_v2_observed(original, runtime, request, materials, &schema, Some(now))
+            .await
+        {
+            Ok(BeginOutcome::Created(receipt)) => {
+                return Ok(SubmissionOutcome::Written(ThreadInputOutcome::Started(
+                    receipt,
+                )));
+            }
+            Ok(BeginOutcome::Replayed(receipt)) => {
+                return Ok(SubmissionOutcome::Replayed(ThreadInputOutcome::Started(
+                    receipt,
+                )));
+            }
+            Err(ThreadDirectoryError::LeaseConflict) => {
+                tx.batch_execute("ROLLBACK TO SAVEPOINT pending_input_begin; RELEASE SAVEPOINT pending_input_begin").await
+                    .map_err(|error| unavailable("rollback occupied input begin", error))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if retained >= i64::from(openbot_contracts::command::THREAD_PENDING_INPUTS_MAX) {
+        return Err(ThreadDirectoryError::PendingInputLimit);
+    }
+    if existing.is_none() {
+        insert_thread_v2(tx, request, now).await?;
+    }
+    let generation = i64::try_from(request.auth_generation.get())
+        .map_err(|_| ThreadDirectoryError::NotVisible)?;
+    tx.execute(
+        "INSERT INTO openbot_internal.thread_pending_inputs
+         (run_id,thread_id,actor_id,auth_generation,bot_id,anchor_kind,message,selected_skill_slugs,model_selection,artifact_refs,
+          state,submitted_at,queued_at,state_changed_at)
+         VALUES($1,$2,$3,$4,$5,'direct_bot',$6,$7,$8,$9,'pending',$10,$10,$10)",
+        &[&command.run_id.as_str(),&command.thread_id.as_str(),&request.actor.as_str(),&generation,
+          &command.bot_id.as_str(),&command.message,&command.selected_skill_slugs,&model,&command.artifact_refs,&now],
+    ).await.map_err(|error| write_error("retain pending input", error))?;
+    tx.execute(
+        "UPDATE public.threads SET updated_at=$2 WHERE thread_id=$1",
+        &[&command.thread_id.as_str(), &now],
+    )
+    .await
+    .map_err(|error| write_error("touch submitted conversation", error))?;
+    let position: i64 = tx
+        .query_one(
+            "SELECT count(*)+1 FROM openbot_internal.thread_pending_inputs
+         WHERE thread_id=$1 AND state='pending' AND queued_at<$2",
+            &[&command.thread_id.as_str(), &now],
+        )
+        .await
+        .map_err(|error| unavailable("read accepted input position", error))?
+        .try_get(0)
+        .map_err(|_| ThreadDirectoryError::Corrupt {
+            field: "pending_input_position",
+        })?;
+    Ok(SubmissionOutcome::Written(ThreadInputOutcome::Queued {
+        run_id: command.run_id.clone(),
+        position: position as u32,
+    }))
+}
+
 struct ThreadState {
     status: String,
     next_message_seq: i64,
@@ -2096,15 +3198,17 @@ async fn apply_begin_observed(
         now,
     );
 
+    let title = initial_thread_title(transaction, &command.thread_id, &command.message).await?;
     transaction
         .execute(
-            "UPDATE public.threads SET next_message_seq=$2,next_event_seq=$3,updated_at=$4 \
+            "UPDATE public.threads SET next_message_seq=$2,next_event_seq=$3,updated_at=$4,title=coalesce(title,$5) \
              WHERE thread_id=$1",
             &[
                 &command.thread_id.as_str(),
                 &next_message_seq,
                 &next_event_seq,
                 &now,
+                &title,
             ],
         )
         .await
@@ -2695,6 +3799,26 @@ async fn apply_begin_v2(
             },
             error => origin_error(error),
         })?;
+    apply_begin_v2_observed(
+        model_transaction,
+        runtime,
+        request,
+        materials,
+        &schema,
+        None,
+    )
+    .await
+}
+
+async fn apply_begin_v2_observed(
+    model_transaction: &crate::model_dataset::ModelDatasetTransaction<'_>,
+    runtime: &RuntimeLease,
+    request: &BeginThreadRunV2Request,
+    materials: &[RunInputArtifactMaterial],
+    schema: &crate::thread_history_writer::CurrentWriterSchema<'_, '_>,
+    accepted_at: Option<OffsetDateTime>,
+) -> Result<BeginOutcome, ThreadDirectoryError> {
+    let transaction = model_transaction.as_transaction();
     crate::model_runtime::validate_actor_v2(transaction, request).await?;
     skills::validate_v2_slugs(request)?;
     let command = &request.command;
@@ -2727,7 +3851,10 @@ async fn apply_begin_v2(
         return Ok(BeginOutcome::Replayed(receipt));
     }
 
-    let now = database_now(transaction).await?;
+    let now = match accepted_at {
+        Some(accepted_at) => accepted_at,
+        None => database_now(transaction).await?,
+    };
     let state = match existing_thread {
         Some(state) => {
             if state.status != "active" {
@@ -2799,7 +3926,7 @@ async fn apply_begin_v2(
     .await?;
     artifact_refs::verify_current(
         transaction,
-        &schema,
+        schema,
         (&request.deployment, &request.tenant),
         &request.actor,
         request.auth_generation.get(),
@@ -2912,15 +4039,17 @@ async fn apply_begin_v2(
         now,
     );
 
+    let title = initial_thread_title(transaction, &command.thread_id, &command.message).await?;
     transaction
         .execute(
-            "UPDATE public.threads SET next_message_seq=$2,next_event_seq=$3,updated_at=$4 \
+            "UPDATE public.threads SET next_message_seq=$2,next_event_seq=$3,updated_at=$4,title=coalesce(title,$5) \
              WHERE thread_id=$1",
             &[
                 &command.thread_id.as_str(),
                 &next_message_seq,
                 &next_event_seq,
                 &now,
+                &title,
             ],
         )
         .await
@@ -3046,7 +4175,7 @@ async fn apply_begin_v2(
         .await
         .map_err(|error| write_error("写 replay-safe dispatch outbox 失败", error))?;
     if matches!(&command.anchor, ThreadRunAnchor::Channel { .. }) {
-        crate::channel_activity::record_from_message(&schema, message.id())
+        crate::channel_activity::record_from_message(schema, message.id())
             .await
             .map_err(writer_error)?;
     }
@@ -3069,6 +4198,35 @@ async fn load_thread_v2(
     request: &BeginThreadRunV2Request,
 ) -> Result<Option<ThreadState>, ThreadDirectoryError> {
     let command = &request.command;
+    let Some((state, anchor_kind, anchor_id)) = load_visible_thread(
+        transaction,
+        &request.deployment,
+        &request.tenant,
+        &request.actor,
+        &command.thread_id,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if !anchor_matches(
+        &command.anchor,
+        command.bot_id.as_str(),
+        &anchor_kind,
+        &anchor_id,
+    ) {
+        return Err(ThreadDirectoryError::RequestConflict);
+    }
+    Ok(Some(state))
+}
+
+async fn load_visible_thread(
+    transaction: &Transaction<'_>,
+    deployment: &DeploymentId,
+    tenant: &TenantId,
+    actor: &ActorId,
+    thread_id: &ThreadId,
+) -> Result<Option<(ThreadState, String, String)>, ThreadDirectoryError> {
     let row = transaction
         .query_opt(
             "SELECT t.deployment_id,t.tenant_id,t.anchor_kind,t.anchor_id,t.status, \
@@ -3081,34 +4239,30 @@ async fn load_thread_v2(
                       WHERE tm.thread_id=t.thread_id AND tm.user_id=$2 \
                     ) END AS member \
              FROM public.threads t WHERE t.thread_id=$1 FOR UPDATE OF t",
-            &[&command.thread_id.as_str(), &request.actor.as_str()],
+            &[&thread_id.as_str(), &actor.as_str()],
         )
         .await
         .map_err(|error| unavailable("读取并锁定 thread 失败", error))?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let deployment: String = decode(&row, "deployment_id")?;
-    let tenant: String = decode(&row, "tenant_id")?;
+    let stored_deployment: String = decode(&row, "deployment_id")?;
+    let stored_tenant: String = decode(&row, "tenant_id")?;
     let anchor_kind: String = decode(&row, "anchor_kind")?;
     let anchor_id: String = decode(&row, "anchor_id")?;
     let member: bool = decode(&row, "member")?;
-    if deployment != request.deployment.as_str() || tenant != request.tenant.as_str() || !member {
+    if stored_deployment != deployment.as_str() || stored_tenant != tenant.as_str() || !member {
         return Err(ThreadDirectoryError::NotVisible);
     }
-    if !anchor_matches(
-        &command.anchor,
-        command.bot_id.as_str(),
-        &anchor_kind,
-        &anchor_id,
-    ) {
-        return Err(ThreadDirectoryError::RequestConflict);
-    }
-    Ok(Some(ThreadState {
-        status: decode(&row, "status")?,
-        next_message_seq: decode(&row, "next_message_seq")?,
-        next_event_seq: decode(&row, "next_event_seq")?,
-    }))
+    Ok(Some((
+        ThreadState {
+            status: decode(&row, "status")?,
+            next_message_seq: decode(&row, "next_message_seq")?,
+            next_event_seq: decode(&row, "next_event_seq")?,
+        },
+        anchor_kind,
+        anchor_id,
+    )))
 }
 
 async fn insert_thread_v2(

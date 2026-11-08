@@ -585,6 +585,18 @@ impl AuthContextBuilder {
         }
     }
 
+    /// Build ordinary user authority after the dispatcher has verified the current ACL.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_verified_pending_input(
+        actor: ActorId,
+        deployment: DeploymentId,
+        tenant: TenantId,
+        auth_generation: AuthGeneration,
+    ) -> Self {
+        Self::from_verified_session(deployment, tenant, actor, auth_generation, false)
+    }
+
     /// 从已核验委托和 owner 当前事实开始构造；角色从空集合积累。
     ///
     /// 仅供受信 Application 代码调用。调用前须确认当前 `auth_generation` 与

@@ -642,6 +642,11 @@ impl RunDispatchConsumer for NoRunDispatchConsumer {
 /// Run journal/outbox/lease 的唯一 application port。
 #[async_trait]
 pub trait RunRuntime: Send + Sync {
+    /// Scan persisted direct input once when the original relay starts after dataset enrollment.
+    async fn scan_pending_inputs_at_startup(&self) -> Result<(), RunRuntimeError> {
+        Ok(())
+    }
+
     /// Claim a durable cancellation only when this process owns or may fence-take the run lease.
     async fn claim_cancellation(&self) -> Result<Option<ClaimedRunCancellation>, RunRuntimeError> {
         Ok(None)

@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use openbot_contracts::command::{ChannelDetail, ThreadRunAnchor};
 use openbot_contracts::ids::{BotId, RunId, ThreadId};
 use openbot_contracts::model_connections::RunModelSelection;
+use openbot_contracts::versioned_model_selection::RunModelSelectionV2;
 
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::api::ApiError;
@@ -13,7 +14,13 @@ use crate::api::{bot_chat_href, channel_new_href, channel_route_href};
 pub(crate) fn is_definite_rejection(error: ApiError) -> bool {
     matches!(
         error,
-        ApiError::Unauthorized | ApiError::Forbidden | ApiError::NotFound | ApiError::Conflict
+        ApiError::Unauthorized
+            | ApiError::Forbidden
+            | ApiError::NotFound
+            | ApiError::Conflict
+            | ApiError::PendingInputLimit
+            | ApiError::PendingInputState
+            | ApiError::AnchorUnsupported
     )
 }
 
@@ -44,6 +51,12 @@ pub(crate) struct RunIntent {
     pub(crate) message: String,
     pub(crate) selected_skill_slugs: Vec<String>,
     pub(crate) model_selection: Option<RunModelSelection>,
+    /// The frozen v2 selection a direct-Bot submission carries.
+    ///
+    /// The direct-Bot entry accepts only a v2 body whose selection is `custom`, so the intent
+    /// keeps that selection next to the v1 one instead of replacing it. The channel entry leaves
+    /// it empty and keeps using `BeginThreadRun`.
+    pub(crate) model_selection_v2: Option<RunModelSelectionV2>,
 }
 
 impl RunIntent {
@@ -62,7 +75,7 @@ pub(crate) struct RunRecovery {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SubmissionBarrier {
     Create(CreateIntent),
-    Run(RunRecovery),
+    Run(Box<RunRecovery>),
 }
 
 impl SubmissionBarrier {
@@ -271,7 +284,7 @@ impl RunSubmissionActions {
                 self.run.with(|pending| {
                     pending
                         .as_ref()
-                        .map(|pending| SubmissionBarrier::Run(pending.recovery.clone()))
+                        .map(|pending| SubmissionBarrier::Run(Box::new(pending.recovery.clone())))
                 })
             })
     }
@@ -404,6 +417,7 @@ mod tests {
                 connection_id: "01991389-7380-7000-8000-000000000001".into(),
                 expected_revision: revision,
             }),
+            model_selection_v2: None,
         }
     }
 

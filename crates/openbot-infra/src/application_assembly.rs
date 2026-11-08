@@ -418,6 +418,13 @@ pub async fn assemble_postgres_application(
     .map_err(|_| fail("thread_directory"))?
     .with_model_dataset_binding(model_dataset_binding.clone())
     .map_err(|_| fail("thread_directory_model_dataset"))?;
+    let pending_inputs = Arc::new(openbot_application::PendingInputDispatcher::new(
+        Arc::new(thread_directory.clone()),
+        artifacts
+            .clone()
+            .unwrap_or_else(|| Arc::new(openbot_application::NoArtifactAdministration)),
+    ));
+    let run_runtime = run_runtime.with_pending_input_dispatcher(pending_inputs);
     let delegation_store = delegation_authority.as_ref().map(|_| {
         Arc::new(crate::delegation::PostgresDelegatedRunStore::new(
             pool.clone(),

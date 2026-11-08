@@ -89,7 +89,11 @@ pub mod delegation;
 pub mod intelligence_import;
 pub mod mcp_connections;
 pub mod model_connections;
+pub mod pending_input;
 pub mod ports;
+pub use pending_input::{
+    PendingInputConsumer, PendingInputDispatcher, PendingInputWake, VerifiedPendingInput,
+};
 pub mod provider;
 pub mod provider_extensions;
 pub mod remote_interrupt;
@@ -177,7 +181,7 @@ pub use mcp_connections::{
 pub use ports::{
     AgentAdministration, AgentAdministrationError, AgentAdministrationScope, AgentDirectory,
     AgentReachability, AgentReadScope, AuditPageRequest, AuditReadError, AuditReader,
-    BeginThreadRunRequest, BeginThreadRunV2Request, CancelThreadRunRequest,
+    BeginThreadRunRequest, BeginThreadRunV2Request, BotThreadCursor, CancelThreadRunRequest,
     ChannelActivitySubscription, ChannelAdministration, ChannelAdministrationError,
     ChannelCreateRequest, ChannelCreateScope, ChannelReadScope, ChannelReader,
     ChannelRoutingBackend, ChannelRoutingBackendError, CorrectMemoryRequest, MemoryAdministration,
@@ -188,9 +192,9 @@ pub use ports::{
     OwnedCredentialRetirementError, OwnedCredentialRetirer, PeopleAdministration,
     PeoplePageRequest, PeoplePortError, PolicyAdministration, PolicyAdministrationError, PortError,
     RecallMemoriesRequest, RememberMemoryRequest, RoutingAuditRecord, RunEffectReceiptsRequest,
-    RunInputArtifactMaterial, RunReconciliationRequest, ThreadConversationRequest, ThreadDirectory,
-    ThreadDirectoryError, ThreadEventSubscription, ThreadHistoryDeletion, ThreadHistoryRequest,
-    UpdateMemoryControlRequest,
+    RunInputArtifactMaterial, RunReconciliationRequest, SubmitThreadInputAttempt,
+    ThreadConversationRequest, ThreadDirectory, ThreadDirectoryError, ThreadEventSubscription,
+    ThreadHistoryDeletion, ThreadHistoryRequest, UpdateMemoryControlRequest,
 };
 pub use provider::{
     AgentAudit, AgentAuditError, AgentAuditKind, AgentAuthorizationError, AgentAuthorizationSource,

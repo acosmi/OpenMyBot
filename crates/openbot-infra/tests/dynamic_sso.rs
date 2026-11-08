@@ -329,10 +329,10 @@ async fn dynamic_saml_is_encrypted_replay_safe_and_delete_cleans_account_anchors
 
 #[tokio::test]
 #[ignore = "requires real PostgreSQL and xmlsec1; set OPENBOT_TEST_DATABASE_URL and pass --include-ignored"]
-async fn native_0053_gives_legacy_provider_ids_a_uuid_without_touching_configuration() {
+async fn native_0054_gives_legacy_provider_ids_a_uuid_without_touching_configuration() {
     let admin =
-        admin_config("native_0053_gives_legacy_provider_ids_a_uuid_without_touching_configuration");
-    with_temp_database(&admin, "dynamic_sso_0053", |config| async move {
+        admin_config("native_0054_gives_legacy_provider_ids_a_uuid_without_touching_configuration");
+    with_temp_database(&admin, "dynamic_sso_0054", |config| async move {
         let pool = pool::connect(&config).await.map_err(|error| error.to_string())?;
         let outcome = async {
             let mut client = pool.get().await.map_err(|error| error.to_string())?;
@@ -373,7 +373,7 @@ async fn native_0053_gives_legacy_provider_ids_a_uuid_without_touching_configura
             let saml: String = row.try_get(1).map_err(|error| error.to_string())?;
             let parsed = uuid::Uuid::parse_str(&id).map_err(|error| error.to_string())?;
             if parsed.is_nil() || parsed.hyphenated().to_string() != id || saml != legacy {
-                return Err(format!("0053 did not give one non-nil UUID id: {id}"));
+                return Err(format!("0054 did not give one non-nil UUID id: {id}"));
             }
             seed(&client).await?;
             drop(client);

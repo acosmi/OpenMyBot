@@ -57,6 +57,71 @@ pub async fn get_thread_status<D: ThreadDirectory>(
     Ok(ThreadStatus { known })
 }
 
+/// Validate the external page position and bounds before querying direct conversations.
+pub async fn list_bot_threads<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    bot_id: openbot_contracts::ids::BotId,
+    status: Option<openbot_contracts::command::ThreadStatusFilter>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<openbot_contracts::command::BotThreadPage, AppError> {
+    if bot_id.as_str().is_empty() {
+        return Err(AppError::MalformedPayload { field: "bot_id" });
+    }
+    let limit = limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::MalformedPayload { field: "limit" });
+    }
+    let cursor = match cursor {
+        None => None,
+        Some(raw) => {
+            let malformed = || AppError::MalformedPayload { field: "cursor" };
+            let (timestamp, thread) = raw.split_once(':').ok_or_else(malformed)?;
+            let updated_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+                timestamp.parse().map_err(|_| malformed())?,
+            )
+            .map_err(|_| malformed())?;
+            let thread_id = ThreadId::new(thread);
+            if !ThreadIdentity::is_plausible(&thread_id) {
+                return Err(malformed());
+            }
+            Some(crate::BotThreadCursor {
+                updated_at,
+                thread_id,
+            })
+        }
+    };
+    directory
+        .list_bot_threads(auth, &bot_id, status.unwrap_or_default(), cursor, limit)
+        .await
+        .map_err(|error| error.into_app_error())
+}
+
+/// Normalize and validate a rename once before passing it to the transaction owner.
+pub async fn set_thread_title<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    title: String,
+) -> Result<openbot_contracts::command::ThreadTitleSet, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    let title = title.trim();
+    if title.is_empty()
+        || title.len() > 480
+        || title.chars().count() > 120
+        || title.chars().any(char::is_control)
+    {
+        return Err(AppError::MalformedPayload { field: "title" });
+    }
+    directory
+        .set_thread_title(auth, &thread_id, title.to_owned())
+        .await
+        .map_err(|error| error.into_app_error())
+}
+
 /// 校验 caller-controlled 字段后，把一次 foreground turn 交给唯一事务端口。
 pub async fn begin_thread_run<D: ThreadDirectory>(
     directory: &D,
@@ -130,13 +195,10 @@ pub async fn begin_thread_run<D: ThreadDirectory>(
     result.map_err(|error| error.into_app_error())
 }
 
-/// 核验 v2 原值、消息及技能预算，再交唯一真实事务端口；不降为 v1。
-pub async fn begin_thread_run_v2<D: ThreadDirectory>(
-    directory: &D,
-    artifacts: &dyn ArtifactAdministration,
+pub(crate) fn prepare_thread_run_v2(
     auth: &AuthContext,
     mut command: BeginThreadRunV2,
-) -> Result<ThreadRunStarted, AppError> {
+) -> Result<BeginThreadRunV2Request, AppError> {
     if !ThreadIdentity::is_plausible(&command.thread_id) {
         return Err(AppError::MalformedPayload { field: "thread_id" });
     }
@@ -181,6 +243,17 @@ pub async fn begin_thread_run_v2<D: ThreadDirectory>(
         actor: auth.actor().clone(),
         command,
     };
+    Ok(request)
+}
+
+/// 核验 v2 原值、消息及技能预算，再交唯一真实事务端口；不降为 v1。
+pub async fn begin_thread_run_v2<D: ThreadDirectory>(
+    directory: &D,
+    artifacts: &dyn ArtifactAdministration,
+    auth: &AuthContext,
+    command: BeginThreadRunV2,
+) -> Result<ThreadRunStarted, AppError> {
+    let request = prepare_thread_run_v2(auth, command)?;
     if request.command.artifact_refs.is_empty() {
         return directory
             .begin_thread_run_v2(request)
@@ -200,6 +273,148 @@ pub async fn begin_thread_run_v2<D: ThreadDirectory>(
         .await;
     require_current_request_binding(auth).await?;
     result.map_err(|error| error.into_app_error())
+}
+
+/// Accept a direct Bot input through one transaction, retaining the original artifact read authority.
+pub async fn submit_thread_input<D: ThreadDirectory>(
+    directory: &D,
+    artifacts: &dyn ArtifactAdministration,
+    auth: &AuthContext,
+    command: BeginThreadRunV2,
+) -> Result<openbot_contracts::command::ThreadInputOutcome, AppError> {
+    use crate::SubmitThreadInputAttempt;
+    let request = prepare_thread_run_v2(auth, command)?;
+    if !matches!(request.command.anchor, ThreadRunAnchor::DirectBot) {
+        return Err(AppError::AnchorUnsupported);
+    }
+    let has_artifacts = !request.command.artifact_refs.is_empty();
+    if has_artifacts {
+        require_current_request_binding(auth).await?;
+    }
+    let first = directory.submit_thread_input(request.clone(), None).await;
+    if has_artifacts {
+        require_current_request_binding(auth).await?;
+    }
+    if let SubmitThreadInputAttempt::Accepted(outcome) =
+        first.map_err(|error| error.into_app_error())?
+    {
+        return Ok(outcome);
+    }
+    let materials =
+        match preread_artifact_materials(artifacts, auth, &request.command.artifact_refs).await {
+            Ok(materials) => materials,
+            Err(read_error) => {
+                // A foreground run may have started during the preread. In that case admission
+                // retains the input and defers material availability to its eventual dispatch.
+                require_current_request_binding(auth).await?;
+                let current = directory.submit_thread_input(request, None).await;
+                require_current_request_binding(auth).await?;
+                return match current.map_err(|error| error.into_app_error())? {
+                    SubmitThreadInputAttempt::Accepted(outcome) => Ok(outcome),
+                    SubmitThreadInputAttempt::NeedsArtifacts => Err(read_error),
+                };
+            }
+        };
+    let result = directory
+        .submit_thread_input(request, Some(materials))
+        .await;
+    require_current_request_binding(auth).await?;
+    match result.map_err(|error| error.into_app_error())? {
+        SubmitThreadInputAttempt::Accepted(outcome) => Ok(outcome),
+        SubmitThreadInputAttempt::NeedsArtifacts => Err(AppError::DependencyUnavailable {
+            dependency: "thread_submission",
+        }),
+    }
+}
+
+/// Read the current conversation's bounded pending and held inputs.
+pub async fn list_pending_inputs<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+) -> Result<openbot_contracts::command::PendingInputs, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    directory
+        .list_pending_inputs(auth, &thread_id)
+        .await
+        .map_err(|error| error.into_app_error())
+}
+
+/// Withdraw one not-yet-dispatched input under the current conversation authority.
+pub async fn withdraw_pending_input<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    run_id: openbot_contracts::ids::RunId,
+) -> Result<openbot_contracts::command::PendingInputReceipt, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    if run_id.as_str().is_empty() || run_id.as_str().as_bytes().contains(&0) {
+        return Err(AppError::MalformedPayload { field: "run_id" });
+    }
+    directory
+        .withdraw_pending_input(auth, &thread_id, &run_id)
+        .await
+        .map_err(|error| error.into_app_error())
+}
+
+/// Hold pending work and preserve the ordinary cancellation contract.
+pub async fn stop_thread_work<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    run_id: Option<openbot_contracts::ids::RunId>,
+) -> Result<openbot_contracts::command::ThreadWorkStopped, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    if run_id
+        .as_ref()
+        .is_some_and(|run| run.as_str().is_empty() || run.as_str().as_bytes().contains(&0))
+    {
+        return Err(AppError::MalformedPayload { field: "run_id" });
+    }
+    directory
+        .stop_thread_work(auth, &thread_id, run_id.as_ref())
+        .await
+        .map_err(|e| e.into_app_error())
+}
+
+/// Release a held input under current authority before the postcommit wake.
+pub async fn release_pending_input<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+    run_id: openbot_contracts::ids::RunId,
+) -> Result<openbot_contracts::command::PendingInputReceipt, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    if run_id.as_str().is_empty() || run_id.as_str().as_bytes().contains(&0) {
+        return Err(AppError::MalformedPayload { field: "run_id" });
+    }
+    directory
+        .release_pending_input(auth, &thread_id, &run_id)
+        .await
+        .map_err(|e| e.into_app_error())
+}
+
+/// Complete a conversation only after all foreground and retained work has settled.
+pub async fn complete_thread<D: ThreadDirectory>(
+    directory: &D,
+    auth: &AuthContext,
+    thread_id: ThreadId,
+) -> Result<openbot_contracts::command::ThreadCompleted, AppError> {
+    if !ThreadIdentity::is_plausible(&thread_id) {
+        return Err(AppError::MalformedPayload { field: "thread_id" });
+    }
+    directory
+        .complete_thread(auth, &thread_id)
+        .await
+        .map_err(|e| e.into_app_error())
 }
 
 fn artifact_refs_malformed() -> AppError {
@@ -272,13 +487,65 @@ fn validate_input_metadata(
     Ok(())
 }
 
-fn input_media_is_text(media_type: &str) -> bool {
+/// Identify text included in ordinary Run input snapshots.
+#[doc(hidden)]
+pub fn input_media_is_text(media_type: &str) -> bool {
     let essence = media_type
         .split(';')
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
     essence.starts_with("text/") || essence == "application/json"
+}
+
+/// Check current metadata before either consumer reads artifact bytes.
+#[doc(hidden)]
+pub fn validate_run_input_metadata<'a>(
+    auth: &AuthContext,
+    refs: &[String],
+    records: impl IntoIterator<Item = &'a ArtifactRecordMetadata>,
+) -> Result<(), AppError> {
+    let records: Vec<_> = records.into_iter().collect();
+    if records.len() != refs.len() {
+        return Err(artifact_input_unavailable());
+    }
+    for (id, record) in refs.iter().zip(&records) {
+        validate_input_metadata(auth, id, record)?;
+    }
+    Ok(())
+}
+
+/// Enforce the original per-text and combined text byte budgets before allocation.
+#[doc(hidden)]
+pub fn validate_run_input_text_budget<'a>(
+    records: impl IntoIterator<Item = &'a ArtifactRecordMetadata>,
+) -> Result<(), AppError> {
+    let mut text_bytes = 0_u64;
+    for record in records {
+        if input_media_is_text(&record.media_type) {
+            text_bytes = text_bytes
+                .checked_add(record.byte_length)
+                .ok_or_else(artifact_refs_malformed)?;
+            if record.byte_length > 256 * 1024 || text_bytes > 1024 * 1024 {
+                return Err(artifact_refs_malformed());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode only the complete body matching the original metadata digest and byte length.
+#[doc(hidden)]
+pub fn decode_run_input_text(
+    record: &ArtifactRecordMetadata,
+    bytes: Vec<u8>,
+) -> Result<String, AppError> {
+    if u64::try_from(bytes.len()).ok() != Some(record.byte_length)
+        || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+    {
+        return Err(artifact_input_unavailable());
+    }
+    String::from_utf8(bytes).map_err(|_| artifact_input_unavailable())
 }
 
 async fn preread_artifact_materials(
@@ -307,27 +574,11 @@ async fn preread_artifact_materials(
         };
         observations.push((record, observation.cleanup_armed));
     }
-    // Finish every reference's current visibility/status check before either refusal below.
-    for (id, (record, _)) in refs.iter().zip(&observations) {
-        validate_input_metadata(auth, id, record)?;
-    }
+    validate_run_input_metadata(auth, refs, observations.iter().map(|(record, _)| record))?;
     if observations.iter().any(|(_, armed)| *armed) {
         return Err(artifact_input_unavailable());
     }
-    let mut text_bytes = 0_u64;
-    for (record, _) in &observations {
-        if input_media_is_text(&record.media_type) {
-            if record.byte_length > 256 * 1024 {
-                return Err(artifact_refs_malformed());
-            }
-            text_bytes = text_bytes
-                .checked_add(record.byte_length)
-                .ok_or_else(artifact_refs_malformed)?;
-            if text_bytes > 1024 * 1024 {
-                return Err(artifact_refs_malformed());
-            }
-        }
-    }
+    validate_run_input_text_budget(observations.iter().map(|(record, _)| record))?;
     let mut materials = Vec::with_capacity(observations.len());
     for (record, _) in observations {
         require_preread_time(deadline)?;
@@ -342,12 +593,7 @@ async fn preread_artifact_materials(
             require_preread_time(deadline)?;
             let bytes = result?.handoff(auth)?;
             require_preread_time(deadline)?;
-            if u64::try_from(bytes.len()).ok() != Some(record.byte_length)
-                || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
-            {
-                return Err(artifact_input_unavailable());
-            }
-            let text = String::from_utf8(bytes).map_err(|_| artifact_input_unavailable())?;
+            let text = decode_run_input_text(&record, bytes)?;
             require_preread_time(deadline)?;
             Some(text)
         } else {

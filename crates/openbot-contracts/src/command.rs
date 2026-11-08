@@ -418,6 +418,59 @@ pub enum AppCommand {
     ///
     /// 没有 deployment/actor 输入字段：二者只能来自权威 [`crate::auth::AuthContext`]。
     MintThreadId,
+    /// Admit one frozen direct Bot input, starting immediately or recording it durably.
+    SubmitThreadInput(BeginThreadRunV2),
+    /// List the current conversation's pending and held inputs.
+    ListPendingInputs {
+        /// Visible direct Bot conversation.
+        thread_id: ThreadId,
+    },
+    /// Withdraw an input that has not become a Run.
+    WithdrawPendingInput {
+        /// Visible direct Bot conversation.
+        thread_id: ThreadId,
+        /// Original input identity and eventual begin idempotency key.
+        run_id: RunId,
+    },
+
+    /// Requeue a held input under the current user generation.
+    ReleasePendingInput {
+        /// Visible direct conversation.
+        thread_id: ThreadId,
+        /// Original held input identity.
+        run_id: RunId,
+    },
+    /// Hold pending input and optionally request cancellation of the current Run.
+    StopThreadWork {
+        /// Visible direct conversation.
+        thread_id: ThreadId,
+        /// Current foreground candidate; omission holds input only.
+        run_id: Option<RunId>,
+    },
+    /// Archive an idle direct conversation.
+    CompleteThread {
+        /// Visible direct conversation.
+        thread_id: ThreadId,
+    },
+
+    /// List the current actor's direct conversations with one visible Bot.
+    ListBotThreads {
+        /// Selected Bot whose visibility is checked by the application.
+        bot_id: BotId,
+        /// Omission selects active conversations.
+        status: Option<ThreadStatusFilter>,
+        /// Opaque position in the most recently updated ordering.
+        cursor: Option<String>,
+        /// Requested page size, from one through one hundred.
+        limit: Option<u32>,
+    },
+    /// Rename one visible direct conversation without changing its identity.
+    SetThreadTitle {
+        /// Existing native conversation.
+        thread_id: ThreadId,
+        /// User-supplied title, normalized at the application boundary.
+        title: String,
+    },
 
     /// 查询当前 actor 是否仍可见一条 native thread。
     GetThreadStatus {
@@ -750,6 +803,20 @@ pub enum AppReply {
     Tool(ToolResult),
     /// [`AppCommand::MintThreadId`] 的应答。
     ThreadMinted(ThreadMinted),
+    /// Durable admission of one frozen direct Bot input.
+    ThreadInputOutcome(ThreadInputOutcome),
+    /// Pending and held inputs visible in the current conversation.
+    PendingInputs(PendingInputs),
+    /// Committed state of an individually addressed input.
+    PendingInputState(PendingInputReceipt),
+    /// Atomic hold and original cancellation receipt.
+    ThreadWorkStopped(ThreadWorkStopped),
+    /// Idle conversation archived.
+    ThreadCompleted(ThreadCompleted),
+    /// Current actor's requested page of direct conversations.
+    BotThreadPage(BotThreadPage),
+    /// Committed normalized conversation title.
+    ThreadTitleSet(ThreadTitleSet),
     /// [`AppCommand::GetThreadStatus`] 的应答。
     ThreadStatus(ThreadStatus),
     /// [`AppCommand::BeginThreadRun`] 的 durable receipt。
@@ -856,6 +923,96 @@ pub struct ThreadMinted {
 pub struct ThreadStatus {
     /// 当前权威 scope 能否产生这条 thread。
     pub known: bool,
+}
+
+/// Supported visible conversation states for the direct Bot directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStatusFilter {
+    /// Open work, including conversations with a current foreground run.
+    #[default]
+    Active,
+    /// Work explicitly marked complete.
+    Archived,
+}
+
+impl ThreadStatusFilter {
+    /// Return the existing database spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+/// Shared query shape for the direct Bot directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotThreadListQuery {
+    /// Omission selects active work.
+    pub status: Option<ThreadStatusFilter>,
+    /// Opaque keyset position returned by the preceding page.
+    pub cursor: Option<String>,
+    /// Omission selects fifty rows.
+    pub limit: Option<u32>,
+}
+
+/// Foreground identity and state read from the durable occupancy projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotThreadForeground {
+    /// Existing closed foreground state.
+    pub state: ThreadForegroundRunState,
+    /// Run holding this conversation's foreground slot.
+    pub run_id: RunId,
+}
+
+/// One visible direct conversation in the Bot directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotThreadSummary {
+    /// Stable conversation identity.
+    pub thread_id: ThreadId,
+    /// Older conversations may not yet have received a title.
+    pub title: Option<String>,
+    /// Existing active or archived state.
+    pub status: ThreadStatusFilter,
+    /// Authoritative most recent conversation write.
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    /// Current foreground occupancy, if present.
+    pub foreground: Option<BotThreadForeground>,
+    /// Number of accepted inputs still pending or held.
+    pub pending_inputs: u32,
+}
+
+/// One keyset page of the current actor's direct conversations.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotThreadPage {
+    /// Rows in descending update time and ascending identity order.
+    pub threads: Vec<BotThreadSummary>,
+    /// Position after the final returned row when more rows exist.
+    pub next_cursor: Option<String>,
+}
+
+/// Closed HTTP body for a conversation rename.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetThreadTitleBody {
+    /// Untrusted title validated by the shared application entry.
+    pub title: String,
+}
+
+/// Committed result of a conversation rename.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadTitleSet {
+    /// Conversation whose title changed.
+    pub thread_id: ThreadId,
+    /// Normalized title stored by the transaction.
+    pub title: String,
 }
 
 /// 一次新 thread/run 的 anchor；不能同时自报 channel 与 direct Bot。
@@ -991,6 +1148,157 @@ pub struct ThreadRunStarted {
     pub event_sequence: u64,
     /// `true` 表示完全相同的 run_id 请求已提交过，本次没有新增行/通知。
     pub replayed: bool,
+}
+
+/// Maximum number of pending and held human inputs in one conversation.
+pub const THREAD_PENDING_INPUTS_MAX: u32 = 20;
+
+/// Durable acceptance either started the original Run or retained its frozen input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ThreadInputOutcomeWire", into = "ThreadInputOutcomeWire")]
+pub enum ThreadInputOutcome {
+    /// The existing begin transaction has committed.
+    Started(ThreadRunStarted),
+    /// The input is durably queued; a Run has not started.
+    Queued {
+        /// Original caller-minted identity.
+        run_id: RunId,
+        /// One plus the number of earlier pending inputs.
+        position: u32,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ThreadInputOutcomeWire {
+    Started {
+        run: ThreadRunStarted,
+    },
+    Queued {
+        #[serde(rename = "runId")]
+        run_id: RunId,
+        position: u32,
+    },
+}
+
+impl From<ThreadInputOutcomeWire> for ThreadInputOutcome {
+    fn from(value: ThreadInputOutcomeWire) -> Self {
+        match value {
+            ThreadInputOutcomeWire::Started { run } => Self::Started(run),
+            ThreadInputOutcomeWire::Queued { run_id, position } => {
+                Self::Queued { run_id, position }
+            }
+        }
+    }
+}
+
+impl From<ThreadInputOutcome> for ThreadInputOutcomeWire {
+    fn from(value: ThreadInputOutcome) -> Self {
+        match value {
+            ThreadInputOutcome::Started(run) => Self::Started { run },
+            ThreadInputOutcome::Queued { run_id, position } => Self::Queued { run_id, position },
+        }
+    }
+}
+
+/// Closed lifecycle of a durable human input, separate from Run status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingInputState {
+    /// Eligible for the foreground dispatcher.
+    Pending,
+    /// Requires explicit user action before dispatch.
+    Held,
+    /// The original input has become a Run.
+    Dispatched,
+    /// The user or conversation deletion withdrew the input.
+    Withdrawn,
+}
+
+/// Closed reasons for retaining an input without dispatching it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingInputHeldReason {
+    /// The user stopped the conversation's work.
+    StoppedByUser,
+    /// The submitting actor's authority generation changed.
+    AuthorityStale,
+    /// Current actor, Bot or material authority is unavailable.
+    AuthorityUnavailable,
+    /// The frozen request was rejected by the begin path.
+    DispatchRejected,
+}
+
+/// One pending or held frozen input returned to its conversation owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingInput {
+    /// Original request identity.
+    pub run_id: RunId,
+    /// Current durable input state.
+    pub state: PendingInputState,
+    /// Present exactly for a held input.
+    pub held_reason: Option<PendingInputHeldReason>,
+    /// Last stable dispatch or lifecycle code, if any.
+    pub last_error: Option<String>,
+    /// Original acceptance time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub submitted_at: OffsetDateTime,
+    /// Current FIFO position time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub queued_at: OffsetDateTime,
+    /// Exact user message accepted with this identity.
+    pub message: String,
+    /// Frozen ordered skill selection.
+    pub selected_skill_slugs: Vec<String>,
+    /// Frozen model selection, never a credential.
+    pub model_selection: crate::versioned_model_selection::RunModelSelectionV2,
+    /// Frozen ordered artifact references.
+    pub artifact_refs: Vec<String>,
+}
+
+/// All pending and held inputs in one visible conversation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingInputs {
+    /// At most twenty entries; dispatched and withdrawn records are omitted.
+    pub items: Vec<PendingInput>,
+}
+
+/// Committed state acknowledgement for an addressed pending input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingInputReceipt {
+    /// Original request identity.
+    pub run_id: RunId,
+    /// Current durable input state.
+    pub state: PendingInputState,
+}
+
+/// Result of holding a conversation's pending inputs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadWorkStopped {
+    /// Number of pending rows held by this transaction.
+    pub held: u32,
+    /// Original cancellation receipt only for the selected foreground Run.
+    pub cancellation: Option<ThreadRunCancellation>,
+}
+
+/// Result of archiving an idle conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadCompleted {
+    /// Existing conversation lifecycle status.
+    pub status: ThreadStatusFilter,
+}
+
+/// Optional current foreground identity for a stop request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopThreadWorkBody {
+    /// Omission only holds pending input.
+    pub run_id: Option<RunId>,
 }
 
 /// Minimal input for durable foreground-run cancellation.
@@ -1421,6 +1729,99 @@ pub struct ThreadRunEvent {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn work_control_commands_and_receipts_keep_closed_wire_shapes() {
+        for (command, expected) in [
+            (
+                AppCommand::StopThreadWork {
+                    thread_id: ThreadId::new("thread"),
+                    run_id: Some(RunId::new("run")),
+                },
+                serde_json::json!({"kind":"stop_thread_work","thread_id":"thread","run_id":"run"}),
+            ),
+            (
+                AppCommand::ReleasePendingInput {
+                    thread_id: ThreadId::new("thread"),
+                    run_id: RunId::new("run"),
+                },
+                serde_json::json!({"kind":"release_pending_input","thread_id":"thread","run_id":"run"}),
+            ),
+            (
+                AppCommand::CompleteThread {
+                    thread_id: ThreadId::new("thread"),
+                },
+                serde_json::json!({"kind":"complete_thread","thread_id":"thread"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&command).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_value(
+                    serde_json::from_value::<AppCommand>(expected.clone()).unwrap()
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(ThreadWorkStopped {
+                held: 2,
+                cancellation: None
+            })
+            .unwrap(),
+            serde_json::json!({"held":2,"cancellation":null})
+        );
+        assert_eq!(
+            serde_json::to_value(ThreadCompleted {
+                status: ThreadStatusFilter::Archived
+            })
+            .unwrap(),
+            serde_json::json!({"status":"archived"})
+        );
+        assert!(
+            serde_json::from_str::<StopThreadWorkBody>(r#"{"runId":"run","authGeneration":1}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_input_outcome_wire_is_closed() {
+        let run = ThreadRunStarted {
+            thread_id: ThreadId::new("thread"),
+            run_id: RunId::new("run"),
+            message_sequence: 4,
+            event_sequence: 9,
+            replayed: false,
+        };
+        for (value, wire) in [
+            (
+                ThreadInputOutcome::Started(run.clone()),
+                serde_json::json!({"outcome":"started","run":run}),
+            ),
+            (
+                ThreadInputOutcome::Queued {
+                    run_id: RunId::new("queued"),
+                    position: 3,
+                },
+                serde_json::json!({"outcome":"queued","runId":"queued","position":3}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&value).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ThreadInputOutcome>(wire.clone()).unwrap(),
+                value
+            );
+            let mut extra = wire;
+            extra["unexpected"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<ThreadInputOutcome>(extra).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ThreadInputOutcome>(serde_json::json!({
+                "outcome":"queued","run":{"runId":"queued","position":3}
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn artifact_refs_dtos_preserve_omitted_empty_and_ordered_wire() {

@@ -787,10 +787,29 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/api/threads/mint", post(threads::mint))
         .route(
+            "/api/agents/{agent_id}/threads",
+            get(threads::list_bot_threads),
+        )
+        .route("/api/threads/{thread_id}/title", post(threads::set_title))
+        .route(
             "/api/threads/{thread_id}/conversation",
             get(threads::conversation),
         )
         .route("/api/threads/{thread_id}/runs", post(threads::begin_run))
+        .route(
+            "/api/threads/{thread_id}/inputs",
+            get(threads::pending_inputs).post(threads::submit_input),
+        )
+        .route(
+            "/api/threads/{thread_id}/inputs/{run_id}/withdraw",
+            post(threads::withdraw_input),
+        )
+        .route(
+            "/api/threads/{thread_id}/inputs/{run_id}/release",
+            post(threads::release_input),
+        )
+        .route("/api/threads/{thread_id}/stop", post(threads::stop_work))
+        .route("/api/threads/{thread_id}/complete", post(threads::complete))
         .route(
             "/api/threads/{thread_id}/runs/{run_id}/cancel",
             post(threads::cancel_run),

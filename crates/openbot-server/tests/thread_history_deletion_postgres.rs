@@ -149,6 +149,24 @@ impl openbot_application::provider::RemoteAguiTransport for NoRemote {
     }
 }
 
+struct WorkControlArtifactRoot(std::path::PathBuf);
+impl WorkControlArtifactRoot {
+    fn new() -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let path = std::env::temp_dir().join(format!("openbot-work-control-{}", Uuid::now_v7()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(text)?;
+        Ok(Self(std::fs::canonicalize(path).map_err(text)?))
+    }
+}
+impl Drop for WorkControlArtifactRoot {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).expect("remove owned artifact fixture");
+    }
+}
+
 struct Fixture {
     pool: pool::DatabasePool,
     registry: Arc<ArtifactDatasetRegistry>,
@@ -157,9 +175,21 @@ struct Fixture {
     assembly: PostgresApplicationAssembly,
     directory: PostgresThreadDirectory,
     router: axum::Router,
+    artifacts: Option<Arc<openbot_infra::artifact_administration::PostgresArtifactAdministration>>,
+    artifact_root: Option<WorkControlArtifactRoot>,
 }
 impl Fixture {
     async fn new(config: pool::DatabaseConfig, generation: u64) -> Result<Self> {
+        Self::new_inner(config, generation, false).await
+    }
+    async fn new_with_artifacts(config: pool::DatabaseConfig, generation: u64) -> Result<Self> {
+        Self::new_inner(config, generation, true).await
+    }
+    async fn new_inner(
+        config: pool::DatabaseConfig,
+        generation: u64,
+        with_artifacts: bool,
+    ) -> Result<Self> {
         let config = config.with_max_pool_size(8);
         let pool = pool::connect(&config).await.map_err(text)?;
         {
@@ -207,6 +237,32 @@ impl Fixture {
             .await
             .map_err(text)?,
         );
+        let artifact_root = with_artifacts
+            .then(WorkControlArtifactRoot::new)
+            .transpose()?;
+        let artifacts = if let Some(root) = &artifact_root {
+            let policy = openbot_domain::artifact::ArtifactQuotaPolicy::default();
+            let store = Arc::new(
+                openbot_infra::artifact_store::DatasetBoundArtifactStore::bind_host_root(
+                    std::fs::File::open(&root.0).map_err(text)?,
+                    registry.clone(),
+                    policy,
+                )
+                .await
+                .map_err(text)?,
+            );
+            Some(Arc::new(
+                openbot_infra::artifact_administration::PostgresArtifactAdministration::new(
+                    registry.clone(),
+                    store,
+                    policy,
+                    SecretBytes::new(vec![0x65; 32]),
+                )
+                .map_err(text)?,
+            ))
+        } else {
+            None
+        };
         let vault = CredentialRecordVault::single_key(
             TenantId::new(TENANT),
             KeyVersion::new(1),
@@ -238,7 +294,9 @@ impl Fixture {
             policy_store,
             ui_preferences: Arc::new(openbot_application::NoUiPreferenceAdministration),
             screen_sessions: Arc::new(openbot_application::NoScreenSessionAdministration),
-            artifacts: None,
+            artifacts: artifacts.clone().map(|value| {
+                value as Arc<dyn openbot_application::artifacts::ArtifactAdministration>
+            }),
             runtime_capabilities: None,
             remote_agent_probe: Arc::new(NoRemote),
             managed_slot_available: false,
@@ -279,6 +337,11 @@ impl Fixture {
         resolver
             .install_thread_history_authority(&authority)
             .map_err(text)?;
+        if let Some(artifacts) = &artifacts {
+            resolver
+                .install_artifact_read_authority(&artifacts.read_authority())
+                .map_err(text)?;
+        }
         let directory = PostgresThreadDirectory::with_runtime(
             pool.clone(),
             config,
@@ -309,6 +372,8 @@ impl Fixture {
             assembly,
             directory,
             router,
+            artifacts,
+            artifact_root,
         })
     }
     async fn auth(&self, actor: &str) -> Result<AuthContext> {
@@ -711,6 +776,8 @@ impl Fixture {
         drop(self.router);
         drop(self.directory);
         drop(self.authority);
+        drop(self.artifacts);
+        drop(self.artifact_root);
         drop(self.registry);
         drop(self.resolver);
         close_pool(self.pool).await
@@ -1202,4 +1269,130 @@ async fn thread_history_deletion_http_route_statuses_closed_body_and_no_store() 
         f.finish().await
     })
     .await;
+}
+
+/// Work control keeps the original Host, ACK1/drain/ACK2 and public soft deletion.
+#[tokio::test]
+#[ignore = "requires explicitly owned loopback PostgreSQL17.11"]
+async fn w07_history_delete_withdraws_inputs() {
+    use openbot_application::artifacts::ArtifactAdministration as _;
+    use openbot_contracts::artifacts::SaveRunMessageTextArtifact;
+    use openbot_contracts::command::{BeginThreadRunV2, ThreadInputOutcome};
+    use openbot_contracts::model_connections::{
+        CreateModelConnection, CustomModelProtocol, ModelApiKey,
+    };
+    use openbot_contracts::versioned_model_selection::{
+        ModelSelectionIntentSource, RunModelSelectionV2,
+    };
+    use openbot_domain::audit::hash::Sha256Digest;
+    use zeroize::Zeroizing;
+
+    harness::with_temp_database(&harness::admin_config("work_delete07"), "workdelete07", |config| async move {
+        let f=Fixture::new_with_artifacts(config,7).await?;
+        let current=f.pool.get().await.map_err(text)?;
+        openbot_infra::db::thread_origin_schema::verify(&current).await.map_err(text)?;
+        openbot_infra::db::thread_history_admission_schema::verify(&current).await.map_err(text)?;
+        drop(current);
+        let a=f.auth(A).await?;
+        check(a.request_binding().is_some(),"actual Server Host binding absent")?;
+        let model=match f.assembly.application.execute(a.clone(),AppCommand::CreateModelConnection(CreateModelConnection {
+            name:"Work deletion choice".into(),protocol:CustomModelProtocol::OpenaiResponses,
+            endpoint:"https://work-control.example.test/v1".into(),model:"owned-work-model".into(),enabled:true,
+            api_key:ModelApiKey::new(Zeroizing::new("OWNED_WORK_SYNTHETIC_KEY".into())).map_err(text)?,
+        })).await.map_err(text)? {
+            AppReply::ModelConnection(model)=>model,
+            other=>return Err(format!("unexpected model reply: {other:?}")),
+        };
+        // Save a real source user message into the original dataset-bound Store.
+        let source=f.request(&a,7000,ThreadRunAnchor::DirectBot);
+        f.directory.begin_thread_run(source.clone()).await.map_err(text)?;
+        let (source_runtime,source_lease)=f.claim(source.command.run_id.as_str()).await?;
+        source_runtime.finish_run(&source_lease,source_lease.next_event_sequence(),RunTerminal::Completed).await.map_err(text)?;
+        drop(source_runtime);
+        let saved=f.artifacts.as_ref().ok_or("owned artifact administration absent")?.save_run_message_text(&a,SaveRunMessageTextArtifact {
+            request_id:request_id(),source_thread_id:source.command.thread_id.clone(),source_run_id:source.command.run_id.clone(),
+            source_message_id:format!("{}:input",source.command.run_id),expected_sha256:Sha256Digest::of(TEXT.as_bytes()).to_hex(),
+        }).await.map_err(text)?;
+        let stored_path=f.artifact_root.as_ref().ok_or("owned artifact root absent")?.0.join("objects").join(&saved.artifact_id);
+        check(std::fs::read(&stored_path).map_err(text)?==TEXT.as_bytes(),"real source Store bytes differ")?;
+        let identity=f.request(&a,7001,ThreadRunAnchor::DirectBot);
+        let command=BeginThreadRunV2 {
+            thread_id:identity.command.thread_id.clone(),run_id:identity.command.run_id.clone(),bot_id:BotId::new(BOT),
+            anchor:ThreadRunAnchor::DirectBot,message:"Delete target with injected copy".into(),selected_skill_slugs:Vec::new(),
+            artifact_refs:vec![saved.artifact_id.clone()],
+            model_selection:RunModelSelectionV2::new(ModelSelectionIntentSource::Custom,model.id.clone(),model.revision,format!("custom:{}",model.id),1).map_err(text)?,
+        };
+        let thread=command.thread_id.clone();let j=thread.as_str();
+        check(matches!(f.assembly.application.execute(a.clone(),AppCommand::SubmitThreadInput(command.clone())).await.map_err(text)?,AppReply::ThreadInputOutcome(ThreadInputOutcome::Started(_))),"target did not start through Application")?;
+        let claim=f.assembly.run_runtime.claim_dispatch().await.map_err(text)?.ok_or("actual assembly target dispatch absent")?;
+        check(claim.lease().run_id()==&command.run_id,"assembly claimed wrong target")?;
+        let lease=f.assembly.run_runtime.acknowledge_dispatch(&claim).await.map_err(text)?;
+        let c=f.pool.get().await.map_err(text)?;
+        let copy:Value=c.query_one("SELECT content FROM public.messages WHERE message_id=$1||':artifact_ref:0'", &[&command.run_id.as_str()]).await.map_err(text)?.try_get(0).map_err(text)?;
+        check(copy["artifactRef"]["artifactId"]==saved.artifact_id && copy["artifactRef"]["bodyIncluded"]==true,"original artifact injection metadata absent")?;
+        check(copy["text"].as_str().is_some_and(|body|body.ends_with(TEXT)),"injected Store copy body absent")?;
+        drop(c);
+        let mut held=command.clone();held.run_id=RunId::new("work-delete-held");held.artifact_refs.clear();held.message="held before deletion".into();
+        let mut pending=held.clone();pending.run_id=RunId::new("work-delete-pending");pending.message="pending before deletion".into();
+        for input in [&held,&pending] {
+            check(matches!(f.assembly.application.execute(a.clone(),AppCommand::SubmitThreadInput(input.clone())).await.map_err(text)?,AppReply::ThreadInputOutcome(ThreadInputOutcome::Queued{..})),"busy input not queued")?;
+        }
+        let stop=f.directory.stop_thread_work(&a,&thread,None).await.map_err(text)?;check(stop.held==2 && stop.cancellation.is_none(),"fixture Stop did not hold original inputs")?;
+        f.directory.release_pending_input(&a,&thread,&pending.run_id).await.map_err(text)?;
+        let c=f.pool.get().await.map_err(text)?;
+        for (input,state) in [(&held,"held"),(&pending,"pending")] {
+            let actual:String=c.query_one("SELECT state FROM openbot_internal.thread_pending_inputs WHERE run_id=$1", &[&input.run_id.as_str()]).await.map_err(text)?.try_get(0).map_err(text)?;
+            check(actual==state,"mixed original pending/held fixture absent")?;
+        }
+        drop(c);
+        // This original RR snapshot must prevent ACK2, including the injected copy.
+        let reader=f.reader(j).await?;
+        let request=request_id();
+        check(receipt(&f.delete(&a,j,&request).await,j,&request)?==ThreadHistoryDeletionState::Pending,"running deletion unexpectedly completed")?;
+        let c=f.pool.get().await.map_err(text)?;
+        let rows=c.query("SELECT run_id,state,held_reason,last_error,message FROM openbot_internal.thread_pending_inputs WHERE thread_id=$1 ORDER BY run_id", &[&j]).await.map_err(text)?;
+        check(rows.len()==2,"original intent lost pending rows")?;
+        for row in rows {
+            check(row.try_get::<_,String>("state").map_err(text)?=="withdrawn" && row.try_get::<_,Option<String>>("held_reason").map_err(text)?.is_none() && row.try_get::<_,String>("last_error").map_err(text)?=="thread_deleted","ACK1 did not withdraw original pending/held atomically")?;
+        }
+        let intent:bool=c.query_one("SELECT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_intents WHERE thread_id=$1)", &[&j]).await.map_err(text)?.try_get(0).map_err(text)?;
+        check(intent,"withdrawn inputs have no original ACK1 intent")?;drop(c);
+        // Stop acceptance is not execution stop; use the already acknowledged lease.
+        f.assembly.run_runtime.finish_run(&lease,lease.next_event_sequence(),RunTerminal::Cancelled).await.map_err(text)?;
+        check(receipt(&f.delete(&a,j,&request).await,j,&request)?==ThreadHistoryDeletionState::Pending,"old reader did not hold ACK2")?;
+        refused(&f.assembly.application.execute(a.clone(),AppCommand::CompleteThread{thread_id:thread.clone()}).await,&AppError::ThreadNotIdle{foreground:None,pending_inputs:0},409)?;
+        let incomplete:bool=f.one("SELECT NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions WHERE thread_id=$1)",j).await?;
+        check(incomplete && f.thread_status(j).await?=="active","clear-only busy case advanced ACK2 or soft deletion")?;
+        let visible_copy:Value=reader.query_one("SELECT content FROM public.messages WHERE message_id=$1||':artifact_ref:0'", &[&command.run_id.as_str()]).await.map_err(text)?.try_get(0).map_err(text)?;
+        check(visible_copy==copy,"old reader lost exact injected history copy before ACK2")?;
+        // A supported new submission after ACK1 is queued while clearing. The final
+        // public soft-delete transaction, rather than fixture SQL, must withdraw it.
+        let mut late=held.clone();late.run_id=RunId::new("work-delete-after-ack1");late.message="submitted between ACK1 and soft deletion".into();
+        check(matches!(f.assembly.application.execute(a.clone(),AppCommand::SubmitThreadInput(late.clone())).await.map_err(text)?,AppReply::ThreadInputOutcome(ThreadInputOutcome::Queued{..})),"late clearing input not durably queued")?;
+        refused(&f.assembly.application.execute(a.clone(),AppCommand::CompleteThread{thread_id:thread.clone()}).await,&AppError::ThreadNotIdle{foreground:None,pending_inputs:1},409)?;
+        let c=f.pool.get().await.map_err(text)?;
+        let row=c.query_one("SELECT state,last_error FROM openbot_internal.thread_pending_inputs WHERE run_id=$1", &[&late.run_id.as_str()]).await.map_err(text)?;
+        check(row.try_get::<_,String>(0).map_err(text)?=="pending" && row.try_get::<_,Option<String>>(1).map_err(text)?.is_none(),"late input was withdrawn before soft deletion")?;drop(c);
+        reader.batch_execute("ROLLBACK").await.map_err(text)?;drop(reader);
+        f.delete_until_cleared(&a,j,&request).await?;f.cleared(&a,j,&request).await?;
+        let c=f.pool.get().await.map_err(text)?;
+        let rows=c.query("SELECT run_id,state,held_reason,last_error,message FROM openbot_internal.thread_pending_inputs WHERE thread_id=$1 ORDER BY run_id", &[&j]).await.map_err(text)?;
+        check(rows.len()==3,"deletion erased durable input receipts")?;
+        for row in rows {
+            check(row.try_get::<_,String>("state").map_err(text)?=="withdrawn" && row.try_get::<_,Option<String>>("held_reason").map_err(text)?.is_none() && row.try_get::<_,String>("last_error").map_err(text)?=="thread_deleted","final soft delete failed to withdraw old or post-ACK1 input")?;
+            let run:String=row.try_get("run_id").map_err(text)?;
+            let expected=if run==held.run_id.as_str(){&held.message}else if run==pending.run_id.as_str(){&pending.message}else{check(run==late.run_id.as_str(),"unexpected input receipt")?;&late.message};
+            check(row.try_get::<_,String>("message").map_err(text)?==*expected,"deletion changed frozen original payload")?;
+            check(c.query_opt("SELECT 1 FROM public.runs WHERE run_id=$1", &[&run]).await.map_err(text)?.is_none(),"withdrawn input became a Run")?;
+        }
+        let cleared_copy:Value=c.query_one("SELECT content FROM public.messages WHERE message_id=$1||':artifact_ref:0'", &[&command.run_id.as_str()]).await.map_err(text)?.try_get(0).map_err(text)?;
+        check(cleared_copy==json!({"text":"","retained":false}),"injected history copy was not scrubbed by original ACK2 clear")?;drop(c);
+        check(std::fs::read(&stored_path).map_err(text)?==TEXT.as_bytes(),"clearing injected copy deleted independently saved Store object")?;
+        for command in [AppCommand::CompleteThread{thread_id:thread.clone()},AppCommand::StopThreadWork{thread_id:thread.clone(),run_id:None},AppCommand::ReleasePendingInput{thread_id:thread.clone(),run_id:late.run_id.clone()}] {
+            refused(&f.assembly.application.execute(a.clone(),command).await,&AppError::NotVisible,404)?;
+        }
+        // The original source Thread and its explicit saved object are independent.
+        check(f.thread_status(source.command.thread_id.as_str()).await?=="active","target deletion changed source Thread")?;
+        f.finish().await
+    }).await;
 }

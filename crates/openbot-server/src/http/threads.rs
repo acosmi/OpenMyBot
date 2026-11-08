@@ -203,6 +203,71 @@ fn valid_reconciliation_percent_escapes(raw: &str) -> bool {
     true
 }
 
+/// Read the current actor's direct conversations with the selected Bot.
+pub async fn list_bot_threads(
+    State(state): State<ServerState>,
+    Authenticated(auth): Authenticated,
+    Path(bot_id): Path<String>,
+    query: Result<Query<openbot_contracts::command::BotThreadListQuery>, QueryRejection>,
+    request: Request,
+) -> Result<(HeaderMap, Json<openbot_contracts::command::BotThreadPage>), HttpError> {
+    let Query(query) = query.map_err(|_| AppError::MalformedPayload { field: "query" })?;
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    let reply = state
+        .application()
+        .execute(
+            auth,
+            AppCommand::ListBotThreads {
+                bot_id: openbot_contracts::ids::BotId::new(bot_id),
+                status: query.status,
+                cursor: query.cursor,
+                limit: query.limit,
+            },
+        )
+        .await?;
+    match reply {
+        AppReply::BotThreadPage(page) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok((headers, Json(page)))
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Rename a conversation through the shared application boundary.
+pub async fn set_title(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    body: Result<Json<openbot_contracts::command::SetThreadTitleBody>, JsonRejection>,
+) -> Result<(HeaderMap, Json<openbot_contracts::command::ThreadTitleSet>), HttpError> {
+    let Json(body) = body.map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::SetThreadTitle {
+                thread_id: ThreadId::new(thread_id),
+                title: body.title,
+            },
+        )
+        .await?
+    {
+        AppReply::ThreadTitleSet(receipt) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok((headers, Json(receipt)))
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
 /// `POST /api/threads/mint`：为已认证 actor 铸造当前 deployment 的 UUIDv8。
 pub async fn mint(
     State(state): State<ServerState>,
@@ -237,6 +302,187 @@ pub async fn status(
         .await?
     {
         AppReply::ThreadStatus(reply) => Ok(Json(reply)),
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Accept a direct Bot input using the original v2 body decoder.
+pub async fn submit_input(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    body: Result<Json<DecodedBeginThreadRunBody>, JsonRejection>,
+) -> Result<Response, HttpError> {
+    let Json(DecodedBeginThreadRunBody::V2(body)) =
+        body.map_err(|_| AppError::MalformedPayload { field: "body" })?
+    else {
+        return Err(AppError::MalformedPayload {
+            field: "model_selection",
+        }
+        .into());
+    };
+    let command = AppCommand::SubmitThreadInput(BeginThreadRunV2 {
+        thread_id: ThreadId::new(thread_id),
+        run_id: body.run_id,
+        bot_id: body.bot_id,
+        anchor: body.anchor,
+        message: body.message,
+        selected_skill_slugs: body.selected_skill_slugs,
+        model_selection: body.model_selection,
+        artifact_refs: body.artifact_refs,
+    });
+    match state.application().execute(auth, command).await? {
+        AppReply::ThreadInputOutcome(outcome) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(outcome)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// List the visible conversation's pending and held inputs.
+pub async fn pending_inputs(
+    State(state): State<ServerState>,
+    Authenticated(auth): Authenticated,
+    Path(thread_id): Path<String>,
+    request: Request,
+) -> Result<Response, HttpError> {
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::ListPendingInputs {
+                thread_id: ThreadId::new(thread_id),
+            },
+        )
+        .await?
+    {
+        AppReply::PendingInputs(inputs) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(inputs)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Withdraw one retained input without changing its frozen request identity.
+pub async fn withdraw_input(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path((thread_id, run_id)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, HttpError> {
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::WithdrawPendingInput {
+                thread_id: ThreadId::new(thread_id),
+                run_id: RunId::new(run_id),
+            },
+        )
+        .await?
+    {
+        AppReply::PendingInputState(receipt) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Release a held input at the tail under the current generation.
+pub async fn release_input(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path((thread_id, run_id)): Path<(String, String)>,
+    request: Request,
+) -> Result<Response, HttpError> {
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::ReleasePendingInput {
+                thread_id: ThreadId::new(thread_id),
+                run_id: RunId::new(run_id),
+            },
+        )
+        .await?
+    {
+        AppReply::PendingInputState(receipt) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Stop pending work and optionally cancel the current foreground Run.
+pub async fn stop_work(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    body: Result<Json<openbot_contracts::command::StopThreadWorkBody>, JsonRejection>,
+) -> Result<Response, HttpError> {
+    let Json(body) = body.map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::StopThreadWork {
+                thread_id: ThreadId::new(thread_id),
+                run_id: body.run_id,
+            },
+        )
+        .await?
+    {
+        AppReply::ThreadWorkStopped(receipt) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response())
+        }
+        _ => Err(application_contract_error()),
+    }
+}
+
+/// Archive a direct conversation after its work has settled.
+pub async fn complete(
+    State(state): State<ServerState>,
+    OriginAuthenticated(auth): OriginAuthenticated,
+    Path(thread_id): Path<String>,
+    request: Request,
+) -> Result<Response, HttpError> {
+    let body = axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .map_err(|_| AppError::MalformedPayload { field: "body" })?;
+    if !body.is_empty() {
+        return Err(AppError::MalformedPayload { field: "body" }.into());
+    }
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::CompleteThread {
+                thread_id: ThreadId::new(thread_id),
+            },
+        )
+        .await?
+    {
+        AppReply::ThreadCompleted(receipt) => {
+            Ok(([(CACHE_CONTROL, "no-store")], Json(receipt)).into_response())
+        }
         _ => Err(application_contract_error()),
     }
 }
@@ -798,6 +1044,186 @@ mod tests {
 
     #[async_trait]
     impl ThreadDirectory for FakeThreadDirectory {
+        async fn stop_thread_work(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            run_id: Option<&RunId>,
+        ) -> Result<openbot_contracts::command::ThreadWorkStopped, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            Ok(openbot_contracts::command::ThreadWorkStopped {
+                held: 2,
+                cancellation: run_id.map(|run_id| {
+                    openbot_contracts::command::ThreadRunCancellation {
+                        thread_id: thread_id.clone(),
+                        run_id: run_id.clone(),
+                        state: openbot_contracts::command::ThreadRunCancellationState::Requested,
+                    }
+                }),
+            })
+        }
+        async fn release_pending_input(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            run_id: &RunId,
+        ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            if run_id.as_str() == "dispatched" {
+                return Err(ThreadDirectoryError::PendingInputState);
+            }
+            if run_id.as_str() == "unavailable" {
+                return Err(ThreadDirectoryError::Unavailable);
+            }
+            Ok(openbot_contracts::command::PendingInputReceipt {
+                run_id: run_id.clone(),
+                state: openbot_contracts::command::PendingInputState::Pending,
+            })
+        }
+        async fn complete_thread(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+        ) -> Result<openbot_contracts::command::ThreadCompleted, ThreadDirectoryError> {
+            self.list_pending_inputs(auth, thread_id).await?;
+            if thread_id.as_str().ends_with("003") {
+                return Err(ThreadDirectoryError::ThreadNotIdle {
+                    foreground: Some(
+                        openbot_contracts::command::ThreadForegroundRunState::Cancelling,
+                    ),
+                    pending_inputs: 2,
+                });
+            }
+            Ok(openbot_contracts::command::ThreadCompleted {
+                status: openbot_contracts::command::ThreadStatusFilter::Archived,
+            })
+        }
+        async fn submit_thread_input(
+            &self,
+            request: openbot_application::BeginThreadRunV2Request,
+            materials: Option<Vec<openbot_application::RunInputArtifactMaterial>>,
+        ) -> Result<openbot_application::SubmitThreadInputAttempt, ThreadDirectoryError> {
+            use openbot_contracts::command::ThreadInputOutcome;
+            assert_eq!(request.actor.as_str(), "u1");
+            assert_eq!(request.command.bot_id.as_str(), "bot");
+            assert_eq!(request.command.selected_skill_slugs, ["coding"]);
+            assert_eq!(
+                request
+                    .command
+                    .model_selection
+                    .expected_connection_revision(),
+                2
+            );
+            assert_eq!(
+                request.command.model_selection.expected_catalog_revision(),
+                3
+            );
+            assert!(materials.is_none());
+            let outcome = match request.command.message.as_str() {
+                "started" => ThreadInputOutcome::Started(ThreadRunStarted {
+                    thread_id: request.command.thread_id,
+                    run_id: request.command.run_id,
+                    message_sequence: 0,
+                    event_sequence: 0,
+                    replayed: false,
+                }),
+                "queued" => ThreadInputOutcome::Queued {
+                    run_id: request.command.run_id,
+                    position: 2,
+                },
+                "limit" => return Err(ThreadDirectoryError::PendingInputLimit),
+                _ => return Err(ThreadDirectoryError::Unavailable),
+            };
+            Ok(openbot_application::SubmitThreadInputAttempt::Accepted(
+                outcome,
+            ))
+        }
+
+        async fn list_pending_inputs(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+        ) -> Result<openbot_contracts::command::PendingInputs, ThreadDirectoryError> {
+            assert_eq!(auth.actor().as_str(), "u1");
+            if thread_id.as_str().ends_with("001") {
+                return Err(ThreadDirectoryError::NotVisible);
+            }
+            if thread_id.as_str().ends_with("002") {
+                return Err(ThreadDirectoryError::AnchorUnsupported);
+            }
+            Ok(openbot_contracts::command::PendingInputs::default())
+        }
+
+        async fn withdraw_pending_input(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            run_id: &RunId,
+        ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+            assert_eq!(auth.actor().as_str(), "u1");
+            assert_eq!(thread_id.as_str(), "550e8400-e29b-41d4-a716-446655440000");
+            if run_id.as_str() == "dispatched" {
+                return Err(ThreadDirectoryError::PendingInputState);
+            }
+            Ok(openbot_contracts::command::PendingInputReceipt {
+                run_id: run_id.clone(),
+                state: openbot_contracts::command::PendingInputState::Withdrawn,
+            })
+        }
+
+        async fn list_bot_threads(
+            &self,
+            auth: &AuthContext,
+            bot_id: &openbot_contracts::ids::BotId,
+            status: openbot_contracts::command::ThreadStatusFilter,
+            cursor: Option<openbot_application::BotThreadCursor>,
+            limit: u32,
+        ) -> Result<openbot_contracts::command::BotThreadPage, ThreadDirectoryError> {
+            if bot_id.as_str() == "missing" {
+                return Err(ThreadDirectoryError::NotVisible);
+            }
+            assert_eq!(auth.actor().as_str(), "u1");
+            if bot_id.as_str() == "default" {
+                assert_eq!(
+                    status,
+                    openbot_contracts::command::ThreadStatusFilter::Active
+                );
+                assert_eq!(limit, 50);
+                assert!(cursor.is_none());
+                return Ok(openbot_contracts::command::BotThreadPage::default());
+            }
+            assert_eq!(bot_id.as_str(), "bot");
+            assert_eq!(
+                status,
+                openbot_contracts::command::ThreadStatusFilter::Archived
+            );
+            assert_eq!(limit, 7);
+            let cursor = cursor.expect("the transport must preserve the cursor");
+            assert_eq!(cursor.updated_at, time::OffsetDateTime::UNIX_EPOCH);
+            assert_eq!(
+                cursor.thread_id.as_str(),
+                "550e8400-e29b-41d4-a716-446655440000"
+            );
+            Ok(openbot_contracts::command::BotThreadPage::default())
+        }
+
+        async fn set_thread_title(
+            &self,
+            auth: &AuthContext,
+            thread_id: &ThreadId,
+            title: String,
+        ) -> Result<openbot_contracts::command::ThreadTitleSet, ThreadDirectoryError> {
+            assert_eq!(auth.actor().as_str(), "u1");
+            assert_eq!(title, "renamed");
+            if thread_id.as_str().ends_with("0001") {
+                return Err(ThreadDirectoryError::AnchorUnsupported);
+            }
+            Ok(openbot_contracts::command::ThreadTitleSet {
+                thread_id: thread_id.clone(),
+                title,
+            })
+        }
+
         async fn mint_thread_id(
             &self,
             deployment: &DeploymentId,
@@ -913,6 +1339,352 @@ mod tests {
 
         fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_input_http_commands_preserve_inputs_and_errors() {
+        use openbot_contracts::versioned_model_selection::{
+            ModelSelectionIntentSource, RunModelSelectionV2,
+        };
+        use serde_json::json;
+
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        let selection = RunModelSelectionV2::new(
+            ModelSelectionIntentSource::Custom,
+            "01900000-0000-7000-8000-000000000001".into(),
+            2,
+            "custom:01900000-0000-7000-8000-000000000001".into(),
+            3,
+        )
+        .unwrap();
+        let submit = |message: &str| {
+            json!({"runId":"input-1","botId":"bot","anchor":{"kind":"direct_bot"},
+            "message":message,"selectedSkillSlugs":["coding"],"artifactRefs":[],"modelSelection":selection}).to_string()
+        };
+        let mut legacy: serde_json::Value = serde_json::from_str(&submit("queued")).unwrap();
+        legacy.as_object_mut().unwrap().remove("modelSelection");
+        for (method, uri, body, status, expected) in [
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs"),
+                submit("started"),
+                200,
+                json!({"outcome":"started","run":{"threadId":thread,"runId":"input-1","messageSequence":0,"eventSequence":0,"replayed":false}}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs"),
+                submit("queued"),
+                200,
+                json!({"outcome":"queued","runId":"input-1","position":2}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs"),
+                submit("limit"),
+                429,
+                json!({"code":"pending_input_limit"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs"),
+                submit("unavailable"),
+                503,
+                json!({"code":"dependency_unavailable"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs"),
+                legacy.to_string(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                format!("/api/threads/{thread}/inputs"),
+                String::new(),
+                200,
+                json!({"items":[]}),
+            ),
+            (
+                Method::GET,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440001/inputs".into(),
+                String::new(),
+                404,
+                json!({"code":"not_visible"}),
+            ),
+            (
+                Method::GET,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440002/inputs".into(),
+                String::new(),
+                400,
+                json!({"code":"anchor_unsupported"}),
+            ),
+            (
+                Method::GET,
+                format!("/api/threads/{thread}/inputs"),
+                "x".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input-1/withdraw"),
+                String::new(),
+                200,
+                json!({"runId":"input-1","state":"withdrawn"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/dispatched/withdraw"),
+                String::new(),
+                409,
+                json!({"code":"pending_input_state"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input-1/withdraw"),
+                "{}".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+        ] {
+            let response = app(
+                FakeThreadDirectory::new(Ok(true)),
+                FixedAuthResolver::granting(auth("u1")),
+            )
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .header("origin", "https://app.example.test")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{uri}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{uri}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body, expected, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn work_control_http_commands_preserve_inputs_and_errors() {
+        use serde_json::json;
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for (method, uri, body, status, expected) in [
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                "{}".into(),
+                200,
+                json!({"held":2,"cancellation":null}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                json!({"runId":"opaque/run?1"}).to_string(),
+                200,
+                json!({"held":2,"cancellation":{"threadId":thread,"runId":"opaque/run?1","state":"requested"}}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/stop"),
+                json!({"runId":"r","actor":"spoof"}).to_string(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input%2Fone/release"),
+                String::new(),
+                200,
+                json!({"runId":"input/one","state":"pending"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/dispatched/release"),
+                String::new(),
+                409,
+                json!({"code":"pending_input_state"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/unavailable/release"),
+                String::new(),
+                503,
+                json!({"code":"dependency_unavailable"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/inputs/input-1/release"),
+                "{}".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/complete"),
+                String::new(),
+                200,
+                json!({"status":"archived"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440003/complete".into(),
+                String::new(),
+                409,
+                json!({"code":"thread_not_idle","foreground":"cancelling","pendingInputs":2}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440001/complete".into(),
+                String::new(),
+                404,
+                json!({"code":"not_visible"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440002/stop".into(),
+                "{}".into(),
+                400,
+                json!({"code":"anchor_unsupported"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/complete"),
+                "{}".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+        ] {
+            let response = app(
+                FakeThreadDirectory::new(Ok(true)),
+                FixedAuthResolver::granting(auth("u1")),
+            )
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("content-type", "application/json")
+                    .header("origin", "https://app.example.test")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{uri}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{uri}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body, expected, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bot_thread_http_commands_preserve_inputs_and_errors() {
+        use serde_json::json;
+        let thread = "550e8400-e29b-41d4-a716-446655440000";
+        for (method, uri, body, expected_status, expected_body) in [
+            (
+                Method::GET,
+                "/api/agents/default/threads".into(),
+                String::new(),
+                200,
+                json!({"threads":[],"nextCursor":null}),
+            ),
+            (
+                Method::GET,
+                format!("/api/agents/bot/threads?status=archived&limit=7&cursor=0%3A{thread}"),
+                String::new(),
+                200,
+                json!({"threads":[],"nextCursor":null}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/missing/threads".into(),
+                String::new(),
+                404,
+                json!({"code":"not_visible"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads?limit=0".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads?status=other".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads?limit=1&limit=2".into(),
+                String::new(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::GET,
+                "/api/agents/bot/threads".into(),
+                "x".into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/title"),
+                r#"{"title":"  renamed  "}"#.into(),
+                200,
+                json!({"threadId":thread,"title":"renamed"}),
+            ),
+            (
+                Method::POST,
+                "/api/threads/550e8400-e29b-41d4-a716-446655440001/title".into(),
+                r#"{"title":"renamed"}"#.into(),
+                400,
+                json!({"code":"anchor_unsupported"}),
+            ),
+            (
+                Method::POST,
+                format!("/api/threads/{thread}/title"),
+                r#"{"title":"renamed","unexpected":true}"#.into(),
+                400,
+                json!({"code":"malformed_payload"}),
+            ),
+        ] {
+            let response = app(
+                FakeThreadDirectory::new(Ok(true)),
+                FixedAuthResolver::granting(auth("u1")),
+            )
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("origin", "https://app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), expected_status, "{uri}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{uri}");
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body, expected_body, "{uri}");
         }
     }
 
