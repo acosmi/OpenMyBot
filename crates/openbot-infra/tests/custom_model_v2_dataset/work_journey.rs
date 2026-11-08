@@ -42,18 +42,22 @@ async fn two_work_journey_preserves_held_inputs_and_other_work() {
             assert_eq!(claim_b.lease().run_id(), &b.command.run_id);
             let lease_b = runtime.acknowledge_dispatch(&claim_b).await.unwrap();
 
+            let mut b_queued = b.command.clone();
+            b_queued.run_id = RunId::new("journey-b-queued");
+            b_queued.message = "Work B: a queued follow-up that A must not touch".into();
+            assert!(matches!(app.execute(auth(), AppCommand::SubmitThreadInput(b_queued.clone())).await.unwrap(),
+                AppReply::ThreadInputOutcome(ThreadInputOutcome::Queued { .. })));
+
+            let b_snapshot = "SELECT jsonb_build_object('thread',to_jsonb(t),'run',to_jsonb(r),\
+                 'messages',(SELECT jsonb_agg(to_jsonb(m) ORDER BY seq) FROM public.messages m WHERE m.thread_id=t.thread_id),\
+                 'members',(SELECT jsonb_agg(to_jsonb(tm) ORDER BY user_id) FROM public.thread_memberships tm WHERE tm.thread_id=t.thread_id),\
+                 'pending',(SELECT jsonb_agg(to_jsonb(p) ORDER BY p.run_id) FROM openbot_internal.thread_pending_inputs p WHERE p.thread_id=t.thread_id),\
+                 'cancel_outbox',(SELECT count(*) FROM public.outbox o WHERE o.aggregate_id=r.run_id AND o.destination='agent_run_cancel')) \
+                 FROM public.threads t JOIN public.runs r ON r.thread_id=t.thread_id WHERE r.run_id=$1";
             let c = f.pool.get().await.unwrap();
-            let b_before: Value = c
-                .query_one(
-                    "SELECT jsonb_build_object('thread',to_jsonb(t),'run',to_jsonb(r),\
-                     'messages',(SELECT jsonb_agg(to_jsonb(m) ORDER BY seq) FROM public.messages m WHERE m.thread_id=t.thread_id),\
-                     'members',(SELECT jsonb_agg(to_jsonb(tm) ORDER BY user_id) FROM public.thread_memberships tm WHERE tm.thread_id=t.thread_id)) \
-                     FROM public.threads t JOIN public.runs r ON r.thread_id=t.thread_id WHERE r.run_id=$1",
-                    &[&b.command.run_id.as_str()],
-                )
-                .await
-                .unwrap()
-                .get(0);
+            let b_before: Value = c.query_one(b_snapshot, &[&b.command.run_id.as_str()]).await.unwrap().get(0);
+            assert_eq!(b_before["pending"][0]["state"], "pending");
+            assert_eq!(b_before["cancel_outbox"], 0);
             drop(c);
 
             let mut held = Vec::new();
@@ -100,7 +104,7 @@ async fn two_work_journey_preserves_held_inputs_and_other_work() {
                 .unwrap() else { panic!("work list reply required") };
             assert_eq!(page.threads.len(), 2);
             assert_eq!(page.threads.iter().find(|row| row.thread_id == a.command.thread_id).unwrap().pending_inputs, 2);
-            assert_eq!(page.threads.iter().find(|row| row.thread_id == b.command.thread_id).unwrap().pending_inputs, 0);
+            assert_eq!(page.threads.iter().find(|row| row.thread_id == b.command.thread_id).unwrap().pending_inputs, 1);
 
             let AppReply::ThreadWorkStopped(stopped) = app
                 .execute(auth(), AppCommand::StopThreadWork {
@@ -170,18 +174,16 @@ async fn two_work_journey_preserves_held_inputs_and_other_work() {
             let c = f.pool.get().await.unwrap();
             assert_eq!(c.query_one("SELECT status FROM public.threads WHERE thread_id=$1",
                 &[&a.command.thread_id.as_str()]).await.unwrap().get::<_, String>(0), "active");
-            let b_after: Value = c.query_one(
-                "SELECT jsonb_build_object('thread',to_jsonb(t),'run',to_jsonb(r),\
-                 'messages',(SELECT jsonb_agg(to_jsonb(m) ORDER BY seq) FROM public.messages m WHERE m.thread_id=t.thread_id),\
-                 'members',(SELECT jsonb_agg(to_jsonb(tm) ORDER BY user_id) FROM public.thread_memberships tm WHERE tm.thread_id=t.thread_id)) \
-                 FROM public.threads t JOIN public.runs r ON r.thread_id=t.thread_id WHERE r.run_id=$1",
-                &[&b.command.run_id.as_str()],
-            ).await.unwrap().get(0);
-            assert_eq!(b_after, b_before, "A must not modify B's Run, input, thread or permissions");
+            let b_after: Value = c.query_one(b_snapshot, &[&b.command.run_id.as_str()]).await.unwrap().get(0);
+            assert_eq!(b_after, b_before, "A must not modify B's Run, queue, thread or permissions");
             assert_eq!(c.query_one("SELECT count(*) FROM public.runs WHERE run_id=$1",
                 &[&held[1].run_id.as_str()]).await.unwrap().get::<_, i64>(0), 0);
             drop(c);
             runtime.finish_run(&lease_b, lease_b.next_event_sequence(), RunTerminal::Completed).await.unwrap();
+            let c = f.pool.get().await.unwrap();
+            assert_eq!(c.query_one("SELECT state FROM openbot_internal.thread_pending_inputs WHERE run_id=$1",
+                &[&b_queued.run_id.as_str()]).await.unwrap().get::<_, String>(0), "dispatched");
+            drop(c);
             drop(reopened);
             f.finish().await;
             Ok(())
