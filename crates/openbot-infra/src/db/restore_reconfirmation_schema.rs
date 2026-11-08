@@ -160,7 +160,16 @@ fn invalid() -> InfraError {
     InfraError::repository_invariant("restore_reconfirmation_schema_invalid")
 }
 
-fn expected() -> Result<Value, InfraError> {
+/// The validated oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶8040).
+static EXPECTED: std::sync::LazyLock<Option<Value>> =
+    std::sync::LazyLock::new(|| parse_expected().ok());
+
+fn expected() -> Result<&'static Value, InfraError> {
+    EXPECTED.as_ref().ok_or_else(invalid)
+}
+
+fn parse_expected() -> Result<Value, InfraError> {
     let value: Value = serde_json::from_str(ORACLE).map_err(|_| invalid())?;
     let fields = value.as_object().ok_or_else(invalid)?;
     if fields.len() != 4
@@ -207,9 +216,12 @@ async fn verify_additive_on<C: GenericClient + Sync>(client: &C) -> Result<(), I
     Ok(())
 }
 
-/// Payload (already capped at 1 MiB in SQL) and oracle text lengths
-/// [`verify_in_transaction`] observes, measured on the same transaction; the
-/// nested origin and writer observations are measured by their own modules.
+/// Oracle text length; its tree is charged once per operation.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const ORACLE_BYTES: u64 = ORACLE.len() as u64;
+
+/// Payload text length (already capped at 1 MiB in SQL) the additive
+/// observation reads, measured on the same transaction.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) async fn observation_bytes_in_transaction(
     tx: &Transaction<'_>,
@@ -229,10 +241,7 @@ pub(crate) async fn observation_bytes_in_transaction(
     let payload: i64 = row.try_get(0).map_err(|source| {
         RowDecodeError::column("(restore_reconfirmation_schema)", "bytes", source)
     })?;
-    u64::try_from(payload)
-        .ok()
-        .and_then(|bytes| bytes.checked_add((ORACLE.len() + MIGRATION_SQL.len()) as u64))
-        .ok_or_else(invalid)
+    u64::try_from(payload).map_err(|_| invalid())
 }
 
 /// New catalog only, after the caller's exact prefix/full legacy schema proof.
@@ -241,11 +250,9 @@ pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {
     verify_additive_on(client).await
 }
 
-/// Same-transaction additive observation, including the unchanged history graph.
-/// The native registry's complete old public/origin/catalog validation remains a
-/// separate prerequisite; this DATA helper never mints candidate authority.
-pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
-    super::thread_origin_schema::verify_in_transaction(tx).await?;
-    super::thread_history_writer_schema::verify_in_transaction(tx).await?;
+/// Same-transaction additive catalog only. Every caller has already observed
+/// the origin and writer catalogs on this transaction, once each (R459); this
+/// DATA helper never mints candidate authority.
+pub(crate) async fn verify_additive_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
     verify_additive_on(tx).await
 }

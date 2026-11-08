@@ -36,15 +36,18 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
         Ok(Self { tx })
     }
 
-    /// Bytes [`Self::observation_bytes`] itself allocates before measuring.
+    /// The origin, writer and restore oracle trees, parsed once per process.
+    /// A restore operation pays them once, when its candidate is bound.
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
-    pub(crate) const MEASUREMENT_BYTES: u64 =
-        JSON_MEMORY_FACTOR * crate::db::thread_history_writer_schema::MEASUREMENT_ORACLE_BYTES;
+    pub(crate) const ORACLE_BYTES: u64 = JSON_MEMORY_FACTOR
+        * (crate::db::thread_origin_schema::ORACLE_BYTES
+            + crate::db::thread_history_writer_schema::ORACLE_BYTES
+            + crate::db::restore_reconfirmation_schema::ORACLE_BYTES);
 
-    /// Bytes [`Self::observe`] allocates on this transaction: the ledger rows,
-    /// plus each origin and writer payload and oracle (each observed twice by
-    /// the chain) and the restore payload and oracle, every JSON text charged
-    /// for its copies, parsed trees and canonical forms.
+    /// Bytes [`Self::observe`] allocates on this transaction: the ledger rows
+    /// plus the origin, writer and restore payloads, each observed once, every
+    /// payload charged for its copies, parsed trees and canonical forms. The
+    /// oracle trees are already paid ([`Self::ORACLE_BYTES`]).
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
     pub(crate) async fn observation_bytes(tx: &'t Transaction<'c>) -> Result<u64, InfraError> {
         let ledger: i64 = tx
@@ -66,7 +69,6 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
             .and_then(|ledger| {
                 origin
                     .checked_add(writer)?
-                    .checked_mul(2)?
                     .checked_add(restore)?
                     .checked_mul(JSON_MEMORY_FACTOR)?
                     .checked_add(ledger)

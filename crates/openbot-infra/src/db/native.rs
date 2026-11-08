@@ -1402,7 +1402,7 @@ pub(crate) async fn validate_custom_model_v2_layout_in_transaction(
     super::thread_origin_schema::verify_in_transaction(tx).await?;
     super::thread_history_writer_schema::verify_in_transaction(tx).await?;
     if latest == NATIVE_LATEST_VERSION {
-        super::restore_reconfirmation_schema::verify_in_transaction(tx).await?;
+        super::restore_reconfirmation_schema::verify_additive_in_transaction(tx).await?;
     }
     Ok(())
 }
@@ -1456,7 +1456,7 @@ pub(crate) async fn validate_gateway_authorization_journal_in_transaction(
     super::gateway_authorization_schema::verify_in_transaction(tx).await?;
     super::thread_origin_schema::verify_in_transaction(tx).await?;
     super::thread_history_writer_schema::verify_in_transaction(tx).await?;
-    super::restore_reconfirmation_schema::verify_in_transaction(tx).await
+    super::restore_reconfirmation_schema::verify_additive_in_transaction(tx).await
 }
 
 /// Explicit pre-upgrade 0013--0051 branch. It grants no current0052 clearing admission.
@@ -1675,7 +1675,7 @@ pub(crate) async fn validate_thread_origin_in_transaction(
     }
     super::thread_origin_schema::verify_in_transaction(tx).await?;
     super::thread_history_writer_schema::verify_in_transaction(tx).await?;
-    super::restore_reconfirmation_schema::verify_in_transaction(tx).await
+    super::restore_reconfirmation_schema::verify_additive_in_transaction(tx).await
 }
 
 /// Only the explicit original migration target49 may observe this exact historical prefix.

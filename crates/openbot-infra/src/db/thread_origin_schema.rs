@@ -8,6 +8,10 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 /// Whole portable schema, the actual table ACL state and original raw facts.
 pub type ThreadOriginSchemaFacts = Value;
 const REGISTERED_SCHEMA: &str = include_str!("../../../../fixtures/db/thread-origins-0049.json");
+/// The registered oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶8040).
+static REGISTERED: std::sync::LazyLock<Option<Value>> =
+    std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 
 const CAPTURE_SQL: &str = r####"WITH
 wanted_relations(schema_name, relation_name) AS (
@@ -928,8 +932,8 @@ async fn observation_on<C: GenericClient + Sync>(
     normalize_owner_relative(raw)
 }
 fn compare_registered(observation: &ThreadOriginSchemaFacts) -> Result<(), InfraError> {
-    let expected: Value = serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("oracle"))?;
-    let keys = obj(&expected)?
+    let expected = REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?;
+    let keys = obj(expected)?
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
@@ -995,8 +999,12 @@ pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), In
     compare_registered(&observation_on(tx).await?)
 }
 
-/// Payload and oracle text lengths one [`verify_in_transaction`] observes,
-/// measured on the same transaction before it runs.
+/// Registered oracle text length; its tree is charged once per operation.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
+
+/// Payload text length one [`verify_in_transaction`] observes, measured on
+/// the same transaction before it runs.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) async fn observation_bytes_in_transaction(
     tx: &Transaction<'_>,
@@ -1013,6 +1021,5 @@ pub(crate) async fn observation_bytes_in_transaction(
         .map_err(|source| RowDecodeError::column("(thread_origin_schema)", "bytes", source))?;
     u64::try_from(payload)
         .ok()
-        .and_then(|bytes| bytes.checked_add(REGISTERED_SCHEMA.len() as u64))
         .ok_or_else(|| corrupt("facts"))
 }

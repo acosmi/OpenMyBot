@@ -5153,6 +5153,13 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
             .ok_or_else(invalid_candidate)?;
+        // The origin, writer and restore oracle trees every schema observation
+        // borrows are paid once per operation, here (spec revision R484 ¶8040).
+        let oracle = crate::thread_history_writer::CurrentWriterSchema::ORACLE_BYTES;
+        let oracle_metadata = stages.admit_capacity(Capacity::MetadataBytes, oracle)?;
+        let oracle_allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, oracle)?;
+        stages.settle_capacity(oracle_metadata, oracle)?;
+        stages.settle_capacity(oracle_allocation, oracle)?;
         let memory =
             std::mem::size_of::<PendingRestoreCandidateAuthority>() as u64 + 2 * PUBLIC_ROW_MEMORY;
         let metadata = stages.admit_capacity(Capacity::MetadataBytes, memory)?;
@@ -5449,7 +5456,7 @@ mod candidate_fixture {
         capacity.max_pg_transactions = 64;
         capacity.max_pg_rows = 1 << 20;
         capacity.max_reconfirm_requirements = 4096;
-        capacity.max_metadata_bytes = 1 << 30;
+        capacity.max_metadata_bytes = 192 << 20;
         capacity.max_total_allocation_bytes = 1 << 32;
         let (mut control, intent) = fixture.open();
         let session = control

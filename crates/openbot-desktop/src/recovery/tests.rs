@@ -82,7 +82,8 @@ impl EntryFixture {
             max_relative_path_bytes: 4096,
             max_path_depth: 64,
             max_open_files,
-            max_metadata_bytes: 32 << 20,
+            // A bound candidate pays its oracle trees once, about 54 MB.
+            max_metadata_bytes: 96 << 20,
             admission_ns: 30_000_000_000,
         };
         // Unexecuted inventory bytes exercise the real release verifier only;
@@ -1527,7 +1528,8 @@ async fn t046_20b_desktop_candidate_start_bind_and_startup_death() {
         s23_car_request(&fixture);
         let mut request: Value =
             serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
-        request["profile"]["capacity"]["maxMetadataBytes"] = json!(32u64 << 20);
+        // The bind pays the oracle trees once (about 54 MB) on top of staging.
+        request["profile"]["capacity"]["maxMetadataBytes"] = json!(96u64 << 20);
         let profile: RestoreOperationProfile =
             serde_json::from_value(request["profile"].clone()).unwrap();
         fixture.write_request(&request);

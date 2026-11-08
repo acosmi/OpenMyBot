@@ -1822,9 +1822,10 @@ pub(crate) mod tests {
             limits.max_open_files = 4096;
             limits.max_path_depth = 128;
             limits.max_relative_path_bytes = 8192;
-            // A bound candidate's schema observations are charged at 32 times
-            // their JSON length on every clear transaction.
-            limits.max_metadata_bytes = 1 << 30;
+            // A bound candidate pays its oracle trees once (about 54 MB) and
+            // each clear transaction's observation (about 22 MB); the heaviest
+            // restore test settles about 127 MB in all.
+            limits.max_metadata_bytes = 192 << 20;
             let mut capacity = restore_capacity();
             capacity.max_open_files = limits.max_open_files;
             capacity.max_metadata_bytes = limits.max_metadata_bytes;

@@ -11,6 +11,10 @@ const REGISTERED_SCHEMA: &str =
     include_str!("../../../../fixtures/db/thread-history-writer-0052.json");
 const LEGACY0051_SCHEMA: &str =
     include_str!("../../../../fixtures/db/thread-history-writer-0051.json");
+/// The registered oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶8040); the legacy oracle stays on demand.
+static REGISTERED: std::sync::LazyLock<Option<Value>> =
+    std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 
 const CAPTURE_SQL: &str = r####"WITH
 wanted_relations(schema_name, relation_name) AS (
@@ -1493,12 +1497,13 @@ async fn observation_on<C: GenericClient + Sync>(
     client: &C,
     current52: bool,
 ) -> Result<ThreadHistoryWriterSchemaFacts, InfraError> {
-    let registered = if current52 {
-        REGISTERED_SCHEMA
+    let legacy: Value;
+    let expected = if current52 {
+        REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?
     } else {
-        LEGACY0051_SCHEMA
+        legacy = serde_json::from_str(LEGACY0051_SCHEMA).map_err(|_| corrupt("oracle"))?;
+        &legacy
     };
-    let expected: Value = serde_json::from_str(registered).map_err(|_| corrupt("oracle"))?;
     let contract = &expected["rawContract"];
     check_raw_contract_shape(contract, current52)?;
     let row = client
@@ -1529,13 +1534,14 @@ fn compare_registered(
     observation: &ThreadHistoryWriterSchemaFacts,
     current52: bool,
 ) -> Result<(), InfraError> {
-    let registered = if current52 {
-        REGISTERED_SCHEMA
+    let legacy: Value;
+    let expected = if current52 {
+        REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?
     } else {
-        LEGACY0051_SCHEMA
+        legacy = serde_json::from_str(LEGACY0051_SCHEMA).map_err(|_| corrupt("oracle"))?;
+        &legacy
     };
-    let expected: Value = serde_json::from_str(registered).map_err(|_| corrupt("oracle"))?;
-    let keys = obj(&expected)?
+    let keys = obj(expected)?
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
@@ -1596,18 +1602,17 @@ pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), In
     compare_registered(&observation_on(tx, true).await?, true)
 }
 
-/// Bytes the measurement below allocates before anything else is known: the
-/// registered oracle parsed into a JSON tree.
+/// Registered oracle text length; its tree is charged once per operation.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
-pub(crate) const MEASUREMENT_ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
+pub(crate) const ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
 
-/// Payload and oracle text lengths one current [`verify_in_transaction`]
-/// observes, measured on the same transaction before it runs.
+/// Payload text length one current [`verify_in_transaction`] observes,
+/// measured on the same transaction before it runs.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) async fn observation_bytes_in_transaction(
     tx: &Transaction<'_>,
 ) -> Result<u64, InfraError> {
-    let expected: Value = serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("oracle"))?;
+    let expected = REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?;
     let row = tx
         .query_one(
             &format!("SELECT coalesce(octet_length(thread_history_raw),0)::bigint FROM ({CAPTURE_SQL}) observed"),
@@ -1620,7 +1625,6 @@ pub(crate) async fn observation_bytes_in_transaction(
     })?;
     u64::try_from(payload)
         .ok()
-        .and_then(|bytes| bytes.checked_add(REGISTERED_SCHEMA.len() as u64))
         .ok_or_else(|| corrupt("facts"))
 }
 /// Schema-only historical51 helper after an explicit exact pre-upgrade prefix proof.
