@@ -18,6 +18,10 @@ pub enum CustomModelCatalogSchemaError {
 const REGISTERED_NATIVE_FLOOR: i32 = native::NATIVE_0046_VERSION;
 const REGISTERED_SCHEMA: &str =
     include_str!("../../../../fixtures/db/custom-model-catalogs-0046.json");
+/// The registered oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶8040).
+static REGISTERED: std::sync::LazyLock<Option<Value>> =
+    std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 const CAPTURE_SQL: &str = r####"WITH
 wanted_relations(schema_name, relation_name) AS (
  VALUES ('public'::text,'model_connections'::text),
@@ -1227,11 +1231,12 @@ async fn canonical_on<C: GenericClient + Sync>(
     normalize_owner_relative(raw_on(client).await?)
 }
 fn compare_registered(actual: &Value) -> Result<(), CustomModelCatalogSchemaError> {
-    let expected: Value =
-        serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("schema_oracle"))?;
+    let expected = REGISTERED
+        .as_ref()
+        .ok_or_else(|| corrupt("schema_oracle"))?;
     // The include is frozen from independent raw owned-PG observations after registration.
     // No expected builder, database-derived widening, field subtraction or fallback.
-    if actual != &expected {
+    if actual != expected {
         return shape();
     }
     Ok(())
@@ -1279,4 +1284,28 @@ pub(crate) async fn verify_in_transaction(
     storage_on(tx).await?;
     compare_registered(&canonical_on(tx).await?)?;
     mapping_on(tx).await
+}
+/// Registered oracle text length; its tree is charged once per operation.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
+
+/// Payload text length one [`verify_in_transaction`] observes, measured on
+/// the same transaction before it runs.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) async fn observation_bytes_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<u64, InfraError> {
+    let row = tx
+        .query_one(
+            &format!("SELECT coalesce(octet_length(custom_model_catalog_raw),0)::bigint FROM ({CAPTURE_SQL}) observed"),
+            &[&REGISTERED_NATIVE_FLOOR],
+        )
+        .await
+        .map_err(|source| InfraError::query("measure custom model catalog schema observation", source))?;
+    let payload: i64 = row.try_get(0).map_err(|source| {
+        super::RowDecodeError::column("(custom_model_catalog_schema)", "bytes", source)
+    })?;
+    u64::try_from(payload).map_err(|_| {
+        InfraError::repository_invariant("custom_model_catalog_schema_observation_bytes")
+    })
 }

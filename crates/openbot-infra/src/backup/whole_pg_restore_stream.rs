@@ -3797,6 +3797,55 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         stages.settle_capacity(reserved_rows, used_rows)?;
         stages.settle_capacity(reserved_metadata, used_memory)?;
         stages.settle_capacity(reserved_allocation, used_memory)?;
+        // The registered schema observers below parse their payloads; each run
+        // pays those measured texts before it allocates (spec revision R484
+        // ¶8040). The additive restore catalog exists only at 54.
+        let measured = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(stages.effect_before(deadline)?),
+            async {
+                use crate::db::{
+                    custom_model_catalog_schema, custom_model_v2_schema,
+                    gateway_authorization_schema, restore_reconfirmation_schema,
+                    thread_history_writer_schema, thread_origin_schema,
+                };
+                let ledger: i64 = transaction
+                    .query_one(
+                        "SELECT coalesce(sum(octet_length(name)+octet_length(checksum)),0)::bigint FROM openbot_internal.schema_migrations",
+                        &[],
+                    )
+                    .await
+                    .map_err(|source| crate::db::InfraError::query("measure native ledger observation", source))?
+                    .try_get(0)
+                    .map_err(|source| crate::db::RowDecodeError::column("(schema_migrations)", "bytes", source))?;
+                let payloads = [
+                    custom_model_catalog_schema::observation_bytes_in_transaction(transaction).await?,
+                    custom_model_v2_schema::observation_bytes_in_transaction(transaction).await?,
+                    gateway_authorization_schema::observation_bytes_in_transaction(transaction).await?,
+                    thread_origin_schema::observation_bytes_in_transaction(transaction).await?,
+                    thread_history_writer_schema::observation_bytes_in_transaction(transaction).await?,
+                    if version == 54 {
+                        restore_reconfirmation_schema::observation_bytes_in_transaction(transaction).await?
+                    } else {
+                        0
+                    },
+                ];
+                Ok::<_, crate::db::InfraError>((ledger, payloads))
+            },
+        )
+        .await
+        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::EffectExpired))?
+        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        stages.effect_before(deadline)?;
+        let (ledger, payloads) = measured;
+        let observation = payloads
+            .into_iter()
+            .try_fold(0_u64, u64::checked_add)
+            .and_then(|bytes| bytes.checked_mul(crate::thread_history_writer::JSON_MEMORY_FACTOR))
+            .and_then(|bytes| bytes.checked_add(u64::try_from(ledger).ok()?))
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        let observation_metadata = stages.admit_capacity(Capacity::MetadataBytes, observation)?;
+        let observation_allocation =
+            stages.admit_capacity(Capacity::TotalAllocationBytes, observation)?;
         raw.validation = Some(
             tokio::time::timeout_at(
                 tokio::time::Instant::from_std(stages.effect_before(deadline)?),
@@ -3814,6 +3863,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             .and_then(|r| r.as_ref().ok())
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(|| infra_observation_error(raw.validation.as_ref()))?;
+        stages.settle_capacity(observation_metadata, observation)?;
+        stages.settle_capacity(observation_allocation, observation)?;
         Ok(())
     }
 

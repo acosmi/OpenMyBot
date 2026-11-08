@@ -1822,9 +1822,10 @@ pub(crate) mod tests {
             limits.max_open_files = 4096;
             limits.max_path_depth = 128;
             limits.max_relative_path_bytes = 8192;
-            // A bound candidate pays its oracle trees once (about 54 MB) and
-            // each clear transaction's observation (about 22 MB); the heaviest
-            // restore test settles about 127 MB in all.
+            // A bound candidate pays its oracle trees once (about 60 MB), each
+            // layout check (about 27 MB) and each clear transaction's
+            // observation (about 22 MB); the heaviest restore test settles
+            // about 160 MB in all.
             limits.max_metadata_bytes = 192 << 20;
             let mut capacity = restore_capacity();
             capacity.max_open_files = limits.max_open_files;

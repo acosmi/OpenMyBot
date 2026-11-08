@@ -12,7 +12,7 @@ use crate::db::{InfraError, RowDecodeError, native};
 /// 32 times the JSON length, the factor capture_materials applies to catalog
 /// JSON: the row copy, parsed trees and canonical copies of each observed text.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
-const JSON_MEMORY_FACTOR: u64 = 32;
+pub(crate) const JSON_MEMORY_FACTOR: u64 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenOrClosed {
@@ -36,13 +36,17 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
         Ok(Self { tx })
     }
 
-    /// The origin, writer and restore oracle trees, parsed once per process.
-    /// A restore operation pays them once, when its candidate is bound.
+    /// Every registered schema oracle tree a candidate observation borrows,
+    /// each parsed once per process. A restore operation pays them once, when
+    /// its candidate is bound.
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
     pub(crate) const ORACLE_BYTES: u64 = JSON_MEMORY_FACTOR
         * (crate::db::thread_origin_schema::ORACLE_BYTES
             + crate::db::thread_history_writer_schema::ORACLE_BYTES
-            + crate::db::restore_reconfirmation_schema::ORACLE_BYTES);
+            + crate::db::restore_reconfirmation_schema::ORACLE_BYTES
+            + crate::db::custom_model_catalog_schema::ORACLE_BYTES
+            + crate::db::custom_model_v2_schema::ORACLE_BYTES
+            + crate::db::gateway_authorization_schema::ORACLE_BYTES);
 
     /// Bytes [`Self::observe`] allocates on this transaction: the ledger rows
     /// plus the origin, writer and restore payloads, each observed once, every
