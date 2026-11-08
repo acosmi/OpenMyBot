@@ -1460,7 +1460,14 @@ async fn t046_20_candidate_child_three_pipes_and_driver_close_or_stay_unknown() 
     );
     runner::request_restore_stop(&mut owner, &clock)
         .unwrap_or_else(|_| panic!("one original TERM"));
-    let mut wait = Box::pin(runner::wait_restore_program(owner, &clock, || Ok(()), true));
+    // The capacity observer fails on its first call: the wait still owns the
+    // same Child and must keep that failure next to the real exit.
+    let mut wait = Box::pin(runner::wait_restore_program(
+        owner,
+        &clock,
+        || Err(crate::postgres_maintenance::MaintenanceError::CapacityExceeded),
+        true,
+    ));
     // Cancelling the observation leaves the original wait resident: no exit is invented.
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait)
@@ -1474,6 +1481,11 @@ async fn t046_20_candidate_child_three_pipes_and_driver_close_or_stay_unknown() 
         .await
         .unwrap();
     assert_eq!(result.native_wait(), Some((pid, Some(0), None)));
+    // The observer failure stays Unknown on the result; the real exit does not erase it.
+    assert!(matches!(
+        result.retained_error(),
+        Some(crate::postgres_maintenance::MaintenanceError::CapacityExceeded)
+    ));
     // No stdin writer task exists for the server; stdout and stderr readers returned.
     assert_eq!(
         result.pipes(),
@@ -1484,4 +1496,126 @@ async fn t046_20_candidate_child_three_pipes_and_driver_close_or_stay_unknown() 
         ]
     );
     drop(session);
+}
+
+#[tokio::test]
+#[ignore = "explicit task CAR plus BIN SBX: real staging, /usr/bin/sandbox-exec and OPENBOT_TEST_POSTGRES_BIN_DIR PostgreSQL 17.11"]
+async fn t046_20b_desktop_candidate_start_bind_and_startup_death() {
+    use super::candidate::CandidateGeneration;
+    use openbot_infra::backup::whole_pg_restore_stream::verify_whole_pg_restore_input;
+    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+    let (bundle_root, digest) = crate::postgres_sidecar::materialize_host_postgres_bundle(&bin_dir);
+    let bundle = crate::postgres_sidecar::VerifiedPostgresBundle::open(
+        &bundle_root,
+        digest,
+        &crate::postgres_sidecar::signing_identity(),
+    )
+    .unwrap();
+    let crate_dir = std::env::current_dir().unwrap();
+    for death in [false, true] {
+        // A short owned fixture root keeps the candidate UDS path below 103
+        // bytes and every ancestor trusted (no world-writable temp directory);
+        // tests run one at a time, so the working directory is ours.
+        let short = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            ".wb046-{}",
+            &uuid::Uuid::now_v7().simple().to_string()[20..]
+        ));
+        DirBuilder::new().mode(0o700).create(&short).unwrap();
+        std::env::set_current_dir(&short).unwrap();
+        let fixture = EntryFixture::with_open_file_limit(4096);
+        std::env::set_current_dir(&crate_dir).unwrap();
+        s23_car_request(&fixture);
+        let mut request: Value =
+            serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+        request["profile"]["capacity"]["maxMetadataBytes"] = json!(32u64 << 20);
+        let profile: RestoreOperationProfile =
+            serde_json::from_value(request["profile"].clone()).unwrap();
+        fixture.write_request(&request);
+        let VerifiedRestoreEntry {
+            mut control,
+            intent,
+            original: _original,
+        } = fixture
+            .entry()
+            .expect("original verified release/OS/request");
+        let mut session = control
+            .claim_restore(intent, profile)
+            .expect("actual same-session claim");
+        let operation = session.operation_id().to_owned();
+        let (input, intent) = session
+            .frozen_input()
+            .expect("one actual held source transfer");
+        let staging = verify_whole_pg_restore_input(input, intent, &mut session)
+            .await
+            .unwrap_or_else(|failure| {
+                panic!("actual source authentication failed: {:?}", failure.fault())
+            });
+        let mut candidate = CandidateGeneration::new(staging);
+        candidate
+            .prepare_directories(&mut session)
+            .expect("same-generation directories and Isolation intent");
+        candidate
+            .prepare_postgres(&mut session)
+            .expect("staging copies and closed configuration");
+        if death {
+            // An invalid setting makes the candidate exit FATAL at startup.
+            let (_, data) = candidate.data_directory().expect("held data root");
+            std::io::Write::write_all(
+                &mut fs::OpenOptions::new()
+                    .append(true)
+                    .open(data.join("postgresql.conf"))
+                    .unwrap(),
+                b"shared_buffers = 'not-a-size'\n",
+            )
+            .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let start = candidate.start_postgres(&mut session, &bundle);
+        let bound = match start {
+            Ok(()) => candidate.bind_postgres(&mut session, &bundle).await,
+            Err(fault) => Err(fault),
+        };
+        if death {
+            assert_eq!(bound, Err(DesktopRestoreError::IsolationUnproven));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "classified well before the 120 s effect deadline"
+            );
+        } else {
+            bound.expect("real candidate bound through the staging-based session bind");
+            let records = serde_json::to_string(&local_journal(
+                &fixture.root.join("com.acosmi.wrokbot.restore-control"),
+                &operation,
+            ))
+            .unwrap();
+            assert!(
+                records.contains("candidate_isolation"),
+                "Isolation stage confirmed"
+            );
+        }
+        // Fast shutdown closes the bound pool's connection; the same Child is then reaped.
+        if let Some(pid) = candidate
+            .original_program()
+            .and_then(|program| program.original_child().id())
+        {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(pid as i32).unwrap(),
+                rustix::process::Signal::INT,
+            );
+        }
+        let mut owned = Some(session);
+        candidate
+            .begin_wait(&mut owned)
+            .expect("original wait owns the same Child");
+        let reaped =
+            tokio::time::timeout(std::time::Duration::from_secs(40), candidate.observe_wait())
+                .await
+                .expect("same Child reaped")
+                .is_ok();
+        assert!(reaped || death);
+        drop(candidate);
+        drop(fixture);
+        let _ = fs::remove_dir_all(&short);
+    }
+    let _ = fs::remove_dir_all(&bundle_root);
 }

@@ -832,6 +832,12 @@ fn decode_digest(s: &str) -> Option<[u8; 32]> {
 // The supported build is thin 64-bit Mach-O. Fat, unexpected architecture, external prefixes,
 // environment search paths and imports outside the closed lib tree are rejected. The accepted
 // dynamic linker and system imports are returned as the program's actual loader inventory.
+/// The most [`verify_loader`] allocates: its load-command buffer (at most
+/// 4 MiB), the strings it copies out of that buffer, and its four vectors.
+#[cfg(target_os = "macos")]
+pub(crate) const VERIFY_LOADER_MEMORY_BYTES: u64 =
+    2 * 4 * 1024 * 1024 + 4 * std::mem::size_of::<Vec<String>>() as u64;
+
 pub(crate) fn verify_loader(
     root: &File,
     path: &str,

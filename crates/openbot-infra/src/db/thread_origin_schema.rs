@@ -995,8 +995,8 @@ pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), In
     compare_registered(&observation_on(tx).await?)
 }
 
-/// Owned bytes one [`verify_in_transaction`] allocates for its payload and
-/// oracle text, measured on the same transaction before it runs.
+/// Payload and oracle text lengths one [`verify_in_transaction`] observes,
+/// measured on the same transaction before it runs.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) async fn observation_bytes_in_transaction(
     tx: &Transaction<'_>,

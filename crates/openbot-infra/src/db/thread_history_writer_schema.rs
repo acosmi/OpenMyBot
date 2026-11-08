@@ -1596,8 +1596,13 @@ pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), In
     compare_registered(&observation_on(tx, true).await?, true)
 }
 
-/// Owned bytes one current [`verify_in_transaction`] allocates for its payload
-/// and oracle text, measured on the same transaction before it runs.
+/// Bytes the measurement below allocates before anything else is known: the
+/// registered oracle parsed into a JSON tree.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const MEASUREMENT_ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
+
+/// Payload and oracle text lengths one current [`verify_in_transaction`]
+/// observes, measured on the same transaction before it runs.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) async fn observation_bytes_in_transaction(
     tx: &Transaction<'_>,

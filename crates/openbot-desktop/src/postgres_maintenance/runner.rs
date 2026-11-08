@@ -258,6 +258,15 @@ impl RestoreProgramResult {
         ))
     }
 
+    /// The failure retained with the original wait, if any: an observer or
+    /// clock error stays here next to the real exit and is never cleared.
+    pub(crate) fn retained_error(&self) -> Option<&MaintenanceError> {
+        match &self.tool {
+            Ok(tool) => tool.error.as_ref(),
+            Err(error) => Some(error),
+        }
+    }
+
     /// The stdin writer, stdout reader and stderr reader joins, in that order.
     pub(crate) fn pipes(&self) -> [RestorePipeJoin; 3] {
         fn join<T>(raw: &Option<Result<T, tokio::task::JoinError>>) -> RestorePipeJoin {

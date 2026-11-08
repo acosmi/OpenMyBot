@@ -1822,8 +1822,9 @@ pub(crate) mod tests {
             limits.max_open_files = 4096;
             limits.max_path_depth = 128;
             limits.max_relative_path_bytes = 8192;
-            // A bound candidate's measured schema observations need room.
-            limits.max_metadata_bytes = 1 << 26;
+            // A bound candidate's schema observations are charged at 32 times
+            // their JSON length on every clear transaction.
+            limits.max_metadata_bytes = 1 << 30;
             let mut capacity = restore_capacity();
             capacity.max_open_files = limits.max_open_files;
             capacity.max_metadata_bytes = limits.max_metadata_bytes;

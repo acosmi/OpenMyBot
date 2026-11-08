@@ -479,16 +479,36 @@ impl CandidateGeneration {
         session: &mut RestoreControlSession,
         bundle: &VerifiedPostgresBundle,
     ) -> Result<(), DesktopRestoreError> {
-        if !self.prepared || self.program.is_some() || self.first_fault.is_some() {
+        // The same precondition retain_program enforces, checked before a spawn,
+        // so a started Child always has an owner to retain it.
+        if !self.prepared
+            || self.program.is_some()
+            || self.waiting.is_some()
+            || self.program_result.is_some()
+            || self.first_fault.is_some()
+        {
             return Err(DesktopRestoreError::EntryInvalid);
         }
         let result = (|| {
             use crate::postgres_maintenance::runner::restore_isolation::{
                 Directory, ExcludedLocation, Generation, RestoreIsolationPolicy,
             };
+            // The loader read is paid at its ceiling before it allocates.
+            let loader_memory = session
+                .admit_capacity(
+                    RestoreCapacityResource::MetadataBytes,
+                    crate::postgres_maintenance::bundle::VERIFY_LOADER_MEMORY_BYTES,
+                )
+                .map_err(|e| self.keep_control(e))?;
             let loader_files = bundle
                 .system_loader_files()
                 .map_err(|_| DesktopRestoreError::IsolationUnproven)?;
+            session
+                .settle_capacity(
+                    loader_memory,
+                    crate::postgres_maintenance::bundle::VERIFY_LOADER_MEMORY_BYTES,
+                )
+                .map_err(|e| self.keep_control(e))?;
             let loaders: Vec<&std::path::Path> =
                 loader_files.iter().map(PathBuf::as_path).collect();
             // Every rendered rule names one of these paths or one ancestor of
@@ -575,19 +595,21 @@ impl CandidateGeneration {
                 secret,
                 (spool, spool, true),
             );
-            session
-                .settle_capacity(memory, policy_bytes as u64)
-                .map_err(|e| self.keep_control(e))?;
+            // Retain a started Child before anything else can fail; a later
+            // settle failure then leaves it owned and faulted.
             match spawned {
                 Ok(owner) => {
                     let mut original = Some(owner);
-                    self.retain_program(&mut original)
+                    self.retain_program(&mut original)?;
                 }
                 Err(failure) => {
                     self.program_failure = Some(failure);
-                    Err(DesktopRestoreError::IsolationUnproven)
+                    return Err(DesktopRestoreError::IsolationUnproven);
                 }
             }
+            session
+                .settle_capacity(memory, policy_bytes as u64)
+                .map_err(|e| self.keep_control(e))
         })();
         if let Err(fault) = result {
             self.first_fault.get_or_insert(fault);
@@ -615,10 +637,29 @@ impl CandidateGeneration {
         let child_id = original.original_child().id();
         let deadline = self.effect()?;
         // PG17 writes "ready" as line 8 of postmaster.pid once it accepts
-        // connections; the original wait is not polled here.
+        // connections; the original wait is not polled here. A Child that
+        // exits or changes identity before that is IsolationUnproven at once.
         loop {
-            let ready = std::fs::read_to_string(self.paths[1].join("postmaster.pid"))
-                .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"));
+            let original = self
+                .program
+                .as_ref()
+                .ok_or(DesktopRestoreError::EntryInvalid)?;
+            if original
+                .original_identity()
+                .as_ref()
+                .map_or(true, |identity| identity.revalidate().is_err())
+            {
+                self.first_fault
+                    .get_or_insert(DesktopRestoreError::IsolationUnproven);
+                return Err(DesktopRestoreError::IsolationUnproven);
+            }
+            let mut lock_bytes = [0_u8; 4096];
+            let ready = std::fs::File::open(self.paths[1].join("postmaster.pid"))
+                .and_then(|mut file| std::io::Read::read(&mut file, &mut lock_bytes))
+                .is_ok_and(|read| {
+                    std::str::from_utf8(&lock_bytes[..read])
+                        .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"))
+                });
             if ready {
                 break;
             }

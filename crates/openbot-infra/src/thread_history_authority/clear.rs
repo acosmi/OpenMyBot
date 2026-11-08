@@ -506,16 +506,21 @@ impl ClearAuthority<'_> {
     ) -> Result<Decision, Error> {
         set_timeouts(tx, deadline).await?;
         // Complete current prefix/origin/writer observation, once and before any row lock.
-        // A restore candidate pays the observation's measured owned bytes first.
+        // A restore candidate pays the measurement's own oracle tree, then the
+        // observation's measured bytes, before either allocates.
         let measured = match self {
             Self::Ordinary(_) => 0,
             #[cfg(all(feature = "server-runtime", target_os = "macos"))]
-            Self::Pending { .. } => usize::try_from(
-                bounded(deadline, CurrentWriterSchema::observation_bytes(tx))
+            Self::Pending { .. } => {
+                let measurement = usize::try_from(CurrentWriterSchema::MEASUREMENT_BYTES)
+                    .map_err(|_| Error::Unavailable)?;
+                let measurement_memory = self.reserve_memory(measurement)?;
+                let measured = bounded(deadline, CurrentWriterSchema::observation_bytes(tx))
                     .await?
-                    .map_err(schema_error)?,
-            )
-            .map_err(|_| Error::Unavailable)?,
+                    .map_err(schema_error)?;
+                self.settle_memory(measurement_memory, measurement)?;
+                usize::try_from(measured).map_err(|_| Error::Unavailable)?
+            }
         };
         let schema_memory = self.reserve_memory(measured)?;
         let schema = bounded(deadline, CurrentWriterSchema::observe(tx))
@@ -716,6 +721,28 @@ impl ClearAuthority<'_> {
         if batches.get() == 0 || column::<i64>(&completion, "run_output_expired")? != 0 {
             return Err(corrupt("clear_completion_count"));
         }
+        // A restore candidate pays the completion audit as the retirement audit
+        // does: its text six times plus the event and stored row, before building it.
+        let audit_bytes = match self {
+            Self::Ordinary(_) => 0,
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { .. } => binding
+                .actor
+                .len()
+                .checked_add(thread.as_str().len())
+                .and_then(|n| n.checked_add(binding.operation_id.len()))
+                .and_then(|n| n.checked_mul(6))
+                .and_then(|n| {
+                    n.checked_add(
+                        2 * std::mem::size_of::<AuditEvent>()
+                            + 2 * std::mem::size_of::<openbot_domain::audit::chain::StoredAuditRow>(
+                            )
+                            + 1024,
+                    )
+                })
+                .ok_or(Error::Unavailable)?,
+        };
+        let audit_memory = self.reserve_memory(audit_bytes)?;
         let payload = counts.audit(&binding, batches)?;
         // Try the original audit lock and tail NOWAIT before the existing chain helpers. Their
         // advisory acquisition and tail lock are reentrant on our already-held original locks.
@@ -753,6 +780,7 @@ impl ClearAuthority<'_> {
         )
         .await?
         .map_err(schema_error)?;
+        self.settle_memory(audit_memory, audit_bytes)?;
         // Force all completion and original writer deferred checks before COMMIT. A database
         // rejection here is known; the guarded COMMIT still owns any later unknown ACK.
         match bounded(deadline, tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")).await? {

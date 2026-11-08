@@ -207,10 +207,9 @@ async fn verify_additive_on<C: GenericClient + Sync>(client: &C) -> Result<(), I
     Ok(())
 }
 
-/// Owned bytes [`verify_in_transaction`] allocates for the additive catalog
-/// payload (already capped at 1 MiB in SQL) and its oracle, measured on the
-/// same transaction; the nested origin and writer observations are measured
-/// by their own modules.
+/// Payload (already capped at 1 MiB in SQL) and oracle text lengths
+/// [`verify_in_transaction`] observes, measured on the same transaction; the
+/// nested origin and writer observations are measured by their own modules.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) async fn observation_bytes_in_transaction(
     tx: &Transaction<'_>,

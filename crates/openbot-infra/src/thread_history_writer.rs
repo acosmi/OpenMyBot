@@ -9,6 +9,11 @@ use tokio_postgres::{Transaction, error::SqlState};
 
 use crate::db::{InfraError, RowDecodeError, native};
 
+/// 32 times the JSON length, the factor capture_materials applies to catalog
+/// JSON: the row copy, parsed trees and canonical copies of each observed text.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+const JSON_MEMORY_FACTOR: u64 = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenOrClosed {
     Open,
@@ -31,10 +36,15 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
         Ok(Self { tx })
     }
 
-    /// Owned bytes [`Self::observe`] allocates on this transaction: the ledger
-    /// rows, the origin and writer payloads (each observed twice by the chain)
-    /// and the restore catalog payload, measured before observing. Parsed JSON
-    /// trees are derived from these already-measured payloads.
+    /// Bytes [`Self::observation_bytes`] itself allocates before measuring.
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    pub(crate) const MEASUREMENT_BYTES: u64 =
+        JSON_MEMORY_FACTOR * crate::db::thread_history_writer_schema::MEASUREMENT_ORACLE_BYTES;
+
+    /// Bytes [`Self::observe`] allocates on this transaction: the ledger rows,
+    /// plus each origin and writer payload and oracle (each observed twice by
+    /// the chain) and the restore payload and oracle, every JSON text charged
+    /// for its copies, parsed trees and canonical forms.
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
     pub(crate) async fn observation_bytes(tx: &'t Transaction<'c>) -> Result<u64, InfraError> {
         let ledger: i64 = tx
@@ -58,6 +68,7 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
                     .checked_add(writer)?
                     .checked_mul(2)?
                     .checked_add(restore)?
+                    .checked_mul(JSON_MEMORY_FACTOR)?
                     .checked_add(ledger)
             })
             .ok_or_else(|| InfraError::repository_invariant("thread_history_writer_schema_bytes"))

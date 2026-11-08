@@ -49,8 +49,10 @@ struct RestoreConfigurationSlot {
 /// All SQL stages borrow its original connection custody and bound pool.
 pub(crate) struct PendingRestoreCandidateAuthority {
     original_process: wrok_bot_macos_process::ProcessIdentity,
-    // Held for the authority's lifetime: the original executable and the
-    // candidate's UDS and data directories cannot be swapped underneath it.
+    // Held for the authority's lifetime. The program FD is the same file object
+    // the policy admitted; program identity itself is bound at spawn by the
+    // policy's process-exec literal and checked command. A held FD does not
+    // stop a path rename; the UDS and data directory FDs pin those inodes.
     #[allow(dead_code)]
     program: File,
     #[allow(dead_code)]
@@ -5096,6 +5098,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         let isolation = invalid_candidate;
         let deadline = stages.effect_before(deadline)?;
         // The live, unreaped original Child with the runner's startup identity.
+        // The program check is only that the held FD is a regular file: program
+        // identity was bound at spawn by the policy's process-exec literal.
         let pid = child_id.ok_or_else(isolation)?;
         let process =
             wrok_bot_macos_process::ProcessIdentity::capture(pid).map_err(|_| isolation())?;
@@ -5445,7 +5449,7 @@ mod candidate_fixture {
         capacity.max_pg_transactions = 64;
         capacity.max_pg_rows = 1 << 20;
         capacity.max_reconfirm_requirements = 4096;
-        capacity.max_metadata_bytes = 1 << 26;
+        capacity.max_metadata_bytes = 1 << 30;
         capacity.max_total_allocation_bytes = 1 << 32;
         let (mut control, intent) = fixture.open();
         let session = control
