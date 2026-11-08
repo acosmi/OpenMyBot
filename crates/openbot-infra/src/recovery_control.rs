@@ -3777,4 +3777,187 @@ pub(crate) mod tests {
         })
         .await;
     }
+
+    /// One real restore driven by the real producers to a published
+    /// RestoreCurrent on an owned PostgreSQL 17.11 target, then reopened as
+    /// the Local runtime with the target's pool bound to its read gate. The
+    /// cohort is the published operation's, so it names that target's own
+    /// `restore_pg_operations` row (requirement and receipt rows have FKs).
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    pub(crate) mod restore_current {
+        use super::RestoreEntryFixture;
+        use crate::backup::whole_pg_restore_stream::candidate_fixture::OwnedCandidate;
+        use crate::backup::whole_pg_restore_stream::{
+            RestoreCandidateExit, RestoredClosedHistoryRequest,
+        };
+        use crate::recovery_control::RestoreCapacityResource as Resource;
+        use openbot_contracts::recovery::RestoreCohortRef;
+        use openbot_domain::vault::SecretBytes;
+        use serde_json::json;
+        use std::time::{Duration, Instant};
+
+        /// Fields drop in order: the runtime closes its gate before the
+        /// target stops and the fixture directory goes.
+        pub(crate) struct RestoreCurrentFixture {
+            pub(crate) runtime: crate::recovery_control::RecoveryRuntimeOwner,
+            pub(crate) pool: crate::db::pool::DatabasePool,
+            pub(crate) cohort: RestoreCohortRef,
+            /// MetadataBytes admitted after the candidate SQL, after both
+            /// slots, after the SCRAM change, after the readback, and after
+            /// the publication.
+            pub(crate) metadata: [u64; 5],
+            _control: crate::recovery_control::RecoveryControl,
+            _pg: OwnedCandidate,
+            fixture: RestoreEntryFixture,
+        }
+
+        impl RestoreCurrentFixture {
+            pub(crate) async fn publish() -> Self {
+                use std::os::unix::fs::DirBuilderExt as _;
+                let mut fixture = RestoreEntryFixture::new();
+                let capacity = &mut fixture.profile.capacity;
+                capacity.max_pg_connections = 65;
+                capacity.max_pg_transactions = 64;
+                capacity.max_pg_rows = 1 << 20;
+                capacity.max_reconfirm_requirements = 4096;
+                // The selected generation is the app-data root Local starts from.
+                let mut request = fixture.request();
+                request["trustedInputSelection"]["target"]["component"] = json!("old-app");
+                let (mut control, intent) = fixture.open_request(request);
+                let mut session = control.claim_restore(intent, fixture.profile.clone()).unwrap();
+                let operation = session.operation_id().to_owned();
+                let epoch = super::head(&fixture)["data"]["epoch"].as_str().unwrap().to_owned();
+                let root = fixture.directory.join("old-app");
+                std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+                let mut pg = OwnedCandidate::start_at(
+                    crate::db::native::NATIVE_LATEST_VERSION,
+                    "",
+                    Some(root.join("data")),
+                )
+                .await;
+                let master = SecretBytes::new(vec![0x41; 32]);
+                let old = pg.scram();
+                let deadline = Instant::now() + Duration::from_secs(25);
+                session
+                    .bind_candidate_from_source_before(
+                        Some(pg.pid()),
+                        pg.identity(),
+                        &pg.uds(),
+                        (pg.system_identifier.clone(), pg.database_oid),
+                        (&old, &master),
+                        deadline,
+                    )
+                    .await
+                    .unwrap();
+                session.upgrade_candidate_schema_before(deadline).await.unwrap();
+                session.retire_cohort_before(deadline).await.unwrap();
+                session
+                    .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline))
+                    .await
+                    .unwrap();
+                let ceiling = fixture.profile.capacity.max_metadata_bytes;
+                let used = |session: &mut crate::recovery_control::RestoreControlSession| {
+                    ceiling - session.input_stages().capacity_available(Resource::MetadataBytes).unwrap()
+                };
+                let mut metadata = [used(&mut session), 0, 0, 0, 0];
+                // The Desktop slot adapter's part: both fixed pairs written
+                // and read back by the store, then observed as matched.
+                let mut random = [0_u8; 32];
+                getrandom::fill(&mut random).unwrap();
+                let new = SecretBytes::new(random.iter().flat_map(|b| format!("{b:02x}").into_bytes()).collect());
+                for kind in [super::super::entry::TargetSlotKind::Master, super::super::entry::TargetSlotKind::Scram] {
+                    session.begin_target_slot_from_session_before(deadline, kind).unwrap();
+                    match kind {
+                        super::super::entry::TargetSlotKind::Master => session
+                            .observe_restore_master_slot_before(super::super::RestoreTargetSlotOutcome::ReadbackMatched, deadline),
+                        super::super::entry::TargetSlotKind::Scram => session
+                            .observe_restore_scram_slot_before(super::super::RestoreTargetSlotOutcome::ReadbackMatched, deadline),
+                    }
+                    .unwrap();
+                }
+                metadata[1] = used(&mut session);
+                let scram = session.rotate_candidate_scram_before(&new, &old, deadline).await.unwrap();
+                metadata[2] = used(&mut session);
+                let readbacks = session.verify_target_installation_before(&master, &new, deadline).await.unwrap();
+                metadata[3] = used(&mut session);
+                let startup = wrok_bot_macos_process::ProcessIdentity::capture(pg.pid())
+                    .unwrap()
+                    .evidence_bytes()
+                    .unwrap();
+                let status = pg.stop();
+                let exit = RestoreCandidateExit {
+                    pid: u32::from_be_bytes(startup[..4].try_into().unwrap()),
+                    start: super::super::ProcessStart {
+                        seconds: u64::from_be_bytes(startup[4..12].try_into().unwrap()),
+                        nanos: u32::from_be_bytes(startup[12..16].try_into().unwrap()) * 1000,
+                    },
+                    exit: super::super::NativeExit::Code { value: status.code().unwrap() },
+                    observed_ns: super::super::clock::monotonic_ns().unwrap(),
+                    pipes: [super::super::PipeJoin::Null, super::super::PipeJoin::Null, super::super::PipeJoin::Null],
+                };
+                session.publish_restore_current_before(scram, readbacks, exit, deadline).await.unwrap();
+                metadata[4] = used(&mut session);
+                drop(session);
+                drop(control);
+                pg.restart(&new).await;
+                let control = super::super::RecoveryControl::open(fixture.config()).unwrap();
+                let runtime = fixture.open_local(&control).unwrap();
+                let mut config = tokio_postgres::Config::new();
+                config
+                    .host_path(pg.uds())
+                    .port(5432)
+                    .user("desktop_admin")
+                    .dbname(crate::db::desktop_local::APPLICATION_DATABASE)
+                    .password(new.expose());
+                let pool = crate::db::pool::connect_config(config, 4, Duration::from_secs(10), "restored target")
+                    .await
+                    .unwrap();
+                // The restored Local binding route is the next batch; the
+                // gate is bound to the same pool its verification would bind.
+                super::super::entry::lock(&control.shared).unwrap().bind_original_local_pool(&pool);
+                let cohort = RestoreCohortRef {
+                    operation_id: super::super::hex_array(&operation),
+                    epoch: super::super::hex_array(&epoch),
+                };
+                Self { runtime, pool, cohort, metadata, _control: control, _pg: pg, fixture }
+            }
+
+            pub(crate) fn read_gate(&self) -> crate::recovery_control::RecoveryReadGate {
+                self.runtime.read_gate()
+            }
+
+            /// One receipt for `requirement`, through the receipt insert
+            /// guard every producer's INSERT passes.
+            pub(crate) async fn confirm(&self, requirement: uuid::Uuid, owner: &str, proof_kind: &str) {
+                let inserted = self.pool.get().await.unwrap().execute(
+                    "INSERT INTO openbot_internal.restore_reconfirm_receipts(operation_id,epoch,requirement_id,confirmation_id,proof_ref,confirmed_by,proof_kind)
+                     VALUES($1,$2,$3,$4,$5,$6,$7)",
+                    &[&uuid::Uuid::from_bytes(self.cohort.operation_id), &self.cohort.epoch.as_slice(), &requirement,
+                      &uuid::Uuid::now_v7(), &uuid::Uuid::now_v7(), &owner, &proof_kind],
+                ).await.unwrap();
+                assert_eq!(inserted, 1);
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+        async fn restore_current_fixture_publishes_one_cohort_and_gates_its_pool() {
+            let restored = RestoreCurrentFixture::publish().await;
+            eprintln!("restore fixture MetadataBytes admitted: candidate SQL {}, slots {}, SCRAM change {}, readback {}, publication {}",
+                restored.metadata[0], restored.metadata[1], restored.metadata[2], restored.metadata[3], restored.metadata[4]);
+            let gate = restored.read_gate();
+            assert!(gate.matches_pool(&restored.pool));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let lease = gate.borrow_worker_before(deadline).await.unwrap();
+            assert_eq!(lease.restore_cohort(), Some(restored.cohort));
+            drop(lease);
+            let row = restored.pool.get().await.unwrap().query_one(
+                "SELECT count(*)::bigint FROM openbot_internal.restore_pg_operations o JOIN openbot_internal.restore_pg_seals s USING(operation_id,epoch) WHERE o.operation_id=$1 AND o.epoch=$2",
+                &[&uuid::Uuid::from_bytes(restored.cohort.operation_id), &restored.cohort.epoch.as_slice()],
+            ).await.unwrap();
+            assert_eq!(row.get::<_, i64>(0), 1, "the published cohort is the target's sealed operation");
+            let head = super::head(&restored.fixture);
+            assert_eq!(head["phase"], "RestoreCurrent");
+        }
+    }
 }

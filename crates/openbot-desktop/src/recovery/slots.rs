@@ -141,6 +141,25 @@ impl RestoreTargetSlotWork {
         self.slots.get(index)?.as_ref()?.readback.as_ref()
     }
 
+    /// The SCRAM secret read back from its matched target slot.
+    pub(super) fn scram_readback(&self) -> Option<&SecretBytes> {
+        self.matched_readback(1)
+    }
+
+    /// Moves the matched master frame read back from its target slot out
+    /// once, for the installation readback with the new key.
+    pub(super) fn take_master_readback(&mut self) -> Option<SecretBytes> {
+        self.matched_readback(0)?;
+        self.slots[0].as_mut()?.readback.take()?.ok()?
+    }
+
+    fn matched_readback(&self, index: usize) -> Option<&SecretBytes> {
+        if !matches!(self.result, Some(Ok(()))) {
+            return None;
+        }
+        self.slots[index].as_ref()?.readback.as_ref()?.as_ref().ok()?.as_ref()
+    }
+
     fn keep_control(&mut self, error: RecoveryControlError) -> DesktopRestoreError {
         let fault = DesktopRestoreError::from_control(&error);
         if self.control_error.is_none() { self.control_error = Some(error); }
@@ -177,14 +196,13 @@ fn prepare_secrets(work: &mut RestoreTargetSlotWork, source: &VerifiedWholePgRes
 fn read_slot(work: &mut RestoreTargetSlotWork, index: usize, readback: bool, session: &mut RestoreControlSession, store: &dyn OsSecretStore) -> Result<(), DesktopRestoreError> {
     let effect = work.slots[index].as_ref().expect("original fixed slot").effect;
     session.check_restore_slot_effect_before(effect).map_err(|error| work.keep_control(error))?;
-    // An original ledger reservation is not a limit on the native port's
-    // internal to_vec. Oversized returned values remain retained on failure;
-    // this component does not claim that production boundary is repaired.
-    let available = session.restore_slot_secret_capacity_before(effect).map_err(|error| work.keep_control(error))?;
-    let reservation = session.admit_capacity(RestoreCapacityResource::SecretMemoryBytes, available).map_err(|error| work.keep_control(error))?;
+    // The slot holds exactly the expected frame (33 B master, 64 B SCRAM);
+    // the store refuses a longer value before copying it into this process.
+    let bound = work.expected(index).expose().len();
+    let reservation = session.admit_capacity(RestoreCapacityResource::SecretMemoryBytes, bound as u64).map_err(|error| work.keep_control(error))?;
     let returned = {
         let slot = work.slots[index].as_ref().expect("original fixed service/account");
-        store.read(&slot.service, &slot.account)
+        store.read_bounded(&slot.service, &slot.account, bound)
     };
     let slot = work.slots[index].as_mut().expect("original returned-read custody");
     let retained = if readback { &mut slot.readback } else { &mut slot.absence };

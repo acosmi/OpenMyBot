@@ -82,8 +82,9 @@ impl EntryFixture {
             max_relative_path_bytes: 4096,
             max_path_depth: 64,
             max_open_files,
-            // A bound candidate pays its oracle trees once, about 60 MB.
-            max_metadata_bytes: 96 << 20,
+            // A bound candidate pays its oracle trees once (about 60 MB) and
+            // each layout and history observation; T046-38 runs them all.
+            max_metadata_bytes: 256 << 20,
             admission_ns: 30_000_000_000,
         };
         // Unexecuted inventory bytes exercise the real release verifier only;
@@ -1615,6 +1616,239 @@ async fn t046_20b_desktop_candidate_start_bind_and_startup_death() {
                 .expect("same Child reaped")
                 .is_ok();
         assert!(reaped || death);
+        drop(candidate);
+        drop(fixture);
+        let _ = fs::remove_dir_all(&short);
+    }
+    let _ = fs::remove_dir_all(&bundle_root);
+}
+
+/// A current-user store stand-in for the S23 target-slot cases: one value
+/// per exact service/account pair, nothing else.
+#[derive(Default)]
+struct SlotMemoryStore(std::sync::Mutex<Vec<(String, String, Vec<u8>)>>);
+
+impl SlotMemoryStore {
+    fn raw(&self, service: &str, account: &str) -> Option<Vec<u8>> {
+        self.0.lock().unwrap().iter()
+            .find(|entry| entry.0 == service && entry.1 == account)
+            .map(|entry| entry.2.clone())
+    }
+}
+
+impl crate::os_secret_store::OsSecretStore for SlotMemoryStore {
+    fn read(&self, service: &str, account: &str) -> Result<Option<openbot_domain::vault::SecretBytes>, crate::os_secret_store::OsSecretStoreError> {
+        Ok(self.raw(service, account).map(openbot_domain::vault::SecretBytes::new))
+    }
+    fn write(&self, service: &str, account: &str, secret: &[u8]) -> Result<(), crate::os_secret_store::OsSecretStoreError> {
+        let mut values = self.0.lock().unwrap();
+        values.retain(|entry| !(entry.0 == service && entry.1 == account));
+        values.push((service.to_owned(), account.to_owned(), secret.to_vec()));
+        Ok(())
+    }
+}
+
+#[test]
+fn t046_37_historical_master_moves_to_target_slot_and_old_slot_stays() {
+    use crate::desktop_vault::{decode_stored, frame_stored};
+    use crate::os_secret_store::{OsSecretStore, OsSecretStoreError};
+    use openbot_domain::vault::{
+        DesktopVaultCanaryBinding, DesktopVaultCanaryEnvelope, KeyVersion, Nonce, SecretBytes,
+        open_desktop_vault_canary, seal_desktop_vault_canary,
+    };
+    let installation = "ab".repeat(32);
+    let old_account = format!("desktop-vault-master-v1-{installation}");
+    let new_account = format!("desktop-vault-master-v1-{installation}-r-{}", "cd".repeat(16));
+    let historical = SecretBytes::new(vec![0x5a; 32]);
+    let canary_binding = || DesktopVaultCanaryBinding::new("11".repeat(16), "dep", "ten", "33".repeat(16), KeyVersion::new(1)).unwrap();
+    // A fixture ciphertext sealed under the historical master.
+    let sealed = seal_desktop_vault_canary(&historical, &canary_binding(), Nonce::from_slice(&[7; 12]).unwrap())
+        .unwrap()
+        .to_column_value();
+    let store = SlotMemoryStore::default();
+    let original = frame_stored(&historical);
+    store.write(VAULT_KEY_STORE_SERVICE, &old_account, original.expose()).unwrap();
+
+    // The old slot is read by the original read path and decoded by the
+    // original codec; the target slot gets the original frame by the original write.
+    let old = decode_stored(store.read(VAULT_KEY_STORE_SERVICE, &old_account).unwrap().unwrap()).unwrap();
+    let moved = frame_stored(old.secret_bytes());
+    store.write(VAULT_KEY_STORE_SERVICE, &new_account, moved.expose()).unwrap();
+    let readback = store.read_bounded(VAULT_KEY_STORE_SERVICE, &new_account, 33).unwrap().expect("target slot written");
+    assert!(readback.ct_eq(&moved), "target slot reads back the exact frame");
+    let master = decode_stored(readback).unwrap();
+    open_desktop_vault_canary(master.secret_bytes(), &canary_binding(), &DesktopVaultCanaryEnvelope::parse(&sealed).unwrap())
+        .expect("the moved historical master opens the fixture ciphertext");
+    assert!(open_desktop_vault_canary(&SecretBytes::new(vec![0x5b; 32]), &canary_binding(), &DesktopVaultCanaryEnvelope::parse(&sealed).unwrap()).is_err());
+    assert_eq!(store.raw(VAULT_KEY_STORE_SERVICE, &old_account).as_deref(), Some(original.expose()), "old slot bytes unchanged");
+
+    // The bounded read refuses a value longer than the slot frame.
+    store.write(VAULT_KEY_STORE_SERVICE, "oversized", &[1; 34]).unwrap();
+    assert!(matches!(store.read_bounded(VAULT_KEY_STORE_SERVICE, "oversized", 33), Err(OsSecretStoreError::Unknown)));
+    assert!(matches!(store.read_bounded(VAULT_KEY_STORE_SERVICE, &new_account, 32), Err(OsSecretStoreError::Unknown)));
+    assert!(matches!(store.read_bounded(VAULT_KEY_STORE_SERVICE, "absent", 33), Ok(None)));
+}
+
+/// An administrator connection to a candidate's own UDS with one password.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+async fn candidate_admin(
+    socket: &std::path::Path,
+    password: &[u8],
+) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host_path(socket)
+        .port(5432)
+        .user("desktop_admin")
+        .dbname(openbot_infra::db::desktop_local::APPLICATION_DATABASE)
+        .password(password);
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+    tokio::spawn(connection);
+    Ok(client)
+}
+
+#[tokio::test]
+#[ignore = "explicit task CAR plus BIN SBX: real staging, /usr/bin/sandbox-exec and OPENBOT_TEST_POSTGRES_BIN_DIR PostgreSQL 17.11"]
+async fn t046_38_scram_rotation_acknowledges_new_password_and_rejects_old() {
+    use super::candidate::CandidateGeneration;
+    use openbot_infra::backup::whole_pg_restore_stream::{
+        RestoredClosedHistoryRequest, verify_whole_pg_restore_input,
+    };
+    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+    let (bundle_root, digest) = crate::postgres_sidecar::materialize_host_postgres_bundle(&bin_dir);
+    let bundle = crate::postgres_sidecar::VerifiedPostgresBundle::open(
+        &bundle_root,
+        digest,
+        &crate::postgres_sidecar::signing_identity(),
+    )
+    .unwrap();
+    let crate_dir = std::env::current_dir().unwrap();
+    let invalid_password = |error: tokio_postgres::Error| {
+        error.code() == Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD)
+    };
+    for unknown in [false, true] {
+        let short = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            ".wb046-{}",
+            &uuid::Uuid::now_v7().simple().to_string()[20..]
+        ));
+        DirBuilder::new().mode(0o700).create(&short).unwrap();
+        std::env::set_current_dir(&short).unwrap();
+        let fixture = EntryFixture::with_open_file_limit(4096);
+        std::env::set_current_dir(&crate_dir).unwrap();
+        s23_car_request(&fixture);
+        let mut request: Value = serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+        // The bind pays the oracle trees once, each candidate SQL stage its
+        // layout and history observations; every transaction its own lease.
+        for (field, value) in [
+            ("maxMetadataBytes", 256u64 << 20), ("maxPgConnections", 64), ("maxPgTransactions", 63),
+            ("maxPgRows", 1 << 20), ("maxReconfirmRequirements", 4096), ("maxJournalRecords", 128),
+            ("maxNativeTasks", 32),
+        ] {
+            request["profile"]["capacity"][field] = json!(value);
+        }
+        let profile: RestoreOperationProfile = serde_json::from_value(request["profile"].clone()).unwrap();
+        fixture.write_request(&request);
+        let VerifiedRestoreEntry { mut control, intent, original: _original } =
+            fixture.entry().expect("original verified release/OS/request");
+        let mut session = control.claim_restore(intent, profile).expect("actual same-session claim");
+        let operation = session.operation_id().to_owned();
+        let (input, intent) = session.frozen_input().expect("one actual held source transfer");
+        let staging = verify_whole_pg_restore_input(input, intent, &mut session)
+            .await
+            .unwrap_or_else(|failure| panic!("actual source authentication failed: {:?}", failure.fault()));
+        let target = staging.candidate_plan().target_installation_id().to_owned();
+        let mut candidate = CandidateGeneration::new(staging);
+        candidate.prepare_directories(&mut session).expect("directories and Isolation intent");
+        candidate.prepare_postgres(&mut session).expect("staging copies and closed configuration");
+        candidate.start_postgres(&mut session, &bundle).expect("sandboxed candidate started");
+        candidate.bind_postgres(&mut session, &bundle).await.expect("candidate bound");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(110);
+        session.upgrade_candidate_schema_before(deadline).await.expect("schema at the latest layout");
+        session.retire_cohort_before(deadline).await.expect("cohort retired and sealed");
+        session
+            .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline))
+            .await
+            .expect("closed history ACK2");
+        let store = SlotMemoryStore::default();
+        candidate.install_target_slots(&mut session, &store).expect("both target slots matched");
+        let socket = candidate.socket_directory().expect("held UDS").1.to_owned();
+        let old = candidate.staging().authenticated_secrets().postgres_scram().expose().to_vec();
+        let new = store
+            .raw(POSTGRES_KEY_STORE_SERVICE, &format!("postgresql-17-{target}-r-{operation}"))
+            .expect("new SCRAM in its target slot");
+        let journal = fixture.root.join("com.acosmi.wrokbot.restore-control");
+        if unknown {
+            // An uncommitted ALTER of the same role holds its catalog row; the
+            // rotation's own ALTER waits on it until a third connection ends
+            // that backend, so its outcome is never acknowledged.
+            let blocker = candidate_admin(&socket, &old).await.unwrap();
+            blocker
+                .batch_execute("BEGIN; ALTER ROLE desktop_admin PASSWORD 'blocker-held-change'")
+                .await
+                .unwrap();
+            let killer = candidate_admin(&socket, &old).await.unwrap();
+            let killing = tokio::spawn(async move {
+                loop {
+                    let ended: i64 = killer
+                        .query_one(
+                            "SELECT count(pg_catalog.pg_terminate_backend(pid)) FROM pg_catalog.pg_stat_activity WHERE application_name='wrokbot_restore_candidate' AND wait_event_type='Lock'",
+                            &[],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    if ended > 0 {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+            let rotated = candidate.rotate_candidate_scram(&mut session, deadline).await;
+            killing.await.unwrap();
+            assert!(rotated.is_err(), "an ALTER without its ACK is not acknowledged");
+            blocker.batch_execute("ROLLBACK").await.unwrap();
+            let records = local_journal(&journal, &operation);
+            let intents = records.iter().filter(|record| record.to_string().contains("restore_scram_change")).count();
+            assert!(candidate.rotate_candidate_scram(&mut session, deadline).await.is_err());
+            let again = local_journal(&journal, &operation);
+            assert_eq!(
+                again.iter().filter(|record| record.to_string().contains("restore_scram_change")).count(),
+                intents,
+                "no second SCRAM change is started"
+            );
+            // Nothing changed the role: the old password still authenticates.
+            candidate_admin(&socket, &old).await.expect("old password unchanged");
+            assert!(candidate_admin(&socket, &new).await.err().is_some_and(invalid_password));
+        } else {
+            candidate.rotate_candidate_scram(&mut session, deadline).await.expect("timely COMMIT ACK and both proofs");
+            let records = local_journal(&journal, &operation);
+            let intent = records
+                .iter()
+                .position(|record| record.to_string().contains("restore_scram_change"))
+                .expect("ScramChange intent");
+            let observed = records[intent + 1].to_string();
+            assert!(observed.contains("PgCommit") && observed.contains("TimelyAck"), "ALTER COMMIT acknowledged in time");
+            candidate_admin(&socket, &new).await.expect("new password authenticates");
+            assert!(candidate_admin(&socket, &old).await.err().is_some_and(invalid_password), "old password refused with 28P01");
+            candidate
+                .verify_target_installation(&mut session, deadline)
+                .await
+                .expect("identity, layout, sealed operation and canary under the new slot keys");
+            assert!(candidate.rotate_candidate_scram(&mut session, deadline).await.is_err(), "the change is acknowledged once");
+            candidate_admin(&socket, &new).await.expect("still the new password");
+        }
+        if let Some(pid) = candidate.original_program().and_then(|program| program.original_child().id()) {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(pid as i32).unwrap(),
+                rustix::process::Signal::INT,
+            );
+        }
+        let mut owned = Some(session);
+        candidate.begin_wait(&mut owned).expect("original wait owns the same Child");
+        let _reaped = tokio::time::timeout(std::time::Duration::from_secs(40), candidate.observe_wait())
+            .await
+            .expect("same Child reaped")
+            .is_ok();
         drop(candidate);
         drop(fixture);
         let _ = fs::remove_dir_all(&short);

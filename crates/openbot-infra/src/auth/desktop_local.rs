@@ -490,6 +490,123 @@ impl DesktopLocalInstallation {
     }
 }
 
+/// Facts of a restored installation read back on the bound candidate with the
+/// new target-slot key: private IDs, the generation's PostgreSQL directory and
+/// tuple (spec revision R484 ¶8022). It carries no authority and is never an
+/// AuthContext source; it only feeds the same restore owner's publication.
+pub struct VerifiedRestoreInstallationBinding {
+    instance_id: String,
+    deployment_id: String,
+    tenant_id: String,
+    dataset_id: String,
+    sidecar_data_dir: PathBuf,
+    pg_system_id: u64,
+    database_oid: u32,
+}
+
+impl core::fmt::Debug for VerifiedRestoreInstallationBinding {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("VerifiedRestoreInstallationBinding(<restored facts>)")
+    }
+}
+
+impl VerifiedRestoreInstallationBinding {
+    /// Only the restore owner's installation readback forms these facts.
+    pub(crate) fn from_readback(
+        [instance_id, deployment_id, tenant_id, dataset_id]: [String; 4],
+        sidecar_data_dir: PathBuf,
+        pg_system_id: u64,
+        database_oid: u32,
+    ) -> Self {
+        Self {
+            instance_id,
+            deployment_id,
+            tenant_id,
+            dataset_id,
+            sidecar_data_dir,
+            pg_system_id,
+            database_oid,
+        }
+    }
+
+    pub(crate) fn ids(&self) -> [&str; 4] {
+        [
+            &self.instance_id,
+            &self.deployment_id,
+            &self.tenant_id,
+            &self.dataset_id,
+        ]
+    }
+
+    pub(crate) fn postgres(&self) -> (u64, u32) {
+        (self.pg_system_id, self.database_oid)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.instance_id.capacity()
+            + self.deployment_id.capacity()
+            + self.tenant_id.capacity()
+            + self.dataset_id.capacity()
+            + self.sidecar_data_dir.capacity()
+    }
+}
+
+/// The same restored facts after the Current descriptor's publication was
+/// observed and read back and the Local subject confirmation gate succeeded
+/// (spec revision R484 ¶8024). Only that startup producer forms it.
+pub struct VerifiedCurrentRestoreInstallationBinding {
+    restored: VerifiedRestoreInstallationBinding,
+}
+
+impl VerifiedCurrentRestoreInstallationBinding {
+    /// The startup producer's single constructor, after its own Current and
+    /// subject checks; it does not repeat or replace them. That producer is
+    /// the restored Local startup route, which lands with the next batch.
+    #[allow(dead_code)]
+    pub(crate) fn after_current_gate(restored: VerifiedRestoreInstallationBinding) -> Self {
+        Self { restored }
+    }
+}
+
+impl DesktopLocalInstallation {
+    /// The restored installation keeps its business IDs and uses the selected
+    /// generation's PostgreSQL directory; ordinary Fresh/Existing are unchanged
+    /// and no dataset can be overridden here (spec revision R484 ¶8024).
+    pub fn from_verified_current_restore(
+        binding: VerifiedCurrentRestoreInstallationBinding,
+    ) -> Result<Self, DesktopLocalAuthorityError> {
+        let restored = binding.restored;
+        let metadata = fs::symlink_metadata(&restored.sidecar_data_dir)
+            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(DesktopLocalAuthorityError::SidecarPermissionsInsecure);
+            }
+        }
+        let auth = AuthContextBuilder::from_verified_session(
+            DeploymentId::new(restored.deployment_id),
+            TenantId::new(restored.tenant_id),
+            ActorId::new(DESKTOP_LOCAL_ACTOR_ID),
+            AuthGeneration::new(0),
+            true,
+        )
+        .with_roles([Role::Admin, Role::User])
+        .build();
+        Ok(Self {
+            authority: DesktopLocalAuthority {
+                instance_id: Arc::from(restored.instance_id),
+                auth,
+            },
+            sidecar_data_dir: restored.sidecar_data_dir,
+        })
+    }
+}
+
 /// Mechanical result of the pre-window Desktop Local database bootstrap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopLocalBootstrapReport {

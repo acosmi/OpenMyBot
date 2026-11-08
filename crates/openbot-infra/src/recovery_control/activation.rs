@@ -437,6 +437,39 @@ impl ActivationBinding {
         }
     }
 
+    /// The restored Local site of one restore operation: its generation and
+    /// actual PostgreSQL tuple, the restored business IDs, the operation's
+    /// epoch and its two target-slot key references (spec revision R484 ¶8134).
+    pub(super) fn restored(
+        [dataset_id, deployment_id, tenant_id, source_installation_id, target_installation_id]: [String; 5],
+        generation_id: String,
+        generation_root: RecoveryFileIdentity,
+        (pg_system_id, database_oid): (u64, u32),
+        (native_version, migration_digest): (u32, String),
+        authorization_epoch: String,
+        master: KeyReference,
+        postgres: KeyReference,
+    ) -> Self {
+        Self {
+            site: ActivationSiteBinding::LocalPhysical {
+                dataset_id,
+                deployment_id,
+                tenant_id,
+                source_installation_id,
+                target_installation_id,
+                generation_id,
+                generation_root,
+                pg_system_id,
+                database_oid,
+                pg_major: 17,
+                native_version,
+                migration_digest,
+                authorization_epoch,
+                key_refs: vec![master, postgres],
+            },
+        }
+    }
+
     /// Server binding of a sealed ordinary operation: keyRefs[0] is the KEK
     /// canary key, keyRefs[1] the database principal (spec 7920, 8335).
     #[allow(clippy::too_many_arguments)]
@@ -853,11 +886,11 @@ pub(super) struct Pending {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Switched {
-    operation_id: String,
-    epoch: String,
-    profile_digest: String,
+    pub(super) operation_id: String,
+    pub(super) epoch: String,
+    pub(super) profile_digest: String,
     pub(super) binding: ActivationBinding,
-    closure_evidence: Vec<JournalReference>,
+    pub(super) closure_evidence: Vec<JournalReference>,
     pub(super) publish_intent: JournalPositionRef,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -865,7 +898,7 @@ pub(super) struct Switched {
 pub(super) struct Current {
     pub(super) operation_id: String,
     pub(super) epoch: String,
-    profile_digest: String,
+    pub(super) profile_digest: String,
     pub(super) binding: ActivationBinding,
     pub(super) closure_evidence: Vec<JournalReference>,
     pub(super) switch_readback: JournalReference,

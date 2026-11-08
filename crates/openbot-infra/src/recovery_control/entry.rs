@@ -1584,7 +1584,7 @@ struct RestoreOperationOwner {
     pending: Option<OwnedRecord>,
     pending_stage: Option<super::activation::JournalReference>,
     pending_closing: Option<RestoreClosingAllowance>,
-    confirmed_stages: Vec<super::activation::JournalReference>,
+    confirmed_stages: Vec<(super::RestoreStage, super::activation::JournalReference)>,
     candidate_plan: super::activation::CandidatePlan,
     candidate_plan_output: Option<OwnedRestoreCandidatePlan>,
 }
@@ -1664,7 +1664,7 @@ pub enum RestoreTargetSlotOutcome {
     ReadbackUnknown,
 }
 #[derive(Clone, Copy)]
-enum TargetSlotKind { Master, Scram }
+pub(crate) enum TargetSlotKind { Master, Scram }
 impl TargetSlotKind {
     fn index(self) -> usize { match self { Self::Master => 0, Self::Scram => 1 } }
     fn prefix(self) -> &'static str { match self { Self::Master => "desktop-vault-master-v1-", Self::Scram => "postgresql-17-" } }
@@ -1674,6 +1674,7 @@ impl TargetSlotKind {
 struct RestoreTargetSlotJournal {
     intent: Option<RestoreStageIntent>,
     refs: Option<(String, String)>,
+    matched: bool,
 }
 
 pub struct OwnedRestoreCandidatePlan {
@@ -1717,6 +1718,7 @@ pub(crate) struct RestoreStages {
 
 pub(crate) struct RestoreStageIntent {
     operation: Hex32,
+    stage: super::RestoreStage,
     reference: super::activation::JournalReference,
 }
 
@@ -1862,6 +1864,7 @@ impl RestoreStages {
                 .pending_stage = Some(reference.clone());
             Ok(RestoreStageIntent {
                 operation: self.operation,
+                stage,
                 reference,
             })
         })();
@@ -1904,7 +1907,7 @@ impl RestoreStages {
                         return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
                     }
                     operation.confirmed_stages.try_reserve_exact(1).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-                    operation.confirmed_stages.push(reference);
+                    operation.confirmed_stages.push((intent.stage, reference));
                     operation.pending_stage = None;
                 }
             }
@@ -2661,6 +2664,237 @@ impl RestoreControlSession {
     }
 }
 
+/// The S23 SCRAM change, installation readback and the S24 publication
+/// (spec revision R484 ¶8012–8025 and ¶8132–8134).
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl RestoreControlSession {
+    /// Change the bound candidate's fixed administrator password to the new
+    /// SCRAM secret already read back from its target slot (¶8021).
+    pub async fn rotate_candidate_scram_before(
+        &mut self,
+        new_password: &openbot_domain::vault::SecretBytes,
+        old_password: &openbot_domain::vault::SecretBytes,
+        deadline: Instant,
+    ) -> Result<crate::backup::whole_pg_restore_stream::RestoreScramAcknowledged, RecoveryControlError> {
+        if !self.target_slots[TargetSlotKind::Scram.index()].as_ref().is_some_and(|slot| slot.matched) {
+            return self.retain_failure(Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)));
+        }
+        let Some(candidate) = self.candidate.as_mut() else {
+            return self.retain_failure(Err(service_invalid()));
+        };
+        let result = crate::backup::whole_pg_restore_stream::rotate_candidate_scram_before(
+            &mut self.stages, candidate, new_password, old_password, deadline,
+        )
+        .await;
+        self.retain_failure(result)
+    }
+
+    /// Read the installation back on a new connection with the historical
+    /// master and the new password, both from their target slots (¶8019–8022).
+    pub async fn verify_target_installation_before(
+        &mut self,
+        master: &openbot_domain::vault::SecretBytes,
+        password: &openbot_domain::vault::SecretBytes,
+        deadline: Instant,
+    ) -> Result<crate::backup::whole_pg_restore_stream::RestoreInstallationReadbacks, RecoveryControlError> {
+        if !self.target_slots[TargetSlotKind::Master.index()].as_ref().is_some_and(|slot| slot.matched) {
+            return self.retain_failure(Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)));
+        }
+        let Some(candidate) = self.candidate.as_mut() else {
+            return self.retain_failure(Err(service_invalid()));
+        };
+        let result = crate::backup::whole_pg_restore_stream::verify_target_installation_before(
+            &mut self.stages, candidate, master, password, deadline,
+        )
+        .await;
+        self.retain_failure(result)
+    }
+
+    /// Publish SwitchedPending and then RestoreCurrent once every fact of
+    /// ¶8132 is resident in this session: the bound candidate (only a verified
+    /// staging binds it outside tests) with its schema, sealed retirement and
+    /// closed-history ACK2, both target slots read back, the acknowledged SCRAM
+    /// change and installation readbacks, the candidate's own exit with its
+    /// drivers destroyed, and the final capacity check. Each descriptor is
+    /// written by the original activation writer between its PublishIntent and
+    /// PublishObserved; one whose observation is missing stays logically
+    /// Pending and is never acknowledged later (¶8134).
+    pub async fn publish_restore_current_before(
+        &mut self,
+        scram: crate::backup::whole_pg_restore_stream::RestoreScramAcknowledged,
+        readbacks: crate::backup::whole_pg_restore_stream::RestoreInstallationReadbacks,
+        exit: crate::backup::whole_pg_restore_stream::RestoreCandidateExit,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let result = async {
+            let operation_uuid = uuid::Uuid::from_bytes(super::hex_array(self.stages.operation.as_str()));
+            if scram.operation() != operation_uuid || readbacks.operation() != operation_uuid {
+                return Err(service_invalid());
+            }
+            if !self.target_slots.iter().all(|slot| slot.as_ref().is_some_and(|slot| slot.matched)) {
+                return Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven));
+            }
+            let candidate = self.candidate.as_mut().ok_or_else(service_invalid)?;
+            crate::backup::whole_pg_restore_stream::close_candidate_before(&mut self.stages, candidate, exit, deadline).await?;
+            let closing = self.stages.convergence_deadline()?;
+            self.stages.check_capacity_before(closing)?;
+            let effect = self.stages.effect_before(deadline)?;
+            let operation = self.stages.operation;
+            let mut state = lock(&self.stages.owner)?;
+            state.verify_restore_live(operation, effect)?;
+            let limits = state.limits.clone();
+            let frame_cap = limits.max_journal_frame_bytes.checked_add(44).ok_or_else(service_invalid)?;
+            // Two descriptors, each encoded, written and read back, and four
+            // journal frames with their serialization scratch; then the
+            // binding's owned strings (bounded by the host ID limit).
+            let fee = limits.max_activation_bytes.checked_mul(8)
+                .and_then(|n| n.checked_add(frame_cap.checked_mul(64)?))
+                .and_then(|n| n.checked_add(limits.max_id_bytes.checked_mul(32)?))
+                .and_then(|n| n.checked_add(4 * std::mem::size_of::<super::activation::ActivationRecord>() as u64))
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            state.prepay(fee, 0)?;
+            {
+                let ledger = &mut state.restore_operation.as_mut().ok_or_else(service_invalid)?.ledger;
+                ledger.admit(super::RestoreCapacityResource::JournalBytes, frame_cap.checked_mul(4).ok_or_else(service_invalid)?)?;
+                ledger.admit(super::RestoreCapacityResource::JournalRecords, 4)?;
+            }
+            // The selected generation root is observed under the held trusted
+            // parent; its identity, never a path, enters the binding.
+            let component = state.restore_operation.as_ref().ok_or_else(service_invalid)?.candidate_plan.entry_component.clone();
+            state.reserve_io(0)?;
+            state.raw.named = Some(rustix::fs::statat(
+                &state.restore_selections[2].as_ref().and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.file,
+                component.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
+            state.post(effect)?;
+            let root = match state.raw.named.as_ref() {
+                Some(Ok(stat)) if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() => RecoveryFileIdentity {
+                    device: stat.st_dev as u64,
+                    inode: stat.st_ino as u64,
+                    uid: stat.st_uid,
+                },
+                _ => return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
+            };
+            let owner = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let expected = &owner.intent.decoded.expected;
+            let restored = readbacks.binding();
+            let [target, deployment, tenant, dataset] = restored.ids();
+            if root.uid != owner.intent.control_root.uid
+                || target != expected.target_installation_id.as_str()
+                || deployment != expected.deployment_id
+                || tenant != expected.tenant_id
+                || dataset != expected.dataset_id.as_str()
+            {
+                return Err(service_invalid());
+            }
+            let key = |index: usize, kind: TargetSlotKind, key_id: String| super::activation::KeyReference {
+                kind: match kind {
+                    TargetSlotKind::Master => super::activation::KeyKind::HistoricalMaster,
+                    TargetSlotKind::Scram => super::activation::KeyKind::PostgresScram,
+                },
+                reviewed_service: owner.intent.host.services[index].clone(),
+                account: format!("{}{target}-r-{}", kind.prefix(), operation.as_str()),
+                key_id,
+                key_version: 1,
+                target_installation_id: target.to_owned(),
+                operation_id: operation.as_str().to_owned(),
+            };
+            let postgres_account = format!("{}{target}-r-{}", TargetSlotKind::Scram.prefix(), operation.as_str());
+            let (native_version, migration_digest) = readbacks.schema();
+            let binding = super::activation::ActivationBinding::restored(
+                [dataset, deployment, tenant, expected.source_installation_id.as_str(), target].map(str::to_owned),
+                owner.candidate_plan.generation_id.clone(),
+                root,
+                restored.postgres(),
+                (native_version, migration_digest.to_owned()),
+                owner.epoch.as_str().to_owned(),
+                key(0, TargetSlotKind::Master, readbacks.key_id().to_owned()),
+                key(1, TargetSlotKind::Scram, postgres_account),
+            );
+            binding.validate(&limits)?;
+            // The closure evidence names the confirmed stage of each fact class
+            // (the last one of a repeated class) and both target slots.
+            let evidence: Vec<super::activation::JournalReference> = {
+                use super::RestoreStage as S;
+                let confirmed = &owner.confirmed_stages;
+                [S::Import, S::Isolation, S::PgUpgrade, S::Retire, S::HqAck2, S::ScramChange, S::ResourceClose]
+                    .into_iter()
+                    .filter_map(|stage| confirmed.iter().rev().find(|(kind, _)| *kind == stage))
+                    .chain(confirmed.iter().filter(|(kind, _)| *kind == S::KeySlot))
+                    .map(|(_, reference)| reference.clone())
+                    .collect()
+            };
+            let pending = owner.pending.as_ref().ok_or_else(service_invalid)?;
+            let raw = pending.bytes.clone();
+            state.prepay(super::activation::read_metadata_reservation(&raw)?, 0)?;
+            let prior = super::activation::observe(&raw, &limits)?;
+            let super::activation::ActivationPayload::Pending(pending) = prior.record.data() else {
+                return Err(service_invalid());
+            };
+            if pending.operation_id != operation.as_str() {
+                return Err(service_invalid());
+            }
+            let (profile_digest, epoch) = (pending.profile_digest.clone(), pending.epoch.clone());
+            let switched = super::activation::Switched {
+                operation_id: operation.as_str().to_owned(),
+                epoch: epoch.clone(),
+                profile_digest: profile_digest.clone(),
+                binding: binding.clone(),
+                closure_evidence: evidence.clone(),
+                publish_intent: super::activation::JournalPositionRef { context_id: operation, sequence: state.next_journal_sequence()? },
+            };
+            let (switched, readback) = publish_restore_head(
+                &mut state, operation, (&prior.record, &prior.digest),
+                super::ActivationPhase::SwitchedPending,
+                super::activation::ActivationPayload::Switched(switched), effect,
+            )?;
+            let current = super::activation::Current {
+                operation_id: operation.as_str().to_owned(),
+                epoch,
+                profile_digest,
+                binding,
+                closure_evidence: evidence,
+                switch_readback: readback,
+                publish_intent: super::activation::JournalPositionRef { context_id: operation, sequence: state.next_journal_sequence()? },
+            };
+            publish_restore_head(
+                &mut state, operation, (&switched.0, &switched.1),
+                super::ActivationPhase::RestoreCurrent,
+                super::activation::ActivationPayload::Current(current), effect,
+            )?;
+            state.observe_restore_capacity(effect)
+        }
+        .await;
+        self.retain_failure(result)
+    }
+}
+
+/// PublishIntent → the original activation writer → PublishObserved, in the
+/// open restore operation's journal. A failed write or observation leaves the
+/// intent without a PublishObserved, so no reader treats the head as published.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+fn publish_restore_head(
+    state: &mut ControlFiles,
+    operation: Hex32,
+    (prior, prior_digest): (&super::activation::ActivationRecord, &str),
+    phase: super::ActivationPhase,
+    data: super::activation::ActivationPayload,
+    effect: Instant,
+) -> Result<((super::activation::ActivationRecord, String), super::activation::JournalReference), RecoveryControlError> {
+    let next = prior.successor(prior_digest, phase, data)?;
+    let (_, digest) = next.encoded()?;
+    let intent = state.append_journal(&operation, &super::journal::JournalData::publish_intent(phase, &digest), effect)?;
+    let published = state.publish_activation(&next, effect)?;
+    let observed = state.append_journal(
+        &operation,
+        &super::journal::JournalData::publish_observed(intent.sequence, &digest, published.identity),
+        effect,
+    )?;
+    state.restore_operation.as_mut().ok_or_else(service_invalid)?.pending = Some(published);
+    Ok(((next, digest), observed))
+}
+
 impl Drop for RestoreControlSession {
     fn drop(&mut self) {
         let Some(candidate) = self.candidate.take() else {
@@ -2685,11 +2919,6 @@ impl RestoreControlSession {
     pub fn check_restore_slot_effect_before(&mut self, deadline: Instant) -> Result<Instant, RecoveryControlError> { self.stages.effect_before(deadline) }
     /// Original C for observing already-entered native results, without renewal.
     pub fn restore_slot_convergence_deadline(&self) -> Result<Instant, RecoveryControlError> { self.stages.convergence_deadline() }
-    /// Remaining original secret-memory credit, after the same E/owner check.
-    pub fn restore_slot_secret_capacity_before(&mut self, deadline: Instant) -> Result<u64, RecoveryControlError> {
-        self.stages.effect_before(deadline)?;
-        self.stages.capacity_available(super::RestoreCapacityResource::SecretMemoryBytes)
-    }
     /// Record the master's native result against its fixed intent/refs (matched33B).
     pub fn observe_restore_master_slot_before(&mut self, outcome: RestoreTargetSlotOutcome, deadline: Instant) -> Result<(), RecoveryControlError> { self.observe_target_slot_before(outcome, deadline, TargetSlotKind::Master) }
     /// Record the SCRAM native result against its fixed intent/refs (matched64B).
@@ -2705,7 +2934,11 @@ impl RestoreControlSession {
             RestoreTargetSlotOutcome::WriteUnknown => super::RestoreDisposition::OsStoreWriteUnknown { intent_ref, service_ref, account_ref },
             RestoreTargetSlotOutcome::ReadbackUnknown => super::RestoreDisposition::OsStoreReadbackUnknown { intent_ref, service_ref, account_ref },
         };
-        self.stages.observe_stage_before(intent, disposition, closing)
+        // Only a matched readback confirms the stage; it is the slot fact
+        // the SCRAM change and the publication require.
+        self.stages.observe_stage_before(intent, disposition, closing)?;
+        self.target_slots[kind.index()].as_mut().ok_or_else(service_invalid)?.matched = true;
+        Ok(())
     }
 
     /// Fixed historical-master service/account DATA and original E.
@@ -2716,6 +2949,24 @@ impl RestoreControlSession {
     pub fn begin_restore_scram_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant) -> Result<(String, String, Instant), RecoveryControlError> { self.begin_target_slot_before(staging, deadline, TargetSlotKind::Scram) }
     #[cfg(feature = "server-runtime")]
     fn begin_target_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant, kind: TargetSlotKind) -> Result<(String, String, Instant), RecoveryControlError> {
+        let matches = (|| {
+            let state = lock(&self.stages.owner)?;
+            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let plan = staging.candidate_plan();
+            if plan.operation_id() != self.operation_id() || plan.generation_id() != operation.candidate_plan.generation_id
+                || plan.target_installation_id() != operation.intent.decoded.expected.target_installation_id.as_str() { return Err(service_invalid()); }
+            Ok(())
+        })();
+        if let Err(error) = matches {
+            return self.retain_failure(Err(error));
+        }
+        self.begin_target_slot_from_session_before(deadline, kind)
+    }
+
+    /// The same slot intent from this session's own claimed plan. The
+    /// production entries above first match the verified staging to it.
+    #[cfg(feature = "server-runtime")]
+    pub(crate) fn begin_target_slot_from_session_before(&mut self, deadline: Instant, kind: TargetSlotKind) -> Result<(String, String, Instant), RecoveryControlError> {
         let result = (|| {
             let index = kind.index();
             if self.target_slots[index].is_some() { return Err(service_invalid()); }
@@ -2723,14 +2974,11 @@ impl RestoreControlSession {
             {
                 let state = lock(&self.stages.owner)?;
                 let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
-                let plan = staging.candidate_plan();
-                if plan.operation_id() != self.operation_id() || plan.generation_id() != operation.candidate_plan.generation_id
-                    || plan.target_installation_id() != operation.intent.decoded.expected.target_installation_id.as_str() { return Err(service_invalid()); }
                 super::id(&operation.intent.host.services[index], state.limits.max_id_bytes)?;
                 if (kind.prefix().len() + 64 + 3 + 32) as u64 > state.limits.max_id_bytes { return Err(service_invalid()); }
             }
             let intent = self.stages.begin_stage_before(super::RestoreStage::KeySlot, kind.effect_id(), effect)?;
-            self.target_slots[index] = Some(RestoreTargetSlotJournal { intent: Some(intent), refs: None });
+            self.target_slots[index] = Some(RestoreTargetSlotJournal { intent: Some(intent), refs: None, matched: false });
             let mut state = lock(&self.stages.owner)?;
             let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
             let service_len = operation.intent.host.services[index].len();

@@ -374,3 +374,80 @@ async fn lock_binding(
     row.map(|_| ())
         .ok_or(UserCredentialSelectionError::Conflict)
 }
+
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod tests {
+    use super::{PluginUserCredentialStore, UserCredentialSelectionError};
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use crate::vault::CredentialRecordVault;
+    use openbot_contracts::ids::{ActorId, TenantId};
+    use openbot_domain::vault::{
+        KeyVersion, SecretBytes, SecretKind, SecretPrincipal, ServiceId, WrappingKey,
+    };
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    const SERVER: &str = "restored-drive";
+
+    /// T046-32 on a published RestoreCurrent: a worker lease borrowed while
+    /// the runtime owner lived is rechecked before each durable claim and send
+    /// admission, so neither commits once that owner is dropped.
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_32_dropped_runtime_owner_closes_refresh_claim_and_admit() {
+        let restored = RestoreCurrentFixture::publish().await;
+        let vault = CredentialRecordVault::single_key(TenantId::new("ten"), KeyVersion::new(1), WrappingKey::from_bytes(vec![0x42; 32]).unwrap());
+        let client = restored.pool.get().await.unwrap();
+        client.batch_execute("INSERT INTO public.mcp_servers(id,title,vendor,url,provenance)
+            VALUES('restored-drive','Restored Drive','Google','https://www.googleapis.com/drive/v3','first-party');").await.unwrap();
+        let oauth_client = Uuid::now_v7();
+        let sealed = vault.seal(&oauth_client, SecretKind::McpOauthClient, SecretPrincipal::Deployment, SecretPrincipal::Service(ServiceId::new(SERVER)),
+            &SecretBytes::new(br#"{"clientId":"client-id","clientSecret":"client-secret"}"#.to_vec())).unwrap();
+        client.execute("INSERT INTO public.credentials(id,kind,provider,encrypted_value,key_id,metadata) VALUES($1,'mcp_oauth_client',$2,$3,'oauth-client','{}')",
+            &[&oauth_client, &SERVER, &sealed]).await.unwrap();
+        client.execute("UPDATE public.mcp_servers SET credential_id=$2 WHERE id=$1", &[&SERVER, &oauth_client]).await.unwrap();
+        let mut tokens = Vec::new();
+        for actor in ["alice", "bob", "carol"] {
+            client.execute("INSERT INTO public.users(id,email,auth_generation) VALUES($1,$1||'@restored.example.test',0)", &[&actor]).await.unwrap();
+            client.execute("INSERT INTO public.user_roles(user_id,role) VALUES($1,'user')", &[&actor]).await.unwrap();
+            let token = Uuid::now_v7();
+            let sealed = vault.seal(&token, SecretKind::McpUserToken, SecretPrincipal::Actor(ActorId::new(actor)), SecretPrincipal::Service(ServiceId::new(SERVER)),
+                &SecretBytes::new(format!("refresh-token-for-{actor}").into_bytes())).unwrap();
+            client.execute("INSERT INTO public.credentials(id,kind,provider,encrypted_value,key_id,metadata) VALUES($1,'mcp_user_token',$2,$3,$4,'{}')",
+                &[&token, &SERVER, &sealed, &actor]).await.unwrap();
+            client.execute("INSERT INTO public.mcp_user_credentials(server_id,user_id,credential_id,scope) VALUES($1,$2,$3,'https://www.googleapis.com/auth/drive.readonly')",
+                &[&SERVER, &actor, &token]).await.unwrap();
+            tokens.push(token);
+        }
+        let store = PluginUserCredentialStore::new(restored.pool.clone(), vault, restored.read_gate())
+            .with_rotation_audit_key(vec![0x5a; 32])
+            .unwrap();
+        let gate = restored.read_gate();
+        let lease = gate.borrow_worker_before(Instant::now() + Duration::from_secs(60)).await.unwrap();
+        assert_eq!(lease.restore_cohort(), Some(restored.cohort));
+        let mut prepared = Vec::new();
+        for actor in ["alice", "bob", "carol"] {
+            prepared.push(store.prepare_admitted(SERVER, &ActorId::new(actor), &lease).await.unwrap());
+        }
+
+        // Positive control under the live owner: claim and send admission commit.
+        let alice = store.claim_refresh(&prepared[0], &lease).await.unwrap();
+        store.admit_refresh(&prepared[0], &alice, &lease).await.unwrap();
+        let bob = store.claim_refresh(&prepared[1], &lease).await.unwrap();
+
+        drop(restored.runtime);
+        assert!(matches!(store.admit_refresh(&prepared[1], &bob, &lease).await, Err(UserCredentialSelectionError::Unavailable)));
+        assert!(matches!(store.claim_refresh(&prepared[2], &lease).await, Err(UserCredentialSelectionError::Unavailable)));
+        let rows = |credential: Uuid| {
+            let client = &client;
+            async move {
+                client.query_one("SELECT count(*)::bigint,count(admitted_at)::bigint FROM public.oauth_refresh_operations WHERE credential_id=$1", &[&credential])
+                    .await.unwrap()
+            }
+        };
+        let (alice_rows, bob_rows, carol_rows) = (rows(tokens[0]).await, rows(tokens[1]).await, rows(tokens[2]).await);
+        assert_eq!((alice_rows.get::<_, i64>(0), alice_rows.get::<_, i64>(1)), (1, 1));
+        assert_eq!((bob_rows.get::<_, i64>(0), bob_rows.get::<_, i64>(1)), (1, 0), "send admitted after the owner dropped");
+        assert_eq!(carol_rows.get::<_, i64>(0), 0, "claim committed after the owner dropped");
+    }
+}

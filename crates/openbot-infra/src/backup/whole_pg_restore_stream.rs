@@ -12,7 +12,9 @@ use crate::recovery_control::{RecoveryControlError, RestoreStages};
 pub use candidate_sql::{RestoreClosedHistoryObservation, RestoredClosedHistoryRequest};
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) use candidate_sql::{
-    bind_candidate_before, retire_cohort_before, upgrade_candidate_schema_before,
+    bind_candidate_before, close_candidate_before, retire_cohort_before,
+    rotate_candidate_scram_before, upgrade_candidate_schema_before,
+    verify_target_installation_before,
 };
 
 /// The same operation's expected candidate identity. The session fills it
@@ -60,6 +62,10 @@ pub(crate) struct PendingRestoreCandidateAuthority {
     #[allow(dead_code)]
     data_directory: File,
     data_path: PathBuf,
+    // The runner's startup evidence of the bound Child, checked at bind; its
+    // exit observation must name the same pid and birth.
+    startup: [u8; 32],
+    socket_path: PathBuf,
     pool: DatabasePool,
     original_client: Option<GuardedClient>,
     binding: RestoreCandidateBinding,
@@ -93,6 +99,63 @@ impl CandidateProgramIdentity {
             data_path,
         }
     }
+}
+
+/// One timely COMMIT of the single bounded `ALTER ROLE` frame on the bound
+/// candidate, then a new connection authenticated by the new password and the
+/// old password refused with SQLSTATE 28P01 (spec revision R484 ¶8021).
+/// Handed out once; only the same session's publication consumes it.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub struct RestoreScramAcknowledged {
+    operation: uuid::Uuid,
+}
+
+/// PostgreSQL identity, business IDs, sealed operation and Vault canary read
+/// back on a new connection with the new target-slot keys (spec revision R484
+/// ¶8019–8022). Only the same session's publication consumes it.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub struct RestoreInstallationReadbacks {
+    operation: uuid::Uuid,
+    binding: crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
+    native_version: u32,
+    migration_digest: String,
+    key_id: String,
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl RestoreInstallationReadbacks {
+    pub(crate) fn operation(&self) -> uuid::Uuid {
+        self.operation
+    }
+    pub(crate) fn binding(
+        &self,
+    ) -> &crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding {
+        &self.binding
+    }
+    pub(crate) fn schema(&self) -> (u32, &str) {
+        (self.native_version, &self.migration_digest)
+    }
+    pub(crate) fn key_id(&self) -> &str {
+        &self.key_id
+    }
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl RestoreScramAcknowledged {
+    pub(crate) fn operation(&self) -> uuid::Uuid {
+        self.operation
+    }
+}
+
+/// The bound candidate Child's own reaped exit, as its Desktop owner observed
+/// it. This is DATA; the session compares it with the bind-time evidence.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub struct RestoreCandidateExit {
+    pub pid: u32,
+    pub start: crate::recovery_control::ProcessStart,
+    pub exit: crate::recovery_control::NativeExit,
+    pub observed_ns: u64,
+    pub pipes: [crate::recovery_control::PipeJoin; 3],
 }
 
 #[cfg(feature = "server-runtime")]
@@ -3137,7 +3200,7 @@ pub(crate) mod candidate_sql {
 
     type QueryResult = Result<Result<Vec<Row>, tokio_postgres::Error>, Elapsed>;
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum StageResult {
         Unstarted,
         InFlight,
@@ -3367,6 +3430,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         pending_batch: Option<(i64, &'static str)>,
         readback_rows: Option<crate::recovery_control::RestoreCapacityReservation>,
         history: StageResult,
+        scram: StageResult,
         history_thread: Option<String>,
         history_operation: Option<String>,
         history_cursor: String,
@@ -3383,6 +3447,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                 pending_batch: None,
                 readback_rows: None,
                 history: StageResult::Unstarted,
+                scram: StageResult::Unstarted,
                 history_thread: None,
                 history_operation: None,
                 history_cursor: String::new(),
@@ -5113,6 +5178,385 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         Err(stages.failure(RecoveryControlFault::DatabaseUnknown))
     }
 
+    // A SCRAM password of the candidate's fixed administrator: exactly 64
+    // lowercase hexadecimal bytes, the shape the sidecar generates.
+    fn scram_text(
+        secret: &openbot_domain::vault::SecretBytes,
+    ) -> Result<&str, RecoveryControlError> {
+        std::str::from_utf8(secret.expose())
+            .ok()
+            .filter(|text| {
+                text.len() == 64
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .ok_or_else(invalid_candidate)
+    }
+
+    // One unpooled probe connection: its client, its driver task and the
+    // driver's two codec buffers (8 KiB each in tokio-postgres).
+    const PROBE_MEMORY: u64 = std::mem::size_of::<tokio_postgres::Client>() as u64
+        + std::mem::size_of::<tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>>() as u64
+        + 2 * 8192;
+
+    type Probe = (
+        tokio_postgres::Client,
+        tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+    );
+
+    // A fresh, unpooled connection to the bound candidate's own UDS. The
+    // server's answer is returned as observed; a timeout is EffectExpired and
+    // never stands for a password rejection (spec revision R484 ¶8021).
+    async fn probe_before(
+        stages: &mut RestoreStages,
+        socket: &std::path::Path,
+        password: &str,
+        deadline: Instant,
+    ) -> Result<Result<Probe, tokio_postgres::Error>, RecoveryControlError> {
+        let deadline = stages.effect_before(deadline)?;
+        let _connection = stages.admit_capacity(Capacity::PgConnections, 1)?;
+        let _driver = stages.admit_capacity(Capacity::NativeTasks, 1)?;
+        let _metadata = stages.admit_capacity(Capacity::MetadataBytes, PROBE_MEMORY)?;
+        let _allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, PROBE_MEMORY)?;
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host_path(socket)
+            .port(5432)
+            .user(openbot_contracts::desktop::DESKTOP_LOCAL_POSTGRES_ADMIN_USER)
+            .dbname(crate::db::desktop_local::APPLICATION_DATABASE)
+            .password(password)
+            .application_name("wrokbot_restore_probe");
+        let connected = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            config.connect(tokio_postgres::NoTls),
+        )
+        .await
+        .map_err(|_| stages.failure(RecoveryControlFault::EffectExpired))?;
+        stages.effect_before(deadline)?;
+        Ok(connected.map(|(client, connection)| (client, tokio::spawn(connection))))
+    }
+
+    // Terminate a probe and join its own driver before the convergence deadline.
+    async fn close_probe_before(
+        stages: &mut RestoreStages,
+        (client, driver): Probe,
+    ) -> Result<(), RecoveryControlError> {
+        let closing = stages.convergence_deadline()?;
+        drop(client);
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(closing), driver).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            _ => Err(stages.failure(RecoveryControlFault::ClosureUnproven)),
+        }
+    }
+
+    /// Change the fixed administrator password of the bound candidate with one
+    /// bounded `ALTER ROLE` frame in its own guarded transaction, then prove
+    /// the change on fresh connections: the new password authenticates and
+    /// the old one is refused with SQLSTATE 28P01 (spec revision R484 ¶8021).
+    /// It runs after the closed-history ACK2, the last candidate SQL that
+    /// still authenticates its pool with the old password. A started change
+    /// is never sent again: any later call after an unproven ACK is Unknown.
+    pub(crate) async fn rotate_candidate_scram_before(
+        stages: &mut RestoreStages,
+        candidate: &mut PendingRestoreCandidateAuthority,
+        new_password: &openbot_domain::vault::SecretBytes,
+        old_password: &openbot_domain::vault::SecretBytes,
+        deadline: Instant,
+    ) -> Result<super::RestoreScramAcknowledged, RecoveryControlError> {
+        if candidate.sql.history != StageResult::Acknowledged {
+            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+        }
+        if candidate.sql.scram != StageResult::Unstarted {
+            return Err(stages.failure(RecoveryControlFault::DatabaseUnknown));
+        }
+        let new_text = scram_text(new_password)?;
+        let old_text = scram_text(old_password)?;
+        if new_text == old_text {
+            return Err(invalid_candidate());
+        }
+        const ALTER: &str = "ALTER ROLE desktop_admin PASSWORD '";
+        let length = ALTER.len() + new_text.len() + 1;
+        // The frame and the driver's copy of it in its outgoing message.
+        let _secret = stages.admit_capacity(Capacity::SecretMemoryBytes, 2 * length as u64)?;
+        let _structure = stages.admit_capacity(
+            Capacity::SecretStructureBytes,
+            std::mem::size_of::<zeroize::Zeroizing<String>>() as u64,
+        )?;
+        let mut frame = zeroize::Zeroizing::new(String::new());
+        frame.try_reserve_exact(length).map_err(|_| {
+            stages.failure(RecoveryControlFault::CapacityExceeded)
+        })?;
+        frame.push_str(ALTER);
+        frame.push_str(new_text);
+        frame.push('\'');
+        checkout_before(stages, candidate, deadline).await?;
+        let reservation = stages.admit_capacity(Capacity::PgTransactions, 1)?;
+        candidate.sql.intent = Some(stages.begin_stage_before(
+            RestoreStage::ScramChange,
+            "restore_scram_change",
+            deadline,
+        )?);
+        let CandidateSqlState {
+            client,
+            raw,
+            intent,
+            scram,
+            ..
+        } = &mut candidate.sql;
+        let client = client
+            .as_mut()
+            .and_then(|v| v.as_mut().ok())
+            .ok_or_else(database_unknown)?;
+        let owner = match client.begin_read_committed().await {
+            Ok(owner) => {
+                raw.begin = Some(Ok(()));
+                owner
+            }
+            Err(error) => {
+                raw.begin = Some(Err(error));
+                return Err(retain_begin_failure(stages, intent, error));
+            }
+        };
+        let prepared = async {
+            let effect = stages.effect_before(deadline)?;
+            stages.settle_capacity(reservation, 1)?;
+            *scram = StageResult::InFlight;
+            raw.unit = Some(
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(effect),
+                    owner.as_transaction().batch_execute(frame.as_str()),
+                )
+                .await,
+            );
+            stages.effect_before(deadline)?;
+            raw.unit
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| sql_observation_error(raw.unit.as_ref()))?;
+            Ok(())
+        }
+        .await;
+        drop(frame);
+        finish(owner, prepared, raw, intent, stages, deadline).await?;
+        let accepted = probe_before(stages, &candidate.socket_path, new_text, deadline)
+            .await?
+            .map_err(|_| stages.failure(RecoveryControlFault::ClosureUnproven))?;
+        close_probe_before(stages, accepted).await?;
+        match probe_before(stages, &candidate.socket_path, old_text, deadline).await? {
+            Err(error) if error.code() == Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD) => {}
+            Err(_) => return Err(stages.failure(RecoveryControlFault::IoFailure)),
+            Ok(accepted) => {
+                close_probe_before(stages, accepted).await?;
+                return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+            }
+        }
+        stages.check_capacity_before(stages.convergence_deadline()?)?;
+        candidate.sql.scram = StageResult::Acknowledged;
+        Ok(super::RestoreScramAcknowledged {
+            operation: candidate.binding.operation_id,
+        })
+    }
+
+    // One row read with the new password on a fresh connection: PostgreSQL
+    // identity, the latest native migration, the same operation's sealed row
+    // and the restored dataset's Vault canary (spec revision R484 ¶8019–8020).
+    // Text fields are bounded by their table constraints.
+    const INSTALLATION_READBACK_SQL: &str = "SELECT (SELECT system_identifier::text FROM pg_catalog.pg_control_system()),
+ (SELECT oid FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()),
+ m.version, CASE WHEN octet_length(m.checksum)<=64 THEN m.checksum END,
+ EXISTS(SELECT 1 FROM openbot_internal.restore_pg_operations o JOIN openbot_internal.restore_pg_seals s USING(operation_id,epoch)
+  WHERE o.operation_id=$1 AND o.epoch=$2 AND o.candidate_generation=$3 AND o.deployment_id=$4 AND o.tenant_id=$5
+   AND o.dataset_id=$6 AND o.source_installation_id=$7 AND o.target_installation_id=$8),
+ c.key_id, c.encrypted_canary
+ FROM (SELECT version,checksum FROM openbot_internal.schema_migrations ORDER BY version DESC LIMIT 1) m
+ LEFT JOIN openbot_internal.desktop_vault_canaries c
+  ON c.deployment_id=$4 AND c.tenant_id=$5 AND c.dataset_id=$6 AND c.key_version=1 AND c.canary_schema=1";
+
+    /// Read the restored installation back with the target-slot keys: a new
+    /// connection authenticated by the new password, the bound PostgreSQL
+    /// identity, the latest native layout, the sealed operation row and the
+    /// Vault canary opened with the historical master from its target slot.
+    pub(crate) async fn verify_target_installation_before(
+        stages: &mut RestoreStages,
+        candidate: &mut PendingRestoreCandidateAuthority,
+        master: &openbot_domain::vault::SecretBytes,
+        password: &openbot_domain::vault::SecretBytes,
+        deadline: Instant,
+    ) -> Result<super::RestoreInstallationReadbacks, RecoveryControlError> {
+        use openbot_domain::vault::{
+            DesktopVaultCanaryBinding, DesktopVaultCanaryEnvelope, KeyVersion,
+            open_desktop_vault_canary,
+        };
+        if candidate.sql.scram != StageResult::Acknowledged {
+            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+        }
+        let password = scram_text(password)?;
+        let probe = probe_before(stages, &candidate.socket_path, password, deadline)
+            .await?
+            .map_err(|_| stages.failure(RecoveryControlFault::ClosureUnproven))?;
+        let deadline = stages.effect_before(deadline)?;
+        // One Row with its body and ranges, its owned copies of the bounded
+        // identity, checksum, key and canary text, and the canary envelope
+        // parsed into its typed wire form.
+        const CANARY: u64 = 4096;
+        let memory = std::mem::size_of::<Row>() as u64
+            + 7 * std::mem::size_of::<Option<std::ops::Range<usize>>>() as u64
+            + 2 * (20 + 64 + 32 + CANARY + 24)
+            + crate::thread_history_writer::JSON_MEMORY_FACTOR * CANARY;
+        let rows = stages.admit_capacity(Capacity::PgRows, 1)?;
+        let _metadata = stages.admit_capacity(Capacity::MetadataBytes, memory)?;
+        let _allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, memory)?;
+        let binding = &candidate.binding;
+        let epoch = binding.epoch.as_slice();
+        let observed = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            probe.0.query_one(
+                INSTALLATION_READBACK_SQL,
+                &[
+                    &binding.operation_id,
+                    &epoch,
+                    &binding.candidate_generation,
+                    &binding.deployment_id,
+                    &binding.tenant_id,
+                    &binding.dataset_id,
+                    &binding.source_installation_id,
+                    &binding.target_installation_id,
+                ],
+            ),
+        )
+        .await;
+        close_probe_before(stages, probe).await?;
+        stages.effect_before(deadline)?;
+        let observed = match observed {
+            Ok(Ok(row)) => row,
+            Err(_) => return Err(stages.failure(RecoveryControlFault::EffectExpired)),
+            Ok(Err(_)) => return Err(stages.failure(RecoveryControlFault::IoFailure)),
+        };
+        stages.settle_capacity(rows, 1)?;
+        let text = |index: usize| observed.try_get::<_, Option<String>>(index).ok().flatten();
+        let system = text(0)
+            .filter(|text| *text == binding.pg_system_identifier)
+            .and_then(|text| text.parse::<u64>().ok());
+        let (Some(pg_system_id), Some(oid), Some(version), Some(checksum), Some(true), Some(key_id), Some(canary)) = (
+            system,
+            observed.try_get::<_, Option<u32>>(1).ok().flatten().filter(|oid| *oid == binding.candidate_database_oid),
+            observed.try_get::<_, Option<i32>>(2).ok().flatten().filter(|version| *version == native::NATIVE_LATEST_VERSION),
+            text(3),
+            observed.try_get::<_, Option<bool>>(4).ok().flatten(),
+            text(5),
+            text(6),
+        ) else {
+            return Err(stages.failure(RecoveryControlFault::InputInvalid));
+        };
+        let opened = DesktopVaultCanaryBinding::new(
+            binding.dataset_id.as_str(),
+            binding.deployment_id.as_str(),
+            binding.tenant_id.as_str(),
+            key_id.as_str(),
+            KeyVersion::new(1),
+        )
+        .and_then(|crypto| {
+            open_desktop_vault_canary(master, &crypto, &DesktopVaultCanaryEnvelope::parse(&canary)?)
+        });
+        if opened.is_err() {
+            return Err(stages.failure(RecoveryControlFault::InputInvalid));
+        }
+        let restored = crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding::from_readback(
+            [
+                binding.target_installation_id.clone(),
+                binding.deployment_id.clone(),
+                binding.tenant_id.clone(),
+                binding.dataset_id.clone(),
+            ],
+            candidate.data_path.clone(),
+            pg_system_id,
+            oid,
+        );
+        let retained = restored.retained_bytes() as u64 + checksum.capacity() as u64 + key_id.capacity() as u64;
+        let _retained_metadata = stages.admit_capacity(Capacity::MetadataBytes, retained)?;
+        let _retained_allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, retained)?;
+        Ok(super::RestoreInstallationReadbacks {
+            operation: binding.operation_id,
+            binding: restored,
+            native_version: version as u32,
+            migration_digest: checksum,
+            key_id,
+        })
+    }
+
+    /// Close the bound candidate after its own Child was reaped: the exit
+    /// must name the bind-time pid and birth and that identity must be gone;
+    /// both guarded clients are released, the original pool is closed and
+    /// every driver it owned is observed destroyed. Only then is the exit
+    /// journaled as the ResourceClose fact (spec revision R484 ¶8132).
+    pub(crate) async fn close_candidate_before(
+        stages: &mut RestoreStages,
+        candidate: &mut PendingRestoreCandidateAuthority,
+        exit: super::RestoreCandidateExit,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        if candidate.sql.scram != StageResult::Acknowledged {
+            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+        }
+        let deadline = stages.effect_before(deadline)?;
+        let startup = &candidate.startup;
+        let pid = u32::from_be_bytes(startup[..4].try_into().expect("fixed evidence"));
+        let seconds = u64::from_be_bytes(startup[4..12].try_into().expect("fixed evidence"));
+        let micros = u32::from_be_bytes(startup[12..16].try_into().expect("fixed evidence"));
+        if exit.pid != pid
+            || exit.start.seconds != seconds
+            || u64::from(exit.start.nanos) != u64::from(micros) * 1000
+        {
+            return Err(invalid_candidate());
+        }
+        if wrok_bot_macos_process::evidence_process_is_absent(startup).is_err() {
+            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+        }
+        // The supervisor keeps an owner until its destruction is recorded, so
+        // live and destroyed owners together bound the observation vector.
+        let owners = candidate.pool.ownership_snapshot();
+        let count = (owners.active_resources
+            + owners.destroyed_connecting_futures
+            + owners.destroyed_connections
+            + owners.destroyed_before_start) as u64;
+        let memory = count
+            .checked_mul(std::mem::size_of::<crate::db::pool::ConnectionObservation>() as u64)
+            .ok_or_else(|| stages.failure(RecoveryControlFault::CapacityExceeded))?;
+        let metadata = stages.admit_capacity(Capacity::MetadataBytes, memory)?;
+        let allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, memory)?;
+        let observations = candidate.pool.connection_observations();
+        let actual = (observations.capacity() * std::mem::size_of::<crate::db::pool::ConnectionObservation>()) as u64;
+        stages.settle_capacity(metadata, actual)?;
+        stages.settle_capacity(allocation, actual)?;
+        candidate.sql.client.take();
+        candidate.original_client.take();
+        candidate.pool.close();
+        let closing = stages.convergence_deadline()?;
+        for observation in &observations {
+            if observation.wait_for_destruction_before(closing).await.is_err() {
+                return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+            }
+        }
+        if candidate.pool.ownership_snapshot().active_resources != 0 {
+            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+        }
+        let intent = stages.begin_stage_before(RestoreStage::ResourceClose, "restore_candidate", deadline)?;
+        stages.observe_stage_before(
+            intent,
+            RestoreDisposition::NativeWait {
+                original_program_id: "restore_candidate".to_owned(),
+                original_pid: exit.pid,
+                original_start_identity: exit.start,
+                exit_code_or_signal: exit.exit,
+                observed_ns: exit.observed_ns,
+                pipes: exit.pipes,
+            },
+            stages.convergence_deadline()?,
+        )
+    }
+
     // Independent post-start readback of the candidate's identity and every
     // closed configuration value (spec revision R484 ¶8006 and ¶8010). Each
     // text field is bounded in SQL before it reaches this process.
@@ -5201,15 +5645,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         }
         let socket_directory = std::fs::File::open(socket_dir).map_err(|_| isolation())?;
         // The source SCRAM secret is the exact 64-byte lowercase-hex password.
-        let password = std::str::from_utf8(scram.expose())
-            .ok()
-            .filter(|text| {
-                text.len() == 64
-                    && text
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-            .ok_or_else(invalid_candidate)?;
+        let password = scram_text(scram)?;
         // The origin, writer and restore oracle trees every schema observation
         // borrows are paid once per operation, here (spec revision R484 ¶7984).
         let oracle = crate::thread_history_writer::CurrentWriterSchema::ORACLE_BYTES;
@@ -5296,6 +5732,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             socket_directory,
             data_directory: program.data_directory,
             data_path: program.data_path,
+            startup: program.startup,
+            socket_path: socket_dir.to_owned(),
             pool,
             original_client: None,
             binding,
@@ -5307,6 +5745,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         };
         let actual = std::mem::size_of::<PendingRestoreCandidateAuthority>() as u64
             + candidate.data_path.capacity() as u64
+            + candidate.socket_path.capacity() as u64
             + candidate.binding.deployment_id.capacity() as u64
             + candidate.binding.tenant_id.capacity() as u64
             + candidate.binding.dataset_id.capacity() as u64;
@@ -5320,7 +5759,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
 /// A task-owned PostgreSQL 17.11 candidate on a private UDS, started as a real
 /// child of this test process, plus the same session's real control claim.
 #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
-mod candidate_fixture {
+pub(crate) mod candidate_fixture {
     use super::CandidateProgramIdentity;
     use crate::db::{baseline, native};
     use crate::recovery_control::tests::RestoreEntryFixture;
@@ -5330,30 +5769,29 @@ mod candidate_fixture {
     use std::time::{Duration, Instant};
 
     /// The dataset expected by the shared restore entry fixture request.
-    pub(super) const DATASET: &str = "0123456789abcdef0123456789abcdef";
-    pub(super) const DEP: &str = "dep";
-    pub(super) const TENANT: &str = "ten";
+    pub(crate) const DATASET: &str = "0123456789abcdef0123456789abcdef";
+    pub(crate) const DEP: &str = "dep";
+    pub(crate) const TENANT: &str = "ten";
 
     pub(super) fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(25)
     }
 
-    pub(super) struct OwnedCandidate {
+    pub(crate) struct OwnedCandidate {
         root: PathBuf,
+        data: PathBuf,
         child: std::process::Child,
         password: String,
-        pub(super) system_identifier: String,
-        pub(super) database_oid: u32,
+        pub(crate) system_identifier: String,
+        pub(crate) database_oid: u32,
     }
 
     impl Drop for OwnedCandidate {
         fn drop(&mut self) {
             // Fast shutdown releases the cluster's SysV resources before removal.
-            let _ = rustix::process::kill_process(
-                rustix::process::Pid::from_raw(self.child.id() as i32).expect("owned child pid"),
-                rustix::process::Signal::INT,
-            );
-            let _ = self.child.wait();
+            if matches!(self.child.try_wait(), Ok(None)) {
+                self.stop();
+            }
             let _ = std::fs::remove_dir_all(&self.root);
         }
     }
@@ -5362,6 +5800,11 @@ mod candidate_fixture {
         /// initdb, the closed candidate configuration, start, the business
         /// database, the native layout through `version`, then `seed` SQL.
         pub(super) async fn start(version: i32, seed: &str) -> Self {
+            Self::start_at(version, seed, None).await
+        }
+
+        /// The same candidate with its data directory at `data` when given.
+        pub(crate) async fn start_at(version: i32, seed: &str, data: Option<PathBuf>) -> Self {
             use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
             let bin = PathBuf::from(
                 std::env::var_os("OPENBOT_TEST_PG_BIN").expect("OPENBOT_TEST_PG_BIN"),
@@ -5385,9 +5828,10 @@ mod candidate_fixture {
             std::fs::write(root.join("pw"), &password).unwrap();
             std::fs::set_permissions(root.join("pw"), std::fs::Permissions::from_mode(0o600))
                 .unwrap();
+            let data = data.unwrap_or_else(|| root.join("data"));
             let status = std::process::Command::new(bin.join("initdb"))
                 .arg("-D")
-                .arg(root.join("data"))
+                .arg(&data)
                 .args([
                     "-U",
                     "desktop_admin",
@@ -5403,44 +5847,37 @@ mod candidate_fixture {
                 .unwrap();
             assert!(status.success(), "initdb");
             std::fs::remove_file(root.join("pw")).unwrap();
-            let data = root.join("data");
             std::fs::write(data.join("postgresql.conf"), format!(
                 "listen_addresses = ''\nport = 5432\nunix_socket_directories = '{}'\nunix_socket_permissions = 0600\nshared_preload_libraries = ''\narchive_mode = off\nssl = off\nlogging_collector = off\nshared_memory_type = mmap\ndynamic_shared_memory_type = mmap\nmax_connections = 20\n",
                 root.join("uds").display())).unwrap();
             std::fs::write(data.join("pg_hba.conf"), "local all desktop_admin scram-sha-256\nlocal all all reject\nlocal replication all reject\n").unwrap();
             std::fs::write(data.join("pg_ident.conf"), "").unwrap();
             std::fs::write(data.join("postgresql.auto.conf"), "").unwrap();
-            let child = std::process::Command::new(bin.join("postgres"))
-                .arg("-D")
-                .arg(&data)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
+            let child = Self::spawn(&data);
             let mut owned = Self {
                 root,
+                data,
                 child,
                 password,
                 system_identifier: String::new(),
                 database_oid: 0,
             };
-            let ready = Instant::now() + Duration::from_secs(20);
-            while !std::fs::read_to_string(owned.data().join("postmaster.pid"))
-                .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"))
-            {
-                assert!(Instant::now() < ready, "candidate readiness");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            owned.ready().await;
             owned.connect("postgres").await
                 .batch_execute("CREATE DATABASE openbot WITH OWNER=desktop_admin TEMPLATE=template0 ENCODING='UTF8' LC_COLLATE='C' LC_CTYPE='C'")
                 .await.unwrap();
             let mut client = owned.client().await;
             baseline::apply(&client).await.unwrap();
             native::apply_through(&mut client, version).await.unwrap();
+            // A genuine canary sealed under the fixed test master `bind` uses.
+            let canary = openbot_domain::vault::seal_desktop_vault_canary(
+                &SecretBytes::new(vec![0x41; 32]),
+                &openbot_domain::vault::DesktopVaultCanaryBinding::new(DATASET, DEP, TENANT, "a".repeat(32), openbot_domain::vault::KeyVersion::new(1)).unwrap(),
+                openbot_domain::vault::Nonce::from_slice(&[9; 12]).unwrap(),
+            ).unwrap().to_column_value();
             client.execute(
-                "INSERT INTO openbot_internal.desktop_vault_canaries(dataset_id,deployment_id,tenant_id,key_id,key_version,canary_schema,encrypted_canary) VALUES($1,$2,$3,repeat('a',32),1,1,'owned')",
-                &[&DATASET, &DEP, &TENANT]).await.unwrap();
+                "INSERT INTO openbot_internal.desktop_vault_canaries(dataset_id,deployment_id,tenant_id,key_id,key_version,canary_schema,encrypted_canary) VALUES($1,$2,$3,repeat('a',32),1,1,$4)",
+                &[&DATASET, &DEP, &TENANT, &canary]).await.unwrap();
             client.batch_execute(seed).await.unwrap();
             let row = client.query_one(
                 "SELECT (SELECT system_identifier::text FROM pg_control_system()),(SELECT oid FROM pg_database WHERE datname='openbot')", &[]).await.unwrap();
@@ -5449,11 +5886,49 @@ mod candidate_fixture {
             owned
         }
 
-        pub(super) fn data(&self) -> PathBuf {
-            self.root.join("data")
+        fn spawn(data: &std::path::Path) -> std::process::Child {
+            let bin = PathBuf::from(std::env::var_os("OPENBOT_TEST_PG_BIN").unwrap());
+            std::process::Command::new(bin.join("postgres"))
+                .arg("-D")
+                .arg(data)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
         }
 
-        pub(super) fn uds(&self) -> PathBuf {
+        async fn ready(&self) {
+            let ready = Instant::now() + Duration::from_secs(20);
+            while !std::fs::read_to_string(self.data.join("postmaster.pid"))
+                .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"))
+            {
+                assert!(Instant::now() < ready, "candidate readiness");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Fast shutdown and the Child's own reaped exit.
+        pub(crate) fn stop(&mut self) -> std::process::ExitStatus {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(self.child.id() as i32).expect("owned child pid"),
+                rustix::process::Signal::INT,
+            );
+            self.child.wait().unwrap()
+        }
+
+        /// Start the same cluster again; its administrator now uses `password`.
+        pub(crate) async fn restart(&mut self, password: &SecretBytes) {
+            self.password = String::from_utf8(password.expose().to_vec()).unwrap();
+            self.child = Self::spawn(&self.data);
+            self.ready().await;
+        }
+
+        pub(crate) fn data(&self) -> PathBuf {
+            self.data.clone()
+        }
+
+        pub(crate) fn uds(&self) -> PathBuf {
             self.root.join("uds")
         }
 
@@ -5471,11 +5946,11 @@ mod candidate_fixture {
         }
 
         /// An independent administrative connection to the business database.
-        pub(super) async fn client(&self) -> tokio_postgres::Client {
+        pub(crate) async fn client(&self) -> tokio_postgres::Client {
             self.connect("openbot").await
         }
 
-        pub(super) fn identity(&self) -> CandidateProgramIdentity {
+        pub(crate) fn identity(&self) -> CandidateProgramIdentity {
             let startup = wrok_bot_macos_process::ProcessIdentity::capture(self.child.id())
                 .unwrap()
                 .evidence_bytes()
@@ -5489,11 +5964,11 @@ mod candidate_fixture {
             )
         }
 
-        pub(super) fn pid(&self) -> u32 {
+        pub(crate) fn pid(&self) -> u32 {
             self.child.id()
         }
 
-        pub(super) fn scram(&self) -> SecretBytes {
+        pub(crate) fn scram(&self) -> SecretBytes {
             SecretBytes::new(self.password.as_bytes().to_vec())
         }
     }

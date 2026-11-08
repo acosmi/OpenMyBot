@@ -468,3 +468,74 @@ impl StrictTokenAuthority for AuthorityInner {
             .map_err(map)
     }
 }
+
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use openbot_contracts::auth::{AuthContextBuilder, AuthGeneration, Role};
+    use openbot_contracts::ids::{ActorId, DeploymentId, TenantId};
+    use openbot_domain::vault::{KeyVersion, WrappingKey};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// T046-32 on a published RestoreCurrent: the strict authority's worker
+    /// lease carries the restored cohort, so a READY connection whose
+    /// `sdk_secret` requirement has no receipt is not loaded or opened.
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_32_unconfirmed_sdk_secret_is_not_loaded() {
+        let restored = RestoreCurrentFixture::publish().await;
+        let (dep, ten) = (DeploymentId::new("dep"), TenantId::new("ten"));
+        let scope = Scope {
+            auth: AuthContextBuilder::from_verified_session(dep.clone(), ten.clone(), ActorId::new("alice"), AuthGeneration::new(7), false)
+                .with_role(Role::User)
+                .build(),
+            deployment: dep,
+            tenant: ten.clone(),
+            connection_id: Uuid::now_v7(),
+            expected_revision: 1,
+            auth_generation: 7,
+            issuer: "https://restored.example.test".into(),
+            client_id: "restored-client".into(),
+            account_id: "restored-account".into(),
+            organization_id: None,
+            cancel: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let vault = crate::vault::CredentialRecordVault::single_key(ten, KeyVersion::new(1), WrappingKey::from_bytes(vec![0x46; 32]).unwrap());
+        let secret = Uuid::now_v7();
+        let tokens = acosmi::TokenSet {
+            access_token: "restored-access-token".into(),
+            refresh_token: "restored-refresh-token".into(),
+            expires_at: "2035-01-01T00:00:00Z".into(),
+            scope: "ai account".into(),
+            client_id: "restored-client".into(),
+            server_url: "https://restored.example.test".into(),
+        };
+        let sealed = super::super::store::seal_tokens(&vault, secret, &scope, 1, &tokens).unwrap();
+        let mut client = restored.pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
+            INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');").await.unwrap();
+        tx.execute("INSERT INTO public.sdk_gateway_connections(id,deployment_id,tenant_id,owner_user_id,name,issuer,client_id,account_id,organization_id,
+              auth_contract_version,error_contract_version,enabled,revision,credential_generation,auth_generation,state,current_secret_id,pending_operation_id,created_at,updated_at)
+            VALUES($1,'dep','ten','alice','Restored SDK',$2,$3,$4,NULL,2,1,true,1,1,7,'ready',$5,NULL,clock_timestamp(),clock_timestamp())",
+            &[&scope.connection_id, &scope.issuer, &scope.client_id, &scope.account_id, &secret]).await.unwrap();
+        tx.execute("INSERT INTO public.sdk_gateway_secrets(id,connection_id,deployment_id,tenant_id,owner_user_id,credential_generation,encrypted_value,created_at)
+            VALUES($1,$2,'dep','ten','alice',1,$3,clock_timestamp())", &[&secret, &scope.connection_id, &sealed]).await.unwrap();
+        tx.commit().await.unwrap();
+        drop(client);
+        let requirement = crate::restore_reconfirmation::tests::bound_requirement(&restored, "sdk_secret", &scope.connection_id.to_string()).await;
+        let inner = AuthorityInner::new(restored.pool.clone(), vault.clone(), SecretBytes::new(vec![0x55; 32]), scope, restored.read_gate());
+        let _guard = inner.lock().await.unwrap();
+
+        assert!(matches!(inner.load_inner().await, Err(GatewayAuthorityError::ReconciliationRequired)), "unconfirmed sdk secret");
+        assert_eq!(vault.open_calls(), 0, "Vault-open before the receipt");
+
+        // Positive control: one receipt for the same requirement loads READY.
+        restored.confirm(requirement, "alice", "fresh_actor").await;
+        assert!(matches!(inner.load_inner().await, Ok(AuthorityState::Ready(_))));
+        assert_eq!(vault.open_calls(), 1);
+    }
+}

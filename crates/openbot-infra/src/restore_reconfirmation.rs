@@ -757,3 +757,80 @@ pub(crate) async fn require_confirmed_before<C: tokio_postgres::GenericClient + 
         },
     }
 }
+
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+pub(crate) mod tests {
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+
+    /// The requirement the retirement producer would write for one live
+    /// source of the fixture's cohort: birth, revision, owner and public
+    /// binding come from the same inventory the readback compares, so one
+    /// receipt confirms it. That producer is not these tests' subject, so its
+    /// insert guard is suspended as in the fixture's own `requirement`.
+    pub(crate) async fn bound_requirement(
+        restored: &RestoreCurrentFixture,
+        kind: &str,
+        source: &str,
+    ) -> uuid::Uuid {
+        let (inventory, _) = super::CONFIRMATION_READBACK_SQL
+            .split_once("\nSELECT EXISTS(")
+            .unwrap();
+        let requirement = uuid::Uuid::now_v7();
+        let client = restored.pool.get().await.unwrap();
+        client.batch_execute("ALTER TABLE openbot_internal.restore_reconfirm_requirements DISABLE TRIGGER restore_reconfirm_requirements_insert").await.unwrap();
+        let inserted = client.execute(
+            &format!("{inventory}
+             INSERT INTO openbot_internal.restore_reconfirm_requirements(operation_id,epoch,requirement_id,requirement_seq,
+               source_kind,source_ref,binding_generation,source_created_at,source_revision,public_binding,owner_kind,owner_id,owner_created_at)
+             SELECT $1,$2,$5,(SELECT coalesce(max(requirement_seq),0)+1 FROM openbot_internal.restore_reconfirm_requirements WHERE operation_id=$1),
+               i.kind,i.ref,0,i.birth,i.revision,
+               pg_catalog.sha256(pg_catalog.convert_to('wrokbot.restore.public-binding.v1'||chr(10)||pg_catalog.jsonb_build_array(i.kind,
+                 CASE WHEN i.kind='model_secret' THEN pg_catalog.jsonb_set(i.public_fields,'{{2}}',pg_catalog.to_jsonb(i.revision)) ELSE i.public_fields END)::text,'UTF8')),
+               i.owner_kind,i.owner_id,i.owner_birth
+             FROM inventory i WHERE i.kind=$3 AND i.ref=$4"),
+            &[&uuid::Uuid::from_bytes(restored.cohort.operation_id), &restored.cohort.epoch.as_slice(), &kind, &source, &requirement],
+        ).await;
+        client.batch_execute("ALTER TABLE openbot_internal.restore_reconfirm_requirements ENABLE TRIGGER restore_reconfirm_requirements_insert").await.unwrap();
+        assert_eq!(inserted.unwrap(), 1, "the source is in the live inventory");
+        requirement
+    }
+
+    /// One enabled personal model connection of `owner` in the fixture's
+    /// namespace and its sealed current key. The connection writer needs a
+    /// host request binding these worker-side tests do not have, so the rows
+    /// are the writer's own two INSERTs.
+    pub(crate) async fn model_connection(
+        restored: &RestoreCurrentFixture,
+        vault: &crate::vault::CredentialRecordVault,
+        owner: &str,
+    ) -> uuid::Uuid {
+        use openbot_domain::vault::{SecretBytes, SecretKind, SecretPrincipal, ServiceId};
+        let (connection, secret) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let sealed = vault
+            .seal(
+                &secret,
+                SecretKind::Model,
+                SecretPrincipal::Actor(openbot_contracts::ids::ActorId::new(owner)),
+                SecretPrincipal::Service(ServiceId::new(connection.to_string())),
+                &SecretBytes::new(b"RESTORED_MODEL_KEY_CANARY".to_vec()),
+            )
+            .unwrap();
+        let config = openbot_application::model_connections::normalize_model_configuration(
+            "Restored choice",
+            openbot_contracts::model_connections::CustomModelProtocol::OpenaiChatCompletions,
+            "https://restored-no-network.example.test/v1",
+            "restored-model",
+            true,
+        )
+        .unwrap();
+        let mut client = restored.pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        tx.execute("INSERT INTO public.model_connections(id,deployment_id,tenant_id,owner_user_id,name,protocol,endpoint,model,enabled,revision,current_secret_id,created_at,updated_at)
+            VALUES($1,'dep','ten',$2,$3,'openai_chat_completions',$4,$5,true,1,$6,clock_timestamp(),clock_timestamp())",
+            &[&connection, &owner, &config.name, &config.endpoint, &config.model, &secret]).await.unwrap();
+        tx.execute("INSERT INTO public.model_connection_secrets(id,connection_id,deployment_id,tenant_id,owner_user_id,encrypted_value,created_at)
+            VALUES($1,$2,'dep','ten',$3,$4,clock_timestamp())", &[&secret, &connection, &owner, &sealed]).await.unwrap();
+        tx.commit().await.unwrap();
+        connection
+    }
+}

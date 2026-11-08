@@ -10,7 +10,8 @@ use std::time::Instant;
 use zeroize::Zeroizing;
 
 use openbot_infra::backup::whole_pg_restore_stream::{
-    CandidateProgramIdentity, VerifiedWholePgRestoreStaging,
+    CandidateProgramIdentity, RestoreInstallationReadbacks, RestoreScramAcknowledged,
+    VerifiedWholePgRestoreStaging,
 };
 use openbot_infra::recovery_control::{
     RecoveryControlError, RestoreCandidateIsolationInput, RestoreCapacityReservation, RestoreCapacityResource, RestoreControlSession, RestoreNewChildKind,
@@ -775,6 +776,44 @@ impl CandidateGeneration {
         // This does not clear a Pending Isolation. The original KeySlot
         // adapter must admit this stage, or retain/refuse it before store IO.
         super::slots::install_target_slots_before(&mut self.target_slots, &self.staging, session, store)
+    }
+
+    /// Change the bound candidate's administrator password from the staging's
+    /// authenticated SCRAM to the new one matched in its target slot.
+    pub(super) async fn rotate_candidate_scram(
+        &mut self,
+        session: &mut RestoreControlSession,
+        deadline: Instant,
+    ) -> Result<RestoreScramAcknowledged, DesktopRestoreError> {
+        let new = self.target_slots.as_ref().and_then(|work| work.scram_readback())
+            .ok_or(DesktopRestoreError::EntryInvalid)?;
+        session
+            .rotate_candidate_scram_before(new, self.staging.authenticated_secrets().postgres_scram(), deadline)
+            .await
+            .map_err(|error| self.keep_control(error))
+    }
+
+    /// Read the installation back with both target-slot keys: the historical
+    /// master decoded from its slot frame by the original Vault codec, and
+    /// the new SCRAM password.
+    pub(super) async fn verify_target_installation(
+        &mut self,
+        session: &mut RestoreControlSession,
+        deadline: Instant,
+    ) -> Result<RestoreInstallationReadbacks, DesktopRestoreError> {
+        let frame = self.target_slots.as_mut().and_then(|work| work.take_master_readback())
+            .ok_or(DesktopRestoreError::EntryInvalid)?;
+        let _decoded = session
+            .admit_capacity(RestoreCapacityResource::SecretMemoryBytes, 32)
+            .map_err(|error| self.keep_control(error))?;
+        let master = crate::desktop_vault::decode_stored(frame)
+            .map_err(|_| DesktopRestoreError::KeyStoreUnknown)?;
+        let password = self.target_slots.as_ref().and_then(|work| work.scram_readback())
+            .ok_or(DesktopRestoreError::EntryInvalid)?;
+        session
+            .verify_target_installation_before(master.secret_bytes(), password, deadline)
+            .await
+            .map_err(|error| self.keep_control(error))
     }
 
     pub(super) fn data_directory(&self) -> Option<(&File, &std::path::Path)> {

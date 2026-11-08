@@ -618,6 +618,14 @@ impl OsSecretStore for DeferredCurrentUserKeychain {
     ) -> Result<Option<SecretBytes>, OsSecretStoreError> {
         self.store()?.read(service, account)
     }
+    fn read_bounded(
+        &self,
+        service: &str,
+        account: &str,
+        max_bytes: usize,
+    ) -> Result<Option<SecretBytes>, OsSecretStoreError> {
+        self.store()?.read_bounded(service, account, max_bytes)
+    }
     fn write(&self, service: &str, account: &str, secret: &[u8]) -> Result<(), OsSecretStoreError> {
         self.store()?.write(service, account, secret)
     }

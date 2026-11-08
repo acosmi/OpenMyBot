@@ -816,7 +816,9 @@ impl Record {
                 }
             },
             (Kind::StageIntent, Data::StageIntent(v)) => {
-                hex(&v.original_effect_id, 32, true)?;
+                // The same bound the stage writer checked: ordinary effects
+                // use minted hex IDs, restore stages their fixed effect names.
+                id(&v.original_effect_id, l.max_id_bytes)?;
                 if let RequiredNullable::Value(b) = &v.expected_binding {
                     b.validate(l)?;
                 }
