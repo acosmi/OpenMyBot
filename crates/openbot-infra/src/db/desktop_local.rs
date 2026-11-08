@@ -164,15 +164,18 @@ impl AttestedDesktopLocalAdmin {
         })?;
         drop(client);
         // Every admin driver created since before the first probe stays registered
-        // with its supervisor until it is destroyed. With no destruction recorded
-        // yet, these observations are that complete original set.
+        // with its supervisor until it is destroyed. When every registered owner
+        // is still live and no owner ever left the registry, these observations
+        // are that complete original set. A destroyed connect future on a driving
+        // owner is the successful hand-over to its Connection, not a destruction.
         let ended = self.pool.ownership_snapshot();
         let admin = self.pool.connection_observations();
-        let admin_observations = (ended.destroyed_connecting_futures == 0
+        let admin_observations = (!admin.is_empty()
+            && ended.active_resources == admin.len()
             && ended.destroyed_connections == 0
             && ended.destroyed_before_start == 0
-            && !admin.is_empty())
-        .then_some(admin);
+            && ended.destroyed_connecting_futures == ended.driving)
+            .then_some(admin);
         self.pool.close();
         let origin = origin?;
 

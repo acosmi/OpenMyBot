@@ -1128,8 +1128,8 @@ impl DesktopLocalRuntimeConfig {
         self
     }
 
-    /// The writer adopting a published head below the latest native version
-    /// (OMB-裁-130); set instead of `with_recovery_fresh`/`with_recovery_runtime`.
+    /// The writer adopting a published head below the latest native version;
+    /// set instead of `with_recovery_fresh`/`with_recovery_runtime`.
     pub(crate) fn with_recovery_upgrade(
         mut self,
         session: openbot_infra::recovery_control::OrdinaryInitializationSession,
@@ -2654,7 +2654,7 @@ const fn phase_code(phase: DesktopLocalRuntimePhase) -> &'static str {
 }
 
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-async fn execute_local_legacy_adoption(
+pub(crate) async fn execute_local_legacy_adoption(
     app_data_root: CurrentOsUserAppDataRoot,
     mut config: DesktopLocalRuntimeConfig,
 ) -> Result<openbot_infra::recovery_control::RuntimeCloseReceipt, DesktopLocalRuntimeError> {

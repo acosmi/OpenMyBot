@@ -316,6 +316,27 @@ fn lock_runtime(owner: &RuntimeOwnerBook) -> Result<RuntimeAccess, RecoveryContr
     Ok(access)
 }
 
+/// A runtime SH caller's short synchronous section on the original state,
+/// left in place under the book guard. A state checked out by the exclusive
+/// close is Busy at once; the section never waits, awaits or re-enters a book
+/// other than the control book after this one.
+fn share_runtime<R>(
+    owner: &RuntimeOwnerBook,
+    section: impl FnOnce(&RuntimeState) -> R,
+) -> Result<R, RecoveryControlError> {
+    let book = owner.lock().map_err(|poisoned| {
+        let book = poisoned.into_inner();
+        if let Some(state) = book.as_ref() {
+            state.handle_alive.store(false, Ordering::SeqCst);
+        }
+        RecoveryControlError::new(RecoveryControlFault::OwnerLost)
+    })?;
+    let state = book
+        .as_ref()
+        .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::OwnerBusy))?;
+    Ok(section(state))
+}
+
 /// Admission source for request and worker consumers. Clones share the same
 /// weak runtime observation or the same outside-domain scope; neither is a lease.
 #[derive(Clone)]
@@ -353,10 +374,9 @@ impl RecoveryRuntimeOwner {
         canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
         services: [&str; 2],
     ) -> Result<(), RecoveryControlError> {
-        let (control, binding, deadline) = {
-            let state = lock_runtime(&self.state)?;
+        let (control, binding, deadline) = share_runtime(&self.state, |state| {
             (Arc::clone(&state.control), state.original.published.binding().clone(), state.original.original_deadline)
-        };
+        })?;
         entry::verify_local_binding_before(&control, &binding, authority, database, canary, services, deadline).await
             .map_err(|error| error.retain(&control))
     }
@@ -498,15 +518,16 @@ impl RecoveryRuntimeOwner {
         purpose: AuthorizationPurpose,
         parent: &[u8],
     ) -> Result<openbot_domain::vault::SecretBytes, RecoveryControlError> {
-        let state = lock_runtime(&self.state)?;
-        if !state.handle_alive.load(Ordering::SeqCst) {
-            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
-        }
-        Ok(authorization_key(
-            state.original.published.binding(),
-            purpose,
-            parent,
-        ))
+        share_runtime(&self.state, |state| {
+            if !state.handle_alive.load(Ordering::SeqCst) {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+            }
+            Ok(authorization_key(
+                state.original.published.binding(),
+                purpose,
+                parent,
+            ))
+        })?
     }
 }
 
@@ -924,53 +945,55 @@ impl AdmissionHold {
         reservation: u64,
         deadline: Instant,
     ) -> Result<Self, HostRequestBindingError> {
-        let (hold, acquired) = {
-            let runtime = state.upgrade().ok_or(HostRequestBindingError::NotCurrent)?;
-            let runtime_state = lock_runtime(&runtime).map_err(unavailable)?;
+        let runtime = state.upgrade().ok_or(HostRequestBindingError::NotCurrent)?;
+        let (hold, acquired) = share_runtime(&runtime, |runtime_state| {
             if !runtime_state.handle_alive.load(Ordering::SeqCst) {
                 return Err(HostRequestBindingError::NotCurrent);
             }
-            let mut files = entry::lock(&runtime_state.control).map_err(unavailable)?;
-            files.prepay(reservation, 0).map_err(unavailable)?;
-            let mut hold = AdmissionHold {
-                runtime: state.clone(),
-                cohort: runtime_state.original.published.restore_cohort(),
-                original_lock: None,
-                control: Arc::clone(&runtime_state.control),
-                header_reservation: reservation,
-                retire_known: false,
-            };
-            let acquired = match files.acquire(
-                "admission.lock",
-                b"WBRCADM1",
-                FlockOperation::NonBlockingLockShared,
-                deadline,
-            ) {
-                Ok(file) => {
-                    hold.original_lock = Some(file);
-                    hold.retire_known = true;
-                    Ok(())
-                }
-                Err(error) => {
-                    if error.fault() == RecoveryControlFault::OwnerBusy {
-                        if let Some(file) = files.take_known_busy_admission() {
-                            hold.original_lock = Some(file);
-                            hold.retire_known = true;
-                        } else {
-                            files.latch(RecoveryControlFault::OwnerLost);
-                        }
-                    } else {
-                        // The raw FD/result and its charge remain resident;
-                        // do not let a later attempt overwrite an unknown IO.
-                        files.latch(error.fault());
+            entry::share(&runtime_state.control, |files| {
+                files.prepay(reservation, 0).map_err(unavailable)?;
+                let mut hold = AdmissionHold {
+                    runtime: state.clone(),
+                    cohort: runtime_state.original.published.restore_cohort(),
+                    original_lock: None,
+                    control: Arc::clone(&runtime_state.control),
+                    header_reservation: reservation,
+                    retire_known: false,
+                };
+                let acquired = match files.acquire(
+                    "admission.lock",
+                    b"WBRCADM1",
+                    FlockOperation::NonBlockingLockShared,
+                    deadline,
+                ) {
+                    Ok(file) => {
+                        hold.original_lock = Some(file);
+                        hold.retire_known = true;
+                        Ok(())
                     }
-                    Err(error)
-                }
-            };
-            (hold, acquired)
-        };
-        // The original control guard is gone before either this error or a
-        // later await can drop the hold and retire a known attempt.
+                    Err(error) => {
+                        if error.fault() == RecoveryControlFault::OwnerBusy {
+                            if let Some(file) = files.take_known_busy_admission() {
+                                hold.original_lock = Some(file);
+                                hold.retire_known = true;
+                            } else {
+                                files.latch(RecoveryControlFault::OwnerLost);
+                            }
+                        } else {
+                            // The raw FD/result and its charge remain resident;
+                            // do not let a later attempt overwrite an unknown IO.
+                            files.latch(error.fault());
+                        }
+                        Err(error)
+                    }
+                };
+                Ok((hold, acquired))
+            })
+            .map_err(unavailable)?
+        })
+        .map_err(unavailable)??;
+        // Both book guards are gone before either this error or a later await
+        // can drop the hold and retire a known attempt.
         acquired.map_err(unavailable)?;
         Ok(hold)
     }
@@ -980,47 +1003,51 @@ impl AdmissionHold {
             .runtime
             .upgrade()
             .ok_or(HostRequestBindingError::NotCurrent)?;
-        let state = lock_runtime(&runtime).map_err(unavailable)?;
-        if !state.handle_alive.load(Ordering::SeqCst) {
-            return Err(HostRequestBindingError::NotCurrent);
-        }
-        let mut files = entry::lock(&state.control).map_err(unavailable)?;
-        files
-            .verify_enrollment_before(&state.original.enrollment, deadline)
-            .map_err(unavailable)?;
-        before(deadline).map_err(unavailable)?;
-        if files.root_identity(deadline).map_err(unavailable)? != state.root {
-            return Err(HostRequestBindingError::NotCurrent);
-        }
-        files
-            .verify_head_digest(state.original.published.digest(), deadline)
-            .map_err(unavailable)?;
-        let admission = self
-            .original_lock
-            .as_ref()
-            .ok_or(HostRequestBindingError::NotCurrent)?;
-        files
-            .verify_held_lock(admission, "admission.lock", deadline)
-            .map_err(unavailable)?;
-        if files
-            .verify_held_lock(&state.runtime_lock, "runtime.lock", deadline)
+        share_runtime(&runtime, |state| {
+            if !state.handle_alive.load(Ordering::SeqCst) {
+                return Err(HostRequestBindingError::NotCurrent);
+            }
+            entry::share(&state.control, |files| {
+                files
+                    .verify_enrollment_before(&state.original.enrollment, deadline)
+                    .map_err(unavailable)?;
+                before(deadline).map_err(unavailable)?;
+                if files.root_identity(deadline).map_err(unavailable)? != state.root {
+                    return Err(HostRequestBindingError::NotCurrent);
+                }
+                files
+                    .verify_head_digest(state.original.published.digest(), deadline)
+                    .map_err(unavailable)?;
+                let admission = self
+                    .original_lock
+                    .as_ref()
+                    .ok_or(HostRequestBindingError::NotCurrent)?;
+                files
+                    .verify_held_lock(admission, "admission.lock", deadline)
+                    .map_err(unavailable)?;
+                if files
+                    .verify_held_lock(&state.runtime_lock, "runtime.lock", deadline)
+                    .map_err(unavailable)?
+                    != state.runtime_identity
+                {
+                    return Err(HostRequestBindingError::NotCurrent);
+                }
+                files
+                    .verify_runtime_enrollment(
+                        &state.runtime_directory,
+                        &state.original.runtime_nonce,
+                        &state.enrollment_file,
+                        deadline,
+                    )
+                    .map_err(unavailable)?;
+                if !state.handle_alive.load(Ordering::SeqCst) {
+                    return Err(HostRequestBindingError::NotCurrent);
+                }
+                files.post(deadline).map_err(unavailable)
+            })
             .map_err(unavailable)?
-            != state.runtime_identity
-        {
-            return Err(HostRequestBindingError::NotCurrent);
-        }
-        files
-            .verify_runtime_enrollment(
-                &state.runtime_directory,
-                &state.original.runtime_nonce,
-                &state.enrollment_file,
-                deadline,
-            )
-            .map_err(unavailable)?;
-        if !state.handle_alive.load(Ordering::SeqCst) {
-            return Err(HostRequestBindingError::NotCurrent);
-        }
-        files.post(deadline).map_err(unavailable)
+        })
+        .map_err(unavailable)?
     }
 }
 
@@ -1094,16 +1121,14 @@ impl RecoveryReadGate {
                 let Some(runtime) = state.upgrade() else {
                     return false;
                 };
-                let Ok(state) = lock_runtime(&runtime) else {
-                    return false;
-                };
-                if !state.handle_alive.load(Ordering::SeqCst) {
-                    return false;
-                }
-                let Ok(files) = entry::lock(&state.control) else {
-                    return false;
-                };
-                files.existing_scope(pool, deployment, tenant)
+                share_runtime(&runtime, |state| {
+                    state.handle_alive.load(Ordering::SeqCst)
+                        && entry::share(&state.control, |files| {
+                            files.existing_scope(pool, deployment, tenant)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
             }
         }
     }
@@ -1122,16 +1147,12 @@ impl RecoveryReadGate {
                 let Some(runtime) = runtime.upgrade() else {
                     return false;
                 };
-                let Ok(state) = lock_runtime(&runtime) else {
-                    return false;
-                };
-                if !state.handle_alive.load(Ordering::SeqCst) {
-                    return false;
-                }
-                let Ok(files) = entry::lock(&state.control) else {
-                    return false;
-                };
-                files.matches_bound_pool(pool)
+                share_runtime(&runtime, |state| {
+                    state.handle_alive.load(Ordering::SeqCst)
+                        && entry::share(&state.control, |files| files.matches_bound_pool(pool))
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
             }
         }
     }

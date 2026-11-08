@@ -1152,7 +1152,7 @@ impl JournalObservation {
         self.confirmed(evidence, &first.operation_id)
     }
 
-    /// A RestoreCurrent republished by a known-site adoption (OMB-裁-130):
+    /// A RestoreCurrent republished by a known-site adoption:
     /// this publication journal is that LegacyAdoption operation, naming the
     /// replaced head, under the Current epoch, with a confirmed ordinary_verify
     /// before its PublishIntent. The restore journal is checked separately.

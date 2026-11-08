@@ -236,6 +236,12 @@ async fn start_desktop_fixture(identity_source: Option<&Path>) -> DesktopFixture
         .unwrap();
     let admin = installation.attest_postgres_admin(admin).await.unwrap();
     let database = admin.connect_application(true).await.unwrap();
+    // The live connected admin pool hands over its complete driver observations.
+    assert!(
+        database
+            .admin_observations()
+            .is_some_and(|observations| !observations.is_empty())
+    );
     DesktopFixture {
         database,
         installation,

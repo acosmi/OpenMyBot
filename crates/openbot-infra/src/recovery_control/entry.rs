@@ -3553,6 +3553,39 @@ pub(super) fn lock(owner: &ControlOwner) -> Result<ControlAccess, RecoveryContro
     Ok(access)
 }
 
+/// One short synchronous section of a runtime SH caller on the original
+/// control value, left in place under the book guard. A value checked out by
+/// an exclusive owner is Busy at once; the section never waits for it, never
+/// awaits and never re-enters the control or runtime book.
+pub(super) fn share<R>(
+    owner: &ControlOwner,
+    section: impl FnOnce(&mut ControlFiles) -> R,
+) -> Result<R, RecoveryControlError> {
+    let mut book = owner.lock().map_err(|poisoned| {
+        let mut book = poisoned.into_inner();
+        book.fault.get_or_insert(RecoveryControlFault::OwnerLost);
+        if let Some(files) = book.files.as_mut() {
+            files.latch(RecoveryControlFault::OwnerLost);
+        }
+        RecoveryControlError::with_owner(RecoveryControlFault::OwnerLost, owner)
+    })?;
+    if let Some(fault) = book.fault {
+        return Err(RecoveryControlError::with_owner(fault, owner));
+    }
+    let book = &mut *book;
+    let files = book
+        .files
+        .as_mut()
+        .ok_or_else(|| RecoveryControlError::with_owner(RecoveryControlFault::OwnerBusy, owner))?;
+    let result = section(files);
+    // The same put-back accounting as `ControlAccess`, applied in place.
+    files.retire_known_ordinary_leases(
+        std::mem::take(&mut book.retired_metadata),
+        std::mem::take(&mut book.retired_files),
+    );
+    Ok(result)
+}
+
 /// Only a known ordinary admission's actual File Drop calls this. A concurrent
 /// original IO owner receives checked fixed aggregates at put-back; no spin,
 /// queue allocation, new quota, runtime-close fact or unknown FD retirement.

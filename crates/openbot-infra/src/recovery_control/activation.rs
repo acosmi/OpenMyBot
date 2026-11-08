@@ -517,7 +517,7 @@ impl ActivationBinding {
 
     /// The same Server binding under the operator's current service
     /// configuration: the legacy_adoption intent of a head below latest is
-    /// carried by an edited configuration (OMB-裁-130 with 129 item 2).
+    /// carried by an edited configuration.
     pub(super) fn with_service_config(&self, config: &ServiceConfigRef) -> Self {
         let mut next = self.clone();
         if let ActivationSiteBinding::ServerDatabase { service_config, .. } = &mut next.site {

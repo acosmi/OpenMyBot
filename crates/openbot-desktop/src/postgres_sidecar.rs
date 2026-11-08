@@ -5401,9 +5401,14 @@ mod tests {
     }
 
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-    #[tokio::test]
+    #[test]
     #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
-    async fn t046_56_agentless_package_normal_exit_retires_desktop_agent_as_never_started() {
+    fn t046_56_agentless_package_normal_exit_retires_desktop_agent_as_never_started() {
+        crate::testing::on_large_stack(t046_56_run);
+    }
+
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    async fn t046_56_run() {
         use crate::tauri_background::DesktopRecoveryBootstrap;
         use openbot_infra::recovery_control::TrustedHostRecoveryLimits;
         use std::os::unix::fs::PermissionsExt as _;

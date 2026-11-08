@@ -2578,7 +2578,7 @@ pub(crate) mod tests {
     }
 
     // V7-IMPL-046 batch C: runtime close receipts and published heads below
-    // the latest native version (OMB-裁-130). Heads and journals are written
+    // the latest native version. Heads and journals are written
     // with the private writer primitives, exactly as the producers write them.
 
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
@@ -2931,6 +2931,61 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    async fn runtime_shared_callers_on_two_threads_never_see_each_other_busy() {
+        let fixture = RestoreEntryFixture::new();
+        let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_active(
+            &fixture,
+            &writer,
+            crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+        );
+        drop(writer);
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let mut runtime = fixture.open_local(&control).unwrap();
+        let gate = runtime.read_gate();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let first = gate.borrow_worker_before(deadline).await.unwrap();
+        let second = gate.borrow_worker_before(deadline).await.unwrap();
+        // Each recheck is a runtime SH section followed by a control SH section;
+        // concurrent sections share both books instead of finding them taken.
+        std::thread::scope(|scope| {
+            for lease in [&first, &second] {
+                scope.spawn(move || {
+                    for _ in 0..500 {
+                        lease.verify_current_before(deadline).unwrap();
+                    }
+                });
+            }
+        });
+        drop((first, second));
+        runtime
+            .close_before(never_started(), deadline)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn exclusive_control_custody_makes_a_shared_section_busy_at_once() {
+        let fixture = RestoreEntryFixture::new();
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let exclusive = super::entry::lock(&control.shared).unwrap();
+        let started = std::time::Instant::now();
+        let error = super::entry::share(&control.shared, |_| ())
+            .err()
+            .expect("taken custody");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "no wait for the exclusive owner"
+        );
+        assert_eq!(error.fault(), RecoveryControlFault::OwnerBusy);
+        drop(error);
+        drop(exclusive);
+        super::entry::share(&control.shared, |_| ()).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
     async fn t046_05_restore_exclusive_waits_for_both_runtime_close_receipts() {
         let fixture = RestoreEntryFixture::new();
         let writer = super::RecoveryControl::open(fixture.config()).unwrap();
@@ -3143,7 +3198,7 @@ pub(crate) mod tests {
 
     #[test]
     fn t046_43_ordinary_upgrade_intent_round_trips_and_rejects_foreign_stages() {
-        // OMB-裁-130: the below-latest exit is a LegacyAdoption of the known
+        // The below-latest exit is a LegacyAdoption of the known
         // site; its OperationIntent names the replaced published head.
         let data = |replaced: &str| {
             json!({"mode": "legacy_adoption",
@@ -3652,6 +3707,28 @@ pub(crate) mod tests {
                 site.operations(),
                 operations,
                 "no adoption operation before the site check"
+            );
+            // A catalog that is not the latest layout is refused before any operation.
+            let client = pool.get().await.map_err(|e| e.to_string())?;
+            client
+                .batch_execute("ALTER TABLE public.credentials RENAME TO credentials_moved")
+                .await
+                .map_err(|e| e.to_string())?;
+            let refused = site
+                .start(&config, KEK)
+                .await
+                .err()
+                .ok_or("catalog mismatch")?;
+            client
+                .batch_execute("ALTER TABLE public.credentials_moved RENAME TO credentials")
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(client);
+            assert_eq!(refused.fault(), RecoveryControlFault::ControlInvalid);
+            assert_eq!(
+                site.operations(),
+                operations,
+                "no adoption operation before the layout check"
             );
             // The migrated database with the operator's intent: adopted and republished.
             let (adopted, _runtime) = site

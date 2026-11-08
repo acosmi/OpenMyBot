@@ -409,10 +409,10 @@ pub(in super::super) async fn adopt_server_legacy_before(
 }
 
 /// A published Server head below the latest native version, after the
-/// operator migrated the database and supplied a legacy_adoption intent
-/// (OMB-裁-129 item 2, OMB-裁-130): the current schema and the sealed site
-/// are checked read-only before the adoption operation opens; the existing
-/// canary is the key proof, so there is no key_slot.
+/// operator migrated the database and supplied a legacy_adoption intent:
+/// the current ledger and catalog layout and the sealed site are checked
+/// read-only before the adoption operation opens; the existing canary is the
+/// key proof, so there is no key_slot.
 async fn adopt_published_server_before(
     session: &mut OrdinaryInitializationSession,
     client: &mut crate::db::pool::PooledClient,
@@ -425,6 +425,12 @@ async fn adopt_published_server_before(
     native::validate_current(client)
         .await
         .map_err(|_| invalid())?;
+    let layout = crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client)
+        .await
+        .map_err(|_| invalid())?;
+    if layout.native_version() != native::NATIVE_LATEST_VERSION {
+        return Err(invalid());
+    }
     let binding = session.published_binding()?.clone();
     super::compare_server_site_before(client, &binding, database, configured, dataset, effect)
         .await?;

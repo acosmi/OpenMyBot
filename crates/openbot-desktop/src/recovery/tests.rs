@@ -768,122 +768,174 @@ async fn s23_real_staging_two_named_slots_preserve_old_and_never_retry_unknown()
     }
 }
 
+/// A real PostgreSQL bundle, Desktop dist and memory key store shared by the
+/// startups of one real-sidecar case.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-#[tokio::test]
-#[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
-async fn t046_07_local_fresh_proof_publishes_ordinary_active() {
-    use std::sync::Arc;
-    use std::time::Duration;
+struct SidecarRelease {
+    bundle_root: PathBuf,
+    digest: crate::postgres_sidecar::PostgresBundleDigest,
+    dist: PathBuf,
+    store: std::sync::Arc<crate::postgres_sidecar::RuntimeMemorySecretStore>,
+}
 
-    use crate::desktop_vault::ReviewedDesktopVaultKeyStoreService;
-    use crate::postgres_sidecar::{
-        ReviewedPostgresKeyStoreService, RuntimeMemorySecretStore, VerifiedPostgresBundle,
-        fixture_root, loaded_desktop_package, materialize_desktop_dist,
-        materialize_host_postgres_bundle, signing_identity,
-    };
-    use crate::tauri_background::{
-        DesktopLocalApplicationInput, DesktopLocalReleaseInput, DesktopLocalRuntimeConfig,
-        DesktopRecoveryBootstrap, prepare_desktop_local_runtime,
-    };
-    use crate::{DesktopAgentBudgets, DesktopOpenAiProviderInput};
-    use openbot_infra::db::native::NATIVE_LATEST_VERSION;
-
-    fn journal(control: &std::path::Path, operation: &str) -> Vec<Value> {
-        let raw = fs::read(
-            control
-                .join("operations")
-                .join(operation)
-                .join("journal-v1"),
-        )
-        .unwrap();
-        let (mut records, mut offset) = (Vec::new(), 0);
-        while offset < raw.len() {
-            let length =
-                u32::from_be_bytes(raw[offset + 8..offset + 12].try_into().unwrap()) as usize;
-            records.push(serde_json::from_slice(&raw[offset + 12..offset + 12 + length]).unwrap());
-            offset += 12 + length + 32;
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl SidecarRelease {
+    fn new() -> Self {
+        let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+        let (bundle_root, digest) =
+            crate::postgres_sidecar::materialize_host_postgres_bundle(&bin_dir);
+        Self {
+            bundle_root,
+            digest,
+            dist: crate::postgres_sidecar::materialize_desktop_dist(),
+            store: std::sync::Arc::new(crate::postgres_sidecar::RuntimeMemorySecretStore::empty()),
         }
-        records
     }
 
-    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
-    let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
-    let bundle = VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
-    let parent = fixture_root("t046-07b-fresh");
+    fn config(
+        &self,
+        host_limits: TrustedHostRecoveryLimits,
+    ) -> crate::tauri_background::DesktopLocalRuntimeConfig {
+        use crate::tauri_background::{
+            DesktopLocalApplicationInput, DesktopLocalReleaseInput, DesktopLocalRuntimeConfig,
+            DesktopRecoveryBootstrap,
+        };
+        use crate::{DesktopAgentBudgets, DesktopOpenAiProviderInput};
+        use std::time::Duration;
+        let bundle = crate::postgres_sidecar::VerifiedPostgresBundle::open(
+            &self.bundle_root,
+            self.digest,
+            &crate::postgres_sidecar::signing_identity(),
+        )
+        .unwrap();
+        let release = DesktopLocalReleaseInput::new(
+            &self.dist,
+            "openbot",
+            "main",
+            bundle,
+            crate::postgres_sidecar::ReviewedPostgresKeyStoreService::from_reviewed_release(
+                "com.example.product.postgresql.t046-local",
+            )
+            .unwrap(),
+            crate::desktop_vault::ReviewedDesktopVaultKeyStoreService::from_reviewed_release(
+                "com.example.product.desktop-vault.t046-local",
+            )
+            .unwrap(),
+            self.store.clone(),
+        )
+        .unwrap();
+        let application = DesktopLocalApplicationInput::new(
+            DesktopOpenAiProviderInput::new("https://api.example.test/v1", Vec::new()).unwrap(),
+            DesktopAgentBudgets::new(
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(1_800)),
+                16_384,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        DesktopLocalRuntimeConfig::new(release, application, |authority| {
+            Ok(crate::postgres_sidecar::loaded_desktop_package(
+                authority.auth_context().tenant().as_str(),
+            ))
+        })
+        .with_recovery_bootstrap(DesktopRecoveryBootstrap {
+            host_limits,
+            bounds: serde_json::from_value(
+                json!({ "effectNs": 120_000_000_000u64, "convergenceNs": 30_000_000_000u64 }),
+            )
+            .unwrap(),
+            release_digest: [11; 32],
+        })
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl Drop for SidecarRelease {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.bundle_root);
+        let _ = fs::remove_dir_all(&self.dist);
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+fn local_journal(control: &std::path::Path, operation: &str) -> Vec<Value> {
+    let raw = fs::read(
+        control
+            .join("operations")
+            .join(operation)
+            .join("journal-v1"),
+    )
+    .unwrap();
+    let (mut records, mut offset) = (Vec::new(), 0);
+    while offset < raw.len() {
+        let length = u32::from_be_bytes(raw[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        records.push(serde_json::from_slice(&raw[offset + 12..offset + 12 + length]).unwrap());
+        offset += 12 + length + 32;
+    }
+    records
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+fn local_head(control: &std::path::Path) -> Value {
+    serde_json::from_slice(&fs::read(control.join("activation-v1")).unwrap()).unwrap()
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+fn local_runtimes(control: &std::path::Path) -> Vec<PathBuf> {
+    fs::read_dir(control.join("runtimes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect()
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[test]
+#[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+fn t046_07_local_fresh_proof_publishes_ordinary_active() {
+    crate::testing::on_large_stack(t046_07_run);
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+async fn t046_07_run() {
+    use crate::tauri_background::prepare_desktop_local_runtime;
+    use openbot_infra::db::native::NATIVE_LATEST_VERSION;
+
+    let site = SidecarRelease::new();
+    let parent = crate::postgres_sidecar::fixture_root("t046-07b-fresh");
     fs::create_dir(&parent).unwrap();
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
     let app_root = parent.join("app");
     let control_root = parent.join("com.acosmi.wrokbot.restore-control");
-    let dist = materialize_desktop_dist();
-    let release = DesktopLocalReleaseInput::new(
-        &dist,
-        "openbot",
-        "main",
-        bundle,
-        ReviewedPostgresKeyStoreService::from_reviewed_release(
-            "com.example.product.postgresql.t046-07b",
-        )
-        .unwrap(),
-        ReviewedDesktopVaultKeyStoreService::from_reviewed_release(
-            "com.example.product.desktop-vault.t046-07b",
-        )
-        .unwrap(),
-        Arc::new(RuntimeMemorySecretStore::empty()),
-    )
-    .unwrap();
-    let application = DesktopLocalApplicationInput::new(
-        DesktopOpenAiProviderInput::new("https://api.example.test/v1", Vec::new()).unwrap(),
-        DesktopAgentBudgets::new(
-            Some(Duration::from_secs(2)),
-            Some(Duration::from_secs(1_800)),
-            16_384,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let bootstrap = DesktopRecoveryBootstrap {
-        host_limits: TrustedHostRecoveryLimits {
-            max_request_bytes: 65_536,
-            max_activation_bytes: 65_536,
-            max_journal_frame_bytes: 65_536,
-            max_journal_bytes: 1 << 20,
-            max_journal_records: 64,
-            max_runtime_record_bytes: 65_536,
-            max_registered_runtimes: 8,
-            max_retained_operations: 8,
-            max_root_entries: 64,
-            max_temp_entries: 8,
-            max_evidence_refs: 16,
-            max_runtime_resource_facts: 16,
-            max_id_bytes: 128,
-            max_component_bytes: 128,
-            max_relative_path_bytes: 1024,
-            max_path_depth: 16,
-            max_open_files: 64,
-            max_metadata_bytes: 1 << 24,
-            admission_ns: 5_000_000_000,
-        },
-        bounds: serde_json::from_value(
-            json!({ "effectNs": 120_000_000_000u64, "convergenceNs": 30_000_000_000u64 }),
-        )
-        .unwrap(),
-        release_digest: [11; 32],
+    let host_limits = TrustedHostRecoveryLimits {
+        max_request_bytes: 65_536,
+        max_activation_bytes: 65_536,
+        max_journal_frame_bytes: 65_536,
+        max_journal_bytes: 1 << 20,
+        max_journal_records: 64,
+        max_runtime_record_bytes: 65_536,
+        max_registered_runtimes: 8,
+        max_retained_operations: 8,
+        max_root_entries: 64,
+        max_temp_entries: 8,
+        max_evidence_refs: 16,
+        max_runtime_resource_facts: 16,
+        max_id_bytes: 128,
+        max_component_bytes: 128,
+        max_relative_path_bytes: 1024,
+        max_path_depth: 16,
+        max_open_files: 64,
+        max_metadata_bytes: 1 << 24,
+        admission_ns: 5_000_000_000,
     };
-    let config = DesktopLocalRuntimeConfig::new(release, application, |authority| {
-        Ok(loaded_desktop_package(
-            authority.auth_context().tenant().as_str(),
-        ))
-    })
-    .with_recovery_bootstrap(bootstrap);
     // A new app-data root: LocalPhysicalFresh, Created/Fresh proof, OrdinaryActive.
     let prepared = prepare_desktop_local_runtime(
         CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap(),
-        config,
+        site.config(host_limits),
     )
     .await
     .unwrap();
-    let head: Value =
-        serde_json::from_slice(&fs::read(control_root.join("activation-v1")).unwrap()).unwrap();
+    let head = local_head(&control_root);
     assert_eq!(head["phase"], "OrdinaryActive");
     assert_eq!(
         head["revision"], 2,
@@ -910,8 +962,7 @@ async fn t046_07_local_fresh_proof_publishes_ordinary_active() {
     // operation closed its resources.
     let evidence = head["data"]["initializationEvidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 1);
-    let operation = evidence[0]["contextId"].as_str().unwrap();
-    let records = journal(&control_root, operation);
+    let records = local_journal(&control_root, evidence[0]["contextId"].as_str().unwrap());
     let observed = &records[evidence[0]["sequence"].as_u64().unwrap() as usize - 1];
     assert_eq!(observed["kind"], "StageObserved");
     let intent = &records[observed["data"]["intentSequence"].as_u64().unwrap() as usize - 1];
@@ -921,16 +972,121 @@ async fn t046_07_local_fresh_proof_publishes_ordinary_active() {
         |record| record["kind"] == "StageIntent" && record["data"]["stage"] == "resource_close"
     ));
     // The runtime holds SH under one enrollment until its receipt.
-    let runtimes = fs::read_dir(control_root.join("runtimes"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect::<Vec<_>>();
+    let runtimes = local_runtimes(&control_root);
     assert_eq!(runtimes.len(), 1);
     assert!(runtimes[0].join("enrollment-v1").is_file());
     assert!(!runtimes[0].join("receipt-v1").exists());
     prepared.shutdown().await.unwrap();
     assert!(runtimes[0].join("receipt-v1").is_file());
     fs::remove_dir_all(parent).unwrap();
-    fs::remove_dir_all(bundle_root).unwrap();
-    fs::remove_dir_all(dist).unwrap();
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[test]
+#[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+fn t046_08_local_legacy_needs_positive_intent_and_rejects_known_restore() {
+    crate::testing::on_large_stack(t046_08_run);
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+async fn t046_08_run() {
+    use crate::tauri_background::{
+        DesktopLocalRuntimeError, execute_local_legacy_adoption, prepare_desktop_local_runtime,
+    };
+    use openbot_infra::db::native::NATIVE_LATEST_VERSION;
+    use openbot_infra::recovery_control::RecoveryControlFault;
+
+    let site = SidecarRelease::new();
+    let fixture = EntryFixture::new();
+    let control = fixture.root.join("com.acosmi.wrokbot.restore-control");
+    let app = || CurrentOsUserAppDataRoot::from_current_os_user_app_data(&fixture.app).unwrap();
+    // An installation the ordinary Fresh path built and closed with its receipt.
+    let prepared = prepare_desktop_local_runtime(app(), site.config(fixture.host.clone()))
+        .await
+        .unwrap();
+    prepared.shutdown().await.unwrap();
+    let fresh = local_head(&control)["data"]["binding"].clone();
+    // Without its control state the installation exists and has no head.
+    fs::remove_file(control.join("activation-v1")).unwrap();
+    for directory in ["operations", "runtimes"] {
+        for entry in fs::read_dir(control.join(directory)).unwrap() {
+            fs::remove_dir_all(entry.unwrap().path()).unwrap();
+        }
+    }
+
+    // (a) An ordinary start of the headless installation has no positive intent.
+    let headless = prepare_desktop_local_runtime(app(), site.config(fixture.host.clone())).await;
+    assert!(matches!(
+        headless,
+        Err(DesktopLocalRuntimeError::InitializationRequired)
+    ));
+    assert!(!control.join("activation-v1").exists());
+    assert_eq!(fs::read_dir(control.join("operations")).unwrap().count(), 0);
+
+    let mut request = fixture.request_value();
+    request["purpose"] = json!("adopt_ordinary_legacy");
+    request.as_object_mut().unwrap().remove("profile");
+    request["trustedInputSelection"] =
+        json!({"installation": {"parent": fixture.root, "component": "app"}});
+    request["limits"] = json!({"effectNs": 60_000_000_000u64, "convergenceNs": 10_000_000_000u64});
+    for (field, binding) in [
+        ("expectedDeploymentId", "deploymentId"),
+        ("expectedTenantId", "tenantId"),
+        ("expectedDatasetId", "datasetId"),
+        ("expectedSourceInstallationId", "targetInstallationId"),
+        ("expectedTargetInstallationId", "targetInstallationId"),
+    ] {
+        request[field] = fresh[binding].clone();
+    }
+    let adopt = || {
+        fixture.write_request(&request);
+        let input = super::input::RestoreEntryInput::from_release(
+            &mut fixture.release(),
+            &std::env::current_exe().unwrap(),
+            &fixture.request,
+        )
+        .unwrap();
+        site.config(fixture.host.clone())
+            .with_recovery_request(input)
+    };
+
+    // (c) A retained restore staging operation in the control root refuses the
+    // adoption before Initializing: nothing is published.
+    let staging = control
+        .join("operations")
+        .join("5aa1e5aa1e5aa1e5aa1e5aa1e5aa1e5a");
+    DirBuilder::new().mode(0o700).create(&staging).unwrap();
+    match execute_local_legacy_adoption(app(), adopt()).await {
+        Err(DesktopLocalRuntimeError::RecoveryControl(error)) => {
+            assert_eq!(error.fault(), RecoveryControlFault::InitializationRequired)
+        }
+        other => panic!("known staging was not refused: {:?}", other.err()),
+    }
+    assert!(!control.join("activation-v1").exists());
+    assert_eq!(fs::read_dir(control.join("operations")).unwrap().count(), 1);
+    fs::remove_dir(&staging).unwrap();
+
+    // (b) The adopt request publishes the latest Active and writes the runtime
+    // receipt before returning.
+    execute_local_legacy_adoption(app(), adopt()).await.unwrap();
+    let head = local_head(&control);
+    assert_eq!(head["phase"], "OrdinaryActive");
+    assert_eq!(head["revision"], 2, "OrdinaryInitializing is revision 1");
+    let binding = &head["data"]["binding"];
+    assert_eq!(binding["nativeVersion"], NATIVE_LATEST_VERSION);
+    assert_eq!(binding["datasetId"], fresh["datasetId"]);
+    let evidence = head["data"]["initializationEvidence"].as_array().unwrap();
+    let records = local_journal(&control, evidence[0]["contextId"].as_str().unwrap());
+    assert_eq!(records[0]["data"]["mode"], "legacy_adoption");
+    assert_eq!(
+        records[0]["epoch"], binding["authorizationEpoch"],
+        "the Active keeps the epoch Initializing sealed"
+    );
+    let runtimes = local_runtimes(&control);
+    assert_eq!(runtimes.len(), 1);
+    assert!(runtimes[0].join("enrollment-v1").is_file());
+    assert!(
+        runtimes[0].join("receipt-v1").is_file(),
+        "receipt written before exit"
+    );
 }

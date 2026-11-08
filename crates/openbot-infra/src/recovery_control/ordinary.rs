@@ -41,7 +41,7 @@ pub(super) enum OrdinaryInitializationSource {
 pub(super) type SealedSource = (OrdinaryInitializationSource, Hex32, RecoveryFileIdentity);
 
 /// A published head below this binary's latest native version, seen under SH
-/// and handed back with its digest (OMB-裁-130). The exclusive writer adopts
+/// and handed back with its digest. The exclusive writer adopts
 /// exactly that head as a known site; another head is `OwnerBusy`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ExpectedHead {
@@ -345,7 +345,7 @@ fn shared_head_inner(
     };
     let below = published.binding().native_version() < latest();
     // Server adoption needs the operator's migrated database and its
-    // legacy_adoption intent (OMB-裁-129 item 2); that intent edits the
+    // legacy_adoption intent; that intent edits the
     // service configuration, which the republished head binds instead.
     let rebound = match &intent.site {
         SiteExpectation::Server { service_config, .. }
@@ -508,7 +508,7 @@ pub(super) fn begin(
                 let record = published.observation().record.clone();
                 let digest = published.digest().to_owned();
                 // A known Local site has no request file: the held published
-                // descriptor is the positive intent (OMB-裁-130).
+                // descriptor is the positive intent.
                 if let SiteExpectation::Local(local) = &mut intent.site {
                     let binding = published.binding().ordinary_local()?;
                     let identity = files
@@ -649,7 +649,7 @@ impl OrdinaryInitializationSession {
     }
 
     /// Whether this writer adopts a published head below the latest native
-    /// version as a known site (OMB-裁-130).
+    /// version as a known site.
     pub fn adopts_published_head(&self) -> bool {
         self.intent.expected_head.is_some()
     }
@@ -668,7 +668,7 @@ impl OrdinaryInitializationSession {
 
     /// Open the legacy adoption operation of the held published head: its
     /// OperationIntent names that head's digest, the envelope keeps the
-    /// binding epoch, and no head is published before the proof (OMB-裁-130).
+    /// binding epoch, and no head is published before the proof.
     /// Then the ordinary_verify StageIntent.
     pub(super) fn seal_published(&mut self) -> Result<(), RecoveryControlError> {
         let invalid = || fault(RecoveryControlFault::EntryInvalid);
@@ -1242,7 +1242,7 @@ impl OrdinaryInitializationSession {
         })
     }
     /// Admit the adopted database's original admin driver observations into
-    /// this owner's ordinary control budget (OMB-裁-136): each driver holds one
+    /// this owner's ordinary control budget: each driver holds one
     /// socket, charged against the release hostLimits `maxOpenFiles`, with its
     /// observation handle as metadata. Missing observations stay
     /// `ClosureUnproven`.
@@ -1262,7 +1262,7 @@ impl OrdinaryInitializationSession {
         Ok(observations.to_vec())
     }
 
-    /// Ordinary Local startup below the latest native version (OMB-裁-130):
+    /// Ordinary Local startup below the latest native version:
     /// the read-only check of the running site against the published binding,
     /// the legacy adoption operation of that head, the original ordinary_verify
     /// transaction with its registered increments, then the republished head.
@@ -1640,7 +1640,7 @@ impl OrdinaryInitializationSession {
 
     /// Republish the adopted known site at the proof's native version:
     /// revision + 1, the same epoch and binding except nativeVersion and
-    /// migrationDigest; a Current keeps its restore fields (OMB-裁-130).
+    /// migrationDigest; a Current keeps its restore fields.
     fn publish_adopted(
         &mut self,
         proof: OrdinaryActivationProof,

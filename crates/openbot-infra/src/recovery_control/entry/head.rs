@@ -120,7 +120,7 @@ impl ControlFiles {
         let reference = observation.publication_reference()?.clone();
         let context = reference.context_id.as_str();
         // A Current republished by a known-site adoption names that operation;
-        // its original restore journal is read and checked first (OMB-裁-130).
+        // its original restore journal is read and checked first.
         let adopted_current = match observation.record.data() {
             super::super::activation::ActivationPayload::Current(current)
                 if current.operation_id != context =>
