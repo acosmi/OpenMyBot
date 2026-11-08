@@ -2304,7 +2304,7 @@ fn ConversationSurface(
                     <super::composer::presentation::DraftSuggestions disabled=textarea_disabled on_choose=UnsyncCallback::new(move |text| { if !textarea_disabled.get_untracked() { draft.set(text); } })/>
                 </Show>
             </div>
-            <Show when=move || direct && (can_stop_work.get() || matches!(state.get().active_run_state, Some(ThreadForegroundRunState::Cancelling)))>
+            <Show when=move || direct && (can_stop_work.get() || work_stopping.get() || matches!(state.get().active_run_state, Some(ThreadForegroundRunState::Cancelling)))>
                 <div class="ob-bot-work-actions">
                     <Button
                         variant=ButtonVariant::Ghost
