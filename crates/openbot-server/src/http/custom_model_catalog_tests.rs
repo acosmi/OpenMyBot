@@ -239,16 +239,26 @@ async fn actual_session_catalog_http_framing_and_no_store() {
             assert_eq!(fixture.calls.load(Ordering::SeqCst),calls);
             drop(response);
         }
-        for origin in [None, Some("https://untrusted.example.test")] {
+        for (method, origin, status, reads) in [
+            (Method::GET, None, StatusCode::OK, 1),
+            (Method::GET, Some("https://untrusted.example.test"), StatusCode::FORBIDDEN, 0),
+            (Method::HEAD, None, StatusCode::METHOD_NOT_ALLOWED, 0),
+        ] {
             let calls = fixture.calls.load(Ordering::SeqCst);
-            let mut request = http::Request::builder().uri(PATH)
+            let mut request = http::Request::builder().method(method).uri(PATH)
                 .header("cookie", format!("openbot_session={COOKIE_A}"));
             if let Some(origin) = origin { request = request.header("origin", origin); }
             let response = router.clone().oneshot(request.body(Body::empty()).unwrap()).await
                 .map_err(|e| e.to_string())?;
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.status(), status);
             assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
-            assert_eq!(fixture.calls.load(Ordering::SeqCst), calls);
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), calls + reads);
+            if status == StatusCode::OK {
+                let bytes = to_bytes(response.into_body(), MAX_CUSTOM_MODEL_CATALOG_RESPONSE_BYTES)
+                    .await.map_err(|e| e.to_string())?;
+                let page: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                assert_eq!(page["models"][0]["connectionId"], CONNECTION);
+            }
         }
         let response=router.oneshot(http::Request::builder().uri(format!("{PATH}?")).header("origin",ORIGIN).header("cookie",format!("openbot_session={COOKIE_A}")).body(Body::empty()).unwrap()).await.map_err(|e|e.to_string())?;
         assert_eq!(response.status(),StatusCode::OK);

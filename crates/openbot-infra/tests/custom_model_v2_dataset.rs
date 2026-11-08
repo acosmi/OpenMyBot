@@ -9,6 +9,8 @@ mod pending_input_dispatcher;
 mod pending_inputs;
 #[path = "custom_model_v2_dataset/work_control.rs"]
 mod work_control;
+#[path = "custom_model_v2_dataset/work_journey.rs"]
+mod work_journey;
 
 use async_trait::async_trait;
 use openbot_application::model_connections::ModelConnectionAdministration;
