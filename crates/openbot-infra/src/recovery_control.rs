@@ -2491,7 +2491,6 @@ pub(crate) mod tests {
         }
     }
 
-
     /// Class 7 (spec revision R484): the RunAssertion key is HKDF-keyed by the
     /// published epoch, so a still-unexpired assertion signed under epoch A is
     /// refused by the epoch B runtime; the signed payload keeps its field set.
@@ -2527,13 +2526,22 @@ pub(crate) mod tests {
         };
         let tools = RemoteToolSet::new(["remember"]).expect("tools");
         let issued = 1_700_000_000_000i64;
-        let signed = epoch_a.mint(scope, &tools, issued).expect("mint under epoch A");
+        let signed = epoch_a
+            .mint(scope, &tools, issued)
+            .expect("mint under epoch A");
         let within_ttl = issued + RUN_ASSERTION_TTL_MILLIS / 2;
         // Positive control: the same epoch verifies inside the TTL.
-        epoch_a.verify(&signed, within_ttl).expect("epoch A verifies its own assertion");
-        assert!(epoch_b.verify(&signed, within_ttl).is_err(), "old epoch assertion accepted");
+        epoch_a
+            .verify(&signed, within_ttl)
+            .expect("epoch A verifies its own assertion");
+        assert!(
+            epoch_b.verify(&signed, within_ttl).is_err(),
+            "old epoch assertion accepted"
+        );
         // The same master under the same epoch derives the same key; only the epoch moved.
-        signer(EPOCH).verify(&signed, within_ttl).expect("same epoch is stable");
+        signer(EPOCH)
+            .verify(&signed, within_ttl)
+            .expect("same epoch is stable");
         let payload = signed.split_once('.').expect("value.signature").0;
         let payload: Value = serde_json::from_slice(
             &base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
