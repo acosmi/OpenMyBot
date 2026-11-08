@@ -207,6 +207,35 @@ async fn verify_additive_on<C: GenericClient + Sync>(client: &C) -> Result<(), I
     Ok(())
 }
 
+/// Owned bytes [`verify_in_transaction`] allocates for the additive catalog
+/// payload (already capped at 1 MiB in SQL) and its oracle, measured on the
+/// same transaction; the nested origin and writer observations are measured
+/// by their own modules.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) async fn observation_bytes_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<u64, InfraError> {
+    let limit = i64::try_from(MAX_CATALOG_BYTES).map_err(|_| invalid())?;
+    let row = tx
+        .query_one(
+            &format!(
+                "SELECT coalesce(octet_length(facts),0)::bigint FROM ({CATALOG_SQL}) observed"
+            ),
+            &[&limit],
+        )
+        .await
+        .map_err(|source| {
+            InfraError::query("measure restore reconfirmation catalog observation", source)
+        })?;
+    let payload: i64 = row.try_get(0).map_err(|source| {
+        RowDecodeError::column("(restore_reconfirmation_schema)", "bytes", source)
+    })?;
+    u64::try_from(payload)
+        .ok()
+        .and_then(|bytes| bytes.checked_add((ORACLE.len() + MIGRATION_SQL.len()) as u64))
+        .ok_or_else(invalid)
+}
+
 /// New catalog only, after the caller's exact prefix/full legacy schema proof.
 /// No ledger/version count can substitute for these actual catalog facts.
 pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {

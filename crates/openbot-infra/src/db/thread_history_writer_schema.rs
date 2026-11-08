@@ -1595,6 +1595,29 @@ pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {
 pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
     compare_registered(&observation_on(tx, true).await?, true)
 }
+
+/// Owned bytes one current [`verify_in_transaction`] allocates for its payload
+/// and oracle text, measured on the same transaction before it runs.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) async fn observation_bytes_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<u64, InfraError> {
+    let expected: Value = serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("oracle"))?;
+    let row = tx
+        .query_one(
+            &format!("SELECT coalesce(octet_length(thread_history_raw),0)::bigint FROM ({CAPTURE_SQL}) observed"),
+            &[&expected["rawContract"], &true],
+        )
+        .await
+        .map_err(|source| InfraError::query("measure thread history writer schema observation", source))?;
+    let payload: i64 = row.try_get(0).map_err(|source| {
+        RowDecodeError::column("(thread_history_writer_schema)", "bytes", source)
+    })?;
+    u64::try_from(payload)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(REGISTERED_SCHEMA.len() as u64))
+        .ok_or_else(|| corrupt("facts"))
+}
 /// Schema-only historical51 helper after an explicit exact pre-upgrade prefix proof.
 pub(crate) async fn verify_schema_legacy0051(client: &Client) -> Result<(), InfraError> {
     compare_registered(&observation_on(client, false).await?, false)

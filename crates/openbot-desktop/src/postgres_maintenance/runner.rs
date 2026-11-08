@@ -236,8 +236,45 @@ struct RestorePipeJoins {
     stderr: Option<Result<Result<DrainResult, MaintenanceError>, tokio::task::JoinError>>,
 }
 
+/// One original pipe task's join outcome, projected without dropping the raw result.
+#[cfg(feature = "postgres-supervisor")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestorePipeJoin {
+    Returned,
+    Panicked,
+    JoinUnknown,
+    Absent,
+}
+
 #[cfg(feature = "postgres-supervisor")]
 impl RestoreProgramResult {
+    /// The original Child's pid, exit code and signal, only after its own wait.
+    pub(crate) fn native_wait(&self) -> Option<(u32, Option<i32>, Option<i32>)> {
+        let tool = self.tool.as_ref().ok()?;
+        tool.observation.original_child_wait.then_some((
+            tool.observation.pid,
+            tool.observation.exit_code,
+            tool.observation.signal,
+        ))
+    }
+
+    /// The stdin writer, stdout reader and stderr reader joins, in that order.
+    pub(crate) fn pipes(&self) -> [RestorePipeJoin; 3] {
+        fn join<T>(raw: &Option<Result<T, tokio::task::JoinError>>) -> RestorePipeJoin {
+            match raw {
+                None => RestorePipeJoin::Absent,
+                Some(Ok(_)) => RestorePipeJoin::Returned,
+                Some(Err(error)) if error.is_panic() => RestorePipeJoin::Panicked,
+                Some(Err(_)) => RestorePipeJoin::JoinUnknown,
+            }
+        }
+        [
+            join(&self.joins.stdin),
+            join(&self.joins.stdout),
+            join(&self.joins.stderr),
+        ]
+    }
+
     pub(crate) fn retained_join_bytes(&self) -> Option<usize> {
         let reports = self.tool.as_ref().ok().map_or(Some(0usize), |tool| {
             tool.observation.stdout.as_ref().map_or(0, |report| report.sha256.capacity())

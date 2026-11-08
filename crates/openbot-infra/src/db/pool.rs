@@ -758,7 +758,7 @@ pub async fn connect(config: &DatabaseConfig) -> Result<DatabasePool, InfraError
 /// connections. The Desktop Local adapter uses it with a fixed numeric-loopback topology and a
 /// startup-only [`openbot_domain::vault::SecretBytes`] owner, avoiding a second public config path
 /// that owns a password `String`.
-pub(super) async fn connect_config(
+pub(crate) async fn connect_config(
     config: tokio_postgres::Config,
     max_pool_size: usize,
     connect_timeout: Duration,

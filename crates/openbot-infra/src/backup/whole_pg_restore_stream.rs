@@ -9,24 +9,30 @@ use crate::db::pool::{DatabasePool, GuardedClient};
 use crate::recovery_control::{RecoveryControlError, RestoreStages};
 
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
-pub(crate) use candidate_sql::{retire_cohort_before, upgrade_candidate_schema_before};
+pub use candidate_sql::{RestoreClosedHistoryObservation, RestoredClosedHistoryRequest};
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) use candidate_sql::{
+    bind_candidate_before, retire_cohort_before, upgrade_candidate_schema_before,
+};
 
-struct RestoreCandidateBinding {
-    operation_id: uuid::Uuid,
-    epoch: [u8; 32],
-    candidate_generation: uuid::Uuid,
-    source_bundle_id: uuid::Uuid,
-    deployment_id: String,
-    tenant_id: String,
-    dataset_id: String,
-    source_installation_id: String,
-    target_installation_id: String,
-    candidate_database_oid: u32,
-    pg_system_identifier: String,
-    profile_binding: [u8; 32],
-    native_version: u32,
-    max_batches: u64,
-    max_requirements: u64,
+/// The same operation's expected candidate identity. The session fills it
+/// from its verified request and journal; the database must then match it.
+pub(crate) struct RestoreCandidateBinding {
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) epoch: [u8; 32],
+    pub(crate) candidate_generation: uuid::Uuid,
+    pub(crate) source_bundle_id: uuid::Uuid,
+    pub(crate) deployment_id: String,
+    pub(crate) tenant_id: String,
+    pub(crate) dataset_id: String,
+    pub(crate) source_installation_id: String,
+    pub(crate) target_installation_id: String,
+    pub(crate) candidate_database_oid: u32,
+    pub(crate) pg_system_identifier: String,
+    pub(crate) profile_binding: [u8; 32],
+    pub(crate) native_version: u32,
+    pub(crate) max_batches: u64,
+    pub(crate) max_requirements: u64,
 }
 
 /// Public slot DATA from the authenticated original configuration inventory.
@@ -43,8 +49,13 @@ struct RestoreConfigurationSlot {
 /// All SQL stages borrow its original connection custody and bound pool.
 pub(crate) struct PendingRestoreCandidateAuthority {
     original_process: wrok_bot_macos_process::ProcessIdentity,
+    // Held for the authority's lifetime: the original executable and the
+    // candidate's UDS and data directories cannot be swapped underneath it.
+    #[allow(dead_code)]
     program: File,
+    #[allow(dead_code)]
     socket_directory: File,
+    #[allow(dead_code)]
     data_directory: File,
     data_path: PathBuf,
     pool: DatabasePool,
@@ -54,6 +65,32 @@ pub(crate) struct PendingRestoreCandidateAuthority {
     audit_key: openbot_domain::vault::SecretBytes,
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
     sql: candidate_sql::CandidateSqlState,
+}
+
+/// The original candidate program facts held by the Desktop process owner:
+/// the runner's startup identity evidence, the authenticated executable and
+/// the held generation data directory. These facts are not authority; only
+/// [`crate::recovery_control::RestoreControlSession::bind_candidate_before`]
+/// can bind them to the real candidate database (spec revision R484 ¶7972).
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub struct CandidateProgramIdentity {
+    startup: [u8; 32],
+    program: File,
+    data_directory: File,
+    data_path: PathBuf,
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl CandidateProgramIdentity {
+    /// Moves the original held program and data directory into the binding.
+    pub fn new(startup: [u8; 32], program: File, data_directory: File, data_path: PathBuf) -> Self {
+        Self {
+            startup,
+            program,
+            data_directory,
+            data_path,
+        }
+    }
 }
 
 #[cfg(feature = "server-runtime")]
@@ -3330,6 +3367,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         history_thread: Option<String>,
         history_operation: Option<String>,
         history_cursor: String,
+        history_observation: RestoreClosedHistoryObservation,
     }
 
     impl CandidateSqlState {
@@ -3345,6 +3383,10 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                 history_thread: None,
                 history_operation: None,
                 history_cursor: String::new(),
+                history_observation: RestoreClosedHistoryObservation {
+                    completed: 0,
+                    already_completed: 0,
+                },
                 raw: SqlResults {
                     begin: None,
                     query: None,
@@ -3464,6 +3506,10 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         deadline: Instant,
     ) -> Result<(), RecoveryControlError> {
         let deadline = stages.effect_before(deadline)?;
+        // Every stage runs only while the bound original candidate process lives.
+        if candidate.original_process.revalidate().is_err() {
+            return Err(stages.failure(RecoveryControlFault::OwnerLost));
+        }
         if candidate.sql.client.is_some() {
             if !matches!(candidate.sql.raw.commit, Some(Ok(())))
                 && !matches!(candidate.sql.raw.rollback, Some(Ok(())))
@@ -4483,54 +4529,128 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
     // BEGIN S22 original closed-history adapter
     /// Reuse the original clear algorithm on this candidate's guarded connection.
     /// Only timely original transaction acknowledgements advance the cursor.
-    pub(crate) async fn clear_restored_closed_history_before(
-        stages: &mut RestoreStages,
-        candidate: &mut PendingRestoreCandidateAuthority,
+    /// Spec revision R484 ¶8092: the original closed history clear request.
+    pub struct RestoredClosedHistoryRequest {
         deadline: Instant,
-    ) -> Result<(), RecoveryControlError> {
-        use crate::thread_history_authority::{RestoredHistoryBatch as Batch, ThreadHistoryStopClearError as ClearError};
-        if candidate.sql.retirement != StageResult::Acknowledged {
-            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+    }
+
+    impl RestoredClosedHistoryRequest {
+        /// Bounded by the original effect deadline of the same operation.
+        pub fn new(deadline: Instant) -> Self {
+            Self { deadline }
         }
-        if candidate.sql.history == StageResult::Acknowledged {
-            return stages.effect_before(deadline).map(|_| ());
+    }
+
+    /// Counts of closed threads finished by this operation and of threads whose
+    /// earlier completion was only verified; tombstones are never rewritten.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RestoreClosedHistoryObservation {
+        completed: u64,
+        already_completed: u64,
+    }
+
+    impl RestoreClosedHistoryObservation {
+        /// Closed threads whose clear completed in this operation.
+        pub fn completed(&self) -> u64 {
+            self.completed
         }
-        if candidate.sql.history == StageResult::InFlight {
-            // An unknown original batch is observed once using its original Q,
-            // never dispatched again or replaced with a new clear operation.
-            let closing = stages.convergence_deadline()?;
-            let reservation = candidate.sql.readback_rows.take().ok_or_else(database_unknown)?;
-            let client = candidate.sql.client.as_ref().and_then(|v| v.as_ref().ok()).ok_or_else(database_unknown)?;
-            let thread = candidate.sql.history_thread.as_deref().ok_or_else(database_unknown)?;
-            let operation = candidate.sql.history_operation.as_deref().ok_or_else(database_unknown)?;
-            candidate.sql.raw.readback = Some(tokio::time::timeout_at(
+        /// Closed threads with an existing completion, verified read-only.
+        pub fn already_completed(&self) -> u64 {
+            self.already_completed
+        }
+    }
+
+    impl RestoreStages {
+        pub(crate) async fn clear_restored_closed_history_before(
+            &mut self,
+            candidate: &mut PendingRestoreCandidateAuthority,
+            request: RestoredClosedHistoryRequest,
+        ) -> Result<RestoreClosedHistoryObservation, RecoveryControlError> {
+            use crate::thread_history_authority::{
+                RestoredHistoryBatch as Batch, ThreadHistoryStopClearError as ClearError,
+            };
+            let stages = self;
+            let deadline = request.deadline;
+            if candidate.sql.retirement != StageResult::Acknowledged {
+                return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+            }
+            if candidate.sql.history == StageResult::Acknowledged {
+                stages.effect_before(deadline)?;
+                return Ok(candidate.sql.history_observation);
+            }
+            if candidate.sql.history == StageResult::InFlight {
+                // An unknown original batch is observed once using its original Q,
+                // never dispatched again or replaced with a new clear operation.
+                let closing = stages.convergence_deadline()?;
+                let reservation = candidate
+                    .sql
+                    .readback_rows
+                    .take()
+                    .ok_or_else(database_unknown)?;
+                let client = candidate
+                    .sql
+                    .client
+                    .as_ref()
+                    .and_then(|v| v.as_ref().ok())
+                    .ok_or_else(database_unknown)?;
+                let thread = candidate
+                    .sql
+                    .history_thread
+                    .as_deref()
+                    .ok_or_else(database_unknown)?;
+                let operation = candidate
+                    .sql
+                    .history_operation
+                    .as_deref()
+                    .ok_or_else(database_unknown)?;
+                candidate.sql.raw.readback = Some(tokio::time::timeout_at(
                 tokio::time::Instant::from_std(closing),
                 client.as_client().query(
                     "SELECT q.operation_id,c.operation_id IS NOT NULL AS completed,(SELECT count(*) FROM openbot_internal.thread_history_clear_batches b WHERE b.operation_id=q.operation_id) AS batches FROM openbot_internal.thread_history_clear_intents q LEFT JOIN openbot_internal.thread_history_clear_completions c ON c.operation_id=q.operation_id WHERE q.operation_id=$1 AND q.thread_id=$2 AND q.deployment_id=$3 AND q.tenant_id=$4",
                     &[&operation,&thread,&candidate.binding.deployment_id,&candidate.binding.tenant_id],
                 ),
             ).await);
-            stages.convergence_deadline()?;
-            if let Some(Ok(Ok(rows))) = &candidate.sql.raw.readback {
-                stages.settle_capacity(reservation, rows.len() as u64)?;
-            }
-            return Err(stages.failure(RecoveryControlFault::DatabaseUnknown));
-        }
-        loop {
-            let deadline = stages.effect_before(deadline)?;
-            checkout_before(stages, candidate, deadline).await?;
-            let reservation = stages.admit_capacity(Capacity::PgTransactions, 1)?;
-            candidate.sql.intent = Some(stages.begin_stage_before(RestoreStage::HqAck2, "closed_history_ack2", deadline)?);
-            let CandidateSqlState { client, raw, intent, history_thread, history_operation, history_cursor, history, .. } = &mut candidate.sql;
-            let client = client.as_mut().and_then(|v| v.as_mut().ok()).ok_or_else(database_unknown)?;
-            let owner = match client.begin_read_committed().await {
-                Ok(owner) => { raw.begin = Some(Ok(())); owner }
-                Err(error) => {
-                    raw.begin = Some(Err(error));
-                    return Err(retain_begin_failure(stages, intent, error));
+                stages.convergence_deadline()?;
+                if let Some(Ok(Ok(rows))) = &candidate.sql.raw.readback {
+                    stages.settle_capacity(reservation, rows.len() as u64)?;
                 }
-            };
-            let prepared = async {
+                return Err(stages.failure(RecoveryControlFault::DatabaseUnknown));
+            }
+            loop {
+                let deadline = stages.effect_before(deadline)?;
+                checkout_before(stages, candidate, deadline).await?;
+                let reservation = stages.admit_capacity(Capacity::PgTransactions, 1)?;
+                candidate.sql.intent = Some(stages.begin_stage_before(
+                    RestoreStage::HqAck2,
+                    "closed_history_ack2",
+                    deadline,
+                )?);
+                let CandidateSqlState {
+                    client,
+                    raw,
+                    intent,
+                    history_thread,
+                    history_operation,
+                    history_cursor,
+                    history,
+                    history_observation,
+                    ..
+                } = &mut candidate.sql;
+                let client = client
+                    .as_mut()
+                    .and_then(|v| v.as_mut().ok())
+                    .ok_or_else(database_unknown)?;
+                let owner = match client.begin_read_committed().await {
+                    Ok(owner) => {
+                        raw.begin = Some(Ok(()));
+                        owner
+                    }
+                    Err(error) => {
+                        raw.begin = Some(Err(error));
+                        return Err(retain_begin_failure(stages, intent, error));
+                    }
+                };
+                let prepared = async {
                 stages.effect_before(deadline)?;
                 stages.settle_capacity(reservation, 1)?;
                 const NEXT_HISTORY: &str = "SELECT coalesce(h.thread_id,q.thread_id) AS thread_id,q.operation_id FROM openbot_internal.thread_history_heads h FULL JOIN openbot_internal.thread_history_clear_intents q ON q.operation_id=h.closure_operation_id AND q.thread_id=h.thread_id AND q.deployment_id=h.deployment_id AND q.tenant_id=h.tenant_id WHERE coalesce(h.deployment_id,q.deployment_id)=$1 AND coalesce(h.tenant_id,q.tenant_id)=$2 AND (h.phase='closed' OR q.operation_id IS NOT NULL) AND coalesce(h.thread_id,q.thread_id) COLLATE \"C\">$3 COLLATE \"C\" ORDER BY coalesce(h.thread_id,q.thread_id) COLLATE \"C\" LIMIT 1";
@@ -4605,48 +4725,74 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                     Err(_) => Err(invalid_candidate()),
                 }
             }.await;
-            let no_rows = history_thread.is_none();
-            let read_only = no_rows || matches!(raw.history.as_ref(), Some(Ok(Batch::ExistingComplete { .. } | Batch::AwaitingDrain | Batch::AwaitingReaders)));
-            if prepared.is_err() || !read_only {
-                finish(owner, prepared, raw, intent, stages, deadline).await?;
-            } else {
-                raw.rollback = Some(owner.rollback_before(deadline).await);
-                let disposition = match raw.rollback.as_ref().expect("resident original history rollback") {
-                    Ok(()) => RestoreRollbackAck::TimelyAck,
-                    Err(TransactionOwnerError::RollbackAcknowledgedAfterDeadline) => RestoreRollbackAck::AcknowledgedAfterDeadline,
-                    Err(_) => RestoreRollbackAck::RollbackUnproven,
-                };
-                if let Some(original) = intent.take() {
-                    let closing = stages.convergence_deadline()?;
-                    stages.observe_stage_before(original, RestoreDisposition::PgRollback(disposition), closing)?;
+                let no_rows = history_thread.is_none();
+                let read_only = no_rows
+                    || matches!(
+                        raw.history.as_ref(),
+                        Some(Ok(Batch::ExistingComplete { .. }
+                            | Batch::AwaitingDrain
+                            | Batch::AwaitingReaders))
+                    );
+                if prepared.is_err() || !read_only {
+                    finish(owner, prepared, raw, intent, stages, deadline).await?;
+                } else {
+                    raw.rollback = Some(owner.rollback_before(deadline).await);
+                    let disposition = match raw
+                        .rollback
+                        .as_ref()
+                        .expect("resident original history rollback")
+                    {
+                        Ok(()) => RestoreRollbackAck::TimelyAck,
+                        Err(TransactionOwnerError::RollbackAcknowledgedAfterDeadline) => {
+                            RestoreRollbackAck::AcknowledgedAfterDeadline
+                        }
+                        Err(_) => RestoreRollbackAck::RollbackUnproven,
+                    };
+                    if let Some(original) = intent.take() {
+                        let closing = stages.convergence_deadline()?;
+                        stages.observe_stage_before(
+                            original,
+                            RestoreDisposition::PgRollback(disposition),
+                            closing,
+                        )?;
+                    }
+                    if !matches!(raw.rollback, Some(Ok(()))) {
+                        return Err(stages.failure(RecoveryControlFault::DatabaseUnknown));
+                    }
+                    stages.effect_before(deadline)?;
                 }
-                if !matches!(raw.rollback, Some(Ok(()))) {
-                    return Err(stages.failure(RecoveryControlFault::DatabaseUnknown));
+                if no_rows {
+                    *history = StageResult::Acknowledged;
+                    return Ok(*history_observation);
                 }
-                stages.effect_before(deadline)?;
+                match raw
+                    .history
+                    .as_ref()
+                    .expect("resident original clear decision")
+                {
+                    Ok(outcome @ (Batch::Complete { .. } | Batch::ExistingComplete { .. })) => {
+                        if matches!(outcome, Batch::Complete { .. }) {
+                            history_observation.completed += 1;
+                        } else {
+                            history_observation.already_completed += 1;
+                        }
+                        *history_cursor = history_thread.take().expect("observed original thread");
+                        history_operation.take();
+                    }
+                    Ok(Batch::Batch { more }) => {
+                        // Even an erased body still needs the original completion transaction.
+                        let _original_more = more;
+                        history_thread.take();
+                    }
+                    Ok(Batch::AwaitingDrain | Batch::AwaitingReaders) => {
+                        *history = StageResult::Unstarted;
+                        return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+                    }
+                    Err(_) => return Err(invalid_candidate()),
+                }
+                *history = StageResult::Unstarted;
+                raw.history = None;
             }
-            if no_rows {
-                *history = StageResult::Acknowledged;
-                return Ok(());
-            }
-            match raw.history.as_ref().expect("resident original clear decision") {
-                Ok(Batch::Complete { .. } | Batch::ExistingComplete { .. }) => {
-                    *history_cursor = history_thread.take().expect("observed original thread");
-                    history_operation.take();
-                }
-                Ok(Batch::Batch { more }) => {
-                    // Even an erased body still needs the original completion transaction.
-                    let _original_more = more;
-                    history_thread.take();
-                }
-                Ok(Batch::AwaitingDrain | Batch::AwaitingReaders) => {
-                    *history = StageResult::Unstarted;
-                    return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
-                }
-                Err(_) => return Err(invalid_candidate()),
-            }
-            *history = StageResult::Unstarted;
-            raw.history = None;
         }
     }
     // END S22 original closed-history adapter
@@ -4907,5 +5053,1075 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         // replacement for the original missing/late timely ACK.
         Err(stages.failure(RecoveryControlFault::DatabaseUnknown))
     }
+
+    // Independent post-start readback of the candidate's identity and every
+    // closed configuration value (spec revision R484 ¶7968 and ¶7972). Each
+    // text field is bounded in SQL before it reaches this process.
+    // With archive_mode off, PostgreSQL 17 reports archive_command as
+    // "(disabled)" and never runs it, so the mode itself is the check.
+    const CANDIDATE_IDENTITY_SQL: &str = "SELECT (SELECT system_identifier::text FROM pg_catalog.pg_control_system()),
+ (SELECT oid FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()),
+ CASE WHEN octet_length(current_setting('data_directory'))<=4096 THEN current_setting('data_directory') END,
+ current_setting('server_version')='17.11',
+ current_setting('listen_addresses')='',
+ CASE WHEN octet_length(current_setting('unix_socket_directories'))<=4096 THEN current_setting('unix_socket_directories') END,
+ current_setting('archive_mode')='off' AND current_setting('archive_library')=''
+  AND current_setting('restore_command')='' AND current_setting('recovery_end_command')='' AND current_setting('archive_cleanup_command')=''
+  AND current_setting('primary_conninfo')='' AND current_setting('shared_preload_libraries')=''
+  AND current_setting('session_preload_libraries')='' AND current_setting('local_preload_libraries')='',
+ (SELECT count(*)>0 AND bool_and(type='local' AND error IS NULL AND auth_method IN ('scram-sha-256','reject'))
+   FROM pg_catalog.pg_hba_file_rules),
+ NOT EXISTS(SELECT 1 FROM pg_catalog.pg_ident_file_mappings),
+ (SELECT max(version)::integer FROM openbot_internal.schema_migrations),
+ EXISTS(SELECT 1 FROM openbot_internal.desktop_vault_canaries WHERE deployment_id=$1 AND tenant_id=$2 AND dataset_id=$3)";
+
+    /// Bind the resident original Child, its held data directory and its own
+    /// UDS to the expected operation identity. On success this is the only
+    /// constructor of [`PendingRestoreCandidateAuthority`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bind_candidate_before(
+        stages: &mut RestoreStages,
+        child_id: Option<u32>,
+        program: super::CandidateProgramIdentity,
+        socket_dir: &std::path::Path,
+        mut binding: RestoreCandidateBinding,
+        scram: &openbot_domain::vault::SecretBytes,
+        master: &openbot_domain::vault::SecretBytes,
+        deadline: Instant,
+    ) -> Result<PendingRestoreCandidateAuthority, RecoveryControlError> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+        // A process, directory or UDS that is not this operation's candidate is
+        // refused as invalid input; Infra's closed fault set has no isolation code.
+        let isolation = invalid_candidate;
+        let deadline = stages.effect_before(deadline)?;
+        // The live, unreaped original Child with the runner's startup identity.
+        let pid = child_id.ok_or_else(isolation)?;
+        let process =
+            wrok_bot_macos_process::ProcessIdentity::capture(pid).map_err(|_| isolation())?;
+        if process.evidence_bytes().map_err(|_| isolation())? != program.startup
+            || !program
+                .program
+                .metadata()
+                .map_err(|_| isolation())?
+                .is_file()
+        {
+            return Err(isolation());
+        }
+        // The held data directory is the named one, and its postmaster.pid
+        // names this Child and this directory (PG17 lines 1 and 2).
+        let held = program.data_directory.metadata().map_err(|_| isolation())?;
+        let named = std::fs::symlink_metadata(&program.data_path).map_err(|_| isolation())?;
+        if !held.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(isolation());
+        }
+        let mut lock_file = rustix::fs::openat(
+            &program.data_directory,
+            "postmaster.pid",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(|_| isolation())?;
+        let mut lock_bytes = [0_u8; 4096];
+        let read = lock_file.read(&mut lock_bytes).map_err(|_| isolation())?;
+        let mut lock_lines = std::str::from_utf8(&lock_bytes[..read])
+            .map_err(|_| isolation())?
+            .lines();
+        if lock_lines.next() != Some(pid.to_string().as_str())
+            || lock_lines.next().map(std::path::Path::new) != Some(program.data_path.as_path())
+        {
+            return Err(isolation());
+        }
+        let socket =
+            std::fs::symlink_metadata(socket_dir.join(".s.PGSQL.5432")).map_err(|_| isolation())?;
+        if !socket.file_type().is_socket() {
+            return Err(isolation());
+        }
+        let socket_directory = std::fs::File::open(socket_dir).map_err(|_| isolation())?;
+        // The source SCRAM secret is the exact 64-byte lowercase-hex password.
+        let password = std::str::from_utf8(scram.expose())
+            .ok()
+            .filter(|text| {
+                text.len() == 64
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .ok_or_else(invalid_candidate)?;
+        let memory =
+            std::mem::size_of::<PendingRestoreCandidateAuthority>() as u64 + 2 * PUBLIC_ROW_MEMORY;
+        let metadata = stages.admit_capacity(Capacity::MetadataBytes, memory)?;
+        let allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, memory)?;
+        let connections = stages.admit_capacity(Capacity::PgConnections, 1)?;
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host_path(socket_dir)
+            .port(5432)
+            .user(openbot_contracts::desktop::DESKTOP_LOCAL_POSTGRES_ADMIN_USER)
+            .dbname(crate::db::desktop_local::APPLICATION_DATABASE)
+            .password(password)
+            .application_name("wrokbot_restore_candidate")
+            .connect_timeout(deadline.saturating_duration_since(Instant::now()));
+        let pool = crate::db::pool::connect_config(
+            config,
+            1,
+            deadline.saturating_duration_since(Instant::now()),
+            "restore candidate",
+        )
+        .await
+        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        stages.effect_before(deadline)?;
+        stages.settle_capacity(connections, 1)?;
+        let rows = stages.admit_capacity(Capacity::PgRows, 1)?;
+        let client = pool.get_guarded(deadline).await.map_err(|error| {
+            RecoveryControlError::new(if error == PoolError::DeadlineExceeded {
+                RecoveryControlFault::EffectExpired
+            } else {
+                RecoveryControlFault::IoFailure
+            })
+        })?;
+        let observed = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            client.as_client().query_one(
+                CANDIDATE_IDENTITY_SQL,
+                &[
+                    &binding.deployment_id,
+                    &binding.tenant_id,
+                    &binding.dataset_id,
+                ],
+            ),
+        )
+        .await
+        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::EffectExpired))?
+        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        drop(client);
+        stages.effect_before(deadline)?;
+        stages.settle_capacity(rows, 1)?;
+        let text = |index: usize| observed.try_get::<_, Option<String>>(index).ok().flatten();
+        let flag =
+            |index: usize| observed.try_get::<_, Option<bool>>(index).ok().flatten() == Some(true);
+        if text(0).as_deref() != Some(binding.pg_system_identifier.as_str())
+            || observed.try_get::<_, Option<u32>>(1).ok().flatten()
+                != Some(binding.candidate_database_oid)
+            || text(2).as_deref().map(std::path::Path::new) != Some(program.data_path.as_path())
+            || text(5).as_deref().map(std::path::Path::new) != Some(socket_dir)
+            || !(3..=4).chain(6..=8).all(flag)
+        {
+            return Err(isolation());
+        }
+        binding.native_version = match observed.try_get::<_, Option<i32>>(9).ok().flatten() {
+            Some(version @ 52..=54) => version as u32,
+            _ => return Err(invalid_candidate()),
+        };
+        if !flag(10) {
+            return Err(invalid_candidate());
+        }
+        let audit_key = openbot_domain::vault::derive_application_key(
+            master,
+            openbot_domain::vault::ApplicationKeyPurpose::AuditCheckpoint,
+        )
+        .map_err(|_| invalid_candidate())?;
+        let candidate = PendingRestoreCandidateAuthority {
+            original_process: process,
+            program: program.program,
+            socket_directory,
+            data_directory: program.data_directory,
+            data_path: program.data_path,
+            pool,
+            original_client: None,
+            binding,
+            // Local releases carry no reviewed external configuration slot;
+            // the seal still checks that no config_slot row exists.
+            configuration_inventory: Vec::new(),
+            audit_key,
+            sql: CandidateSqlState::new(),
+        };
+        let actual = std::mem::size_of::<PendingRestoreCandidateAuthority>() as u64
+            + candidate.data_path.capacity() as u64
+            + candidate.binding.deployment_id.capacity() as u64
+            + candidate.binding.tenant_id.capacity() as u64
+            + candidate.binding.dataset_id.capacity() as u64;
+        stages.settle_capacity(metadata, actual)?;
+        stages.settle_capacity(allocation, actual)?;
+        Ok(candidate)
+    }
 }
 // END S21 candidate_sql
+
+/// A task-owned PostgreSQL 17.11 candidate on a private UDS, started as a real
+/// child of this test process, plus the same session's real control claim.
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod candidate_fixture {
+    use super::CandidateProgramIdentity;
+    use crate::db::{baseline, native};
+    use crate::recovery_control::tests::RestoreEntryFixture;
+    use crate::recovery_control::{RecoveryControl, RecoveryControlFault, RestoreControlSession};
+    use openbot_domain::vault::SecretBytes;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// The dataset expected by the shared restore entry fixture request.
+    pub(super) const DATASET: &str = "0123456789abcdef0123456789abcdef";
+    pub(super) const DEP: &str = "dep";
+    pub(super) const TENANT: &str = "ten";
+
+    pub(super) fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(25)
+    }
+
+    pub(super) struct OwnedCandidate {
+        root: PathBuf,
+        child: std::process::Child,
+        password: String,
+        pub(super) system_identifier: String,
+        pub(super) database_oid: u32,
+    }
+
+    impl Drop for OwnedCandidate {
+        fn drop(&mut self) {
+            // Fast shutdown releases the cluster's SysV resources before removal.
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(self.child.id() as i32).expect("owned child pid"),
+                rustix::process::Signal::INT,
+            );
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl OwnedCandidate {
+        /// initdb, the closed candidate configuration, start, the business
+        /// database, the native layout through `version`, then `seed` SQL.
+        pub(super) async fn start(version: i32, seed: &str) -> Self {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            let bin = PathBuf::from(
+                std::env::var_os("OPENBOT_TEST_PG_BIN").expect("OPENBOT_TEST_PG_BIN"),
+            );
+            // A short private root keeps the UDS path below the 103-byte limit.
+            let root = PathBuf::from(format!(
+                "/private/tmp/wb046-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.join("uds"))
+                .unwrap();
+            let mut random = [0_u8; 32];
+            getrandom::fill(&mut random).unwrap();
+            let password: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            std::fs::write(root.join("pw"), &password).unwrap();
+            std::fs::set_permissions(root.join("pw"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let status = std::process::Command::new(bin.join("initdb"))
+                .arg("-D")
+                .arg(root.join("data"))
+                .args([
+                    "-U",
+                    "desktop_admin",
+                    "--auth=scram-sha-256",
+                    "-E",
+                    "UTF8",
+                    "--locale=C",
+                ])
+                .arg(format!("--pwfile={}", root.join("pw").display()))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "initdb");
+            std::fs::remove_file(root.join("pw")).unwrap();
+            let data = root.join("data");
+            std::fs::write(data.join("postgresql.conf"), format!(
+                "listen_addresses = ''\nport = 5432\nunix_socket_directories = '{}'\nunix_socket_permissions = 0600\nshared_preload_libraries = ''\narchive_mode = off\nssl = off\nlogging_collector = off\nshared_memory_type = mmap\ndynamic_shared_memory_type = mmap\nmax_connections = 20\n",
+                root.join("uds").display())).unwrap();
+            std::fs::write(data.join("pg_hba.conf"), "local all desktop_admin scram-sha-256\nlocal all all reject\nlocal replication all reject\n").unwrap();
+            std::fs::write(data.join("pg_ident.conf"), "").unwrap();
+            std::fs::write(data.join("postgresql.auto.conf"), "").unwrap();
+            let child = std::process::Command::new(bin.join("postgres"))
+                .arg("-D")
+                .arg(&data)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut owned = Self {
+                root,
+                child,
+                password,
+                system_identifier: String::new(),
+                database_oid: 0,
+            };
+            let ready = Instant::now() + Duration::from_secs(20);
+            while !std::fs::read_to_string(owned.data().join("postmaster.pid"))
+                .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"))
+            {
+                assert!(Instant::now() < ready, "candidate readiness");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            owned.connect("postgres").await
+                .batch_execute("CREATE DATABASE openbot WITH OWNER=desktop_admin TEMPLATE=template0 ENCODING='UTF8' LC_COLLATE='C' LC_CTYPE='C'")
+                .await.unwrap();
+            let mut client = owned.client().await;
+            baseline::apply(&client).await.unwrap();
+            native::apply_through(&mut client, version).await.unwrap();
+            client.execute(
+                "INSERT INTO openbot_internal.desktop_vault_canaries(dataset_id,deployment_id,tenant_id,key_id,key_version,canary_schema,encrypted_canary) VALUES($1,$2,$3,repeat('a',32),1,1,'owned')",
+                &[&DATASET, &DEP, &TENANT]).await.unwrap();
+            client.batch_execute(seed).await.unwrap();
+            let row = client.query_one(
+                "SELECT (SELECT system_identifier::text FROM pg_control_system()),(SELECT oid FROM pg_database WHERE datname='openbot')", &[]).await.unwrap();
+            owned.system_identifier = row.get(0);
+            owned.database_oid = row.get(1);
+            owned
+        }
+
+        pub(super) fn data(&self) -> PathBuf {
+            self.root.join("data")
+        }
+
+        pub(super) fn uds(&self) -> PathBuf {
+            self.root.join("uds")
+        }
+
+        async fn connect(&self, database: &str) -> tokio_postgres::Client {
+            let mut config = tokio_postgres::Config::new();
+            config
+                .host_path(self.uds())
+                .port(5432)
+                .user("desktop_admin")
+                .dbname(database)
+                .password(self.password.as_str());
+            let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+            tokio::spawn(connection);
+            client
+        }
+
+        /// An independent administrative connection to the business database.
+        pub(super) async fn client(&self) -> tokio_postgres::Client {
+            self.connect("openbot").await
+        }
+
+        pub(super) fn identity(&self) -> CandidateProgramIdentity {
+            let startup = wrok_bot_macos_process::ProcessIdentity::capture(self.child.id())
+                .unwrap()
+                .evidence_bytes()
+                .unwrap();
+            let bin = PathBuf::from(std::env::var_os("OPENBOT_TEST_PG_BIN").unwrap());
+            CandidateProgramIdentity::new(
+                startup,
+                std::fs::File::open(bin.join("postgres")).unwrap(),
+                std::fs::File::open(self.data()).unwrap(),
+                self.data(),
+            )
+        }
+
+        pub(super) fn pid(&self) -> u32 {
+            self.child.id()
+        }
+
+        pub(super) fn scram(&self) -> SecretBytes {
+            SecretBytes::new(self.password.as_bytes().to_vec())
+        }
+    }
+
+    /// One real restore claim with a profile large enough for the candidate stages.
+    pub(super) struct Claimed {
+        pub(super) session: RestoreControlSession,
+        _control: RecoveryControl,
+        pub(super) fixture: RestoreEntryFixture,
+    }
+
+    pub(super) fn claim() -> Claimed {
+        let mut fixture = RestoreEntryFixture::new();
+        let capacity = &mut fixture.profile.capacity;
+        // Each guarded checkout carries exactly one transaction, plus the bind.
+        capacity.max_pg_connections = 65;
+        capacity.max_pg_transactions = 64;
+        capacity.max_pg_rows = 1 << 20;
+        capacity.max_reconfirm_requirements = 4096;
+        capacity.max_metadata_bytes = 1 << 26;
+        capacity.max_total_allocation_bytes = 1 << 32;
+        let (mut control, intent) = fixture.open();
+        let session = control
+            .claim_restore(intent, fixture.profile.clone())
+            .unwrap();
+        Claimed {
+            session,
+            _control: control,
+            fixture,
+        }
+    }
+
+    /// Bind with the given source identity; the master is a fixed test key.
+    pub(super) async fn bind(
+        claimed: &mut Claimed,
+        pg: &OwnedCandidate,
+        system_identifier: &str,
+    ) -> Result<(), RecoveryControlFault> {
+        let master = SecretBytes::new(vec![0x41; 32]);
+        claimed
+            .session
+            .bind_candidate_from_source_before(
+                Some(pg.pid()),
+                pg.identity(),
+                &pg.uds(),
+                (system_identifier.to_owned(), pg.database_oid),
+                (&pg.scram(), &master),
+                deadline(),
+            )
+            .await
+            .map_err(|error| error.fault())
+    }
+
+    pub(super) async fn ledger(client: &tokio_postgres::Client) -> Vec<(i32, String, String)> {
+        client.query("SELECT version,name,checksum FROM openbot_internal.schema_migrations ORDER BY version", &[]).await.unwrap()
+            .iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect()
+    }
+
+    /// Public and internal relation, column and constraint facts, for prefix comparison.
+    pub(super) async fn catalog(client: &tokio_postgres::Client, namespace: &str) -> String {
+        client.query_one(
+            "SELECT coalesce(string_agg(fact, E'\\n' ORDER BY fact COLLATE \"C\"),'') FROM (
+              SELECT 'c:'||c.relname||':'||c.relkind::text AS fact FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1
+              UNION ALL SELECT 'a:'||c.relname||'.'||a.attname||':'||format_type(a.atttypid,a.atttypmod)||':'||a.attnotnull FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND a.attnum>0 AND NOT a.attisdropped
+              UNION ALL SELECT 'k:'||c.relname||'.'||k.conname||':'||pg_get_constraintdef(k.oid) FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1
+              UNION ALL SELECT 't:'||c.relname||'.'||t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND NOT t.tgisinternal
+              UNION ALL SELECT 'p:'||p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1) facts",
+            &[&namespace]).await.unwrap().get(0)
+    }
+}
+
+/// INF-W cases on a real bound candidate (task card section 5.1, T046-21a/22/23).
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod candidate {
+    use super::candidate_fixture::{
+        DATASET, DEP, OwnedCandidate, TENANT, bind, catalog, claim, deadline, ledger,
+    };
+    use crate::db::native;
+    use crate::recovery_control::RecoveryControlFault;
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
+    async fn t046_21_strict_52_or_53_to_54_single_migration_keeps_prefix_and_fixtures() {
+        let reference = OwnedCandidate::start(53, "").await;
+        let reference_client = reference.client().await;
+        let public53 = catalog(&reference_client, "public").await;
+        let internal53 = catalog(&reference_client, "openbot_internal").await;
+        for version in [52, 53] {
+            let pg = OwnedCandidate::start(version, "").await;
+            let client = pg.client().await;
+            let before = ledger(&client).await;
+            let mut claimed = claim();
+            bind(&mut claimed, &pg, &pg.system_identifier)
+                .await
+                .unwrap();
+            claimed
+                .session
+                .upgrade_candidate_schema_before(deadline())
+                .await
+                .unwrap();
+            let after = ledger(&client).await;
+            // Every registered prior row is byte-identical; only the missing
+            // increments were appended, each with its checksum from the SQL bytes.
+            assert_eq!(after.len(), native::NATIVE_MIGRATION_COUNT);
+            assert_eq!(&after[..before.len()], &before[..]);
+            let appended: Vec<_> = after[before.len()..].iter().map(|row| row.0).collect();
+            assert_eq!(
+                appended,
+                if version == 52 {
+                    vec![53, 54]
+                } else {
+                    vec![54]
+                }
+            );
+            assert_eq!(
+                after[after.len() - 2],
+                (
+                    native::NATIVE_0053_VERSION,
+                    native::NATIVE_0053_NAME.to_owned(),
+                    native::native_0053_checksum()
+                )
+            );
+            assert_eq!(
+                after[after.len() - 1],
+                (
+                    native::NATIVE_0054_VERSION,
+                    native::NATIVE_0054_NAME.to_owned(),
+                    native::native_0054_checksum()
+                )
+            );
+            // Public facts after the upgrade equal the registered 0053 layout:
+            // 0054 adds no public relation, column, constraint or trigger.
+            assert_eq!(catalog(&client, "public").await, public53);
+            let internal = catalog(&client, "openbot_internal").await;
+            let added: Vec<&str> = internal
+                .lines()
+                .filter(|fact| !internal53.lines().any(|old| old == *fact))
+                .collect();
+            assert!(
+                internal53
+                    .lines()
+                    .all(|fact| internal.lines().any(|new| new == fact)),
+                "0054 keeps every 0053 internal fact"
+            );
+            for table in [
+                "restore_pg_operations",
+                "restore_pg_batches",
+                "restore_reconfirm_requirements",
+                "restore_reconfirm_receipts",
+                "restore_pg_seals",
+                "server_kek_canaries",
+            ] {
+                assert!(added.contains(&format!("c:{table}:r").as_str()), "{table}");
+            }
+            // The independent registered oracle accepts the actual catalog.
+            crate::db::restore_reconfirmation_schema::verify_schema(&client)
+                .await
+                .unwrap();
+            // The migration inserts no operation, cleanup, reconfirmation or Current fact.
+            let facts: i64 = client.query_one("SELECT (SELECT count(*) FROM openbot_internal.restore_pg_operations)+(SELECT count(*) FROM openbot_internal.restore_pg_batches)+(SELECT count(*) FROM openbot_internal.restore_reconfirm_requirements)+(SELECT count(*) FROM openbot_internal.restore_reconfirm_receipts)+(SELECT count(*) FROM openbot_internal.restore_pg_seals)", &[]).await.unwrap().get(0);
+            assert_eq!(facts, 0);
+        }
+        let _ = (DATASET, DEP, TENANT);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
+    async fn t046_22_strict_54_source_and_same_operation_reentry_are_read_only() {
+        // A current source is only observed, in a read-only transaction, and a
+        // same-operation repeat observes again without any new row.
+        let pg = OwnedCandidate::start(native::NATIVE_0054_VERSION, "").await;
+        let client = pg.client().await;
+        let before = (
+            ledger(&client).await,
+            catalog(&client, "openbot_internal").await,
+            catalog(&client, "public").await,
+        );
+        let mut claimed = claim();
+        bind(&mut claimed, &pg, &pg.system_identifier)
+            .await
+            .unwrap();
+        claimed
+            .session
+            .upgrade_candidate_schema_before(deadline())
+            .await
+            .unwrap();
+        claimed
+            .session
+            .upgrade_candidate_schema_before(deadline())
+            .await
+            .unwrap();
+        assert_eq!(
+            before,
+            (
+                ledger(&client).await,
+                catalog(&client, "openbot_internal").await,
+                catalog(&client, "public").await
+            )
+        );
+
+        // A 51 prefix is not a supported source.
+        let pg = OwnedCandidate::start(51, "").await;
+        let mut claimed = claim();
+        assert_eq!(
+            bind(&mut claimed, &pg, &pg.system_identifier).await,
+            Err(RecoveryControlFault::InputInvalid)
+        );
+
+        // An extra internal object on a 53 source fails the strict layout and
+        // its upgrade transaction leaves the ledger untouched.
+        let pg = OwnedCandidate::start(53, "CREATE TABLE openbot_internal.owned_extra(id integer)")
+            .await;
+        let client = pg.client().await;
+        let before = ledger(&client).await;
+        let mut claimed = claim();
+        bind(&mut claimed, &pg, &pg.system_identifier)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed
+                .session
+                .upgrade_candidate_schema_before(deadline())
+                .await
+                .err()
+                .map(|e| e.fault()),
+            Some(RecoveryControlFault::InputInvalid)
+        );
+        assert_eq!(ledger(&client).await, before);
+
+        // Identity branch: another system identifier is not this source's candidate.
+        let pg = OwnedCandidate::start(53, "").await;
+        let mut claimed = claim();
+        assert_eq!(
+            bind(&mut claimed, &pg, "1").await,
+            Err(RecoveryControlFault::InputInvalid)
+        );
+        assert!(
+            claimed
+                .session
+                .upgrade_candidate_schema_before(deadline())
+                .await
+                .is_err()
+        );
+        // Identity branch: a database without the expected business canary.
+        let pg =
+            OwnedCandidate::start(53, "DELETE FROM openbot_internal.desktop_vault_canaries").await;
+        let mut claimed = claim();
+        assert_eq!(
+            bind(&mut claimed, &pg, &pg.system_identifier).await,
+            Err(RecoveryControlFault::InputInvalid)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
+    async fn t046_23_restore_tables_enforce_triggers_fk_immutability_acl_and_catalog() {
+        let pg = OwnedCandidate::start(53, "INSERT INTO public.users(id,email,auth_generation) VALUES('restore-actor','restore-actor@example.test',3)").await;
+        let mut claimed = claim();
+        bind(&mut claimed, &pg, &pg.system_identifier)
+            .await
+            .unwrap();
+        claimed
+            .session
+            .upgrade_candidate_schema_before(deadline())
+            .await
+            .unwrap();
+        claimed
+            .session
+            .retire_cohort_before(deadline())
+            .await
+            .unwrap();
+        let client = pg.client().await;
+        let refused = |sql: &'static str| {
+            let client = &client;
+            async move {
+                client.batch_execute("BEGIN").await.unwrap();
+                let error = client
+                    .batch_execute(sql)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("accepted: {sql}"));
+                client.batch_execute("ROLLBACK").await.unwrap();
+                let db = error.as_db_error().unwrap_or_else(|| panic!("{sql}"));
+                (db.code().code().to_owned(), db.message().to_owned())
+            }
+        };
+        for table in [
+            "restore_pg_operations",
+            "restore_pg_batches",
+            "restore_reconfirm_requirements",
+            "restore_pg_seals",
+        ] {
+            for sql in [
+                format!("UPDATE openbot_internal.{table} SET epoch=epoch"),
+                format!("DELETE FROM openbot_internal.{table}"),
+                format!("TRUNCATE openbot_internal.{table} CASCADE"),
+            ] {
+                let sql: &'static str = Box::leak(sql.into_boxed_str());
+                assert_eq!(
+                    refused(sql).await,
+                    ("55000".to_owned(), "restore_pg_facts_immutable".to_owned()),
+                    "{sql}"
+                );
+            }
+        }
+        // Receipts have no row before reconfirmation; TRUNCATE is still refused.
+        assert_eq!(
+            refused("TRUNCATE openbot_internal.restore_reconfirm_receipts")
+                .await
+                .0,
+            "55000"
+        );
+        // A batch for an operation that does not exist is refused.
+        let (code, _) = refused("INSERT INTO openbot_internal.restore_pg_batches(operation_id,epoch,batch_seq,action,affected_count,remaining_count) VALUES(gen_random_uuid(),decode(repeat('11',32),'hex'),1,'sessions_retired',0,0)").await;
+        assert!(code == "23503" || code == "55000", "{code}");
+        // An out-of-closed-set action is refused by its check.
+        let (code, _) = refused("INSERT INTO openbot_internal.restore_pg_batches(operation_id,epoch,batch_seq,action,affected_count,remaining_count) SELECT operation_id,epoch,1000,'unknown_action',0,0 FROM openbot_internal.restore_pg_operations").await;
+        assert!(code == "23514" || code == "55000", "{code}");
+        // PUBLIC holds no privilege on any of the six tables.
+        let public: i64 = client.query_one(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace, aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a
+             WHERE n.nspname='openbot_internal' AND a.grantee=0 AND c.relname IN ('restore_pg_operations','restore_pg_batches','restore_reconfirm_requirements','restore_reconfirm_receipts','restore_pg_seals','server_kek_canaries')", &[]).await.unwrap().get(0);
+        assert_eq!(public, 0);
+        // server_kek_canaries closed checks and its key.
+        for sql in [
+            "INSERT INTO openbot_internal.server_kek_canaries(deployment_id,tenant_id,dataset_id,key_id,encrypted_canary) VALUES('d','t','not-hex',repeat('a',32),'c')",
+            "INSERT INTO openbot_internal.server_kek_canaries(deployment_id,tenant_id,dataset_id,key_id,encrypted_canary) VALUES('d','t',repeat('a',32),'short','c')",
+            "INSERT INTO openbot_internal.server_kek_canaries(deployment_id,tenant_id,dataset_id,key_id,encrypted_canary) VALUES('d','t',repeat('a',32),repeat('a',32),repeat('c',4097))",
+        ] {
+            assert_eq!(refused(sql).await.0, "23514", "{sql}");
+        }
+        assert_eq!(refused("INSERT INTO openbot_internal.server_kek_canaries(deployment_id,tenant_id,dataset_id,key_id,encrypted_canary) VALUES('d','t',repeat('a',32),repeat('a',32),'c'),('d','t',repeat('b',32),repeat('b',32),'c')").await.0, "23505");
+        // The actual catalog equals the registered 0054 fixture.
+        crate::db::restore_reconfirmation_schema::verify_schema(&client)
+            .await
+            .unwrap();
+    }
+}
+
+/// INF-R cases on a real bound candidate (task card section 5.1, T046-24/26/39).
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod retirement {
+    use super::RestoredClosedHistoryRequest;
+    use super::candidate_fixture::{Claimed, DEP, OwnedCandidate, TENANT, bind, claim, deadline};
+    use crate::db::native;
+    use std::time::{Duration, Instant};
+
+    const SUBJECTS: &str = "INSERT INTO public.users(id,email,auth_generation) SELECT 'restore-user-'||lpad(i::text,3,'0'),'u'||i||'@example.test',CASE WHEN i%3=0 THEN NULL ELSE i%5 END FROM generate_series(1,70) i;
+INSERT INTO public.sessions(id,user_id,token,expires_at) SELECT 'restore-session-'||i,'restore-user-001','token-'||i,now()+interval '1 day' FROM generate_series(1,5) i;
+INSERT INTO public.verifications(id,identifier,value,expires_at) SELECT 'restore-verification-'||i,'state','private',now()+interval '1 hour' FROM generate_series(1,3) i;";
+
+    const ACTOR_SEED: &str = "INSERT INTO public.users(id,email,auth_generation) VALUES('restore-actor','restore-actor@example.test',7);
+INSERT INTO public.user_roles(user_id,role) VALUES('restore-actor','user');
+INSERT INTO public.agents(id,name,type,configuration) VALUES('restore-bot','Owned bot','built_in','{}');
+INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility) VALUES('restore-bot','restore-actor','Owned bot','','seed','public');";
+
+    fn journal(claimed: &Claimed) -> String {
+        let path = claimed
+            .fixture
+            .directory
+            .join("com.acosmi.wrokbot.restore-control/operations")
+            .join(claimed.session.operation_id())
+            .join("journal-v1");
+        String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned()
+    }
+
+    async fn upgraded(pg: &OwnedCandidate) -> Claimed {
+        let mut claimed = claim();
+        bind(&mut claimed, pg, &pg.system_identifier).await.unwrap();
+        claimed
+            .session
+            .upgrade_candidate_schema_before(deadline())
+            .await
+            .unwrap();
+        claimed
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
+    async fn t046_24_retirement_batches_count_remaining_seal_and_rollback_unknown() {
+        let pg = OwnedCandidate::start(53, SUBJECTS).await;
+        let client = pg.client().await;
+        let generations: Vec<(String, Option<i64>)> = client
+            .query(
+                "SELECT id,auth_generation FROM public.users ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let mut claimed = upgraded(&pg).await;
+        claimed
+            .session
+            .retire_cohort_before(deadline())
+            .await
+            .unwrap();
+        // Each class's affected counts are the RETURNING counts; the last batch
+        // of each class has no residual row.
+        let totals: Vec<(String, i64, i64, i64)> = client.query(
+            "SELECT action,count(*),sum(affected_count)::bigint,(array_agg(remaining_count ORDER BY batch_seq DESC))[1] FROM openbot_internal.restore_pg_batches GROUP BY action ORDER BY min(batch_seq)", &[]).await.unwrap()
+            .iter().map(|row| (row.get(0), row.get(1), row.get(2), row.get(3))).collect();
+        let expect = |action: &str, batches: i64, affected: i64| {
+            assert!(
+                totals.contains(&(action.to_owned(), batches, affected, 0)),
+                "{action}: {totals:?}"
+            );
+        };
+        expect("auth_generation", 2, 70);
+        expect("sessions_retired", 1, 5);
+        expect("approvals_cancelled", 1, 0);
+        expect("human_decisions_cancelled", 1, 0);
+        expect("leases_expired", 1, 0);
+        expect("capabilities_aborted", 1, 0);
+        expect("oauth_states_retired", 1, 3);
+        expect("callback_registrations_retired", 1, 0);
+        expect("remote_interrupts_expired", 1, 0);
+        expect("subject_requirements", 2, 70);
+        expect("credential_requirements", 1, 0);
+        // Every user advanced exactly once, including null and positive generations.
+        let after: Vec<(String, Option<i64>)> = client
+            .query(
+                "SELECT id,auth_generation FROM public.users ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        for ((id, before), (same, now)) in generations.iter().zip(&after) {
+            assert_eq!(id, same);
+            assert_eq!(*now, Some(before.unwrap_or(0) + 1));
+        }
+        let (sessions, verifications): (i64, i64) = {
+            let row = client.query_one("SELECT (SELECT count(*) FROM public.sessions),(SELECT count(*) FROM public.verifications)", &[]).await.unwrap();
+            (row.get(0), row.get(1))
+        };
+        assert_eq!((sessions, verifications), (0, 0));
+        let seal = client.query_one(
+            "SELECT s.batches,s.subject_requirements,s.credential_requirements,(SELECT count(*) FROM openbot_internal.restore_pg_batches) FROM openbot_internal.restore_pg_seals s", &[]).await.unwrap();
+        assert_eq!(
+            (
+                seal.get::<_, i64>(0),
+                seal.get::<_, i64>(1),
+                seal.get::<_, i64>(2)
+            ),
+            (seal.get::<_, i64>(3), 70, 0)
+        );
+        // One timely COMMIT disposition per batch, plus the upgrade, the
+        // operation row and the seal; each in its own journal stage.
+        let batches: i64 = seal.get(3);
+        assert_eq!(
+            journal(&claimed).matches("TimelyAck").count() as i64,
+            batches + 3
+        );
+        // Same-operation re-entry is an observation, not a second retirement.
+        claimed
+            .session
+            .retire_cohort_before(deadline())
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT count(*) FROM openbot_internal.restore_pg_batches",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            batches
+        );
+
+        // A backend terminated before COMMIT leaves an unproven rollback and the
+        // same operation never replays the batch.
+        let pg = OwnedCandidate::start(53, SUBJECTS).await;
+        let client = pg.client().await;
+        let blocker = pg.client().await;
+        let mut claimed = upgraded(&pg).await;
+        blocker
+            .batch_execute("BEGIN; LOCK TABLE public.sessions IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let terminate = async {
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                let waiting = client.query(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='wrokbot_restore_candidate' AND wait_event_type='Lock'", &[]).await.unwrap();
+                if !waiting.is_empty() {
+                    break;
+                }
+                assert!(Instant::now() < until, "candidate batch never waited");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let (retired, ()) =
+            tokio::join!(claimed.session.retire_cohort_before(deadline()), terminate);
+        blocker.batch_execute("ROLLBACK").await.unwrap();
+        assert!(retired.is_err());
+        assert!(journal(&claimed).contains("RollbackUnproven"));
+        let count = "SELECT (SELECT count(*) FROM openbot_internal.restore_pg_batches WHERE action='sessions_retired'),(SELECT count(*) FROM public.sessions)";
+        let row = client.query_one(count, &[]).await.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (0, 5));
+        assert!(
+            claimed
+                .session
+                .retire_cohort_before(deadline())
+                .await
+                .is_err()
+        );
+        let row = client.query_one(count, &[]).await.unwrap();
+        assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (0, 5));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
+    async fn t046_26_pending_approvals_decisions_leases_and_capability_attempts_retire() {
+        let seed = format!("{ACTOR_SEED}
+INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,status) VALUES('restore-thread','{TENANT}','{DEP}','restore-actor','direct_bot','restore-bot','active');
+INSERT INTO public.thread_memberships(thread_id,user_id) VALUES('restore-thread','restore-actor');
+INSERT INTO public.runs(run_id,thread_id,bot_id,actor_id,foreground,status,fencing_token,started_at) VALUES('restore-run','restore-thread','restore-bot','restore-actor',true,'running',1,clock_timestamp());
+INSERT INTO public.thread_leases(thread_id,owner_id,fencing_token,acquired_at,expires_at,updated_at) VALUES('restore-thread','runtime',1,clock_timestamp(),clock_timestamp()+interval '10 minutes',clock_timestamp());
+INSERT INTO public.tool_approvals(approval_id,tool_call_id,deployment_id,tenant_id,thread_id,run_id,actor_id,bot_id,auth_generation,tool_name,args_hash,target_kind,target_id,effect,approval_class,computer_generation,catalog_generation,policy_version,arguments_summary,change_summary,state,requested_at,expires_at,created_at,updated_at) SELECT 'restore-pending-approval','restore-call-approval','{DEP}','{TENANT}','restore-thread','restore-run','restore-actor','restore-bot',7,'computer.write',repeat('a',64),'thread','restore-thread','write','every_call',1,1,repeat('b',64),'{{\"summary\":\"private\"}}','{{\"summary\":\"private\"}}','pending',now(),now()+interval '1 hour',now(),now();
+INSERT INTO public.components(name,title,kind,draft_description,published_description,published,published_at,updated_by,created_at,updated_at) VALUES('askApproval','Ask approval','decision','Owned test decision','Owned test decision',true,now(),'owned-test',now(),now());
+INSERT INTO public.component_human_decisions(decision_id,deployment_id,tenant_id,thread_id,run_id,actor_id,bot_id,auth_generation,provider_call_id,component_name,arguments,arguments_hash,state,answer,requested_at,expires_at,resolved_at,resolved_by,created_at,updated_at) VALUES
+ ('restore-pending-decision','{DEP}','{TENANT}','restore-thread','restore-run','restore-actor','restore-bot',7,'restore-provider-pending','askApproval','{{\"title\":\"private\"}}',repeat('a',64),'pending',NULL,now(),now()+interval '1 hour',NULL,NULL,now(),now()),
+ ('restore-answered-decision','{DEP}','{TENANT}','restore-thread','restore-run','restore-actor','restore-bot',7,'restore-provider-answered','askApproval','{{\"title\":\"private\"}}',repeat('a',64),'answered','{{\"decision\":\"approved\"}}',now(),now()+interval '1 hour',now(),'restore-actor',now(),now());
+INSERT INTO public.tool_calls(tool_call_id,run_id,call_seq,decision_id,actor_id,bot_id,tool_name,schema_hash,catalog_generation,args_hash,target_kind,target_id,effect,effect_downgraded,idempotency,idempotency_key,approval_class,policy_version)
+ SELECT 'restore-call-'||i,'restore-run',i,'restore-decision-'||i,'restore-actor','restore-bot','remember',repeat('a',64),1,repeat('b',64),'memory_user','restore-actor','write',false,'non_idempotent',NULL,'not_required',repeat('c',64) FROM generate_series(0,1) i;
+INSERT INTO public.tool_attempts(tool_call_id,attempt_seq,attempt_id,capability_id,status,commit_state,started_at,finished_at) VALUES
+ ('restore-call-0',0,'restore-attempt-0','restore-capability-0','executing',NULL,now(),NULL),
+ ('restore-call-1',0,'restore-attempt-1','restore-capability-1','completed','committed',now(),now());");
+        let pg = OwnedCandidate::start(53, &seed).await;
+        let client = pg.client().await;
+        let history = "SELECT (SELECT row_to_json(d)::text FROM public.component_human_decisions d WHERE decision_id='restore-answered-decision'),(SELECT row_to_json(a)::text FROM public.tool_attempts a WHERE tool_call_id='restore-call-1')";
+        let before = client.query_one(history, &[]).await.unwrap();
+        let before: (String, String) = (before.get(0), before.get(1));
+        let mut claimed = upgraded(&pg).await;
+        claimed
+            .session
+            .retire_cohort_before(deadline())
+            .await
+            .unwrap();
+        let row = client.query_one(
+            "SELECT (SELECT state FROM public.tool_approvals WHERE approval_id='restore-pending-approval'),
+                    (SELECT state FROM public.component_human_decisions WHERE decision_id='restore-pending-decision'),
+                    (SELECT expires_at<=clock_timestamp() FROM public.thread_leases WHERE thread_id='restore-thread'),
+                    (SELECT status FROM public.tool_attempts WHERE tool_call_id='restore-call-0')", &[]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "cancelled");
+        assert_eq!(row.get::<_, String>(1), "cancelled");
+        assert!(row.get::<_, bool>(2));
+        assert_eq!(row.get::<_, String>(3), "aborted");
+        let after = client.query_one(history, &[]).await.unwrap();
+        assert_eq!(before, (after.get(0), after.get(1)));
+        let counted: Vec<(String, i64)> = client.query(
+            "SELECT action,sum(affected_count)::bigint FROM openbot_internal.restore_pg_batches WHERE action IN ('approvals_cancelled','human_decisions_cancelled','leases_expired','capabilities_aborted') GROUP BY action ORDER BY action", &[]).await.unwrap()
+            .iter().map(|row| (row.get(0), row.get(1))).collect();
+        assert_eq!(
+            counted,
+            [
+                ("approvals_cancelled", 1),
+                ("capabilities_aborted", 1),
+                ("human_decisions_cancelled", 1),
+                ("leases_expired", 1)
+            ]
+            .map(|(a, n)| (a.to_owned(), n))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
+    async fn t046_39_closed_history_ack2_completes_and_keeps_tombstones() {
+        use crate::thread_history_authority::{
+            PostgresThreadHistoryAuthority, ThreadHistoryClearProgress,
+        };
+        use openbot_contracts::ids::{DeploymentId, TenantId};
+        // The ordinary authority observes this binary's full native layout.
+        let pg = OwnedCandidate::start(54, ACTOR_SEED).await;
+        let client = pg.client().await;
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let thread = uuid::Uuid::now_v7().to_string();
+            client.batch_execute("BEGIN").await.unwrap();
+            client.execute("INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,title,next_message_seq,next_event_seq) VALUES($1,$2,$3,'restore-actor','direct_bot','restore-bot','Owned title',0,0)", &[&thread, &TENANT, &DEP]).await.unwrap();
+            client
+                .batch_execute("SET CONSTRAINTS ALL IMMEDIATE; COMMIT")
+                .await
+                .unwrap();
+            client.execute("INSERT INTO public.messages(message_id,thread_id,seq,role,content,search_text,actor_id) VALUES($1,$2,0,'user','{\"text\":\"Owned body\"}','Owned body','restore-actor')", &[&format!("restore-message-{thread}"), &thread]).await.unwrap();
+            let operation = uuid::Uuid::now_v7().to_string();
+            client
+                .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+                .await
+                .unwrap();
+            let at: time::OffsetDateTime = client
+                .query_one("SELECT clock_timestamp()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            client.execute("INSERT INTO openbot_internal.thread_history_clear_intents(deployment_id,tenant_id,thread_id,intent_schema,intent_kind,operation_id,request_id,actor_id,auth_generation,anchor_kind,anchor_id,thread_created_at,recorded_at) SELECT deployment_id,tenant_id,thread_id,1,'stop_clear',$2,$3,'restore-actor',7,anchor_kind,anchor_id,thread_created_at,$4 FROM openbot_internal.thread_history_heads WHERE thread_id=$1", &[&thread, &operation, &uuid::Uuid::now_v7().to_string(), &at]).await.unwrap();
+            client.execute("UPDATE openbot_internal.thread_history_heads SET phase='closed',closure_operation_id=$2,closure_request_id=(SELECT request_id FROM openbot_internal.thread_history_clear_intents WHERE operation_id=$2),closure_actor_id='restore-actor',closure_auth_generation=7,closed_at=$3 WHERE thread_id=$1", &[&thread, &operation, &at]).await.unwrap();
+            client
+                .batch_execute("SET CONSTRAINTS ALL IMMEDIATE; COMMIT")
+                .await
+                .unwrap();
+            threads.push((thread, operation));
+        }
+        // The second thread already completed before capture, with the same
+        // historical audit key the candidate derives from its master.
+        let config = crate::db::pool::DatabaseConfig::new(
+            pg.uds().to_str().unwrap(),
+            5432,
+            "desktop_admin",
+            "openbot",
+        )
+        .with_password(std::str::from_utf8(pg.scram().expose()).unwrap());
+        let pool = crate::db::pool::connect(&config).await.unwrap();
+        let authority = std::sync::Arc::new(
+            PostgresThreadHistoryAuthority::new(
+                pool.clone(),
+                DeploymentId::new(DEP),
+                TenantId::new(TENANT),
+            )
+            .unwrap(),
+        );
+        authority
+            .enroll_clear_audit_checkpoint_key(
+                openbot_domain::vault::derive_application_key(
+                    &openbot_domain::vault::SecretBytes::new(vec![0x41; 32]),
+                    openbot_domain::vault::ApplicationKeyPurpose::AuditCheckpoint,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let progress = authority
+            .clear_closed_history_before(&threads[1].0, deadline())
+            .await
+            .unwrap();
+        assert!(
+            matches!(progress, ThreadHistoryClearProgress::Completed { ref operation_id } if *operation_id == threads[1].1),
+            "{progress:?}"
+        );
+        drop(authority);
+        pool.close();
+        let tombstone = "SELECT row_to_json(c)::text FROM openbot_internal.thread_history_clear_completions c WHERE thread_id=$1";
+        let kept: String = client
+            .query_one(tombstone, &[&threads[1].0])
+            .await
+            .unwrap()
+            .get(0);
+
+        let mut claimed = upgraded(&pg).await;
+        claimed
+            .session
+            .retire_cohort_before(deadline())
+            .await
+            .unwrap();
+        let observation = claimed
+            .session
+            .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (observation.completed(), observation.already_completed()),
+            (1, 1)
+        );
+        let completed = client.query_one(
+            "SELECT operation_id,(SELECT count(*) FROM public.messages WHERE thread_id=$1 AND (content<>'{\"text\":\"\",\"retained\":false}'::jsonb OR search_text<>'')) FROM openbot_internal.thread_history_clear_completions WHERE thread_id=$1", &[&threads[0].0]).await.unwrap();
+        assert_eq!(completed.get::<_, String>(0), threads[0].1);
+        // The original algorithm keeps message rows and erases their bodies.
+        assert_eq!(completed.get::<_, i64>(1), 0);
+        assert_eq!(
+            client
+                .query_one(tombstone, &[&threads[1].0])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+            kept
+        );
+        // A repeated ACK2 is the same observation and writes nothing.
+        let rows = "SELECT (SELECT count(*) FROM openbot_internal.thread_history_clear_completions)+(SELECT count(*) FROM openbot_internal.thread_history_clear_batches)";
+        let before: i64 = client.query_one(rows, &[]).await.unwrap().get(0);
+        assert_eq!(
+            claimed
+                .session
+                .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline()))
+                .await
+                .unwrap(),
+            observation
+        );
+        assert_eq!(
+            client.query_one(rows, &[]).await.unwrap().get::<_, i64>(0),
+            before
+        );
+        let _ = native::NATIVE_0054_VERSION;
+    }
+}

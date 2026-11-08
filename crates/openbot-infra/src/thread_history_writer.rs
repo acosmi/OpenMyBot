@@ -31,6 +31,38 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
         Ok(Self { tx })
     }
 
+    /// Owned bytes [`Self::observe`] allocates on this transaction: the ledger
+    /// rows, the origin and writer payloads (each observed twice by the chain)
+    /// and the restore catalog payload, measured before observing. Parsed JSON
+    /// trees are derived from these already-measured payloads.
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    pub(crate) async fn observation_bytes(tx: &'t Transaction<'c>) -> Result<u64, InfraError> {
+        let ledger: i64 = tx
+            .query_one(
+                "SELECT coalesce(sum(octet_length(name)+octet_length(checksum)),0)::bigint FROM openbot_internal.schema_migrations",
+                &[],
+            )
+            .await
+            .map_err(|source| InfraError::query("measure native ledger observation", source))?
+            .try_get(0)
+            .map_err(|source| RowDecodeError::column("(schema_migrations)", "bytes", source))?;
+        let origin = crate::db::thread_origin_schema::observation_bytes_in_transaction(tx).await?;
+        let writer =
+            crate::db::thread_history_writer_schema::observation_bytes_in_transaction(tx).await?;
+        let restore =
+            crate::db::restore_reconfirmation_schema::observation_bytes_in_transaction(tx).await?;
+        u64::try_from(ledger)
+            .ok()
+            .and_then(|ledger| {
+                origin
+                    .checked_add(writer)?
+                    .checked_mul(2)?
+                    .checked_add(restore)?
+                    .checked_add(ledger)
+            })
+            .ok_or_else(|| InfraError::repository_invariant("thread_history_writer_schema_bytes"))
+    }
+
     /// The original transaction this proof was observed on.
     #[cfg(feature = "server-runtime")]
     pub(crate) fn transaction(&self) -> &'t Transaction<'c> {

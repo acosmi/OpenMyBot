@@ -9,7 +9,9 @@ use std::pin::Pin;
 use std::time::Instant;
 use zeroize::Zeroizing;
 
-use openbot_infra::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging;
+use openbot_infra::backup::whole_pg_restore_stream::{
+    CandidateProgramIdentity, VerifiedWholePgRestoreStaging,
+};
 use openbot_infra::recovery_control::{
     RecoveryControlError, RestoreCandidateIsolationInput, RestoreCapacityReservation, RestoreCapacityResource, RestoreControlSession, RestoreNewChildKind,
     RestoreStorageKind,
@@ -19,6 +21,7 @@ use rustix::fs::{Mode, OFlags};
 use crate::postgres_maintenance::MaintenanceError;
 use crate::postgres_maintenance::clock::OperationClock;
 use crate::postgres_maintenance::runner::{self, RestoreProgramFailure, RestoreProgramOwner, RestoreProgramResult};
+use crate::postgres_sidecar::VerifiedPostgresBundle;
 
 use super::DesktopRestoreError;
 
@@ -466,6 +469,179 @@ impl CandidateGeneration {
         })();
         if let Err(fault) = result { self.first_fault.get_or_insert(fault); }
         result
+    }
+
+    /// Start the authenticated `postgres` under the original restore sandbox
+    /// on this generation (spec revision R484 ¶7968–7970). Unsupported or
+    /// refused isolation stays IsolationUnproven; there is no fallback.
+    pub(super) fn start_postgres(
+        &mut self,
+        session: &mut RestoreControlSession,
+        bundle: &VerifiedPostgresBundle,
+    ) -> Result<(), DesktopRestoreError> {
+        if !self.prepared || self.program.is_some() || self.first_fault.is_some() {
+            return Err(DesktopRestoreError::EntryInvalid);
+        }
+        let result = (|| {
+            use crate::postgres_maintenance::runner::restore_isolation::{
+                Directory, ExcludedLocation, Generation, RestoreIsolationPolicy,
+            };
+            let loader_files = bundle
+                .system_loader_files()
+                .map_err(|_| DesktopRestoreError::IsolationUnproven)?;
+            let loaders: Vec<&std::path::Path> =
+                loader_files.iter().map(PathBuf::as_path).collect();
+            // Every rendered rule names one of these paths or one ancestor of
+            // them; bound the profile text by that count before rendering.
+            let policy_bytes = self
+                .paths
+                .iter()
+                .map(PathBuf::as_path)
+                .chain([bundle.root(), bundle.postgres()])
+                .chain(loaders.iter().copied())
+                .map(|path| (path.as_os_str().len() + 64) * (path.components().count() + 2))
+                .try_fold(4096_usize, usize::checked_add)
+                .ok_or(DesktopRestoreError::CapacityExceeded)?;
+            let memory = session
+                .admit_capacity(RestoreCapacityResource::MetadataBytes, policy_bytes as u64)
+                .map_err(|e| self.keep_control(e))?;
+            let isolation = self
+                .isolation
+                .as_ref()
+                .ok_or(DesktopRestoreError::EntryInvalid)?;
+            let roots = [
+                self.staging.generation_root(),
+                self.directories[1]
+                    .as_ref()
+                    .ok_or(DesktopRestoreError::EntryInvalid)?,
+                self.directories[2]
+                    .as_ref()
+                    .ok_or(DesktopRestoreError::EntryInvalid)?,
+                self.directories[3]
+                    .as_ref()
+                    .ok_or(DesktopRestoreError::EntryInvalid)?,
+                self.directories[4]
+                    .as_ref()
+                    .ok_or(DesktopRestoreError::EntryInvalid)?,
+                self.staging.materials_root(),
+            ];
+            let directory = |index: usize| Directory {
+                path: &self.paths[index],
+                original: roots[index],
+            };
+            let excluded = isolation.excluded_locations();
+            let [Some(a), Some(b), Some(c)] = excluded.map(|(original, path, component)| {
+                Some(ExcludedLocation {
+                    parent: Directory { path, original },
+                    component: component.to_str()?,
+                })
+            }) else {
+                return Err(DesktopRestoreError::IsolationUnproven);
+            };
+            let policy = RestoreIsolationPolicy::prepare(
+                Generation {
+                    root: directory(0),
+                    data: directory(1),
+                    wal: directory(2),
+                    temp: directory(3),
+                    uds: directory(4),
+                    materials: directory(5),
+                },
+                [a, b, c],
+                &loaders,
+                policy_bytes as u64,
+            )
+            .map_err(|_| DesktopRestoreError::IsolationUnproven)?;
+            let secret = std::sync::Arc::new(openbot_domain::vault::SecretBytes::new(
+                self.staging
+                    .authenticated_secrets()
+                    .postgres_scram()
+                    .expose()
+                    .to_vec(),
+            ));
+            let spool = isolation.profile().capacity.max_spool_bytes;
+            let clock = self
+                .clock
+                .as_ref()
+                .ok_or(DesktopRestoreError::EntryInvalid)?;
+            let spawned = runner::spawn_restore_program(
+                &policy,
+                bundle,
+                &[
+                    std::ffi::OsString::from("-D"),
+                    self.paths[1].clone().into_os_string(),
+                ],
+                clock,
+                secret,
+                (spool, spool, true),
+            );
+            session
+                .settle_capacity(memory, policy_bytes as u64)
+                .map_err(|e| self.keep_control(e))?;
+            match spawned {
+                Ok(owner) => {
+                    let mut original = Some(owner);
+                    self.retain_program(&mut original)
+                }
+                Err(failure) => {
+                    self.program_failure = Some(failure);
+                    Err(DesktopRestoreError::IsolationUnproven)
+                }
+            }
+        })();
+        if let Err(fault) = result {
+            self.first_fault.get_or_insert(fault);
+        }
+        result
+    }
+
+    /// Wait for the started candidate's own readiness, then bind it in the
+    /// same session: same Child, held data directory and private UDS.
+    pub(super) async fn bind_postgres(
+        &mut self,
+        session: &mut RestoreControlSession,
+        bundle: &VerifiedPostgresBundle,
+    ) -> Result<(), DesktopRestoreError> {
+        let original = self
+            .program
+            .as_ref()
+            .ok_or(DesktopRestoreError::EntryInvalid)?;
+        let startup = original
+            .original_identity()
+            .as_ref()
+            .map_err(|_| DesktopRestoreError::IsolationUnproven)?
+            .evidence_bytes()
+            .map_err(|_| DesktopRestoreError::IsolationUnproven)?;
+        let child_id = original.original_child().id();
+        let deadline = self.effect()?;
+        // PG17 writes "ready" as line 8 of postmaster.pid once it accepts
+        // connections; the original wait is not polled here.
+        loop {
+            let ready = std::fs::read_to_string(self.paths[1].join("postmaster.pid"))
+                .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"));
+            if ready {
+                break;
+            }
+            self.effect()?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let program = std::fs::File::open(bundle.postgres())
+            .map_err(|_| DesktopRestoreError::IsolationUnproven)?;
+        let data = self.directories[1]
+            .as_ref()
+            .ok_or(DesktopRestoreError::EntryInvalid)?
+            .try_clone()
+            .map_err(|_| DesktopRestoreError::IoFailure)?;
+        let identity = CandidateProgramIdentity::new(startup, program, data, self.paths[1].clone());
+        let bound = session
+            .bind_candidate_before(child_id, identity, &self.paths[4], &self.staging, deadline)
+            .await;
+        if let Err(error) = bound {
+            let fault = self.keep_control(error);
+            self.first_fault.get_or_insert(fault);
+            return Err(fault);
+        }
+        Ok(())
     }
 
     pub(super) fn request_stop(&mut self) -> Result<(), DesktopRestoreError> {

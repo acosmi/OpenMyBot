@@ -201,6 +201,9 @@ impl<'a> RestoreIsolationPolicy<'a> {
             maximum: self.max_policy_bytes,
         };
         p.parts(&["(version 1)\n(deny default)\n(allow process-fork)\n(allow signal (target self))\n(allow signal (target same-sandbox))\n"])?;
+        // PG17 on macOS needs its SysV interlock segment and semaphores even
+        // with mmap shared memory; without them postmaster startup fails.
+        p.parts(&["(allow ipc-sysv-shm)\n(allow ipc-sysv-sem)\n"])?;
         // No allow-default, imported Engine policy, no-sandbox helper, IP/loopback rule,
         // Mach service or arbitrary-executable fallback is added.
         p.rule("process-exec*", "literal", executable)?;

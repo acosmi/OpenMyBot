@@ -238,6 +238,9 @@ pub struct VerifiedPostgresBundle {
     pg_ctl: PathBuf,
     manifest_sha256: [u8; 32],
     signing_identity: ReviewedPostgresSigningIdentity,
+    // The declared server program and file set, for the restore loader check.
+    #[cfg(all(feature = "postgres-maintenance", target_os = "macos"))]
+    loader_input: (String, BTreeSet<String>),
 }
 
 impl core::fmt::Debug for VerifiedPostgresBundle {
@@ -310,6 +313,8 @@ impl VerifiedPostgresBundle {
             pg_ctl,
             manifest_sha256,
             signing_identity: expected_signing_identity.clone(),
+            #[cfg(all(feature = "postgres-maintenance", target_os = "macos"))]
+            loader_input: (manifest.programs.postgres.clone(), manifest_files),
         })
     }
 
@@ -323,6 +328,22 @@ impl VerifiedPostgresBundle {
     #[must_use]
     pub fn postgres(&self) -> &Path {
         &self.postgres
+    }
+
+    /// The server program's actual Mach-O dynamic linker and system imports,
+    /// read from this verified bundle where the restore sandbox admits exactly
+    /// these loader paths (spec revision R484 ¶7970).
+    #[cfg(all(feature = "postgres-maintenance", target_os = "macos"))]
+    pub(crate) fn system_loader_files(
+        &self,
+    ) -> Result<Vec<PathBuf>, crate::postgres_maintenance::MaintenanceError> {
+        let (program, declared) = &self.loader_input;
+        let files = crate::postgres_maintenance::bundle::verify_loader(
+            &fs::File::open(&self.root)?,
+            program,
+            declared,
+        )?;
+        Ok(files.into_iter().map(PathBuf::from).collect())
     }
 
     /// Verified `initdb` executable.

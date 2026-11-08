@@ -436,6 +436,40 @@ impl ClearAuthority<'_> {
         let _ordinary = (reservation, bytes);
         Ok(())
     }
+    /// A restore candidate pays the binding row's measured text bytes (driver
+    /// row and owned copies) before [`Self::clear_binding`] allocates them.
+    async fn reserve_binding(
+        &mut self,
+        tx: &Transaction<'_>,
+        thread: &ThreadId,
+        deadline: Instant,
+    ) -> Result<
+        (
+            Option<[crate::recovery_control::RestoreCapacityReservation; 2]>,
+            usize,
+        ),
+        Error,
+    > {
+        if matches!(self, Self::Ordinary(_)) {
+            return Ok((None, 0));
+        }
+        let measured = one(
+            tx,
+            deadline,
+            &format!("SELECT coalesce(sum(octet_length(operation_id)+octet_length(actor_id)+octet_length(intent_kind)),0)::bigint AS bytes FROM ({BINDING}) binding"),
+            &[&self.deployment(), &self.tenant(), &thread.as_str()],
+        )
+        .await?;
+        let bytes = usize::try_from(column::<i64>(&measured, "bytes")?)
+            .ok()
+            .and_then(|bytes| {
+                bytes
+                    .checked_mul(2)?
+                    .checked_add(std::mem::size_of::<Binding>())
+            })
+            .ok_or(Error::Unavailable)?;
+        Ok((self.reserve_memory(bytes)?, bytes))
+    }
     fn batch_bound(&self) -> usize {
         match self {
             Self::Ordinary(_) => ROW_LIMIT,
@@ -472,10 +506,25 @@ impl ClearAuthority<'_> {
     ) -> Result<Decision, Error> {
         set_timeouts(tx, deadline).await?;
         // Complete current prefix/origin/writer observation, once and before any row lock.
+        // A restore candidate pays the observation's measured owned bytes first.
+        let measured = match self {
+            Self::Ordinary(_) => 0,
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { .. } => usize::try_from(
+                bounded(deadline, CurrentWriterSchema::observation_bytes(tx))
+                    .await?
+                    .map_err(schema_error)?,
+            )
+            .map_err(|_| Error::Unavailable)?,
+        };
+        let schema_memory = self.reserve_memory(measured)?;
         let schema = bounded(deadline, CurrentWriterSchema::observe(tx))
             .await?
             .map_err(schema_error)?;
+        self.settle_memory(schema_memory, measured)?;
+        let (binding_memory, binding_bytes) = self.reserve_binding(tx, thread, deadline).await?;
         let binding = self.clear_binding(tx, thread, deadline).await?;
+        self.settle_memory(binding_memory, binding_bytes)?;
         // Q is immutable metadata, but its NOWAIT row lock serializes this operation's batch
         // sequence/count preselection with other batches and completion, without a new wait edge.
         let locked = rows(tx, deadline,
@@ -623,7 +672,9 @@ impl ClearAuthority<'_> {
         }
         require_closed(schema, tx, thread, deadline).await?;
         // Separate RC statements after the possible pre-lock race, not a stale pre-lock answer.
+        let (binding_memory, binding_bytes) = self.reserve_binding(tx, thread, deadline).await?;
         let fresh = self.clear_binding(tx, thread, deadline).await?;
+        self.settle_memory(binding_memory, binding_bytes)?;
         if fresh.operation_id != binding.operation_id {
             return Err(corrupt("history_binding"));
         }

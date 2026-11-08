@@ -2489,6 +2489,178 @@ pub struct RestoreControlSession {
     target_slots: [Option<RestoreTargetSlotJournal>; 2],
 }
 
+/// The candidate stages borrow the session's stages and its separately held
+/// candidate authority (spec revision R484 ¶7972, ¶7991–8003 and ¶8092).
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+impl RestoreControlSession {
+    /// Bind the resident original candidate Child, held data directory and
+    /// private UDS to this operation, then confirm the Isolation stage.
+    pub async fn bind_candidate_before(
+        &mut self,
+        child_id: Option<u32>,
+        program: crate::backup::whole_pg_restore_stream::CandidateProgramIdentity,
+        socket_dir: &Path,
+        staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        if self.isolation_intent.is_none()
+            || staging.candidate_plan().operation_id() != self.operation_id()
+        {
+            return self.retain_failure(Err(service_invalid()));
+        }
+        let source = &staging.manifest().claim().source;
+        let secrets = staging.authenticated_secrets();
+        self.bind_candidate_from_source_before(
+            child_id,
+            program,
+            socket_dir,
+            (source.system_identifier.clone(), source.database_oid),
+            (secrets.postgres_scram(), secrets.historical_master()),
+            deadline,
+        )
+        .await
+    }
+
+    /// The same binding from the authenticated source identity and secrets.
+    /// The production entry above takes them from the verified staging.
+    pub(crate) async fn bind_candidate_from_source_before(
+        &mut self,
+        child_id: Option<u32>,
+        program: crate::backup::whole_pg_restore_stream::CandidateProgramIdentity,
+        socket_dir: &Path,
+        (system_identifier, database_oid): (String, u32),
+        (scram, master): (
+            &openbot_domain::vault::SecretBytes,
+            &openbot_domain::vault::SecretBytes,
+        ),
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let result = async {
+            if self.candidate.is_some() {
+                return Err(service_invalid());
+            }
+            let binding = {
+                let state = lock(&self.stages.owner)?;
+                let operation = state
+                    .restore_operation
+                    .as_ref()
+                    .ok_or_else(service_invalid)?;
+                let expected = &operation.intent.decoded.expected;
+                let profile = serde_json::to_vec(&operation.profile)
+                    .map_err(RecoveryControlError::from_json)?;
+                crate::backup::whole_pg_restore_stream::RestoreCandidateBinding {
+                    operation_id: uuid::Uuid::from_bytes(super::hex_array(
+                        operation.operation.as_str(),
+                    )),
+                    epoch: super::hex_array(operation.epoch.as_str()),
+                    candidate_generation: uuid::Uuid::from_bytes(super::hex_array(
+                        &operation.candidate_plan.generation_id,
+                    )),
+                    source_bundle_id: operation.intent.decoded.selection.expected_bundle_id.0,
+                    deployment_id: expected.deployment_id.clone(),
+                    tenant_id: expected.tenant_id.clone(),
+                    dataset_id: expected.dataset_id.as_str().to_owned(),
+                    source_installation_id: expected.source_installation_id.as_str().to_owned(),
+                    target_installation_id: expected.target_installation_id.as_str().to_owned(),
+                    candidate_database_oid: database_oid,
+                    pg_system_identifier: system_identifier,
+                    // The journal intent's profile digest (SHA-256 of the same bytes).
+                    profile_binding: Sha256::digest(&profile).into(),
+                    native_version: 0,
+                    // Every retirement batch is one candidate transaction.
+                    max_batches: operation.profile.capacity.max_pg_transactions,
+                    max_requirements: operation.profile.capacity.max_reconfirm_requirements,
+                }
+            };
+            let candidate = crate::backup::whole_pg_restore_stream::bind_candidate_before(
+                &mut self.stages,
+                child_id,
+                program,
+                socket_dir,
+                binding,
+                scram,
+                master,
+                deadline,
+            )
+            .await?;
+            self.candidate = Some(candidate);
+            if let Some(intent) = self.isolation_intent.take() {
+                let observed_ns =
+                    crate::backup::whole_pg_capture_stream::CaptureClockCheck::observed_ns(
+                        &self.stages,
+                    )
+                    .map_err(|_| RecoveryControlError::new(RecoveryControlFault::OwnerLost))?;
+                let closing = self.stages.convergence_deadline()?;
+                self.stages.observe_stage_before(
+                    intent,
+                    super::RestoreDisposition::TaskReturned {
+                        original_task_id: "candidate_isolation".to_owned(),
+                        observed_ns,
+                    },
+                    closing,
+                )?;
+            }
+            Ok(())
+        }
+        .await;
+        self.retain_failure(result)
+    }
+
+    /// Apply the registered increments a 52 or 53 source still needs, or
+    /// observe a 54 source read-only, on the bound candidate.
+    pub async fn upgrade_candidate_schema_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let Some(candidate) = self.candidate.as_mut() else {
+            return self.retain_failure(Err(service_invalid()));
+        };
+        let result = crate::backup::whole_pg_restore_stream::upgrade_candidate_schema_before(
+            &mut self.stages,
+            candidate,
+            deadline,
+        )
+        .await;
+        self.retain_failure(result)
+    }
+
+    /// Retire the nine restored classes in bounded batches, enumerate the
+    /// reconfirmation requirements and seal the cohort.
+    pub async fn retire_cohort_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let Some(candidate) = self.candidate.as_mut() else {
+            return self.retain_failure(Err(service_invalid()));
+        };
+        let result = crate::backup::whole_pg_restore_stream::retire_cohort_before(
+            &mut self.stages,
+            candidate,
+            deadline,
+        )
+        .await;
+        self.retain_failure(result)
+    }
+
+    /// Finish the restored closed history and its intents without completion.
+    pub async fn clear_restored_closed_history_before(
+        &mut self,
+        request: crate::backup::whole_pg_restore_stream::RestoredClosedHistoryRequest,
+    ) -> Result<
+        crate::backup::whole_pg_restore_stream::RestoreClosedHistoryObservation,
+        RecoveryControlError,
+    > {
+        let Some(candidate) = self.candidate.as_mut() else {
+            return self.retain_failure(Err(service_invalid()));
+        };
+        let result = self
+            .stages
+            .clear_restored_closed_history_before(candidate, request)
+            .await;
+        self.retain_failure(result)
+    }
+}
+
 impl Drop for RestoreControlSession {
     fn drop(&mut self) {
         let Some(candidate) = self.candidate.take() else {

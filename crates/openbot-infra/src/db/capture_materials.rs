@@ -1044,7 +1044,7 @@ pub(crate) async fn verify_restore_catalog_in_transaction(
     let context = tokio::time::timeout(
         duration,
         transaction.query_one(
-            "SELECT CASE WHEN octet_length(current_setting('search_path'))<=$1 THEN current_setting('search_path') END, CASE WHEN octet_length(current_setting('TimeZone'))<=$1 THEN current_setting('TimeZone') END",
+            "SELECT CASE WHEN octet_length(current_setting('search_path'))<=$1::bigint THEN current_setting('search_path') END, CASE WHEN octet_length(current_setting('TimeZone'))<=$1::bigint THEN current_setting('TimeZone') END",
             &[&field_limit],
         ),
     ).await.map_err(|_| CaptureSqlFailure::Database)?

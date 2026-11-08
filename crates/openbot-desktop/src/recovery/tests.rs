@@ -1090,3 +1090,398 @@ async fn t046_08_run() {
         "receipt written before exit"
     );
 }
+
+/// A task-owned generation and three excluded original locations under one
+/// short private root, an initdb'd PostgreSQL 17.11 data directory with the
+/// candidate's closed configuration, and the authenticated software bundle.
+struct SandboxFixture {
+    root: PathBuf,
+    bundle: crate::postgres_sidecar::VerifiedPostgresBundle,
+    bundle_root: PathBuf,
+    password: String,
+    paths: Vec<PathBuf>,
+    held: Vec<fs::File>,
+    parent: fs::File,
+}
+
+impl SandboxFixture {
+    const GENERATION: [&str; 6] = [
+        "gen",
+        "gen/data",
+        "gen/wal",
+        "gen/temp",
+        "gen/uds",
+        "gen/materials",
+    ];
+    const EXCLUDED: [&str; 3] = ["old-site", "control", "key-medium"];
+
+    fn new() -> Self {
+        let bin = PathBuf::from(
+            std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR")
+                .expect("OPENBOT_TEST_POSTGRES_BIN_DIR"),
+        );
+        let (bundle_root, digest) = crate::postgres_sidecar::materialize_host_postgres_bundle(&bin);
+        let bundle = crate::postgres_sidecar::VerifiedPostgresBundle::open(
+            &bundle_root,
+            digest,
+            &crate::postgres_sidecar::signing_identity(),
+        )
+        .unwrap();
+        // The UDS path must stay below PostgreSQL's 103-byte limit.
+        let root = PathBuf::from(format!(
+            "/private/tmp/wb046-{}",
+            &uuid::Uuid::now_v7().simple().to_string()[20..]
+        ));
+        DirBuilder::new().mode(0o700).create(&root).unwrap();
+        for leaf in Self::GENERATION.iter().chain(&Self::EXCLUDED) {
+            DirBuilder::new()
+                .mode(0o700)
+                .create(root.join(leaf))
+                .unwrap();
+        }
+        for leaf in Self::EXCLUDED {
+            fs::write(root.join(leaf).join("sentinel"), leaf).unwrap();
+        }
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).unwrap();
+        let password: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(root.join("pw"), &password).unwrap();
+        let status = std::process::Command::new(bin.join("initdb"))
+            .arg("-D")
+            .arg(root.join("gen/data"))
+            .args([
+                "-U",
+                "desktop_admin",
+                "--auth=scram-sha-256",
+                "-E",
+                "UTF8",
+                "--locale=C",
+            ])
+            .arg(format!("--pwfile={}", root.join("pw").display()))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::remove_file(root.join("pw")).unwrap();
+        let paths: Vec<PathBuf> = Self::GENERATION
+            .iter()
+            .map(|leaf| root.join(leaf))
+            .collect();
+        let held = paths
+            .iter()
+            .map(|path| fs::File::open(path).unwrap())
+            .collect();
+        let parent = fs::File::open(&root).unwrap();
+        let fixture = Self {
+            root,
+            bundle,
+            bundle_root,
+            password,
+            paths,
+            held,
+            parent,
+        };
+        fixture.configure("''");
+        fixture
+    }
+
+    fn data(&self) -> PathBuf {
+        self.root.join("gen/data")
+    }
+
+    fn configure(&self, listen: &str) {
+        fs::write(self.data().join("postgresql.conf"), format!(
+            "listen_addresses = {listen}\nport = 5432\nunix_socket_directories = '{}'\nunix_socket_permissions = 0600\nshared_preload_libraries = ''\narchive_mode = off\nssl = off\nlogging_collector = off\nshared_memory_type = mmap\ndynamic_shared_memory_type = mmap\n",
+            self.root.join("gen/uds").display())).unwrap();
+        fs::write(self.data().join("pg_hba.conf"), "local all desktop_admin scram-sha-256\nlocal all all reject\nlocal replication all reject\n").unwrap();
+        fs::write(self.data().join("pg_ident.conf"), "").unwrap();
+        fs::write(self.data().join("postgresql.auto.conf"), "").unwrap();
+    }
+
+    fn policy<'a>(
+        &'a self,
+        loaders: &'a [&'a std::path::Path],
+    ) -> crate::postgres_maintenance::runner::restore_isolation::RestoreIsolationPolicy<'a> {
+        use crate::postgres_maintenance::runner::restore_isolation::{
+            Directory, ExcludedLocation, Generation, RestoreIsolationPolicy,
+        };
+        let directory = |index: usize| Directory {
+            path: &self.paths[index],
+            original: &self.held[index],
+        };
+        RestoreIsolationPolicy::prepare(
+            Generation {
+                root: directory(0),
+                data: directory(1),
+                wal: directory(2),
+                temp: directory(3),
+                uds: directory(4),
+                materials: directory(5),
+            },
+            Self::EXCLUDED.map(|component| ExcludedLocation {
+                parent: Directory {
+                    path: &self.root,
+                    original: &self.parent,
+                },
+                component,
+            }),
+            loaders,
+            1 << 20,
+        )
+        .unwrap()
+    }
+
+    fn excluded_state(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut state = Vec::new();
+        for leaf in Self::EXCLUDED {
+            for entry in fs::read_dir(self.root.join(leaf)).unwrap() {
+                let path = entry.unwrap().path();
+                state.push((path.clone(), fs::read(&path).unwrap()));
+            }
+        }
+        state.sort();
+        state
+    }
+}
+
+impl Drop for SandboxFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.bundle_root);
+    }
+}
+
+#[tokio::test]
+#[ignore = "BIN SBX: real /usr/bin/sandbox-exec and OPENBOT_TEST_POSTGRES_BIN_DIR PostgreSQL 17.11"]
+async fn t046_19_candidate_sandbox_denies_network_exec_original_site_and_control_writes() {
+    let fixture = SandboxFixture::new();
+    let loader_files = fixture
+        .bundle
+        .system_loader_files()
+        .unwrap_or_else(|_| panic!("actual loader inventory"));
+    let loaders: Vec<&std::path::Path> = loader_files.iter().map(PathBuf::as_path).collect();
+    assert!(
+        loaders.contains(&std::path::Path::new("/usr/lib/dyld")),
+        "actual loader inventory"
+    );
+    let policy = fixture.policy(&loaders);
+    let before = fixture.excluded_state();
+    let run = |args: Vec<std::ffi::OsString>, input: Vec<u8>| {
+        let mut command = policy
+            .checked_postgres_command(&fixture.bundle, &args)
+            .unwrap_or_else(|_| panic!("original policy command"));
+        async move {
+            use tokio::io::AsyncWriteExt;
+            let mut child = command.spawn().unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&input).await.unwrap();
+            drop(stdin);
+            tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let data = fixture.data().into_os_string();
+
+    // The candidate's only listener is its private UDS: a TCP listener fails.
+    fixture.configure("'127.0.0.1'");
+    let output = run(
+        vec!["-D".into(), data.clone(), "-p".into(), "45432".into()],
+        Vec::new(),
+    )
+    .await;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not bind IPv4 address \"127.0.0.1\": Operation not permitted"),
+        "{stderr}"
+    );
+    fixture.configure("''");
+
+    // The same policy denies executing anything but the authenticated postgres.
+    let command = policy
+        .checked_postgres_command(&fixture.bundle, &[])
+        .unwrap_or_else(|_| panic!("original policy command"));
+    let mut args = command.as_std().get_args();
+    assert_eq!(args.next(), Some(std::ffi::OsStr::new("-p")));
+    let profile = args.next().unwrap().to_owned();
+    let shell = std::process::Command::new("/usr/bin/sandbox-exec")
+        .arg("-p")
+        .arg(&profile)
+        .args(["/bin/sh", "-c", "exit 0"])
+        .output()
+        .unwrap();
+    assert!(!shell.status.success());
+    assert!(String::from_utf8_lossy(&shell.stderr).contains("Operation not permitted"));
+
+    // The sandboxed postgres itself cannot write into the original site, the
+    // control root or the key-medium directory (server-side COPY TO through a
+    // client on its private UDS).
+    let mut server = policy
+        .checked_postgres_command(&fixture.bundle, &["-D".into(), data])
+        .unwrap_or_else(|_| panic!("original policy command"));
+    let mut child = server.spawn().unwrap();
+    let ready = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !fs::read_to_string(fixture.data().join("postmaster.pid"))
+        .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"))
+    {
+        assert!(std::time::Instant::now() < ready, "candidate readiness");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host_path(fixture.root.join("gen/uds"))
+        .port(5432)
+        .user("desktop_admin")
+        .dbname("postgres")
+        .password(fixture.password.as_str());
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    for leaf in SandboxFixture::EXCLUDED {
+        let error = client
+            .batch_execute(&format!(
+                "COPY (SELECT 'leak') TO '{}'",
+                fixture.root.join(leaf).join("written").display()
+            ))
+            .await
+            .unwrap_err();
+        let message = error.as_db_error().map(|e| e.message().to_owned());
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("Operation not permitted")),
+            "{message:?}"
+        );
+    }
+    // The candidate's own temp directory stays writable under the same policy.
+    client
+        .batch_execute(&format!(
+            "COPY (SELECT 'own') TO '{}'",
+            fixture.root.join("gen/temp/own").display()
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read(fixture.root.join("gen/temp/own")).unwrap(),
+        b"own\n"
+    );
+    drop(client);
+    driver.await.unwrap().unwrap();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    assert!(child.wait().await.unwrap().success());
+    assert_eq!(fixture.excluded_state(), before);
+}
+
+#[tokio::test]
+#[ignore = "BIN SBX: real /usr/bin/sandbox-exec and OPENBOT_TEST_POSTGRES_BIN_DIR PostgreSQL 17.11"]
+async fn t046_20_candidate_child_three_pipes_and_driver_close_or_stay_unknown() {
+    use crate::postgres_maintenance::clock::OperationClock;
+    use crate::postgres_maintenance::runner::{self, RestorePipeJoin};
+    let entry = EntryFixture::new();
+    let key_parent = entry.root.join("key-inputs");
+    DirBuilder::new().mode(0o700).create(&key_parent).unwrap();
+    fs::write(key_parent.join("key-medium"), [3u8; 104]).unwrap();
+    fs::set_permissions(
+        key_parent.join("key-medium"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let mut request = entry.request_value();
+    request["trustedInputSelection"]["keyMedium"] =
+        json!({"parent":key_parent,"component":"key-medium"});
+    request["trustedInputSelection"]["target"]["component"] = json!("new-generation");
+    request["profile"]["capacity"]["maxTotalAllocationBytes"] = json!(1u64 << 32);
+    let profile: RestoreOperationProfile =
+        serde_json::from_value(request["profile"].clone()).unwrap();
+    entry.write_request(&request);
+    let VerifiedRestoreEntry {
+        mut control,
+        intent,
+        original: _original,
+    } = entry.entry().unwrap();
+    let mut session = control.claim_restore(intent, profile).unwrap();
+    let clock = OperationClock::from_restore_session(&mut session).unwrap();
+
+    let fixture = SandboxFixture::new();
+    let loader_files = fixture
+        .bundle
+        .system_loader_files()
+        .unwrap_or_else(|_| panic!("actual loader inventory"));
+    let loaders: Vec<&std::path::Path> = loader_files.iter().map(PathBuf::as_path).collect();
+    let policy = fixture.policy(&loaders);
+    let secret = std::sync::Arc::new(openbot_domain::vault::SecretBytes::new(
+        fixture.password.as_bytes().to_vec(),
+    ));
+    let mut owner = runner::spawn_restore_program(
+        &policy,
+        &fixture.bundle,
+        &["-D".into(), fixture.data().into_os_string()],
+        &clock,
+        secret,
+        (1 << 20, 1 << 20, true),
+    )
+    .unwrap_or_else(|_| panic!("original sandboxed candidate spawn"));
+    let pid = owner.original_child().id().unwrap();
+    assert!(
+        owner.original_identity().is_ok()
+            && owner.post_directories().is_ok()
+            && owner.post_software().is_ok()
+    );
+    let ready = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !fs::read_to_string(fixture.data().join("postmaster.pid"))
+        .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"))
+    {
+        assert!(std::time::Instant::now() < ready, "candidate readiness");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // A connected driver keeps the smart shutdown waiting.
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host_path(fixture.root.join("gen/uds"))
+        .port(5432)
+        .user("desktop_admin")
+        .dbname("postgres")
+        .password(fixture.password.as_str());
+    let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    assert_eq!(
+        client
+            .query_one("SELECT current_setting('listen_addresses')", &[])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        ""
+    );
+    runner::request_restore_stop(&mut owner, &clock)
+        .unwrap_or_else(|_| panic!("one original TERM"));
+    let mut wait = Box::pin(runner::wait_restore_program(owner, &clock, || Ok(()), true));
+    // Cancelling the observation leaves the original wait resident: no exit is invented.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait)
+            .await
+            .is_err()
+    );
+    // Closing the driver lets the same Child exit; the same wait then returns.
+    drop(client);
+    driver.await.unwrap().unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(20), wait)
+        .await
+        .unwrap();
+    assert_eq!(result.native_wait(), Some((pid, Some(0), None)));
+    // No stdin writer task exists for the server; stdout and stderr readers returned.
+    assert_eq!(
+        result.pipes(),
+        [
+            RestorePipeJoin::Absent,
+            RestorePipeJoin::Returned,
+            RestorePipeJoin::Returned
+        ]
+    );
+    drop(session);
+}
