@@ -3345,6 +3345,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         command: Option<Result<Result<u64, tokio_postgres::Error>, Elapsed>>,
         unit: Option<Result<Result<(), tokio_postgres::Error>, Elapsed>>,
         validation: Option<Result<Result<(), InfraError>, Elapsed>>,
+        layout_measure: Option<Result<Result<(i64, [u64; 6]), InfraError>, Elapsed>>,
         catalog: Option<Result<Result<(u64, u64), CaptureSqlFailure>, Elapsed>>,
         commit: Option<Result<(), TransactionOwnerError>>,
         rollback: Option<Result<(), TransactionOwnerError>>,
@@ -3395,6 +3396,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                     command: None,
                     unit: None,
                     validation: None,
+                    layout_measure: None,
                     catalog: None,
                     commit: None,
                     rollback: None,
@@ -3799,8 +3801,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         stages.settle_capacity(reserved_allocation, used_memory)?;
         // The registered schema observers below parse their payloads; each run
         // pays those measured texts before it allocates (spec revision R484
-        // ¶8040). The additive restore catalog exists only at 54.
-        let measured = tokio::time::timeout_at(
+        // ¶8040). The additive restore catalog exists only at the latest layout.
+        raw.layout_measure = Some(tokio::time::timeout_at(
             tokio::time::Instant::from_std(stages.effect_before(deadline)?),
             async {
                 use crate::db::{
@@ -3823,7 +3825,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                     gateway_authorization_schema::observation_bytes_in_transaction(transaction).await?,
                     thread_origin_schema::observation_bytes_in_transaction(transaction).await?,
                     thread_history_writer_schema::observation_bytes_in_transaction(transaction).await?,
-                    if version == 54 {
+                    if version as i32 == native::NATIVE_LATEST_VERSION {
                         restore_reconfirmation_schema::observation_bytes_in_transaction(transaction).await?
                     } else {
                         0
@@ -3832,11 +3834,15 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                 Ok::<_, crate::db::InfraError>((ledger, payloads))
             },
         )
-        .await
-        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::EffectExpired))?
-        .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
+        .await);
         stages.effect_before(deadline)?;
-        let (ledger, payloads) = measured;
+        let (ledger, payloads) = raw
+            .layout_measure
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|r| r.as_ref().ok())
+            .copied()
+            .ok_or_else(|| infra_observation_error(raw.layout_measure.as_ref()))?;
         let observation = payloads
             .into_iter()
             .try_fold(0_u64, u64::checked_add)
