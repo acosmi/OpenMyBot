@@ -1172,6 +1172,14 @@ fn ConversationSurface(
                 stop_receipt.set(None);
                 work.on_changed.run(());
             }
+            // A new work has no Server thread until its first accepted submission, so its
+            // queue is lawfully empty; the first acceptance flips this and reads again.
+            if allow_missing_snapshot.get() {
+                pending_items.set(Vec::new());
+                pending_failed.set(false);
+                pending_loading.set(false);
+                return run;
+            }
             pending_loading.set(true);
             pending_failed.set(false);
             #[cfg(target_arch = "wasm32")]
