@@ -5161,9 +5161,22 @@ impl ControlFiles {
                 decoded_enrollment: None,
                 decoded_receipt: None,
             });
-            let (directory, _) =
-                self.open_named(Directory::Runtimes, nonce.as_str(), true, deadline)?;
-            self.runtime_work = Some(directory);
+            // The runtime directory itself, read-only, as `read_journal` opens an operation.
+            self.reserve_io(1)?;
+            self.raw.file = Some(
+                rustix::fs::openat(
+                    self.directory(Directory::Runtimes)?,
+                    nonce.as_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map(File::from)
+                .map_err(io::Error::from),
+            );
+            self.post(deadline)?;
+            let identity = self.check_opened(true, deadline)?;
+            self.named_matches(Directory::Runtimes, nonce.as_str(), identity, deadline)?;
+            self.runtime_work = Some(self.take_opened()?);
             self.restore_runtime_readbacks[index].enrollment =
                 Some(self.read_record(Directory::RuntimeWork, "enrollment-v1", cap, deadline)?);
             self.reserve_io(0)?;

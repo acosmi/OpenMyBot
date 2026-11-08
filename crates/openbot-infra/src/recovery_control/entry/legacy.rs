@@ -270,11 +270,23 @@ pub(in super::super) async fn adopt_server_legacy_before(
     owner: &ControlOwner,
     session: &mut OrdinaryInitializationSession,
     pool: &crate::db::pool::DatabasePool,
+    database: &crate::db::pool::DatabaseConfig,
     configured: &crate::auth::config::KeyEncryptionKey,
 ) -> Result<(), RecoveryControlError> {
     use native::BootstrapTransactionClient as _;
     let (deployment, tenant, dataset, effect) = session.server_scope()?;
     let mut client = pool.get().await.map_err(|_| io())?;
+    if session.adopts_published_head() {
+        return adopt_published_server_before(
+            session,
+            &mut client,
+            database,
+            configured,
+            &dataset,
+            effect,
+        )
+        .await;
+    }
     // 2. read-only site checks
     let site = actual_site(&client).await?.ok_or_else(invalid)?;
     let restore_table: bool = client
@@ -386,6 +398,68 @@ pub(in super::super) async fn adopt_server_legacy_before(
         }
     };
     // 7. proof and publication
+    session.publish_active(OrdinaryActivationProof::Legacy(
+        VerifiedOrdinaryLegacyProof {
+            operation: session.operation()?,
+            site: super::super::ordinary::LegacySite::Server { site, key_id },
+            native_version: native::NATIVE_LATEST_VERSION.unsigned_abs(),
+            migration_digest,
+        },
+    ))
+}
+
+/// A published Server head below the latest native version, after the
+/// operator migrated the database and supplied a legacy_adoption intent
+/// (OMB-裁-129 item 2, OMB-裁-130): the current schema and the sealed site
+/// are checked read-only before the adoption operation opens; the existing
+/// canary is the key proof, so there is no key_slot.
+async fn adopt_published_server_before(
+    session: &mut OrdinaryInitializationSession,
+    client: &mut crate::db::pool::PooledClient,
+    database: &crate::db::pool::DatabaseConfig,
+    configured: &crate::auth::config::KeyEncryptionKey,
+    dataset: &Hex32,
+    effect: Instant,
+) -> Result<(), RecoveryControlError> {
+    use native::BootstrapTransactionClient as _;
+    native::validate_current(client)
+        .await
+        .map_err(|_| invalid())?;
+    let binding = session.published_binding()?.clone();
+    super::compare_server_site_before(client, &binding, database, configured, dataset, effect)
+        .await?;
+    let server = binding.ordinary_server()?;
+    let (site, key_id) = (
+        server.server_database.clone(),
+        Hex32::parse(&server.master.key_id)?,
+    );
+    session.seal_published()?;
+    let transaction = client
+        .bootstrap_transaction_builder()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .read_only(true)
+        .start()
+        .await
+        .map_err(|_| io())?;
+    let ledger = transaction
+        .query_one(
+            "SELECT version, checksum FROM openbot_internal.schema_migrations ORDER BY version DESC LIMIT 1",
+            &[],
+        )
+        .await;
+    let rollback = transaction.rollback().await;
+    let returned = Instant::now();
+    if !session.observe_rollback(rollback.is_ok(), returned)? {
+        return Err(RecoveryControlError::new(
+            RecoveryControlFault::EffectExpired,
+        ));
+    }
+    let row = ledger.map_err(|_| io())?;
+    let version: i32 = row.try_get("version").map_err(|_| io())?;
+    let migration_digest: String = row.try_get("checksum").map_err(|_| io())?;
+    if version != native::NATIVE_LATEST_VERSION {
+        return Err(invalid());
+    }
     session.publish_active(OrdinaryActivationProof::Legacy(
         VerifiedOrdinaryLegacyProof {
             operation: session.operation()?,

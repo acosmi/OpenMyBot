@@ -119,6 +119,23 @@ impl ControlFiles {
         }
         let reference = observation.publication_reference()?.clone();
         let context = reference.context_id.as_str();
+        // A Current republished by a known-site adoption names that operation;
+        // its original restore journal is read and checked first (OMB-裁-130).
+        let adopted_current = match observation.record.data() {
+            super::super::activation::ActivationPayload::Current(current)
+                if current.operation_id != context =>
+            {
+                let restore = self.read_journal(&current.operation_id, record as u64, deadline)?;
+                let fee =
+                    super::super::journal::read_metadata_reservation(&restore.bytes, &self.limits)?;
+                self.prepay(fee, 0)?;
+                let chain = super::super::journal::observe_chain(&restore.bytes, &self.limits);
+                self.post(deadline)?;
+                chain?.verify_current_evidence(&observation)?;
+                true
+            }
+            _ => false,
+        };
         let journal = self.read_journal(context, record as u64, deadline)?;
         self.publication_journal = Some(Arc::clone(&journal));
         let fee = super::super::journal::read_metadata_reservation(&journal.bytes, &self.limits)?;
@@ -135,6 +152,8 @@ impl ControlFiles {
         };
         if phase == ActivationPhase::OrdinaryActive {
             chain.verify_ordinary_evidence(&observation)?;
+        } else if adopted_current {
+            chain.verify_adopted_current(&observation)?;
         } else {
             chain.verify_current_evidence(&observation)?;
         }

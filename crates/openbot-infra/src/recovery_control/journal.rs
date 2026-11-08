@@ -1137,12 +1137,54 @@ impl JournalObservation {
         if first.epoch != binding.authorization_epoch() {
             return Err(unproven());
         }
-        match &first.data {
-            Data::Operation(OperationIntent::FreshInit(_) | OperationIntent::LegacyAdoption(_)) => {
+        // The operation names the descriptor it replaces: its Initializing
+        // head, or the published head a known-site adoption republishes.
+        let replaced = match &first.data {
+            Data::Operation(OperationIntent::FreshInit(v)) => &v.initializing_descriptor_digest,
+            Data::Operation(OperationIntent::LegacyAdoption(v)) => {
+                &v.initializing_descriptor_digest
             }
             _ => return Err(unproven()),
+        };
+        if Some(replaced.as_str()) != observation.record.previous_digest() {
+            return Err(unproven());
         }
         self.confirmed(evidence, &first.operation_id)
+    }
+
+    /// A RestoreCurrent republished by a known-site adoption (OMB-裁-130):
+    /// this publication journal is that LegacyAdoption operation, naming the
+    /// replaced head, under the Current epoch, with a confirmed ordinary_verify
+    /// before its PublishIntent. The restore journal is checked separately.
+    pub(super) fn verify_adopted_current(
+        &self,
+        observation: &super::activation::ActivationObservation,
+    ) -> Result<(), RecoveryControlError> {
+        let super::activation::ActivationPayload::Current(current) = observation.record.data()
+        else {
+            return Err(unproven());
+        };
+        let first = self.records.first().ok_or_else(unproven)?;
+        let Data::Operation(OperationIntent::LegacyAdoption(adoption)) = &first.data else {
+            return Err(unproven());
+        };
+        let publish =
+            usize::try_from(current.publish_intent.sequence.get() - 1).map_err(|_| unproven())?;
+        let verified = self.records.iter().take(publish).any(|record| {
+            matches!(&record.data, Data::StageObserved(observed)
+                if observed.typed_disposition.confirms_effect()
+                    && matches!(self.records.get(usize::try_from(observed.intent_sequence - 1).unwrap_or(usize::MAX)),
+                        Some(Record { data: Data::StageIntent(StageIntent { stage: Stage::OrdinaryVerify, .. }), .. })))
+        });
+        if first.epoch != current.epoch
+            || first.operation_id == current.operation_id
+            || Some(adoption.initializing_descriptor_digest.as_str())
+                != observation.record.previous_digest()
+            || !verified
+        {
+            return Err(unproven());
+        }
+        Ok(())
     }
 
     /// RestoreCurrent evidence comes from its one original restore journal.

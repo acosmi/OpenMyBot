@@ -493,6 +493,39 @@ impl ActivationBinding {
         self.common().migration_digest
     }
 
+    /// The same binding at another native version and ledger digest; epoch,
+    /// IDs, keyRefs and site are unchanged (spec 8338).
+    pub(super) fn with_native(&self, version: u32, digest: String) -> Self {
+        let mut next = self.clone();
+        match &mut next.site {
+            ActivationSiteBinding::LocalPhysical {
+                native_version,
+                migration_digest,
+                ..
+            }
+            | ActivationSiteBinding::ServerDatabase {
+                native_version,
+                migration_digest,
+                ..
+            } => {
+                *native_version = version;
+                *migration_digest = digest;
+            }
+        }
+        next
+    }
+
+    /// The same Server binding under the operator's current service
+    /// configuration: the legacy_adoption intent of a head below latest is
+    /// carried by an edited configuration (OMB-裁-130 with 129 item 2).
+    pub(super) fn with_service_config(&self, config: &ServiceConfigRef) -> Self {
+        let mut next = self.clone();
+        if let ActivationSiteBinding::ServerDatabase { service_config, .. } = &mut next.site {
+            *service_config = config.clone();
+        }
+        next
+    }
+
     pub(super) fn validate(
         &self,
         l: &TrustedHostRecoveryLimits,

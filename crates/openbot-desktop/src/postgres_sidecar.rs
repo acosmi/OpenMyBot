@@ -3057,6 +3057,13 @@ fn sync_directory(_path: &Path) -> Result<(), PostgresSidecarError> {
     Ok(())
 }
 
+// The recovery startup cases drive the same real-sidecar fixtures.
+#[cfg(all(test, feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) use tests::{
+    RuntimeMemorySecretStore, loaded_desktop_package, materialize_desktop_dist,
+    materialize_host_postgres_bundle, root as fixture_root, signing_identity,
+};
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -3116,7 +3123,7 @@ mod tests {
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn root(name: &str) -> PathBuf {
+    pub(crate) fn root(name: &str) -> PathBuf {
         // Resolve the OS temp-dir alias (such as macOS /var) that trusted-root opens reject.
         fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -3127,7 +3134,7 @@ mod tests {
             ))
     }
 
-    pub(super) fn signing_identity() -> ReviewedPostgresSigningIdentity {
+    pub(crate) fn signing_identity() -> ReviewedPostgresSigningIdentity {
         ReviewedPostgresSigningIdentity::from_reviewed_release(
             "Developer ID Application: Example Product (ABCDE12345)",
         )
@@ -3553,14 +3560,14 @@ mod tests {
     }
 
     #[cfg(all(feature = "desktop-local-runtime", unix))]
-    struct RuntimeMemorySecretStore {
+    pub(crate) struct RuntimeMemorySecretStore {
         values: Mutex<std::collections::BTreeMap<(String, String), Vec<u8>>>,
         writes: AtomicUsize,
     }
 
     #[cfg(all(feature = "desktop-local-runtime", unix))]
     impl RuntimeMemorySecretStore {
-        fn empty() -> Self {
+        pub(crate) fn empty() -> Self {
             Self {
                 values: Mutex::new(std::collections::BTreeMap::new()),
                 writes: AtomicUsize::new(0),
@@ -4675,7 +4682,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "postgres-supervisor", unix))]
-    pub(super) fn materialize_host_postgres_bundle(
+    pub(crate) fn materialize_host_postgres_bundle(
         bin_dir: &Path,
     ) -> (PathBuf, PostgresBundleDigest) {
         // This fixture uses one complete local installation. Resource copying does not attest
@@ -4760,7 +4767,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "desktop-vault", unix))]
-    fn loaded_desktop_package(tenant_id: &str) -> LoadedTenantPackage {
+    pub(crate) fn loaded_desktop_package(tenant_id: &str) -> LoadedTenantPackage {
         let files = TenantPackageFiles {
             brand: format!("tenant: {{ id: {tenant_id}, product_name: Desktop Local }}"),
             agents: "agents: [{ id: desktop-assistant, name: Assistant, title: Local Assistant, role_description: Help locally., type: built-in, system_prompt: Answer carefully. }]".to_owned(),
@@ -4882,7 +4889,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "desktop-local-runtime", unix))]
-    fn materialize_desktop_dist() -> PathBuf {
+    pub(crate) fn materialize_desktop_dist() -> PathBuf {
         let dist = root("tauri-background-dist");
         fs::create_dir_all(&dist).unwrap();
         fs::write(

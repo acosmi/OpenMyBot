@@ -767,3 +767,170 @@ async fn s23_real_staging_two_named_slots_preserve_old_and_never_retry_unknown()
         eprintln!("S23 named MemoryStore scenario {fault}: actual reads={reads} writes={writes}; old slots intact; repeated work zero IO");
     }
 }
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+async fn t046_07_local_fresh_proof_publishes_ordinary_active() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::desktop_vault::ReviewedDesktopVaultKeyStoreService;
+    use crate::postgres_sidecar::{
+        ReviewedPostgresKeyStoreService, RuntimeMemorySecretStore, VerifiedPostgresBundle,
+        fixture_root, loaded_desktop_package, materialize_desktop_dist,
+        materialize_host_postgres_bundle, signing_identity,
+    };
+    use crate::tauri_background::{
+        DesktopLocalApplicationInput, DesktopLocalReleaseInput, DesktopLocalRuntimeConfig,
+        DesktopRecoveryBootstrap, prepare_desktop_local_runtime,
+    };
+    use crate::{DesktopAgentBudgets, DesktopOpenAiProviderInput};
+    use openbot_infra::db::native::NATIVE_LATEST_VERSION;
+
+    fn journal(control: &std::path::Path, operation: &str) -> Vec<Value> {
+        let raw = fs::read(
+            control
+                .join("operations")
+                .join(operation)
+                .join("journal-v1"),
+        )
+        .unwrap();
+        let (mut records, mut offset) = (Vec::new(), 0);
+        while offset < raw.len() {
+            let length =
+                u32::from_be_bytes(raw[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            records.push(serde_json::from_slice(&raw[offset + 12..offset + 12 + length]).unwrap());
+            offset += 12 + length + 32;
+        }
+        records
+    }
+
+    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+    let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
+    let bundle = VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
+    let parent = fixture_root("t046-07b-fresh");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let app_root = parent.join("app");
+    let control_root = parent.join("com.acosmi.wrokbot.restore-control");
+    let dist = materialize_desktop_dist();
+    let release = DesktopLocalReleaseInput::new(
+        &dist,
+        "openbot",
+        "main",
+        bundle,
+        ReviewedPostgresKeyStoreService::from_reviewed_release(
+            "com.example.product.postgresql.t046-07b",
+        )
+        .unwrap(),
+        ReviewedDesktopVaultKeyStoreService::from_reviewed_release(
+            "com.example.product.desktop-vault.t046-07b",
+        )
+        .unwrap(),
+        Arc::new(RuntimeMemorySecretStore::empty()),
+    )
+    .unwrap();
+    let application = DesktopLocalApplicationInput::new(
+        DesktopOpenAiProviderInput::new("https://api.example.test/v1", Vec::new()).unwrap(),
+        DesktopAgentBudgets::new(
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(1_800)),
+            16_384,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let bootstrap = DesktopRecoveryBootstrap {
+        host_limits: TrustedHostRecoveryLimits {
+            max_request_bytes: 65_536,
+            max_activation_bytes: 65_536,
+            max_journal_frame_bytes: 65_536,
+            max_journal_bytes: 1 << 20,
+            max_journal_records: 64,
+            max_runtime_record_bytes: 65_536,
+            max_registered_runtimes: 8,
+            max_retained_operations: 8,
+            max_root_entries: 64,
+            max_temp_entries: 8,
+            max_evidence_refs: 16,
+            max_runtime_resource_facts: 16,
+            max_id_bytes: 128,
+            max_component_bytes: 128,
+            max_relative_path_bytes: 1024,
+            max_path_depth: 16,
+            max_open_files: 64,
+            max_metadata_bytes: 1 << 24,
+            admission_ns: 5_000_000_000,
+        },
+        bounds: serde_json::from_value(
+            json!({ "effectNs": 120_000_000_000u64, "convergenceNs": 30_000_000_000u64 }),
+        )
+        .unwrap(),
+        release_digest: [11; 32],
+    };
+    let config = DesktopLocalRuntimeConfig::new(release, application, |authority| {
+        Ok(loaded_desktop_package(
+            authority.auth_context().tenant().as_str(),
+        ))
+    })
+    .with_recovery_bootstrap(bootstrap);
+    // A new app-data root: LocalPhysicalFresh, Created/Fresh proof, OrdinaryActive.
+    let prepared = prepare_desktop_local_runtime(
+        CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap(),
+        config,
+    )
+    .await
+    .unwrap();
+    let head: Value =
+        serde_json::from_slice(&fs::read(control_root.join("activation-v1")).unwrap()).unwrap();
+    assert_eq!(head["phase"], "OrdinaryActive");
+    assert_eq!(
+        head["revision"], 2,
+        "OrdinaryInitializing precedes the Active head"
+    );
+    assert_eq!(
+        head["data"]["binding"]["nativeVersion"],
+        NATIVE_LATEST_VERSION
+    );
+    let version: i32 = prepared
+        .pool()
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT max(version) FROM openbot_internal.schema_migrations",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(version, NATIVE_LATEST_VERSION);
+    // The evidence is exactly the ordinary_initialize StageObserved, and the
+    // operation closed its resources.
+    let evidence = head["data"]["initializationEvidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 1);
+    let operation = evidence[0]["contextId"].as_str().unwrap();
+    let records = journal(&control_root, operation);
+    let observed = &records[evidence[0]["sequence"].as_u64().unwrap() as usize - 1];
+    assert_eq!(observed["kind"], "StageObserved");
+    let intent = &records[observed["data"]["intentSequence"].as_u64().unwrap() as usize - 1];
+    assert_eq!(intent["data"]["stage"], "ordinary_initialize");
+    assert_eq!(records[0]["data"]["mode"], "fresh_init");
+    assert!(records.iter().any(
+        |record| record["kind"] == "StageIntent" && record["data"]["stage"] == "resource_close"
+    ));
+    // The runtime holds SH under one enrollment until its receipt.
+    let runtimes = fs::read_dir(control_root.join("runtimes"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(runtimes.len(), 1);
+    assert!(runtimes[0].join("enrollment-v1").is_file());
+    assert!(!runtimes[0].join("receipt-v1").exists());
+    prepared.shutdown().await.unwrap();
+    assert!(runtimes[0].join("receipt-v1").is_file());
+    fs::remove_dir_all(parent).unwrap();
+    fs::remove_dir_all(bundle_root).unwrap();
+    fs::remove_dir_all(dist).unwrap();
+}

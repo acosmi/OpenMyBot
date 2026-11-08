@@ -1103,8 +1103,14 @@ impl RecoveryControl {
             Some(ordinary::OrdinaryInitializationSource::LegacyAdoption {
                 site: ordinary::OrdinarySite::ServerDatabase,
             }) => {
-                entry::adopt_server_legacy_before(&self.shared, &mut session, &pool, configured)
-                    .await?;
+                entry::adopt_server_legacy_before(
+                    &self.shared,
+                    &mut session,
+                    &pool,
+                    database,
+                    configured,
+                )
+                .await?;
             }
             _ => {
                 return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
@@ -2569,5 +2575,1124 @@ pub(crate) mod tests {
                 "version"
             ]
         );
+    }
+
+    // V7-IMPL-046 batch C: runtime close receipts and published heads below
+    // the latest native version (OMB-裁-130). Heads and journals are written
+    // with the private writer primitives, exactly as the producers write them.
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    const ADOPTION: &str = "abcdefabcdefabcdefabcdefabcdef02";
+    /// The original operation of a synthetic site; distinct from the restore request ID.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    const SITE: &str = "abcdefabcdefabcdefabcdefabcdef03";
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    const REPLACED: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    const LOCAL_OWNERS: [super::RuntimeOwner; 5] = [
+        super::RuntimeOwner::PostgresSidecar,
+        super::RuntimeOwner::SqlDriver,
+        super::RuntimeOwner::ApplicationAssembly,
+        super::RuntimeOwner::DesktopAgentRelay,
+        super::RuntimeOwner::DesktopAgent,
+    ];
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    impl RestoreEntryFixture {
+        /// The ordinary site's original app-data root, created once.
+        fn site_root(&self) -> RecoveryFileIdentity {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let root = self.directory.join("old-app");
+            if !root.exists() {
+                std::fs::create_dir(&root).unwrap();
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let meta = std::fs::metadata(&root).unwrap();
+            RecoveryFileIdentity {
+                device: meta.dev(),
+                inode: meta.ino(),
+                uid: meta.uid(),
+            }
+        }
+
+        fn open_local(
+            &self,
+            control: &super::RecoveryControl,
+        ) -> Result<super::RecoveryRuntimeOwner, super::RecoveryControlError> {
+            let store = crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore::new(
+                crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(
+                    self.directory.join("old-app"),
+                )
+                .unwrap(),
+            );
+            control.open_local_before(
+                &store,
+                [0x11; 32],
+                ["test.vault", "test.postgres"],
+                serde_json::from_value(
+                    json!({"effectNs": 30_000_000_000u64, "convergenceNs": 30_000_000_000u64}),
+                )
+                .unwrap(),
+                &LOCAL_OWNERS,
+            )
+        }
+
+        /// The handed-back intent of a below-latest head and the head it names.
+        fn below_latest(
+            &self,
+            control: &super::RecoveryControl,
+        ) -> (
+            super::VerifiedOrdinaryStartupIntent,
+            super::ordinary::ExpectedHead,
+        ) {
+            let error = self
+                .open_local(control)
+                .err()
+                .expect("below latest is not admitted");
+            assert_eq!(error.fault(), RecoveryControlFault::InitializationRequired);
+            let intent = error
+                .into_unconsumed_intent()
+                .expect("the intent is handed back");
+            let head = intent
+                .expected_head()
+                .cloned()
+                .expect("the seen head is named");
+            (intent, head)
+        }
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn site_binding(fixture: &RestoreEntryFixture, native: u32) -> Value {
+        let mut binding = binding();
+        binding["generationRoot"] = serde_json::to_value(fixture.site_root()).unwrap();
+        binding["nativeVersion"] = json!(native);
+        binding
+    }
+
+    /// One operation journal of `entries`, then the publication of the
+    /// descriptor `descriptor` builds from their references and its own
+    /// PublishIntent position. Returns the published digest.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn publish_synthetic(
+        control: &super::RecoveryControl,
+        operation: &str,
+        epoch: &str,
+        entries: Vec<super::journal::JournalData>,
+        descriptor: impl FnOnce(&[Value], Value) -> Value,
+    ) -> String {
+        publish_synthetic_in(control, CONTROL, operation, epoch, entries, descriptor)
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn publish_synthetic_in(
+        control: &super::RecoveryControl,
+        control_id: &str,
+        operation: &str,
+        epoch: &str,
+        entries: Vec<super::journal::JournalData>,
+        descriptor: impl FnOnce(&[Value], Value) -> Value,
+    ) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut files = super::entry::lock(&control.shared).unwrap();
+        files.acquire_writer_before(deadline).unwrap();
+        let op = super::Hex32::parse(operation).unwrap();
+        files
+            .begin_journal(
+                &op,
+                &super::Hex32::parse(control_id).unwrap(),
+                epoch,
+                deadline,
+            )
+            .unwrap();
+        let references: Vec<Value> = entries
+            .iter()
+            .map(|entry| {
+                serde_json::to_value(files.append_journal(&op, entry, deadline).unwrap()).unwrap()
+            })
+            .collect();
+        let sequence = references.len() as u64 + 1;
+        let record: ActivationRecord = serde_json::from_value(descriptor(
+            &references,
+            json!({"contextId": operation, "sequence": sequence}),
+        ))
+        .unwrap();
+        let (_, digest) = record.encoded().unwrap();
+        files
+            .append_journal(
+                &op,
+                &super::journal::JournalData::publish_intent(record.phase, &digest),
+                deadline,
+            )
+            .unwrap();
+        let published = files.publish_activation(&record, deadline).unwrap();
+        files
+            .append_journal(
+                &op,
+                &super::journal::JournalData::publish_observed(
+                    sequence,
+                    &digest,
+                    published.identity,
+                ),
+                deadline,
+            )
+            .unwrap();
+        files.release_writer();
+        digest
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn descriptor(revision: u64, previous: &str, phase: &str, data: Value) -> Value {
+        json!({"recordType": "wrokbot-recovery-activation", "version": 1, "controlId": CONTROL,
+            "revision": revision, "previousDigest": previous, "phase": phase, "data": data})
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn confirmed_stage(stage: super::journal::Stage) -> [super::journal::JournalData; 2] {
+        [
+            super::journal::JournalData::stage_intent(stage, CONTROL),
+            super::journal::JournalData::stage_observed(
+                2,
+                super::journal::Disposition::PgCommit(super::journal::CommitAck::TimelyAck),
+            ),
+        ]
+    }
+
+    /// A first published OrdinaryActive at `native`, as Fresh publishes it:
+    /// its operation names the replaced Initializing digest.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn publish_active(
+        fixture: &RestoreEntryFixture,
+        control: &super::RecoveryControl,
+        native: u32,
+    ) -> String {
+        let [intent, observed] = [
+            super::journal::JournalData::stage_intent(
+                super::journal::Stage::OrdinaryInitialize,
+                CONTROL,
+            ),
+            super::journal::JournalData::stage_observed(
+                2,
+                super::journal::Disposition::TaskReturned {
+                    original_task_id: "local-fresh-chain".to_owned(),
+                    observed_ns: 3,
+                },
+            ),
+        ];
+        let entries = vec![
+            super::journal::JournalData::fresh_init(
+                serde_json::from_value(host()).unwrap(),
+                SITE,
+                serde_json::from_value(planned()).unwrap(),
+                serde_json::from_value(json!({"effectNs": 5, "convergenceNs": 9})).unwrap(),
+                REPLACED,
+                serde_json::from_value(clock()).unwrap(),
+            ),
+            intent,
+            observed,
+        ];
+        let binding = site_binding(fixture, native);
+        publish_synthetic(control, SITE, EPOCH, entries, |refs, position| {
+            descriptor(
+                2,
+                REPLACED,
+                "OrdinaryActive",
+                json!({"binding": binding,
+                "initializationEvidence": [refs[2]], "publishIntent": position}),
+            )
+        })
+    }
+
+    /// A first published RestoreCurrent at `native` with its restore journal.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn publish_current(
+        fixture: &RestoreEntryFixture,
+        control: &super::RecoveryControl,
+        native: u32,
+    ) -> String {
+        let [intent, observed] = confirmed_stage(super::journal::Stage::Switch);
+        let restore: super::journal::RestoreIntent = serde_json::from_value(json!({
+            "profile": fixture.profile, "inputIdentities": {"carrier": {"file": file(5), "length": 1},
+                "keyMedium": {"file": file(6), "length": 104}},
+            "business": {"deploymentId": "dep", "tenantId": "ten", "datasetId": "data"},
+            "sourceInstallationId": "source", "targetInstallationId": "target",
+            "candidatePlan": {"siteKind": "local_physical", "trustedParent": file(3), "entryComponent": "app",
+                "installationId": "target", "generationId": "abcdefabcdefabcdefabcdefabcdef01"},
+            "ownerClock": clock()})).unwrap();
+        let entries = vec![
+            super::journal::JournalData::restore(restore),
+            intent,
+            observed,
+        ];
+        let binding = site_binding(fixture, native);
+        publish_synthetic(control, SITE, EPOCH, entries, |refs, position| {
+            descriptor(
+                2,
+                REPLACED,
+                "RestoreCurrent",
+                json!({"operationId": SITE, "epoch": EPOCH,
+                "profileDigest": ZERO64, "binding": binding, "closureEvidence": [refs[2]],
+                "switchReadback": refs[2], "publishIntent": position}),
+            )
+        })
+    }
+
+    /// The LegacyAdoption OperationIntent a known-site adoption writes.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn adoption_intent(replaced: &str) -> super::journal::JournalData {
+        super::journal::JournalData::legacy_adoption(
+            serde_json::from_value(host()).unwrap(),
+            ADOPTION,
+            serde_json::from_value(file(21)).unwrap(),
+            serde_json::from_value(json!({"siteKind": "local_physical", "trustedParent": file(3), "entryComponent": "app"})).unwrap(),
+            serde_json::from_value(json!({"deploymentId": "dep", "tenantId": "ten", "datasetId": "data",
+                "sourceInstallationId": "target", "targetInstallationId": "target"})).unwrap(),
+            serde_json::from_value(json!({"effectNs": 5, "convergenceNs": 9})).unwrap(),
+            replaced,
+            serde_json::from_value(clock()).unwrap(),
+        )
+    }
+
+    /// Complete the held adoption session as its producers do after the
+    /// read-only site check: one confirmed ordinary_verify, the proof of the
+    /// actual site at the latest version, publication and enrollment.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn adopt(
+        fixture: &RestoreEntryFixture,
+        mut session: super::OrdinaryInitializationSession,
+    ) -> super::RecoveryRuntimeOwner {
+        use super::activation::{KeyKind, KeyReference};
+        session.seal_published().unwrap();
+        assert!(
+            session
+                .observe_commit(true, std::time::Instant::now())
+                .unwrap()
+        );
+        let key = |kind| KeyReference {
+            kind,
+            reviewed_service: "svc".to_owned(),
+            account: "acct".to_owned(),
+            key_id: "key".to_owned(),
+            key_version: 1,
+            target_installation_id: "target".to_owned(),
+            operation_id: OPERATION.to_owned(),
+        };
+        let site = super::activation::OrdinaryLocalSite {
+            dataset_id: "data".to_owned(),
+            deployment_id: "dep".to_owned(),
+            tenant_id: "ten".to_owned(),
+            installation_id: "target".to_owned(),
+            generation_root: fixture.site_root(),
+            pg_system_id: 7_000_000_001,
+            database_oid: 16384,
+            master: key(KeyKind::HistoricalMaster),
+            postgres: key(KeyKind::PostgresScram),
+        };
+        let operation = session.operation().unwrap();
+        session
+            .publish_active(super::OrdinaryActivationProof::Legacy(
+                super::VerifiedOrdinaryLegacyProof {
+                    operation,
+                    site: super::ordinary::LegacySite::Local(site),
+                    native_version: crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+                    migration_digest: "ab".repeat(32),
+                },
+            ))
+            .unwrap();
+        session.into_runtime_before().unwrap()
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn head(fixture: &RestoreEntryFixture) -> Value {
+        serde_json::from_slice(
+            &std::fs::read(fixture.control_root().join("activation-v1")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn never_started() -> super::RuntimeCloseResources {
+        super::RuntimeCloseResources::new(
+            LOCAL_OWNERS
+                .into_iter()
+                .map(|owner| super::RuntimeCloseFact::PassiveRetirement {
+                    object: super::PassiveObjectKind::NeverStarted(owner),
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn runtime_records(fixture: &RestoreEntryFixture, name: &str) -> usize {
+        std::fs::read_dir(fixture.control_root().join("runtimes"))
+            .unwrap()
+            .filter(|runtime| runtime.as_ref().unwrap().path().join(name).exists())
+            .count()
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    async fn t046_05_restore_exclusive_waits_for_both_runtime_close_receipts() {
+        let fixture = RestoreEntryFixture::new();
+        let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_active(
+            &fixture,
+            &writer,
+            crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+        );
+        drop(writer);
+        let first_control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let mut first = fixture.open_local(&first_control).unwrap();
+        let second_control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let mut second = fixture.open_local(&second_control).unwrap();
+        assert_eq!(runtime_records(&fixture, "enrollment-v1"), 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        first.close_before(never_started(), deadline).await.unwrap();
+        drop(first);
+        drop(first_control);
+        let (mut control, entry) = fixture.open();
+        let error = control
+            .claim_restore(entry, fixture.profile.clone())
+            .err()
+            .expect("one runtime is still open");
+        assert_eq!(error.fault(), RecoveryControlFault::OwnerBusy);
+        drop(error);
+        drop(control);
+        assert_eq!(
+            std::fs::read_dir(fixture.control_root().join("operations"))
+                .unwrap()
+                .count(),
+            1
+        );
+        second
+            .close_before(never_started(), deadline)
+            .await
+            .unwrap();
+        drop(second);
+        drop(second_control);
+        assert_eq!(runtime_records(&fixture, "receipt-v1"), 2);
+        let (mut control, entry) = fixture.open();
+        control
+            .claim_restore(entry, fixture.profile.clone())
+            .expect("both original runtimes left their close receipts");
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    async fn t046_06_missing_close_gone_pid_or_released_lock_keeps_pending() {
+        let fixture = RestoreEntryFixture::new();
+        let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_active(
+            &fixture,
+            &writer,
+            crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+        );
+        drop(writer);
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let runtime = fixture.open_local(&control).unwrap();
+        // The runtime goes away without a close: its runtime.lock SH is released.
+        drop(runtime);
+        drop(control);
+        let enrollments = restore_control_bytes(&fixture.control_root().join("runtimes"));
+        assert_eq!(runtime_records(&fixture, "enrollment-v1"), 1);
+        assert_eq!(runtime_records(&fixture, "receipt-v1"), 0);
+        for _ in 0..2 {
+            let (mut control, entry) = fixture.open();
+            assert_eq!(
+                control
+                    .claim_restore(entry, fixture.profile.clone())
+                    .err()
+                    .map(|e| e.fault()),
+                Some(RecoveryControlFault::OwnerBusy),
+                "a released lock is not a close receipt"
+            );
+        }
+        assert_eq!(
+            restore_control_bytes(&fixture.control_root().join("runtimes")),
+            enrollments
+        );
+        assert!(
+            !fixture
+                .control_root()
+                .join("operations")
+                .join(OPERATION)
+                .exists(),
+            "no restore operation was claimed"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_41_low_native_active_hands_back_intent_and_busy_writer_changes_nothing() {
+        let fixture = RestoreEntryFixture::new();
+        // NOENT with an existing root is not handed back (no positive intent).
+        fixture.site_root();
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let error = fixture.open_local(&control).err().expect("no head");
+        assert_eq!(error.fault(), RecoveryControlFault::InitializationRequired);
+        assert!(error.into_unconsumed_intent().is_none());
+        let digest = publish_active(
+            &fixture,
+            &control,
+            crate::db::native::NATIVE_0052_VERSION.unsigned_abs(),
+        );
+        let (intent, seen) = fixture.below_latest(&control);
+        assert_eq!(
+            seen,
+            super::ordinary::ExpectedHead::ActiveBelowLatest(digest.clone())
+        );
+        // Another writer holds ownerEX: begin is OwnerBusy and writes nothing.
+        let before = restore_control_bytes(&fixture.control_root());
+        let busy = super::RecoveryControl::open(fixture.config()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        super::entry::lock(&busy.shared)
+            .unwrap()
+            .acquire_writer_before(deadline)
+            .unwrap();
+        let mut control = control;
+        let error = control
+            .begin_ordinary_initialization_before(
+                intent,
+                std::time::Instant::now() + std::time::Duration::from_millis(200),
+            )
+            .err()
+            .expect("writer is busy");
+        assert_eq!(error.fault(), RecoveryControlFault::OwnerBusy);
+        assert!(
+            error.into_unconsumed_intent().is_some(),
+            "a busy writer keeps the intent"
+        );
+        drop(busy);
+        assert_eq!(restore_control_bytes(&fixture.control_root()), before);
+        // The head changes between SH and EX: OwnerBusy.
+        let (intent, _) = fixture.below_latest(&control);
+        let other = publish_synthetic(
+            &control,
+            ADOPTION,
+            EPOCH,
+            {
+                let [intent, observed] = confirmed_stage(super::journal::Stage::OrdinaryVerify);
+                vec![adoption_intent(&digest), intent, observed]
+            },
+            |refs, position| {
+                descriptor(
+                    3,
+                    &digest,
+                    "OrdinaryActive",
+                    json!({"binding": site_binding(&fixture, crate::db::native::NATIVE_0053_VERSION.unsigned_abs()),
+                "initializationEvidence": [refs[2]], "publishIntent": position}),
+                )
+            },
+        );
+        let error = control
+            .begin_ordinary_initialization_before(
+                intent,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .err()
+            .expect("head changed");
+        assert_eq!(error.fault(), RecoveryControlFault::OwnerBusy);
+        // The current head is adopted and republished at the latest version.
+        let (intent, seen) = fixture.below_latest(&control);
+        assert_eq!(
+            seen,
+            super::ordinary::ExpectedHead::ActiveBelowLatest(other.clone())
+        );
+        let session = control
+            .begin_ordinary_initialization_before(
+                intent,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(session.adopts_published_head());
+        let _runtime = adopt(&fixture, session);
+        let republished = head(&fixture);
+        assert_eq!(republished["phase"], "OrdinaryActive");
+        assert_eq!(republished["revision"], 4);
+        assert_eq!(republished["previousDigest"], other.as_str());
+        assert_eq!(
+            republished["data"]["binding"]["nativeVersion"],
+            crate::db::native::NATIVE_LATEST_VERSION
+        );
+        assert_eq!(republished["data"]["binding"]["authorizationEpoch"], EPOCH);
+        let context = republished["data"]["publishIntent"]["contextId"]
+            .as_str()
+            .unwrap();
+        assert_ne!(context, ADOPTION);
+        let journal = std::fs::read(
+            fixture
+                .control_root()
+                .join("operations")
+                .join(context)
+                .join("journal-v1"),
+        )
+        .unwrap();
+        let length = u32::from_be_bytes(journal[8..12].try_into().unwrap()) as usize;
+        let first: Value = serde_json::from_slice(&journal[12..12 + length]).unwrap();
+        assert_eq!(first["data"]["mode"], "legacy_adoption");
+        assert_eq!(
+            first["data"]["initializingDescriptorDigest"],
+            other.as_str()
+        );
+        assert_eq!(first["epoch"], EPOCH);
+        // Another startup reads the republished head and enrolls.
+        let reader = super::RecoveryControl::open(fixture.config()).unwrap();
+        fixture
+            .open_local(&reader)
+            .expect("republished head at the latest version");
+    }
+
+    #[test]
+    fn t046_43_ordinary_upgrade_intent_round_trips_and_rejects_foreign_stages() {
+        // OMB-裁-130: the below-latest exit is a LegacyAdoption of the known
+        // site; its OperationIntent names the replaced published head.
+        let data = |replaced: &str| {
+            json!({"mode": "legacy_adoption",
+            "hostBinding": host(), "originalStartupIntent": OPERATION, "ownedIntentFileIdentity": file(21),
+            "originalSiteSelection": {"siteKind": "local_physical", "trustedParent": file(3), "entryComponent": "app"},
+            "expectedOriginalBusinessAndInstallation": {"deploymentId": "dep", "tenantId": "ten", "datasetId": "data",
+                "sourceInstallationId": "target", "targetInstallationId": "target"},
+            "ordinaryStartupBounds": {"effectNs": 5, "convergenceNs": 9},
+            "initializingDescriptorDigest": replaced, "originalClockRelation": clock()})
+        };
+        let adoption = |replaced: &str| journal_record("OperationIntent", data(replaced));
+        let stage = |name: &str| {
+            journal_record(
+                "StageIntent",
+                json!({"stage": name, "originalEffectId": CONTROL, "expectedBinding": null}),
+            )
+        };
+        let observed = journal_record(
+            "StageObserved",
+            json!({"intentSequence": 2,
+            "typedDisposition": {"kind": "PgCommit", "data": "TimelyAck"}, "actualBinding": null, "receiptRefs": []}),
+        );
+        let raw = frames(&[adoption(REPLACED_43), stage("ordinary_verify"), observed]);
+        let chain =
+            observe_chain(&raw, &limits()).expect("closed LegacyAdoption decodes canonically");
+        // The typed writer encodes the same first frame byte for byte.
+        let typed = super::journal::JournalData::legacy_adoption(
+            serde_json::from_value(host()).unwrap(),
+            OPERATION,
+            serde_json::from_value(file(21)).unwrap(),
+            serde_json::from_value(data(REPLACED_43)["originalSiteSelection"].clone()).unwrap(),
+            serde_json::from_value(
+                data(REPLACED_43)["expectedOriginalBusinessAndInstallation"].clone(),
+            )
+            .unwrap(),
+            serde_json::from_value(json!({"effectNs": 5, "convergenceNs": 9})).unwrap(),
+            REPLACED_43,
+            serde_json::from_value(clock()).unwrap(),
+        )
+        .frame(CONTROL, OPERATION, EPOCH, 1, None, &limits())
+        .unwrap();
+        assert_eq!(
+            typed.bytes,
+            raw[..typed.bytes.len()],
+            "encode → decode → encode is byte-identical"
+        );
+        for foreign in ["ordinary_initialize", "pg_upgrade", "import", "switch"] {
+            assert_eq!(
+                observe_chain(&frames(&[adoption(REPLACED_43), stage(foreign)]), &limits())
+                    .err()
+                    .map(|e| e.fault()),
+                Some(RecoveryControlFault::ControlInvalid),
+                "{foreign} is not a legacy adoption stage"
+            );
+        }
+        // Closed keys: a missing or an unknown key fails typed decoding.
+        let single = |mut record: Value| {
+            record["sequence"] = json!(1);
+            let body = serde_json::to_vec(&record).unwrap();
+            let mut raw = b"WBRCJ001".to_vec();
+            raw.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes());
+            raw.extend_from_slice(&body);
+            let digest = Sha256::new()
+                .chain_update(b"wrokbot.restore.journal.v1\0")
+                .chain_update(&raw)
+                .finalize();
+            raw.extend_from_slice(&digest);
+            observe_chain(&raw, &limits())
+        };
+        for missing in [
+            "initializingDescriptorDigest",
+            "originalStartupIntent",
+            "ownedIntentFileIdentity",
+        ] {
+            let mut record = adoption(REPLACED_43);
+            record["data"].as_object_mut().unwrap().remove(missing);
+            let error = single(record).err().expect("a required key is missing");
+            assert!(
+                error.original_json_error.is_some(),
+                "{missing} fails typed decoding"
+            );
+        }
+        let mut unknown = adoption(REPLACED_43);
+        unknown["data"]["toNativeVersion"] = json!(54);
+        let error = single(unknown).err().expect("no fourth-mode field");
+        assert!(
+            error.original_json_error.is_some(),
+            "an unknown key fails typed decoding"
+        );
+        // The Active it publishes names the replaced head as previousDigest.
+        let (_, mut active) = descriptors().into_iter().nth(1).unwrap();
+        active["revision"] = json!(3);
+        active["previousDigest"] = json!(REPLACED_43);
+        active["data"]["initializationEvidence"] =
+            json!([{"contextId": OPERATION, "sequence": 3, "digest": evidence_digest(&raw, 3)}]);
+        let published = observe(&canonical_descriptor(active.clone()), &limits()).unwrap();
+        chain
+            .verify_ordinary_evidence(&published)
+            .expect("names the replaced head");
+        active["previousDigest"] = json!(EPOCH.replace('1', "3"));
+        let published = observe(&canonical_descriptor(active), &limits()).unwrap();
+        assert_eq!(
+            chain
+                .verify_ordinary_evidence(&published)
+                .err()
+                .map(|e| e.fault()),
+            Some(RecoveryControlFault::ClosureUnproven),
+            "an operation naming another head than previousDigest is refused"
+        );
+    }
+
+    const REPLACED_43: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+    /// Frame digest of record `sequence` in `raw` (1-based).
+    fn evidence_digest(raw: &[u8], sequence: usize) -> String {
+        let mut offset = 0;
+        for index in 1..=sequence {
+            let length =
+                u32::from_be_bytes(raw[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let end = offset + 12 + length;
+            if index == sequence {
+                return digest_hex(&raw[end..end + 32].try_into().unwrap());
+            }
+            offset = end + 32;
+        }
+        unreachable!()
+    }
+
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_47_restore_current_below_latest_republishes_with_both_journals_checked() {
+        let below = crate::db::native::NATIVE_0052_VERSION.unsigned_abs();
+        let latest = crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs();
+        let fixture = RestoreEntryFixture::new();
+        let mut control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let digest = publish_current(&fixture, &control, below);
+        let (intent, seen) = fixture.below_latest(&control);
+        assert_eq!(
+            seen,
+            super::ordinary::ExpectedHead::CurrentBelowLatest(digest.clone())
+        );
+        let original = head(&fixture);
+        let session = control
+            .begin_ordinary_initialization_before(
+                intent,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        let runtime = adopt(&fixture, session);
+        let current = head(&fixture);
+        assert_eq!(current["phase"], "RestoreCurrent");
+        assert_eq!(current["revision"], 3);
+        assert_eq!(current["previousDigest"], digest.as_str());
+        for unchanged in [
+            "operationId",
+            "epoch",
+            "profileDigest",
+            "closureEvidence",
+            "switchReadback",
+        ] {
+            assert_eq!(
+                current["data"][unchanged], original["data"][unchanged],
+                "{unchanged}"
+            );
+        }
+        assert_eq!(current["data"]["binding"]["nativeVersion"], latest);
+        assert_ne!(current["data"]["publishIntent"]["contextId"], SITE);
+        drop(runtime);
+        let reader = super::RecoveryControl::open(fixture.config()).unwrap();
+        fixture.open_local(&reader).expect("both journals check");
+
+        // Synthetic republications, each in its own site: one field changed → refused.
+        let case = |edit: &dyn Fn(&mut Value, &mut Vec<super::journal::JournalData>)| -> Result<super::RecoveryRuntimeOwner, super::RecoveryControlError> {
+            let fixture = RestoreEntryFixture::new();
+            let control = super::RecoveryControl::open(fixture.config()).unwrap();
+            let replaced = publish_current(&fixture, &control, below);
+            let original = head(&fixture);
+            let [intent, observed] = confirmed_stage(super::journal::Stage::OrdinaryVerify);
+            let mut entries = vec![adoption_intent(&replaced), intent, observed];
+            let mut data = original["data"].clone();
+            data["binding"]["nativeVersion"] = json!(latest);
+            edit(&mut data, &mut entries);
+            publish_synthetic(&control, ADOPTION, EPOCH, entries, |_, position| {
+                let mut data = data;
+                data["publishIntent"] = position;
+                descriptor(3, &replaced, "RestoreCurrent", data)
+            });
+            let reader = super::RecoveryControl::open(fixture.config()).unwrap();
+            let result = fixture.open_local(&reader);
+            drop(fixture);
+            result
+        };
+        case(&|_, _| ()).expect("the unchanged synthetic republication is accepted");
+        let refused: [(
+            &str,
+            &dyn Fn(&mut Value, &mut Vec<super::journal::JournalData>),
+        ); 6] = [
+            ("operationId", &|data, _| {
+                data["operationId"] = json!("abcdefabcdefabcdefabcdefabcdef09")
+            }),
+            ("epoch", &|data, _| {
+                data["epoch"] = json!(EPOCH.replace('1', "5"))
+            }),
+            ("closureEvidence", &|data, _| {
+                data["closureEvidence"][0]["digest"] = json!(REPLACED)
+            }),
+            ("switchReadback", &|data, _| {
+                data["switchReadback"]["digest"] = json!(REPLACED)
+            }),
+            ("priorActivationDigest", &|_, entries| {
+                entries[0] = adoption_intent(REPLACED)
+            }),
+            ("missing ordinary_verify", &|_, entries| entries.truncate(1)),
+        ];
+        for (name, edit) in refused {
+            assert!(case(edit).is_err(), "{name}");
+        }
+        // publishIntent naming the restore operation with a new version is refused.
+        let fixture = RestoreEntryFixture::new();
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_current(&fixture, &control, below);
+        let path = fixture.control_root().join("activation-v1");
+        let mut changed = head(&fixture);
+        changed["data"]["binding"]["nativeVersion"] = json!(latest);
+        let bytes = canonical_descriptor(changed);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            fixture.open_local(&control).is_err(),
+            "a rewritten head has no publication"
+        );
+    }
+
+    #[cfg(all(
+        feature = "desktop-local",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
+    mod harness {
+        use crate as openbot_infra;
+        include!("../../../test-support/postgres_harness.rs");
+    }
+
+    /// Server site of T046-48: configuration, optional intent and control root.
+    #[cfg(all(
+        feature = "desktop-local",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
+    struct ServerSite {
+        directory: std::path::PathBuf,
+    }
+
+    #[cfg(all(
+        feature = "desktop-local",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
+    impl Drop for ServerSite {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[cfg(all(
+        feature = "desktop-local",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
+    impl ServerSite {
+        const DEP: &'static str = "below-latest-deployment";
+        const TENANT: &'static str = "below-latest-tenant";
+
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = std::env::current_dir()
+                .unwrap()
+                .join(format!(".server-046-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            Self { directory }
+        }
+
+        fn kek(bytes: [u8; 32]) -> crate::auth::config::KeyEncryptionKey {
+            use base64::Engine as _;
+            let env: crate::auth::config::EnvMap = [(
+                "KEY_ENCRYPTION_KEY".to_owned(),
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            )]
+            .into_iter()
+            .collect();
+            crate::auth::config::KeyEncryptionKey::from_env_map(
+                &env,
+                crate::auth::config::ExampleKeyPolicy::Reject,
+            )
+            .unwrap()
+        }
+
+        async fn configure(&self, pool: &crate::db::pool::DatabasePool, mode: &str) {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let row = pool.get().await.unwrap().query_one(
+                "SELECT pcs.system_identifier::text AS system, d.oid AS oid FROM pg_control_system() pcs JOIN pg_database d ON d.datname=current_database()", &[]).await.unwrap();
+            let system: String = row.get("system");
+            let oid: u32 = row.get("oid");
+            let (intent, config) = (self.directory.join("intent"), self.directory.join("config"));
+            let _ = std::fs::remove_file(&intent);
+            let _ = std::fs::remove_file(&config);
+            let bytes = serde_json::to_vec(&json!({
+                "version": 1, "controlRoot": self.directory.join("control"),
+                "hostLimits": {"maxRequestBytes": 65536, "maxActivationBytes": 65536, "maxJournalFrameBytes": 65536,
+                    "maxJournalBytes": 1 << 20, "maxJournalRecords": 64, "maxRuntimeRecordBytes": 65536,
+                    "maxRegisteredRuntimes": 8, "maxRetainedOperations": 8, "maxRootEntries": 64, "maxTempEntries": 8,
+                    "maxEvidenceRefs": 16, "maxRuntimeResourceFacts": 16, "maxIdBytes": 128, "maxComponentBytes": 128,
+                    "maxRelativePathBytes": 8192, "maxPathDepth": 128, "maxOpenFiles": 4096, "maxMetadataBytes": 1 << 24,
+                    "admissionNs": 30_000_000_000u64},
+                "ordinaryStartupBounds": {"effectNs": 60_000_000_000u64, "convergenceNs": 30_000_000_000u64},
+                "expectedServiceOwner": {"uid": rustix::process::getuid().as_raw(), "service": "openbot-test"},
+                "expectedInstallationBinding": {"deploymentId": Self::DEP, "tenantId": Self::TENANT, "datasetId": CONTROL,
+                    "sourceInstallationId": "server-source", "targetInstallationId": "server-target"},
+                "expectedServerDatabase": {"pgSystemId": system.parse::<u64>().unwrap(), "databaseOid": oid, "pgMajor": 17},
+                "optionalStartupIntent": {"mode": mode, "intentFile": intent},
+            })).unwrap();
+            std::fs::write(&config, &bytes).unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let meta = std::fs::metadata(&config).unwrap();
+            let mut id = [0u8; 16];
+            getrandom::fill(&mut id).unwrap();
+            let request = serde_json::to_vec(&json!({"formatVersion": 1, "requestId": digest_hex(&Sha256::digest(id).into())[..32],
+                "mode": mode, "serviceConfig": {"file": {"device": meta.dev(), "inode": meta.ino(), "uid": meta.uid()},
+                "length": meta.len(), "digest": digest_hex(&Sha256::digest(&bytes).into())}})).unwrap();
+            std::fs::write(&intent, request).unwrap();
+            std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        fn control(&self) -> super::RecoveryControl {
+            let host =
+                super::load_service_recovery_host_from_config(&self.directory.join("config"))
+                    .unwrap();
+            let limits = host.host_limits().clone();
+            super::RecoveryControl::open(
+                super::RecoveryControlConfig::server(host, limits).unwrap(),
+            )
+            .unwrap()
+        }
+
+        async fn start(
+            &self,
+            database: &crate::db::pool::DatabaseConfig,
+            key: [u8; 32],
+        ) -> Result<
+            (crate::db::pool::DatabasePool, super::RecoveryRuntimeOwner),
+            super::RecoveryControlError,
+        > {
+            self.control()
+                .open_server_before(
+                    database,
+                    &Self::kek(key),
+                    &openbot_contracts::ids::DeploymentId::new(Self::DEP),
+                    &openbot_contracts::ids::TenantId::new(Self::TENANT),
+                    &[super::RuntimeOwner::RunRelay],
+                )
+                .await
+        }
+
+        fn head(&self) -> Value {
+            serde_json::from_slice(
+                &std::fs::read(self.directory.join("control").join("activation-v1")).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn operations(&self) -> usize {
+            std::fs::read_dir(self.directory.join("control").join("operations"))
+                .unwrap()
+                .count()
+        }
+
+        /// Republish the latest Fresh head at the strict-prior version through
+        /// the private codec, as an earlier binary would have published it.
+        async fn below_latest(&self, pool: &crate::db::pool::DatabasePool) -> String {
+            let head = self.head();
+            let replaced = {
+                let record: ActivationRecord = serde_json::from_value(head.clone()).unwrap();
+                record.encoded().unwrap().1
+            };
+            let control_id = head["controlId"].as_str().unwrap().to_owned();
+            let epoch = head["data"]["binding"]["authorizationEpoch"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let fresh = head["data"]["publishIntent"]["contextId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let raw = std::fs::read(
+                self.directory
+                    .join("control")
+                    .join("operations")
+                    .join(&fresh)
+                    .join("journal-v1"),
+            )
+            .unwrap();
+            let length = u32::from_be_bytes(raw[8..12].try_into().unwrap()) as usize;
+            let first: Value = serde_json::from_slice(&raw[12..12 + length]).unwrap();
+            let host = first["data"]["hostBinding"].clone();
+            let older: String = pool
+                .get()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT checksum FROM openbot_internal.schema_migrations WHERE version=$1",
+                    &[&crate::db::native::NATIVE_0052_VERSION],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let mut binding = head["data"]["binding"].clone();
+            binding["nativeVersion"] = json!(crate::db::native::NATIVE_0052_VERSION);
+            binding["migrationDigest"] = json!(older);
+            let entries = vec![
+                super::journal::JournalData::legacy_adoption(
+                    serde_json::from_value(host.clone()).unwrap(),
+                    ADOPTION,
+                    RecoveryFileIdentity { device: 7, inode: 21, uid: rustix::process::getuid().as_raw() },
+                    serde_json::from_value(json!({"siteKind": "server_database", "serviceConfig": host["serviceConfig"],
+                        "expectedServerDatabase": {"pgSystemId": host["serverDatabase"]["pgSystemId"],
+                            "databaseOid": host["serverDatabase"]["databaseOid"], "pgMajor": 17}})).unwrap(),
+                    serde_json::from_value(json!({"deploymentId": Self::DEP, "tenantId": Self::TENANT, "datasetId": CONTROL,
+                        "sourceInstallationId": "server-source", "targetInstallationId": "server-target"})).unwrap(),
+                    serde_json::from_value(json!({"effectNs": 5, "convergenceNs": 9})).unwrap(),
+                    &replaced,
+                    serde_json::from_value(clock()).unwrap(),
+                ),
+                super::journal::JournalData::stage_intent(super::journal::Stage::OrdinaryVerify, CONTROL),
+                super::journal::JournalData::stage_observed(2, super::journal::Disposition::PgRollback(super::journal::RollbackAck::TimelyAck)),
+            ];
+            let control = self.control();
+            publish_synthetic_in(
+                &control,
+                &control_id,
+                ADOPTION,
+                &epoch,
+                entries,
+                |refs, position| {
+                    json!({"recordType": "wrokbot-recovery-activation", "version": 1, "controlId": control_id,
+                    "revision": head["revision"].as_u64().unwrap() + 1, "previousDigest": replaced, "phase": "OrdinaryActive",
+                    "data": {"binding": binding, "initializationEvidence": [refs[2]], "publishIntent": position}})
+                },
+            )
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires owned PostgreSQL 17.11 through OPENBOT_TEST_DATABASE_URL"]
+    #[cfg(all(
+        feature = "desktop-local",
+        feature = "server-runtime",
+        target_os = "macos"
+    ))]
+    async fn t046_48_server_active_below_latest_compares_site_before_upgrade() {
+        const KEK: [u8; 32] = [0x42; 32];
+        let admin = harness::admin_config("t046_48");
+        harness::with_temp_database(&admin, "t046_48", |config| async move {
+            let config = config.with_max_pool_size(4);
+            let site = ServerSite::new();
+            let pool = crate::db::pool::connect(&config)
+                .await
+                .map_err(|e| e.to_string())?;
+            site.configure(&pool, "fresh_init").await;
+            let (fresh_pool, mut runtime) = site
+                .start(&config, KEK)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            // Close the Fresh runtime with its receipt so the writer lock is free.
+            // Its only owner never started; the control root keeps the
+            // original connection, so no SqlDriver owner is enrolled here.
+            fresh_pool.close();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let facts = vec![super::RuntimeCloseFact::PassiveRetirement {
+                object: super::PassiveObjectKind::NeverStarted(super::RuntimeOwner::RunRelay),
+            }];
+            runtime
+                .close_before(super::RuntimeCloseResources::new(facts), deadline)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            drop(runtime);
+            let below = site.below_latest(&pool).await;
+            let operations = site.operations();
+            // The unchanged configuration has no legacy_adoption intent:
+            // InitializationRequired, nothing written.
+            let error = site
+                .start(&config, KEK)
+                .await
+                .err()
+                .ok_or("below latest without intent")?;
+            assert_eq!(error.fault(), RecoveryControlFault::InitializationRequired);
+            assert_eq!(site.operations(), operations);
+            // A canary under another KEK fails the site comparison before any operation.
+            site.configure(&pool, "legacy_adoption").await;
+            let error = site
+                .start(&config, [0x24; 32])
+                .await
+                .err()
+                .ok_or("another KEK")?;
+            assert_eq!(error.fault(), RecoveryControlFault::KeyUnverified);
+            assert_eq!(
+                site.operations(),
+                operations,
+                "no adoption operation before the site check"
+            );
+            // The migrated database with the operator's intent: adopted and republished.
+            let (adopted, _runtime) = site
+                .start(&config, KEK)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            adopted.close();
+            let head = site.head();
+            assert_eq!(head["phase"], "OrdinaryActive");
+            assert_eq!(head["previousDigest"], below.as_str());
+            assert_eq!(
+                head["data"]["binding"]["nativeVersion"],
+                crate::db::native::NATIVE_LATEST_VERSION
+            );
+            assert_eq!(site.operations(), operations + 1);
+            let context = head["data"]["publishIntent"]["contextId"].as_str().unwrap();
+            let raw = std::fs::read(
+                site.directory
+                    .join("control")
+                    .join("operations")
+                    .join(context)
+                    .join("journal-v1"),
+            )
+            .unwrap();
+            let length = u32::from_be_bytes(raw[8..12].try_into().unwrap()) as usize;
+            let first: Value = serde_json::from_slice(&raw[12..12 + length]).unwrap();
+            assert_eq!(first["data"]["mode"], "legacy_adoption");
+            assert_eq!(
+                first["data"]["initializingDescriptorDigest"],
+                below.as_str()
+            );
+            // The republished head binds the edited configuration: the same
+            // service starts again on it.
+            let (again, _second) = site
+                .start(&config, KEK)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            again.close();
+            pool.close();
+            Ok(())
+        })
+        .await;
     }
 }

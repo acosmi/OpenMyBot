@@ -40,6 +40,25 @@ pub(super) enum OrdinaryInitializationSource {
 
 pub(super) type SealedSource = (OrdinaryInitializationSource, Hex32, RecoveryFileIdentity);
 
+/// A published head below this binary's latest native version, seen under SH
+/// and handed back with its digest (OMB-裁-130). The exclusive writer adopts
+/// exactly that head as a known site; another head is `OwnerBusy`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ExpectedHead {
+    ActiveBelowLatest(String),
+    CurrentBelowLatest(String),
+}
+
+impl ExpectedHead {
+    fn matches(&self, published: &PublishedActivation) -> bool {
+        let (phase, digest) = match self {
+            Self::ActiveBelowLatest(digest) => (ActivationPhase::OrdinaryActive, digest),
+            Self::CurrentBelowLatest(digest) => (ActivationPhase::RestoreCurrent, digest),
+        };
+        published.observation().record.phase == phase && published.digest() == digest
+    }
+}
+
 /// Trusted site expectation the producer already checked; no actual PG tuple.
 pub(super) enum SiteExpectation {
     Server {
@@ -78,6 +97,7 @@ pub struct VerifiedOrdinaryStartupIntent {
     resource_model: ResourceModel,
     owners: Vec<RuntimeOwner>,
     local_request: Option<entry::VerifiedRecoveryHostIntent>,
+    expected_head: Option<ExpectedHead>,
     #[cfg(feature = "desktop-local")]
     fresh_installation: Option<crate::auth::single_user::desktop_local::DesktopLocalInstallation>,
 }
@@ -148,6 +168,7 @@ impl VerifiedOrdinaryStartupIntent {
             resource_model,
             owners: owners.to_vec(),
             local_request: None,
+            expected_head: None,
             #[cfg(feature = "desktop-local")]
             fresh_installation: None,
         })
@@ -166,6 +187,11 @@ impl VerifiedOrdinaryStartupIntent {
             Ok(mut intent) => { intent.admission = intent.admission.min(request_deadline); intent.local_request = Some(request); Ok(intent) }
             Err(mut error) => { error.retained_restore_intent = Some(Box::new(request)); Err(error) }
         }
+    }
+
+    /// The below-latest head a shared-lock branch handed this intent back for.
+    pub(super) fn expected_head(&self) -> Option<&ExpectedHead> {
+        self.expected_head.as_ref()
     }
 
     /// Deadline A: lock acquisition and the shared-lock head read.
@@ -317,13 +343,37 @@ fn shared_head_inner(
             return Err(error.retain(control));
         }
     };
-    if let Err(error) = intent.expects(published.binding()) {
+    let below = published.binding().native_version() < latest();
+    // Server adoption needs the operator's migrated database and its
+    // legacy_adoption intent (OMB-裁-129 item 2); that intent edits the
+    // service configuration, which the republished head binds instead.
+    let rebound = match &intent.site {
+        SiteExpectation::Server { service_config, .. }
+            if below
+                && intent.source.map(|(source, _, _)| source)
+                    == Some(OrdinaryInitializationSource::LegacyAdoption {
+                        site: OrdinarySite::ServerDatabase,
+                    }) =>
+        {
+            Some(published.binding().with_service_config(service_config))
+        }
+        _ => None,
+    };
+    if let Err(error) = intent.expects(rebound.as_ref().unwrap_or(published.binding())) {
         files.release_registration_attempt();
         return Err(error);
     }
-    if published.binding().native_version() < latest() {
+    if below {
         files.release_registration_attempt();
-        return Err(initialization_required(None));
+        if matches!(intent.site, SiteExpectation::Server { .. }) && rebound.is_none() {
+            return Err(initialization_required(None));
+        }
+        let digest = published.digest().to_owned();
+        intent.expected_head = Some(match published.observation().record.phase {
+            ActivationPhase::OrdinaryActive => ExpectedHead::ActiveBelowLatest(digest),
+            _ => ExpectedHead::CurrentBelowLatest(digest),
+        });
+        return Err(initialization_required(Some(intent)));
     }
     Ok((published, intent))
 }
@@ -441,45 +491,88 @@ pub(super) fn begin(
 ) -> Result<OrdinaryInitializationSession, RecoveryControlError> {
     let mut original = Some(intent);
     let result = (|| {
-    let intent = original.as_ref().expect("original intent retained");
-    let admission = deadline.min(intent.admission);
-    let mut files = entry::lock(control)?;
-    files.acquire_writer_before(admission)?;
-    let head = match files.read_head_before(admission) {
-        Ok(head) => head,
-        Err(error) => {
-            files.latch(error.fault());
-            return Err(error.retain(control));
+        let intent = original.as_mut().expect("original intent retained");
+        let admission = deadline.min(intent.admission);
+        let mut files = entry::lock(control)?;
+        files.acquire_writer_before(admission)?;
+        let head = match files.read_head_before(admission) {
+            Ok(head) => head,
+            Err(error) => {
+                files.latch(error.fault());
+                return Err(error.retain(control));
+            }
+        };
+        let adopted = match (&head, &intent.expected_head) {
+            (Head::Absent, None) if intent.source.is_some() => None,
+            (Head::Published(published), Some(expected)) if expected.matches(published) => {
+                let record = published.observation().record.clone();
+                let digest = published.digest().to_owned();
+                // A known Local site has no request file: the held published
+                // descriptor is the positive intent (OMB-裁-130).
+                if let SiteExpectation::Local(local) = &mut intent.site {
+                    let binding = published.binding().ordinary_local()?;
+                    let identity = files
+                        .activation_source
+                        .as_ref()
+                        .ok_or_else(|| fault(RecoveryControlFault::ControlInvalid))?
+                        .identity;
+                    local.installation_id = Some(binding.installation_id.to_owned());
+                    local.legacy_expected = Some(BusinessAndInstallation {
+                        deployment_id: binding.deployment_id.to_owned(),
+                        tenant_id: binding.tenant_id.to_owned(),
+                        dataset_id: binding.dataset_id.to_owned(),
+                        source_installation_id: binding.installation_id.to_owned(),
+                        target_installation_id: binding.installation_id.to_owned(),
+                    });
+                    intent.source = Some((
+                        OrdinaryInitializationSource::LegacyAdoption {
+                            site: OrdinarySite::LocalPhysical,
+                        },
+                        Hex32::mint(&mint::<16>()?)?,
+                        identity,
+                    ));
+                }
+                Some((record, digest))
+            }
+            _ => {
+                files.release_writer();
+                return Err(fault(RecoveryControlFault::OwnerBusy));
+            }
+        };
+        #[cfg(feature = "desktop-local")]
+        if adopted.is_none()
+            && intent.source.is_some_and(|(source, _, _)| {
+                source
+                    == OrdinaryInitializationSource::LegacyAdoption {
+                        site: OrdinarySite::LocalPhysical,
+                    }
+            })
+        {
+            if let Err(error) = files.require_empty_legacy_control_before(admission) {
+                files.release_writer();
+                return Err(error);
+            }
         }
-    };
-    if !matches!(head, Head::Absent) || intent.source.is_none() {
-        files.release_writer();
-        return Err(fault(RecoveryControlFault::OwnerBusy));
-    }
-    #[cfg(feature = "desktop-local")]
-    if intent.source.is_some_and(|(source, _, _)| source == OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical }) {
-        if let Err(error) = files.require_empty_legacy_control_before(admission) { files.release_writer(); return Err(error); }
-    }
-    #[cfg(feature = "desktop-local")]
-    if let SiteExpectation::Local(local) = &intent.site {
-        files.verify_local_root_before(
-            local
-                .root
-                .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))?,
-            intent.effect,
-        )?;
-    }
-    drop(files);
-    Ok(OrdinaryInitializationSession {
-        control: Arc::clone(control),
-        intent: original.take().expect("original intent transferred once"),
-        head: None,
-        operation: None,
-        pending: None,
-        last: None,
-        evidence: Vec::new(),
-        local_sql: LocalLegacySql::default(),
-    })
+        #[cfg(feature = "desktop-local")]
+        if let SiteExpectation::Local(local) = &intent.site {
+            files.verify_local_root_before(
+                local
+                    .root
+                    .ok_or_else(|| fault(RecoveryControlFault::EntryInvalid))?,
+                intent.effect,
+            )?;
+        }
+        drop(files);
+        Ok(OrdinaryInitializationSession {
+            control: Arc::clone(control),
+            intent: original.take().expect("original intent transferred once"),
+            head: adopted,
+            operation: None,
+            pending: None,
+            last: None,
+            evidence: Vec::new(),
+            local_sql: LocalLegacySql::default(),
+        })
     })();
     result.map_err(|mut error: RecoveryControlError| {
         error.unconsumed = original.take().map(Box::new);
@@ -553,6 +646,116 @@ impl OrdinaryInitializationSession {
     /// Whether this owner consumed a Local legacy adoption request.
     pub fn is_local_legacy(&self) -> bool {
         self.initialization_source() == Some(OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical })
+    }
+
+    /// Whether this writer adopts a published head below the latest native
+    /// version as a known site (OMB-裁-130).
+    pub fn adopts_published_head(&self) -> bool {
+        self.intent.expected_head.is_some()
+    }
+
+    /// The binding of the published head this writer adopts.
+    pub(super) fn published_binding(&self) -> Result<&ActivationBinding, RecoveryControlError> {
+        match (
+            &self.intent.expected_head,
+            self.head.as_ref().map(|(record, _)| record.data()),
+        ) {
+            (Some(_), Some(ActivationPayload::Active(active))) => Ok(&active.binding),
+            (Some(_), Some(ActivationPayload::Current(current))) => Ok(&current.binding),
+            _ => Err(fault(RecoveryControlFault::EntryInvalid)),
+        }
+    }
+
+    /// Open the legacy adoption operation of the held published head: its
+    /// OperationIntent names that head's digest, the envelope keeps the
+    /// binding epoch, and no head is published before the proof (OMB-裁-130).
+    /// Then the ordinary_verify StageIntent.
+    pub(super) fn seal_published(&mut self) -> Result<(), RecoveryControlError> {
+        let invalid = || fault(RecoveryControlFault::EntryInvalid);
+        if self.operation.is_some() {
+            return Err(invalid());
+        }
+        let (record, digest) = self.head.clone().ok_or_else(invalid)?;
+        let binding = self.published_binding()?.clone();
+        let (_, intent_id, intent_file) = self.intent.source.ok_or_else(invalid)?;
+        let effect = self.intent.effect;
+        let mut files = entry::lock(&self.control)?;
+        let control_root = files.root_identity(effect)?;
+        let (host, selection, ids) = match &self.intent.site {
+            SiteExpectation::Server {
+                ids,
+                service_config,
+                owner,
+                database,
+                ..
+            } => {
+                let actual = binding.ordinary_server()?;
+                (
+                    HostBinding::ServerDatabase {
+                        actual_os_owner: owner.clone(),
+                        service_config: service_config.clone(),
+                        control_root,
+                        server_database: actual.server_database.clone(),
+                    },
+                    SiteSelection::ServerDatabase {
+                        service_config: service_config.clone(),
+                        expected_server_database: *database,
+                    },
+                    BusinessAndInstallation {
+                        deployment_id: ids[0].clone(),
+                        tenant_id: ids[1].clone(),
+                        dataset_id: actual.dataset_id.to_owned(),
+                        source_installation_id: ids[2].clone(),
+                        target_installation_id: ids[3].clone(),
+                    },
+                )
+            }
+            SiteExpectation::Local(local) => {
+                let root = local.root.ok_or_else(invalid)?;
+                (
+                    HostBinding::LocalPhysical {
+                        actual_os_owner: ActualOsOwner::LocalUid { uid: root.uid },
+                        app_data_parent: local.parent,
+                        control_root,
+                        reviewed_release_digest: local.release.as_str().to_owned(),
+                    },
+                    SiteSelection::LocalPhysical {
+                        trusted_parent: local.parent,
+                        entry_component: local.component.clone(),
+                    },
+                    local.legacy_expected.clone().ok_or_else(invalid)?,
+                )
+            }
+        };
+        files.verify_head_digest(&digest, effect)?;
+        let clock = files.owner_clock(
+            Hex32::mint(&mint::<16>()?)?,
+            self.intent.t0_ns,
+            &self.intent.bounds,
+        )?;
+        let control_id = Hex32::parse(&record.control_id)?;
+        let epoch = match record.data() {
+            ActivationPayload::Current(current) => current.epoch.as_str(),
+            _ => binding.authorization_epoch(),
+        };
+        self.operation = Some(intent_id);
+        files.begin_journal(&intent_id, &control_id, epoch, effect)?;
+        files.append_journal(
+            &intent_id,
+            &JournalData::legacy_adoption(
+                host,
+                intent_id.as_str(),
+                intent_file,
+                selection,
+                ids,
+                self.intent.bounds,
+                &digest,
+                clock,
+            ),
+            effect,
+        )?;
+        drop(files);
+        self.intend(OrdinaryStage::Verify)
     }
 
     /// The sealed source of this original initialization session.
@@ -983,11 +1186,15 @@ impl OrdinaryInitializationSession {
         }
         let mut files = entry::lock(&self.control)?;
         files.verify_local_root_before(root, self.intent.effect)?;
-        entry::recheck_legacy_request_before(
-            &mut files,
-            self.intent.local_request.as_mut().ok_or_else(invalid)?,
-            self.intent.effect,
-        )?;
+        // A known site's positive intent is its published head, already
+        // rechecked when sealed; a first adoption rechecks its request file.
+        if self.intent.expected_head.is_none() {
+            entry::recheck_legacy_request_before(
+                &mut files,
+                self.intent.local_request.as_mut().ok_or_else(invalid)?,
+                self.intent.effect,
+            )?;
+        }
         files.bind_original_local_pool(database.pool());
         drop(files);
         let operation = self.operation()?;
@@ -1034,6 +1241,60 @@ impl OrdinaryInitializationSession {
             migration_digest,
         })
     }
+    /// Admit the adopted database's original admin driver observations into
+    /// this owner's ordinary control budget (OMB-裁-136): each driver holds one
+    /// socket, charged against the release hostLimits `maxOpenFiles`, with its
+    /// observation handle as metadata. Missing observations stay
+    /// `ClosureUnproven`.
+    #[cfg(feature = "desktop-local")]
+    pub fn admit_admin_observations(
+        &self,
+        database: &crate::db::desktop_local::DesktopLocalDatabase,
+    ) -> Result<Vec<crate::db::pool::ConnectionObservation>, RecoveryControlError> {
+        let observations = database
+            .admin_observations()
+            .ok_or_else(|| fault(RecoveryControlFault::ClosureUnproven))?;
+        let count = observations.len() as u64;
+        let bytes = count
+            .checked_mul(std::mem::size_of::<crate::db::pool::ConnectionObservation>() as u64)
+            .ok_or_else(|| fault(RecoveryControlFault::CapacityExceeded))?;
+        entry::lock(&self.control)?.prepay(bytes, count)?;
+        Ok(observations.to_vec())
+    }
+
+    /// Ordinary Local startup below the latest native version (OMB-裁-130):
+    /// the read-only check of the running site against the published binding,
+    /// the legacy adoption operation of that head, the original ordinary_verify
+    /// transaction with its registered increments, then the republished head.
+    /// The caller then takes `into_runtime_before`.
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub async fn adopt_local_published_before(
+        &mut self,
+        authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+        database: &crate::db::desktop_local::DesktopLocalDatabase,
+        canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
+    ) -> Result<(), RecoveryControlError> {
+        let SiteExpectation::Local(local) = &self.intent.site else {
+            return Err(fault(RecoveryControlFault::EntryInvalid));
+        };
+        let services = [local.master_service.clone(), local.postgres_service.clone()];
+        entry::verify_local_binding_before(
+            &self.control,
+            self.published_binding()?,
+            authority,
+            database,
+            canary,
+            [services[0].as_str(), services[1].as_str()],
+            self.intent.effect,
+        )
+        .await?;
+        self.seal_published()?;
+        let proof = self
+            .verify_local_legacy_before(authority, database, canary)
+            .await?;
+        self.publish_active(OrdinaryActivationProof::Legacy(proof))
+    }
+
     /// Verify the actual Fresh database, canary and original root, then record the
     /// observed completion of that chain. Its internal COMMITs are not fabricated ACKs.
     #[cfg(feature = "desktop-local")]
@@ -1291,13 +1552,16 @@ impl OrdinaryInitializationSession {
         proof: OrdinaryActivationProof,
     ) -> Result<(), RecoveryControlError> {
         let invalid = || fault(RecoveryControlFault::EntryInvalid);
+        if self.evidence.is_empty() || self.pending.is_some() {
+            return Err(fault(RecoveryControlFault::ClosureUnproven));
+        }
+        if self.intent.expected_head.is_some() {
+            return self.publish_adopted(proof);
+        }
         let (record, _) = self.head.as_ref().ok_or_else(invalid)?;
         let ActivationPayload::Initializing(initializing) = record.data() else {
             return Err(invalid());
         };
-        if self.evidence.is_empty() || self.pending.is_some() {
-            return Err(fault(RecoveryControlFault::ClosureUnproven));
-        }
         let operation = self.operation()?;
         if let OrdinaryActivationProof::Legacy(legacy) = &proof {
             if legacy.operation != operation {
@@ -1374,6 +1638,72 @@ impl OrdinaryInitializationSession {
         self.resource_close()
     }
 
+    /// Republish the adopted known site at the proof's native version:
+    /// revision + 1, the same epoch and binding except nativeVersion and
+    /// migrationDigest; a Current keeps its restore fields (OMB-裁-130).
+    fn publish_adopted(
+        &mut self,
+        proof: OrdinaryActivationProof,
+    ) -> Result<(), RecoveryControlError> {
+        let invalid = || fault(RecoveryControlFault::EntryInvalid);
+        let OrdinaryActivationProof::Legacy(proof) = proof else {
+            return Err(invalid());
+        };
+        let binding = self.published_binding()?;
+        let matches = match &proof.site {
+            LegacySite::Local(site) => binding.ordinary_local().is_ok_and(|expected| {
+                expected.dataset_id == site.dataset_id
+                    && expected.deployment_id == site.deployment_id
+                    && expected.tenant_id == site.tenant_id
+                    && expected.installation_id == site.installation_id
+                    && expected.generation_root == site.generation_root
+                    && expected.pg_system_id == site.pg_system_id
+                    && expected.database_oid == site.database_oid
+                    && expected.master.key_id == site.master.key_id
+                    && expected.master.key_version == site.master.key_version
+            }),
+            LegacySite::Server { site, key_id } => {
+                binding.ordinary_server().is_ok_and(|expected| {
+                    expected.server_database == site && expected.master.key_id == key_id.as_str()
+                })
+            }
+        };
+        if proof.operation != self.operation()?
+            || !matches
+            || proof.native_version != latest()
+            || binding.native_version() >= latest()
+        {
+            return Err(fault(RecoveryControlFault::ControlInvalid));
+        }
+        let mut binding = binding.with_native(proof.native_version, proof.migration_digest);
+        if let SiteExpectation::Server { service_config, .. } = &self.intent.site {
+            binding = binding.with_service_config(service_config);
+        }
+        binding.validate(&entry::lock(&self.control)?.limits)?;
+        let evidence = self.evidence.clone();
+        let (record, _) = self.head.as_ref().ok_or_else(invalid)?;
+        match record.data().clone() {
+            ActivationPayload::Active(_) => {
+                self.publish(ActivationPhase::OrdinaryActive, |publish_intent| {
+                    ActivationPayload::Active(Active {
+                        binding,
+                        initialization_evidence: evidence,
+                        publish_intent,
+                    })
+                })?
+            }
+            ActivationPayload::Current(mut current) => {
+                self.publish(ActivationPhase::RestoreCurrent, |publish_intent| {
+                    current.binding = binding;
+                    current.publish_intent = publish_intent;
+                    ActivationPayload::Current(current)
+                })?
+            }
+            _ => return Err(invalid()),
+        }
+        self.resource_close()
+    }
+
     /// Downgrade runtimeEX to SH on the same FD, write the enrollment and
     /// release ownerEX/admissionEX (spec 8073). The held head must be at the
     /// latest native version.
@@ -1384,6 +1714,7 @@ impl OrdinaryInitializationSession {
             .as_ref()
             .is_some_and(|(record, _)| match record.data() {
                 ActivationPayload::Active(active) => active.binding.native_version() == latest(),
+                ActivationPayload::Current(current) => current.binding.native_version() == latest(),
                 _ => false,
             });
         if !latest_head || self.pending.is_some() {

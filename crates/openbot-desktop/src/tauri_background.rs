@@ -1034,6 +1034,8 @@ pub struct DesktopLocalRuntimeConfig {
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     recovery_fresh: Option<openbot_infra::recovery_control::OrdinaryInitializationSession>,
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    recovery_upgrade: Option<openbot_infra::recovery_control::OrdinaryInitializationSession>,
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     recovery_request: Option<crate::recovery::input::RestoreEntryInput>,
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     self_owned_capture_fixture: Option<SelfOwnedCaptureFixtureBinding>,
@@ -1068,6 +1070,8 @@ impl DesktopLocalRuntimeConfig {
             recovery_runtime: None,
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             recovery_fresh: None,
+            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+            recovery_upgrade: None,
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             recovery_request: None,
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
@@ -1121,6 +1125,16 @@ impl DesktopLocalRuntimeConfig {
         session: openbot_infra::recovery_control::OrdinaryInitializationSession,
     ) -> Self {
         self.recovery_fresh = Some(session);
+        self
+    }
+
+    /// The writer adopting a published head below the latest native version
+    /// (OMB-裁-130); set instead of `with_recovery_fresh`/`with_recovery_runtime`.
+    pub(crate) fn with_recovery_upgrade(
+        mut self,
+        session: openbot_infra::recovery_control::OrdinaryInitializationSession,
+    ) -> Self {
+        self.recovery_upgrade = Some(session);
         self
     }
 
@@ -2715,6 +2729,21 @@ async fn execute_local_legacy_adoption(
             return Err(owner.fail(error.into()));
         }
     };
+    // The admin pool closed inside preparation; keep its original driver
+    // observations under this owner's ordinary budget for the SqlDriver fact.
+    match owner
+        .session
+        .as_ref()
+        .expect("original legacy owner")
+        .admit_admin_observations(prepared.database())
+    {
+        Ok(observations) => owner.admin_observations = Some(observations),
+        Err(error) => {
+            drop(vault);
+            owner.shutdown = Some(prepared.shutdown().await);
+            return Err(owner.fail(error.into()));
+        }
+    }
     if let Err(error) = owner.session.as_mut().expect("original legacy owner")
         .publish_active(OrdinaryActivationProof::Legacy(proof)) {
         drop(vault);
@@ -2733,8 +2762,8 @@ async fn execute_local_legacy_adoption(
     // Adoption ends here: no principal/package synchronization, application, Agent or window.
     drop(vault);
     owner.shutdown = Some(prepared.shutdown().await);
-    // The current producer retained only application-pool observations. Missing admin
-    // observations cannot certify the original SqlDriver owner or consume a close attempt.
+    // Missing admin observations cannot certify the original SqlDriver owner or consume a
+    // close attempt.
     if owner.admin_observations.as_ref().is_none_or(|observations| observations.is_empty()) {
         return Err(owner.fail(DesktopLocalRuntimeError::ClosureUnproven));
     }
@@ -2775,7 +2804,10 @@ pub(crate) async fn prepare_desktop_local_runtime(
             .recovery_bootstrap
             .as_ref()
             .ok_or(DesktopLocalRuntimeError::InitializationRequired)?;
-        if config.recovery_runtime.is_none() && config.recovery_fresh.is_none() {
+        if config.recovery_runtime.is_none()
+            && config.recovery_fresh.is_none()
+            && config.recovery_upgrade.is_none()
+        {
             let mut control = RecoveryControl::open(RecoveryControlConfig::local(
                 app_data_root.clone(),
                 bootstrap.host_limits.clone(),
@@ -2806,6 +2838,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
                         control.begin_ordinary_initialization_before(intent, admission)?;
                     if session.is_local_fresh() {
                         config.with_recovery_fresh(session)
+                    } else if session.adopts_published_head() {
+                        config.with_recovery_upgrade(session)
                     } else {
                         return Err(DesktopLocalRuntimeError::InitializationRequired);
                     }
@@ -2826,6 +2860,8 @@ pub(crate) async fn prepare_desktop_local_runtime(
         mut recovery_runtime,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         mut recovery_fresh,
+        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+        mut recovery_upgrade,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         recovery_request: _,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
@@ -3337,6 +3373,15 @@ pub(crate) async fn prepare_desktop_local_runtime(
                     )
                     .await?;
                 session.publish_active(OrdinaryActivationProof::LocalFresh(proof))?;
+                recovery_runtime = Some(session.into_runtime_before()?);
+            } else if let Some(mut session) = recovery_upgrade.take() {
+                session
+                    .adopt_local_published_before(
+                        prepared_data_plane.authority(),
+                        prepared_data_plane.database(),
+                        vault_ready.canary(),
+                    )
+                    .await?;
                 recovery_runtime = Some(session.into_runtime_before()?);
             } else {
                 recovery_runtime
