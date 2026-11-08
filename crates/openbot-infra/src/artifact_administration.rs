@@ -507,6 +507,8 @@ pub struct PostgresArtifactAdministration {
     read_authority: OnceLock<Arc<artifact_read_authority::PostgresArtifactReadAuthority>>,
     cleanup_physical_observer: OnceLock<Arc<dyn ArtifactCleanupPhysicalObserver>>,
     save_producer_diagnostic: OnceLock<Arc<SaveProducerDiagnosticCapture>>,
+    /// Worker admission for the pending-input preread, injected once at assembly.
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
     /// Artifacts whose public deletion a call of this instance is removing or completing.
     deleting: Mutex<std::collections::HashSet<String>>,
 }
@@ -624,6 +626,7 @@ impl PostgresArtifactAdministration {
         store: Arc<DatasetBoundArtifactStore>,
         policy: ArtifactQuotaPolicy,
         audit_key: SecretBytes,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, ArtifactAdministrationError> {
         if !store.matches_registry_owner(&registry) || audit_key.is_empty() {
             return Err(unavailable());
@@ -636,6 +639,7 @@ impl PostgresArtifactAdministration {
             read_authority: OnceLock::new(),
             cleanup_physical_observer: OnceLock::new(),
             save_producer_diagnostic: OnceLock::new(),
+            recovery_gate,
             deleting: Mutex::default(),
         })
     }
@@ -727,6 +731,33 @@ impl PostgresArtifactAdministration {
             .borrow_recovery_admission_before(auth, deadline)
             .await
             .map_err(|_| PublicReadRecordFailure::observed(unavailable()))?;
+        let recheck = || {
+            admission
+                .verify_current_before(binding, auth, deadline)
+                .is_ok()
+        };
+        #[cfg(test)]
+        return self
+            .observe_read_record_admitted(auth, artifact_id, deadline, recheck, final_query_gate)
+            .await;
+        #[cfg(not(test))]
+        self.observe_read_record_admitted(auth, artifact_id, deadline, recheck)
+            .await
+    }
+
+    /// The query body shared by the request entry and the pending-input worker preread; the
+    /// caller already holds its recovery admission and `recheck` proves it before returning.
+    async fn observe_read_record_admitted(
+        &self,
+        auth: &AuthContext,
+        artifact_id: &str,
+        deadline: std::time::Instant,
+        recheck: impl FnOnce() -> bool,
+        #[cfg(test)] final_query_gate: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ) -> Result<ObservedArtifactReadRecord, PublicReadRecordFailure> {
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
             let check_budget = || {
                 deadline
@@ -833,9 +864,9 @@ impl PostgresArtifactAdministration {
                 .await
                 .map_err(|_| PublicReadRecordFailure::unproven(unavailable()))?;
             check_budget()?;
-            admission
-                .verify_current_before(binding, auth, deadline)
-                .map_err(|_| PublicReadRecordFailure::observed(unavailable()))?;
+            if !recheck() {
+                return Err(PublicReadRecordFailure::observed(unavailable()));
+            }
             outcome.map_err(PublicReadRecordFailure::observed)
         })
         .await
@@ -1839,15 +1870,28 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
         let unavailable = || AppError::DependencyUnavailable {
             dependency: "artifacts",
         };
+        // A worker entry: the pending input carries no request binding, so one worker
+        // lease under the dispatcher's deadline is held across the whole preread.
+        let lease = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| unavailable())?;
         let mut observations = Vec::with_capacity(refs.len());
         for id in refs {
-            let record = self
-                .observe_read_record_before_inner(auth, id, deadline)
-                .await
-                .map_err(|failure| match failure.error {
-                    ArtifactAdministrationError::Gone { .. } => AppError::NotVisible,
-                    error => error.into_app_error(),
-                })?;
+            // The lease is rechecked once before the materials return.
+            #[cfg(test)]
+            let observed = self
+                .observe_read_record_admitted(auth, id, deadline, || true, None)
+                .await;
+            #[cfg(not(test))]
+            let observed = self
+                .observe_read_record_admitted(auth, id, deadline, || true)
+                .await;
+            let record = observed.map_err(|failure| match failure.error {
+                ArtifactAdministrationError::Gone { .. } => AppError::NotVisible,
+                error => error.into_app_error(),
+            })?;
             observations.push(record);
         }
         validate_run_input_metadata(
@@ -1902,6 +1946,9 @@ impl ArtifactAdministration for PostgresArtifactAdministration {
                 body,
             });
         }
+        lease
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
         Ok(materials)
     }
 

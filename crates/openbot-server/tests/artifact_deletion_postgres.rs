@@ -200,6 +200,11 @@ impl Fixture {
                 store,
                 ArtifactQuotaPolicy::default(),
                 SecretBytes::new(vec![0x31; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &admin,
+                    &DeploymentId::new("outside"),
+                    &TenantId::new("outside"),
+                ),
             )
             .map_err(text)?,
         );

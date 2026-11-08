@@ -498,6 +498,11 @@ impl LocalFixture {
                 store,
                 ArtifactQuotaPolicy::default(),
                 SecretBytes::new(vec![0x75; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &database,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|e| e.to_string())?,
         );

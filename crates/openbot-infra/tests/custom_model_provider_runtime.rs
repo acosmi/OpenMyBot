@@ -1,5 +1,7 @@
 //! Owned PG + TLS integration for actual personal provider starts, without vendor accounts.
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 #[path = "custom_model_provider_runtime/target_identity.rs"]
 mod target_identity;
 use async_trait::async_trait;
@@ -58,15 +60,18 @@ const TENANT: &str = "custom-runtime-tenant";
 const OWNER: &str = "custom-runtime";
 const KEY: &str = "OWNED_CUSTOM_MODEL_CANARY";
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    // This owned database is outside every recovery domain (spec revision R484 S12).
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct Fixture {
     pool: openbot_infra::db::pool::DatabasePool,

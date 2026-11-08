@@ -165,6 +165,11 @@ impl Fixture {
                 Arc::clone(&store),
                 policy,
                 SecretBytes::new(vec![0x83; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|e| e.to_string())?,
         );
@@ -660,7 +665,7 @@ async fn actual_current_source_scope_and_materialized_identity_integrity_are_enf
             let foreign_pool=pool::connect(&f.config).await.map_err(|_| "independent owned manager".to_owned())?;
             require(!f.administration.read_authority().matches_pool_scope(&foreign_pool,&DeploymentId::new(DEPLOYMENT),&TenantId::new(TENANT)),"foreign actual manager must fail same-Pool enrollment")?;
             foreign_pool.close();
-            let other=Arc::new(PostgresArtifactAdministration::new(f.registry.clone(),f.store.clone(),ArtifactQuotaPolicy::default(),SecretBytes::new(vec![0x84;32])).map_err(|_| "owned second adapter".to_owned())?);
+            let other=Arc::new(PostgresArtifactAdministration::new(f.registry.clone(),f.store.clone(),ArtifactQuotaPolicy::default(),SecretBytes::new(vec![0x84;32]),openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool,&DeploymentId::new(DEPLOYMENT),&TenantId::new(TENANT))).map_err(|_| "owned second adapter".to_owned())?);
             let plain=f.auth_as(OWNER,0);
             let guard=ForeignGuard{issuer:f.issuer.clone(),foreign:other.read_authority()};
             let epoch=ServerSessionBindingIdentity::from_verified_row("core-read-session-a".into(),plain.actor().clone(),"owned-test-session-column-a".into(),f.created,plain.auth_generation());

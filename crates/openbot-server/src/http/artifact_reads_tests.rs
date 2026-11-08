@@ -361,6 +361,11 @@ impl Fixture {
                 store.clone(),
                 ArtifactQuotaPolicy::default(),
                 SecretBytes::new(vec![0x88; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?,
         );
@@ -583,6 +588,11 @@ fn shared_public_peer(
             fixture.store.clone(),
             ArtifactQuotaPolicy::default(),
             SecretBytes::new(vec![0x88; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &fixture.pool,
+                &DeploymentId::new("outside"),
+                &TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?,
     );
@@ -649,7 +659,8 @@ async fn shared_read_barrier_closes_all_administrations_and_keeps_other_artifact
             ).await.map_err(|error| error.to_string())?);
             let foreign_weak = Arc::downgrade(&foreign_store);
             let foreign = Arc::new(PostgresArtifactAdministration::new(foreign_registry.clone(), foreign_store.clone(),
-                ArtifactQuotaPolicy::default(), SecretBytes::new(vec![0x88; 32])).map_err(|error| error.to_string())?);
+                ArtifactQuotaPolicy::default(), SecretBytes::new(vec![0x88; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&fixture.pool, &DeploymentId::new("outside"), &TenantId::new("outside"))).map_err(|error| error.to_string())?);
             require(foreign.close_observed_artifact_reads(&record).is_err(), "actual foreign Store closed an original snapshot by string identity")?;
             drop(foreign); drop(foreign_store); drop(foreign_registry);
             require(foreign_weak.upgrade().is_none(), "extra foreign test Store Arc remained live")?;

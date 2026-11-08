@@ -237,6 +237,11 @@ impl Fixture {
                     store,
                     policy,
                     SecretBytes::new(vec![0x82; 32]),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             ))

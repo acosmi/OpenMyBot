@@ -303,6 +303,11 @@ impl Fixture {
                 store,
                 policy,
                 SecretBytes::new(vec![0x59; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|_| "owned_administration_failed")?,
         );

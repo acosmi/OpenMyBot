@@ -3723,6 +3723,17 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 .await);
             }
         };
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    let recovery_gate = recovery_runtime
+        .as_ref()
+        .expect("the original Local runtime was bound before assembly")
+        .read_gate();
+    #[cfg(not(all(feature = "desktop-launcher", target_os = "macos")))]
+    let recovery_gate = openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+        &pool,
+        auth.deployment(),
+        auth.tenant(),
+    );
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let artifact_administration = {
         let artifact_policy = openbot_domain::artifact::ArtifactQuotaPolicy::default();
@@ -3763,6 +3774,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
             artifact_store,
             artifact_policy,
             openbot_domain::vault::SecretBytes::new(audit_key.expose().to_vec()),
+            recovery_gate.clone(),
         ) {
             Ok(port) => Arc::new(port),
             Err(_) => {
@@ -3883,17 +3895,6 @@ pub(crate) async fn prepare_desktop_local_runtime(
             }
             None => (ui_preferences, None, None),
         };
-    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-    let recovery_gate = recovery_runtime
-        .as_ref()
-        .expect("the original Local runtime was bound before assembly")
-        .read_gate();
-    #[cfg(not(all(feature = "desktop-launcher", target_os = "macos")))]
-    let recovery_gate = openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-        &pool,
-        auth.deployment(),
-        auth.tenant(),
-    );
     let assembly = match assemble_postgres_application(PostgresApplicationAssemblyInput {
         recovery_gate: recovery_gate.clone(),
         pool: pool.clone(),

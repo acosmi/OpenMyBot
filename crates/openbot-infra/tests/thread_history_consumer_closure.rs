@@ -2391,6 +2391,7 @@ async fn hold_operation(
 
 /// Builds the save adapter over `registry` and a fresh private root.
 async fn artifact_admin(
+    pool: &pool::DatabasePool,
     registry: Arc<ArtifactDatasetRegistry>,
 ) -> TestResult<(PostgresArtifactAdministration, OwnedRoot)> {
     let root = OwnedRoot::new()?;
@@ -2407,6 +2408,11 @@ async fn artifact_admin(
         Arc::new(store),
         policy,
         SecretBytes::new(vec![0x81; 32]),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            pool,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?;
     Ok((administration, root))
@@ -2452,7 +2458,7 @@ async fn save_case(
         .await
         .map_err(text)?,
     );
-    let (administration, root) = artifact_admin(registry).await?;
+    let (administration, root) = artifact_admin(p, registry).await?;
     let administration = Arc::new(administration);
     let dir = directory(p, proxied)?;
     let [refused, before_io, after_io, replayed, ordered] =
@@ -3012,7 +3018,7 @@ async fn not_closed_case(
         .await
         .map_err(text)?;
     let registry = v2.registry.clone().ok_or("the dataset registry is gone")?;
-    let (administration, _root) = artifact_admin(registry).await?;
+    let (administration, _root) = artifact_admin(&p, registry).await?;
     let owner = auth();
     let save_asked = save_request(&save);
 

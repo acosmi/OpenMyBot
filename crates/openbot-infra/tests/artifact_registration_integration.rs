@@ -300,6 +300,11 @@ impl Fixture {
             store,
             policy,
             SecretBytes::new(vec![0x81; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map(Arc::new)
         .map_err(|error| error.to_string())
@@ -1168,6 +1173,11 @@ async fn equal_database_identity_does_not_combine_foreign_pool_and_store_owner()
             store,
             ArtifactQuotaPolicy::default(),
             SecretBytes::new(vec![0x81; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &foreign,
+                &DeploymentId::new(DEPLOYMENT),
+                &TenantId::new(TENANT),
+            ),
         );
         require(
             administration.is_err(),

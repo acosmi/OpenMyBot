@@ -492,6 +492,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     store,
                     policy,
                     SecretBytes::new(audit_key.expose().to_vec()),
+                    recovery_read_gate.clone(),
                 )
                 .map_err(|_| startup_error("artifact_administration_unavailable"))?,
             );

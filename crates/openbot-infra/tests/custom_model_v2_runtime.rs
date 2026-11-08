@@ -1,6 +1,8 @@
 //! Real current-dataset v2 provider starts against owned PG, original Vault and loopback TLS.
 #![cfg(feature = "server-runtime")]
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openbot_application::model_connections::ModelConnectionAdministration;
@@ -131,15 +133,18 @@ const TENANT: &str = "custom-runtime-tenant";
 const OWNER: &str = "custom-runtime";
 const KEY: &str = "OWNED_CUSTOM_MODEL_CANARY";
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    // This owned database is outside every recovery domain (spec revision R484 S12).
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct Fixture {
     pool: openbot_infra::db::pool::DatabasePool,

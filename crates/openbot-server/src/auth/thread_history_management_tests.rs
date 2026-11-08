@@ -813,6 +813,11 @@ async fn thread_history_management_scope_is_one_j_and_preserves_source_read_and_
                 store.clone(),
                 policy,
                 SecretBytes::new(vec![0x83; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &f.pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             )
             .map_err(|e| e.to_string())?,
         );
