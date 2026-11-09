@@ -1261,9 +1261,11 @@ mod v2_vault_tests {
     }
 
     // The selector identifies the actual last-authority statement from the frozen
-    // source. It is not an authority oracle, result replacement or a second query.
+    // source: the closed-history head read that follows the v2 load and is the
+    // last SQL before the start's synchronous continuation. It is not an
+    // authority oracle, result replacement or a second query.
     const LAST_AUTHORITY_SQL_SHA256: &str =
-        "83f8da58bb0c955b5e185584e6b292c4b1e50593062bcc700921c1c6cc88ccc0";
+        "4004ac47376f3992dab936335edf6c4abc507a5af306b60f9292cf04868e0c88";
 
     #[derive(Default)]
     struct LastReadyRelayCounts {
@@ -1460,7 +1462,7 @@ mod v2_vault_tests {
         {
             return Err("D1 original binary result format required");
         }
-        if parameters != 22 {
+        if parameters != 3 {
             return Err("D1 original last-authority parameter count");
         }
         Ok(parameters)
@@ -1623,10 +1625,10 @@ mod v2_vault_tests {
                     continue;
                 }
                 if executed.load(Ordering::SeqCst) && tag == b'D' {
-                    // Original binary bool true; these are actual server bytes,
-                    // retained without constructing an ACK or substituting a Row.
-                    if bytes != [0, 1, 0, 0, 0, 1, 1] {
-                        return Err("D1 last current row must be actual true");
+                    // Original binary bool false (the history is open); these are actual
+                    // server bytes, retained without constructing an ACK or substituting a Row.
+                    if bytes != [0, 1, 0, 0, 0, 1, 0] {
+                        return Err("D1 last current row must be actual false");
                     }
                     let mut held = last_ready_wire_frame(tag, &bytes);
                     let (command, command_bytes) = last_ready_frame(&mut up_read)
@@ -1793,8 +1795,8 @@ mod v2_vault_tests {
                     }
                 }
             }).await.expect("original start reached actual last SQL within its original budget");
-            assert_eq!(metadata.backend_pid,backend);assert_eq!(metadata.query_bytes,2936);
-            assert_eq!(metadata.parameter_count,22);assert_eq!(metadata.held_bytes,32);
+            assert_eq!(metadata.backend_pid,backend);assert_eq!(metadata.query_bytes,162);
+            assert_eq!(metadata.parameter_count,3);assert_eq!(metadata.held_bytes,32);
             assert_eq!(adapter.v2_expired_last_authority_ready.load(Ordering::SeqCst),0);
             assert_eq!(adapter.v2_vault_opens.load(Ordering::SeqCst),0);assert_eq!(dns.0.load(Ordering::SeqCst),0);
             assert!(!original.snapshot().retirement_requested && !original.snapshot().connection_destroyed);
@@ -1835,7 +1837,7 @@ mod v2_vault_tests {
             tokio::time::timeout(Duration::from_secs(2),changes.changed()).await.unwrap().unwrap();
             eprintln!("CUSTOM_V2_D1_TRACE wake_after_release={} elapsed_us={}",wake.generation.load(Ordering::SeqCst),first_poll_before.elapsed().as_micros());
             // A wake/socket write supplies scheduling only. This ONE resumed poll
-            // must itself reach the actual load Ok continuation and observe expiry.
+            // must itself reach the actual head-read Ok continuation and observe expiry.
             original_polls+=1;
             let result=match Future::poll(started.as_mut(),&mut cx) {
                 Poll::Ready(result)=>Some(result),
@@ -1880,7 +1882,7 @@ mod v2_vault_tests {
                 // used to make observer0 appear accepted.
                 drop(adapter);f.finish().await;relay.stop().await;return Err(error.to_owned());
             }
-            eprintln!("CUSTOM_V2_D1_LAST_READY query_sha256={LAST_AUTHORITY_SQL_SHA256} original_backend={backend} successor_backend={successor_pid} parsed=1 bound=1 executed=1 actual_binary_true_rows=1 command=SELECT_1 ready=T held_bytes=32 released=1 resumed_polls=1 actual_expired_load_ready=1 vault=0 dns=0 original_retirement_before_pool_close=true original_backend_ended_before_pool_close=true");
+            eprintln!("CUSTOM_V2_D1_LAST_READY query_sha256={LAST_AUTHORITY_SQL_SHA256} original_backend={backend} successor_backend={successor_pid} parsed=1 bound=1 executed=1 actual_binary_false_rows=1 command=SELECT_1 ready=T held_bytes=32 released=1 resumed_polls=1 actual_expired_load_ready=1 vault=0 dns=0 original_retirement_before_pool_close=true original_backend_ended_before_pool_close=true");
             // A separate fresh original start supplies the counter's positive
             // control. The prior original deadline/future is never retried internally.
             assert!(matches!(adapter.start(request).await,Err(ProviderPortError::CommitUnknown)));
