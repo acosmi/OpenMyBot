@@ -504,14 +504,24 @@ impl ArtifactDatasetRegistry {
             .map_err(infra)?;
         let public: schema_facts::SchemaFacts = serde_json::from_str(REGISTERED_PUBLIC_SCHEMA)
             .map_err(|_| corrupt("public_schema_oracle"))?;
-        let payload: String = tx
-            .query_one(schema_facts::SCHEMA_FACTS_SQL, &[])
+        // Rendered in UTC like `schema_facts::fetch`; the savepoint scopes the
+        // zone to this observation inside the caller's transaction.
+        let messages = tx
+            .simple_query(&format!(
+                "SAVEPOINT schema_facts; SET LOCAL timezone='UTC';\n{}\nROLLBACK TO SAVEPOINT schema_facts; RELEASE SAVEPOINT schema_facts",
+                schema_facts::SCHEMA_FACTS_SQL
+            ))
             .await
-            .map_err(|_| ArtifactRegistryError::Unavailable)?
-            .try_get(0)
-            .map_err(|_| corrupt("public_schema"))?;
+            .map_err(|_| ArtifactRegistryError::Unavailable)?;
+        let payload = messages
+            .iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+                _ => None,
+            })
+            .ok_or_else(|| corrupt("public_schema"))?;
         let actual: schema_facts::SchemaFacts =
-            serde_json::from_str(&payload).map_err(|_| corrupt("public_schema"))?;
+            serde_json::from_str(payload).map_err(|_| corrupt("public_schema"))?;
         if actual != public {
             return Err(corrupt("public_schema"));
         }
