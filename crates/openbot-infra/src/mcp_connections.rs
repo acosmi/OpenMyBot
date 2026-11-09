@@ -969,11 +969,13 @@ impl PostgresMcpConnections {
 
         // Catalog failure does not roll back a valid connection; it remains invisible until a later
         // refresh rather than lying that consent failed after the credential transaction committed.
+        // A refused recheck after the persist await skips that send the same way.
         let catalog_bearer = match material.transport {
             VendorTransportKind::Mcp => McpBearerToken::from_secret(access).map(Some).ok(),
             VendorTransportKind::GoogleDriveRest => Some(None),
         };
         if let Some(bearer) = catalog_bearer
+            && current().is_ok()
             && let Err(error) = self.catalog.refresh(&attempt.server_id, bearer).await
         {
             tracing::warn!(code = %error, "MCP OAuth callback 后 catalog refresh 失败");
@@ -4479,6 +4481,506 @@ mod tests {
             })
             .is_err(),
             "host bits must not be silently canonicalized"
+        );
+    }
+}
+
+/// T046-27 and T046-31 on a published RestoreCurrent (spec revision R484):
+/// epoch-keyed OAuth state and the gate every callback, refresh and
+/// revocation worker borrows before an open or send.
+#[cfg(all(
+    test,
+    feature = "server-sso",
+    feature = "desktop-local",
+    target_os = "macos"
+))]
+mod consumers {
+    use super::*;
+    use crate::auth::oidc::attempt::LoginAttempt;
+    use crate::auth::oidc::redirect::{CanonicalRedirectUri, HTTPS_ONLY};
+    use crate::auth::oidc::{PostgresAttemptError, PostgresLoginAttemptStore, ProviderId};
+    use crate::auth::sso::{PostgresSamlAttemptStore, SsoEphemeralError};
+    use crate::net::safe_http::{EgressPolicy, SafeDialer};
+    use crate::recovery_control::AuthorizationPurpose;
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use openbot_domain::vault::{KeyVersion, WrappingKey};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SERVER: &str = "restored-notes";
+    const AUDIT: &[u8] = b"restore-consumer-audit-key-at-least-32-bytes";
+    const TOMBSTONE: &str = r#"{"revocation_status":"pending","revocation_reason":"reconnected"}"#;
+
+    fn restored_connections(
+        restored: &RestoreCurrentFixture,
+        vault: &CredentialRecordVault,
+        state_key: &[u8],
+    ) -> PostgresMcpConnections {
+        let rmcp = crate::mcp::SafeRmcpClient::new(
+            SafeDialer::new(EgressPolicy::default()),
+            SchemePolicy::HttpOrHttps,
+            Some(StdDuration::from_secs(2)),
+        );
+        let catalog =
+            Arc::new(PostgresMcpCatalog::new(restored.pool.clone(), rmcp, AUDIT.to_vec()).unwrap());
+        PostgresMcpConnections::new(
+            restored.pool.clone(),
+            vault.clone(),
+            McpOAuthClient::new(
+                SafeDialer::new(EgressPolicy::default()),
+                SchemePolicy::HttpOrHttps,
+            ),
+            catalog,
+            DeploymentId::new("dep"),
+            TenantId::new("ten"),
+            state_key.to_vec(),
+            AUDIT.to_vec(),
+            Some("http://127.0.0.1:9"),
+            Some("http://app.example.test"),
+            SchemePolicy::HttpOrHttps,
+            restored.read_gate(),
+        )
+        .unwrap()
+    }
+
+    /// The attempt `begin_oauth` writes for `actor` on the server at `origin`.
+    fn attempt(
+        connections: &PostgresMcpConnections,
+        actor: &str,
+        auth_generation: i64,
+        client: Uuid,
+        origin: &str,
+    ) -> StoredAttempt {
+        StoredAttempt {
+            version: ATTEMPT_VERSION,
+            deployment_id: "dep".to_owned(),
+            tenant_id: "ten".to_owned(),
+            actor_id: actor.to_owned(),
+            auth_generation,
+            server_id: SERVER.to_owned(),
+            client_credential_id: client,
+            resource: format!("{origin}/mcp"),
+            transport: "mcp".to_owned(),
+            egress_allow_cidrs: vec!["127.0.0.1/32".to_owned()],
+            code_verifier: "v".repeat(64),
+            redirect_uri: connections.callback_uri.clone().unwrap(),
+            issuer: origin.to_owned(),
+            issuer_required: false,
+            requested_scope: "notes:read".to_owned(),
+            return_to: McpOAuthReturnTo::Settings,
+            expires_at_unix_seconds: (OffsetDateTime::now_utc() + ATTEMPT_TTL).unix_timestamp(),
+        }
+    }
+
+    /// Pre-restore states are retired; a state keyed under the old epoch is
+    /// refused by the restored runtime's OIDC, SSO and MCP stores without
+    /// being burned (no old-key retry), while the old key still opens it and
+    /// the new key opens its own.
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_27_old_oauth_state_and_old_epoch_keys_have_no_fallback() {
+        let restored = RestoreCurrentFixture::publish(
+            "INSERT INTO public.verifications(id,identifier,value,expires_at,created_at,updated_at)
+             SELECT 'pre-restore-'||p,p||':pre-restore','sealed',now()+interval '1 hour',now(),now()
+               FROM unnest(ARRAY['oidc-attempt','saml-attempt','mcp-oauth-attempt']) AS p;",
+        )
+        .await;
+        let client = restored.pool.get().await.unwrap();
+        let pending = || {
+            let client = &client;
+            async move {
+                client
+                    .query_one("SELECT count(*)::bigint FROM public.verifications", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+            }
+        };
+        assert_eq!(
+            pending().await,
+            0,
+            "pre-restore OAuth states survived the retirement"
+        );
+        let (parent, now, ten) = (
+            [0x27_u8; 32],
+            OffsetDateTime::now_utc(),
+            TenantId::new("ten"),
+        );
+        let keys = |purpose| {
+            let old = RestoreCurrentFixture::old_epoch_key(purpose, &parent);
+            let new = restored
+                .runtime
+                .derive_authorization_key(purpose, &parent)
+                .unwrap();
+            assert_ne!(old.expose(), new.expose());
+            [old, new]
+        };
+
+        let okta = ProviderId::parse("okta").unwrap();
+        let begin = || {
+            let redirect =
+                CanonicalRedirectUri::parse("https://app.example.test/auth/callback", HTTPS_ONLY)
+                    .unwrap();
+            LoginAttempt::begin(okta.clone(), redirect, now, Duration::minutes(10))
+        };
+        let [old, new] = keys(AuthorizationPurpose::OidcState).map(|key| {
+            PostgresLoginAttemptStore::new(restored.pool.clone(), key.expose().to_vec(), &ten, 16)
+                .unwrap()
+        });
+        let started = begin();
+        let state = started.state().secret().clone();
+        old.insert(started, now).await.unwrap();
+        assert_eq!(
+            new.consume(&state, &okta, now).await.err(),
+            Some(PostgresAttemptError::Unknown)
+        );
+        assert_eq!(
+            pending().await,
+            1,
+            "the refused OIDC state was burned or retried"
+        );
+        old.consume(&state, &okta, now).await.unwrap();
+        let started = begin();
+        let state = started.state().secret().clone();
+        new.insert(started, now).await.unwrap();
+        new.consume(&state, &okta, now).await.unwrap();
+
+        let [old, new] = keys(AuthorizationPurpose::SsoState).map(|key| {
+            PostgresSamlAttemptStore::new(
+                restored.pool.clone(),
+                key.expose().to_vec(),
+                &ten,
+                16,
+                Duration::minutes(10),
+            )
+            .unwrap()
+        });
+        let acs = "https://app.example.test/api/auth/sso/saml/acs";
+        let relay = old
+            .issue(&okta, Uuid::now_v7(), "_restored", acs, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            new.consume(&relay, &okta, now).await.err(),
+            Some(SsoEphemeralError::Unknown)
+        );
+        assert_eq!(
+            pending().await,
+            1,
+            "the refused SAML state was burned or retried"
+        );
+        old.consume(&relay, &okta, now).await.unwrap();
+        let relay = new
+            .issue(&okta, Uuid::now_v7(), "_restored", acs, now)
+            .await
+            .unwrap();
+        new.consume(&relay, &okta, now).await.unwrap();
+
+        let vault = CredentialRecordVault::single_key(
+            ten.clone(),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x27; 32]).unwrap(),
+        );
+        let oauth_client = Uuid::now_v7();
+        let sealed = vault
+            .seal(
+                &oauth_client,
+                SecretKind::McpOauthClient,
+                SecretPrincipal::Deployment,
+                SecretPrincipal::Service(ServiceId::new(SERVER)),
+                &SecretBytes::new(b"{}".to_vec()),
+            )
+            .unwrap();
+        client.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('carol','carol@restored.example.test',0);
+            INSERT INTO public.user_roles(user_id,role) VALUES('carol','user');").await.unwrap();
+        client.execute("INSERT INTO public.credentials(id,kind,provider,key_id,encrypted_value,metadata) VALUES($1,'mcp_oauth_client',$2,'oauth-client',$3,'{}')",
+            &[&oauth_client, &SERVER, &sealed]).await.unwrap();
+        client.execute("INSERT INTO public.mcp_servers(id,title,vendor,url,provenance,transport,credential_id,credential_generation,egress_allow_cidrs)
+            VALUES($1,'Restored Notes','test','http://127.0.0.1:9/mcp','custom','mcp',$2,0,ARRAY['127.0.0.1/32'])",
+            &[&SERVER, &oauth_client]).await.unwrap();
+        let [old, new] = keys(AuthorizationPurpose::McpState)
+            .map(|key| restored_connections(&restored, &vault, key.expose()));
+        let origin = "http://127.0.0.1:9";
+        old.insert_attempt(
+            "old-epoch-state",
+            &attempt(&old, "carol", 0, oauth_client, origin),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            new.consume_attempt(b"old-epoch-state").await,
+            Err(McpConnectionError::NotVisible)
+        ));
+        assert_eq!(
+            pending().await,
+            1,
+            "the refused MCP state was burned or retried"
+        );
+        old.consume_attempt(b"old-epoch-state").await.unwrap();
+        new.insert_attempt(
+            "new-epoch-state",
+            &attempt(&new, "carol", 0, oauth_client, origin),
+        )
+        .await
+        .unwrap();
+        new.consume_attempt(b"new-epoch-state").await.unwrap();
+        assert_eq!(pending().await, 0);
+    }
+
+    /// Gate open with the retired credentials confirmed: the revocation
+    /// sweep, the refresh broker and the callback each open and send exactly
+    /// once. Owner dropped: the same workers on fresh material open nothing,
+    /// send nothing and leave the state and tombstone in place.
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_31_callback_refresh_revocation_workers_check_gate_before_open_or_send() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // Vendor stand-in: RFC 9728 and RFC 8414 metadata, token and RFC 7009
+        // revocation endpoints. Every accepted connection and request counts.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        tokio::spawn({
+            let (origin, accepts, log) = (origin.clone(), accepts.clone(), log.clone());
+            async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    let (mut request, mut buffer) = (Vec::new(), [0_u8; 4096]);
+                    let head = loop {
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break Some(end + 4);
+                        }
+                        if read == 0 {
+                            break None;
+                        }
+                    };
+                    let Some(head) = head else { continue };
+                    let text = String::from_utf8_lossy(&request[..head]).into_owned();
+                    let line = text.split(' ').take(2).collect::<Vec<_>>().join(" ");
+                    let length = text
+                        .lines()
+                        .find_map(|header| {
+                            header
+                                .to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < head + length {
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let issued = log.lock().unwrap().len();
+                    let (status, body) = match line.as_str() {
+                        "GET /.well-known/oauth-protected-resource/mcp" => ("200 OK", serde_json::json!({
+                            "resource": format!("{origin}/mcp"), "authorization_servers": [&origin]}).to_string()),
+                        "GET /.well-known/oauth-authorization-server" => ("200 OK", serde_json::json!({
+                            "issuer": &origin, "authorization_endpoint": format!("{origin}/authorize"),
+                            "token_endpoint": format!("{origin}/token"), "revocation_endpoint": format!("{origin}/revoke"),
+                            "code_challenge_methods_supported": ["S256"]}).to_string()),
+                        "POST /token" => ("200 OK", serde_json::json!({
+                            "access_token": format!("access-{issued}"), "token_type": "Bearer",
+                            "refresh_token": format!("refresh-{issued}")}).to_string()),
+                        "POST /revoke" => ("200 OK", String::new()),
+                        _ => ("404 Not Found", String::new()),
+                    };
+                    log.lock().unwrap().push(line);
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            }
+        });
+        let sends = |line: &str| {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|seen| *seen == line)
+                .count()
+        };
+
+        // Before the backup: alice's connection, one pending tombstone of hers
+        // and bob without a connection, all on one OAuth client.
+        let vault = CredentialRecordVault::single_key(
+            TenantId::new("ten"),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x31; 32]).unwrap(),
+        );
+        let seal = |id: &Uuid, kind, owner, value: &str| {
+            vault
+                .seal(
+                    id,
+                    kind,
+                    owner,
+                    SecretPrincipal::Service(ServiceId::new(SERVER)),
+                    &SecretBytes::new(value.as_bytes().to_vec()),
+                )
+                .unwrap()
+        };
+        let alice = || SecretPrincipal::Actor(ActorId::new("alice"));
+        let (oauth_client, token, tombstone, closed_tombstone) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let registration =
+            serde_json::json!({"clientId": "restored-client", "clientSecret": "restored-secret",
+            "issuer": &origin, "tokenEndpointAuthMethod": "client_secret_basic"})
+            .to_string();
+        let seed = format!(
+            "INSERT INTO public.users(id,email,auth_generation) VALUES('alice','alice@restored.example.test',0),('bob','bob@restored.example.test',0);
+             INSERT INTO public.user_roles(user_id,role) VALUES('alice','user'),('bob','user');
+             INSERT INTO public.credentials(id,kind,provider,key_id,encrypted_value,metadata) VALUES
+               ('{oauth_client}','mcp_oauth_client','{SERVER}','oauth-client','{}','{{}}'),('{token}','mcp_user_token','{SERVER}','alice','{}','{{}}');
+             INSERT INTO public.credentials(id,kind,provider,key_id,encrypted_value,metadata,revoked_at,updated_at) VALUES
+               ('{tombstone}','mcp_user_token','{SERVER}','alice','{}','{TOMBSTONE}',now()-interval '1 hour',now()-interval '1 hour');
+             INSERT INTO public.mcp_servers(id,title,vendor,url,provenance,transport,credential_id,credential_generation,egress_allow_cidrs)
+               VALUES('{SERVER}','Restored Notes','test','{origin}/mcp','custom','mcp','{oauth_client}',0,ARRAY['127.0.0.1/32']);
+             INSERT INTO public.mcp_user_credentials(server_id,user_id,credential_id,scope) VALUES('{SERVER}','alice','{token}','notes:read');",
+            seal(&oauth_client, SecretKind::McpOauthClient, SecretPrincipal::Deployment, &registration),
+            seal(&token, SecretKind::McpUserToken, alice(), "refresh-alice"),
+            seal(&tombstone, SecretKind::McpUserToken, alice(), "refresh-retired"),
+        );
+        let restored = RestoreCurrentFixture::publish(&seed).await;
+        let client = restored.pool.get().await.unwrap();
+        for source in [oauth_client, token, tombstone] {
+            let row = client.query_one(
+                "SELECT requirement_id,owner_kind,owner_id FROM openbot_internal.restore_reconfirm_requirements WHERE source_kind='credential' AND source_ref=$1",
+                &[&source.to_string()],
+            ).await.unwrap();
+            let proof = if row.get::<_, &str>(1) == "actor" {
+                "fresh_actor"
+            } else {
+                "fresh_service_operator"
+            };
+            restored.confirm(row.get(0), row.get(2), proof).await;
+        }
+        let connections = restored_connections(&restored, &vault, &[0x31; 32]);
+        let broker = PostgresMcpCredentialBroker::new(
+            restored.pool.clone(),
+            vault.clone(),
+            restored.read_gate(),
+        )
+        .with_user_oauth(
+            SafeDialer::new(EgressPolicy::default()),
+            SchemePolicy::HttpOrHttps,
+            AUDIT.to_vec(),
+        )
+        .unwrap();
+        let callback = |state: &str| {
+            McpOAuthCallbackInput::new(b"vendor-code".to_vec(), state.as_bytes().to_vec(), None)
+        };
+        let pending = || {
+            let client = &client;
+            async move {
+                client
+                    .query_one("SELECT count(*)::bigint FROM public.verifications", &[])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+            }
+        };
+
+        // Gate open: the tombstone and the client open, one revocation goes.
+        let opens = vault.open_calls();
+        let sweep = connections.reconcile_pending_revocations().await.unwrap();
+        assert_eq!((sweep.attempted, sweep.revoked), (1, 1));
+        assert_eq!((vault.open_calls() - opens, sends("POST /revoke")), (2, 1));
+        // The refresh token and the client open, one refresh goes.
+        let opens = vault.open_calls();
+        assert!(
+            broker
+                .bearer_for(SERVER, &ActorId::new("alice"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!((vault.open_calls() - opens, sends("POST /token")), (2, 1));
+        // The retirement moved bob to generation 1; burn, client open, one exchange.
+        connections
+            .insert_attempt(
+                "open-callback",
+                &attempt(&connections, "bob", 1, oauth_client, &origin),
+            )
+            .await
+            .unwrap();
+        let opens = vault.open_calls();
+        connections
+            .complete_inner(&callback("open-callback"))
+            .await
+            .unwrap();
+        assert_eq!((vault.open_calls() - opens, sends("POST /token")), (1, 2));
+        assert_eq!(pending().await, 0);
+
+        // Fresh material of the same shapes, then the owner goes.
+        connections
+            .insert_attempt(
+                "closed-callback",
+                &attempt(&connections, "bob", 1, oauth_client, &origin),
+            )
+            .await
+            .unwrap();
+        client.execute(
+            "INSERT INTO public.credentials(id,kind,provider,key_id,encrypted_value,metadata,revoked_at,updated_at)
+             VALUES($1,'mcp_user_token',$2,'alice',$3,$4::text::jsonb,now()-interval '1 hour',now()-interval '1 hour')",
+            &[&closed_tombstone, &SERVER, &seal(&closed_tombstone, SecretKind::McpUserToken, alice(), "refresh-closed"), &TOMBSTONE],
+        ).await.unwrap();
+        drop(restored.runtime);
+        let (opens, accepted, requests) = (
+            vault.open_calls(),
+            accepts.load(Ordering::SeqCst),
+            log.lock().unwrap().len(),
+        );
+        assert_eq!(
+            connections
+                .complete_inner(&callback("closed-callback"))
+                .await
+                .err(),
+            Some(McpConnectionError::Unavailable)
+        );
+        assert_eq!(
+            pending().await,
+            1,
+            "a closed gate burned the callback state"
+        );
+        assert_eq!(
+            broker
+                .bearer_for(SERVER, &ActorId::new("alice"))
+                .await
+                .err(),
+            Some(McpCredentialError::Unavailable)
+        );
+        assert_eq!(
+            connections.reconcile_pending_revocations().await.err(),
+            Some(McpConnectionError::Unavailable)
+        );
+        let status: String = client
+            .query_one(
+                "SELECT metadata->>'revocation_status' FROM public.credentials WHERE id=$1",
+                &[&closed_tombstone],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(status, "pending", "a closed gate claimed the tombstone");
+        assert_eq!(
+            (
+                vault.open_calls(),
+                accepts.load(Ordering::SeqCst),
+                log.lock().unwrap().len()
+            ),
+            (opens, accepted, requests),
+            "Vault-open or send behind a closed gate"
         );
     }
 }

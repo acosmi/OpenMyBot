@@ -542,6 +542,12 @@ mod v2_test_harness {
     include!("../../../../test-support/postgres_harness.rs");
 }
 
+// The integration tests' outside-domain request binding: model writes
+// borrow a Normal admission with no restore cohort.
+#[cfg(test)]
+#[path = "../../tests/support/recovery_admission.rs"]
+mod recovery_admission;
+
 #[cfg(test)]
 mod v2_vault_tests {
     use super::*;
@@ -640,8 +646,8 @@ mod v2_vault_tests {
                 .with_model_dataset_binding(binding.clone()).unwrap();
             let context=PostgresAgentContextSource::new(p.clone(),DeploymentId::new(DEP),TenantId::new(TENANT),Some(32)).unwrap()
                 .with_model_dataset_binding(binding.clone()).unwrap();
-            let auth=AuthContextBuilder::from_verified_session(DeploymentId::new(DEP),TenantId::new(TENANT),ActorId::new("alice"),AuthGeneration::new(7),false)
-                .with_roles([Role::User]).build();
+            let auth=recovery_admission::outside_domain(AuthContextBuilder::from_verified_session(DeploymentId::new(DEP),TenantId::new(TENANT),ActorId::new("alice"),AuthGeneration::new(7),false)
+                .with_roles([Role::User]).build());
             let original_dataset:String=p.get().await.unwrap().query_one("SELECT dataset_id FROM openbot_internal.artifact_dataset_bindings WHERE deployment_id=$1 AND tenant_id=$2",&[&DEP,&TENANT]).await.unwrap().get(0);
             for mode in 0..12u64 {
                 let model=models.create(&auth,&CreateModelConnection{name:"Owned no-effect choice".into(),protocol:CustomModelProtocol::OpenaiChatCompletions,
@@ -788,15 +794,17 @@ mod v2_vault_tests {
             .unwrap()
             .with_model_dataset_binding(binding.clone())
             .unwrap();
-            let auth = AuthContextBuilder::from_verified_session(
-                DeploymentId::new(DEP),
-                TenantId::new(TENANT),
-                ActorId::new("alice"),
-                AuthGeneration::new(7),
-                false,
-            )
-            .with_roles([Role::User])
-            .build();
+            let auth = recovery_admission::outside_domain(
+                AuthContextBuilder::from_verified_session(
+                    DeploymentId::new(DEP),
+                    TenantId::new(TENANT),
+                    ActorId::new("alice"),
+                    AuthGeneration::new(7),
+                    false,
+                )
+                .with_roles([Role::User])
+                .build(),
+            );
             Self {
                 pool: p,
                 vault,
@@ -1209,7 +1217,7 @@ mod v2_vault_tests {
                     3=>{owned_dataset_statement(&c,"UPDATE openbot_internal.artifact_dataset_bindings SET initial_origin='desktop_canary' WHERE deployment_id=$1 AND tenant_id=$2",&[&deployment,&tenant]).await.unwrap();},
                     4=>{owned_dataset_statement(&c,"UPDATE openbot_internal.artifact_dataset_bindings SET created_at=created_at+interval '1 second' WHERE deployment_id=$1 AND tenant_id=$2",&[&deployment,&tenant]).await.unwrap();},
                     5=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=repeat('0',64) WHERE version=47",&[]).await.unwrap();},
-                    6=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(48,'owned_unknown_native_version',repeat('0',64))",&[]).await.unwrap();},
+                    6=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES($1,'owned_unknown_native_version',repeat('0',64))",&[&(crate::db::native::NATIVE_LATEST_VERSION+1)]).await.unwrap();},
                     7=>{c.batch_execute("ALTER TABLE openbot_internal.artifact_dataset_bindings RENAME TO owned_v2_fault_namespace").await.unwrap();},
                     8=>{c.batch_execute("ALTER TABLE openbot_internal.artifact_dataset_bindings RENAME CONSTRAINT artifact_dataset_bindings_schema_known TO owned_v2_fault_constraint").await.unwrap();},
                     _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT run_model_selection_v2_snapshots_protocol_check TO owned_v2_fault_snapshot_protocol").await.unwrap();},
@@ -1228,7 +1236,7 @@ mod v2_vault_tests {
                             &[&current_deployment,&current_tenant,&deployment,&tenant,&dataset,&schema,&origin,&created]).await.unwrap();
                     },
                     5=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=$1 WHERE version=47",&[&original_checksum]).await.unwrap();},
-                    6=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=48",&[]).await.unwrap();},
+                    6=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=$1",&[&(crate::db::native::NATIVE_LATEST_VERSION+1)]).await.unwrap();},
                     7=>{c.batch_execute("ALTER TABLE openbot_internal.owned_v2_fault_namespace RENAME TO artifact_dataset_bindings").await.unwrap();},
                     8=>{c.batch_execute("ALTER TABLE openbot_internal.artifact_dataset_bindings RENAME CONSTRAINT owned_v2_fault_constraint TO artifact_dataset_bindings_schema_known").await.unwrap();},
                     _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT owned_v2_fault_snapshot_protocol TO run_model_selection_v2_snapshots_protocol_check").await.unwrap();},
@@ -1893,7 +1901,7 @@ mod v2_vault_tests {
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_32_unconfirmed_model_secret_start_opens_no_vault_and_no_dns() {
         let restored =
-            crate::recovery_control::tests::restore_current::RestoreCurrentFixture::publish().await;
+            crate::recovery_control::tests::restore_current::RestoreCurrentFixture::publish("").await;
         let (p, dep, ten) = (restored.pool.clone(), DeploymentId::new("dep"), TenantId::new("ten"));
         p.get().await.unwrap().batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
             INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');

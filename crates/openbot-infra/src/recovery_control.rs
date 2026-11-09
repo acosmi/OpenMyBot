@@ -3812,7 +3812,9 @@ pub(crate) mod tests {
         }
 
         impl RestoreCurrentFixture {
-            pub(crate) async fn publish() -> Self {
+            /// `seed` is SQL the source applies after its native layout and
+            /// before the restore claims, retires and publishes it.
+            pub(crate) async fn publish(seed: &str) -> Self {
                 use std::os::unix::fs::DirBuilderExt as _;
                 let mut fixture = RestoreEntryFixture::new();
                 let capacity = &mut fixture.profile.capacity;
@@ -3831,7 +3833,7 @@ pub(crate) mod tests {
                 std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
                 let mut pg = OwnedCandidate::start_at(
                     crate::db::native::NATIVE_LATEST_VERSION,
-                    "",
+                    seed,
                     Some(root.join("data")),
                 )
                 .await;
@@ -3926,6 +3928,16 @@ pub(crate) mod tests {
                 self.runtime.read_gate()
             }
 
+            /// The key `purpose` derives from `parent` under the pre-restore
+            /// binding: the same deployment and tenant, only its own epoch.
+            #[cfg(feature = "server-runtime")]
+            pub(crate) fn old_epoch_key(
+                purpose: crate::recovery_control::AuthorizationPurpose,
+                parent: &[u8],
+            ) -> SecretBytes {
+                super::super::runtime::authorization_key(&serde_json::from_value(super::binding()).unwrap(), purpose, parent)
+            }
+
             /// One receipt for `requirement`, through the receipt insert
             /// guard every producer's INSERT passes.
             pub(crate) async fn confirm(&self, requirement: uuid::Uuid, owner: &str, proof_kind: &str) {
@@ -3942,7 +3954,7 @@ pub(crate) mod tests {
         #[tokio::test]
         #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
         async fn restore_current_fixture_publishes_one_cohort_and_gates_its_pool() {
-            let restored = RestoreCurrentFixture::publish().await;
+            let restored = RestoreCurrentFixture::publish("").await;
             eprintln!("restore fixture MetadataBytes admitted: candidate SQL {}, slots {}, SCRAM change {}, readback {}, publication {}",
                 restored.metadata[0], restored.metadata[1], restored.metadata[2], restored.metadata[3], restored.metadata[4]);
             let gate = restored.read_gate();

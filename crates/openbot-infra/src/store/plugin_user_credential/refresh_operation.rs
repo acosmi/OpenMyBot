@@ -395,7 +395,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_32_dropped_runtime_owner_closes_refresh_claim_and_admit() {
-        let restored = RestoreCurrentFixture::publish().await;
+        let restored = RestoreCurrentFixture::publish("").await;
         let vault = CredentialRecordVault::single_key(TenantId::new("ten"), KeyVersion::new(1), WrappingKey::from_bytes(vec![0x42; 32]).unwrap());
         let client = restored.pool.get().await.unwrap();
         client.batch_execute("INSERT INTO public.mcp_servers(id,title,vendor,url,provenance)

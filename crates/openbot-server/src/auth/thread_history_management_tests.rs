@@ -263,6 +263,15 @@ impl Fixture {
         resolver
             .install_thread_history_authority(&authority)
             .map_err(|e| format!("{e:?}"))?;
+        resolver
+            .install_recovery_read_gate(
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
+            )
+            .map_err(|e| format!("{e:?}"))?;
         let directory = PostgresThreadDirectory::with_runtime(
             pool.clone(),
             config.clone(),

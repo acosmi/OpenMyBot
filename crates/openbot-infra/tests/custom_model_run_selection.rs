@@ -1,5 +1,7 @@
 //! Explicit custom run acceptance through real PostgreSQL/Vault management and ThreadDirectory.
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 use openbot_application::model_connections::ModelConnectionAdministration;
 use openbot_application::{BeginThreadRunRequest, ThreadDirectory, ThreadDirectoryError as Error};
 use openbot_contracts::{
@@ -23,15 +25,18 @@ use zeroize::Zeroizing;
 const DEP: &str = "selection-dep";
 const TENANT: &str = "selection-tenant";
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    // This owned database is outside every recovery domain.
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 fn input(protocol: CustomModelProtocol) -> CreateModelConnection {
     CreateModelConnection {

@@ -293,9 +293,16 @@ impl ModelDatasetFacts {
 
 // A controlled physical replacement is a refusal fault, never a restore capability.
 // The tests keep the real original Desktop owner, registry and manager across the fault.
+// The integration tests' outside-domain request binding: model writes
+// borrow a Normal admission with no restore cohort.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "../tests/support/recovery_admission.rs"]
+mod recovery_admission;
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod physical_lineage_tests {
     use super::PostgresModelDatasetBinding;
+    use super::recovery_admission;
     use crate::artifact_registry::{
         ArtifactDatasetRegistry, ArtifactRegistryError, verify_artifact_registry_schema,
     };
@@ -804,7 +811,7 @@ mod physical_lineage_tests {
             .unwrap();
             let model = models
                 .create(
-                    &auth,
+                    &recovery_admission::outside_domain(auth.clone()),
                     &CreateModelConnection {
                         name: "Owned physical lineage choice".into(),
                         protocol: CustomModelProtocol::OpenaiChatCompletions,

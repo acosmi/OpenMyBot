@@ -1056,3 +1056,205 @@ mod tests {
         );
     }
 }
+
+/// T046-25 on a published RestoreCurrent (spec revision R484): the source
+/// runtime's sessions are retired and its session key is not the restored
+/// one; a verified callback commits the subject's `fresh_actor` receipt in
+/// the session's own transaction, so a failed COMMIT leaves neither.
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod reconfirm {
+    use super::*;
+    use crate::recovery_control::AuthorizationPurpose;
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use hmac::{Hmac, Mac};
+    use openidconnect::core::CoreJwsSigningAlgorithm;
+    use openidconnect::{ClientSecret, JsonWebKeySet, Nonce};
+    use std::time::Duration;
+
+    const ISSUER: &str = "https://login.restored.example.test/oauth2/default";
+    const SECRET: &str = "restored-oidc-client-secret-for-tests";
+    const EMAIL: &str = "alice@restored.example.test";
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_25_old_sessions_fail_and_login_receipt_precedes_cookie() {
+        let parent = [0x25_u8; 32];
+        let old_key = RestoreCurrentFixture::old_epoch_key(AuthorizationPurpose::Session, &parent);
+        let old_token = generate_token().unwrap();
+        let hashed = |token: &SessionCookieValue, key: &SecretBytes| {
+            SessionTokenHash::compute(
+                SessionToken::new(token.expose().as_bytes()),
+                SessionHashKey::new(key.expose()),
+            )
+            .to_column_value()
+        };
+        let restored = RestoreCurrentFixture::publish(&format!(
+            "INSERT INTO public.users(id,email,email_verified,auth_generation) VALUES('alice','{EMAIL}',true,0);
+             INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');
+             INSERT INTO public.sessions(id,user_id,token,expires_at,auth_generation)
+               VALUES('source-session','alice','{}',now()+interval '1 day',0);",
+            hashed(&old_token, &old_key),
+        ))
+        .await;
+        let new_key = restored
+            .runtime
+            .derive_authorization_key(AuthorizationPurpose::Session, &parent)
+            .unwrap();
+        assert_ne!(old_key.expose(), new_key.expose());
+        let client = restored.pool.get().await.unwrap();
+        // `None` counts every session; `Some` looks a cookie up as the resolver does, by its keyed hash.
+        let sessions = |token: Option<String>| {
+            let client = &client;
+            async move {
+                client
+                    .query_one("SELECT count(*)::bigint FROM public.sessions WHERE $1::text IS NULL OR token=$1", &[&token])
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+            }
+        };
+        // The source session neither survives the retirement nor resolves under either key.
+        assert_eq!(sessions(None).await, 0);
+        assert_eq!(sessions(Some(hashed(&old_token, &old_key))).await, 0);
+        assert_eq!(sessions(Some(hashed(&old_token, &new_key))).await, 0);
+        let requirement: Uuid = client
+            .query_one(
+                "SELECT requirement_id FROM openbot_internal.restore_reconfirm_requirements WHERE source_kind='subject' AND source_ref='alice'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let receipts = || {
+            let client = &client;
+            async move {
+                client
+                    .query_one(
+                        "SELECT count(*)::bigint FROM openbot_internal.restore_reconfirm_receipts WHERE requirement_id=$1 AND confirmed_by='alice' AND proof_kind='fresh_actor'",
+                        &[&requirement],
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+            }
+        };
+        assert_eq!(receipts().await, 0);
+
+        let provider = super::super::provider::fixtures::config(
+            "okta",
+            super::super::provider::fixtures::okta_kind(ISSUER),
+            ProviderOrigin::EnvironmentConfigured,
+            &["restored.example.test"],
+        );
+        let now = OffsetDateTime::now_utc();
+        // An ID token as the provider signs it (HS256 under the client secret).
+        let identity = || {
+            let claims = serde_json::json!({"iss": ISSUER, "aud": ["okta-client"], "exp": now.unix_timestamp() + 600,
+                "iat": now.unix_timestamp(), "sub": "alice-subject", "nonce": "restored-nonce", "email": EMAIL});
+            let signing = format!(
+                "{}.{}",
+                URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256"}"#),
+                URL_SAFE_NO_PAD.encode(claims.to_string())
+            );
+            let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+            mac.update(signing.as_bytes());
+            let token = format!(
+                "{signing}.{}",
+                URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+            );
+            let verifier = super::super::claims::build_verifier_at(
+                &provider,
+                Some(&ClientSecret::new(SECRET.to_owned())),
+                JsonWebKeySet::new(Vec::new()),
+                &[CoreJwsSigningAlgorithm::HmacSha256],
+                now,
+            )
+            .unwrap();
+            super::super::claims::verify_with(
+                &token,
+                &verifier,
+                &provider,
+                &Nonce::new("restored-nonce".to_owned()),
+            )
+            .unwrap()
+        };
+        let gate = restored.read_gate();
+        let issuer = PostgresOidcSessionIssuer::new(
+            restored.pool.clone(),
+            new_key.expose().to_vec(),
+            crate::auth::config::default_session_lifetime(),
+            AdminFloor::from_configured(["admin@restored.example.test"]).unwrap(),
+            // The restored chain's checkpoint key: the fixture master's audit purpose.
+            openbot_domain::vault::derive_application_key(
+                &SecretBytes::new(vec![0x41; 32]),
+                openbot_domain::vault::ApplicationKeyPurpose::AuditCheckpoint,
+            )
+            .unwrap()
+            .expose()
+            .to_vec(),
+            gate.clone(),
+        )
+        .unwrap();
+        // One original callback budget: the lease is borrowed for it and each request carries it.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let request = || OriginalLoginRequest::new(deadline, CancellationToken::new());
+
+        // The proof-less route cannot mint a session for a restored subject.
+        assert_eq!(
+            issuer
+                .issue(&identity(), &provider, now, None, None)
+                .await
+                .err(),
+            Some(SessionIssueError::DependencyUnavailable)
+        );
+        // A rejected COMMIT returns no session and leaves no receipt: both
+        // were written in the one transaction that did not commit.
+        client
+            .batch_execute(
+                "CREATE FUNCTION public.t046_25_reject_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected session COMMIT rejection'; END $$;
+                 CREATE CONSTRAINT TRIGGER t046_25_reject_session AFTER INSERT ON public.sessions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.t046_25_reject_session();",
+            )
+            .await
+            .unwrap();
+        let lease = gate.borrow_worker_before(deadline).await.unwrap();
+        assert_eq!(lease.restore_cohort(), Some(restored.cohort));
+        let login = VerifiedCurrentFederatedLogin::from_oidc_callback(
+            identity(),
+            &provider,
+            now,
+            None,
+            None,
+            Some(&lease),
+        );
+        assert_eq!(
+            issuer.issue_current_login(login, request()).await.err(),
+            Some(SessionIssueError::DependencyUnavailable)
+        );
+        assert_eq!(
+            receipts().await,
+            0,
+            "a receipt outlived its rejected COMMIT"
+        );
+        assert_eq!(sessions(None).await, 0);
+
+        // Positive control: the same callback after the injection is removed
+        // returns a cookie only with the receipt already committed beside it.
+        client
+            .batch_execute("DROP TRIGGER t046_25_reject_session ON public.sessions; DROP FUNCTION public.t046_25_reject_session();")
+            .await
+            .unwrap();
+        let login = VerifiedCurrentFederatedLogin::from_oidc_callback(
+            identity(),
+            &provider,
+            now,
+            None,
+            None,
+            Some(&lease),
+        );
+        let issued = issuer.issue_current_login(login, request()).await.unwrap();
+        assert_eq!(issued.actor().as_str(), "alice");
+        assert_eq!(receipts().await, 1);
+        assert_eq!(sessions(Some(hashed(issued.token(), &new_key))).await, 1);
+        assert_eq!(sessions(Some(hashed(&old_token, &new_key))).await, 0);
+    }
+}
