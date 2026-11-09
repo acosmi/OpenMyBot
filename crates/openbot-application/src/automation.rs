@@ -253,12 +253,13 @@ pub struct AutomationToolIdentity {
 /// Execution consumers share the management adapter's original Pool and persisted grant facts.
 #[async_trait]
 pub trait AutomationExecutionBudgets: Send + Sync {
-    /// Reserve before the real provider start; a repeated uncertain attempt must not be sent again.
+    /// Reserve one provider start. True permits one automation send; false leaves other Runs
+    /// on their original path. A repeated uncertain attempt must not be sent again.
     async fn reserve_sampling(
         &self,
         lease: &crate::RunExecutionLease,
         index: u32,
-    ) -> Result<(), AppError>;
+    ) -> Result<bool, AppError>;
     /// Intersect frozen intents with the existing pipeline's resolved actual resource.
     async fn allows_tool(
         &self,

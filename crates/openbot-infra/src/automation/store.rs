@@ -573,10 +573,18 @@ impl PostgresAutomations {
                 if replacement.wire().bot_id != config.bot_id {
                     return Err(AppError::MalformedPayload { field: "bot_id" });
                 }
+                let old = &config.permission_ceiling;
+                let next = &replacement.wire().permission_ceiling;
+                let revoke = old_enabled
+                    || old.tool_ids.iter().any(|id| !next.tool_ids.contains(id))
+                    || old
+                        .data_scopes
+                        .iter()
+                        .any(|id| !next.data_scopes.contains(id));
                 config = replacement.wire().clone();
                 (
                     "paused",
-                    true,
+                    revoke,
                     Some(("superseded", "automation_revision_superseded")),
                     "automation_replaced",
                 )
@@ -609,17 +617,25 @@ impl PostgresAutomations {
                     &config.budget,
                 )
                 .await?;
-                let now: OffsetDateTime = tx
-                    .query_one("SELECT statement_timestamp()", &[])
+                let requested_expiry = match grant_consent.validity {
+                    AutomationGrantValidity::UntilRevoked {} => None,
+                    AutomationGrantValidity::Expires { expires_at } => Some(expires_at),
+                };
+                let times = tx
+                    .query_one(
+                        "SELECT statement_timestamp(), $1::timestamptz",
+                        &[&requested_expiry],
+                    )
                     .await
-                    .map_err(|_| unavailable())?
-                    .get(0);
-                let (validity, expires) = match &grant_consent.validity {
-                    AutomationGrantValidity::UntilRevoked {} => ("until_revoked", None),
-                    AutomationGrantValidity::Expires { expires_at } if *expires_at > now => {
-                        ("expires", Some(*expires_at))
+                    .map_err(|_| unavailable())?;
+                let now: OffsetDateTime = times.get(0);
+                let expires: Option<OffsetDateTime> = times.get(1);
+                let (validity, snapshot_validity) = match expires {
+                    None => ("until_revoked", AutomationGrantValidity::UntilRevoked {}),
+                    Some(expires_at) if expires_at > now => {
+                        ("expires", AutomationGrantValidity::Expires { expires_at })
                     }
-                    AutomationGrantValidity::Expires { .. } => {
+                    Some(_) => {
                         return Err(AppError::MalformedPayload {
                             field: "expires_at",
                         });
@@ -642,7 +658,7 @@ impl PostgresAutomations {
                     data_scopes: config.permission_ceiling.data_scopes.clone(),
                     budget_policy_revision: revision.try_into()?,
                     auth_generation: generation,
-                    validity: grant_consent.validity,
+                    validity: snapshot_validity,
                     template: config.prompt_template.clone(),
                     run_deadline_seconds: u16::try_from(config.run_deadline_seconds)
                         .map_err(|_| unavailable())?,

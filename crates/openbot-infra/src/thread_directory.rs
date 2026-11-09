@@ -911,13 +911,23 @@ impl ThreadDirectory for PostgresThreadDirectory {
                  AND t.status=$5 AND t.deleted_at IS NULL
                  AND EXISTS(SELECT 1 FROM public.thread_memberships tm
                    WHERE tm.thread_id=t.thread_id AND tm.user_id=$2)
+                 AND NOT EXISTS(SELECT 1 FROM openbot_internal.automation_definitions a
+                   WHERE a.thread_id=t.thread_id)
                  AND ($6::timestamptz IS NULL OR t.updated_at<$6
                    OR (t.updated_at=$6 AND t.thread_id>$7))
                ORDER BY t.updated_at DESC,t.thread_id ASC LIMIT $8
              ), occupancy_scope AS (SELECT thread_id FROM candidates)
              {}
-             SELECT b.visible, EXISTS(SELECT 1 FROM openbot_internal.automation_definitions a
-                 WHERE a.deployment_id=$3 AND a.tenant_id=$4 AND a.owner_id=$2 AND a.bot_id=$1) AS automation_bound,
+             SELECT b.visible, EXISTS(
+                 SELECT 1 FROM public.threads cursor_thread
+                 JOIN openbot_internal.automation_definitions a ON a.thread_id=cursor_thread.thread_id
+                 WHERE cursor_thread.thread_id=$7 AND cursor_thread.created_by=$2
+                   AND cursor_thread.deployment_id=$3 AND cursor_thread.tenant_id=$4
+                   AND cursor_thread.anchor_kind='direct_bot' AND cursor_thread.anchor_id=$1
+                   AND cursor_thread.status<>'deleted' AND cursor_thread.deleted_at IS NULL
+                   AND EXISTS(SELECT 1 FROM public.thread_memberships tm
+                     WHERE tm.thread_id=cursor_thread.thread_id AND tm.user_id=$2)
+               ) AS automation_bound,
                t.thread_id,t.title,t.updated_at,i.bad_occupancy,
                r.run_id,r.status AS run_status,
                (SELECT count(*) FROM openbot_internal.thread_pending_inputs p

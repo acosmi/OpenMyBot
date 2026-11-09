@@ -322,7 +322,6 @@ async fn definition_revision_owner_scope_and_exclusive_thread() {
             let before=image(&f).await;
             // All direct-assistant paths refuse the dedicated Thread before creating queue/Run facts.
             for command in [
-                AppCommand::ListBotThreads{bot_id:config().bot_id,status:None,cursor:None,limit:None},
                 AppCommand::SetThreadTitle{thread_id:created.thread_id.clone(),title:"Not direct work".to_owned()},
                 AppCommand::SubmitThreadInput(openbot_contracts::command::BeginThreadRunV2{
                     artifact_refs:Vec::new(),thread_id:created.thread_id.clone(),run_id:openbot_contracts::ids::RunId::new("direct-input"),bot_id:config().bot_id,
@@ -361,6 +360,157 @@ async fn definition_revision_owner_scope_and_exclusive_thread() {
         }.await;
         f.assembly.shutdown().await;f.pool.close();result
     }).await;
+}
+
+#[cfg(feature = "server-runtime")]
+#[tokio::test]
+#[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
+async fn bot_pages_keep_ordinary_threads_and_reject_a_dedicated_cursor() {
+    use openbot_application::{RunFailureCode, RunTerminal};
+    use openbot_contracts::{
+        command::{BeginThreadRun, ThreadRunAnchor, ThreadStatusFilter},
+        ids::RunId,
+    };
+    let admin = harness::admin_config("automation_bot_pages");
+    harness::with_temp_database(&admin, "automation_bot_pages", |database| async move {
+        let f = assembly_fixture::Fixture::with_options(
+            &database,
+            assembly_fixture::Options {
+                automation: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let application = &f.assembly.application;
+        let mut ordinary = Vec::new();
+        for name in ["active-first", "active-second", "archived"] {
+            let AppReply::ThreadMinted(minted) = application
+                .execute(f.auth.clone(), AppCommand::MintThreadId)
+                .await
+                .unwrap()
+            else {
+                panic!("missing ordinary Thread id");
+            };
+            application
+                .execute(
+                    f.auth.clone(),
+                    AppCommand::BeginThreadRun(BeginThreadRun {
+                        thread_id: minted.thread_id.clone(),
+                        run_id: RunId::new(name),
+                        bot_id: config().bot_id,
+                        anchor: ThreadRunAnchor::DirectBot,
+                        message: "Ordinary owner conversation".to_owned(),
+                        model_selection: None,
+                        selected_skill_slugs: Vec::new(),
+                        artifact_refs: Vec::new(),
+                    }),
+                )
+                .await
+                .unwrap();
+            let lease = claim(&f).await;
+            f.assembly
+                .run_runtime
+                .finish_run(
+                    &lease,
+                    lease.next_event_sequence(),
+                    RunTerminal::Failed(RunFailureCode::ProviderUnavailable),
+                )
+                .await
+                .unwrap();
+            ordinary.push(minted.thread_id);
+        }
+        application
+            .execute(
+                f.auth.clone(),
+                AppCommand::CompleteThread {
+                    thread_id: ordinary[2].clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let dedicated = create(&f, "mixed-pages").await;
+        let list = |status, cursor| AppCommand::ListBotThreads {
+            bot_id: config().bot_id,
+            status,
+            cursor,
+            limit: Some(1),
+        };
+        for state in [
+            AutomationDefinitionState::Paused,
+            AutomationDefinitionState::Enabled,
+            AutomationDefinitionState::Tombstoned,
+        ] {
+            match state {
+                AutomationDefinitionState::Paused => {}
+                AutomationDefinitionState::Enabled => {
+                    install_budgets(&f, "20").await;
+                    enable(&f, "mixed-pages", 1).await;
+                }
+                AutomationDefinitionState::Tombstoned => {
+                    application
+                        .execute(
+                            f.auth.clone(),
+                            AppCommand::TombstoneAutomationDefinition {
+                                automation_id: id("mixed-pages"),
+                                input: TombstoneAutomationDefinition {
+                                    expected_revision: revision(2),
+                                },
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let AppReply::BotThreadPage(first) = application
+                .execute(f.auth.clone(), list(None, None))
+                .await
+                .unwrap()
+            else {
+                panic!("missing ordinary active page");
+            };
+            assert_eq!(first.threads.len(), 1, "{state:?}");
+            assert_eq!(first.threads[0].thread_id, ordinary[1], "{state:?}");
+            let next = first.next_cursor.expect("another ordinary active Thread");
+            let AppReply::BotThreadPage(last) = application
+                .execute(f.auth.clone(), list(None, Some(next)))
+                .await
+                .unwrap()
+            else {
+                panic!("missing second active page");
+            };
+            assert_eq!(last.threads.len(), 1, "{state:?}");
+            assert_eq!(last.threads[0].thread_id, ordinary[0], "{state:?}");
+            assert!(last.next_cursor.is_none());
+            let AppReply::BotThreadPage(archived) = application
+                .execute(
+                    f.auth.clone(),
+                    list(Some(ThreadStatusFilter::Archived), None),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("missing archived page");
+            };
+            assert_eq!(archived.threads.len(), 1, "{state:?}");
+            assert_eq!(archived.threads[0].thread_id, ordinary[2], "{state:?}");
+            let cursor = format!(
+                "{}:{}",
+                dedicated.created_at.unix_timestamp_nanos(),
+                dedicated.thread_id.as_str()
+            );
+            assert_eq!(
+                application
+                    .execute(f.auth.clone(), list(None, Some(cursor)))
+                    .await
+                    .unwrap_err(),
+                AppError::AnchorUnsupported
+            );
+        }
+        f.assembly.shutdown().await;
+        f.pool.close();
+        Ok(())
+    })
+    .await;
 }
 
 #[cfg(feature = "server-runtime")]
@@ -778,9 +928,29 @@ async fn delegation_lifecycle_and_current_generation() {
             &database,
             assembly_fixture::Options { automation: true, ..Default::default() },
         ).await?;
-        create(&f, "authority").await;
+        let mut original = config();
+        original.permission_ceiling.tool_ids.push("remember".to_owned());
+        f.assembly.application.execute(f.auth.clone(), AppCommand::CreateAutomationDefinition(
+            CreateAutomationDefinition { automation_id: id("authority"), config: original.clone() },
+        )).await.unwrap();
         install_budgets(&f, "20").await;
-        enable(&f, "authority", 1).await;
+        let expires_at = time::OffsetDateTime::parse(
+            "2036-01-01T00:00:00.123456789Z", &time::format_description::well_known::Rfc3339,
+        ).unwrap();
+        f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
+            automation_id: id("authority"),
+            input: UpdateAutomationDefinition::Enable {
+                expected_revision: revision(1),
+                grant_consent: AutomationGrantConsent { validity: AutomationGrantValidity::Expires { expires_at } },
+            },
+        }).await.unwrap();
+        let client = f.pool.get().await.unwrap();
+        let grant = client.query_one("SELECT expires_at,grant_snapshot FROM openbot_internal.automation_delegations", &[]).await.unwrap();
+        let snapshot: AutomationDelegationV1 = serde_json::from_value(grant.get("grant_snapshot")).unwrap();
+        let stored_expiry: time::OffsetDateTime = grant.get("expires_at");
+        assert_eq!(stored_expiry.nanosecond(), 123_456_000);
+        assert_eq!(snapshot.validity, AutomationGrantValidity::Expires { expires_at: stored_expiry });
+        drop(client);
         let store = f.assembly.automations.as_ref().unwrap();
         let deployment = f.auth.deployment();
         let tenant = f.auth.tenant();
@@ -807,7 +977,17 @@ async fn delegation_lifecycle_and_current_generation() {
         ).await.unwrap();
         assert!(authority.verify_current(deployment, tenant, &source, 2).await.is_ok(),
             "pause retains the running grant");
-        store.reserve_sampling(&lease, 0).await.unwrap();
+        let mut edited = original;
+        edited.title = "Updated title".to_owned();
+        edited.prompt_template = "Use this template on the next authorized Run.".to_owned();
+        let replaced = f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
+            automation_id: id("authority"),
+            input: UpdateAutomationDefinition::Replace { expected_revision: revision(3), config: edited.clone() },
+        }).await.unwrap();
+        assert!(matches!(replaced, AppReply::AutomationDefinition(ref d) if d.revision == revision(4) && d.grant.valid));
+        assert!(authority.verify_current(deployment, tenant, &source, 2).await.is_ok(),
+            "paused title and template edits retain the running grant");
+        assert!(store.reserve_sampling(&lease, 0).await.unwrap());
         let client = f.pool.get().await.unwrap();
         let run = lease.run_id().as_str();
         let status: String = client.query_one(
@@ -818,12 +998,12 @@ async fn delegation_lifecycle_and_current_generation() {
         let runtime = &f.assembly.run_runtime;
         assert!(runtime.claim_cancellation().await.unwrap().is_none());
 
-        enable(&f, "authority", 3).await;
+        enable(&f, "authority", 4).await;
         assert!(matches!(
             authority.verify_current(deployment, tenant, &source, 2).await,
             Err(DelegationAuthorityError::NotCurrent),
         ));
-        assert!(authority.verify_current(deployment, tenant, &source, 4).await.is_ok());
+        assert!(authority.verify_current(deployment, tenant, &source, 5).await.is_ok());
         let before = image(&f).await;
         assert_eq!(store.reserve_sampling(&lease, 1).await.unwrap_err(), AppError::AutomationDelegationInvalid);
         assert_eq!(image(&f).await, before);
@@ -869,13 +1049,38 @@ async fn delegation_lifecycle_and_current_generation() {
         assert_eq!(row.get::<_, String>("cancellation"), "delivered");
         assert_eq!(row.get::<_, i64>("active"), 0);
         assert_eq!(row.get::<_, String>("budget"), "unknown");
+        drop(client);
+
+        trigger(&f, "authority", "next-run", 5).await;
+        let request = store.pending().await.unwrap().pop().unwrap();
+        f.assembly.delegated_entry.as_ref().unwrap().begin(request).await.unwrap();
+        let restricted = claim(&f).await;
+        f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
+            automation_id: id("authority"),
+            input: UpdateAutomationDefinition::Pause { expected_revision: revision(5) },
+        }).await.unwrap();
+        edited.permission_ceiling.tool_ids.clear();
+        f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
+            automation_id: id("authority"),
+            input: UpdateAutomationDefinition::Replace { expected_revision: revision(6), config: edited },
+        }).await.unwrap();
+        assert_eq!(store.reserve_sampling(&restricted, 0).await.unwrap_err(), AppError::AutomationDelegationInvalid);
+        let stop = runtime.claim_cancellation().await.unwrap().expect("narrower permission requested a durable stop");
+        assert_eq!(stop.lease().run_id(), restricted.run_id());
+        runtime.mark_cancellation_signalled(&stop).await.unwrap();
+        runtime.finish_run(stop.lease(), stop.lease().next_event_sequence(), RunTerminal::Cancelled).await.unwrap();
+        assert!(runtime.claim_cancellation().await.unwrap().is_none());
+
+        enable(&f, "authority", 7).await;
+        assert!(authority.verify_current(deployment, tenant, &source, 8).await.is_ok());
+        let client = f.pool.get().await.unwrap();
         client.execute(
             "UPDATE public.users SET auth_generation=coalesce(auth_generation,0)+1 WHERE id=$1",
             &[&f.auth.actor().as_str()],
         ).await.unwrap();
         drop(client);
         assert!(matches!(
-            authority.verify_current(deployment, tenant, &source, 4).await,
+            authority.verify_current(deployment, tenant, &source, 8).await,
             Err(DelegationAuthorityError::NotCurrent),
         ));
         let before = image(&f).await;
@@ -915,10 +1120,18 @@ async fn unknown_usage_survives_windows_and_policy_revisions() {
         .await?;
         let store = f.assembly.automations.as_ref().unwrap();
         let rule = json!([{"metric":"sampling_calls","totalLimit":"20",
-            "window":{"origin":"2026-01-01T00:00:00Z","seconds":2,"limit":"10"}}]);
+            "window":{"origin":"2026-01-01T00:00:00.123456789Z","seconds":2,"limit":"10"}}]);
         let initial = budget_file(&f, 1, rule.clone(), rule.clone());
-        let updated = budget_file(&f, 2, rule.clone(), rule);
+        let updated = budget_file(&f, 2, rule.clone(), rule.clone());
         store.install_budgets(Some(&initial)).await.unwrap();
+        store.install_budgets(Some(&initial)).await.unwrap();
+        let mut changed = rule.clone();
+        changed[0]["window"]["origin"] = json!("2026-01-01T00:00:00.123458789Z");
+        let changed = budget_file(&f, 1, changed, rule);
+        assert!(matches!(
+            store.install_budgets(Some(&changed)).await,
+            Err(AutomationBudgetStartupError::Invalid)
+        ));
         create(&f, "window").await;
         enable(&f, "window", 1).await;
         trigger(&f, "window", "first", 2).await;
@@ -1073,6 +1286,97 @@ async fn unknown_usage_survives_windows_and_policy_revisions() {
         Ok(())
     })
     .await;
+}
+
+#[cfg(feature = "server-runtime")]
+#[tokio::test]
+#[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
+async fn first_sampling_moves_only_unsent_reservations_to_the_current_window() {
+    use openbot_application::automation::AutomationExecutionBudgets;
+    let admin = harness::admin_config("automation_unsent_window");
+    harness::with_temp_database(&admin, "automation_unsent_window", |database| async move {
+        let f = assembly_fixture::Fixture::with_options(
+            &database,
+            assembly_fixture::Options { automation: true, ..Default::default() },
+        ).await?;
+        let store = f.assembly.automations.as_ref().unwrap();
+        let rule = json!([{"metric":"sampling_calls","totalLimit":"3",
+            "window":{"origin":"2026-01-01T00:00:00Z","seconds":6,"limit":"1"}}]);
+        store.install_budgets(Some(&budget_file(&f, 1, rule.clone(), rule.clone()))).await.unwrap();
+        for name in ["old-window", "new-window"] {
+            create(&f, name).await;
+            enable(&f, name, 1).await;
+        }
+        let dispatcher = AutomationDispatcher::new(
+            store.clone(), f.assembly.delegated_entry.as_ref().unwrap().clone(),
+        );
+        trigger(&f, "old-window", "first", 2).await;
+        assert_eq!(dispatcher.scan().await.unwrap(), 1);
+        let old = claim(&f).await;
+        let owner_bucket = "SELECT a.attempt_id,a.state,q.policy_revision,q.bucket_start,b.used,b.reserved
+            FROM openbot_internal.automation_budget_attempts a
+            JOIN openbot_internal.automation_budget_reservations q USING(deployment_id,tenant_id,attempt_id)
+            JOIN openbot_internal.automation_budget_balances b USING(deployment_id,tenant_id,scope_kind,scope_id,policy_revision,metric,bucket_start,is_total)
+            WHERE a.run_id=$1 AND q.scope_kind='owner' AND NOT q.is_total";
+        let client = f.pool.get().await.unwrap();
+        let initial = client.query_one(owner_bucket, &[&old.run_id().as_str()]).await.unwrap();
+        let original_start: time::OffsetDateTime = initial.get("bucket_start");
+        let attempt: String = initial.get("attempt_id");
+        assert_eq!(initial.get::<_, String>("state"), "reserved");
+        client.query_one(
+            "SELECT pg_sleep(GREATEST(0, extract(epoch FROM ($1::timestamptz + interval '6 seconds' - statement_timestamp()))::double precision) + 0.05)",
+            &[&original_start],
+        ).await.unwrap();
+        drop(client);
+
+        trigger(&f, "new-window", "first", 2).await;
+        assert_eq!(dispatcher.scan().await.unwrap(), 1);
+        let new = claim(&f).await;
+        assert!(store.reserve_sampling(&new, 0).await.unwrap());
+        let client = f.pool.get().await.unwrap();
+        let current = client.query_one(owner_bucket, &[&new.run_id().as_str()]).await.unwrap();
+        let current_start: time::OffsetDateTime = current.get("bucket_start");
+        assert!(current_start > original_start);
+        assert_eq!(current.get::<_, String>("state"), "unknown");
+        assert_eq!(current.get::<_, i64>("reserved"), 1);
+        drop(client);
+
+        let before = image(&f).await;
+        assert!(budget_refusal(&store.reserve_sampling(&old, 0).await.unwrap_err()));
+        assert_eq!(image(&f).await, before, "refusal preserves the original unsent attempt and its old window");
+
+        let mut widened = rule;
+        widened[0]["window"]["limit"] = json!("2");
+        store.install_budgets(Some(&budget_file(&f, 2, widened.clone(), widened))).await.unwrap();
+        assert!(store.reserve_sampling(&old, 0).await.unwrap());
+        let client = f.pool.get().await.unwrap();
+        let moved = client.query_one(owner_bucket, &[&old.run_id().as_str()]).await.unwrap();
+        assert_eq!(moved.get::<_, String>("attempt_id"), attempt);
+        assert_eq!(moved.get::<_, String>("state"), "unknown");
+        assert_eq!(moved.get::<_, i64>("policy_revision"), 2);
+        assert_eq!(moved.get::<_, time::OffsetDateTime>("bucket_start"), current_start);
+        assert_eq!((moved.get::<_, i64>("used"), moved.get::<_, i64>("reserved")), (0, 2));
+        let original = client.query_one(
+            "SELECT used,reserved FROM openbot_internal.automation_budget_balances
+             WHERE scope_kind='owner' AND policy_revision=1 AND NOT is_total AND bucket_start=$1",
+            &[&original_start],
+        ).await.unwrap();
+        assert_eq!((original.get::<_, i64>(0), original.get::<_, i64>(1)), (0, 0));
+        let held = client.query_one(owner_bucket, &[&new.run_id().as_str()]).await.unwrap();
+        assert_eq!(held.get::<_, i64>("policy_revision"), 1);
+        assert_eq!(held.get::<_, time::OffsetDateTime>("bucket_start"), current_start);
+        assert_eq!(held.get::<_, String>("state"), "unknown");
+        let total = client.query_one(
+            "SELECT used,reserved FROM openbot_internal.automation_budget_balances
+             WHERE scope_kind='owner' AND policy_revision=2 AND is_total",
+            &[],
+        ).await.unwrap();
+        assert_eq!((total.get::<_, i64>(0), total.get::<_, i64>(1)), (0, 2));
+        drop(client);
+        f.assembly.shutdown().await;
+        f.pool.close();
+        Ok(())
+    }).await;
 }
 
 #[cfg(feature = "server-runtime")]
@@ -1359,12 +1663,13 @@ async fn restored_generation_requires_new_owner_authority() {
 #[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
 async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
     use openbot_agent::{
-        BuiltInAgentConfig, BuiltInAgentRuntime, BuiltInRunPorts, NoAgentToolInvoker,
+        AutomationSamplingPorts, BuiltInAgentConfig, BuiltInAgentRuntime, BuiltInRunPorts,
+        NoAgentToolInvoker, ProviderRouter, RetryingProvider, RetryingProviderConfig,
     };
     use openbot_application::{
         NoAgentAudit, NoRemoteInterruptCoordinator, ProviderAdapter, ProviderEvent,
-        ProviderPortError, ProviderRequest, ProviderRoute, ProviderSession, ProviderUsage,
-        RunDispatchConsumer, RunDispatchDecision, RunExecutionLease,
+        ProviderFailure, ProviderPortError, ProviderRequest, ProviderRoute, ProviderSession,
+        ProviderUsage, RunDispatchConsumer, RunDispatchDecision, RunExecutionLease,
         automation::AutomationExecutionBudgets,
     };
     use openbot_infra::provider::context::PostgresAgentContextSource;
@@ -1372,13 +1677,16 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
         collections::VecDeque,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     #[derive(Default)]
-    struct CountingProvider(AtomicUsize);
+    struct CountingProvider {
+        starts: AtomicUsize,
+        unavailable: AtomicBool,
+    }
     struct Sample(VecDeque<ProviderEvent>);
     #[async_trait::async_trait]
     impl ProviderSession for Sample {
@@ -1393,7 +1701,12 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
             request: ProviderRequest,
         ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
             assert!(matches!(request.route, ProviderRoute::PackageOpenAi));
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if self.unavailable.load(Ordering::SeqCst) {
+                return Ok(Box::new(Sample(VecDeque::from([ProviderEvent::Failed(
+                    ProviderFailure::ServerUnavailable { retry_after: None },
+                )]))));
+            }
             Ok(Box::new(Sample(VecDeque::from([
                 ProviderEvent::TextDelta {
                     index: 0,
@@ -1477,6 +1790,13 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
         assert_eq!(dispatcher.scan().await.unwrap(), 2);
 
         let provider = Arc::new(CountingProvider::default());
+        let router: Arc<dyn ProviderAdapter> = Arc::new(ProviderRouter::new(provider.clone(), None));
+        let retrying = Arc::new(RetryingProvider::new(router.clone(), RetryingProviderConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter: false,
+        }).unwrap());
         let context = PostgresAgentContextSource::new(
             f.pool.clone(),
             f.auth.deployment().clone(),
@@ -1487,10 +1807,10 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
         let agent = BuiltInAgentRuntime::start_with_run_ports(
             BuiltInRunPorts {
                 runtime: f.assembly.run_runtime.clone(),
-                automation_budgets: Some(store.clone()),
+                automation_sampling: Some(AutomationSamplingPorts { budgets: store.clone(), provider: router }),
             },
             Arc::new(context),
-            provider.clone(),
+            retrying,
             Arc::new(NoAgentToolInvoker),
             Arc::new(NoAgentAudit),
             Arc::new(NoRemoteInterruptCoordinator),
@@ -1512,7 +1832,7 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
                 Some("automation_budget_exceeded".to_owned())
             ),
         );
-        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.starts.load(Ordering::SeqCst), 0);
 
         store
             .install_budgets(Some(&budget_file(
@@ -1533,7 +1853,7 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
                 Some("journal_commit_unknown".to_owned())
             ),
         );
-        assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.starts.load(Ordering::SeqCst), 0);
         let client = f.pool.get().await.unwrap();
         let held = client
             .query_one(
@@ -1560,7 +1880,7 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
             activate_and_read_terminal(&f, consumer.as_ref(), &allowed).await,
             ("completed".to_owned(), None),
         );
-        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.starts.load(Ordering::SeqCst), 1);
         let client = f.pool.get().await.unwrap();
         let settled = client
             .query_one(
@@ -1578,6 +1898,22 @@ async fn agent_sampling_reserves_before_provider_and_keeps_unknown() {
             json!(1)
         );
         assert_eq!(settled.get::<_, String>("answer"), "Owned sampling result.");
+        drop(client);
+
+        provider.unavailable.store(true, Ordering::SeqCst);
+        create(&f, "budget-unavailable").await;
+        enable(&f, "budget-unavailable", 1).await;
+        trigger(&f, "budget-unavailable", "first", 2).await;
+        assert_eq!(dispatcher.scan().await.unwrap(), 1);
+        let unavailable = reserve_and_ack(&f, consumer.as_ref()).await;
+        assert_eq!(activate_and_read_terminal(&f, consumer.as_ref(), &unavailable).await,
+            ("failed".to_owned(), Some("provider_unavailable".to_owned())));
+        assert_eq!(provider.starts.load(Ordering::SeqCst), 2, "retryable first response grants no second send");
+        let client = f.pool.get().await.unwrap();
+        let attempt = client.query_one("SELECT state,actual_usage FROM openbot_internal.automation_budget_attempts WHERE run_id=$1",
+            &[&unavailable.run_id().as_str()]).await.unwrap();
+        assert_eq!(attempt.get::<_, String>("state"), "unknown");
+        assert_eq!(attempt.get::<_, Option<Value>>("actual_usage"), None);
         drop(client);
         agent.stop().await;
         f.assembly.shutdown().await;

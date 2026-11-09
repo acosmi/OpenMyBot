@@ -98,8 +98,16 @@ impl BuiltInAgentConfig {
 pub struct BuiltInRunPorts {
     /// Original Run lease and journal port.
     pub runtime: Arc<dyn RunRuntime>,
-    /// Automation execution budgets, installed only by the Server host.
-    pub automation_budgets: Option<Arc<dyn AutomationExecutionBudgets>>,
+    /// Automation sampling services, installed only by the Server host.
+    pub automation_sampling: Option<AutomationSamplingPorts>,
+}
+
+/// One proved reservation permits one provider start.
+pub struct AutomationSamplingPorts {
+    /// Durable pre-send budget and grant gate.
+    pub budgets: Arc<dyn AutomationExecutionBudgets>,
+    /// The provider route without a retry wrapper.
+    pub provider: Arc<dyn ProviderAdapter>,
 }
 
 /// Lifecycle owner；consumer clone is injected into RunRelay，handle stays in Server main。
@@ -162,7 +170,7 @@ impl BuiltInAgentRuntime {
         Self::start_with_run_ports(
             BuiltInRunPorts {
                 runtime,
-                automation_budgets: None,
+                automation_sampling: None,
             },
             context,
             provider,
@@ -188,7 +196,7 @@ impl BuiltInAgentRuntime {
         let (stop, stop_rx) = watch::channel(false);
         let inner = Arc::new(Inner {
             runtime: ports.runtime,
-            automation_budgets: ports.automation_budgets,
+            automation_sampling: ports.automation_sampling,
             context,
             provider,
             tools,
@@ -338,7 +346,7 @@ impl RunDispatchConsumer for BuiltInAgentConsumer {
 
 struct Inner {
     runtime: Arc<dyn RunRuntime>,
-    automation_budgets: Option<Arc<dyn AutomationExecutionBudgets>>,
+    automation_sampling: Option<AutomationSamplingPorts>,
     context: Arc<dyn AgentContextSource>,
     provider: Arc<dyn ProviderAdapter>,
     tools: Arc<dyn AgentToolInvoker>,
@@ -1047,11 +1055,12 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
                 return;
             }
         }
+        let mut provider = inner.provider.as_ref();
         if lease.delegation_required()
-            && let Some(budgets) = &inner.automation_budgets
+            && let Some(automation) = &inner.automation_sampling
         {
             let event = match await_run_child(
-                budgets.reserve_sampling(lease, sampling_index),
+                automation.budgets.reserve_sampling(lease, sampling_index),
                 &mut activation.cancel,
                 &mut renew,
                 deadline,
@@ -1060,7 +1069,12 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
             )
             .await
             {
-                ControlledChild::Ready(Ok(())) => None,
+                ControlledChild::Ready(Ok(reserved)) => {
+                    if reserved {
+                        provider = automation.provider.as_ref();
+                    }
+                    None
+                }
                 ControlledChild::Ready(Err(AppError::PolicyRefused { rule, .. }))
                     if rule == "automation_budget_exceeded" =>
                 {
@@ -1097,7 +1111,7 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
             return;
         }
         let session = match await_run_child(
-            inner.provider.start(request),
+            provider.start(request),
             &mut activation.cancel,
             &mut renew,
             deadline,

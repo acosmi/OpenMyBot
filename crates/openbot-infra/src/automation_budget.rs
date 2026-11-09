@@ -104,10 +104,10 @@ async fn install_policy(
             .map_err(|_| unavailable())?;
         let window_limit = rule.window.as_ref().map(|v| v.limit.get());
         let total_limit = rule.total_limit.map(AutomationAmount::get);
-        if let Some(old)=tx.query_opt("SELECT window_origin,window_seconds,window_limit,total_limit,currency FROM openbot_internal.automation_budget_policies
+        if let Some(old)=tx.query_opt("SELECT window_origin IS NOT DISTINCT FROM $7 AS same_origin,window_seconds,window_limit,total_limit,currency FROM openbot_internal.automation_budget_policies
             WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind=$3 AND scope_id=$4 AND revision=$5 AND metric=$6",
-            &[&deployment.as_str(),&tenant.as_str(),&kind,&id,&revision,&metric]).await.map_err(|_|unavailable())? {
-            if column::<Option<OffsetDateTime>>(&old,"window_origin")?!=origin || column::<Option<i64>>(&old,"window_seconds")?!=seconds
+            &[&deployment.as_str(),&tenant.as_str(),&kind,&id,&revision,&metric,&origin]).await.map_err(|_|unavailable())? {
+            if !column::<bool>(&old,"same_origin")? || column::<Option<i64>>(&old,"window_seconds")?!=seconds
                 || column::<Option<i64>>(&old,"window_limit")?!=window_limit || column::<Option<i64>>(&old,"total_limit")?!=total_limit
                 || column::<Option<String>>(&old,"currency")?!=rule.currency {return Err(unavailable());}
             tx.execute("UPDATE openbot_internal.automation_budget_policies SET current=true WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind=$3 AND scope_id=$4 AND revision=$5 AND metric=$6",
@@ -367,7 +367,7 @@ impl AutomationBudgetPlan {
     ) -> Result<Self, AppError> {
         let owner: String = column(definition, "owner_id")?;
         let id: String = column(definition, "automation_id")?;
-        Self::prepare(tx, deployment, tenant, &owner, &id, true, false).await
+        Self::prepare(tx, deployment, tenant, &owner, &id, true).await
     }
     async fn prepare(
         tx: &Transaction<'_>,
@@ -376,7 +376,6 @@ impl AutomationBudgetPlan {
         owner: &str,
         automation: &str,
         sampling: bool,
-        reused: bool,
     ) -> Result<Self, AppError> {
         let policies = policies(tx, deployment, tenant, owner, automation).await?;
         for kind in ["owner", "workspace", "automation"] {
@@ -400,10 +399,9 @@ impl AutomationBudgetPlan {
             let (used, reserved) = bucket.sync(tx).await?;
             tx.query_one("SELECT used,reserved FROM openbot_internal.automation_budget_balances WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind=$3 AND scope_id=$4 AND policy_revision=$5 AND metric=$6 AND bucket_start=$7 AND is_total=$8 FOR UPDATE",
                 &[&bucket.deployment,&bucket.tenant,&bucket.kind,&bucket.id,&bucket.revision,&bucket.metric,&bucket.start,&bucket.total]).await.map_err(|_|unavailable())?;
-            let added = if reused { 0 } else { amount };
             if used
                 .checked_add(reserved)
-                .and_then(|v| v.checked_add(added))
+                .and_then(|v| v.checked_add(amount))
                 .is_none_or(|v| v > bucket.limit)
             {
                 return Err(budget_blocked());
@@ -450,6 +448,10 @@ impl AutomationBudgetPlan {
         tx.execute("INSERT INTO openbot_internal.automation_budget_attempts(attempt_id,deployment_id,tenant_id,automation_id,root_run_id,run_id,usage_kind,source_attempt_ref,state,reserved_bound)
             VALUES($1,$2,$3,$4,$5,$5,$6,$7,$8,$9)",
             &[&attempt,&deployment,&tenant,&automation,&run,&kind,&source,&state,&bound]).await.map_err(|_|unavailable())?;
+        self.reserve_buckets(tx, &attempt).await
+    }
+
+    async fn reserve_buckets(self, tx: &Transaction<'_>, attempt: &str) -> Result<(), AppError> {
         for bucket in &self.buckets {
             let amount = self.bound.amount(&bucket.metric)?;
             tx.execute("INSERT INTO openbot_internal.automation_budget_reservations(deployment_id,tenant_id,attempt_id,scope_kind,scope_id,policy_revision,metric,bucket_start,is_total,reserved)
@@ -512,7 +514,7 @@ impl crate::automation::PostgresAutomations {
         &self,
         lease: &openbot_application::RunExecutionLease,
         index: u32,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let mut client = self.pool.get().await.map_err(|_| unavailable())?;
         let tx = client.transaction().await.map_err(|_| unavailable())?;
         lock_workspace(&tx, &self.deployment, &self.tenant).await?;
@@ -520,7 +522,7 @@ impl crate::automation::PostgresAutomations {
             locked_definition_for_run(&tx, &self.deployment, &self.tenant, lease.run_id().as_str())
                 .await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         verify_lease(&tx, lease, &definition).await?;
         execution_grant(
@@ -532,14 +534,29 @@ impl crate::automation::PostgresAutomations {
         )
         .await?;
         let source = format!("sampling:{index}");
-        let existing=tx.query_opt("SELECT attempt_id,state FROM openbot_internal.automation_budget_attempts WHERE deployment_id=$1 AND tenant_id=$2 AND run_id=$3 AND usage_kind='sampling' AND source_attempt_ref=$4",
+        let existing=tx.query_opt("SELECT attempt_id,state,(reserved_bound->>'chargeAt')::timestamptz AS charge_at FROM openbot_internal.automation_budget_attempts WHERE deployment_id=$1 AND tenant_id=$2 AND run_id=$3 AND usage_kind='sampling' AND source_attempt_ref=$4",
             &[&self.deployment.as_str(),&self.tenant.as_str(),&lease.run_id().as_str(),&source]).await.map_err(|_|unavailable())?;
-        if existing
-            .as_ref()
-            .is_some_and(|r| r.get::<_, String>("state") != "reserved")
-        {
-            return Err(AppError::ReconciliationRequired { accepted: true });
-        }
+        let previous_buckets = if let Some(existing) = &existing {
+            if column::<String>(existing, "state")? != "reserved" {
+                return Err(AppError::ReconciliationRequired { accepted: true });
+            }
+            let attempt: String = column(existing, "attempt_id")?;
+            let previous_buckets = attempt_buckets(
+                &tx,
+                &self.deployment,
+                &self.tenant,
+                &attempt,
+                column(existing, "charge_at")?,
+            )
+            .await?;
+            // Move only the unsent start reservation. A refusal rolls this back, and the
+            // original attempt stays bound to its old buckets until a send is permitted.
+            tx.execute("DELETE FROM openbot_internal.automation_budget_reservations WHERE deployment_id=$1 AND tenant_id=$2 AND attempt_id=$3",
+                &[&self.deployment.as_str(),&self.tenant.as_str(),&attempt]).await.map_err(|_|unavailable())?;
+            previous_buckets
+        } else {
+            Vec::new()
+        };
         let plan = AutomationBudgetPlan::prepare(
             &tx,
             &self.deployment,
@@ -547,11 +564,14 @@ impl crate::automation::PostgresAutomations {
             &column::<String>(&definition, "owner_id")?,
             &column::<String>(&definition, "automation_id")?,
             true,
-            existing.is_some(),
         )
         .await?;
         if let Some(existing) = existing {
-            tx.execute("UPDATE openbot_internal.automation_budget_attempts SET state='unknown' WHERE attempt_id=$1 AND state='reserved'",&[&column::<String>(&existing,"attempt_id")?]).await.map_err(|_|unavailable())?;
+            let attempt: String = column(&existing, "attempt_id")?;
+            let bound = serde_json::to_value(&plan.bound).map_err(|_| unavailable())?;
+            tx.execute("UPDATE openbot_internal.automation_budget_attempts SET state='unknown',reserved_bound=$4 WHERE deployment_id=$1 AND tenant_id=$2 AND attempt_id=$3 AND state='reserved'",
+                &[&self.deployment.as_str(),&self.tenant.as_str(),&attempt,&bound]).await.map_err(|_|unavailable())?;
+            plan.reserve_buckets(&tx, &attempt).await?;
         } else {
             plan.insert(
                 &tx,
@@ -563,8 +583,11 @@ impl crate::automation::PostgresAutomations {
             )
             .await?;
         }
+        for bucket in previous_buckets {
+            bucket.sync(&tx).await?;
+        }
         tx.commit().await.map_err(|_| unavailable())?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -660,8 +683,23 @@ async fn settle(
         &[&deployment.as_str(),&tenant.as_str(),&attempt,&actual]).await.map_err(|_|unavailable())?;
     tx.execute("UPDATE openbot_internal.automation_budget_reservations SET settled=($4::jsonb->>metric)::bigint,released=reserved-($4::jsonb->>metric)::bigint WHERE deployment_id=$1 AND tenant_id=$2 AND attempt_id=$3",
         &[&deployment.as_str(),&tenant.as_str(),&attempt,&actual]).await.map_err(|_|unavailable())?;
-    // A later revision may have carried this exact unresolved attempt. Recompute each stored
-    // interval from original reservation ancestry; future revisions cannot charge older ones.
+    for bucket in
+        attempt_buckets(tx, deployment, tenant, attempt, column(&row, "charge_at")?).await?
+    {
+        bucket.sync(tx).await?;
+    }
+    Ok(())
+}
+
+// A later revision may have carried this attempt. Recompute each stored interval from
+// reservation ancestry; future revisions cannot charge older ones.
+async fn attempt_buckets(
+    tx: &Transaction<'_>,
+    deployment: &DeploymentId,
+    tenant: &TenantId,
+    attempt: &str,
+    charge_at: OffsetDateTime,
+) -> Result<Vec<Bucket>, AppError> {
     let balances=tx.query("SELECT p.*,b.bucket_start,b.is_total FROM openbot_internal.automation_budget_balances b
         JOIN openbot_internal.automation_budget_policies p ON (p.deployment_id,p.tenant_id,p.scope_kind,p.scope_id,p.revision,p.metric)=(b.deployment_id,b.tenant_id,b.scope_kind,b.scope_id,b.policy_revision,b.metric)
         WHERE b.deployment_id=$1 AND b.tenant_id=$2
@@ -670,17 +708,11 @@ async fn settle(
               AND q.attempt_id=$3 AND q.policy_revision<=b.policy_revision)
           AND (b.is_total OR (b.bucket_start<=$4 AND b.bucket_start + p.window_seconds*interval '1 second'>$4))
         ORDER BY b.scope_kind,b.scope_id,b.metric,b.bucket_start,b.is_total",
-        &[&deployment.as_str(),&tenant.as_str(),&attempt,&column::<OffsetDateTime>(&row,"charge_at")?]).await.map_err(|_|unavailable())?;
-    for row in balances {
-        Bucket::from_policy(
-            &row,
-            column(&row, "bucket_start")?,
-            column(&row, "is_total")?,
-        )?
-        .sync(tx)
-        .await?;
-    }
-    Ok(())
+        &[&deployment.as_str(),&tenant.as_str(),&attempt,&charge_at]).await.map_err(|_|unavailable())?;
+    balances
+        .iter()
+        .map(|row| Bucket::from_policy(row, column(row, "bucket_start")?, column(row, "is_total")?))
+        .collect()
 }
 
 /// Only reservations that never crossed the pre-send boundary may be released at a real terminal.
@@ -748,7 +780,7 @@ impl openbot_application::automation::AutomationExecutionBudgets
         &self,
         lease: &openbot_application::RunExecutionLease,
         index: u32,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         self.before_sampling(lease, index).await
     }
 
@@ -837,7 +869,6 @@ impl openbot_application::automation::AutomationExecutionBudgets
             &self.tenant,
             grant.owner_id.as_str(),
             &column::<String>(&definition, "automation_id")?,
-            false,
             false,
         )
         .await?;

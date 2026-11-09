@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openbot_agent::{
-    AgentToolInvoker, AuthorizedAgentToolGateway, BuiltInAgentConfig, BuiltInAgentRuntime,
-    BuiltInRunPorts, ProviderRouter, RemoteAgentToolInvoker, RemoteAguiProvider, RetryingProvider,
-    RetryingProviderConfig,
+    AgentToolInvoker, AuthorizedAgentToolGateway, AutomationSamplingPorts, BuiltInAgentConfig,
+    BuiltInAgentRuntime, BuiltInRunPorts, ProviderRouter, RemoteAgentToolInvoker,
+    RemoteAguiProvider, RetryingProvider, RetryingProviderConfig,
 };
 use openbot_application::tenant::package::{
     BuiltInProviderSource, TenantAgentConfiguration, TenantAgentType, TenantPackageAudienceContext,
@@ -940,15 +940,16 @@ fn build_built_in_agent(input: BuiltInAgentAssemblyInput) -> Result<AgentAssembl
         )?
         .with_model_dataset_binding(Arc::clone(&model_dataset_binding))?,
     );
+    let single_attempt: Arc<dyn ProviderAdapter> = Arc::new(
+        ProviderRouter::new(
+            package_provider,
+            managed.as_ref().map(|(provider, _)| Arc::clone(provider)),
+        )
+        .with_remote_agui(remote_provider)
+        .with_custom(custom_provider),
+    );
     let provider = Arc::new(RetryingProvider::new(
-        Arc::new(
-            ProviderRouter::new(
-                package_provider,
-                managed.as_ref().map(|(provider, _)| Arc::clone(provider)),
-            )
-            .with_remote_agui(remote_provider)
-            .with_custom(custom_provider),
-        ),
+        single_attempt.clone(),
         RetryingProviderConfig::default(),
     )?);
     let context = Arc::new(
@@ -968,7 +969,10 @@ fn build_built_in_agent(input: BuiltInAgentAssemblyInput) -> Result<AgentAssembl
     let agent = BuiltInAgentRuntime::start_with_run_ports(
         BuiltInRunPorts {
             runtime,
-            automation_budgets,
+            automation_sampling: automation_budgets.map(|budgets| AutomationSamplingPorts {
+                budgets,
+                provider: single_attempt,
+            }),
         },
         context,
         provider,
