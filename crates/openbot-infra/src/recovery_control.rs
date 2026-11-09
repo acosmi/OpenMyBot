@@ -33,6 +33,8 @@ pub use ordinary::{
 #[cfg(feature = "server-runtime")]
 pub use runtime::AuthorizationPurpose;
 pub(crate) use runtime::RecoveryWorkerLease;
+#[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+pub use runtime::LocalSubjectReconfirmation;
 pub use runtime::{
     PassiveObjectKind, RecoveryReadGate, RecoveryRuntimeOwner, RuntimeCloseFact,
     RuntimeCloseReceipt, RuntimeCloseResources, RuntimeOwner, RuntimePgAck, RuntimeTaskOutcome,

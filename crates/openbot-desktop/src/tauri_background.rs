@@ -2883,6 +2883,65 @@ pub(crate) async fn prepare_desktop_local_runtime(
         secret_store,
     } = release;
     let DesktopLocalApplicationInput { provider, budgets } = application;
+    // A restored Current head opens its selected generation before any installation exists:
+    // PostgreSQL on its `data` child with the SCRAM target slot, the Vault with the master target
+    // slot, the real Current readback, then the Local subject gate. Only that gate forms the
+    // installation; a Pending binding reaches no factory (spec revision R484 ¶8023–8025,
+    // ¶8132–8134). Ordinary Fresh/Existing heads take none of this path.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    let mut postgres_bundle = Some(postgres_bundle);
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    let mut current = None;
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    if let Some(runtime) = recovery_runtime.as_mut()
+        && let Some(site) = runtime.restored_local_site(&app_data_root)?
+    {
+        use crate::desktop_local_bootstrap::{RestoredOpenFailure, SqlDriverOutcome};
+        use crate::postgres_sidecar::SidecarOutcome;
+        use openbot_infra::recovery_control::{PassiveObjectKind, RuntimeCloseFact, RuntimeOwner};
+        let facts = || {
+            [RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay, RuntimeOwner::DesktopAgent]
+                .into_iter()
+                .map(|owner| RuntimeCloseFact::PassiveRetirement { object: PassiveObjectKind::NeverStarted(owner) })
+                .collect()
+        };
+        // Capture of a restored generation is not part of this startup.
+        let opened = if capture_request.is_some() || self_owned_capture_fixture.is_some() {
+            Err((None, Err(SidecarOutcome::NeverSpawned), SqlDriverOutcome::NeverStarted))
+        } else {
+            // Boxed: the restored open keeps its state off the startup future.
+            Box::pin(crate::desktop_local_bootstrap::open_current_installation(
+                runtime,
+                site,
+                app_data_root.as_path(),
+                postgres_bundle.take().ok_or(DesktopLocalRuntimeError::Configuration)?,
+                secret_store.as_ref(),
+                &postgres_key_store_service,
+                &vault_key_store_service,
+            ))
+            .await
+            .map_err(|(failure, sidecar, sql)| (Some(failure), sidecar, sql))
+        };
+        match opened {
+            Ok(opened) => current = Some(opened),
+            Err((failure, sidecar, sql)) => {
+                let deadline = Instant::now() + crate::cancel::SHUTDOWN_DEADLINE;
+                close_local_recovery(&mut recovery_runtime, facts(), sidecar, sql, deadline).await;
+                return Err(match failure {
+                    None => DesktopLocalRuntimeError::Configuration,
+                    Some(RestoredOpenFailure::Sidecar(error)) => map_sidecar_error(error),
+                    Some(RestoredOpenFailure::DataPlane(error)) => map_data_plane_error(error),
+                    Some(RestoredOpenFailure::Vault(error)) => map_vault_error(error),
+                    Some(RestoredOpenFailure::Control(error)) => error.into(),
+                    Some(RestoredOpenFailure::Gate(
+                        openbot_infra::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed,
+                    )) => DesktopLocalRuntimeError::RecoveryRequired,
+                    Some(RestoredOpenFailure::Gate(_)) => DesktopLocalRuntimeError::DataPlane,
+                    Some(RestoredOpenFailure::Authority) => DesktopLocalRuntimeError::Authority,
+                });
+            }
+        }
+    }
     let pre_start = (|| {
         let remote_agent_probe = provider
             .remote_transport(budgets.stall_timeout)
@@ -2972,11 +3031,12 @@ pub(crate) async fn prepare_desktop_local_runtime(
         }
 
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-        let installation = match recovery_fresh.as_mut() {
-            Some(session) => session
+        let installation = match (current.as_ref(), recovery_fresh.as_mut()) {
+            (Some((installation, ..)), _) => installation.clone(),
+            (None, Some(session)) => session
                 .take_fresh_installation()
                 .ok_or(DesktopLocalRuntimeError::InitializationEvidenceInvalid)?,
-            None => authority_store
+            (None, None) => authority_store
                 .load_or_create_installation()
                 .map_err(|_| DesktopLocalRuntimeError::Authority)?,
         };
@@ -3160,14 +3220,20 @@ pub(crate) async fn prepare_desktop_local_runtime(
                             object: PassiveObjectKind::NeverStarted(owner),
                         })
                         .collect();
-                        close_local_recovery(
-                            &mut recovery_runtime,
-                            facts,
-                            Err(SidecarOutcome::NeverSpawned),
-                            SqlDriverOutcome::NeverStarted,
-                            deadline,
-                        )
-                        .await;
+                        // A consumed Current already runs its data plane.
+                        let (sidecar, sql) = match current.take() {
+                            Some((_, prepared, vault)) => {
+                                drop(vault);
+                                match prepared.shutdown().await {
+                                    Ok((exit, observations)) => {
+                                        (Ok(exit), SqlDriverOutcome::Observed(observations))
+                                    }
+                                    Err((_, sidecar, sql)) => (sidecar, sql),
+                                }
+                            }
+                            None => (Err(SidecarOutcome::NeverSpawned), SqlDriverOutcome::NeverStarted),
+                        };
+                        close_local_recovery(&mut recovery_runtime, facts, sidecar, sql, deadline).await;
                     }
                 }
                 return Err(original);
@@ -3192,6 +3258,23 @@ pub(crate) async fn prepare_desktop_local_runtime(
         target_os = "macos"
     )))]
     let () = capture_start;
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    let current_verified = current.is_some();
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    let current_parts = current.map(|(_, prepared, vault)| (prepared, vault));
+    #[cfg(not(all(feature = "desktop-launcher", target_os = "macos")))]
+    let current_parts: Option<(
+        crate::desktop_local_bootstrap::PreparedDesktopLocalDataPlane,
+        crate::desktop_vault::VaultReadyDesktopMaterial,
+    )> =
+        None;
+    let (prepared_data_plane, mut vault_ready) = match current_parts {
+        Some(parts) => parts,
+        None => {
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    let Some(postgres_bundle) = postgres_bundle.take() else {
+        return Err(DesktopLocalRuntimeError::Configuration);
+    };
     let start = async {
         #[cfg(all(
             feature = "desktop-launcher",
@@ -3321,7 +3404,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
             )
             .await
     };
-    let mut vault_ready = match verify_vault.await {
+    let vault_ready = match verify_vault.await {
         Ok(material) => material,
         Err(error) => {
             let original = map_vault_error(error);
@@ -3360,6 +3443,9 @@ pub(crate) async fn prepare_desktop_local_runtime(
             });
         }
     };
+    (prepared_data_plane, vault_ready)
+        }
+    };
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     {
         let bound: Result<(), DesktopLocalRuntimeError> = async {
@@ -3383,7 +3469,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                     )
                     .await?;
                 recovery_runtime = Some(session.into_runtime_before()?);
-            } else {
+            } else if !current_verified {
                 recovery_runtime
                     .as_mut()
                     .ok_or(DesktopLocalRuntimeError::InitializationRequired)?

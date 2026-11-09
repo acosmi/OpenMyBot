@@ -33,8 +33,9 @@ use std::{str::FromStr, sync::OnceLock};
 use time::OffsetDateTime;
 #[cfg(feature = "server-runtime")]
 use tokio_postgres::Transaction;
+/// The cancellation an original reconfirmation request observes.
 #[cfg(feature = "server-runtime")]
-use tokio_util::sync::CancellationToken;
+pub use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[cfg(feature = "server-runtime")]
@@ -577,6 +578,135 @@ impl RestoreReconfirmation {
     }
 }
 
+/// The Local actor's subject receipt of one restored Current runtime, after
+/// its host consumed one OS confirmation (spec revision R484 ¶8087–8089):
+/// the actor row and the latest in-cohort subject requirement are locked, the
+/// audit event and the `fresh_local_os` receipt commit in one GuardedRC, the
+/// ACK is required, and the readback consumers use must accept the receipt.
+#[cfg(all(feature = "server-runtime", feature = "desktop-local"))]
+pub(crate) async fn confirm_restored_local_subject(
+    lease: &crate::recovery_control::RecoveryWorkerLease<'_>,
+    pool: &DatabasePool,
+    actor: &str,
+    audit_key: &[u8],
+    mut request: OriginalReconfirmationRequest,
+) -> Result<ReconfirmationCommitFact, RestoreReconfirmationError> {
+    let deadline = request.deadline;
+    let cohort = lease.restore_cohort().ok_or(RestoreReconfirmationError::Unavailable)?;
+    if request.confirmations_left != 1 || request.cancel.is_cancelled() || deadline > lease.deadline() {
+        return Err(RestoreReconfirmationError::Unavailable);
+    }
+    request.confirmations_left = 0;
+    let current = || lease.verify_current_before(deadline).map_err(|_| RestoreReconfirmationError::Unavailable);
+    current()?;
+    let operation_id = Uuid::from_bytes(cohort.operation_id);
+    let mut client = pool
+        .get_guarded(deadline)
+        .await
+        .map_err(|_| RestoreReconfirmationError::Unavailable)?;
+    let owner = client
+        .begin_read_committed()
+        .await
+        .map_err(|_| RestoreReconfirmationError::Unavailable)?;
+    let tx = owner.as_transaction();
+    let prepare = async {
+        let birth: OffsetDateTime = tx
+            .query_opt("SELECT created_at FROM public.users WHERE id=$1 FOR SHARE", &[&actor])
+            .await
+            .map_err(|_| RestoreReconfirmationError::Unavailable)?
+            .ok_or(RestoreReconfirmationError::NotVisible)?
+            .try_get(0)
+            .map_err(|_| RestoreReconfirmationError::Unavailable)?;
+        let requirement: Uuid = tx.query_opt(
+            "SELECT requirement_id FROM openbot_internal.restore_reconfirm_requirements r \
+             WHERE operation_id=$1 AND epoch=$2 AND source_kind='subject' AND source_ref=$3 \
+             AND owner_kind='actor' AND owner_id=$3 AND source_created_at=$4 AND owner_created_at=$4 \
+             AND NOT EXISTS(SELECT 1 FROM openbot_internal.restore_reconfirm_requirements newer \
+                WHERE newer.operation_id=r.operation_id AND newer.source_kind=r.source_kind \
+                AND newer.source_ref=r.source_ref AND newer.binding_generation>r.binding_generation) FOR UPDATE",
+            &[&operation_id, &cohort.epoch.as_slice(), &actor, &birth],
+        ).await.map_err(|_| RestoreReconfirmationError::Unavailable)?
+            .ok_or(RestoreReconfirmationError::NotVisible)?
+            .try_get(0)
+            .map_err(|_| RestoreReconfirmationError::Unavailable)?;
+        let (id, created_at) = next_event_coordinates(tx)
+            .await
+            .map_err(|_| RestoreReconfirmationError::Unavailable)?;
+        let event = AuditEvent {
+            id,
+            actor: Some(ActorId::new(actor)),
+            event_type: AuditEventType::parse("configuration.changed")
+                .ok_or(RestoreReconfirmationError::Unavailable)?,
+            target_kind: AuditLabel::new("restore_requirement"),
+            target_id: Some(
+                AuditIdentifier::new(requirement.to_string())
+                    .map_err(|_| RestoreReconfirmationError::Unavailable)?,
+            ),
+            payload: AuditPayload::from_facts([AuditFact::ConfigurationChange(AuditLabel::new(
+                "restore_binding_reconfirmed",
+            ))])
+            .map_err(|_| RestoreReconfirmationError::Unavailable)?,
+            created_at,
+        };
+        append_event_in_transaction(tx, &event, audit_key)
+            .await
+            .map_err(|_| RestoreReconfirmationError::Unavailable)?;
+        current()?;
+        tx.execute(
+            "INSERT INTO openbot_internal.restore_reconfirm_receipts \
+             (operation_id,epoch,requirement_id,confirmation_id,proof_ref,confirmed_by,proof_kind) \
+             VALUES($1,$2,$3,$4,$5,$6,'fresh_local_os') ON CONFLICT(requirement_id) DO NOTHING",
+            &[&operation_id, &cohort.epoch.as_slice(), &requirement, &request.confirmation_id, &request.proof_ref, &actor],
+        ).await.map_err(|_| RestoreReconfirmationError::Unavailable)?;
+        Ok::<_, RestoreReconfirmationError>(requirement)
+    };
+    let requirement = tokio::select! {
+        biased;
+        _ = request.cancel.cancelled() => return Err(RestoreReconfirmationError::Unavailable),
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), prepare) => result.map_err(|_| RestoreReconfirmationError::Unavailable)??,
+    };
+    current()?;
+    if request.cancel.is_cancelled() {
+        return Err(RestoreReconfirmationError::Unavailable);
+    }
+    // GuardedRC owns COMMIT's deadline and its exact ACK/Unknown classification.
+    owner.commit().await.map_err(|error| match error {
+        TransactionOwnerError::CommitUnknown => RestoreReconfirmationError::CommitUnknown,
+        TransactionOwnerError::CommitAcknowledgedAfterDeadline => {
+            RestoreReconfirmationError::CommitAcknowledgedAfterDeadline
+        }
+        _ => RestoreReconfirmationError::Unavailable,
+    })?;
+    current()?;
+    let readback = async {
+        let row = client
+            .as_client()
+            .query_opt(
+                "SELECT confirmation_id FROM openbot_internal.restore_reconfirm_receipts \
+                 WHERE requirement_id=$1 AND operation_id=$2 AND epoch=$3 AND confirmed_by=$4 AND proof_kind='fresh_local_os'",
+                &[&requirement, &operation_id, &cohort.epoch.as_slice(), &actor],
+            )
+            .await
+            .map_err(|_| RestoreReconfirmationError::Unavailable)?
+            .ok_or(RestoreReconfirmationError::NotVisible)?;
+        // The consumers' own readback must accept this receipt as confirming.
+        require_confirmed_before(
+            client.as_client(),
+            RequirementSource { cohort: Some(cohort), kind: RequirementKind::Subject, source_ref: actor },
+            deadline,
+        )
+        .await?;
+        row.try_get::<_, Uuid>(0).map_err(|_| RestoreReconfirmationError::Unavailable)
+    };
+    let confirmation_id = tokio::select! {
+        biased;
+        _ = request.cancel.cancelled() => return Err(RestoreReconfirmationError::Unavailable),
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), readback) => result.map_err(|_| RestoreReconfirmationError::Unavailable)??,
+    };
+    current()?;
+    Ok(ReconfirmationCommitFact { requirement_id: requirement, confirmation_id })
+}
+
 #[cfg(feature = "server-runtime")]
 impl RestoreReconfirmation {
     async fn lock_source(
@@ -832,5 +962,125 @@ pub(crate) mod tests {
             VALUES($1,$2,'dep','ten',$3,$4,clock_timestamp())", &[&secret, &connection, &owner, &sealed]).await.unwrap();
         tx.commit().await.unwrap();
         connection
+    }
+}
+
+/// The Local subject producer on a published RestoreCurrent (spec revision
+/// R484 ¶8087–8089, ¶8024): before its receipt the Current installation gate
+/// stays closed, a cancelled request writes nothing, one request commits one
+/// `fresh_local_os` receipt with its audit event, and only then does the
+/// gate form the Current binding. The host's OS confirmation is not modelled
+/// here; this proves the database side the host drives after it.
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod local_subject {
+    use super::*;
+    use crate::auth::single_user::desktop_local::{
+        DESKTOP_LOCAL_ACTOR_ID, DESKTOP_LOCAL_EMAIL, VerifiedRestoreInstallationBinding,
+    };
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn local_subject_receipt_commits_once_and_opens_the_current_binding_gate() {
+        let restored = RestoreCurrentFixture::publish(
+            &format!(
+                "INSERT INTO public.users(id,email,email_verified,auth_generation) VALUES('{DESKTOP_LOCAL_ACTOR_ID}','{DESKTOP_LOCAL_EMAIL}',true,0);
+                 INSERT INTO public.user_roles(user_id,role) VALUES('{DESKTOP_LOCAL_ACTOR_ID}','admin');"
+            ),
+            async |_| {},
+        )
+        .await;
+        let client = restored.pool.get().await.unwrap();
+        // The target's own restore row and cluster identity, read back.
+        let row = client
+            .query_one(
+                "SELECT o.target_installation_id,o.deployment_id,o.tenant_id,o.dataset_id,
+                        (SELECT system_identifier FROM pg_control_system()),
+                        (SELECT oid FROM pg_database WHERE datname=current_database()),
+                        current_setting('data_directory')
+                   FROM openbot_internal.restore_pg_operations o WHERE o.operation_id=$1",
+                &[&Uuid::from_bytes(restored.cohort.operation_id)],
+            )
+            .await
+            .unwrap();
+        let pending = |oid: u32| {
+            VerifiedRestoreInstallationBinding::from_readback(
+                [0, 1, 2, 3].map(|index| row.get::<_, String>(index)),
+                std::path::PathBuf::from(row.get::<_, String>(6)),
+                row.get::<_, i64>(4) as u64,
+                oid,
+            )
+        };
+        let oid: u32 = row.get(5);
+        let audit_key = openbot_domain::vault::derive_application_key(
+            &SecretBytes::new(vec![0x41; 32]),
+            openbot_domain::vault::ApplicationKeyPurpose::AuditCheckpoint,
+        )
+        .unwrap();
+        // One original deadline per request: its admission and its receipt share it.
+        let due = Instant::now() + std::time::Duration::from_secs(60);
+        let request = |cancel: CancellationToken| OriginalReconfirmationRequest::new(due, cancel);
+        let deadline = || due;
+        let receipts = || async {
+            client
+                .query_one(
+                    "SELECT count(*)::bigint FROM openbot_internal.restore_reconfirm_receipts
+                      WHERE confirmed_by=$1 AND proof_kind='fresh_local_os'",
+                    &[&DESKTOP_LOCAL_ACTOR_ID],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+
+        assert!(matches!(
+            restored.runtime.current_restore_installation_before(&restored.pool, pending(oid), deadline()).await,
+            Err(RestoreReconfirmationError::NotConfirmed)
+        ));
+        let other = restored.runtime.admit_restored_local_subject_before(&pending(oid + 1), 0, deadline());
+        assert!(matches!(other, Err(RestoreReconfirmationError::NotVisible)), "another installation's facts");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cancelled = restored
+            .runtime
+            .admit_restored_local_subject_before(&pending(oid), 0, deadline())
+            .unwrap()
+            .confirm_before(&restored.pool, audit_key.expose(), request(cancel))
+            .await;
+        assert!(matches!(cancelled, Err(RestoreReconfirmationError::Unavailable)));
+        assert_eq!(receipts().await, 0, "a cancelled request wrote a receipt");
+
+        let fact = restored
+            .runtime
+            .admit_restored_local_subject_before(&pending(oid), 0, deadline())
+            .unwrap()
+            .confirm_before(&restored.pool, audit_key.expose(), request(CancellationToken::new()))
+            .await
+            .unwrap();
+        assert_eq!(receipts().await, 1);
+        let audited: i64 = client
+            .query_one(
+                "SELECT count(*)::bigint FROM public.audit_events WHERE actor_user_id=$1 AND target_id=$2",
+                &[&DESKTOP_LOCAL_ACTOR_ID, &fact.requirement_id().to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(audited, 1, "the receipt's audit event is in its transaction");
+        // A second request adds no receipt and reads back the first.
+        let again = restored
+            .runtime
+            .admit_restored_local_subject_before(&pending(oid), 0, deadline())
+            .unwrap()
+            .confirm_before(&restored.pool, audit_key.expose(), request(CancellationToken::new()))
+            .await
+            .unwrap();
+        assert_eq!(again.confirmation_id(), fact.confirmation_id());
+        assert_eq!(receipts().await, 1);
+        restored
+            .runtime
+            .current_restore_installation_before(&restored.pool, pending(oid), deadline())
+            .await
+            .unwrap();
     }
 }

@@ -490,6 +490,68 @@ impl DesktopLocalInstallation {
     }
 }
 
+/// The selected restored generation a Current Local runtime names, before any
+/// readback: business IDs, its `data` child and both target key references
+/// (spec revision R484 ¶8023, ¶8132). Only that runtime forms it; it carries no
+/// authority, opens no principal and is never an AuthContext source.
+pub struct RestoredLocalSite {
+    pub(crate) ids: [String; 4],
+    pub(crate) data_dir: PathBuf,
+    pub(crate) master: (String, String),
+    pub(crate) postgres_account: String,
+}
+
+impl core::fmt::Debug for RestoredLocalSite {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("RestoredLocalSite(<selected generation>)")
+    }
+}
+
+impl RestoredLocalSite {
+    /// The target installation ID; the sidecar's lock and journal namespace.
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        &self.ids[0]
+    }
+
+    /// The deployment, tenant and dataset IDs the Vault canary must match.
+    #[must_use]
+    pub fn business_ids(&self) -> [&str; 3] {
+        [&self.ids[1], &self.ids[2], &self.ids[3]]
+    }
+
+    /// The generation's PostgreSQL directory.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The master target slot account and the canary key ID it names.
+    #[must_use]
+    pub fn master(&self) -> (&str, &str) {
+        (&self.master.0, &self.master.1)
+    }
+
+    /// The SCRAM target slot account.
+    #[must_use]
+    pub fn postgres_account(&self) -> &str {
+        &self.postgres_account
+    }
+
+    /// The same live attestation an installation makes, against this
+    /// generation's directory; it converts no installation authority.
+    pub async fn attest_postgres_admin(
+        &self,
+        admin: UnattestedDesktopLocalAdmin,
+    ) -> Result<AttestedDesktopLocalAdmin, DesktopLocalBootstrapError> {
+        if let Err(error) = verify_postgres_sidecar(admin.pool(), &self.data_dir).await {
+            admin.close();
+            return Err(error);
+        }
+        Ok(admin.into_attested())
+    }
+}
+
 /// Facts of a restored installation read back on the bound candidate with the
 /// new target-slot key: private IDs, the generation's PostgreSQL directory and
 /// tuple (spec revision R484 ¶8022). It carries no authority and is never an
@@ -553,8 +615,8 @@ pub struct VerifiedCurrentRestoreInstallationBinding {
 impl VerifiedCurrentRestoreInstallationBinding {
     /// The startup producer's single constructor, after its own Current and
     /// subject checks; it does not repeat or replace them. That producer is
-    /// the restored Local startup route, which lands with the next batch.
-    #[allow(dead_code)]
+    /// `RecoveryRuntimeOwner::current_restore_installation_before`.
+    #[cfg(feature = "server-runtime")]
     pub(crate) fn after_current_gate(restored: VerifiedRestoreInstallationBinding) -> Self {
         Self { restored }
     }

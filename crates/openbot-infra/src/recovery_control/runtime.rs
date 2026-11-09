@@ -377,8 +377,150 @@ impl RecoveryRuntimeOwner {
         let (control, binding, deadline) = share_runtime(&self.state, |state| {
             (Arc::clone(&state.control), state.original.published.binding().clone(), state.original.original_deadline)
         })?;
-        entry::verify_local_binding_before(&control, &binding, authority, database, canary, services, deadline).await
+        entry::verify_local_binding_before(&control, &binding, Some(authority), database, canary, services, deadline).await
             .map_err(|error| error.retain(&control))
+    }
+
+    /// The selected generation this runtime's published head names when it
+    /// is a restored Current; `None` for every ordinary head. Its PostgreSQL
+    /// directory is the generation root's `data` child, and that root is the
+    /// app-data root this control opened (spec revision R484 ¶8132).
+    #[cfg(feature = "desktop-local")]
+    pub fn restored_local_site(
+        &self,
+        app_data_root: &crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
+    ) -> Result<Option<crate::auth::single_user::desktop_local::RestoredLocalSite>, RecoveryControlError> {
+        let (binding, cohort) = share_runtime(&self.state, |state| {
+            (state.original.published.binding().clone(), state.original.published.restore_cohort())
+        })?;
+        if cohort.is_none() {
+            return Ok(None);
+        }
+        let site = binding.ordinary_local()?;
+        Ok(Some(crate::auth::single_user::desktop_local::RestoredLocalSite {
+            ids: [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id].map(str::to_owned),
+            data_dir: app_data_root.as_path().join("data"),
+            master: (site.master.account.clone(), site.master.key_id.clone()),
+            postgres_account: site.postgres.account.clone(),
+        }))
+    }
+
+    /// The real Current readback of a restored Local generation, made before
+    /// any installation authority exists: its target slots opened the vault
+    /// and started PostgreSQL in its `data` child, and the running cluster, canary,
+    /// layout and root are the published binding's (spec revision R484
+    /// ¶8023, ¶8132). The result is Pending: it carries no authority.
+    #[cfg(feature = "desktop-local")]
+    pub async fn verify_restored_local_before(
+        &mut self,
+        database: &crate::db::desktop_local::DesktopLocalDatabase,
+        canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
+        services: [&str; 2],
+        restored: &crate::auth::single_user::desktop_local::RestoredLocalSite,
+    ) -> Result<crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding, RecoveryControlError> {
+        let data_dir = restored.data_dir();
+        let (control, binding, cohort, deadline) = share_runtime(&self.state, |state| {
+            (
+                Arc::clone(&state.control),
+                state.original.published.binding().clone(),
+                state.original.published.restore_cohort(),
+                state.original.original_deadline,
+            )
+        })?;
+        let result = async {
+            if cohort.is_none() {
+                return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
+            }
+            entry::verify_local_binding_before(&control, &binding, None, database, canary, services, deadline).await?;
+            let running: String = database
+                .pool()
+                .get()
+                .await
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?
+                .query_one("SELECT current_setting('data_directory')", &[])
+                .await
+                .and_then(|row| row.try_get(0))
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?;
+            if std::path::Path::new(&running) != data_dir {
+                return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
+            }
+            let site = binding.ordinary_local()?;
+            Ok(crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding::from_readback(
+                [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id].map(str::to_owned),
+                data_dir.to_path_buf(),
+                site.pg_system_id,
+                site.database_oid,
+            ))
+        }
+        .await;
+        result.map_err(|error| error.retain(&control))
+    }
+
+    /// Admit one Local subject reconfirmation of this Current before the host
+    /// allocates its OS confirmation: the worker lease and `native_bytes`,
+    /// the host's exact confirmation structure size, are charged here, once,
+    /// with no refund (spec revision R484 ¶7984, ¶8087).
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub fn admit_restored_local_subject_before(
+        &self,
+        pending: &crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
+        native_bytes: u64,
+        deadline: Instant,
+    ) -> Result<LocalSubjectReconfirmation<'_>, crate::restore_reconfirmation::RestoreReconfirmationError> {
+        use crate::restore_reconfirmation::RestoreReconfirmationError as Error;
+        let binding = share_runtime(&self.state, |state| state.original.published.binding().clone())
+            .map_err(|_| Error::Unavailable)?;
+        let site = binding.ordinary_local().map_err(|_| Error::Unavailable)?;
+        if pending.ids() != [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id]
+            || pending.postgres() != (site.pg_system_id, site.database_oid)
+        {
+            return Err(Error::NotVisible);
+        }
+        let reservation = (std::mem::size_of::<RecoveryWorkerLease<'_>>() as u64)
+            .checked_add(std::mem::size_of::<crate::restore_reconfirmation::OriginalReconfirmationRequest>() as u64)
+            .and_then(|n| n.checked_add(native_bytes))
+            .ok_or(Error::Unavailable)?;
+        let hold = AdmissionHold::acquire(&Arc::downgrade(&self.state), reservation, deadline)
+            .map_err(|_| Error::Unavailable)?;
+        Ok(LocalSubjectReconfirmation {
+            lease: RecoveryWorkerLease { hold: Some(hold), deadline, _gate: std::marker::PhantomData },
+        })
+    }
+
+    /// The startup producer of the Current installation binding: only after
+    /// the Local subject's latest in-cohort requirement reads back confirmed
+    /// (spec revision R484 ¶8024, ¶8089).
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub async fn current_restore_installation_before(
+        &self,
+        pool: &crate::db::pool::DatabasePool,
+        pending: crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
+        deadline: Instant,
+    ) -> Result<crate::auth::single_user::desktop_local::VerifiedCurrentRestoreInstallationBinding, crate::restore_reconfirmation::RestoreReconfirmationError> {
+        use crate::restore_reconfirmation::RestoreReconfirmationError as Error;
+        let (binding, cohort) = share_runtime(&self.state, |state| {
+            (state.original.published.binding().clone(), state.original.published.restore_cohort())
+        })
+        .map_err(|_| Error::Unavailable)?;
+        let site = binding.ordinary_local().map_err(|_| Error::Unavailable)?;
+        if cohort.is_none()
+            || pending.ids() != [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id]
+            || pending.postgres() != (site.pg_system_id, site.database_oid)
+        {
+            return Err(Error::NotVisible);
+        }
+        let client = pool.get().await.map_err(|_| Error::Unavailable)?;
+        crate::restore_reconfirmation::require_confirmed_before(
+            &**client,
+            crate::restore_reconfirmation::RequirementSource {
+                cohort,
+                kind: crate::restore_reconfirmation::RequirementKind::Subject,
+                source_ref: crate::auth::single_user::desktop_local::DESKTOP_LOCAL_ACTOR_ID,
+            },
+            deadline,
+        )
+        .await?;
+        Ok(crate::auth::single_user::desktop_local::VerifiedCurrentRestoreInstallationBinding::after_current_gate(pending))
     }
 
     #[must_use]
@@ -1250,6 +1392,34 @@ impl RecoveryReadGate {
 
 /// Admission held by a consumer without an AuthContext (MCP callback, token
 /// refresh, revocation/reconciliation and artifact body-read workers).
+/// One admitted Local subject reconfirmation; it confirms at most once.
+#[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+pub struct LocalSubjectReconfirmation<'a> {
+    lease: RecoveryWorkerLease<'a>,
+}
+
+#[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+impl LocalSubjectReconfirmation<'_> {
+    /// Write the Local actor's `fresh_local_os` subject receipt after the
+    /// host consumed one OS confirmation for this Current (spec revision
+    /// R484 ¶8087–8089).
+    pub async fn confirm_before(
+        self,
+        pool: &crate::db::pool::DatabasePool,
+        audit_key: &[u8],
+        request: crate::restore_reconfirmation::OriginalReconfirmationRequest,
+    ) -> Result<crate::restore_reconfirmation::ReconfirmationCommitFact, crate::restore_reconfirmation::RestoreReconfirmationError> {
+        crate::restore_reconfirmation::confirm_restored_local_subject(
+            &self.lease,
+            pool,
+            crate::auth::single_user::desktop_local::DESKTOP_LOCAL_ACTOR_ID,
+            audit_key,
+            request,
+        )
+        .await
+    }
+}
+
 pub(crate) struct RecoveryWorkerLease<'a> {
     hold: Option<AdmissionHold>,
     deadline: Instant,

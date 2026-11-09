@@ -394,11 +394,35 @@ pub(crate) enum PostgresProgram {
     Control,
 }
 
+/// The generation of one instance a start owns (spec revision R484 ¶8132).
+#[derive(Clone, Copy)]
+pub(crate) enum PostgresGeneration<'a> {
+    /// The instance's own `postgresql-17-{instance}` child and SCRAM slot.
+    Ordinary,
+    /// The selected restored generation's `data` child and its target SCRAM
+    /// slot. It is only ever an existing cluster; nothing is created for it.
+    #[cfg_attr(not(all(feature = "desktop-launcher", target_os = "macos")), allow(dead_code))]
+    RestoredCurrent { scram_account: &'a str },
+}
+
+impl PostgresGeneration<'_> {
+    fn names(self, instance_id: &str) -> (String, String) {
+        match self {
+            Self::Ordinary => (format!("postgresql-17-{instance_id}"), format!("postgresql-17-{instance_id}")),
+            Self::RestoredCurrent { scram_account } => ("data".to_owned(), scram_account.to_owned()),
+        }
+    }
+}
+
 /// Exclusive per-instance startup ownership; crash residue intentionally fails closed.
 pub struct PostgresStartLock {
     path: PathBuf,
     bytes: Vec<u8>,
     instance_id: Arc<str>,
+    /// The data directory child and SCRAM slot account of the generation this start owns.
+    data_dir_name: Arc<str>,
+    #[cfg_attr(not(feature = "postgres-key-store"), allow(dead_code))]
+    scram_account: Arc<str>,
     remove_on_drop: bool,
     #[cfg(feature = "postgres-key-store")]
     secret_creation_attempted: std::sync::atomic::AtomicBool,
@@ -444,6 +468,7 @@ impl PostgresStartLock {
             bundle_digest,
             None,
             StartControlInspection::Ordinary,
+            PostgresGeneration::Ordinary,
         )
     }
 
@@ -460,6 +485,7 @@ impl PostgresStartLock {
             bundle_digest,
             Some(data_dir),
             StartControlInspection::Ordinary,
+            PostgresGeneration::Ordinary,
         )
     }
 
@@ -469,7 +495,9 @@ impl PostgresStartLock {
         bundle_digest: PostgresBundleDigest,
         data_dir: Option<&Path>,
         control_inspection: StartControlInspection,
+        generation: PostgresGeneration<'_>,
     ) -> Result<Self, PostgresSidecarError> {
+        let (data_dir_name, scram_account) = generation.names(instance_id);
         let kernel_guard = KernelStartLock::acquire(app_data_root, instance_id)?;
         #[cfg(all(
             feature = "desktop-launcher",
@@ -525,6 +553,7 @@ impl PostgresStartLock {
                             app_data_root,
                             instance_id,
                             data_dir,
+                            &data_dir_name,
                             &evidence,
                         )
                         .and_then(|verified| {
@@ -567,6 +596,7 @@ impl PostgresStartLock {
                                 app_data_root,
                                 instance_id,
                                 data_dir,
+                                &data_dir_name,
                             )
                             .and_then(|()| {
                                 if !evidence.is_current(&kernel_guard) {
@@ -620,6 +650,8 @@ impl PostgresStartLock {
             path,
             bytes,
             instance_id: Arc::from(instance_id),
+            data_dir_name: Arc::from(data_dir_name),
+            scram_account: Arc::from(scram_account),
             remove_on_drop: true,
             #[cfg(feature = "postgres-key-store")]
             secret_creation_attempted: std::sync::atomic::AtomicBool::new(false),
@@ -840,8 +872,8 @@ impl PostgresStartLock {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(PostgresSecretStoreError::ReconciliationRequired);
         }
-        let account = format!("postgresql-17-{}", self.instance_id);
-        let stored = store.read(service.as_str(), &account)?;
+        let account = &*self.scram_account;
+        let stored = store.read(service.as_str(), account)?;
         match journal.as_ref() {
             Some(journal) => journal
                 .revalidate(self, disposition)
@@ -919,10 +951,10 @@ impl PostgresStartLock {
             return Err(PostgresSecretStoreError::DispositionInvalid);
         }
         store
-            .write(service.as_str(), &account, generated.expose())
+            .write(service.as_str(), account, generated.expose())
             .map_err(mark_os_store_write_ambiguous)?;
         let persisted = store
-            .read(service.as_str(), &account)
+            .read(service.as_str(), account)
             .map_err(mark_os_store_write_ambiguous)?
             .ok_or(PostgresSecretStoreError::ReconciliationRequired)
             .and_then(|stored| {
@@ -1903,6 +1935,7 @@ impl PostgresSidecarSupervisor {
             service,
             StartControlInspection::Ordinary,
             None,
+            PostgresGeneration::Ordinary,
         )
         .await
         .map_err(|(error, _)| error)
@@ -1935,6 +1968,33 @@ impl PostgresSidecarSupervisor {
                 None => StartControlInspection::Ordinary,
             },
             legacy.map(|owner| (owner.effect_deadline(), owner.convergence_deadline())),
+            PostgresGeneration::Ordinary,
+        )
+        .await
+    }
+
+    /// Start the selected restored generation of a Current head: its `data`
+    /// child with the SCRAM secret its target slot holds (spec revision R484
+    /// ¶8132). Only an existing cluster with an existing secret starts; no
+    /// initdb and no secret creation happen for it.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(crate) async fn start_restored_current<S: PostgresSecretStore + ?Sized>(
+        bundle: VerifiedPostgresBundle,
+        app_data_root: &Path,
+        site: &openbot_infra::auth::single_user::desktop_local::RestoredLocalSite,
+        store: &S,
+        service: &ReviewedPostgresKeyStoreService,
+    ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
+        Self::start_inner(
+            bundle,
+            app_data_root,
+            site.installation_id(),
+            site.data_dir(),
+            store,
+            service,
+            StartControlInspection::Ordinary,
+            None,
+            PostgresGeneration::RestoredCurrent { scram_account: site.postgres_account() },
         )
         .await
     }
@@ -1948,11 +2008,12 @@ impl PostgresSidecarSupervisor {
         service: &ReviewedPostgresKeyStoreService,
         control_inspection: StartControlInspection,
         legacy: Option<(std::time::Instant, std::time::Instant)>,
+        generation: PostgresGeneration<'_>,
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
         if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
             return Err((PostgresSidecarError::ReadyTimeout, SidecarOutcome::NeverSpawned));
         }
-        validate_supervisor_paths(app_data_root, instance_id, data_dir)
+        validate_supervisor_paths(app_data_root, instance_id, &generation.names(instance_id).0, data_dir)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
         let mut lock = PostgresStartLock::acquire_inner(
@@ -1961,6 +2022,7 @@ impl PostgresSidecarSupervisor {
             PostgresBundleDigest(bundle.manifest_sha256),
             Some(data_dir),
             control_inspection,
+            generation,
         )
         .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(not(all(feature = "postgres-supervisor", target_os = "macos")))]
@@ -2025,8 +2087,11 @@ impl PostgresSidecarSupervisor {
         let disposition = lock
             .inspect_data_directory(data_dir)
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
-        // Adoption can never initialize an empty legacy directory or create its SCRAM key.
-        if legacy.is_some() && !disposition.is_existing() {
+        // Adoption and a restored generation can never initialize an empty directory or create
+        // its SCRAM key.
+        if (legacy.is_some() || matches!(generation, PostgresGeneration::RestoredCurrent { .. }))
+            && !disposition.is_existing()
+        {
             return Err((PostgresSidecarError::StartupJournalRecoveryRequired, SidecarOutcome::NeverSpawned));
         }
         #[cfg(target_os = "macos")]
@@ -2279,11 +2344,12 @@ fn map_helper_journal_error(error: HelperJournalError) -> PostgresSidecarError {
 fn validate_supervisor_paths(
     app_data_root: &Path,
     instance_id: &str,
+    data_dir_name: &str,
     data_dir: &Path,
 ) -> Result<(), PostgresSidecarError> {
     if !app_data_root.is_absolute()
         || !valid_instance_id(instance_id)
-        || data_dir != app_data_root.join(format!("postgresql-17-{instance_id}"))
+        || data_dir != app_data_root.join(data_dir_name)
     {
         return Err(PostgresSidecarError::DataDirectoryInvalid);
     }
@@ -3410,7 +3476,7 @@ mod tests {
             fs::set_permissions(&app_root, fs::Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        validate_supervisor_paths(&app_root, &instance, &data_dir).unwrap();
+        validate_supervisor_paths(&app_root, &instance, &format!("postgresql-17-{instance}"), &data_dir).unwrap();
         assert_eq!(
             data_directory_origin(&data_dir).unwrap(),
             PostgresSidecarOrigin::Fresh
@@ -5105,9 +5171,18 @@ mod tests {
         feature = "postgres-maintenance",
         target_os = "macos"
     ))]
-    #[tokio::test]
+    #[test]
     #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
-    async fn fresh_database_passes_the_normal_capture_reads_and_the_empty_periodic() {
+    fn fresh_database_passes_the_normal_capture_reads_and_the_empty_periodic() {
+        crate::testing::on_large_stack(fresh_database_capture_reads_run);
+    }
+
+    #[cfg(all(
+        feature = "desktop-launcher",
+        feature = "postgres-maintenance",
+        target_os = "macos"
+    ))]
+    async fn fresh_database_capture_reads_run() {
         use openbot_contracts::ids::AuditEventId;
         use openbot_domain::audit::event::{AuditEvent, AuditEventType};
         use openbot_domain::audit::payload::{AuditFact, AuditLabel, AuditPayload};
@@ -5325,9 +5400,14 @@ mod tests {
     }
 
     #[cfg(all(feature = "desktop-local-runtime", unix))]
-    #[tokio::test]
+    #[test]
     #[ignore = "需要本机PostgreSQL 17.11 binaries；设置OPENBOT_TEST_POSTGRES_BIN_DIR后运行"]
-    async fn existing_cluster_without_business_database_maps_recovery_and_writes_nothing_new() {
+    fn existing_cluster_without_business_database_maps_recovery_and_writes_nothing_new() {
+        crate::testing::on_large_stack(existing_cluster_without_business_database_run);
+    }
+
+    #[cfg(all(feature = "desktop-local-runtime", unix))]
+    async fn existing_cluster_without_business_database_run() {
         let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
         let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
         let signing = signing_identity();
@@ -5593,9 +5673,14 @@ mod tests {
     }
 
     #[cfg(all(feature = "desktop-local-runtime", unix))]
-    #[tokio::test]
+    #[test]
     #[ignore = "需要本机PostgreSQL 17.11 binaries；设置OPENBOT_TEST_POSTGRES_BIN_DIR后运行"]
-    async fn tauri_background_prepares_one_real_application_and_cleans_every_owner() {
+    fn tauri_background_prepares_one_real_application_and_cleans_every_owner() {
+        crate::testing::on_large_stack(tauri_background_prepares_run);
+    }
+
+    #[cfg(all(feature = "desktop-local-runtime", unix))]
+    async fn tauri_background_prepares_run() {
         let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
         let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
         let bundle =

@@ -1867,3 +1867,329 @@ async fn t046_38_scram_rotation_acknowledges_new_password_and_rejects_old() {
     }
     let _ = fs::remove_dir_all(&bundle_root);
 }
+
+/// A narrow private stand-in for the original native confirmation owner, for
+/// T046-35 only. It confirms at most once and reports the two clocks of that
+/// confirmation; it opens no window and holds no authority. It is not an OS
+/// measurement: it proves nothing about Touch ID, the session monitor or the
+/// native owner's stop, which only the real `MacLocalAuthOwner` observes.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+struct StandInConfirmation {
+    used: bool,
+    session_changed: bool,
+    wall_skew: std::time::Duration,
+    confirmed: Option<super::entry::ConfirmedLocalOwner>,
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl StandInConfirmation {
+    fn new() -> Self {
+        Self { used: false, session_changed: false, wall_skew: std::time::Duration::ZERO, confirmed: None }
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl super::entry::OriginalLocalConfirmation for StandInConfirmation {
+    async fn confirm_once(
+        &mut self,
+        effect: std::time::Instant,
+        _convergence: std::time::Instant,
+    ) -> Result<(), DesktopRestoreError> {
+        if std::mem::replace(&mut self.used, true) {
+            return Err(DesktopRestoreError::EntryInvalid);
+        }
+        // The real owner reports a session change as a lost owner.
+        if self.session_changed {
+            return Err(DesktopRestoreError::OwnerLost);
+        }
+        if std::time::Instant::now() >= effect {
+            return Err(DesktopRestoreError::EffectExpired);
+        }
+        self.confirmed = Some(super::entry::ConfirmedLocalOwner {
+            at: std::time::Instant::now(),
+            wall: std::time::SystemTime::now() + self.wall_skew,
+        });
+        Ok(())
+    }
+
+    fn take_confirmation(&mut self) -> Result<super::entry::ConfirmedLocalOwner, DesktopRestoreError> {
+        self.confirmed.take().ok_or(DesktopRestoreError::ClosureUnproven)
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[test]
+#[ignore = "explicit task CAR plus BIN SBX: real staging, /usr/bin/sandbox-exec and OPENBOT_TEST_POSTGRES_BIN_DIR PostgreSQL 17.11"]
+fn t046_35_local_reconfirmation_consumes_one_os_confirmation_before_any_window() {
+    crate::testing::on_large_stack(t046_35_run);
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+async fn t046_35_run() {
+    use super::candidate::CandidateGeneration;
+    use super::entry::{OriginalLocalConfirmationRequest, OwnedVerifiedCurrentReconfirmationEntry};
+    use crate::tauri_background::{
+        DesktopLocalApplicationInput, DesktopLocalReleaseInput, DesktopLocalRuntimeConfig,
+        DesktopLocalRuntimeError, prepare_desktop_local_runtime,
+    };
+    use openbot_infra::auth::single_user::desktop_local::DesktopLocalAuthorityStore;
+    use openbot_infra::backup::whole_pg_restore_stream::{
+        RestoreCandidateExit, RestoredClosedHistoryRequest, verify_whole_pg_restore_input,
+    };
+    use openbot_infra::recovery_control::{
+        NativeExit, PipeJoin, ProcessStart, RecoveryControl, RecoveryControlConfig, RuntimeOwner,
+    };
+    use openbot_infra::restore_reconfirmation::CancellationToken;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+    let (bundle_root, digest) = crate::postgres_sidecar::materialize_host_postgres_bundle(&bin_dir);
+    let bundle = || {
+        crate::postgres_sidecar::VerifiedPostgresBundle::open(
+            &bundle_root,
+            digest,
+            &crate::postgres_sidecar::signing_identity(),
+        )
+        .unwrap()
+    };
+    let crate_dir = std::env::current_dir().unwrap();
+    let short = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join(format!(".wb046-{}", &uuid::Uuid::now_v7().simple().to_string()[20..]));
+    DirBuilder::new().mode(0o700).create(&short).unwrap();
+    std::env::set_current_dir(&short).unwrap();
+    let fixture = EntryFixture::with_open_file_limit(4096);
+    std::env::set_current_dir(&crate_dir).unwrap();
+    s23_car_request(&fixture);
+    let mut request: Value = serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+    for (field, value) in [
+        ("maxMetadataBytes", 256u64 << 20), ("maxPgConnections", 64), ("maxPgTransactions", 63),
+        ("maxPgRows", 1 << 20), ("maxReconfirmRequirements", 4096), ("maxJournalRecords", 128),
+        ("maxNativeTasks", 32),
+    ] {
+        request["profile"]["capacity"][field] = json!(value);
+    }
+    let profile: RestoreOperationProfile = serde_json::from_value(request["profile"].clone()).unwrap();
+    fixture.write_request(&request);
+
+    // The real restore to RestoreCurrent, in the production order.
+    let VerifiedRestoreEntry { mut control, intent, original: _original } =
+        fixture.entry().expect("original verified release/OS/request");
+    let mut session = control.claim_restore(intent, profile).expect("actual same-session claim");
+    let (input, intent) = session.frozen_input().expect("one actual held source transfer");
+    let staging = verify_whole_pg_restore_input(input, intent, &mut session)
+        .await
+        .unwrap_or_else(|failure| panic!("actual source authentication failed: {:?}", failure.fault()));
+    let mut candidate = CandidateGeneration::new(staging);
+    candidate.prepare_directories(&mut session).expect("directories and Isolation intent");
+    candidate.prepare_postgres(&mut session).expect("staging copies and closed configuration");
+    candidate.start_postgres(&mut session, &bundle()).expect("sandboxed candidate started");
+    candidate.bind_postgres(&mut session, &bundle()).await.expect("candidate bound");
+    let deadline = Instant::now() + Duration::from_secs(110);
+    session.upgrade_candidate_schema_before(deadline).await.expect("schema at the latest layout");
+    session.retire_cohort_before(deadline).await.expect("cohort retired and sealed");
+    session
+        .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline))
+        .await
+        .expect("closed history ACK2");
+    let store = Arc::new(SlotMemoryStore::default());
+    candidate.install_target_slots(&mut session, &*store).expect("both target slots matched");
+    let scram = candidate.rotate_candidate_scram(&mut session, deadline).await.expect("SCRAM change acknowledged");
+    let readbacks = candidate
+        .verify_target_installation(&mut session, deadline)
+        .await
+        .expect("installation read back under the new slot keys");
+    let pid = candidate.original_program().and_then(|program| program.original_child().id()).unwrap();
+    let startup = wrok_bot_macos_process::ProcessIdentity::capture(pid).unwrap().evidence_bytes().unwrap();
+    candidate.release_candidate(&mut session, deadline).await.expect("candidate clients released");
+    candidate.request_stop().expect("one original TERM");
+    let mut owned = Some(session);
+    candidate.begin_wait(&mut owned).expect("original wait owns the same Child");
+    tokio::time::timeout(Duration::from_secs(40), candidate.observe_wait())
+        .await
+        .expect("same Child reaped")
+        .expect("smart shutdown completed");
+    let mut session = candidate.take_wait_session().expect("original session returned");
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let exit = RestoreCandidateExit {
+        pid: u32::from_be_bytes(startup[..4].try_into().unwrap()),
+        start: ProcessStart {
+            seconds: u64::from_be_bytes(startup[4..12].try_into().unwrap()),
+            nanos: u32::from_be_bytes(startup[12..16].try_into().unwrap()) * 1000,
+        },
+        exit: NativeExit::Code { value: 0 },
+        observed_ns: now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
+        pipes: [PipeJoin::Null, PipeJoin::Null, PipeJoin::Null],
+    };
+    session
+        .publish_restore_current_before(scram, readbacks, exit, deadline)
+        .await
+        .expect("RestoreCurrent published");
+    drop(session);
+    drop(candidate);
+    drop(control);
+    assert_eq!(local_head(&fixture.root.join("com.acosmi.wrokbot.restore-control"))["phase"], "RestoreCurrent");
+
+    // The published generation is the app-data root Local starts from next;
+    // it shares the original control root beside it.
+    let generation = fixture.root.join("new-generation");
+    let app = || CurrentOsUserAppDataRoot::from_current_os_user_app_data(&generation).unwrap();
+    let bootstrap = fixture.release().recovery.clone().expect("release recovery control");
+    let owners = [
+        RuntimeOwner::PostgresSidecar,
+        RuntimeOwner::SqlDriver,
+        RuntimeOwner::ApplicationAssembly,
+        RuntimeOwner::DesktopAgentRelay,
+        RuntimeOwner::DesktopAgent,
+    ];
+    let runtime = || {
+        let control =
+            RecoveryControl::open(RecoveryControlConfig::local(app(), bootstrap.host_limits.clone()).unwrap()).unwrap();
+        control
+            .open_local_before(
+                &DesktopLocalAuthorityStore::new(app()),
+                bootstrap.release_digest,
+                [VAULT_KEY_STORE_SERVICE, POSTGRES_KEY_STORE_SERVICE],
+                bootstrap.bounds,
+                &owners,
+            )
+            .expect("the Current head enrolls a runtime")
+    };
+    let entry = || OwnedVerifiedCurrentReconfirmationEntry::new(app(), runtime()).expect("a restored Current entry");
+    let dist = crate::postgres_sidecar::materialize_desktop_dist();
+    let startup = || {
+        let release = DesktopLocalReleaseInput::new(
+            dist.clone(),
+            "openbot",
+            "main",
+            bundle(),
+            crate::postgres_sidecar::ReviewedPostgresKeyStoreService::from_reviewed_release(POSTGRES_KEY_STORE_SERVICE)
+                .unwrap(),
+            crate::desktop_vault::ReviewedDesktopVaultKeyStoreService::from_reviewed_release(VAULT_KEY_STORE_SERVICE)
+                .unwrap(),
+            store.clone(),
+        )
+        .unwrap();
+        let application = DesktopLocalApplicationInput::new(
+            crate::DesktopOpenAiProviderInput::new("https://api.example.test/v1", Vec::new()).unwrap(),
+            crate::DesktopAgentBudgets::new(Some(Duration::from_secs(2)), Some(Duration::from_secs(1_800)), 16_384)
+                .unwrap(),
+        )
+        .unwrap();
+        DesktopLocalRuntimeConfig::new(release, application, |authority| {
+            Ok(crate::postgres_sidecar::loaded_desktop_package(authority.auth_context().tenant().as_str()))
+        })
+        .with_recovery_bootstrap(bootstrap.clone())
+    };
+
+    // Before any confirmation the Current gate keeps startup closed: no
+    // installation, principal or window is formed from a Pending binding.
+    let refused = prepare_desktop_local_runtime(app(), startup()).await.err();
+    assert!(
+        matches!(refused, Some(DesktopLocalRuntimeError::RecoveryRequired)),
+        "an unconfirmed Current opens nothing: {refused:?}"
+    );
+
+    let reconfirm = |native: StandInConfirmation, cancel: CancellationToken| {
+        let mut release = fixture.release();
+        release.postgres = bundle();
+        let effect = Instant::now() + Duration::from_secs(60);
+        let request =
+            OriginalLocalConfirmationRequest::new(native, effect, effect + Duration::from_secs(20), cancel).unwrap();
+        let store = store.clone();
+        let entry = entry();
+        async move { release.reconfirm_restored_local_owner_for_test(entry, request, &*store).await }
+    };
+    // A cancelled request, a session change, a confirmation already used and
+    // a wall clock ahead of the request each write no receipt.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert_eq!(
+        reconfirm(StandInConfirmation::new(), cancel).await.unwrap_err(),
+        DesktopRestoreError::OwnerLost,
+        "cancelled"
+    );
+    let mut changed = StandInConfirmation::new();
+    changed.session_changed = true;
+    assert_eq!(reconfirm(changed, CancellationToken::new()).await.unwrap_err(), DesktopRestoreError::OwnerLost);
+    let mut used = StandInConfirmation::new();
+    used.used = true;
+    assert_eq!(reconfirm(used, CancellationToken::new()).await.unwrap_err(), DesktopRestoreError::EntryInvalid);
+    let mut ahead = StandInConfirmation::new();
+    ahead.wall_skew = Duration::from_secs(3_600);
+    assert_eq!(reconfirm(ahead, CancellationToken::new()).await.unwrap_err(), DesktopRestoreError::OwnerLost);
+    // One confirmation of the real Current, both clocks inside the request:
+    // the Local actor's fresh_local_os receipt and its audit commit together.
+    let fact = reconfirm(StandInConfirmation::new(), CancellationToken::new())
+        .await
+        .expect("one confirmed request writes its receipt");
+
+    // Startup's consumption of the Current now passes its gate: the one
+    // restricted factory forms the installation over the running data plane.
+    let mut runtime = runtime();
+    let site = runtime.restored_local_site(&app()).unwrap().expect("a restored site");
+    let (installation, prepared, vault) = crate::desktop_local_bootstrap::open_current_installation(
+        &mut runtime,
+        site,
+        generation.as_path(),
+        bundle(),
+        store.as_ref(),
+        &crate::postgres_sidecar::ReviewedPostgresKeyStoreService::from_reviewed_release(POSTGRES_KEY_STORE_SERVICE)
+            .unwrap(),
+        &crate::desktop_vault::ReviewedDesktopVaultKeyStoreService::from_reviewed_release(VAULT_KEY_STORE_SERVICE)
+            .unwrap(),
+    )
+    .await
+    .map_err(|(failure, ..)| failure)
+    .expect("the confirmed Current forms its installation");
+    assert_eq!(installation.sidecar_data_dir(), generation.join("data"));
+    let client = prepared.pool().get().await.unwrap();
+    let receipts = client
+        .query(
+            "SELECT confirmation_id, confirmed_by, proof_kind FROM openbot_internal.restore_reconfirm_receipts r
+              JOIN openbot_internal.restore_reconfirm_requirements q USING (requirement_id)
+             WHERE q.source_kind='subject'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1, "exactly one receipt; the refused requests wrote none");
+    assert_eq!(receipts[0].get::<_, uuid::Uuid>(0), fact.confirmation_id());
+    assert_eq!(receipts[0].get::<_, String>(1), openbot_infra::auth::single_user::desktop_local::DESKTOP_LOCAL_ACTOR_ID);
+    assert_eq!(receipts[0].get::<_, String>(2), "fresh_local_os");
+    let audited: i64 = client
+        .query_one(
+            "SELECT count(*)::bigint FROM public.audit_events WHERE target_id=$1",
+            &[&fact.requirement_id().to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(audited, 1);
+    drop(client);
+    drop(vault);
+    let (exit, observations) = prepared.shutdown().await.map_err(|(error, ..)| error).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut facts: Vec<_> = [RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay, RuntimeOwner::DesktopAgent]
+        .into_iter()
+        .map(|owner| openbot_infra::recovery_control::RuntimeCloseFact::PassiveRetirement {
+            object: openbot_infra::recovery_control::PassiveObjectKind::NeverStarted(owner),
+        })
+        .collect();
+    facts.extend(crate::desktop_local_bootstrap::sidecar_close_fact(Ok(exit)));
+    facts.extend(
+        crate::desktop_local_bootstrap::sql_driver_close_fact(
+            crate::desktop_local_bootstrap::SqlDriverOutcome::Observed(observations),
+            deadline,
+        )
+        .await,
+    );
+    runtime
+        .close_before(openbot_infra::recovery_control::RuntimeCloseResources::new(facts), deadline)
+        .await
+        .expect("the consuming runtime closes");
+    drop(fixture);
+    let _ = fs::remove_dir_all(&short);
+    let _ = fs::remove_dir_all(&bundle_root);
+    let _ = fs::remove_dir_all(&dist);
+}

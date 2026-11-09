@@ -1281,7 +1281,7 @@ impl OrdinaryInitializationSession {
         entry::verify_local_binding_before(
             &self.control,
             self.published_binding()?,
-            authority,
+            Some(authority),
             database,
             canary,
             [services[0].as_str(), services[1].as_str()],

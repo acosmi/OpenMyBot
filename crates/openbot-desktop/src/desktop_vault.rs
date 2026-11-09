@@ -340,6 +340,13 @@ impl VaultReadyDesktopMaterial {
         &self.proof
     }
 
+    /// The audit checkpoint key a restored generation's reconfirmation
+    /// receipt is audited with, before any installation authority exists.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(crate) fn audit_key(&self) -> &[u8] {
+        self.material.expose_audit_key()
+    }
+
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     pub(crate) fn bind_recovery_runtime(
         &mut self,
@@ -404,6 +411,54 @@ impl VaultReadyDesktopMaterial {
             self.database_origin,
             self.retained_capture,
         )
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl PreparedDesktopLocalDataPlane<openbot_infra::auth::single_user::desktop_local::RestoredLocalSite> {
+    /// Open the restored generation's Vault with the historical master its
+    /// target slot holds and verify the restored canary under the published
+    /// business IDs and key ID (spec revision R484 ¶8132). Nothing is created:
+    /// a missing slot or a canary mismatch fails closed.
+    pub(crate) async fn verify_restored_key_material<S: OsSecretStore + ?Sized>(
+        &self,
+        store: &S,
+        service: &ReviewedDesktopVaultKeyStoreService,
+    ) -> Result<VaultReadyDesktopMaterial, DesktopVaultKeyError> {
+        self.ensure_owner_current()
+            .map_err(|_| DesktopVaultKeyError::DataPlaneNotRunning)?;
+        let (account, key_id) = self.site().master();
+        let master = decode_stored(
+            store
+                .read(service.as_str(), account)?
+                .ok_or(DesktopVaultKeyError::Missing)?,
+        )?;
+        let [deployment, tenant, dataset] = self.site().business_ids();
+        let proof = desktop_vault_canary::verify_persisted(
+            self.database(),
+            &master.0,
+            dataset,
+            deployment,
+            tenant,
+            key_id,
+        )
+        .await
+        .map_err(|error| match error {
+            desktop_vault_canary::DesktopVaultCanaryError::MaterialInvalid => {
+                DesktopVaultKeyError::MaterialInvalid
+            }
+            _ => DesktopVaultKeyError::ReconciliationRequired,
+        })?;
+        self.ensure_owner_current()
+            .map_err(|_| DesktopVaultKeyError::DataPlaneNotRunning)?;
+        let material = derive_application_material(TenantId::new(tenant), &master)?;
+        Ok(VaultReadyDesktopMaterial {
+            material,
+            proof,
+            database_origin: DatabaseOrigin::RustManaged,
+            retained_capture: None,
+            retained_master: Some(master),
+        })
     }
 }
 

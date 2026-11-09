@@ -11,6 +11,10 @@ use wrok_bot_macos_local_auth::{
     session::{self, CleanupReceipt, Invalidation, MonitorError, MonitorHandle},
 };
 
+use openbot_infra::auth::single_user::desktop_local::{CurrentOsUserAppDataRoot, RestoredLocalSite};
+use openbot_infra::recovery_control::RecoveryRuntimeOwner;
+use openbot_infra::restore_reconfirmation::CancellationToken;
+
 use super::DesktopRestoreError;
 
 // The original native adapter observes retirement at this interval; it is not a deadline.
@@ -20,6 +24,97 @@ struct OriginalMainObservation {
     monitor: Option<Result<MonitorHandle, MonitorError>>,
     cleanup: Option<Result<CleanupReceipt, MonitorError>>,
     installation_expired: bool,
+}
+
+/// The verified entry of one `reconfirm_current_binding` request: the current
+/// OS user's app-data root and the runtime its Current head enrolled, with the
+/// restored generation that head selects (spec revision R484 ¶8087).
+pub(crate) struct OwnedVerifiedCurrentReconfirmationEntry {
+    pub(crate) app_data_root: CurrentOsUserAppDataRoot,
+    pub(crate) runtime: RecoveryRuntimeOwner,
+    pub(crate) site: RestoredLocalSite,
+}
+
+impl OwnedVerifiedCurrentReconfirmationEntry {
+    /// Only a runtime whose published head is a restored Current forms an entry.
+    #[allow(dead_code)] // the `reconfirm_current_binding` request driver constructs it
+    pub(crate) fn new(
+        app_data_root: CurrentOsUserAppDataRoot,
+        runtime: RecoveryRuntimeOwner,
+    ) -> Result<Self, DesktopRestoreError> {
+        let site = runtime
+            .restored_local_site(&app_data_root)
+            .map_err(|error| DesktopRestoreError::from_control(&error))?
+            .ok_or(DesktopRestoreError::EntryInvalid)?;
+        Ok(Self { app_data_root, runtime, site })
+    }
+}
+
+/// The two clocks of the one Confirmed proof an original request consumed.
+#[derive(Clone, Copy)]
+pub(crate) struct ConfirmedLocalOwner {
+    pub(crate) at: Instant,
+    pub(crate) wall: SystemTime,
+}
+
+/// One original OS confirmation: it runs once, closes its own native
+/// resources before returning, and its Confirmed proof is taken at most once.
+pub(crate) trait OriginalLocalConfirmation {
+    async fn confirm_once(&mut self, effect: Instant, convergence: Instant) -> Result<(), DesktopRestoreError>;
+    fn take_confirmation(&mut self) -> Result<ConfirmedLocalOwner, DesktopRestoreError>;
+}
+
+/// The real `MacLocalAuthOwner` owner, dispatched on the application's main
+/// thread, with no window, AuthContext or token wrapper.
+pub(crate) struct MacLocalReconfirmation {
+    native: LocalReconfirmationNative,
+    app: tauri::AppHandle<tauri::Wry>,
+    locale: ConfirmationLocale,
+}
+
+impl MacLocalReconfirmation {
+    #[allow(dead_code)] // the `reconfirm_current_binding` request driver constructs it
+    pub(crate) fn new(app: tauri::AppHandle<tauri::Wry>, locale: ConfirmationLocale) -> Self {
+        Self { native: LocalReconfirmationNative::new(), app, locale }
+    }
+}
+
+impl OriginalLocalConfirmation for MacLocalReconfirmation {
+    async fn confirm_once(&mut self, effect: Instant, convergence: Instant) -> Result<(), DesktopRestoreError> {
+        self.native.confirm_once(&self.app, self.locale, effect, convergence).await
+    }
+
+    fn take_confirmation(&mut self) -> Result<ConfirmedLocalOwner, DesktopRestoreError> {
+        let proof = self.native.take_confirmation()?;
+        Ok(ConfirmedLocalOwner { at: proof.confirmed_at(), wall: proof.confirmed_at_wall() })
+    }
+}
+
+/// One bounded original confirmation request: its native owner, its effect
+/// and convergence deadlines and its cancellation.
+pub(crate) struct OriginalLocalConfirmationRequest<N> {
+    pub(crate) native: N,
+    pub(crate) effect: Instant,
+    pub(crate) convergence: Instant,
+    pub(crate) cancel: CancellationToken,
+}
+
+impl<N: OriginalLocalConfirmation> OriginalLocalConfirmationRequest<N> {
+    #[allow(dead_code)] // the `reconfirm_current_binding` request driver constructs it
+    pub(crate) fn new(
+        native: N,
+        effect: Instant,
+        convergence: Instant,
+        cancel: CancellationToken,
+    ) -> Result<Self, DesktopRestoreError> {
+        if effect >= convergence {
+            return Err(DesktopRestoreError::ProfileInvalid);
+        }
+        if Instant::now() >= effect {
+            return Err(DesktopRestoreError::EffectExpired);
+        }
+        Ok(Self { native, effect, convergence, cancel })
+    }
 }
 
 /// Resources of one persisted confirmation request, never a fresh-actor token.

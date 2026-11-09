@@ -15,6 +15,8 @@ use openbot_infra::auth::single_user::desktop_local::{
     DesktopLocalAuthority, DesktopLocalBootstrapError, DesktopLocalBootstrapReport,
     DesktopLocalInstallation,
 };
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+use openbot_infra::auth::single_user::desktop_local::RestoredLocalSite;
 use openbot_infra::db::desktop_local::{
     DesktopLocalDatabase, DesktopLocalDatabaseError, DesktopLocalDatabaseOrigin,
     connect_for_attestation,
@@ -180,11 +182,13 @@ pub struct RunningDesktopLocalDataPlane {
 }
 
 /// PG-attested data plane that exposes no runtime authority before Vault canary verification.
-pub struct PreparedDesktopLocalDataPlane {
+/// Its site is an installation, or a restored generation that has not yet passed its Current gate
+/// and therefore has no installation authority at all (spec revision R484 ¶8023).
+pub struct PreparedDesktopLocalDataPlane<S = DesktopLocalInstallation> {
     initialization_deadlines: Option<(std::time::Instant, std::time::Instant)>,
     database: DesktopLocalDatabase,
     sidecar: Option<RunningPostgresSidecar>,
-    installation: DesktopLocalInstallation,
+    installation: S,
     #[cfg(all(
         feature = "desktop-launcher",
         feature = "postgres-maintenance",
@@ -408,6 +412,38 @@ impl PreparedDesktopLocalDataPlane {
         self.installation.authority()
     }
 
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        self.installation.sidecar_data_dir()
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl PreparedDesktopLocalDataPlane<RestoredLocalSite> {
+    pub(crate) fn site(&self) -> &RestoredLocalSite {
+        &self.installation
+    }
+
+    /// The installation formed only after this generation's Current gate
+    /// (spec revision R484 ¶8024) takes over the same running data plane.
+    pub(crate) fn into_current(self, installation: DesktopLocalInstallation) -> PreparedDesktopLocalDataPlane {
+        PreparedDesktopLocalDataPlane {
+            initialization_deadlines: self.initialization_deadlines,
+            database: self.database,
+            sidecar: self.sidecar,
+            installation,
+            #[cfg(all(
+                feature = "desktop-launcher",
+                feature = "postgres-maintenance",
+                target_os = "macos"
+            ))]
+            capture_custody: self.capture_custody,
+            #[cfg(feature = "desktop-vault")]
+            vault_creation_attempted: self.vault_creation_attempted,
+        }
+    }
+}
+
+impl<S> PreparedDesktopLocalDataPlane<S> {
     pub(crate) fn pool(&self) -> &DatabasePool {
         self.database.pool()
     }
@@ -424,10 +460,6 @@ impl PreparedDesktopLocalDataPlane {
         self.sidecar.as_ref().map(RunningPostgresSidecar::origin)
     }
 
-    pub(crate) fn data_dir(&self) -> &std::path::Path {
-        self.installation.sidecar_data_dir()
-    }
-
     pub(crate) fn ensure_owner_current(&self) -> Result<(), DesktopLocalCompositionError> {
         if self.initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
             return Err(DesktopLocalCompositionError::InstallationMismatch);
@@ -439,6 +471,9 @@ impl PreparedDesktopLocalDataPlane {
             .map_err(|_| DesktopLocalCompositionError::InstallationMismatch)
     }
 
+}
+
+impl PreparedDesktopLocalDataPlane {
     pub(crate) async fn initialize_fresh_schema(
         &self,
         package: &LoadedTenantPackage,
@@ -666,6 +701,9 @@ impl PreparedDesktopLocalDataPlane {
         })
     }
 
+}
+
+impl<S> PreparedDesktopLocalDataPlane<S> {
     pub(crate) async fn shutdown(
         mut self,
     ) -> Result<
@@ -808,10 +846,11 @@ pub async fn prepare_running_sidecar(
     sidecar: RunningPostgresSidecar,
     package: &LoadedTenantPackage,
 ) -> Result<PreparedDesktopLocalDataPlane, DesktopLocalCompositionError> {
+    let scope = installation.validate_package_scope(package);
     prepare_running_sidecar_inner(
         installation,
         sidecar,
-        package,
+        scope,
         StartupDriverCustody::Ordinary,
         None,
     )
@@ -838,10 +877,11 @@ pub(crate) async fn prepare_running_sidecar_retained(
         SqlDriverOutcome,
     ),
 > {
+    let scope = installation.validate_package_scope(package);
     prepare_running_sidecar_inner(
         installation,
         sidecar,
-        package,
+        scope,
         match custody {
             Some(custody) => StartupDriverCustody::Armed(custody),
             None => StartupDriverCustody::Ordinary,
@@ -851,14 +891,193 @@ pub(crate) async fn prepare_running_sidecar_retained(
     .await
 }
 
-async fn prepare_running_sidecar_inner(
-    installation: DesktopLocalInstallation,
+/// Prepare the selected restored generation's running child the same way, before any
+/// installation authority exists; no package or database creation is involved.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) async fn prepare_restored_sidecar(
+    site: RestoredLocalSite,
     sidecar: RunningPostgresSidecar,
-    package: &LoadedTenantPackage,
+) -> Result<
+    PreparedDesktopLocalDataPlane<RestoredLocalSite>,
+    (
+        DesktopLocalCompositionError,
+        Result<SidecarExit, SidecarOutcome>,
+        SqlDriverOutcome,
+    ),
+> {
+    prepare_running_sidecar_inner(site, sidecar, Ok(()), StartupDriverCustody::Ordinary, None).await
+}
+
+/// Where opening a restored generation stopped, with what its original sidecar and SQL owners
+/// actually observed for the runtime close.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) enum RestoredOpenFailure {
+    Sidecar(crate::postgres_sidecar::PostgresSidecarError),
+    DataPlane(DesktopLocalCompositionError),
+    Vault(crate::desktop_vault::DesktopVaultKeyError),
+    Control(openbot_infra::recovery_control::RecoveryControlError),
+    /// The Local subject gate refused or could not be read.
+    Gate(openbot_infra::restore_reconfirmation::RestoreReconfirmationError),
+    /// The confirmed generation's directory could not form an installation.
+    Authority,
+}
+
+/// A restored generation opened to its real Current readback: its sidecar,
+/// pool and Vault are running and the result is Pending, with no
+/// installation authority (spec revision R484 ¶8023, ¶8132).
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) struct OpenedRestoredGeneration {
+    pub(crate) data_plane: PreparedDesktopLocalDataPlane<RestoredLocalSite>,
+    pub(crate) vault: crate::desktop_vault::VaultReadyDesktopMaterial,
+    pub(crate) pending: openbot_infra::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
+}
+
+/// Start the selected generation `runtime` names with its SCRAM slot, attest it, open its Vault
+/// with its master slot and read it back against the published binding.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
+    runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
+    site: RestoredLocalSite,
+    app_data_root: &std::path::Path,
+    bundle: crate::postgres_sidecar::VerifiedPostgresBundle,
+    store: &S,
+    postgres_service: &crate::postgres_sidecar::ReviewedPostgresKeyStoreService,
+    vault_service: &crate::desktop_vault::ReviewedDesktopVaultKeyStoreService,
+) -> Result<
+    OpenedRestoredGeneration,
+    (
+        RestoredOpenFailure,
+        Result<SidecarExit, SidecarOutcome>,
+        SqlDriverOutcome,
+    ),
+> {
+    let sidecar = crate::postgres_sidecar::PostgresSidecarSupervisor::start_restored_current(
+        bundle,
+        app_data_root,
+        &site,
+        store,
+        postgres_service,
+    )
+    .await
+    .map_err(|(error, outcome)| {
+        (RestoredOpenFailure::Sidecar(error), Err(outcome), SqlDriverOutcome::NeverStarted)
+    })?;
+    let data_plane = prepare_restored_sidecar(site, sidecar)
+        .await
+        .map_err(|(error, sidecar, sql)| (RestoredOpenFailure::DataPlane(error), sidecar, sql))?;
+    let vault = match data_plane.verify_restored_key_material(store, vault_service).await {
+        Ok(vault) => vault,
+        Err(error) => {
+            let (_, sidecar, sql) = data_plane.cleanup_with(DesktopLocalCompositionError::SidecarShutdown).await;
+            return Err((RestoredOpenFailure::Vault(error), sidecar, sql));
+        }
+    };
+    let services = [vault_service.as_str(), postgres_service.as_str()];
+    let pending = runtime
+        .verify_restored_local_before(data_plane.database(), vault.canary(), services, data_plane.site())
+        .await;
+    match pending {
+        Ok(pending) => Ok(OpenedRestoredGeneration { data_plane, vault, pending }),
+        Err(error) => {
+            drop(vault);
+            let (_, sidecar, sql) = data_plane.cleanup_with(DesktopLocalCompositionError::SidecarShutdown).await;
+            Err((RestoredOpenFailure::Control(error), sidecar, sql))
+        }
+    }
+}
+
+/// Startup's consumption of a restored Current: the opened generation passes
+/// the Local subject gate, and only then does the one restricted factory form
+/// its installation, which takes over the same running data plane (spec
+/// revision R484 ¶8024, ¶8089). A Pending binding never reaches a factory.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
+    runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
+    site: RestoredLocalSite,
+    app_data_root: &std::path::Path,
+    bundle: crate::postgres_sidecar::VerifiedPostgresBundle,
+    store: &S,
+    postgres_service: &crate::postgres_sidecar::ReviewedPostgresKeyStoreService,
+    vault_service: &crate::desktop_vault::ReviewedDesktopVaultKeyStoreService,
+) -> Result<
+    (DesktopLocalInstallation, PreparedDesktopLocalDataPlane, crate::desktop_vault::VaultReadyDesktopMaterial),
+    (
+        RestoredOpenFailure,
+        Result<SidecarExit, SidecarOutcome>,
+        SqlDriverOutcome,
+    ),
+> {
+    let OpenedRestoredGeneration { data_plane, vault, pending } =
+        open_restored_generation(runtime, site, app_data_root, bundle, store, postgres_service, vault_service).await?;
+    let gate = runtime
+        .current_restore_installation_before(data_plane.pool(), pending, std::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT)
+        .await
+        .map_err(RestoredOpenFailure::Gate)
+        .and_then(|current| {
+            DesktopLocalInstallation::from_verified_current_restore(current).map_err(|_| RestoredOpenFailure::Authority)
+        });
+    match gate {
+        Ok(installation) => {
+            let prepared = data_plane.into_current(installation.clone());
+            Ok((installation, prepared, vault))
+        }
+        Err(failure) => {
+            drop(vault);
+            let (_, sidecar, sql) = data_plane.cleanup_with(DesktopLocalCompositionError::SidecarShutdown).await;
+            Err((failure, sidecar, sql))
+        }
+    }
+}
+
+/// The two sites a prepared data plane can belong to.
+trait DataPlaneSite {
+    fn data_dir(&self) -> &std::path::Path;
+    fn attest(
+        &self,
+        admin: openbot_infra::db::desktop_local::UnattestedDesktopLocalAdmin,
+    ) -> impl std::future::Future<
+        Output = Result<openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin, DesktopLocalBootstrapError>,
+    > + Send;
+}
+
+impl DataPlaneSite for DesktopLocalInstallation {
+    fn data_dir(&self) -> &std::path::Path {
+        self.sidecar_data_dir()
+    }
+    fn attest(
+        &self,
+        admin: openbot_infra::db::desktop_local::UnattestedDesktopLocalAdmin,
+    ) -> impl std::future::Future<
+        Output = Result<openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin, DesktopLocalBootstrapError>,
+    > + Send {
+        self.attest_postgres_admin(admin)
+    }
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+impl DataPlaneSite for RestoredLocalSite {
+    fn data_dir(&self) -> &std::path::Path {
+        RestoredLocalSite::data_dir(self)
+    }
+    fn attest(
+        &self,
+        admin: openbot_infra::db::desktop_local::UnattestedDesktopLocalAdmin,
+    ) -> impl std::future::Future<
+        Output = Result<openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin, DesktopLocalBootstrapError>,
+    > + Send {
+        self.attest_postgres_admin(admin)
+    }
+}
+
+async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
+    installation: S,
+    sidecar: RunningPostgresSidecar,
+    scope: Result<(), DesktopLocalBootstrapError>,
     mut custody: StartupDriverCustody,
     initialization_deadlines: Option<(std::time::Instant, std::time::Instant)>,
 ) -> Result<
-    PreparedDesktopLocalDataPlane,
+    PreparedDesktopLocalDataPlane<S>,
     (
         DesktopLocalCompositionError,
         Result<SidecarExit, SidecarOutcome>,
@@ -867,7 +1086,7 @@ async fn prepare_running_sidecar_inner(
 > {
     let step_deadline = || initialization_deadlines.map(|(effect, _)| tokio::time::Instant::from_std(effect))
         .map_or(tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT, |effect| effect.min(tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT));
-    if sidecar.data_dir() != installation.sidecar_data_dir() {
+    if sidecar.data_dir() != installation.data_dir() {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
@@ -877,7 +1096,7 @@ async fn prepare_running_sidecar_inner(
         .await;
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
-    if let Err(error) = installation.validate_package_scope(package) {
+    if let Err(error) = scope {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::PackageScope(error),
@@ -948,7 +1167,7 @@ async fn prepare_running_sidecar_inner(
     }
     let admin = match tokio::time::timeout_at(
         step_deadline(),
-        installation.attest_postgres_admin(admin),
+        installation.attest(admin),
     )
     .await
     .map_err(|_| DesktopLocalBootstrapError::PostgresAttestationUnavailable)

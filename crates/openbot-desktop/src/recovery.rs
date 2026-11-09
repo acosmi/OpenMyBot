@@ -1,7 +1,7 @@
 //! Release-bound, pre-window restoration and current-installation confirmation.
 
 mod candidate;
-mod entry;
+pub(crate) mod entry;
 pub(crate) mod input;
 mod slots;
 #[cfg(test)]
@@ -63,7 +63,7 @@ pub enum DesktopRestoreError {
 }
 
 impl DesktopRestoreError {
-    fn from_control(error: &openbot_infra::recovery_control::RecoveryControlError) -> Self {
+    pub(crate) fn from_control(error: &openbot_infra::recovery_control::RecoveryControlError) -> Self {
         use openbot_infra::recovery_control::RecoveryControlFault as Fault;
         match error.fault() {
             Fault::EntryInvalid => Self::EntryInvalid,

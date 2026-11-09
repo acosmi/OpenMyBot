@@ -6850,11 +6850,14 @@ pub(super) fn local_intent(
     VerifiedOrdinaryStartupIntent::seal_at(None, site, bounds, admission_ns, owners, t0, t0_ns)
 }
 
+/// `authority` is the ordinary installation's own; a restored Current has
+/// none before its subject confirmation, and its accounts are the operation's
+/// target slots (spec revision R484 ¶8023).
 #[cfg(feature = "desktop-local")]
 pub(super) async fn verify_local_binding_before(
     control: &ControlOwner,
     binding: &super::ActivationBinding,
-    authority: &crate::auth::single_user::desktop_local::DesktopLocalAuthority,
+    authority: Option<&crate::auth::single_user::desktop_local::DesktopLocalAuthority>,
     database: &crate::db::desktop_local::DesktopLocalDatabase,
     canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
     services: [&str; 2],
@@ -6862,22 +6865,31 @@ pub(super) async fn verify_local_binding_before(
 ) -> Result<(), RecoveryControlError> {
     before(deadline)?;
     let expected = binding.ordinary_local()?;
+    let accounts = match authority {
+        Some(authority) => {
+            if expected.installation_id != authority.instance_id()
+                || expected.deployment_id != authority.auth_context().deployment().as_str()
+                || expected.tenant_id != authority.auth_context().tenant().as_str()
+            {
+                return Err(service_invalid());
+            }
+            authority.instance_id().to_owned()
+        }
+        None => format!("{}-r-{}", expected.installation_id, expected.postgres.operation_id),
+    };
     if !canary
         .matches_database(database)
         .await
         .map_err(|_| service_invalid())?
-        || expected.installation_id != authority.instance_id()
         || expected.dataset_id != canary.dataset_id()
-        || expected.deployment_id != authority.auth_context().deployment().as_str()
-        || expected.tenant_id != authority.auth_context().tenant().as_str()
         || expected.deployment_id != canary.deployment_id()
         || expected.tenant_id != canary.tenant_id()
         || expected.master.reviewed_service != services[0]
         || expected.postgres.reviewed_service != services[1]
-        || expected.master.account != format!("desktop-vault-master-v1-{}", authority.instance_id())
+        || expected.master.account != format!("desktop-vault-master-v1-{accounts}")
         || expected.master.key_id != canary.key_id()
         || i64::from(expected.master.key_version) != i64::from(canary.key_version())
-        || expected.postgres.account != format!("postgresql-17-{}", authority.instance_id())
+        || expected.postgres.account != format!("postgresql-17-{accounts}")
         || expected.postgres.key_id != expected.postgres.account
         || expected.postgres.key_version != 1
     {

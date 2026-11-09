@@ -28,7 +28,13 @@ use crate::postgres_sidecar::{
     PostgresBundleDigest, ReviewedPostgresKeyStoreService, ReviewedPostgresSigningIdentity,
     VerifiedPostgresBundle,
 };
+use crate::recovery::DesktopRestoreError;
+use crate::recovery::entry::{
+    ConfirmedLocalOwner, OriginalLocalConfirmation, OriginalLocalConfirmationRequest,
+    OwnedVerifiedCurrentReconfirmationEntry,
+};
 use crate::tauri_background::{DesktopRecoveryBootstrap, DesktopUiResource};
+use openbot_infra::restore_reconfirmation::ReconfirmationCommitFact;
 use crate::tauri_host::{VerifiedUiAssets, static_asset_max_bytes};
 use crate::{
     DesktopAgentBudgets, DesktopLocalApplicationInput, DesktopLocalReleaseInput,
@@ -523,6 +529,151 @@ impl VerifiedDesktopRelease {
             None => runtime,
         })
     }
+}
+
+impl VerifiedDesktopRelease {
+    /// Reconfirm the Local owner of a restored Current before any window: open
+    /// the selected generation and read it back, consume exactly one OS
+    /// confirmation of the current user under the original bounded request,
+    /// then write the Local actor's `fresh_local_os` receipt and its audit in
+    /// one new guarded transaction whose COMMIT must be acknowledged in time
+    /// (spec revision R484 ¶8087–8089). A cancelled request, a locked or
+    /// changed session, a native owner that did not provably stop, or a
+    /// cleanup that is not proven writes no receipt.
+    #[allow(dead_code)] // reached through the `reconfirm_current_binding` request driver
+    pub(crate) async fn reconfirm_restored_local_owner<N: OriginalLocalConfirmation>(
+        self,
+        entry: OwnedVerifiedCurrentReconfirmationEntry,
+        request: OriginalLocalConfirmationRequest<N>,
+    ) -> Result<ReconfirmationCommitFact, DesktopRestoreError> {
+        let store = DeferredCurrentUserKeychain::default();
+        self.reconfirm_with_store(entry, request, &store).await
+    }
+
+    /// The same path over a test secret store; the native owner is the
+    /// request's, never a window or an authority.
+    #[cfg(test)]
+    pub(crate) async fn reconfirm_restored_local_owner_for_test<N: OriginalLocalConfirmation, S: OsSecretStore + ?Sized>(
+        self,
+        entry: OwnedVerifiedCurrentReconfirmationEntry,
+        request: OriginalLocalConfirmationRequest<N>,
+        store: &S,
+    ) -> Result<ReconfirmationCommitFact, DesktopRestoreError> {
+        self.reconfirm_with_store(entry, request, store).await
+    }
+
+    async fn reconfirm_with_store<N: OriginalLocalConfirmation, S: OsSecretStore + ?Sized>(
+        self,
+        entry: OwnedVerifiedCurrentReconfirmationEntry,
+        mut request: OriginalLocalConfirmationRequest<N>,
+        store: &S,
+    ) -> Result<ReconfirmationCommitFact, DesktopRestoreError> {
+        use crate::desktop_local_bootstrap::{OpenedRestoredGeneration, RestoredOpenFailure, SqlDriverOutcome};
+        use openbot_infra::restore_reconfirmation::{OriginalReconfirmationRequest, RestoreReconfirmationError};
+        let reconfirmation = |error| match error {
+            RestoreReconfirmationError::NotConfirmed | RestoreReconfirmationError::NotVisible => {
+                DesktopRestoreError::EntryInvalid
+            }
+            RestoreReconfirmationError::Unavailable | RestoreReconfirmationError::NotFresh => {
+                DesktopRestoreError::OwnerLost
+            }
+            RestoreReconfirmationError::CommitUnknown => DesktopRestoreError::DatabaseUnknown,
+            RestoreReconfirmationError::CommitAcknowledgedAfterDeadline => DesktopRestoreError::EffectExpired,
+        };
+        let postgres_service =
+            ReviewedPostgresKeyStoreService::from_reviewed_release(POSTGRES_KEY_STORE_SERVICE.to_owned())
+                .map_err(|_| DesktopRestoreError::EntryInvalid)?;
+        let vault_service = ReviewedDesktopVaultKeyStoreService::from_reviewed_release(VAULT_KEY_STORE_SERVICE.to_owned())
+            .map_err(|_| DesktopRestoreError::EntryInvalid)?;
+        let OwnedVerifiedCurrentReconfirmationEntry { app_data_root, mut runtime, site } = entry;
+        let opened = crate::desktop_local_bootstrap::open_restored_generation(
+            &mut runtime,
+            site,
+            app_data_root.as_path(),
+            self.postgres,
+            store,
+            &postgres_service,
+            &vault_service,
+        )
+        .await;
+        let OpenedRestoredGeneration { data_plane, vault, pending } = match opened {
+            Ok(opened) => opened,
+            Err((failure, sidecar, sql)) => {
+                let _ = close_reconfirmation_runtime(&mut runtime, sidecar, sql, request.convergence).await;
+                return Err(match failure {
+                    RestoredOpenFailure::Sidecar(_) => DesktopRestoreError::IoFailure,
+                    RestoredOpenFailure::DataPlane(_) => DesktopRestoreError::DatabaseUnknown,
+                    RestoredOpenFailure::Vault(_) => DesktopRestoreError::KeyStoreUnknown,
+                    RestoredOpenFailure::Control(error) => DesktopRestoreError::from_control(&error),
+                    RestoredOpenFailure::Gate(_) | RestoredOpenFailure::Authority => DesktopRestoreError::EntryInvalid,
+                });
+            }
+        };
+        let confirmed = async {
+            // Admitted before the native owner allocates anything: the request
+            // with its owner and the confirmed clocks, at their exact sizes.
+            let native_bytes = (std::mem::size_of::<OriginalLocalConfirmationRequest<N>>()
+                + std::mem::size_of::<ConfirmedLocalOwner>()) as u64;
+            let admission = runtime
+                .admit_restored_local_subject_before(&pending, native_bytes, request.effect)
+                .map_err(reconfirmation)?;
+            request.native.confirm_once(request.effect, request.convergence).await?;
+            let owner = request.native.take_confirmation()?;
+            let now = (std::time::Instant::now(), std::time::SystemTime::now());
+            if request.cancel.is_cancelled() || owner.at > now.0 || owner.wall > now.1 {
+                return Err(DesktopRestoreError::OwnerLost);
+            }
+            if now.0 >= request.effect {
+                return Err(DesktopRestoreError::EffectExpired);
+            }
+            admission
+                .confirm_before(
+                    data_plane.pool(),
+                    vault.audit_key(),
+                    OriginalReconfirmationRequest::new(request.effect, request.cancel.clone()),
+                )
+                .await
+                .map_err(reconfirmation)
+        }
+        .await;
+        drop(vault);
+        let closed = match data_plane.shutdown().await {
+            Ok((exit, observations)) => {
+                close_reconfirmation_runtime(&mut runtime, Ok(exit), SqlDriverOutcome::Observed(observations), request.convergence).await
+            }
+            Err((_, sidecar, sql)) => {
+                let _ = close_reconfirmation_runtime(&mut runtime, sidecar, sql, request.convergence).await;
+                Err(DesktopRestoreError::ClosureUnproven)
+            }
+        };
+        // A committed receipt stays durable; a close that is not proven is
+        // still reported after it.
+        let fact = confirmed?;
+        closed?;
+        Ok(fact)
+    }
+}
+
+/// Close the reconfirming runtime with its actual owner results; nothing past
+/// the data plane ever started.
+async fn close_reconfirmation_runtime(
+    runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
+    sidecar: Result<crate::postgres_sidecar::SidecarExit, crate::postgres_sidecar::SidecarOutcome>,
+    sql: crate::desktop_local_bootstrap::SqlDriverOutcome,
+    deadline: std::time::Instant,
+) -> Result<(), DesktopRestoreError> {
+    use openbot_infra::recovery_control::{PassiveObjectKind, RuntimeCloseFact, RuntimeCloseResources, RuntimeOwner};
+    let mut facts: Vec<_> = [RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay, RuntimeOwner::DesktopAgent]
+        .into_iter()
+        .map(|owner| RuntimeCloseFact::PassiveRetirement { object: PassiveObjectKind::NeverStarted(owner) })
+        .collect();
+    facts.extend(crate::desktop_local_bootstrap::sidecar_close_fact(sidecar));
+    facts.extend(crate::desktop_local_bootstrap::sql_driver_close_fact(sql, deadline).await);
+    runtime
+        .close_before(RuntimeCloseResources::new(facts), deadline)
+        .await
+        .map(|_| ())
+        .map_err(|_| DesktopRestoreError::ClosureUnproven)
 }
 
 struct VerifiedTenantTemplate {
