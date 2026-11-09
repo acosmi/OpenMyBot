@@ -190,6 +190,7 @@ impl VerifiedOrdinaryStartupIntent {
     }
 
     /// The below-latest head a shared-lock branch handed this intent back for.
+    #[cfg(test)]
     pub(super) fn expected_head(&self) -> Option<&ExpectedHead> {
         self.expected_head.as_ref()
     }
@@ -209,6 +210,10 @@ impl VerifiedOrdinaryStartupIntent {
 
     pub(super) fn effect_deadline(&self) -> Instant {
         self.effect
+    }
+
+    pub(super) fn convergence_deadline(&self) -> Instant {
+        self.convergence
     }
 
     pub(super) fn resource_model(&self) -> ResourceModel {
@@ -344,6 +349,18 @@ fn shared_head_inner(
         }
     };
     let below = published.binding().native_version() < latest();
+    #[cfg(feature = "desktop-local")]
+    if published.observation().record.phase == ActivationPhase::RestoreCurrent
+        && let SiteExpectation::Local(expected) = &mut intent.site
+    {
+        let plan = published.restore_plan().ok_or_else(|| fault(RecoveryControlFault::ControlInvalid))?;
+        if expected.parent != plan.trusted_parent {
+            files.release_registration_attempt();
+            return Err(fault(RecoveryControlFault::EntryInvalid));
+        }
+        expected.root = Some(files.select_restored_local_root_before(&published, admission)?);
+        expected.component = plan.entry_component.clone();
+    }
     // Server adoption needs the operator's migrated database and its
     // legacy_adoption intent; that intent edits the
     // service configuration, which the republished head binds instead.

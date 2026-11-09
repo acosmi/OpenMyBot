@@ -383,26 +383,23 @@ impl RecoveryRuntimeOwner {
 
     /// The selected generation this runtime's published head names when it
     /// is a restored Current; `None` for every ordinary head. Its PostgreSQL
-    /// directory is the generation root's `data` child, and that root is the
-    /// app-data root this control opened (spec revision R484 ¶8132).
+    /// directory is the verified original journal's selected generation,
+    /// independent of the Manager's ordinary app-data leaf (spec revision R484 ¶8132).
     #[cfg(feature = "desktop-local")]
     pub fn restored_local_site(
         &self,
         app_data_root: &crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
     ) -> Result<Option<crate::auth::single_user::desktop_local::RestoredLocalSite>, RecoveryControlError> {
-        let (binding, cohort) = share_runtime(&self.state, |state| {
-            (state.original.published.binding().clone(), state.original.published.restore_cohort())
-        })?;
-        if cohort.is_none() {
-            return Ok(None);
-        }
-        let site = binding.ordinary_local()?;
-        Ok(Some(crate::auth::single_user::desktop_local::RestoredLocalSite {
-            ids: [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id].map(str::to_owned),
-            data_dir: app_data_root.as_path().join("data"),
-            master: (site.master.account.clone(), site.master.key_id.clone()),
-            postgres_account: site.postgres.account.clone(),
-        }))
+        share_runtime(&self.state, |state| {
+            if state.original.published.restore_cohort().is_none() {
+                return Ok(None);
+            }
+            entry::share(&state.control, |files| {
+                files.restored_local_site_before(
+                    &state.original.published, app_data_root, state.original.original_deadline,
+                ).map(Some)
+            })?
+        })?
     }
 
     /// The real Current readback of a restored Local generation, made before

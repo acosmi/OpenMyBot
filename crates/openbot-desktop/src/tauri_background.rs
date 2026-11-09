@@ -688,15 +688,6 @@ pub enum DesktopLocalRuntimeError {
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     #[error(transparent)]
     RecoveryControl(#[from] openbot_infra::recovery_control::RecoveryControlError),
-    /// Original request verification failed while retaining its actual FD/results owner.
-    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-    #[error("desktop_local_recovery_entry_failed")]
-    RecoveryEntry {
-        /// Fixed classification of the original verification failure.
-        fault: crate::recovery::DesktopRestoreError,
-        /// Original held files and complete verification results.
-        original: Box<crate::recovery::input::RestoreEntryInput>,
-    },
     /// Failed original Local adoption, retaining its session and actual cleanup results.
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     #[error("desktop_local_legacy_execution_failed")]
@@ -790,8 +781,6 @@ impl DesktopLocalRuntimeError {
             Self::RecoveryControl(_) => "desktop_local_runtime_recovery_control_failed",
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             Self::LocalLegacyExecution(owner) => owner.original.as_ref().map_or("desktop_local_legacy_execution_failed", |error| error.code()),
-            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-            Self::RecoveryEntry { .. } => "desktop_local_recovery_entry_failed",
             Self::Configuration => "desktop_local_runtime_configuration_invalid",
             Self::AppData => "desktop_local_runtime_app_data_unavailable",
             Self::Authority => "desktop_local_runtime_authority_failed",
@@ -1036,8 +1025,6 @@ pub struct DesktopLocalRuntimeConfig {
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     recovery_upgrade: Option<openbot_infra::recovery_control::OrdinaryInitializationSession>,
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-    recovery_request: Option<crate::recovery::input::RestoreEntryInput>,
-    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     self_owned_capture_fixture: Option<SelfOwnedCaptureFixtureBinding>,
     #[cfg(all(
         feature = "desktop-launcher",
@@ -1073,8 +1060,6 @@ impl DesktopLocalRuntimeConfig {
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             recovery_upgrade: None,
             #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-            recovery_request: None,
-            #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
             self_owned_capture_fixture: None,
             #[cfg(all(
                 feature = "desktop-launcher",
@@ -1083,12 +1068,6 @@ impl DesktopLocalRuntimeConfig {
             ))]
             capture_request: None,
         }
-    }
-
-    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-    pub(crate) fn with_recovery_request(mut self, input: crate::recovery::input::RestoreEntryInput) -> Self {
-        self.recovery_request = Some(input);
-        self
     }
 
     #[cfg(all(
@@ -2282,22 +2261,6 @@ pub fn register_desktop_local_runtime(
                     exit_if_live(&setup_state, &app_handle, 0);
                     return;
                 }
-                #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-                if config.recovery_request.is_some() {
-                    let completed = report_preparation_result(execute_local_legacy_adoption(app_data_root, config).await);
-                    match completed {
-                        Ok(_receipt) => {
-                            setup_state.finish_shutdown(true);
-                            println!("wrok_bot_ordinary_legacy_adopted");
-                            exit_if_live(&setup_state, &app_handle, 0);
-                        }
-                        Err(_) => {
-                            setup_state.fail_startup();
-                            exit_if_live(&setup_state, &app_handle, 1);
-                        }
-                    }
-                    return;
-                }
                 let prepared = report_preparation_result(
                     prepare_desktop_local_runtime(app_data_root, config).await,
                 );
@@ -2656,17 +2619,13 @@ const fn phase_code(phase: DesktopLocalRuntimePhase) -> &'static str {
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 pub(crate) async fn execute_local_legacy_adoption(
     app_data_root: CurrentOsUserAppDataRoot,
-    mut config: DesktopLocalRuntimeConfig,
+    config: DesktopLocalRuntimeConfig,
+    entry: crate::recovery::VerifiedRestoreEntry,
 ) -> Result<openbot_infra::recovery_control::RuntimeCloseReceipt, DesktopLocalRuntimeError> {
     use crate::desktop_local_bootstrap::{sidecar_close_fact_ref, sql_driver_close_fact_ref, SqlDriverOutcome};
     use openbot_infra::recovery_control::{OrdinaryActivationProof, RecoveryRequestPurpose, RuntimeOwner, RuntimeCloseFact, RuntimeCloseResources, PassiveObjectKind};
-    let mut input = config.recovery_request.take().ok_or(DesktopLocalRuntimeError::Configuration)?;
-    let (mut control, intent) = match input.verify_held(app_data_root.clone()) {
-        Ok(entry) => entry,
-        Err(fault) => return Err(DesktopLocalRuntimeError::RecoveryEntry { fault, original: Box::new(input) }),
-    };
+    let crate::recovery::VerifiedRestoreEntry { mut control, intent, original: _original } = entry;
     if intent.purpose() != RecoveryRequestPurpose::AdoptOrdinaryLegacy {
-        // The other purposes have not yet been connected to their actual driver.
         return Err(DesktopLocalRuntimeError::RecoveryRequired);
     }
     let intent = intent.into_ordinary_legacy_intent(&control, &[
@@ -2863,8 +2822,6 @@ pub(crate) async fn prepare_desktop_local_runtime(
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         mut recovery_upgrade,
         #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-        recovery_request: _,
-        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
         mut self_owned_capture_fixture,
         #[cfg(all(
             feature = "desktop-launcher",
@@ -2913,7 +2870,6 @@ pub(crate) async fn prepare_desktop_local_runtime(
             Box::pin(crate::desktop_local_bootstrap::open_current_installation(
                 runtime,
                 site,
-                app_data_root.as_path(),
                 postgres_bundle.take().ok_or(DesktopLocalRuntimeError::Configuration)?,
                 secret_store.as_ref(),
                 &postgres_key_store_service,

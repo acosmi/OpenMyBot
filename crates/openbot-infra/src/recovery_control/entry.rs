@@ -967,8 +967,8 @@ pub fn load_service_recovery_host_from_config(
     Ok(verified)
 }
 
+#[cfg(feature = "desktop-local")]
 enum HostOrigin {
-    #[cfg(feature = "desktop-local")]
     LocalRelease {
         program: (File, std::ffi::OsString, File),
         release: (File, std::ffi::OsString, File),
@@ -977,7 +977,6 @@ enum HostOrigin {
         metadata: [Option<io::Result<Metadata>>; 4],
         named: [Option<rustix::io::Result<rustix::fs::Stat>>; 2],
     },
-    ServiceConfig(File),
 }
 
 /// Closed request purpose; observing it grants no operation authority.
@@ -1079,11 +1078,58 @@ struct LegacyRequestWire {
 enum RecoveryRequestWire {
     Restore(RestoreRequestWire),
     Legacy(LegacyRequestWire),
+    Current(CurrentRequestWire),
+}
+
+#[derive(Deserialize)]
+enum CurrentLocalSubject {
+    #[serde(rename = "current_os_owner")]
+    CurrentOsOwner,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentSelection {
+    #[serde(rename = "localSubject")]
+    _local_subject: CurrentLocalSubject,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentRequestLimits {
+    effect_ns: std::num::NonZeroU64,
+    convergence_ns: std::num::NonZeroU64,
+    max_confirmations: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentRequestWire {
+    format_version: u32,
+    request_id: Hex32,
+    purpose: RecoveryRequestPurpose,
+    expected_reviewed_release_digest: Hex64,
+    expected_deployment_id: String,
+    expected_tenant_id: String,
+    expected_dataset_id: Hex32,
+    expected_source_installation_id: Hex64,
+    expected_target_installation_id: Hex64,
+    #[serde(rename = "trustedInputSelection")]
+    _trusted_input_selection: CurrentSelection,
+    limits: CurrentRequestLimits,
+}
+
+struct LocalCurrentRequest {
+    request_id: Hex32,
+    expected: RecoveryRequestExpected,
+    limits: OrdinaryStartupBounds,
+    issued: bool,
 }
 
 enum DecodedRecoveryRequest {
     Restore(RecoveryRequestV1),
     Legacy(LocalLegacyRequest),
+    Current(LocalCurrentRequest),
 }
 
 struct LocalLegacyRequest {
@@ -1098,12 +1144,14 @@ impl DecodedRecoveryRequest {
         match self {
             Self::Restore(request) => request.purpose,
             Self::Legacy(_) => RecoveryRequestPurpose::AdoptOrdinaryLegacy,
+            Self::Current(_) => RecoveryRequestPurpose::ReconfirmCurrentBinding,
         }
     }
     fn expected(&self) -> &RecoveryRequestExpected {
         match self {
             Self::Restore(request) => &request.expected,
             Self::Legacy(request) => &request.expected,
+            Self::Current(request) => &request.expected,
         }
     }
 }
@@ -1123,6 +1171,17 @@ fn decode_restore_request(
     let wire: RecoveryRequestWire = serde_json::from_slice(raw).map_err(RecoveryControlError::from_json)?;
     let wire = match wire {
         RecoveryRequestWire::Restore(wire) => wire,
+        RecoveryRequestWire::Current(wire) => {
+            if wire.format_version != 1 || wire.purpose != RecoveryRequestPurpose::ReconfirmCurrentBinding
+                || wire.limits.max_confirmations != 1
+            { return Err(service_invalid()); }
+            for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] { super::id(value, limits.max_id_bytes)?; }
+            return Ok(DecodedRecoveryRequest::Current(LocalCurrentRequest {
+                request_id: wire.request_id,
+                expected: RecoveryRequestExpected { reviewed_release_digest: wire.expected_reviewed_release_digest, deployment_id: wire.expected_deployment_id, tenant_id: wire.expected_tenant_id, dataset_id: wire.expected_dataset_id, source_installation_id: wire.expected_source_installation_id, target_installation_id: wire.expected_target_installation_id },
+                limits: OrdinaryStartupBounds { effect_ns: wire.limits.effect_ns, convergence_ns: wire.limits.convergence_ns }, issued: false,
+            }));
+        }
         RecoveryRequestWire::Legacy(wire) => {
             if wire.format_version != 1 || wire.purpose != RecoveryRequestPurpose::AdoptOrdinaryLegacy || wire.expected_source_installation_id != wire.expected_target_installation_id { return Err(service_invalid()); }
             for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] { super::id(value, limits.max_id_bytes)?; }
@@ -1228,7 +1287,10 @@ pub struct VerifiedRecoveryHost {
     reviewed_release_digest: [u8; 32],
     limits: TrustedHostRecoveryLimits,
     uid: u32,
+    #[cfg(feature = "desktop-local")]
     original: HostOrigin,
+    #[cfg(not(feature = "desktop-local"))]
+    _unavailable: std::convert::Infallible,
     ordinary_bounds: OrdinaryStartupBounds,
     services: [String; 2],
 }
@@ -1288,6 +1350,10 @@ impl VerifiedRecoveryHost {
     }
 
     pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
+        #[cfg(not(feature = "desktop-local"))]
+        { Err(service_invalid()) }
+        #[cfg(feature = "desktop-local")]
+        {
         let fixed = (std::mem::size_of::<Self>() as u64)
             .checked_add(self.services[0].capacity() as u64).and_then(|n| n.checked_add(self.services[1].capacity() as u64)).ok_or_else(service_invalid)?;
         match &self.original {
@@ -1307,7 +1373,7 @@ impl VerifiedRecoveryHost {
                     })?;
                 Ok((bytes, 4))
             }
-            HostOrigin::ServiceConfig(_) => Ok((fixed, 1)),
+        }
         }
     }
 
@@ -1318,6 +1384,7 @@ impl VerifiedRecoveryHost {
         {
             return Err(service_invalid());
         }
+        #[cfg(feature = "desktop-local")]
         match &mut self.original {
             #[cfg(feature = "desktop-local")]
             HostOrigin::LocalRelease {
@@ -1398,8 +1465,9 @@ impl VerifiedRecoveryHost {
                 *identities = Some(observed);
                 Ok(())
             }
-            HostOrigin::ServiceConfig(_) => Err(service_invalid()),
         }
+        #[cfg(not(feature = "desktop-local"))]
+        { Err(service_invalid()) }
     }
 }
 
@@ -1567,7 +1635,7 @@ impl VerifiedRecoveryHostIntent {
         self.decoded.purpose()
     }
     pub fn restore_profile(&self) -> Option<&super::RestoreOperationProfile> {
-        match &self.decoded { DecodedRecoveryRequest::Restore(request) => Some(&request.profile), DecodedRecoveryRequest::Legacy(_) => None }
+        match &self.decoded { DecodedRecoveryRequest::Restore(request) => Some(&request.profile), DecodedRecoveryRequest::Legacy(_) | DecodedRecoveryRequest::Current(_) => None }
     }
     pub fn expected(&self) -> &RecoveryRequestExpected {
         self.decoded.expected()
@@ -2399,6 +2467,20 @@ pub(super) fn claim_restore(
     })
 }
 
+#[cfg(feature = "desktop-local")]
+pub(super) fn observe_unclaimed_restore(owner: &ControlOwner) -> Result<ReadOnlyRestoreOwner, RecoveryControlError> {
+    let original = {
+        let mut state = lock(owner)?;
+        if state.restore_operation.is_some() { return Err(service_invalid()); }
+        state.pending_restore_intent.take().ok_or_else(service_invalid)?
+    };
+    let VerifiedRestoreHostIntent { host, request, request_bytes, control_root, decoded, original_deadline } = original;
+    ReadOnlyRestoreOwner::from_original(Arc::clone(owner), VerifiedRecoveryHostIntent {
+        host, request, request_bytes, control_root,
+        decoded: DecodedRecoveryRequest::Restore(decoded), original_deadline,
+    }, original_deadline)
+}
+
 /// Bounded same-operation reader after the original restore owner has gone.
 /// It carries no effect clock, stages, candidate or execution API.
 pub struct ReadOnlyRestoreOwner {
@@ -2499,6 +2581,16 @@ pub struct RestoreControlSession {
 /// candidate authority (spec revision R484 ¶8010, ¶8029–8041 and ¶8130).
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 impl RestoreControlSession {
+    /// Observe original cumulative counters without a clock, admission or
+    /// accounting mutation. Unknown work keeps its original admitted charge.
+    pub fn capacity_observation(&self, resource: super::RestoreCapacityResource) -> Result<super::RestoreCapacityObservation, RecoveryControlError> {
+        let state = lock(&self.stages.owner)?;
+        let ledger = &state.restore_operation.as_ref().ok_or_else(service_invalid)?.ledger;
+        Ok(super::RestoreCapacityObservation {
+            limit: ledger.ceiling(resource), admitted: ledger.admitted[resource as usize], actual: ledger.actual[resource as usize],
+        })
+    }
+
     /// Bind the resident original candidate Child, held data directory and
     /// private UDS to this operation, then confirm the Isolation stage.
     pub async fn bind_candidate_before(
@@ -2701,6 +2793,43 @@ impl RestoreControlSession {
         self.retain_failure(result)
     }
 
+    /// Preserve the captured artifact identity and replace only its physical
+    /// root on this isolated candidate, before any SCRAM change. An unresolved
+    /// original transaction is observed read-only; it is never sent again
+    /// (spec revision R484 ¶4054, ¶7280, ¶8002 and ¶8134).
+    pub async fn restore_candidate_artifacts_before(
+        &mut self,
+        staging: &mut crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging,
+        deadline: Instant,
+    ) -> Result<crate::backup::whole_pg_restore_stream::RestoreArtifactRebindOutcome, RecoveryControlError> {
+        let result = async {
+            if staging.candidate_plan().operation_id() != self.operation_id() {
+                return Err(service_invalid());
+            }
+            let candidate = self.candidate.as_mut().ok_or_else(service_invalid)?;
+            if let Some(observed) = crate::backup::whole_pg_restore_stream::candidate_sql::prepare_artifact_binding_before(
+                &mut self.stages, candidate, staging.artifact_source(), deadline,
+            ).await? {
+                return Ok(observed);
+            }
+            staging.place_artifact_spool_before(self, deadline)?;
+            let candidate = self.candidate.as_mut().ok_or_else(service_invalid)?;
+            crate::backup::whole_pg_restore_stream::candidate_sql::rebind_artifact_root_before(
+                &mut self.stages, candidate, staging, deadline,
+            ).await
+        }.await;
+        self.retain_failure(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn verify_absent_artifacts_for_test(&mut self, deadline: Instant) {
+        let candidate = self.candidate.as_mut().unwrap();
+        let observed = crate::backup::whole_pg_restore_stream::candidate_sql::prepare_artifact_binding_before(
+            &mut self.stages, candidate, None, deadline,
+        ).await.unwrap();
+        assert_eq!(observed, Some(crate::backup::whole_pg_restore_stream::RestoreArtifactRebindOutcome::Acknowledged));
+    }
+
     /// Release the candidate's clients and pool before the Desktop owner's one
     /// original TERM (¶8132); publication then requires that closed pool.
     pub async fn release_candidate_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
@@ -2709,6 +2838,14 @@ impl RestoreControlSession {
         };
         let result = crate::backup::whole_pg_restore_stream::release_candidate_before(&mut self.stages, candidate, deadline).await;
         self.retain_failure(result)
+    }
+
+    /// Retire only the original candidate's clients after a failed stage.
+    /// This is cleanup, never a successful release or publication fact.
+    pub fn abandon_candidate_connections(&mut self) {
+        if let Some(candidate) = self.candidate.as_mut() {
+            crate::backup::whole_pg_restore_stream::candidate_sql::abandon_candidate_connections(candidate);
+        }
     }
 
     /// Read the installation back on a new connection with the historical
@@ -3878,6 +4015,8 @@ pub(super) struct ControlFiles {
     #[cfg(feature = "desktop-local")]
     local_root: Option<File>,
     #[cfg(feature = "desktop-local")]
+    selected_local_component: Option<String>,
+    #[cfg(feature = "desktop-local")]
     local_creation: Option<
         Result<
             (
@@ -4154,6 +4293,7 @@ impl ControlFiles {
         deadline: Instant,
     ) -> Result<(Option<RecoveryFileIdentity>, RecoveryFileIdentity, String), RecoveryControlError>
     {
+        self.selected_local_component = None;
         let component = self
             .app_component
             .as_ref()
@@ -4223,10 +4363,8 @@ impl ControlFiles {
         self.reserve_io(0)?;
         self.raw.named = Some(rustix::fs::statat(
             self.parent.as_ref().ok_or_else(service_invalid)?,
-            self.app_component
-                .as_ref()
-                .ok_or_else(service_invalid)?
-                .as_os_str(),
+            self.selected_local_component.as_deref().map(std::ffi::OsStr::new)
+                .or(self.app_component.as_deref()).ok_or_else(service_invalid)?,
             AtFlags::SYMLINK_NOFOLLOW,
         ));
         self.post(deadline)?;
@@ -4245,6 +4383,77 @@ impl ControlFiles {
             return Err(service_invalid());
         }
         Ok(())
+    }
+
+    /// Select only the original journal's generation under the already held parent.
+    #[cfg(feature = "desktop-local")]
+    pub(super) fn select_restored_local_root_before(
+        &mut self,
+        published: &super::activation::PublishedActivation,
+        deadline: Instant,
+    ) -> Result<RecoveryFileIdentity, RecoveryControlError> {
+        let plan = published.restore_plan().ok_or_else(service_invalid)?;
+        let expected = published.binding().ordinary_local()?.generation_root;
+        self.prepay((plan.entry_component.len() as u64).checked_mul(4).ok_or_else(service_invalid)?, 0)?;
+        self.reserve_io(0)?;
+        self.raw.metadata = Some(self.parent.as_ref().ok_or_else(service_invalid)?.metadata());
+        self.post(deadline)?;
+        if self.raw.metadata.as_ref().and_then(|r| r.as_ref().ok()).map(identity)
+            != Some(plan.trusted_parent)
+        {
+            return Err(service_invalid());
+        }
+        self.reserve_io(1)?;
+        self.raw.file = Some(rustix::fs::openat(
+            self.parent.as_ref().ok_or_else(service_invalid)?,
+            plan.entry_component.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ).map(File::from).map_err(io::Error::from));
+        self.post(deadline)?;
+        if self.check_opened(true, deadline)? != expected {
+            return Err(service_invalid());
+        }
+        self.local_root = Some(self.take_opened()?);
+        self.selected_local_component = Some(plan.entry_component.clone());
+        self.verify_local_root_before(expected, deadline)?;
+        Ok(expected)
+    }
+
+    #[cfg(feature = "desktop-local")]
+    pub(super) fn restored_local_site_before(
+        &mut self,
+        published: &super::activation::PublishedActivation,
+        app: &crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
+        deadline: Instant,
+    ) -> Result<crate::auth::single_user::desktop_local::RestoredLocalSite, RecoveryControlError> {
+        let plan = published.restore_plan().ok_or_else(service_invalid)?;
+        if app.as_path().parent() != self.root_path.parent()
+            || app.as_path().file_name() != self.app_component.as_deref()
+            || self.selected_local_component.as_deref() != Some(plan.entry_component.as_str())
+        {
+            return Err(service_invalid());
+        }
+        let site = published.binding().ordinary_local()?;
+        self.verify_local_root_before(site.generation_root, deadline)?;
+        let parent = self.root_path.parent().ok_or_else(service_invalid)?;
+        let paths = parent.as_os_str().len().checked_add(plan.entry_component.len())
+            .and_then(|n| n.checked_add(6)).and_then(|n| n.checked_mul(4)).ok_or_else(service_invalid)?;
+        let strings = [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id,
+            &site.master.account, &site.master.key_id, &site.postgres.account]
+            .iter().try_fold(0usize, |n, s| n.checked_add(s.len()))
+            .and_then(|n| n.checked_mul(2)).ok_or_else(service_invalid)?;
+        let fee = paths.checked_add(strings)
+            .and_then(|n| n.checked_add(std::mem::size_of::<crate::auth::single_user::desktop_local::RestoredLocalSite>()))
+            .ok_or_else(service_invalid)?;
+        self.prepay(fee as u64, 0)?;
+        let parent = self.root_path.parent().ok_or_else(service_invalid)?;
+        Ok(crate::auth::single_user::desktop_local::RestoredLocalSite {
+            ids: [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id].map(str::to_owned),
+            data_dir: parent.join(&plan.entry_component).join("data"),
+            master: (site.master.account.clone(), site.master.key_id.clone()),
+            postgres_account: site.postgres.account.clone(),
+        })
     }
 
     #[cfg(feature = "desktop-local")]
@@ -4498,6 +4707,7 @@ impl ControlFiles {
                 ledger.observe_file(file, false, deadline)?;
             }
         }
+        #[cfg(feature = "desktop-local")]
         match &intent.host.original {
             #[cfg(feature = "desktop-local")]
             HostOrigin::LocalRelease {
@@ -4507,7 +4717,6 @@ impl ControlFiles {
                     ledger.observe_file(file, false, deadline)?;
                 }
             }
-            HostOrigin::ServiceConfig(_) => return Err(service_invalid()),
         }
         for (index, selection) in restore_selections.iter().enumerate() {
             if let Some(selection) = selection {
@@ -6808,6 +7017,45 @@ pub(super) fn recheck_legacy_request_before(files: &mut ControlFiles, request: &
     Ok(())
 }
 
+#[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+pub(super) fn enter_current_reconfirmation(
+    owner: &ControlOwner,
+    request: &mut VerifiedRecoveryHostIntent,
+    creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+    owners: &[super::runtime::RuntimeOwner],
+    cancel: crate::restore_reconfirmation::CancellationToken,
+) -> Result<(super::runtime::RecoveryRuntimeOwner, crate::restore_reconfirmation::OriginalReconfirmationRequest, Instant), RecoveryControlError> {
+    {
+        let mut files = lock(owner)?;
+        let deadline = request.original_deadline;
+        recheck_legacy_request_before(&mut files, request, deadline)?;
+        if files.root_identity(deadline)? != request.control_root { return Err(service_invalid()); }
+        files.prepay(std::mem::size_of::<crate::restore_reconfirmation::OriginalReconfirmationRequest>() as u64, 0)?;
+    }
+    let DecodedRecoveryRequest::Current(current) = &mut request.decoded else { return Err(service_invalid()); };
+    if current.issued { return Err(service_invalid()); }
+    current.issued = true;
+    let intent = local_intent(owner, creator, request.host.reviewed_release_digest,
+        [&request.host.services[0], &request.host.services[1]], current.limits, owners)?;
+    let admission = intent.admission_deadline().min(request.original_deadline);
+    let (published, intent) = super::ordinary::shared_local_head(owner, intent, admission, creator)?;
+    let binding = published.binding().ordinary_local()?;
+    let expected = &current.expected;
+    if published.restore_cohort().is_none()
+        || published.binding().source_installation_id() != expected.source_installation_id.as_str()
+        || binding.deployment_id != expected.deployment_id
+        || binding.tenant_id != expected.tenant_id
+        || binding.dataset_id != expected.dataset_id.as_str()
+        || binding.installation_id != expected.target_installation_id.as_str()
+    { lock(owner)?.release_registration_attempt(); return Err(service_invalid()); }
+    let sql = crate::restore_reconfirmation::OriginalReconfirmationRequest::for_current_local(
+        intent.effect_deadline(), cancel, uuid::Uuid::from_bytes(super::hex_array(current.request_id.as_str())),
+    );
+    let convergence = intent.convergence_deadline();
+    let runtime = super::ordinary::enroll(owner, published, &intent)?;
+    Ok((runtime, sql, convergence))
+}
+
 #[cfg(feature = "desktop-local")]
 pub(super) fn local_intent(
     owner: &ControlOwner,
@@ -7194,6 +7442,8 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
             #[cfg(feature = "desktop-local")]
             local_root: None,
             #[cfg(feature = "desktop-local")]
+            selected_local_component: None,
+            #[cfg(feature = "desktop-local")]
             local_creation: None,
             #[cfg(feature = "desktop-local")]
             existing_local_pool: None,
@@ -7551,6 +7801,7 @@ pub(super) fn verify_intent(
                 RecoveryControlFault::EntryInvalid,
             ));
         }
+        #[cfg(feature = "desktop-local")]
         match &h.original {
             #[cfg(feature = "desktop-local")]
             HostOrigin::LocalRelease { actual, .. } => {
@@ -7560,7 +7811,6 @@ pub(super) fn verify_intent(
                     return Err(service_invalid());
                 }
             }
-            HostOrigin::ServiceConfig(_) => return Err(service_invalid()),
         }
         let (host_bytes, host_files) = h.retained_usage()?;
         let request = state.pending_request.as_ref().ok_or_else(service_invalid)?;
@@ -7810,6 +8060,7 @@ pub(super) fn verify_intent(
         ) {
             return Err(service_invalid());
         }
+        #[cfg(feature = "desktop-local")]
         match &host.original {
             #[cfg(feature = "desktop-local")]
             HostOrigin::LocalRelease { actual, .. } => {
@@ -7821,9 +8072,11 @@ pub(super) fn verify_intent(
                         let selection = &decoded.selection.installation;
                         if Some(selection.parent.as_path()) != actual.as_path().parent() || actual.as_path().file_name() != Some(std::ffi::OsStr::new(&selection.component)) || decoded.limits.effect_ns > host.ordinary_bounds.effect_ns || decoded.limits.convergence_ns > host.ordinary_bounds.convergence_ns { return Err(service_invalid()); }
                     }
+                    DecodedRecoveryRequest::Current(decoded) => {
+                        if decoded.limits.effect_ns > host.ordinary_bounds.effect_ns || decoded.limits.convergence_ns > host.ordinary_bounds.convergence_ns { return Err(service_invalid()); }
+                    }
                 }
             }
-            HostOrigin::ServiceConfig(_) => return Err(service_invalid()),
         }
         let file = state.take_opened()?;
         let mut request = state

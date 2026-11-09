@@ -119,6 +119,14 @@ impl ControlFiles {
         }
         let reference = observation.publication_reference()?.clone();
         let context = reference.context_id.as_str();
+        if phase == ActivationPhase::RestoreCurrent {
+            let fee = self.limits.max_component_bytes.checked_mul(2)
+                .and_then(|n| n.checked_add(self.limits.max_id_bytes.checked_mul(4)?))
+                .and_then(|n| n.checked_add(std::mem::size_of::<super::super::activation::CandidatePlan>() as u64))
+                .ok_or_else(invalid)?;
+            self.prepay(fee, 0)?;
+        }
+        let mut restore_plan = None;
         // A Current republished by a known-site adoption names that operation;
         // its original restore journal is read and checked first.
         let adopted_current = match observation.record.data() {
@@ -131,7 +139,9 @@ impl ControlFiles {
                 self.prepay(fee, 0)?;
                 let chain = super::super::journal::observe_chain(&restore.bytes, &self.limits);
                 self.post(deadline)?;
-                chain?.verify_current_evidence(&observation)?;
+                let chain = chain?;
+                chain.verify_current_evidence(&observation)?;
+                restore_plan = Some(chain.restore_candidate_plan().ok_or_else(invalid)?.clone());
                 true
             }
             _ => false,
@@ -156,6 +166,7 @@ impl ControlFiles {
             chain.verify_adopted_current(&observation)?;
         } else {
             chain.verify_current_evidence(&observation)?;
+            restore_plan = Some(chain.restore_candidate_plan().ok_or_else(invalid)?.clone());
         }
         self.publication_seal = Some(chain.publication_for(
             &observation.record.control_id,
@@ -179,7 +190,7 @@ impl ControlFiles {
                 return Err(RecoveryControlError::new(fault));
             }
         };
-        PublishedActivation::bind(observation, publication).map(Head::Published)
+        PublishedActivation::bind(observation, publication, restore_plan).map(Head::Published)
     }
 
     /// Open `operations/<context>` as the held operation directory and read

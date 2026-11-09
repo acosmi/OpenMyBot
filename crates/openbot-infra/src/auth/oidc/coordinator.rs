@@ -149,6 +149,7 @@ impl OidcProviderRuntime {
     }
 
     /// The row incarnation is configuration DATA, not a Current provider admission.
+    #[cfg(any(feature = "server-sso", test))]
     pub(crate) async fn discover_bound(
         config: OidcProviderConfig,
         client_secret: Option<SecretBytes>,
@@ -175,6 +176,7 @@ impl OidcProviderRuntime {
     }
 
     /// Registration has no stored row incarnation yet; validate metadata without minting a runtime.
+    #[cfg(feature = "server-sso")]
     pub(crate) async fn validate_registration(
         config: &OidcProviderConfig,
         group_mapping: Option<IdpGroupMapping>,

@@ -3,7 +3,6 @@
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::time::Instant;
 
 use crate::db::pool::{DatabasePool, GuardedClient};
 use crate::recovery_control::{RecoveryControlError, RestoreStages};
@@ -47,6 +46,13 @@ struct RestoreConfigurationSlot {
     owner_id: String,
 }
 
+/// Once-verified source DATA; it grants no ordinary root-rebinding authority.
+#[derive(Clone, Copy)]
+pub(crate) struct RestoreArtifactSource {
+    store_id: uuid::Uuid,
+    root: crate::recovery_control::RecoveryFileIdentity,
+}
+
 /// Only the same session's verified Child/UDS/PG binding creates this owner.
 /// All SQL stages borrow its original connection custody and bound pool.
 pub(crate) struct PendingRestoreCandidateAuthority {
@@ -55,12 +61,9 @@ pub(crate) struct PendingRestoreCandidateAuthority {
     // the policy admitted; program identity itself is bound at spawn by the
     // policy's process-exec literal and checked command. A held FD does not
     // stop a path rename; the UDS and data directory FDs pin those inodes.
-    #[allow(dead_code)]
-    program: File,
-    #[allow(dead_code)]
-    socket_directory: File,
-    #[allow(dead_code)]
-    data_directory: File,
+    _program: File,
+    _socket_directory: File,
+    _data_directory: File,
     data_path: PathBuf,
     // The runner's startup evidence of the bound Child, checked at bind; its
     // exit observation must name the same pid and birth.
@@ -156,6 +159,18 @@ pub struct RestoreCandidateExit {
     pub exit: crate::recovery_control::NativeExit,
     pub observed_ns: u64,
     pub pipes: [crate::recovery_control::PipeJoin; 3],
+}
+
+/// Original artifact-root observations. Only the session's private state can
+/// authorize publication; constructing this DATA cannot acknowledge a write.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum RestoreArtifactRebindOutcome {
+    /// The original dedicated update had a timely COMMIT acknowledgement.
+    Acknowledged,
+    /// Readback cannot establish the captured or replacement root binding.
+    IsolationUnproven,
 }
 
 #[cfg(feature = "server-runtime")]
@@ -325,9 +340,9 @@ pub(crate) mod input {
     /// first failure. Never exposes a partially authenticated secret or receipt.
     pub struct RetainedRestoreInputFailure {
         fault: WholePgCarrierFault,
-        input: FrozenWholePgRestoreInput,
-        intent: ReviewedWholePgRestoreIntent,
-        control_error: Option<RecoveryControlError>,
+        _input: FrozenWholePgRestoreInput,
+        _intent: ReviewedWholePgRestoreIntent,
+        _control_error: Option<RecoveryControlError>,
     }
     impl RetainedRestoreInputFailure {
         pub fn fault(&self) -> WholePgCarrierFault {
@@ -444,9 +459,9 @@ pub(crate) mod input {
             }),
             Err(fault) => Err(RetainedRestoreInputFailure {
                 fault,
-                input,
-                intent,
-                control_error,
+                _input: input,
+                _intent: intent,
+                _control_error: control_error,
             }),
         }
     }
@@ -784,9 +799,19 @@ pub(crate) mod input {
                     .relative_path
                     .strip_prefix("materials/artifact-spool/")
                     .is_some_and(|path| {
-                        !path.contains('/')
-                            && path.len() <= 44
-                            && material.material_id.strip_prefix("artifact:") == Some(path)
+                        let closed_name = path == ".artifact-store-v1"
+                            || path.split_once('/').is_some_and(|(directory, leaf)| {
+                                matches!(directory, "objects" | "staging")
+                                    && leaf.len() == 36
+                                    && leaf.bytes().enumerate().all(|(index, byte)| {
+                                        if [8, 13, 18, 23].contains(&index) {
+                                            byte == b'-'
+                                        } else {
+                                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                        }
+                                    })
+                            });
+                        closed_name && material.material_id.strip_prefix("artifact:") == Some(path)
                     }),
                 K::MasterSecret => {
                     material.material_id == "master-secret"
@@ -941,6 +966,9 @@ pub(crate) mod input {
     }
     struct RestoreStagingWork {
         import_intent: Option<crate::recovery_control::RestoreStageIntent>,
+        artifact_source: Option<super::RestoreArtifactSource>,
+        artifact_placed: bool,
+        artifact_fault: Option<WholePgCarrierFault>,
         plan: Option<OwnedRestoreCandidatePlan>,
         directories: Vec<StagingDirectory>,
         materials: Vec<StagingMaterial>,
@@ -959,6 +987,9 @@ pub(crate) mod input {
         fn new() -> Self {
             Self {
                 import_intent: None,
+                artifact_source: None,
+                artifact_placed: false,
+                artifact_fault: None,
                 plan: None,
                 directories: Vec::new(),
                 materials: Vec::new(),
@@ -1164,6 +1195,174 @@ pub(crate) mod input {
         pub fn authenticated_secrets(&self) -> &AuthenticatedRestoreSecrets {
             &self.carrier.secrets
         }
+        pub(crate) fn artifact_source(&self) -> Option<super::RestoreArtifactSource> {
+            self.work().artifact_source
+        }
+
+        pub(crate) fn placed_artifact_root(&self) -> Option<&File> {
+            let work = self.work();
+            if !work.artifact_placed { return None; }
+            work.directories.iter().find(|directory| directory.relative.as_deref() == Some("artifacts"))?.file.as_ref()
+        }
+
+        /// Called only after the bound candidate's source binding has matched.
+        /// Staging already lives in this generation, so its original directory
+        /// moves on the same volume without replacing any existing entry
+        /// (spec revision R484 ¶4054, ¶7280 and ¶8002).
+        pub(crate) fn place_artifact_spool_before(
+            &mut self,
+            session: &mut RestoreControlSession,
+            deadline: Instant,
+        ) -> Result<(), RecoveryControlError> {
+            let input = &mut self.carrier.input;
+            let mut control_error = None;
+            let result = (|| -> Result<(), WholePgCarrierFault> {
+                let work = input.staging.as_ref().expect("verified staging owner");
+                if let Some(fault) = work.artifact_fault { return Err(fault); }
+                if work.artifact_placed || work.artifact_source.is_none() {
+                    return Err(WholePgCarrierFault::IntentMismatch);
+                }
+                verify_staging_directory_membership(input, session, deadline, &mut control_error, true)?;
+                let manifest = input.manifest.as_ref().expect("verified manifest");
+                let work = input.staging.as_mut().expect("verified staging owner");
+                let root = work.directories.iter().position(|directory| {
+                    directory.relative.as_deref() == Some("materials/artifact-spool")
+                }).ok_or(WholePgCarrierFault::MaterialMissing)?;
+                let source_parent = work.directories[root].parent.ok_or(WholePgCarrierFault::PathUnsafe)?;
+                let mut marker = None;
+                // Reuse the original prepaid decode buffer; no artifact-sized allocation.
+                let chunk = input.buffer.capacity().min(65536);
+                if chunk == 0 { return Err(WholePgCarrierFault::CapacityExceeded); }
+                for (ordinal, material) in manifest.materials().iter().enumerate() {
+                    if material.kind != WholePgMaterialKind::Artifact { continue; }
+                    let source = work.materials[ordinal].file.as_ref().ok_or(WholePgCarrierFault::MaterialMissing)?;
+                    stage_effect(session, deadline, &mut control_error)?;
+                    work.metadata = Some(source.metadata());
+                    stage_effect(session, deadline, &mut control_error)?;
+                    let before = RestoreInputFileIdentity::from_metadata(work.metadata.as_ref()
+                        .and_then(|raw| raw.as_ref().ok()).ok_or(WholePgCarrierFault::IoFailure)?)?;
+                    if Some(before) != work.materials[ordinal].stamp || before.length != material.plain_len {
+                        return Err(WholePgCarrierFault::SourceChanged);
+                    }
+                    let mut hash = Sha256::new();
+                    let mut offset = 0;
+                    while offset < material.plain_len {
+                        let count = (material.plain_len - offset).min(chunk as u64) as usize;
+                        input.buffer.resize(count, 0);
+                        stage_effect(session, deadline, &mut control_error)?;
+                        input.raw_read = Some(source.read_exact_at(input.buffer.as_mut_slice(), offset));
+                        stage_effect(session, deadline, &mut control_error)?;
+                        if !matches!(input.raw_read, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                        hash.update(input.buffer.as_slice());
+                        input.buffer.as_mut_slice().zeroize();
+                        input.buffer.clear();
+                        offset += count as u64;
+                    }
+                    let observed: [u8; 32] = hash.finalize().into();
+                    if observed != material.plain_sha256 { return Err(WholePgCarrierFault::ReadbackFailed); }
+                    work.metadata = Some(source.metadata());
+                    stage_effect(session, deadline, &mut control_error)?;
+                    if RestoreInputFileIdentity::from_metadata(work.metadata.as_ref()
+                        .and_then(|raw| raw.as_ref().ok()).ok_or(WholePgCarrierFault::IoFailure)?)? != before
+                    {
+                        return Err(WholePgCarrierFault::SourceChanged);
+                    }
+                    if material.material_id == "artifact:.artifact-store-v1" { marker = Some(ordinal); }
+                    work.synced = Some(source.sync_all());
+                    stage_effect(session, deadline, &mut control_error)?;
+                    if !matches!(work.synced, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                }
+                let marker = marker.ok_or(WholePgCarrierFault::MaterialMissing)?;
+                // Empty directories have no manifest leaf but are part of the fixed spool layout.
+                for relative in ["materials/artifact-spool/objects", "materials/artifact-spool/staging"] {
+                    if work.directories.iter().any(|directory| directory.relative.as_deref() == Some(relative)) { continue; }
+                    if work.directories.len() as u64 >= input.bounds.max_directories {
+                        return Err(WholePgCarrierFault::CapacityExceeded);
+                    }
+                    let fee = (2 * std::mem::size_of::<StagingDirectory>() + 2 * relative.len()) as u64;
+                    let _metadata = session.admit_capacity(Capacity::MetadataBytes, fee)
+                        .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                    let _allocation = session.admit_capacity(Capacity::TotalAllocationBytes, fee)
+                        .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                    if work.directories.len() == work.directories.capacity() {
+                        let previous = work.directories.capacity();
+                        work.directories.try_reserve_exact(1).map_err(|_| WholePgCarrierFault::CapacityExceeded)?;
+                        if work.directories.capacity().saturating_sub(previous) > 2 {
+                            return Err(WholePgCarrierFault::CapacityExceeded);
+                        }
+                    }
+                    work.create_directory(Some(root), Some(relative), session, deadline, &mut control_error)?;
+                }
+                let StagingMaterial { file, stamp, .. } = &mut work.materials[marker];
+                let file = file.as_ref().ok_or(WholePgCarrierFault::MaterialMissing)?;
+                work.written = Some(rustix::fs::fchmod(file, Mode::from_bits_truncate(0o400)).map_err(io::Error::from));
+                stage_effect(session, deadline, &mut control_error)?;
+                if !matches!(work.written, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                work.metadata = Some(file.metadata());
+                stage_effect(session, deadline, &mut control_error)?;
+                let actual = work.metadata.as_ref().and_then(|raw| raw.as_ref().ok()).ok_or(WholePgCarrierFault::IoFailure)?;
+                let before = stamp.as_mut().ok_or(WholePgCarrierFault::SourceChanged)?;
+                if !actual.is_file() || actual.mode() & 0o7777 != 0o400 || actual.nlink() != 1
+                    || (actual.dev(), actual.ino(), actual.uid(), actual.len(), actual.mtime(), actual.mtime_nsec())
+                        != (before.device, before.inode, before.uid, before.length, before.modified_seconds, before.modified_nanos)
+                {
+                    return Err(WholePgCarrierFault::SourceChanged);
+                }
+                before.mode = actual.mode();
+                before.changed_seconds = actual.ctime();
+                before.changed_nanos = actual.ctime_nsec();
+                work.synced = Some(file.sync_all());
+                stage_effect(session, deadline, &mut control_error)?;
+                if !matches!(work.synced, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                verify_staging_directory_membership(input, session, deadline, &mut control_error, true)?;
+                let work = input.staging.as_mut().expect("verified staging owner");
+                work.space = Some(rustix::fs::fstatvfs(work.directory_file(0)));
+                stage_effect(session, deadline, &mut control_error)?;
+                let grain = work.space.as_ref().and_then(|raw| raw.as_ref().ok())
+                    .map(|space| space.f_frsize.max(space.f_bsize)).filter(|grain| *grain > 0)
+                    .ok_or(WholePgCarrierFault::IoFailure)?;
+                let target_growth = session.admit_storage_before(work.directory_file(0), grain, RestoreStorageKind::Working, deadline)
+                    .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                let source_growth = session.admit_storage_before(work.directory_file(source_parent), grain, RestoreStorageKind::Working, deadline)
+                    .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                let target = session.admit_new_child_before(work.directory_file(0), OsStr::new("artifacts"), grain, RestoreNewChildKind::Directory, deadline)
+                    .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                work.created = Some(rustix::fs::renameat_with(
+                    work.directory_file(source_parent), "artifact-spool", work.directory_file(0), "artifacts",
+                    rustix::fs::RenameFlags::NOREPLACE,
+                ));
+                if matches!(work.created, Some(Ok(()))) {
+                    work.artifact_placed = true;
+                    work.directories[root].parent = Some(0);
+                    let name = work.directories[root].relative.as_mut().expect("original spool component");
+                    name.clear();
+                    name.push_str("artifacts"); // Original string backing is longer; no allocation.
+                }
+                stage_effect(session, deadline, &mut control_error)?;
+                if !work.artifact_placed { return Err(WholePgCarrierFault::PathUnsafe); }
+                session.settle_new_child_before(target, work.directory_file(0), work.directory_file(root), deadline)
+                    .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                for index in [root, source_parent, 0] {
+                    work.synced = Some(work.directory_file(index).sync_all());
+                    stage_effect(session, deadline, &mut control_error)?;
+                    if !matches!(work.synced, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                }
+                session.settle_storage_before(source_growth, work.directory_file(source_parent), deadline)
+                    .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                session.settle_storage_before(target_growth, work.directory_file(0), deadline)
+                    .map_err(|error| retain_stage_control(error, &mut control_error))?;
+                Ok(())
+            })();
+            result.map_err(|fault| {
+                input.staging.as_mut().expect("verified staging owner").artifact_fault.get_or_insert(fault);
+                control_error.unwrap_or_else(|| RecoveryControlError::new(match fault {
+                    WholePgCarrierFault::CapacityExceeded | WholePgCarrierFault::BoundsOverflow => crate::recovery_control::RecoveryControlFault::CapacityExceeded,
+                    WholePgCarrierFault::DeadlineExpired => crate::recovery_control::RecoveryControlFault::EffectExpired,
+                    WholePgCarrierFault::IoFailure => crate::recovery_control::RecoveryControlFault::IoFailure,
+                    _ => crate::recovery_control::RecoveryControlFault::InputInvalid,
+                }))
+            })
+        }
     }
 
     pub async fn verify_whole_pg_restore_input(
@@ -1172,7 +1371,7 @@ pub(crate) mod input {
         session: &mut RestoreControlSession,
     ) -> Result<VerifiedWholePgRestoreStaging, RetainedRestoreInputFailure> {
         if input.operation != intent.operation || input.operation.as_str() != session.operation_id() {
-            return Err(RetainedRestoreInputFailure { fault: WholePgCarrierFault::IntentMismatch, input, intent, control_error: None });
+            return Err(RetainedRestoreInputFailure { fault: WholePgCarrierFault::IntentMismatch, _input: input, _intent: intent, _control_error: None });
         }
         let mut carrier = authenticate_whole_pg_restore_carrier_before(input, intent, session)?;
         let mut control_error = None;
@@ -1184,9 +1383,9 @@ pub(crate) mod input {
                 carrier.input.authenticated = Some(carrier.secrets);
                 Err(RetainedRestoreInputFailure {
                     fault,
-                    input: carrier.input,
-                    intent: carrier.intent,
-                    control_error,
+                    _input: carrier.input,
+                    _intent: carrier.intent,
+                    _control_error: control_error,
                 })
             }
         }
@@ -1769,7 +1968,7 @@ pub(crate) mod input {
                 .settle_capacity(extra_fd, 0)
                 .map_err(|e| retain_stage_control(e, error))?;
         }
-        verify_staging_directory_membership(input, session, deadline, error)?;
+        verify_staging_directory_membership(input, session, deadline, error, false)?;
         session
             .check_capacity_before(deadline)
             .map_err(|e| retain_stage_control(e, error))
@@ -1779,10 +1978,14 @@ pub(crate) mod input {
         session: &mut RestoreControlSession,
         deadline: Instant,
         error: &mut Option<RecoveryControlError>,
+        artifacts_only: bool,
     ) -> Result<(), WholePgCarrierFault> {
         let manifest = input.manifest.as_ref().expect("original manifest retained");
         let work = input.staging.as_mut().expect("staging owner retained");
         for index in (0..work.directories.len()).rev() {
+            if artifacts_only && !work.directories[index].relative.as_deref().is_some_and(|path| {
+                path == "materials/artifact-spool" || path.starts_with("materials/artifact-spool/")
+            }) { continue; }
             stage_effect(session, deadline, error)?;
             work.synced = Some(work.directory_file(index).sync_all());
             stage_effect(session, deadline, error)?;
@@ -2414,6 +2617,12 @@ pub(crate) mod input {
         {
             return Err(WholePgCarrierFault::IntentMismatch);
         }
+        input.staging.as_mut().expect("staging owner").artifact_source = Some(super::RestoreArtifactSource {
+            store_id,
+            root: crate::recovery_control::RecoveryFileIdentity {
+                device: artifact.0, inode: artifact.1, uid: artifact.2,
+            },
+        });
         input.buffer.as_mut_slice().zeroize();
         input.buffer.clear();
         stage_effect(session, deadline, error)
@@ -2464,20 +2673,20 @@ pub(crate) mod input {
         let (input, intent) = session.frozen_input().expect("one actual frozen input transfer");
         assert_eq!(input.bounds.max_chunk_plain_bytes, 4 * 1024 * 1024, "profile is chunk upper bound");
         let staged = verify_whole_pg_restore_input(input, intent, &mut session).await.unwrap_or_else(|failure| {
-            if let Some(work) = &failure.input.staging {
+            if let Some(work) = &failure._input.staging {
                 eprintln!("staging progress plan={} dirs={} materials={} readers={} import_intent={}", work.plan.is_some(), work.directories.len(), work.materials.len(), work.materials.iter().filter(|material| material.stamp.is_some()).count(), work.import_intent.is_some());
                 let grain = work.space.as_ref().and_then(|value| value.as_ref().ok()).map(|space| space.f_frsize.max(space.f_bsize));
                 eprintln!("actual allocation grain={grain:?}");
                 for (ordinal, material) in work.materials.iter().enumerate() {
                     if let Some(file) = &material.file {
                         let metadata = file.metadata().expect("retained own fixture metadata");
-                        let expected = failure.input.manifest.as_ref().expect("authenticated manifest").materials()[ordinal].plain_len;
+                        let expected = failure._input.manifest.as_ref().expect("authenticated manifest").materials()[ordinal].plain_len;
                         if grain.is_some_and(|grain| metadata.blocks() * 512 > expected.div_ceil(grain) * grain) { eprintln!("allocation ordinal={ordinal} plain={expected} length={} allocated={}", metadata.len(), metadata.blocks() * 512); }
                     }
                 }
             }
             for resource in [Capacity::MetadataBytes, Capacity::OpenFiles, Capacity::MaterialDirectories, Capacity::MaterialFiles, Capacity::MaterialPlainBytes, Capacity::SecretMemoryBytes, Capacity::JournalBytes, Capacity::JournalRecords] { eprintln!("remaining {resource:?}={:?}", session.input_stages().capacity_available(resource).map_err(|error| error.fault())); }
-            panic!("real staging failed: {:?} control={:?}", failure.fault(), failure.control_error.as_ref().map(RecoveryControlError::fault));
+            panic!("real staging failed: {:?} control={:?}", failure.fault(), failure._control_error.as_ref().map(RecoveryControlError::fault));
         });
         assert_eq!(staged.candidate_plan().operation_id(), session.operation_id());
         assert_eq!(u32::from_be_bytes(staged.manifest().header()[32..36].try_into().expect("fixed chunk bytes")), 65536, "actual authenticated F07 chunk");
@@ -2500,7 +2709,7 @@ pub(crate) mod input {
     async fn t046_18_replacing_original_package_after_staging_has_no_effect() {
         let (fixture, _control, mut session) = real_staging_fixture();
         let (input, intent) = session.frozen_input().expect("actual frozen input");
-        let staged = verify_whole_pg_restore_input(input, intent, &mut session).await.unwrap_or_else(|failure| panic!("real staging failed: {:?} control={:?}", failure.fault(), failure.control_error.as_ref().map(RecoveryControlError::fault)));
+        let staged = verify_whole_pg_restore_input(input, intent, &mut session).await.unwrap_or_else(|failure| panic!("real staging failed: {:?} control={:?}", failure.fault(), failure._control_error.as_ref().map(RecoveryControlError::fault)));
         std::fs::rename(fixture.directory.join("carrier-medium/carrier"), fixture.directory.join("carrier-medium/old-carrier")).expect("replace owned original name");
         std::fs::write(fixture.directory.join("carrier-medium/carrier"), b"replacement").expect("owned replacement package");
         std::fs::OpenOptions::new().write(true).open(fixture.directory.join("carrier-medium/old-carrier")).expect("original package inode").set_len(0).expect("change original package bytes");
@@ -2533,7 +2742,7 @@ pub(crate) mod input {
             let (input, intent) = session.frozen_input().expect("actual frozen mutated input");
             let failure = verify_whole_pg_restore_input(input, intent, &mut session).await.err().expect("mixed input rejected");
             assert!(matches!(failure.fault(), WholePgCarrierFault::KeyMediumInvalid | WholePgCarrierFault::IntentMismatch | WholePgCarrierFault::AuthenticationFailed));
-            assert!(failure.input.staging.is_none()); assert!(failure.input.carrier.metadata().is_ok()); assert!(failure.input.key_medium.metadata().is_ok());
+            assert!(failure._input.staging.is_none()); assert!(failure._input.carrier.metadata().is_ok()); assert!(failure._input.key_medium.metadata().is_ok());
             assert!(!fixture.directory.join("new-generation").exists());
         }
         eprintln!("T15 original six mismatch/corruption cases rejected before staging");
@@ -2652,11 +2861,11 @@ pub(crate) mod input {
             let (input, intent) = session.frozen_input().expect("original expected/key remain unchanged");
             let failure = verify_whole_pg_restore_input(input, intent, &mut session).await.err().expect("literal cross-package mixture rejected");
             assert_eq!(failure.fault(), if mix_header { WholePgCarrierFault::IntentMismatch } else { WholePgCarrierFault::AuthenticationFailed });
-            let carrier_after = failure.input.carrier.metadata().expect("original rejected carrier FD retained");
-            let key_after = failure.input.key_medium.metadata().expect("original independent key FD retained");
+            let carrier_after = failure._input.carrier.metadata().expect("original rejected carrier FD retained");
+            let key_after = failure._input.key_medium.metadata().expect("original independent key FD retained");
             assert_eq!((carrier_before.dev(), carrier_before.ino(), carrier_before.len()), (carrier_after.dev(), carrier_after.ino(), carrier_after.len()));
             assert_eq!((key_before.dev(), key_before.ino(), key_before.len()), (key_after.dev(), key_after.ino(), key_after.len()));
-            assert!(failure.input.staging.is_none());
+            assert!(failure._input.staging.is_none());
             assert!(!fixture.directory.join("new-generation").exists());
             eprintln!("T15 literal valid-other {} rejected with retained original FDs and zero staging", if mix_header { "header" } else { "complete manifest frame" });
         }
@@ -2723,7 +2932,7 @@ pub(crate) mod input {
             let (input, intent) = session.frozen_input().expect("actual frozen mutated carrier");
             let failure = verify_whole_pg_restore_input(input, intent, &mut session).await.err().expect("malformed carrier rejected");
             assert!(matches!(failure.fault(), WholePgCarrierFault::ShortRead | WholePgCarrierFault::ExtraTail | WholePgCarrierFault::FrameInvalid));
-            assert!(failure.input.staging.is_none()); assert!(failure.input.carrier.metadata().is_ok()); assert!(!fixture.directory.join("new-generation").exists());
+            assert!(failure._input.staging.is_none()); assert!(failure._input.carrier.metadata().is_ok()); assert!(!fixture.directory.join("new-generation").exists());
         }
     }
 
@@ -3404,6 +3613,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
 
     struct SqlResults {
         begin: Option<Result<(), TransactionOwnerError>>,
+        artifact_metadata: Option<rustix::io::Result<rustix::fs::Stat>>,
         query: Option<QueryResult>,
         command: Option<Result<Result<u64, tokio_postgres::Error>, Elapsed>>,
         unit: Option<Result<Result<(), tokio_postgres::Error>, Elapsed>>,
@@ -3423,6 +3633,10 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
     /// Empty state cannot construct a candidate, acknowledge SQL or resume it.
     pub(super) struct CandidateSqlState {
         schema: StageResult,
+        artifacts: StageResult,
+        artifact_prepared: bool,
+        // Store ID, source tuple and target tuple; all backing is paid before E.
+        artifact_coordinates: Option<[String; 7]>,
         retirement: StageResult,
         client: Option<Result<GuardedClient, PoolError>>,
         intent: Option<RestoreStageIntent>,
@@ -3441,6 +3655,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         pub(super) fn new() -> Self {
             Self {
                 schema: StageResult::Unstarted,
+                artifacts: StageResult::Unstarted,
+                artifact_prepared: false,
+                artifact_coordinates: None,
                 retirement: StageResult::Unstarted,
                 client: None,
                 intent: None,
@@ -3457,6 +3674,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                 },
                 raw: SqlResults {
                     begin: None,
+                    artifact_metadata: None,
                     query: None,
                     command: None,
                     unit: None,
@@ -3614,6 +3832,169 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             stages.admit_capacity(Capacity::TotalAllocationBytes, PUBLIC_ROW_MEMORY)?;
         candidate.sql.raw.readback = None;
         Ok(())
+    }
+
+    /// Read the captured physical binding before any artifact placement. This
+    /// read-only transaction is separate from the one later tuple update.
+    pub(crate) async fn prepare_artifact_binding_before(
+        stages: &mut RestoreStages,
+        candidate: &mut PendingRestoreCandidateAuthority,
+        source: Option<super::RestoreArtifactSource>,
+        deadline: Instant,
+    ) -> Result<Option<super::RestoreArtifactRebindOutcome>, RecoveryControlError> {
+        use super::RestoreArtifactRebindOutcome as Outcome;
+        if candidate.sql.artifacts == StageResult::Acknowledged { return Ok(Some(Outcome::Acknowledged)); }
+        if candidate.sql.artifacts == StageResult::InFlight {
+            return observe_artifact_rebind_before(stages, candidate).await.map(Some);
+        }
+        if candidate.sql.artifact_prepared { return Ok(None); }
+        if candidate.sql.schema != StageResult::Acknowledged || candidate.sql.scram != StageResult::Unstarted {
+            return Err(invalid_candidate());
+        }
+        checkout_before(stages, candidate, deadline).await?;
+        let transaction_charge = stages.admit_capacity(Capacity::PgTransactions, 1)?;
+        let CandidateSqlState { client, raw, intent, .. } = &mut candidate.sql;
+        let client = client.as_mut().and_then(|raw| raw.as_mut().ok()).ok_or_else(invalid_candidate)?;
+        let owner = match client.begin_read_committed_read_only().await {
+            Ok(owner) => { raw.begin = Some(Ok(())); owner }
+            Err(error) => { raw.begin = Some(Err(error)); return Err(retain_begin_failure(stages, intent, error)); }
+        };
+        let mut absent = false;
+        let prepared = async {
+            stages.settle_capacity(transaction_charge, 1)?;
+            let binding = &candidate.binding;
+            let observed = rows(raw, stages, owner.as_transaction(),
+                "SELECT CASE WHEN octet_length(store_id)<=36 THEN store_id END, CASE WHEN octet_length(root_device)<=20 THEN root_device END, CASE WHEN octet_length(root_inode)<=20 THEN root_inode END, CASE WHEN octet_length(root_uid)<=20 THEN root_uid END FROM openbot_internal.artifact_store_bindings WHERE deployment_id=$1 AND tenant_id=$2 AND dataset_id=$3 LIMIT 2",
+                &[&binding.deployment_id, &binding.tenant_id, &binding.dataset_id], 2, deadline).await?;
+            match (source, observed) {
+                (None, []) => absent = true,
+                (Some(source), [row]) => {
+                    let text = |index| row.try_get::<_, &str>(index).map_err(|_| invalid_candidate());
+                    if uuid::Uuid::parse_str(text(0)?).ok() != Some(source.store_id)
+                        || text(1)?.parse::<u64>().ok() != Some(source.root.device)
+                        || text(2)?.parse::<u64>().ok() != Some(source.root.inode)
+                        || text(3)?.parse::<u32>().ok() != Some(source.root.uid)
+                    { return Err(invalid_candidate()); }
+                }
+                _ => return Err(invalid_candidate()),
+            }
+            Ok(())
+        }.await;
+        finish(owner, prepared, raw, intent, stages, deadline).await?;
+        candidate.sql.artifact_prepared = true;
+        if absent {
+            candidate.sql.artifacts = StageResult::Acknowledged;
+            Ok(Some(Outcome::Acknowledged))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The only physical-tuple writer. No other candidate write belongs to this
+    /// transaction (spec revision R484 ¶4054 and ¶8002).
+    pub(crate) async fn rebind_artifact_root_before(
+        stages: &mut RestoreStages,
+        candidate: &mut PendingRestoreCandidateAuthority,
+        staging: &super::VerifiedWholePgRestoreStaging,
+        deadline: Instant,
+    ) -> Result<super::RestoreArtifactRebindOutcome, RecoveryControlError> {
+        use super::RestoreArtifactRebindOutcome as Outcome;
+        if candidate.sql.artifacts == StageResult::Acknowledged { return Ok(Outcome::Acknowledged); }
+        if candidate.sql.artifacts == StageResult::InFlight {
+            return observe_artifact_rebind_before(stages, candidate).await;
+        }
+        if !candidate.sql.artifact_prepared { return Err(invalid_candidate()); }
+        let source = staging.artifact_source().ok_or_else(invalid_candidate)?;
+        stages.effect_before(deadline)?;
+        let root = staging.placed_artifact_root().ok_or_else(invalid_candidate)?;
+        candidate.sql.raw.artifact_metadata = Some(rustix::fs::fstat(root));
+        stages.effect_before(deadline)?;
+        let target = candidate.sql.raw.artifact_metadata.as_ref().and_then(|raw| raw.as_ref().ok())
+            .ok_or_else(|| stages.failure(RecoveryControlFault::IoFailure))?;
+        if rustix::fs::FileType::from_raw_mode(target.st_mode) != rustix::fs::FileType::Directory
+            || target.st_mode & 0o7777 != 0o700 || target.st_uid != rustix::process::geteuid().as_raw()
+        { return Err(invalid_candidate()); }
+        let memory = std::mem::size_of::<[String; 7]>() as u64 + 2 * (36 + 6 * 20);
+        let _metadata = stages.admit_capacity(Capacity::MetadataBytes, memory)?;
+        let _allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, memory)?;
+        candidate.sql.artifact_coordinates = Some([
+            source.store_id.to_string(), source.root.device.to_string(), source.root.inode.to_string(), source.root.uid.to_string(),
+            (target.st_dev as u64).to_string(), (target.st_ino as u64).to_string(), target.st_uid.to_string(),
+        ]);
+        checkout_before(stages, candidate, deadline).await?;
+        candidate.sql.intent = Some(stages.begin_stage_before(RestoreStage::Import, "artifact_root_rebind", deadline)?);
+        candidate.sql.artifacts = StageResult::InFlight;
+        let transaction_charge = stages.admit_capacity(Capacity::PgTransactions, 1)?;
+        let row_charge = stages.admit_capacity(Capacity::PgRows, 1)?;
+        let CandidateSqlState { client, raw, intent, artifact_coordinates, .. } = &mut candidate.sql;
+        let coordinates = artifact_coordinates.as_ref().ok_or_else(invalid_candidate)?;
+        let client = client.as_mut().and_then(|raw| raw.as_mut().ok()).ok_or_else(invalid_candidate)?;
+        let owner = match client.begin_read_committed().await {
+            Ok(owner) => { raw.begin = Some(Ok(())); owner }
+            Err(error) => { raw.begin = Some(Err(error)); return Err(retain_begin_failure(stages, intent, error)); }
+        };
+        let prepared = async {
+            stages.settle_capacity(transaction_charge, 1)?;
+            let transaction = owner.as_transaction();
+            let binding = &candidate.binding;
+            execute(raw, stages, transaction,
+                "ALTER TABLE openbot_internal.artifact_store_bindings DISABLE TRIGGER artifact_store_bindings_append_only", &[], deadline).await?;
+            let affected = execute(raw, stages, transaction,
+                "UPDATE openbot_internal.artifact_store_bindings SET root_device=$5,root_inode=$6,root_uid=$7 WHERE deployment_id=$1 AND tenant_id=$2 AND dataset_id=$3 AND store_id=$4 AND root_device=$8 AND root_inode=$9 AND root_uid=$10",
+                &[&binding.deployment_id, &binding.tenant_id, &binding.dataset_id, &coordinates[0],
+                    &coordinates[4], &coordinates[5], &coordinates[6], &coordinates[1], &coordinates[2], &coordinates[3]], deadline).await?;
+            if affected != 1 { return Err(invalid_candidate()); }
+            stages.settle_capacity(row_charge, affected)?;
+            execute(raw, stages, transaction,
+                "ALTER TABLE openbot_internal.artifact_store_bindings ENABLE TRIGGER artifact_store_bindings_append_only", &[], deadline).await?;
+            Ok(())
+        }.await;
+        let finished = finish(owner, prepared, raw, intent, stages, deadline).await;
+        if let Err(error) = finished {
+            if matches!(candidate.sql.raw.commit, Some(Err(TransactionOwnerError::CommitUnknown))) {
+                // The prepaid original connection may only read under C.
+                // Its raw result remains resident even if the connection died;
+                // no readback can replace the missing original COMMIT ACK.
+                let _observed = observe_artifact_rebind_before(stages, candidate).await;
+            }
+            return Err(error);
+        }
+        candidate.sql.artifacts = StageResult::Acknowledged;
+        Ok(Outcome::Acknowledged)
+    }
+
+    /// Re-entry never repeats DISABLE/UPDATE/ENABLE. Even a matching committed
+    /// tuple cannot replace the original missing or late COMMIT acknowledgement.
+    async fn observe_artifact_rebind_before(
+        stages: &mut RestoreStages,
+        candidate: &mut PendingRestoreCandidateAuthority,
+    ) -> Result<super::RestoreArtifactRebindOutcome, RecoveryControlError> {
+        let closing = stages.convergence_deadline()?;
+        if candidate.sql.raw.readback.is_none() {
+            let reservation = candidate.sql.readback_rows.take().ok_or_else(database_unknown)?;
+            let client = candidate.sql.client.as_ref().and_then(|raw| raw.as_ref().ok()).ok_or_else(database_unknown)?;
+            let coordinates = candidate.sql.artifact_coordinates.as_ref().ok_or_else(database_unknown)?;
+            let binding = &candidate.binding;
+            candidate.sql.raw.readback = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(closing),
+                client.as_client().query(
+                    "SELECT (root_device,root_inode,root_uid)=($5::text,$6::text,$7::text),(root_device,root_inode,root_uid)=($8::text,$9::text,$10::text),(SELECT tgenabled='O' FROM pg_catalog.pg_trigger WHERE tgrelid='openbot_internal.artifact_store_bindings'::regclass AND tgname='artifact_store_bindings_append_only') FROM openbot_internal.artifact_store_bindings WHERE deployment_id=$1 AND tenant_id=$2 AND dataset_id=$3 AND store_id=$4",
+                    &[&binding.deployment_id, &binding.tenant_id, &binding.dataset_id, &coordinates[0],
+                        &coordinates[4], &coordinates[5], &coordinates[6], &coordinates[1], &coordinates[2], &coordinates[3]],
+                )).await);
+            stages.convergence_deadline()?;
+            if let Some(Ok(Ok(rows))) = candidate.sql.raw.readback.as_ref() {
+                let _settled = stages.settle_capacity(reservation, rows.len() as u64);
+            }
+        }
+        if let Some(Ok(Ok(rows))) = candidate.sql.raw.readback.as_ref() {
+            if rows.len() != 1 || rows[0].try_get::<_, bool>(2).ok() != Some(true)
+                || (rows[0].try_get::<_, bool>(0).ok() != Some(true)
+                    && rows[0].try_get::<_, bool>(1).ok() != Some(true))
+            {
+                return Ok(super::RestoreArtifactRebindOutcome::IsolationUnproven);
+            }
+        }
+        Err(stages.failure(RecoveryControlFault::DatabaseUnknown))
     }
 
     async fn rows<'a>(
@@ -5264,7 +5645,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         old_password: &openbot_domain::vault::SecretBytes,
         deadline: Instant,
     ) -> Result<super::RestoreScramAcknowledged, RecoveryControlError> {
-        if candidate.sql.history != StageResult::Acknowledged {
+        if candidate.sql.history != StageResult::Acknowledged
+            || candidate.sql.artifacts != StageResult::Acknowledged
+        {
             return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
         }
         if candidate.sql.scram != StageResult::Unstarted {
@@ -5389,7 +5772,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             DesktopVaultCanaryBinding, DesktopVaultCanaryEnvelope, KeyVersion,
             open_desktop_vault_canary,
         };
-        if candidate.sql.scram != StageResult::Acknowledged {
+        if candidate.sql.scram != StageResult::Acknowledged
+            || candidate.sql.artifacts != StageResult::Acknowledged
+        {
             return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
         }
         let password = scram_text(password)?;
@@ -5536,6 +5921,15 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         Ok(())
     }
 
+    /// Failure cleanup only: retire leases so the original candidate's smart
+    /// shutdown can finish. The pool and its driver registry remain resident;
+    /// this produces no close receipt and cannot authorize publication.
+    pub(crate) fn abandon_candidate_connections(candidate: &mut PendingRestoreCandidateAuthority) {
+        candidate.pool.close();
+        candidate.sql.client.take();
+        candidate.original_client.take();
+    }
+
     /// Close the bound candidate after its own Child was reaped: the exit
     /// must name the bind-time pid and birth, that identity must be gone and
     /// the released pool must own nothing. Only then is the exit journaled
@@ -5546,7 +5940,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         exit: super::RestoreCandidateExit,
         deadline: Instant,
     ) -> Result<(), RecoveryControlError> {
-        if candidate.sql.scram != StageResult::Acknowledged {
+        if candidate.sql.scram != StageResult::Acknowledged
+            || candidate.sql.artifacts != StageResult::Acknowledged
+        {
             return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
         }
         let deadline = stages.effect_before(deadline)?;
@@ -5752,9 +6148,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         .map_err(|_| invalid_candidate())?;
         let candidate = PendingRestoreCandidateAuthority {
             original_process: process,
-            program: program.program,
-            socket_directory,
-            data_directory: program.data_directory,
+            _program: program.program,
+            _socket_directory: socket_directory,
+            _data_directory: program.data_directory,
             data_path: program.data_path,
             startup: program.startup,
             socket_path: socket_dir.to_owned(),

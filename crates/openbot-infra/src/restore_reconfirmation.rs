@@ -136,6 +136,15 @@ impl OriginalReconfirmationRequest {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
+
+    pub(crate) fn for_current_local(
+        deadline: Instant,
+        cancel: CancellationToken,
+        request_id: Uuid,
+    ) -> Self {
+        Self { deadline, cancel, confirmation_id: Uuid::now_v7(), proof_ref: request_id,
+            confirmations_left: 1 }
+    }
 }
 #[cfg(feature = "server-runtime")]
 impl std::fmt::Debug for OriginalReconfirmationRequest {

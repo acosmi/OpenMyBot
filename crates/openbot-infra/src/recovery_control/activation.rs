@@ -339,6 +339,10 @@ impl ActivationBinding {
     pub(super) fn authorization_epoch(&self) -> &str {
         self.common().authorization_epoch
     }
+    #[cfg(feature = "desktop-local")]
+    pub(super) fn source_installation_id(&self) -> &str {
+        self.common().ids[3]
+    }
     /// Deployment and tenant IDs bound into this descriptor.
     pub(super) fn scope(&self) -> (&str, &str) {
         let ids = self.common().ids;
@@ -939,6 +943,7 @@ pub(super) struct ActivationObservation {
 pub(super) struct PublishedActivation {
     observation: std::sync::Arc<ActivationObservation>,
     _publication: super::journal::VerifiedPublication,
+    restore_plan: Option<CandidatePlan>,
 }
 
 impl ActivationRecord {
@@ -1189,6 +1194,7 @@ impl PublishedActivation {
     pub(super) fn bind(
         observation: std::sync::Arc<ActivationObservation>,
         publication: super::journal::VerifiedPublication,
+        restore_plan: Option<CandidatePlan>,
     ) -> Result<Self, RecoveryControlError> {
         publication.matches(&observation.record.control_id, &observation.digest)?;
         if !matches!(
@@ -1199,10 +1205,28 @@ impl PublishedActivation {
                 RecoveryControlFault::InitializationRequired,
             ));
         }
+        if let ActivationPayload::Current(current) = &observation.record.data {
+            let plan = restore_plan.as_ref().ok_or_else(invalid)?;
+            if let ActivationSiteBinding::LocalPhysical {
+                generation_id,
+                target_installation_id,
+                ..
+            } = &current.binding.site
+                && (plan.generation_id != *generation_id
+                    || plan.installation_id != *target_installation_id)
+            {
+                return Err(invalid());
+            }
+        }
         Ok(Self {
             observation,
             _publication: publication,
+            restore_plan,
         })
+    }
+
+    pub(super) fn restore_plan(&self) -> Option<&CandidatePlan> {
+        self.restore_plan.as_ref()
     }
 
     pub(super) fn binding(&self) -> &ActivationBinding {

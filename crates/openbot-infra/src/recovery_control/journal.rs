@@ -1241,6 +1241,7 @@ impl JournalObservation {
     /// followed by exactly one synced `PublishObserved` for that position.
     /// `OrdinaryInitializing.initJournalPrefix`: the record at that position is
     /// the operation's Fresh or Legacy `OperationIntent` naming this descriptor.
+    #[cfg(test)]
     pub(super) fn initializing_prefix_for(
         &self,
         reference: &super::activation::JournalPositionRef,

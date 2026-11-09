@@ -939,7 +939,6 @@ pub(crate) struct OpenedRestoredGeneration {
 pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
     runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
     site: RestoredLocalSite,
-    app_data_root: &std::path::Path,
     bundle: crate::postgres_sidecar::VerifiedPostgresBundle,
     store: &S,
     postgres_service: &crate::postgres_sidecar::ReviewedPostgresKeyStoreService,
@@ -954,7 +953,6 @@ pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecret
 > {
     let sidecar = crate::postgres_sidecar::PostgresSidecarSupervisor::start_restored_current(
         bundle,
-        app_data_root,
         &site,
         store,
         postgres_service,
@@ -995,7 +993,6 @@ pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecret
 pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
     runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
     site: RestoredLocalSite,
-    app_data_root: &std::path::Path,
     bundle: crate::postgres_sidecar::VerifiedPostgresBundle,
     store: &S,
     postgres_service: &crate::postgres_sidecar::ReviewedPostgresKeyStoreService,
@@ -1009,7 +1006,7 @@ pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecre
     ),
 > {
     let OpenedRestoredGeneration { data_plane, vault, pending } =
-        open_restored_generation(runtime, site, app_data_root, bundle, store, postgres_service, vault_service).await?;
+        open_restored_generation(runtime, site, bundle, store, postgres_service, vault_service).await?;
     let gate = runtime
         .current_restore_installation_before(data_plane.pool(), pending, std::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT)
         .await

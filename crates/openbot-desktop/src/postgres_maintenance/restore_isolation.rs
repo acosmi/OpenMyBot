@@ -40,7 +40,7 @@ pub(crate) enum IsolationFault {
 /// Raw IO remains available to the enclosing original owner; formatting is redacted.
 pub(crate) struct IsolationFailure {
     pub(crate) fault: IsolationFault,
-    pub(crate) original_io: Option<io::Error>,
+    pub(crate) _original_io: Option<io::Error>,
 }
 impl std::fmt::Debug for IsolationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,20 +52,20 @@ impl std::fmt::Debug for IsolationFailure {
 fn unproven() -> IsolationFailure {
     IsolationFailure {
         fault: IsolationFault::IsolationUnproven,
-        original_io: None,
+        _original_io: None,
     }
 }
 fn capacity() -> IsolationFailure {
     IsolationFailure {
         fault: IsolationFault::CapacityExceeded,
-        original_io: None,
+        _original_io: None,
     }
 }
 impl From<io::Error> for IsolationFailure {
     fn from(error: io::Error) -> Self {
         Self {
             fault: IsolationFault::IsolationUnproven,
-            original_io: Some(error),
+            _original_io: Some(error),
         }
     }
 }
@@ -152,28 +152,28 @@ impl<'a> RestoreIsolationPolicy<'a> {
         args: &[std::ffi::OsString],
     ) -> Result<Command, super::RestoreProgramFailure> {
         self.revalidate()
-            .map_err(super::RestoreProgramFailure::Isolation)?;
+            .map_err(|original| super::RestoreProgramFailure::Isolation { _original: original })?;
         let resource = bundle.root();
         for location in &self.excluded {
             let excluded = location.parent.path.join(location.component);
             if overlaps(resource, &excluded) {
-                return Err(super::RestoreProgramFailure::Isolation(unproven()));
+                return Err(super::RestoreProgramFailure::Isolation { _original: unproven() });
             }
         }
         if overlaps(resource, self.generation.root.path) {
-            return Err(super::RestoreProgramFailure::Isolation(unproven()));
+            return Err(super::RestoreProgramFailure::Isolation { _original: unproven() });
         }
         let executable = bundle.postgres();
         let profile = self
             .render(resource, executable)
-            .map_err(super::RestoreProgramFailure::Isolation)?;
+            .map_err(|original| super::RestoreProgramFailure::Isolation { _original: original })?;
         // Render first, then recheck the complete original authenticated program
         // and loader tree. The runner repeats directory identity checks at spawn.
         let verified = bundle
             .checked_command(PostgresProgram::Server)
-            .map_err(super::RestoreProgramFailure::Bundle)?;
+            .map_err(|original| super::RestoreProgramFailure::Bundle { _original: original })?;
         if verified.as_std().get_program() != executable.as_os_str() {
-            return Err(super::RestoreProgramFailure::Isolation(unproven()));
+            return Err(super::RestoreProgramFailure::Isolation { _original: unproven() });
         }
         let mut command = Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(profile).arg(executable).args(args);
@@ -504,10 +504,10 @@ mod tests {
         let mut command = policy
             .checked_postgres_command(&bundle, &[std::ffi::OsString::from("--version")])
             .unwrap_or_else(|error| match error {
-                super::super::RestoreProgramFailure::Isolation(error) => {
+                super::super::RestoreProgramFailure::Isolation { _original: error } => {
                     panic!("original policy command: {error:?}")
                 }
-                super::super::RestoreProgramFailure::Bundle(error) => {
+                super::super::RestoreProgramFailure::Bundle { _original: error } => {
                     panic!("original bundle command: {error:?}")
                 }
                 _ => panic!("unexpected pre-spawn failure in original policy command"),

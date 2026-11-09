@@ -21,9 +21,9 @@ use super::DesktopRestoreError;
 
 /// One authenticated release request. It is neither serializable nor a runtime authority.
 pub struct VerifiedRestoreEntry {
-    pub(super) control: RecoveryControl,
-    pub(super) intent: VerifiedRecoveryHostIntent,
-    pub(super) original: RestoreEntryInput,
+    pub(crate) control: RecoveryControl,
+    pub(crate) intent: VerifiedRecoveryHostIntent,
+    pub(crate) original: RestoreEntryInput,
 }
 
 impl std::fmt::Debug for VerifiedRestoreEntry {

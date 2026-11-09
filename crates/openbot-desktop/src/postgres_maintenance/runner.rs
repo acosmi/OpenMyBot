@@ -43,13 +43,13 @@ use restore_isolation::{IsolationFailure, RestoreIsolationPolicy};
 // original closed mapping; the restore owner additionally keeps native spawn IO.
 pub(crate) struct NativeSpawnFailure {
     fault: MaintenanceError,
-    original_io: Option<std::io::Error>,
+    _original_io: Option<std::io::Error>,
 }
 impl From<MaintenanceError> for NativeSpawnFailure {
     fn from(fault: MaintenanceError) -> Self {
         Self {
             fault,
-            original_io: None,
+            _original_io: None,
         }
     }
 }
@@ -57,17 +57,17 @@ impl From<std::io::Error> for NativeSpawnFailure {
     fn from(error: std::io::Error) -> Self {
         Self {
             fault: MaintenanceError::IoFailure,
-            original_io: Some(error),
+            _original_io: Some(error),
         }
     }
 }
 #[cfg(feature = "postgres-supervisor")]
 pub(crate) enum RestoreProgramFailure {
-    Isolation(IsolationFailure),
-    Bundle(PostgresSidecarError),
-    OriginalSpawn(NativeSpawnFailure),
-    Identity(wrok_bot_macos_process::ProcessObservationError),
-    ClosingGate(MaintenanceError),
+    Isolation { _original: IsolationFailure },
+    Bundle { _original: PostgresSidecarError },
+    OriginalSpawn { _original: NativeSpawnFailure },
+    Identity { _original: wrok_bot_macos_process::ProcessObservationError },
+    ClosingGate { _original: MaintenanceError },
     OriginalStopUnknown,
 }
 
@@ -83,6 +83,7 @@ pub(crate) struct RestoreProgramOwner {
         wrok_bot_macos_process::ProcessIdentity,
         wrok_bot_macos_process::ProcessObservationError,
     >,
+    birth: Result<[u8; 32], wrok_bot_macos_process::ProcessObservationError>,
     generation: [u64; 3],
     stop: Option<RestoreStopState>,
     post_directories: Result<(), IsolationFailure>,
@@ -112,9 +113,6 @@ impl RestoreProgramOwner {
         &self.post_software
     }
 
-    pub(crate) fn original_stop(&self) -> Option<&RestoreStopState> {
-        self.stop.as_ref()
-    }
 }
 
 // The full restore session/candidate/config producer is a separately registered
@@ -130,11 +128,11 @@ pub(crate) fn spawn_restore_program(
 ) -> Result<RestoreProgramOwner, RestoreProgramFailure> {
     let generation = policy
         .generation_identity()
-        .map_err(RestoreProgramFailure::Isolation)?;
+        .map_err(|original| RestoreProgramFailure::Isolation { _original: original })?;
     let command = policy.checked_postgres_command(bundle, authenticated_config_args)?;
     policy
         .revalidate()
-        .map_err(RestoreProgramFailure::Isolation)?;
+        .map_err(|original| RestoreProgramFailure::Isolation { _original: original })?;
     // This real sandbox-exec Command enters the original spawn body; no second
     // Child/pipe abstraction, optional sandbox or unisolated fallback is used.
     let original = spawn_program_retaining_io(
@@ -146,10 +144,11 @@ pub(crate) fn spawn_restore_program(
         limits,
         false,
     )
-    .map_err(RestoreProgramFailure::OriginalSpawn)?;
+    .map_err(|original| RestoreProgramFailure::OriginalSpawn { _original: original })?;
     // No fallible return drops a spawned Child. Capture failure remains resident
     // with that owner and cannot authorize another native request.
     let identity = wrok_bot_macos_process::ProcessIdentity::capture(original.pid);
+    let birth = identity.as_ref().map_err(|error| *error).and_then(|identity| identity.evidence_bytes());
     let post_software = bundle.checked_command(PostgresProgram::Server).map(|_| ());
     let post_directories = policy.revalidate();
     // Post-check failure stays WITH the original Child and raw identity outcome.
@@ -158,6 +157,7 @@ pub(crate) fn spawn_restore_program(
     Ok(RestoreProgramOwner {
         original,
         identity,
+        birth,
         generation,
         stop: None,
         post_directories,
@@ -178,25 +178,25 @@ pub(crate) fn request_restore_stop(
     if owner.original.role != "restore_postgres"
         || owner.original.child.id() != Some(owner.original.pid)
     {
-        return Err(RestoreProgramFailure::Identity(
-            wrok_bot_macos_process::ProcessObservationError::ObservationChanged,
-        ));
+        return Err(RestoreProgramFailure::Identity {
+            _original: wrok_bot_macos_process::ProcessObservationError::ObservationChanged,
+        });
     }
     owner
         .identity
         .as_ref()
-        .map_err(|error| RestoreProgramFailure::Identity(*error))?
+        .map_err(|error| RestoreProgramFailure::Identity { _original: *error })?
         .revalidate()
-        .map_err(RestoreProgramFailure::Identity)?;
+        .map_err(|original| RestoreProgramFailure::Identity { _original: original })?;
     let pid = i32::try_from(owner.original.pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
-        .ok_or(RestoreProgramFailure::Identity(
-            wrok_bot_macos_process::ProcessObservationError::InvalidPid,
-        ))?;
+        .ok_or(RestoreProgramFailure::Identity {
+            _original: wrok_bot_macos_process::ProcessObservationError::InvalidPid,
+        })?;
     clock
         .permit_closing_request()
-        .map_err(RestoreProgramFailure::ClosingGate)?;
+        .map_err(|original| RestoreProgramFailure::ClosingGate { _original: original })?;
     owner.stop = Some(RestoreStopState::Entered);
     let result = rustix::process::kill_process(pid, rustix::process::Signal::TERM)
         .map_err(std::io::Error::from);
@@ -215,11 +215,12 @@ pub(crate) fn request_restore_stop(
 pub(crate) struct RestoreProgramResult {
     tool: Result<ToolResult, MaintenanceError>,
     joins: RestorePipeJoins,
-    identity: Result<
+    _identity: Result<
         wrok_bot_macos_process::ProcessIdentity,
         wrok_bot_macos_process::ProcessObservationError,
     >,
-    generation: [u64; 3],
+    birth: Result<[u8; 32], wrok_bot_macos_process::ProcessObservationError>,
+    _generation: [u64; 3],
     stop: Option<RestoreStopState>,
     post_directories: Result<(), IsolationFailure>,
     post_software: Result<(), PostgresSidecarError>,
@@ -248,6 +249,45 @@ pub(crate) enum RestorePipeJoin {
 
 #[cfg(feature = "postgres-supervisor")]
 impl RestoreProgramResult {
+    /// Project only observations made by the original process and pipe owners.
+    /// This does not sample a new clock or turn a signal request into an exit.
+    #[cfg(feature = "desktop-launcher")]
+    pub(crate) fn candidate_exit(&self) -> Option<openbot_infra::backup::whole_pg_restore_stream::RestoreCandidateExit> {
+        use openbot_infra::recovery_control::{NativeExit, PipeJoin, ProcessStart};
+        let tool = self.tool.as_ref().ok()?;
+        let observation = &tool.observation;
+        if self.retained_error().is_some() || !observation.original_child_wait
+            || self.post_directories.is_err() || self.post_software.is_err()
+            || !matches!(self.stop, Some(RestoreStopState::Returned(Ok(()))))
+        { return None; }
+        let identity = self.birth.as_ref().ok()?;
+        let pid = u32::from_be_bytes(identity[..4].try_into().ok()?);
+        let (wait_pid, code, signal) = self.native_wait()?;
+        if pid != wait_pid { return None; }
+        let exit = match (code, signal) {
+            (Some(value), None) => NativeExit::Code { value },
+            (None, Some(value)) => NativeExit::Signal { value },
+            _ => return None,
+        };
+        let joined = observation.pipe_joins_observed_ns?;
+        let pipes = self.pipes().map(|pipe| match pipe {
+            RestorePipeJoin::Returned => PipeJoin::Returned { observed_ns: joined },
+            RestorePipeJoin::Panicked => PipeJoin::Panicked { observed_ns: joined },
+            RestorePipeJoin::JoinUnknown => PipeJoin::JoinUnknown,
+            RestorePipeJoin::Absent => PipeJoin::Null,
+        });
+        Some(openbot_infra::backup::whole_pg_restore_stream::RestoreCandidateExit {
+            pid,
+            start: ProcessStart {
+                seconds: u64::from_be_bytes(identity[4..12].try_into().ok()?),
+                nanos: u32::from_be_bytes(identity[12..16].try_into().ok()?).checked_mul(1000)?,
+            },
+            exit,
+            observed_ns: observation.wait_observed_ns?,
+            pipes,
+        })
+    }
+
     /// The original Child's pid, exit code and signal, only after its own wait.
     pub(crate) fn native_wait(&self) -> Option<(u32, Option<i32>, Option<i32>)> {
         let tool = self.tool.as_ref().ok()?;
@@ -307,6 +347,7 @@ pub(crate) async fn wait_restore_program(
     let RestoreProgramOwner {
         original,
         identity,
+        birth,
         generation,
         stop,
         post_directories,
@@ -320,8 +361,9 @@ pub(crate) async fn wait_restore_program(
     RestoreProgramResult {
         tool,
         joins,
-        identity,
-        generation,
+        _identity: identity,
+        birth,
+        _generation: generation,
         stop,
         post_directories,
         post_software,

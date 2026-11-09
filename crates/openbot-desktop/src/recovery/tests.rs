@@ -24,6 +24,39 @@ use super::{DesktopRestoreError, VerifiedRestoreEntry};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) struct PublicationTest {
+    read_only_root: Option<PathBuf>,
+    capacity: std::sync::Mutex<Vec<(openbot_infra::recovery_control::RestoreCapacityResource, openbot_infra::recovery_control::RestoreCapacityObservation)>>,
+}
+
+impl PublicationTest {
+    pub(super) fn before_publish(&self) {
+        if let Some(root) = &self.read_only_root {
+            fs::set_permissions(root, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+    }
+
+    pub(super) fn observe(&self, owner: &super::OwnedDesktopRestore) {
+        use openbot_infra::recovery_control::RestoreCapacityResource::*;
+        let mut observations = self.capacity.lock().unwrap();
+        assert!(observations.is_empty());
+        for resource in [InputWireBytes, ManifestBytes, MaterialFiles, MaterialDirectories,
+            SingleMaterialBytes, MaterialPlainBytes, PathBytes, PathDepth, CandidateDataBytes,
+            CandidateWalBytes, CandidateTempBytes, SpoolBytes, RetainedPriorBytes, JournalBytes,
+            JournalRecords, MetadataBytes, OpenFiles, NativeTasks, PgConnections, PgTransactions,
+            PgRows, ReconfirmRequirements, SecretMemoryBytes, SecretStructureBytes,
+            TotalAllocationBytes, KeyMediumAllocationBytes]
+        {
+            let observation = owner.capacity_observation(resource).expect("the original ledger remains available as DATA");
+            assert!(observation.admitted <= observation.limit, "{resource:?}");
+            assert!(observation.actual <= observation.limit, "{resource:?}");
+            eprintln!("restore_capacity {resource:?} admitted={} actual={} limit={}",
+                observation.admitted, observation.actual, observation.limit);
+            observations.push((resource, observation));
+        }
+    }
+}
+
 struct EntryFixture {
     root: PathBuf,
     release: PathBuf,
@@ -39,6 +72,10 @@ impl EntryFixture {
     }
 
     fn with_open_file_limit(max_open_files: u64) -> Self {
+        Self::with_entry_limits(max_open_files, 256 << 20)
+    }
+
+    fn with_entry_limits(max_open_files: u64, max_metadata_bytes: u64) -> Self {
         let root = std::env::current_dir()
             .unwrap()
             .canonicalize()
@@ -84,7 +121,7 @@ impl EntryFixture {
             max_open_files,
             // A bound candidate pays its oracle trees once (about 60 MB) and
             // each layout and history observation; T046-38 runs them all.
-            max_metadata_bytes: 256 << 20,
+            max_metadata_bytes,
             admission_ns: 30_000_000_000,
         };
         // Unexecuted inventory bytes exercise the real release verifier only;
@@ -367,6 +404,42 @@ fn t046_01_release_and_request_verify_without_business_grant() {
 }
 
 #[test]
+fn current_reconfirmation_request_is_closed_and_selects_the_local_os_owner() {
+    let fixture = EntryFixture::new();
+    let mut request = fixture.request_value();
+    request["purpose"] = json!("reconfirm_current_binding");
+    request.as_object_mut().unwrap().remove("profile");
+    request["trustedInputSelection"] = json!({"localSubject":"current_os_owner"});
+    request["limits"] = json!({"effectNs":30_000_000_000u64,"convergenceNs":10_000_000_000u64,"maxConfirmations":1});
+    // Current preserves the original source ID after a new-installation
+    // restore; both IDs match the real descriptor before enrollment.
+    fixture.write_request(&request);
+    let entry = fixture.entry().expect("closed Current request");
+    assert_eq!(entry.intent.purpose(), RecoveryRequestPurpose::ReconfirmCurrentBinding);
+    assert!(entry.intent.restore_profile().is_none());
+    drop(entry);
+    for (pointer, wrong) in [
+        ("/limits/maxConfirmations", json!(2)),
+        ("/limits/effectNs", json!(0)),
+        ("/limits/convergenceNs", json!(0)),
+        ("/trustedInputSelection/localSubject", json!("another_user")),
+    ] {
+        let mut invalid = request.clone();
+        *invalid.pointer_mut(pointer).unwrap() = wrong;
+        fixture.write_request(&invalid);
+        assert!(fixture.entry().is_err(), "{pointer}");
+    }
+    let mut cross_purpose = request.clone();
+    cross_purpose["trustedInputSelection"]["carrier"] = json!({"parent":fixture.root,"component":"carrier"});
+    fixture.write_request(&cross_purpose);
+    assert!(fixture.entry().is_err());
+    request.as_object_mut().unwrap().remove("limits");
+    fixture.write_request(&request);
+    assert!(fixture.entry().is_err());
+    fixture.assert_no_operation_or_application();
+}
+
+#[test]
 fn malformed_entry_refuses_before_claim_and_keeps_the_request() {
     for case in ["unknown", "duplicate", "oversized"] {
         let fixture = EntryFixture::new();
@@ -393,7 +466,7 @@ fn malformed_entry_refuses_before_claim_and_keeps_the_request() {
 }
 
 #[test]
-fn t046_02_entry_negative_components_preserve_original_requests_and_operations() {
+fn t046_02_unknown_duplicate_oversize_or_replaced_request_is_rejected() {
     use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, Instant};
     use openbot_infra::recovery_control::{OwnedRecoveryRequestFile, RecoveryControl, RecoveryControlFault, VerifiedRecoveryHost};
@@ -1042,14 +1115,7 @@ async fn t046_08_run() {
     }
     let adopt = || {
         fixture.write_request(&request);
-        let input = super::input::RestoreEntryInput::from_release(
-            &mut fixture.release(),
-            &std::env::current_exe().unwrap(),
-            &fixture.request,
-        )
-        .unwrap();
-        site.config(fixture.host.clone())
-            .with_recovery_request(input)
+        fixture.entry().unwrap()
     };
 
     // (c) A retained restore staging operation in the control root refuses the
@@ -1058,7 +1124,7 @@ async fn t046_08_run() {
         .join("operations")
         .join("5aa1e5aa1e5aa1e5aa1e5aa1e5aa1e5a");
     DirBuilder::new().mode(0o700).create(&staging).unwrap();
-    match execute_local_legacy_adoption(app(), adopt()).await {
+    match execute_local_legacy_adoption(app(), site.config(fixture.host.clone()), adopt()).await {
         Err(DesktopLocalRuntimeError::RecoveryControl(error)) => {
             assert_eq!(error.fault(), RecoveryControlFault::InitializationRequired)
         }
@@ -1070,7 +1136,7 @@ async fn t046_08_run() {
 
     // (b) The adopt request publishes the latest Active and writes the runtime
     // receipt before returning.
-    execute_local_legacy_adoption(app(), adopt()).await.unwrap();
+    execute_local_legacy_adoption(app(), site.config(fixture.host.clone()), adopt()).await.unwrap();
     let head = local_head(&control);
     assert_eq!(head["phase"], "OrdinaryActive");
     assert_eq!(head["revision"], 2, "OrdinaryInitializing is revision 1");
@@ -1770,6 +1836,7 @@ async fn t046_38_scram_rotation_acknowledges_new_password_and_rejects_old() {
             .await
             .expect("closed history ACK2");
         let store = SlotMemoryStore::default();
+        candidate.restore_artifacts(&mut session, deadline).await.expect("captured artifact root placed and rebound");
         candidate.install_target_slots(&mut session, &store).expect("both target slots matched");
         let socket = candidate.socket_directory().expect("held UDS").1.to_owned();
         let old = candidate.staging().authenticated_secrets().postgres_scram().expose().to_vec();
@@ -1868,6 +1935,377 @@ async fn t046_38_scram_rotation_acknowledges_new_password_and_rejects_old() {
     let _ = fs::remove_dir_all(&bundle_root);
 }
 
+struct ArtifactCommitRelay {
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    remaining: std::sync::Arc<AtomicU64>,
+    updates: std::sync::Arc<AtomicU64>,
+    dropped: std::sync::Arc<AtomicU64>,
+    statements: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ArtifactCommitRelay {
+    async fn start(socket: &std::path::Path) -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let real = socket.join(".s.PGSQL.1");
+        let exposed = socket.join(".s.PGSQL.5432");
+        fs::rename(&exposed, &real).unwrap();
+        let listener = tokio::net::UnixListener::bind(&exposed).unwrap();
+        fs::set_permissions(&exposed, fs::Permissions::from_mode(0o600)).unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let remaining = Arc::new(AtomicU64::new(0));
+        let updates = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let statements = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let state = (armed.clone(), remaining.clone(), updates.clone(), dropped.clone(), statements.clone());
+        let task = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            loop {
+                let client = tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => accepted.unwrap().0,
+                };
+                let server = tokio::net::UnixStream::connect(&real).await.unwrap();
+                let (armed, remaining, updates, dropped, statements) = state.clone();
+                children.spawn(async move {
+                    let (mut cr, mut cw) = client.into_split();
+                    let (mut sr, mut sw) = server.into_split();
+                    let frontend = async {
+                        // NoTls uses one length-prefixed startup packet, then
+                        // regular typed messages. Never record bind/auth bytes.
+                        let length = cr.read_u32().await?;
+                        if !(4..=16 * 1024 * 1024).contains(&length) { return Err(std::io::Error::other("invalid owned startup frame")); }
+                        let mut payload = vec![0; (length - 4) as usize];
+                        cr.read_exact(&mut payload).await?;
+                        sw.write_u32(length).await?;
+                        sw.write_all(&payload).await?;
+                        loop {
+                            let kind = cr.read_u8().await?;
+                            let length = cr.read_u32().await?;
+                            if !(4..=16 * 1024 * 1024).contains(&length) { return Err(std::io::Error::other("invalid owned frontend frame")); }
+                            payload.resize((length - 4) as usize, 0);
+                            cr.read_exact(&mut payload).await?;
+                            if armed.load(Ordering::SeqCst) && matches!(kind, b'P' | b'Q') {
+                                let start = if kind == b'P' { payload.iter().position(|b| *b == 0).unwrap() + 1 } else { 0 };
+                                let end = payload[start..].iter().position(|b| *b == 0).unwrap() + start;
+                                let sql = std::str::from_utf8(&payload[start..end]).unwrap();
+                                let mut trace = statements.lock().unwrap();
+                                assert!(trace.len() < 64);
+                                trace.push(sql.to_owned());
+                            }
+                            sw.write_u8(kind).await?;
+                            sw.write_u32(length).await?;
+                            sw.write_all(&payload).await?;
+                        }
+                    };
+                    let backend = async {
+                        loop {
+                            let kind = sr.read_u8().await?;
+                            let length = sr.read_u32().await?;
+                            if !(4..=16 * 1024 * 1024).contains(&length) { return Err(std::io::Error::other("invalid owned backend frame")); }
+                            let mut payload = vec![0; (length - 4) as usize];
+                            sr.read_exact(&mut payload).await?;
+                            if armed.load(Ordering::SeqCst) && kind == b'C' {
+                                if payload == b"UPDATE 1\0" { updates.fetch_add(1, Ordering::SeqCst); }
+                                if payload == b"COMMIT\0" && remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)) == Ok(1) {
+                                    dropped.fetch_add(1, Ordering::SeqCst);
+                                    // PostgreSQL has committed; the original caller
+                                    // receives neither CommandComplete nor ReadyForQuery.
+                                    return Ok::<(), std::io::Error>(());
+                                }
+                            }
+                            cw.write_u8(kind).await?;
+                            cw.write_u32(length).await?;
+                            cw.write_all(&payload).await?;
+                        }
+                    };
+                    tokio::select! { result = frontend => result, result = backend => result }
+                });
+            }
+            drop(listener);
+            while let Some(joined) = children.join_next().await {
+                let _transport_result = joined.expect("original relay task joined");
+            }
+        });
+        Self { armed, remaining, updates, dropped, statements, stop: Some(stop), task: Some(task) }
+    }
+
+    async fn close(mut self) {
+        self.stop.take().unwrap().send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.task.take().unwrap())
+            .await.expect("original relay converged").expect("original relay joined");
+    }
+}
+
+impl Drop for ArtifactCommitRelay {
+    fn drop(&mut self) {
+        // A failed fixture never reports this cancellation as a successful join.
+        if let Some(task) = &self.task { task.abort(); }
+    }
+}
+
+#[test]
+#[ignore = "explicit task CAR and real isolated PostgreSQL 17.11; actual COMMIT ACK loss over owned UDS"]
+fn artifact_rebind_rejects_mismatched_source_and_never_repeats_unknown_commit() {
+    crate::testing::on_large_stack(artifact_rebind_faults_run);
+}
+
+async fn artifact_rebind_faults_run() {
+    use super::candidate::CandidateGeneration;
+    use openbot_infra::backup::whole_pg_restore_stream::{RestoredClosedHistoryRequest, verify_whole_pg_restore_input};
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant};
+    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+    let (bundle_root, digest) = crate::postgres_sidecar::materialize_host_postgres_bundle(&bin_dir);
+    let bundle = crate::postgres_sidecar::VerifiedPostgresBundle::open(&bundle_root, digest, &crate::postgres_sidecar::signing_identity()).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    for mismatch in [true, false] {
+        let short = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(".wb046-{}", &uuid::Uuid::now_v7().simple().to_string()[20..]));
+        DirBuilder::new().mode(0o700).create(&short).unwrap();
+        std::env::set_current_dir(&short).unwrap();
+        let fixture = EntryFixture::with_entry_limits(4096, 384 << 20);
+        std::env::set_current_dir(&cwd).unwrap();
+        s23_car_request(&fixture);
+        let mut request: Value = serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+        for (field, value) in [
+            ("maxMetadataBytes", 384u64 << 20), ("maxPgConnections", 64), ("maxPgTransactions", 63),
+            ("maxPgRows", 1 << 20), ("maxReconfirmRequirements", 4096), ("maxJournalRecords", 128), ("maxNativeTasks", 32),
+        ] { request["profile"]["capacity"][field] = json!(value); }
+        let profile = serde_json::from_value(request["profile"].clone()).unwrap();
+        fixture.write_request(&request);
+        let VerifiedRestoreEntry { mut control, intent, original: _original } = fixture.entry().unwrap();
+        let mut session = control.claim_restore(intent, profile).unwrap();
+        let operation = session.operation_id().to_owned();
+        let (input, intent) = session.frozen_input().unwrap();
+        let staging = verify_whole_pg_restore_input(input, intent, &mut session).await
+            .unwrap_or_else(|failure| panic!("source authentication: {:?}", failure.fault()));
+        let mut candidate = CandidateGeneration::new(staging);
+        candidate.prepare_directories(&mut session).unwrap();
+        candidate.prepare_postgres(&mut session).unwrap();
+        candidate.start_postgres(&mut session, &bundle).unwrap();
+        let deadline = candidate.effect_deadline().unwrap();
+        while !fs::read_to_string(candidate.data_directory().unwrap().1.join("postmaster.pid"))
+            .is_ok_and(|text| text.lines().nth(7).map(str::trim) == Some("ready"))
+        {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let socket = candidate.socket_directory().unwrap().1.to_owned();
+        let relay = ArtifactCommitRelay::start(&socket).await;
+        candidate.bind_postgres(&mut session, &bundle).await.unwrap();
+        session.upgrade_candidate_schema_before(deadline).await.unwrap();
+        session.retire_cohort_before(deadline).await.unwrap();
+        session.clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline)).await.unwrap();
+        let mut config = tokio_postgres::Config::new();
+        config.host_path(&socket).port(1).user("desktop_admin")
+            .dbname(openbot_infra::db::desktop_local::APPLICATION_DATABASE)
+            .password(candidate.staging().authenticated_secrets().postgres_scram().expose());
+        let (admin, driver) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let driver = tokio::spawn(driver);
+        if mismatch {
+            admin.batch_execute("BEGIN; ALTER TABLE openbot_internal.artifact_store_bindings DISABLE TRIGGER artifact_store_bindings_append_only").await.unwrap();
+            admin.execute("UPDATE openbot_internal.artifact_store_bindings SET store_id=$1", &[&uuid::Uuid::now_v7().to_string()]).await.unwrap();
+            admin.batch_execute("ALTER TABLE openbot_internal.artifact_store_bindings ENABLE TRIGGER artifact_store_bindings_append_only; COMMIT").await.unwrap();
+        }
+        let before = admin.query_one("SELECT store_id,root_device,root_inode,root_uid FROM openbot_internal.artifact_store_bindings", &[]).await.unwrap();
+        relay.remaining.store(if mismatch { 0 } else { 2 }, Ordering::SeqCst);
+        relay.armed.store(true, Ordering::SeqCst);
+        let outcome = candidate.restore_artifacts(&mut session, deadline).await;
+        let generation = fixture.root.join("new-generation");
+        let control_root = fixture.root.join("com.acosmi.wrokbot.restore-control");
+        if mismatch {
+            assert_eq!(outcome, Err(DesktopRestoreError::InputInvalid));
+            assert!(!generation.join("artifacts").exists());
+            assert_eq!(relay.updates.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(outcome, Err(DesktopRestoreError::DatabaseUnknown));
+            assert_eq!(relay.dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(relay.updates.load(Ordering::SeqCst), 1, "the real backend updated exactly one row");
+            let records = local_journal(&control_root, &operation);
+            assert_eq!(candidate.restore_artifacts(&mut session, deadline).await, Err(DesktopRestoreError::DatabaseUnknown));
+            assert_eq!(local_journal(&control_root, &operation), records, "re-entry observes without a new stage");
+            assert_eq!(relay.updates.load(Ordering::SeqCst), 1, "no second physical update");
+            let trace = relay.statements.lock().unwrap();
+            let disable = trace.iter().position(|sql| sql == "ALTER TABLE openbot_internal.artifact_store_bindings DISABLE TRIGGER artifact_store_bindings_append_only").unwrap();
+            let begin = trace[..disable].iter().rposition(|sql| sql.starts_with("START TRANSACTION")).unwrap();
+            let commit = trace[disable..].iter().position(|sql| sql == "COMMIT").unwrap() + disable;
+            assert!(trace[begin].contains("READ COMMITTED") && !trace[begin].contains("READ ONLY"));
+            let writes: Vec<_> = trace[begin + 1..commit].iter().filter(|sql| {
+                ["ALTER", "UPDATE", "INSERT", "DELETE", "CREATE", "TRUNCATE"].iter().any(|prefix| sql.starts_with(prefix))
+            }).collect();
+            assert_eq!(writes.len(), 3, "only disable, the one tuple update and enable");
+            assert!(writes[1].starts_with("UPDATE openbot_internal.artifact_store_bindings SET root_device="));
+            assert_eq!(writes[2].as_str(), "ALTER TABLE openbot_internal.artifact_store_bindings ENABLE TRIGGER artifact_store_bindings_append_only");
+        }
+        let after = admin.query_one("SELECT store_id,root_device,root_inode,root_uid,(SELECT tgenabled='O' FROM pg_catalog.pg_trigger WHERE tgrelid='openbot_internal.artifact_store_bindings'::regclass AND tgname='artifact_store_bindings_append_only') FROM openbot_internal.artifact_store_bindings", &[]).await.unwrap();
+        assert_eq!(after.get::<_, String>(0), before.get::<_, String>(0));
+        assert!(after.get::<_, bool>(4), "the dedicated transaction restored the trigger");
+        if mismatch {
+            for index in 1..4 { assert_eq!(after.get::<_, String>(index), before.get::<_, String>(index)); }
+        } else {
+            let root = fs::metadata(generation.join("artifacts")).unwrap();
+            assert_eq!([after.get::<_, String>(1), after.get(2), after.get(3)],
+                [root.dev().to_string(), root.ino().to_string(), root.uid().to_string()]);
+        }
+        assert_eq!(local_head(&control_root)["phase"], "RestorePending");
+        drop(admin);
+        driver.await.unwrap().unwrap();
+        session.abandon_candidate_connections();
+        candidate.request_stop().unwrap();
+        let mut owner = Some(session);
+        candidate.begin_wait(&mut owner).unwrap();
+        let _pending = tokio::time::timeout(Duration::from_secs(30), candidate.observe_wait()).await.expect("original Child converged");
+        relay.close().await;
+        drop(candidate);
+        drop(control);
+        let original_records = local_journal(&control_root, &operation);
+        let mut release = fixture.release();
+        release.postgres = crate::postgres_sidecar::VerifiedPostgresBundle::open(&bundle_root, digest, &crate::postgres_sidecar::signing_identity()).unwrap();
+        release.restore_test_store = Some(std::sync::Arc::new(SlotMemoryStore::default()));
+        assert_eq!(super::run_restore_request(release, &fixture.request,
+            CurrentOsUserAppDataRoot::from_current_os_user_app_data(&fixture.app).unwrap(),
+            || panic!("a reopened Pending operation has no native confirmation"),
+        ).await.expect("reopened operation stays read-only"), super::RestoreExecutionObservation::Pending);
+        assert_eq!(local_journal(&control_root, &operation), original_records);
+        drop(fixture);
+        fs::remove_dir_all(short).unwrap();
+    }
+    fs::remove_dir_all(bundle_root).unwrap();
+}
+
+#[test]
+#[ignore = "explicit task CAR and real isolated PostgreSQL 17.11; in-memory OS store only"]
+fn t046_14_new_installation_restore_keeps_business_ids() {
+    crate::testing::on_large_stack(t046_14_run);
+}
+
+async fn t046_14_run() {
+    use std::sync::Arc;
+    use super::{RestoreExecutionObservation, run_restore_request};
+    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+    let (bundle_root, digest) = crate::postgres_sidecar::materialize_host_postgres_bundle(&bin_dir);
+    let bundle = || crate::postgres_sidecar::VerifiedPostgresBundle::open(
+        &bundle_root, digest, &crate::postgres_sidecar::signing_identity(),
+    ).unwrap();
+    let original_cwd = std::env::current_dir().unwrap();
+    let short = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join(format!(".wb046-{}", &uuid::Uuid::now_v7().simple().to_string()[20..]));
+    DirBuilder::new().mode(0o700).create(&short).unwrap();
+    std::env::set_current_dir(&short).unwrap();
+    let fixture = EntryFixture::with_entry_limits(4096, 384 << 20);
+    std::env::set_current_dir(&original_cwd).unwrap();
+    s23_car_request(&fixture);
+    let mut request: Value = serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+    // This complete driver also pays the two artifact-binding transactions;
+    // choose its finite budget before the operation, never after a rejection.
+    for (field, value) in [
+        ("maxMetadataBytes", 384u64 << 20), ("maxPgConnections", 64), ("maxPgTransactions", 63),
+        ("maxPgRows", 1 << 20), ("maxReconfirmRequirements", 4096), ("maxJournalRecords", 128),
+        ("maxNativeTasks", 32),
+    ] { request["profile"]["capacity"][field] = json!(value); }
+    fixture.write_request(&request);
+    assert_ne!(request["expectedSourceInstallationId"], request["expectedTargetInstallationId"]);
+    let store = Arc::new(SlotMemoryStore::default());
+    let release = || {
+        let mut release = fixture.release();
+        release.postgres = bundle();
+        release.restore_test_store = Some(store.clone());
+        release
+    };
+    let actual = || CurrentOsUserAppDataRoot::from_current_os_user_app_data(&fixture.app).unwrap();
+    let release_input = release();
+    let request_path = fixture.request.clone();
+    let actual_root = actual();
+    // The fixture is prepared on the larger test stack, but the production
+    // restore future is polled by a default Tokio worker, as in the launcher.
+    let restored = tokio::spawn(async move {
+        run_restore_request(release_input, &request_path, actual_root, || {
+            panic!("a restore must not request a native confirmation or fabricate an AppHandle")
+        }).await
+    }).await.expect("the original restore worker joined");
+    assert_eq!(restored.expect("the complete production restore driver"), RestoreExecutionObservation::Current);
+    let control = fixture.root.join("com.acosmi.wrokbot.restore-control");
+    let head = local_head(&control);
+    assert_eq!(head["phase"], "RestoreCurrent");
+    let binding = &head["data"]["binding"];
+    for (field, expected) in [
+        ("deploymentId", "expectedDeploymentId"), ("tenantId", "expectedTenantId"),
+        ("datasetId", "expectedDatasetId"), ("sourceInstallationId", "expectedSourceInstallationId"),
+        ("targetInstallationId", "expectedTargetInstallationId"),
+    ] { assert_eq!(binding[field], request[expected], "{field}"); }
+    let operation = request["requestId"].as_str().unwrap();
+    let records = local_journal(&control, operation);
+    let activation = fs::read(control.join("activation-v1")).unwrap();
+    assert_eq!(run_restore_request(release(), &fixture.request, actual(), || {
+        panic!("same-operation observation must not invoke native confirmation")
+    }).await.expect("same request reopens only its completed journal"), RestoreExecutionObservation::Current);
+    assert_eq!(fs::read(control.join("activation-v1")).unwrap(), activation);
+    assert_eq!(local_journal(&control, operation), records, "re-entry writes no stage or epoch");
+    assert_eq!(fs::read_dir(control.join("operations")).unwrap().count(), 1);
+    drop(fixture);
+    fs::remove_dir_all(short).unwrap();
+    fs::remove_dir_all(bundle_root).unwrap();
+}
+
+#[test]
+#[ignore = "explicit task CAR and real isolated PostgreSQL 17.11; actual publication write denial"]
+fn restore_publication_write_failure_stays_pending_on_reentry() {
+    crate::testing::on_large_stack(restore_publication_failure_run);
+}
+
+async fn restore_publication_failure_run() {
+    use std::sync::Arc;
+    let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+    let (bundle_root, digest) = crate::postgres_sidecar::materialize_host_postgres_bundle(&bin_dir);
+    let bundle = || crate::postgres_sidecar::VerifiedPostgresBundle::open(&bundle_root, digest, &crate::postgres_sidecar::signing_identity()).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let short = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(".wb046-{}", &uuid::Uuid::now_v7().simple().to_string()[20..]));
+    DirBuilder::new().mode(0o700).create(&short).unwrap();
+    std::env::set_current_dir(&short).unwrap();
+    let fixture = EntryFixture::with_entry_limits(4096, 384 << 20);
+    std::env::set_current_dir(&cwd).unwrap();
+    s23_car_request(&fixture);
+    let mut request: Value = serde_json::from_slice(&fs::read(&fixture.request).unwrap()).unwrap();
+    request["purpose"] = json!("restore_same_installation");
+    request["expectedTargetInstallationId"] = request["expectedSourceInstallationId"].clone();
+    for (field, value) in [
+        ("maxMetadataBytes", 384u64 << 20), ("maxPgConnections", 64), ("maxPgTransactions", 63),
+        ("maxPgRows", 1 << 20), ("maxReconfirmRequirements", 4096), ("maxJournalRecords", 128), ("maxNativeTasks", 32),
+    ] { request["profile"]["capacity"][field] = json!(value); }
+    fixture.write_request(&request);
+    let root = fixture.root.join("com.acosmi.wrokbot.restore-control");
+    let publication = Arc::new(PublicationTest { read_only_root: Some(root.clone()), capacity: Default::default() });
+    let store = Arc::new(SlotMemoryStore::default());
+    let release = || {
+        let mut release = fixture.release();
+        release.postgres = bundle();
+        release.restore_test_store = Some(store.clone());
+        release
+    };
+    let mut first = release();
+    first.restore_test_publication = Some(publication.clone());
+    let actual = || CurrentOsUserAppDataRoot::from_current_os_user_app_data(&fixture.app).unwrap();
+    let outcome = super::run_restore_request(first, &fixture.request, actual(), || panic!("restore has no native confirmation")).await;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(outcome.is_err(), "the real 0500 control root refuses publication");
+    assert_eq!(local_head(&root)["phase"], "RestorePending");
+    assert_eq!(publication.capacity.lock().unwrap().len(), 26, "the full driver reached publication after its actual original wait");
+    assert!(!fixture.root.join("new-generation/data/postmaster.pid").exists(), "the original candidate was reaped");
+    let records = local_journal(&root, request["requestId"].as_str().unwrap());
+    let head = fs::read(root.join("activation-v1")).unwrap();
+    assert_eq!(super::run_restore_request(release(), &fixture.request, actual(), || panic!("read-only re-entry has no native confirmation"))
+        .await.unwrap(), super::RestoreExecutionObservation::Pending);
+    assert_eq!(fs::read(root.join("activation-v1")).unwrap(), head);
+    assert_eq!(local_journal(&root, request["requestId"].as_str().unwrap()), records);
+    drop(fixture);
+    fs::remove_dir_all(short).unwrap();
+    fs::remove_dir_all(bundle_root).unwrap();
+}
+
 /// A narrow private stand-in for the original native confirmation owner, for
 /// T046-35 only. It confirms at most once and reports the two clocks of that
 /// confirmation; it opens no window and holds no authority. It is not an OS
@@ -1934,10 +2372,10 @@ async fn t046_35_run() {
     };
     use openbot_infra::auth::single_user::desktop_local::DesktopLocalAuthorityStore;
     use openbot_infra::backup::whole_pg_restore_stream::{
-        RestoreCandidateExit, RestoredClosedHistoryRequest, verify_whole_pg_restore_input,
+        RestoredClosedHistoryRequest, verify_whole_pg_restore_input,
     };
     use openbot_infra::recovery_control::{
-        NativeExit, PipeJoin, ProcessStart, RecoveryControl, RecoveryControlConfig, RuntimeOwner,
+        RecoveryControl, RecoveryControlConfig, RuntimeOwner,
     };
     use openbot_infra::restore_reconfirmation::CancellationToken;
     use std::sync::Arc;
@@ -1993,14 +2431,13 @@ async fn t046_35_run() {
         .await
         .expect("closed history ACK2");
     let store = Arc::new(SlotMemoryStore::default());
+    candidate.restore_artifacts(&mut session, deadline).await.expect("captured artifact root placed and rebound");
     candidate.install_target_slots(&mut session, &*store).expect("both target slots matched");
     let scram = candidate.rotate_candidate_scram(&mut session, deadline).await.expect("SCRAM change acknowledged");
     let readbacks = candidate
         .verify_target_installation(&mut session, deadline)
         .await
         .expect("installation read back under the new slot keys");
-    let pid = candidate.original_program().and_then(|program| program.original_child().id()).unwrap();
-    let startup = wrok_bot_macos_process::ProcessIdentity::capture(pid).unwrap().evidence_bytes().unwrap();
     candidate.release_candidate(&mut session, deadline).await.expect("candidate clients released");
     candidate.request_stop().expect("one original TERM");
     let mut owned = Some(session);
@@ -2010,17 +2447,8 @@ async fn t046_35_run() {
         .expect("same Child reaped")
         .expect("smart shutdown completed");
     let mut session = candidate.take_wait_session().expect("original session returned");
-    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    let exit = RestoreCandidateExit {
-        pid: u32::from_be_bytes(startup[..4].try_into().unwrap()),
-        start: ProcessStart {
-            seconds: u64::from_be_bytes(startup[4..12].try_into().unwrap()),
-            nanos: u32::from_be_bytes(startup[12..16].try_into().unwrap()) * 1000,
-        },
-        exit: NativeExit::Code { value: 0 },
-        observed_ns: now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64,
-        pipes: [PipeJoin::Null, PipeJoin::Null, PipeJoin::Null],
-    };
+    let exit = candidate.program_result().and_then(|result| result.candidate_exit())
+        .expect("original birth, Child wait and real pipe joins");
     session
         .publish_restore_current_before(scram, readbacks, exit, deadline)
         .await
@@ -2030,10 +2458,10 @@ async fn t046_35_run() {
     drop(control);
     assert_eq!(local_head(&fixture.root.join("com.acosmi.wrokbot.restore-control"))["phase"], "RestoreCurrent");
 
-    // The published generation is the app-data root Local starts from next;
-    // it shares the original control root beside it.
+    // The Manager keeps its original app-data leaf. Current selects the
+    // separately published generation from the original verified journal.
     let generation = fixture.root.join("new-generation");
-    let app = || CurrentOsUserAppDataRoot::from_current_os_user_app_data(&generation).unwrap();
+    let app = || CurrentOsUserAppDataRoot::from_current_os_user_app_data(&fixture.app).unwrap();
     let bootstrap = fixture.release().recovery.clone().expect("release recovery control");
     let owners = [
         RuntimeOwner::PostgresSidecar,
@@ -2055,7 +2483,6 @@ async fn t046_35_run() {
             )
             .expect("the Current head enrolls a runtime")
     };
-    let entry = || OwnedVerifiedCurrentReconfirmationEntry::new(app(), runtime()).expect("a restored Current entry");
     let dist = crate::postgres_sidecar::materialize_desktop_dist();
     let startup = || {
         let release = DesktopLocalReleaseInput::new(
@@ -2090,37 +2517,58 @@ async fn t046_35_run() {
         "an unconfirmed Current opens nothing: {refused:?}"
     );
 
-    let reconfirm = |native: StandInConfirmation, cancel: CancellationToken| {
+    let reconfirm = |native: StandInConfirmation, cancel: CancellationToken, request_id: uuid::Uuid| {
         let mut release = fixture.release();
         release.postgres = bundle();
-        let effect = Instant::now() + Duration::from_secs(60);
-        let request =
-            OriginalLocalConfirmationRequest::new(native, effect, effect + Duration::from_secs(20), cancel).unwrap();
+        let mut current = request.clone();
+        current.as_object_mut().unwrap().remove("profile");
+        current["purpose"] = json!("reconfirm_current_binding");
+        current["requestId"] = json!(request_id.simple().to_string());
+        current["trustedInputSelection"] = json!({"localSubject":"current_os_owner"});
+        current["limits"] = json!({"effectNs":60_000_000_000u64,"convergenceNs":10_000_000_000u64,"maxConfirmations":1});
+        let path = fixture.root.join("requests").join(format!("current-{}.json", request_id.simple()));
+        fs::write(&path, serde_json::to_vec(&current).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut original = RestoreEntryInput::new();
+        let (control, intent) = original.verify(&mut release, app(), &std::env::current_exe().unwrap(), &path).unwrap();
+        let mut verified = VerifiedRestoreEntry { control, intent, original };
+        let (runtime, sql, convergence) = verified.control.enter_current_reconfirmation(
+            &mut verified.intent, &DesktopLocalAuthorityStore::new(app()), &owners, cancel.clone(),
+        ).expect("the closed Current request selects the actual source and target");
+        assert!(verified.control.enter_current_reconfirmation(
+            &mut verified.intent, &DesktopLocalAuthorityStore::new(app()), &owners, cancel.clone(),
+        ).is_err(), "the original request is consumed once");
+        let entry = OwnedVerifiedCurrentReconfirmationEntry::new(app(), runtime).unwrap();
+        let request = OriginalLocalConfirmationRequest::new(native, sql.deadline(), convergence, cancel, sql).unwrap();
         let store = store.clone();
-        let entry = entry();
-        async move { release.reconfirm_restored_local_owner_for_test(entry, request, &*store).await }
+        async move {
+            let result = release.reconfirm_restored_local_owner_for_test(entry, request, &*store).await;
+            drop(verified);
+            result
+        }
     };
     // A cancelled request, a session change, a confirmation already used and
     // a wall clock ahead of the request each write no receipt.
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert_eq!(
-        reconfirm(StandInConfirmation::new(), cancel).await.unwrap_err(),
+        reconfirm(StandInConfirmation::new(), cancel, uuid::Uuid::now_v7()).await.unwrap_err(),
         DesktopRestoreError::OwnerLost,
         "cancelled"
     );
     let mut changed = StandInConfirmation::new();
     changed.session_changed = true;
-    assert_eq!(reconfirm(changed, CancellationToken::new()).await.unwrap_err(), DesktopRestoreError::OwnerLost);
+    assert_eq!(reconfirm(changed, CancellationToken::new(), uuid::Uuid::now_v7()).await.unwrap_err(), DesktopRestoreError::OwnerLost);
     let mut used = StandInConfirmation::new();
     used.used = true;
-    assert_eq!(reconfirm(used, CancellationToken::new()).await.unwrap_err(), DesktopRestoreError::EntryInvalid);
+    assert_eq!(reconfirm(used, CancellationToken::new(), uuid::Uuid::now_v7()).await.unwrap_err(), DesktopRestoreError::EntryInvalid);
     let mut ahead = StandInConfirmation::new();
     ahead.wall_skew = Duration::from_secs(3_600);
-    assert_eq!(reconfirm(ahead, CancellationToken::new()).await.unwrap_err(), DesktopRestoreError::OwnerLost);
+    assert_eq!(reconfirm(ahead, CancellationToken::new(), uuid::Uuid::now_v7()).await.unwrap_err(), DesktopRestoreError::OwnerLost);
     // One confirmation of the real Current, both clocks inside the request:
     // the Local actor's fresh_local_os receipt and its audit commit together.
-    let fact = reconfirm(StandInConfirmation::new(), CancellationToken::new())
+    let confirmation_request_id = uuid::Uuid::now_v7();
+    let fact = reconfirm(StandInConfirmation::new(), CancellationToken::new(), confirmation_request_id)
         .await
         .expect("one confirmed request writes its receipt");
 
@@ -2131,7 +2579,6 @@ async fn t046_35_run() {
     let (installation, prepared, vault) = crate::desktop_local_bootstrap::open_current_installation(
         &mut runtime,
         site,
-        generation.as_path(),
         bundle(),
         store.as_ref(),
         &crate::postgres_sidecar::ReviewedPostgresKeyStoreService::from_reviewed_release(POSTGRES_KEY_STORE_SERVICE)
@@ -2146,7 +2593,7 @@ async fn t046_35_run() {
     let client = prepared.pool().get().await.unwrap();
     let receipts = client
         .query(
-            "SELECT confirmation_id, confirmed_by, proof_kind FROM openbot_internal.restore_reconfirm_receipts r
+            "SELECT confirmation_id, confirmed_by, proof_kind, proof_ref FROM openbot_internal.restore_reconfirm_receipts r
               JOIN openbot_internal.restore_reconfirm_requirements q USING (requirement_id)
              WHERE q.source_kind='subject'",
             &[],
@@ -2157,6 +2604,7 @@ async fn t046_35_run() {
     assert_eq!(receipts[0].get::<_, uuid::Uuid>(0), fact.confirmation_id());
     assert_eq!(receipts[0].get::<_, String>(1), openbot_infra::auth::single_user::desktop_local::DESKTOP_LOCAL_ACTOR_ID);
     assert_eq!(receipts[0].get::<_, String>(2), "fresh_local_os");
+    assert_eq!(receipts[0].get::<_, uuid::Uuid>(3), confirmation_request_id, "the original request ID is the one proof reference");
     let audited: i64 = client
         .query_one(
             "SELECT count(*)::bigint FROM public.audit_events WHERE target_id=$1",
@@ -2188,6 +2636,38 @@ async fn t046_35_run() {
         .close_before(openbot_infra::recovery_control::RuntimeCloseResources::new(facts), deadline)
         .await
         .expect("the consuming runtime closes");
+
+    // Continue through the complete startup, including the existing artifact
+    // reader. The restore's dedicated transaction must leave its trigger on.
+    let running = prepare_desktop_local_runtime(app(), startup()).await.expect("complete Current startup");
+    let client = running.pool().get().await.unwrap();
+    let enabled: bool = client.query_one(
+        "SELECT tgenabled='O' FROM pg_catalog.pg_trigger WHERE tgrelid='openbot_internal.artifact_store_bindings'::regclass AND tgname='artifact_store_bindings_append_only'",
+        &[],
+    ).await.unwrap().get(0);
+    assert!(enabled);
+    drop(client);
+    running.shutdown().await.unwrap();
+
+    // The same real restored PG is opened by the complete startup again.
+    // Only the marker's store ID changes; the ordinary binding reader must
+    // refuse it and must not rewrite either the marker or the PG tuple.
+    let marker_path = generation.join("artifacts/.artifact-store-v1");
+    let original_marker = fs::read(&marker_path).unwrap();
+    let mut wrong: Value = serde_json::from_slice(&original_marker).unwrap();
+    wrong["storeId"] = json!(uuid::Uuid::now_v7().to_string());
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let wrong_bytes = serde_json::to_vec(&wrong).unwrap();
+    fs::write(&marker_path, &wrong_bytes).unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(matches!(prepare_desktop_local_runtime(app(), startup()).await,
+        Err(DesktopLocalRuntimeError::Application)), "mismatched marker refuses complete startup");
+    assert_eq!(fs::read(&marker_path).unwrap(), wrong_bytes, "startup never replaces the existing marker");
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&marker_path, &original_marker).unwrap();
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o400)).unwrap();
+    prepare_desktop_local_runtime(app(), startup()).await.expect("restoring only original marker bytes reopens startup")
+        .shutdown().await.unwrap();
     drop(fixture);
     let _ = fs::remove_dir_all(&short);
     let _ = fs::remove_dir_all(&bundle_root);

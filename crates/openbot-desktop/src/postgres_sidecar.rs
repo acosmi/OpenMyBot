@@ -1980,14 +1980,15 @@ impl PostgresSidecarSupervisor {
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     pub(crate) async fn start_restored_current<S: PostgresSecretStore + ?Sized>(
         bundle: VerifiedPostgresBundle,
-        app_data_root: &Path,
         site: &openbot_infra::auth::single_user::desktop_local::RestoredLocalSite,
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
+        let generation_root = site.data_dir().parent()
+            .ok_or((PostgresSidecarError::DataDirectoryInvalid, SidecarOutcome::NeverSpawned))?;
         Self::start_inner(
             bundle,
-            app_data_root,
+            generation_root,
             site.installation_id(),
             site.data_dir(),
             store,
@@ -2882,6 +2883,7 @@ async fn postgres_ready(port: u16, secret: &PostgresScramSecret) -> bool {
 }
 
 #[cfg(feature = "postgres-supervisor")]
+#[cfg(test)]
 async fn run_pg_ctl_stop(
     bundle: &VerifiedPostgresBundle,
     data_dir: &Path,

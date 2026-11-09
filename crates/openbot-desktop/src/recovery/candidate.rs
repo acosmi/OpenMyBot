@@ -210,9 +210,9 @@ impl CandidateGeneration {
                 .checked_mul(2)
                 .and_then(|n| {
                     n.checked_add(
-                        (std::mem::size_of::<Self>()
+                        std::mem::size_of::<Self>()
                             - std::mem::size_of::<VerifiedWholePgRestoreStaging>()
-                            - std::mem::size_of::<RestoreCandidateIsolationInput>()),
+                            - std::mem::size_of::<RestoreCandidateIsolationInput>(),
                     )
                 })
                 .ok_or(DesktopRestoreError::CapacityExceeded)?;
@@ -240,9 +240,9 @@ impl CandidateGeneration {
                 .paths
                 .iter()
                 .try_fold(
-                    (std::mem::size_of::<Self>()
+                    std::mem::size_of::<Self>()
                         - std::mem::size_of::<VerifiedWholePgRestoreStaging>()
-                        - std::mem::size_of::<RestoreCandidateIsolationInput>()),
+                        - std::mem::size_of::<RestoreCandidateIsolationInput>(),
                     |n, path| n.checked_add(path.capacity()),
                 )
                 .ok_or(DesktopRestoreError::CapacityExceeded)?;
@@ -759,12 +759,31 @@ impl CandidateGeneration {
         self.program.as_ref()
     }
 
+    #[cfg(test)]
     pub(super) fn staging(&self) -> &VerifiedWholePgRestoreStaging {
         &self.staging
     }
 
-    pub(super) fn isolation_input(&self) -> Option<&RestoreCandidateIsolationInput> {
-        self.isolation.as_ref()
+    pub(super) fn effect_deadline(&self) -> Result<Instant, DesktopRestoreError> {
+        self.effect_deadline.ok_or(DesktopRestoreError::EntryInvalid)
+    }
+
+    pub(super) fn program_result(&self) -> Option<&RestoreProgramResult> {
+        self.program_result.as_ref()
+    }
+
+
+    pub(super) async fn restore_artifacts(
+        &mut self,
+        session: &mut RestoreControlSession,
+        deadline: Instant,
+    ) -> Result<(), DesktopRestoreError> {
+        use openbot_infra::backup::whole_pg_restore_stream::RestoreArtifactRebindOutcome;
+        match session.restore_candidate_artifacts_before(&mut self.staging, deadline).await {
+            Ok(RestoreArtifactRebindOutcome::Acknowledged) => Ok(()),
+            Ok(RestoreArtifactRebindOutcome::IsolationUnproven) => Err(DesktopRestoreError::IsolationUnproven),
+            Err(error) => Err(self.keep_control(error)),
+        }
     }
 
     pub(super) fn install_target_slots(

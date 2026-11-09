@@ -352,6 +352,10 @@ pub struct VerifiedDesktopRelease {
     capture: Option<ReviewedNormalCaptureRequest>,
     pub(crate) recovery: Option<DesktopRecoveryBootstrap>,
     pub(crate) original_release: Option<(File, OsString, File)>,
+    #[cfg(test)]
+    pub(crate) restore_test_store: Option<Arc<dyn OsSecretStore>>,
+    #[cfg(test)]
+    pub(crate) restore_test_publication: Option<Arc<crate::recovery::tests::PublicationTest>>,
 }
 
 impl core::fmt::Debug for VerifiedDesktopRelease {
@@ -361,6 +365,12 @@ impl core::fmt::Debug for VerifiedDesktopRelease {
 }
 
 impl VerifiedDesktopRelease {
+    /// Transfer this verified release and its original request to one bounded
+    /// restore owner. No process, SQL or secret-store effect starts here.
+    pub fn begin_restore(self, entry: crate::recovery::VerifiedRestoreEntry) -> Result<crate::recovery::OwnedDesktopRestore, DesktopRestoreError> {
+        crate::recovery::OwnedDesktopRestore::new(self, entry)
+    }
+
     /// Verify the outer trust binding first, then both exact resource inventories and the existing
     /// PostgreSQL release contract. `root` must be an absolute canonical directory with no symlink.
     pub fn open(
@@ -472,19 +482,11 @@ impl VerifiedDesktopRelease {
             capture,
             recovery,
             original_release: Some((parent, component, original_root)),
+            #[cfg(test)]
+            restore_test_store: None,
+            #[cfg(test)]
+            restore_test_publication: None,
         })
-    }
-
-    /// Carry one original launcher request to the existing pre-window Manager entry.
-    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-    pub fn into_runtime_config_with_request(
-        mut self,
-        program: std::path::PathBuf,
-        request: std::path::PathBuf,
-    ) -> Result<DesktopLocalRuntimeConfig, DesktopReleaseError> {
-        let input = crate::recovery::input::RestoreEntryInput::from_release(&mut self, &program, &request)
-            .map_err(|_| DesktopReleaseError::Application)?;
-        Ok(self.into_runtime_config()?.with_recovery_request(input))
     }
 
     /// Reuse the existing authority → real PG/SCRAM → current PG actor → OS Vault → Agent → window
@@ -540,7 +542,6 @@ impl VerifiedDesktopRelease {
     /// (spec revision R484 ¶8087–8089). A cancelled request, a locked or
     /// changed session, a native owner that did not provably stop, or a
     /// cleanup that is not proven writes no receipt.
-    #[allow(dead_code)] // reached through the `reconfirm_current_binding` request driver
     pub(crate) async fn reconfirm_restored_local_owner<N: OriginalLocalConfirmation>(
         self,
         entry: OwnedVerifiedCurrentReconfirmationEntry,
@@ -569,7 +570,7 @@ impl VerifiedDesktopRelease {
         store: &S,
     ) -> Result<ReconfirmationCommitFact, DesktopRestoreError> {
         use crate::desktop_local_bootstrap::{OpenedRestoredGeneration, RestoredOpenFailure, SqlDriverOutcome};
-        use openbot_infra::restore_reconfirmation::{OriginalReconfirmationRequest, RestoreReconfirmationError};
+        use openbot_infra::restore_reconfirmation::RestoreReconfirmationError;
         let reconfirmation = |error| match error {
             RestoreReconfirmationError::NotConfirmed | RestoreReconfirmationError::NotVisible => {
                 DesktopRestoreError::EntryInvalid
@@ -585,11 +586,10 @@ impl VerifiedDesktopRelease {
                 .map_err(|_| DesktopRestoreError::EntryInvalid)?;
         let vault_service = ReviewedDesktopVaultKeyStoreService::from_reviewed_release(VAULT_KEY_STORE_SERVICE.to_owned())
             .map_err(|_| DesktopRestoreError::EntryInvalid)?;
-        let OwnedVerifiedCurrentReconfirmationEntry { app_data_root, mut runtime, site } = entry;
+        let OwnedVerifiedCurrentReconfirmationEntry { mut runtime, site } = entry;
         let opened = crate::desktop_local_bootstrap::open_restored_generation(
             &mut runtime,
             site,
-            app_data_root.as_path(),
             self.postgres,
             store,
             &postgres_service,
@@ -630,7 +630,7 @@ impl VerifiedDesktopRelease {
                 .confirm_before(
                     data_plane.pool(),
                     vault.audit_key(),
-                    OriginalReconfirmationRequest::new(request.effect, request.cancel.clone()),
+                    request.sql,
                 )
                 .await
                 .map_err(reconfirmation)
@@ -748,7 +748,7 @@ impl VerifiedTenantTemplate {
 }
 
 #[derive(Default)]
-struct DeferredCurrentUserKeychain {
+pub(crate) struct DeferredCurrentUserKeychain {
     store: OnceLock<Result<MacOsKeychainSecretStore, OsSecretStoreError>>,
 }
 

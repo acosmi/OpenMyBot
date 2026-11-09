@@ -63,7 +63,7 @@ pub enum RecoveryControlFault {
 pub struct RecoveryControlError {
     fault: RecoveryControlFault,
     retained: Option<entry::ControlOwner>,
-    original_json_error: Option<serde_json::Error>,
+    _original_json_error: Option<serde_json::Error>,
     unconsumed: Option<Box<VerifiedOrdinaryStartupIntent>>,
     retained_host: Option<Box<VerifiedRecoveryHost>>,
     retained_request: Option<Box<entry::RequestOpenOwner>>,
@@ -77,7 +77,7 @@ impl RecoveryControlError {
         Self {
             fault,
             retained: None,
-            original_json_error: None,
+            _original_json_error: None,
             unconsumed: None,
             retained_host: None,
             retained_request: None,
@@ -91,7 +91,7 @@ impl RecoveryControlError {
         Self {
             fault,
             retained: Some(Arc::clone(owner)),
-            original_json_error: None,
+            _original_json_error: None,
             unconsumed: None,
             retained_host: None,
             retained_request: None,
@@ -110,7 +110,7 @@ impl RecoveryControlError {
         Self {
             fault: RecoveryControlFault::ControlInvalid,
             retained: None,
-            original_json_error: Some(error),
+            _original_json_error: Some(error),
             unconsumed: None,
             retained_host: None,
             retained_request: None,
@@ -384,6 +384,14 @@ pub enum RestoreCapacityResource {
     SecretStructureBytes,
     TotalAllocationBytes,
     KeyMediumAllocationBytes,
+}
+
+/// Read-only counters from the original operation ledger, not a reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreCapacityObservation {
+    pub limit: u64,
+    pub admitted: u64,
+    pub actual: u64,
 }
 
 pub struct RestoreCapacityReservation {
@@ -1043,6 +1051,28 @@ impl RecoveryControl {
         profile: RestoreOperationProfile,
     ) -> Result<RestoreControlSession, RecoveryControlError> {
         entry::claim_restore(&self.shared, entry, profile)
+    }
+
+    /// Reuse the once-verified request retained by a refused claim to observe
+    /// its existing operation. This cannot mint an operation or effect clock.
+    #[cfg(feature = "desktop-local")]
+    pub fn observe_unclaimed_restore(&mut self) -> Result<ReadOnlyRestoreOwner, RecoveryControlError> {
+        entry::observe_unclaimed_restore(&self.shared)
+    }
+
+    /// Consume one verified Current request under its own explicit clock and
+    /// count. The returned runtime holds only the existing shared enrollment;
+    /// a fresh OS proof is still required before any confirmation transaction.
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub fn enter_current_reconfirmation(
+        &self,
+        request: &mut VerifiedRecoveryHostIntent,
+        creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+        owners: &[RuntimeOwner],
+        cancel: crate::restore_reconfirmation::CancellationToken,
+    ) -> Result<(RecoveryRuntimeOwner, crate::restore_reconfirmation::OriginalReconfirmationRequest, Instant), RecoveryControlError> {
+        entry::enter_current_reconfirmation(&self.shared, request, creator, owners, cancel)
+            .map_err(|error| error.retain(&self.shared))
     }
 
     /// Ordinary Server startup (S8). One clock read seals the entry intent;
@@ -2431,7 +2461,7 @@ pub(crate) mod tests {
             .err()
             .expect("only original three modes decode");
         assert!(
-            error.original_json_error.is_some(),
+            error._original_json_error.is_some(),
             "the fourth mode must fail closed enum decoding before canonical/publication checks"
         );
 
@@ -2816,21 +2846,25 @@ pub(crate) mod tests {
         control: &super::RecoveryControl,
         native: u32,
     ) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let binding = site_binding(fixture, native);
+        let parent = std::fs::metadata(&fixture.directory).unwrap();
         let [intent, observed] = confirmed_stage(super::journal::Stage::Switch);
         let restore: super::journal::RestoreIntent = serde_json::from_value(json!({
             "profile": fixture.profile, "inputIdentities": {"carrier": {"file": file(5), "length": 1},
                 "keyMedium": {"file": file(6), "length": 104}},
             "business": {"deploymentId": "dep", "tenantId": "ten", "datasetId": "data"},
             "sourceInstallationId": "source", "targetInstallationId": "target",
-            "candidatePlan": {"siteKind": "local_physical", "trustedParent": file(3), "entryComponent": "app",
-                "installationId": "target", "generationId": "abcdefabcdefabcdefabcdefabcdef01"},
+            "candidatePlan": {"siteKind": "local_physical",
+                "trustedParent": {"device": parent.dev(), "inode": parent.ino(), "uid": parent.uid()},
+                "entryComponent": "old-app", "installationId": binding["targetInstallationId"],
+                "generationId": binding["generationId"]},
             "ownerClock": clock()})).unwrap();
         let entries = vec![
             super::journal::JournalData::restore(restore),
             intent,
             observed,
         ];
-        let binding = site_binding(fixture, native);
         publish_synthetic(control, SITE, EPOCH, entries, |refs, position| {
             descriptor(
                 2,
@@ -3082,6 +3116,67 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    async fn t046_51_never_started_and_start_exit_close_while_unknown_sidecar_stays_pending() {
+        use super::{NativeExit, PassiveObjectKind, PipeJoin, ProcessStart, RuntimeCloseFact, RuntimeCloseResources, RuntimeOwner};
+        use crate::db::pool::ConnectionDestruction;
+        for case in ["never", "code", "signal", "missing", "duplicate", "drivers", "empty_drivers"] {
+            let fixture = RestoreEntryFixture::new();
+            let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+            publish_active(&fixture, &writer, crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs());
+            drop(writer);
+            let control = super::RecoveryControl::open(fixture.config()).unwrap();
+            let mut runtime = fixture.open_local(&control).unwrap();
+            let root = fixture.control_root().join("runtimes");
+            let original = restore_control_bytes(&root);
+            let enrollment = original.iter().find(|(path, _)| path.ends_with("enrollment-v1")).unwrap();
+            let passive = |owner| RuntimeCloseFact::PassiveRetirement {
+                object: PassiveObjectKind::NeverStarted(owner),
+            };
+            let mut facts: Vec<_> = LOCAL_OWNERS.into_iter().filter(|owner| {
+                *owner != RuntimeOwner::PostgresSidecar &&
+                (!matches!(case, "drivers" | "empty_drivers") || *owner != RuntimeOwner::SqlDriver)
+            }).map(passive).collect();
+            // Receipt-side fixtures exercise the exact adapter fact shapes.
+            // T046-50/52/54 separately observe the original native waits and
+            // SQL driver destruction; these DATA do not claim an OS wait.
+            if case == "never" {
+                facts.push(passive(RuntimeOwner::PostgresSidecar));
+            } else if case != "missing" {
+                facts.push(RuntimeCloseFact::NativeWait {
+                    original_program_id: RuntimeOwner::PostgresSidecar,
+                    original_pid: 7,
+                    original_start_identity: ProcessStart { seconds: 1, nanos: 0 },
+                    exit: if case == "signal" { NativeExit::Signal { value: 9 } } else { NativeExit::Code { value: 17 } },
+                    observed_ns: super::clock::monotonic_ns().unwrap(),
+                    pipes: [PipeJoin::Null, PipeJoin::Null, PipeJoin::Null],
+                });
+            }
+            if case == "duplicate" { facts.push(passive(RuntimeOwner::PostgresSidecar)); }
+            if matches!(case, "drivers" | "empty_drivers") {
+                let drivers = if case == "drivers" {
+                    vec![ConnectionDestruction::ConnectingFutureDestroyed, ConnectionDestruction::ConnectionDestroyed]
+                } else { Vec::new() };
+                facts.push(RuntimeCloseFact::PassiveRetirement { object: PassiveObjectKind::SqlDriver(drivers) });
+            }
+            let closes = !matches!(case, "missing" | "duplicate");
+            let result = runtime.close_before(RuntimeCloseResources::new(facts),
+                std::time::Instant::now() + std::time::Duration::from_secs(30)).await;
+            assert_eq!(result.is_ok(), closes, "{case}");
+            drop(result);
+            drop(runtime);
+            drop(control);
+            assert_eq!(std::fs::read(enrollment.0).unwrap(), *enrollment.1, "immutable enrollment: {case}");
+            assert_eq!(runtime_records(&fixture, "receipt-v1"), usize::from(closes), "{case}");
+            if !closes { assert_eq!(restore_control_bytes(&root), original); }
+            let (mut control, intent) = fixture.open();
+            let claim = control.claim_restore(intent, fixture.profile.clone());
+            assert_eq!(claim.is_ok(), closes, "only an actual complete receipt releases the runtime: {case}");
+            if !closes { assert_eq!(claim.err().unwrap().fault(), RecoveryControlFault::OwnerBusy); }
+        }
+    }
+
     #[test]
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
     fn t046_41_low_native_active_hands_back_intent_and_busy_writer_changes_nothing() {
@@ -3284,7 +3379,7 @@ pub(crate) mod tests {
             record["data"].as_object_mut().unwrap().remove(missing);
             let error = single(record).err().expect("a required key is missing");
             assert!(
-                error.original_json_error.is_some(),
+                error._original_json_error.is_some(),
                 "{missing} fails typed decoding"
             );
         }
@@ -3292,7 +3387,7 @@ pub(crate) mod tests {
         unknown["data"]["toNativeVersion"] = json!(54);
         let error = single(unknown).err().expect("no fourth-mode field");
         assert!(
-            error.original_json_error.is_some(),
+            error._original_json_error.is_some(),
             "an unknown key fails typed decoding"
         );
         // The Active it publishes names the replaced head as previousDigest.
@@ -3870,6 +3965,7 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                 session.upgrade_candidate_schema_before(deadline).await.unwrap();
+                session.verify_absent_artifacts_for_test(deadline).await;
                 session.retire_cohort_before(deadline).await.unwrap();
                 session
                     .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline))
