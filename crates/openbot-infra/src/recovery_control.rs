@@ -3847,6 +3847,7 @@ pub(crate) mod tests {
                         &pg.uds(),
                         (pg.system_identifier.clone(), pg.database_oid),
                         (&old, &master),
+                        &std::fs::File::open(&root).unwrap(),
                         deadline,
                     )
                     .await
@@ -3886,7 +3887,9 @@ pub(crate) mod tests {
                     .unwrap()
                     .evidence_bytes()
                     .unwrap();
-                let status = pg.stop();
+                // The production stop order: release, one TERM, then wait.
+                session.release_candidate_before(deadline).await.unwrap();
+                let status = pg.terminate().await;
                 let exit = RestoreCandidateExit {
                     pid: u32::from_be_bytes(startup[..4].try_into().unwrap()),
                     start: super::super::ProcessStart {

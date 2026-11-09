@@ -1819,6 +1819,13 @@ async fn t046_38_scram_rotation_acknowledges_new_password_and_rejects_old() {
             // Nothing changed the role: the old password still authenticates.
             candidate_admin(&socket, &old).await.expect("old password unchanged");
             assert!(candidate_admin(&socket, &new).await.err().is_some_and(invalid_password));
+            // No publication follows an unknown change; a fast shutdown ends this leg.
+            if let Some(pid) = candidate.original_program().and_then(|program| program.original_child().id()) {
+                let _ = rustix::process::kill_process(
+                    rustix::process::Pid::from_raw(pid as i32).unwrap(),
+                    rustix::process::Signal::INT,
+                );
+            }
         } else {
             candidate.rotate_candidate_scram(&mut session, deadline).await.expect("timely COMMIT ACK and both proofs");
             let records = local_journal(&journal, &operation);
@@ -1834,21 +1841,26 @@ async fn t046_38_scram_rotation_acknowledges_new_password_and_rejects_old() {
                 .verify_target_installation(&mut session, deadline)
                 .await
                 .expect("identity, layout, sealed operation and canary under the new slot keys");
-            assert!(candidate.rotate_candidate_scram(&mut session, deadline).await.is_err(), "the change is acknowledged once");
-            candidate_admin(&socket, &new).await.expect("still the new password");
-        }
-        if let Some(pid) = candidate.original_program().and_then(|program| program.original_child().id()) {
-            let _ = rustix::process::kill_process(
-                rustix::process::Pid::from_raw(pid as i32).unwrap(),
-                rustix::process::Signal::INT,
-            );
+            // The production stop order: the session's clients and pool go
+            // first, so the one original TERM (a smart shutdown) completes.
+            candidate.release_candidate(&mut session, deadline).await.expect("candidate clients released");
+            candidate.request_stop().expect("one original TERM");
         }
         let mut owned = Some(session);
         candidate.begin_wait(&mut owned).expect("original wait owns the same Child");
-        let _reaped = tokio::time::timeout(std::time::Duration::from_secs(40), candidate.observe_wait())
+        let reaped = tokio::time::timeout(std::time::Duration::from_secs(40), candidate.observe_wait())
             .await
             .expect("same Child reaped")
             .is_ok();
+        assert!(reaped || unknown, "the original TERM's smart shutdown completed");
+        if !unknown {
+            // A repeat refuses on the acknowledged state before any SQL.
+            let mut session = candidate.take_wait_session().expect("original session returned");
+            assert!(
+                matches!(candidate.rotate_candidate_scram(&mut session, deadline).await, Err(DesktopRestoreError::DatabaseUnknown)),
+                "the change is acknowledged once"
+            );
+        }
         drop(candidate);
         drop(fixture);
         let _ = fs::remove_dir_all(&short);

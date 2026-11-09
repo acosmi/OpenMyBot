@@ -12,7 +12,7 @@ use crate::recovery_control::{RecoveryControlError, RestoreStages};
 pub use candidate_sql::{RestoreClosedHistoryObservation, RestoredClosedHistoryRequest};
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) use candidate_sql::{
-    bind_candidate_before, close_candidate_before, retire_cohort_before,
+    bind_candidate_before, close_candidate_before, release_candidate_before, retire_cohort_before,
     rotate_candidate_scram_before, upgrade_candidate_schema_before,
     verify_target_installation_before,
 };
@@ -5463,20 +5463,26 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         if opened.is_err() {
             return Err(stages.failure(RecoveryControlFault::InputInvalid));
         }
+        // Admitted before the copies: each clone of an ID or of the data
+        // path allocates exactly its length (spec revision R484 ¶7984).
+        let ids = [
+            &binding.target_installation_id,
+            &binding.deployment_id,
+            &binding.tenant_id,
+            &binding.dataset_id,
+        ];
+        let retained = ids.iter().map(|id| id.len() as u64).sum::<u64>()
+            + candidate.data_path.as_os_str().len() as u64
+            + checksum.capacity() as u64
+            + key_id.capacity() as u64;
+        let _retained_metadata = stages.admit_capacity(Capacity::MetadataBytes, retained)?;
+        let _retained_allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, retained)?;
         let restored = crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding::from_readback(
-            [
-                binding.target_installation_id.clone(),
-                binding.deployment_id.clone(),
-                binding.tenant_id.clone(),
-                binding.dataset_id.clone(),
-            ],
+            ids.map(String::clone),
             candidate.data_path.clone(),
             pg_system_id,
             oid,
         );
-        let retained = restored.retained_bytes() as u64 + checksum.capacity() as u64 + key_id.capacity() as u64;
-        let _retained_metadata = stages.admit_capacity(Capacity::MetadataBytes, retained)?;
-        let _retained_allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, retained)?;
         Ok(super::RestoreInstallationReadbacks {
             operation: binding.operation_id,
             binding: restored,
@@ -5486,34 +5492,19 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         })
     }
 
-    /// Close the bound candidate after its own Child was reaped: the exit
-    /// must name the bind-time pid and birth and that identity must be gone;
-    /// both guarded clients are released, the original pool is closed and
-    /// every driver it owned is observed destroyed. Only then is the exit
-    /// journaled as the ResourceClose fact (spec revision R484 ¶8132).
-    pub(crate) async fn close_candidate_before(
+    /// Release both guarded clients, close the original pool and observe
+    /// every driver it owned destroyed. The Desktop owner's one original
+    /// TERM is PostgreSQL's smart shutdown, which waits for each client
+    /// session, so this precedes it (spec revision R484 ¶8132).
+    pub(crate) async fn release_candidate_before(
         stages: &mut RestoreStages,
         candidate: &mut PendingRestoreCandidateAuthority,
-        exit: super::RestoreCandidateExit,
         deadline: Instant,
     ) -> Result<(), RecoveryControlError> {
         if candidate.sql.scram != StageResult::Acknowledged {
             return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
         }
-        let deadline = stages.effect_before(deadline)?;
-        let startup = &candidate.startup;
-        let pid = u32::from_be_bytes(startup[..4].try_into().expect("fixed evidence"));
-        let seconds = u64::from_be_bytes(startup[4..12].try_into().expect("fixed evidence"));
-        let micros = u32::from_be_bytes(startup[12..16].try_into().expect("fixed evidence"));
-        if exit.pid != pid
-            || exit.start.seconds != seconds
-            || u64::from(exit.start.nanos) != u64::from(micros) * 1000
-        {
-            return Err(invalid_candidate());
-        }
-        if wrok_bot_macos_process::evidence_process_is_absent(startup).is_err() {
-            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
-        }
+        stages.effect_before(deadline)?;
         // The supervisor keeps an owner until its destruction is recorded, so
         // live and destroyed owners together bound the observation vector.
         let owners = candidate.pool.ownership_snapshot();
@@ -5540,6 +5531,39 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             }
         }
         if candidate.pool.ownership_snapshot().active_resources != 0 {
+            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+        }
+        Ok(())
+    }
+
+    /// Close the bound candidate after its own Child was reaped: the exit
+    /// must name the bind-time pid and birth, that identity must be gone and
+    /// the released pool must own nothing. Only then is the exit journaled
+    /// as the ResourceClose fact (spec revision R484 ¶8132).
+    pub(crate) async fn close_candidate_before(
+        stages: &mut RestoreStages,
+        candidate: &mut PendingRestoreCandidateAuthority,
+        exit: super::RestoreCandidateExit,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        if candidate.sql.scram != StageResult::Acknowledged {
+            return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
+        }
+        let deadline = stages.effect_before(deadline)?;
+        let startup = &candidate.startup;
+        let pid = u32::from_be_bytes(startup[..4].try_into().expect("fixed evidence"));
+        let seconds = u64::from_be_bytes(startup[4..12].try_into().expect("fixed evidence"));
+        let micros = u32::from_be_bytes(startup[12..16].try_into().expect("fixed evidence"));
+        if exit.pid != pid
+            || exit.start.seconds != seconds
+            || u64::from(exit.start.nanos) != u64::from(micros) * 1000
+        {
+            return Err(invalid_candidate());
+        }
+        if wrok_bot_macos_process::evidence_process_is_absent(startup).is_err()
+            || !candidate.pool.is_closed()
+            || candidate.pool.ownership_snapshot().active_resources != 0
+        {
             return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
         }
         let intent = stages.begin_stage_before(RestoreStage::ResourceClose, "restore_candidate", deadline)?;
@@ -5917,6 +5941,23 @@ pub(crate) mod candidate_fixture {
             self.child.wait().unwrap()
         }
 
+        /// The production stop: one TERM, PostgreSQL's smart shutdown, which
+        /// ends only after every client session has.
+        pub(crate) async fn terminate(&mut self) -> std::process::ExitStatus {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(self.child.id() as i32).expect("owned child pid"),
+                rustix::process::Signal::TERM,
+            );
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(Instant::now() < until, "the smart shutdown did not complete");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
         /// Start the same cluster again; its administrator now uses `password`.
         pub(crate) async fn restart(&mut self, password: &SecretBytes) {
             self.password = String::from_utf8(password.expose().to_vec()).unwrap();
@@ -6016,6 +6057,7 @@ pub(crate) mod candidate_fixture {
                 &pg.uds(),
                 (system_identifier.to_owned(), pg.database_oid),
                 (&pg.scram(), &master),
+                &std::fs::File::open(pg.data()).unwrap(),
                 deadline(),
             )
             .await

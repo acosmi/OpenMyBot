@@ -2385,6 +2385,7 @@ pub(super) fn claim_restore(
             candidate: None,
             isolation_intent: None,
             target_slots: [None, None],
+            generation_root: None,
         })
     })();
     result.map_err(|mut error: RecoveryControlError| {
@@ -2490,6 +2491,8 @@ pub struct RestoreControlSession {
     candidate: Option<PendingRestoreCandidateAuthority>,
     isolation_intent: Option<RestoreStageIntent>,
     target_slots: [Option<RestoreTargetSlotJournal>; 2],
+    /// The held generation root's identity at bind; publication names it.
+    generation_root: Option<RecoveryFileIdentity>,
 }
 
 /// The candidate stages borrow the session's stages and its separately held
@@ -2519,6 +2522,7 @@ impl RestoreControlSession {
             socket_dir,
             (source.system_identifier.clone(), source.database_oid),
             (secrets.postgres_scram(), secrets.historical_master()),
+            staging.generation_root(),
             deadline,
         )
         .await
@@ -2536,12 +2540,15 @@ impl RestoreControlSession {
             &openbot_domain::vault::SecretBytes,
             &openbot_domain::vault::SecretBytes,
         ),
+        generation_root: &File,
         deadline: Instant,
     ) -> Result<(), RecoveryControlError> {
         let result = async {
             if self.candidate.is_some() {
                 return Err(service_invalid());
             }
+            let root = rustix::fs::fstat(generation_root)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
             let binding = {
                 let state = lock(&self.stages.owner)?;
                 let operation = state
@@ -2587,6 +2594,11 @@ impl RestoreControlSession {
             )
             .await?;
             self.candidate = Some(candidate);
+            self.generation_root = Some(RecoveryFileIdentity {
+                device: root.st_dev as u64,
+                inode: root.st_ino as u64,
+                uid: root.st_uid,
+            });
             if let Some(intent) = self.isolation_intent.take() {
                 let observed_ns =
                     crate::backup::whole_pg_capture_stream::CaptureClockCheck::observed_ns(
@@ -2689,6 +2701,16 @@ impl RestoreControlSession {
         self.retain_failure(result)
     }
 
+    /// Release the candidate's clients and pool before the Desktop owner's one
+    /// original TERM (¶8132); publication then requires that closed pool.
+    pub async fn release_candidate_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+        let Some(candidate) = self.candidate.as_mut() else {
+            return self.retain_failure(Err(service_invalid()));
+        };
+        let result = crate::backup::whole_pg_restore_stream::release_candidate_before(&mut self.stages, candidate, deadline).await;
+        self.retain_failure(result)
+    }
+
     /// Read the installation back on a new connection with the historical
     /// master and the new password, both from their target slots (¶8019–8022).
     pub async fn verify_target_installation_before(
@@ -2734,6 +2756,7 @@ impl RestoreControlSession {
             if !self.target_slots.iter().all(|slot| slot.as_ref().is_some_and(|slot| slot.matched)) {
                 return Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven));
             }
+            let bound_root = self.generation_root.ok_or_else(service_invalid)?;
             let candidate = self.candidate.as_mut().ok_or_else(service_invalid)?;
             crate::backup::whole_pg_restore_stream::close_candidate_before(&mut self.stages, candidate, exit, deadline).await?;
             let closing = self.stages.convergence_deadline()?;
@@ -2780,7 +2803,10 @@ impl RestoreControlSession {
             let expected = &owner.intent.decoded.expected;
             let restored = readbacks.binding();
             let [target, deployment, tenant, dataset] = restored.ids();
-            if root.uid != owner.intent.control_root.uid
+            // The root observed now must be the one held at bind, not a
+            // same-owner directory renamed into its place since.
+            if root != bound_root
+                || root.uid != owner.intent.control_root.uid
                 || target != expected.target_installation_id.as_str()
                 || deployment != expected.deployment_id
                 || tenant != expected.tenant_id

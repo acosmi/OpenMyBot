@@ -541,14 +541,6 @@ impl VerifiedRestoreInstallationBinding {
     pub(crate) fn postgres(&self) -> (u64, u32) {
         (self.pg_system_id, self.database_oid)
     }
-
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.instance_id.capacity()
-            + self.deployment_id.capacity()
-            + self.tenant_id.capacity()
-            + self.dataset_id.capacity()
-            + self.sidecar_data_dir.capacity()
-    }
 }
 
 /// The same restored facts after the Current descriptor's publication was

@@ -816,6 +816,16 @@ impl CandidateGeneration {
             .map_err(|error| self.keep_control(error))
     }
 
+    /// Release the session's candidate clients and close its pool before the
+    /// one original TERM, whose smart shutdown waits for every client.
+    pub(super) async fn release_candidate(
+        &mut self,
+        session: &mut RestoreControlSession,
+        deadline: Instant,
+    ) -> Result<(), DesktopRestoreError> {
+        session.release_candidate_before(deadline).await.map_err(|error| self.keep_control(error))
+    }
+
     pub(super) fn data_directory(&self) -> Option<(&File, &std::path::Path)> {
         self.directories[1].as_ref().map(|file| (file, self.paths[1].as_path()))
     }
