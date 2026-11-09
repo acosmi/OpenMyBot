@@ -248,8 +248,14 @@ async fn native43_fresh_keeps_public_and_artifact_oracles_and_is_idempotent() {
         &harness::admin_config("prefs43fresh"),
         "prefs43fresh",
         |config| async move {
-            let pool = fresh_pool(&config).await;
+            let pool = pool::connect(&config).await.unwrap();
             let mut client = pool.get().await.unwrap();
+            // Pin native 43 for its public-schema preservation assertion;
+            // later migrations intentionally change those public objects.
+            baseline::apply(&client).await.unwrap();
+            native::apply_through(&mut client, native::NATIVE_0043_VERSION)
+                .await
+                .unwrap();
             approval_preference_schema::verify_storage_prerequisites(&client)
                 .await
                 .unwrap();
@@ -267,31 +273,47 @@ async fn native43_fresh_keeps_public_and_artifact_oracles_and_is_idempotent() {
                     .unwrap();
             assert_eq!(schema_facts::fetch(&client).await.unwrap(), public);
             let before = ledger(&client).await;
+            // This original prefix and native 43's evidence remain exact.
+            let latest = native::validate_known_prefix(&client, native::NATIVE_0043_VERSION)
+                .await
+                .unwrap()
+                .latest_version();
+            assert_eq!(latest, native::NATIVE_0043_VERSION);
             assert_eq!(
                 before.iter().map(|row| row.0).collect::<Vec<_>>(),
-                (13..=43).collect::<Vec<_>>()
+                (13..=latest).collect::<Vec<_>>()
             );
-            assert_eq!(before.last().unwrap().1, native::NATIVE_0043_NAME);
+            let native43 = &before[(native::NATIVE_0043_VERSION - 13) as usize];
+            assert_eq!(native43.1, native::NATIVE_0043_NAME);
             assert_eq!(
-                before.last().unwrap().2,
+                native43.2,
                 format!("{:x}", Sha256::digest(native::NATIVE_0043_SQL.as_bytes()))
-            );
-            assert_eq!(
-                native::validate_known_prefix(&client, native::NATIVE_0043_VERSION)
-                    .await
-                    .unwrap()
-                    .latest_version(),
-                43
             );
             let empty = business_rows(&client).await;
             assert_eq!(empty["preferences"], serde_json::json!([]));
             assert_eq!(empty["audit"], serde_json::json!([]));
             assert_eq!(
-                native::apply(&mut client).await.unwrap(),
+                native::apply_through(&mut client, native::NATIVE_0043_VERSION)
+                    .await
+                    .unwrap(),
                 native::ApplyOutcome::AlreadyApplied
             );
             approval_preference_schema::verify(&client).await.unwrap();
             assert_eq!(ledger(&client).await, before);
+            assert_eq!(business_rows(&client).await, empty);
+            // Current-schema compatibility does not assert that later public
+            // migrations are no-ops. The original approval oracle and prefix stay fixed.
+            native::apply(&mut client).await.unwrap();
+            approval_preference_schema::verify(&client).await.unwrap();
+            assert_eq!(approval_preference_schema::capture(&client).await.unwrap(), expected);
+            let current = ledger(&client).await;
+            assert_eq!(&current[..before.len()], before.as_slice());
+            assert_eq!(
+                current.iter().map(|row| row.0).collect::<Vec<_>>(),
+                (13..=native::NATIVE_LATEST_VERSION).collect::<Vec<_>>()
+            );
+            assert_eq!(native::apply(&mut client).await.unwrap(), native::ApplyOutcome::AlreadyApplied);
+            assert_eq!(ledger(&client).await, current);
             assert_eq!(business_rows(&client).await, empty);
             drop(client);
             // These older internal oracles remain byte-identical and independently accepted.
@@ -335,12 +357,16 @@ async fn native42_upgrade_preserves_existing_rows_and_migration_evidence() {
         assert!(client.query_one("SELECT to_regclass($1)::text", &[&TABLE]).await.unwrap().get::<_,Option<String>>(0).is_none());
         assert!(approval_preference_schema::verify(&client).await.is_err());
         assert_eq!(ledger(&client).await, old_ledger);
-        native::apply(&mut client).await.unwrap();
+        // Only native 43 is responsible for preserving this native 42 public schema.
+        native::apply_through(&mut client, native::NATIVE_0043_VERSION).await.unwrap();
         approval_preference_schema::verify(&client).await.unwrap();
         let current = ledger(&client).await;
         assert_eq!(&current[..old_ledger.len()], old_ledger.as_slice());
-        assert_eq!(current.len(), old_ledger.len() + 1);
-        assert_eq!(current.last().unwrap().0, 43);
+        // The known prefix ends at the migration this test is exercising.
+        let latest = native::validate_known_prefix(&client, native::NATIVE_0043_VERSION).await.unwrap().latest_version();
+        assert_eq!(latest, native::NATIVE_0043_VERSION);
+        assert_eq!(current.iter().map(|row| row.0).collect::<Vec<_>>(), (13..=latest).collect::<Vec<_>>());
+        assert_eq!(current[old_ledger.len()].0, native::NATIVE_0043_VERSION);
         assert_eq!(client.query_one(sql, &[]).await.unwrap().get::<_,String>(0), before);
         assert_eq!(schema_facts::fetch(&client).await.unwrap(), old_public);
         assert_eq!(business_rows(&client).await["preferences"], serde_json::json!([]));
@@ -733,7 +759,7 @@ async fn schema_verification_rejects_known_prefix_drift_read_only() {
             "DELETE FROM openbot_internal.schema_migrations WHERE version=20",
             "UPDATE openbot_internal.schema_migrations SET name='drifted-native43' WHERE version=43",
             "UPDATE openbot_internal.schema_migrations SET checksum=repeat('0',64) WHERE version=43",
-            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(44,'unknown-native44',repeat('4',64))",
+            "INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(9999,'unknown-native9999',repeat('4',64))",
         ] {
             assert_ledger_drift_refused(&client, mutation).await;
         }
