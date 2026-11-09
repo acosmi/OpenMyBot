@@ -4564,7 +4564,7 @@ mod restore_consumer_tests {
     #[tokio::test]
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_32_unconfirmed_model_selection_begins_no_run() {
-        let restored = RestoreCurrentFixture::publish("").await;
+        let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
         let (p, dep, ten) = (restored.pool.clone(), DeploymentId::new("dep"), TenantId::new("ten"));
         p.get().await.unwrap().batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
             INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');

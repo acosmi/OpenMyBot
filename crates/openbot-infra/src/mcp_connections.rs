@@ -4499,7 +4499,7 @@ mod consumers {
     use crate::auth::oidc::attempt::LoginAttempt;
     use crate::auth::oidc::redirect::{CanonicalRedirectUri, HTTPS_ONLY};
     use crate::auth::oidc::{PostgresAttemptError, PostgresLoginAttemptStore, ProviderId};
-    use crate::auth::sso::{PostgresSamlAttemptStore, SsoEphemeralError};
+    use crate::auth::sso::{PostgresSamlAttemptStore, PostgresSsoRouteTicketStore, SsoEphemeralError};
     use crate::net::safe_http::{EgressPolicy, SafeDialer};
     use crate::recovery_control::AuthorizationPurpose;
     use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
@@ -4511,7 +4511,8 @@ mod consumers {
     const TOMBSTONE: &str = r#"{"revocation_status":"pending","revocation_reason":"reconnected"}"#;
 
     fn restored_connections(
-        restored: &RestoreCurrentFixture,
+        pool: &crate::db::pool::DatabasePool,
+        gate: crate::recovery_control::RecoveryReadGate,
         vault: &CredentialRecordVault,
         state_key: &[u8],
     ) -> PostgresMcpConnections {
@@ -4521,9 +4522,9 @@ mod consumers {
             Some(StdDuration::from_secs(2)),
         );
         let catalog =
-            Arc::new(PostgresMcpCatalog::new(restored.pool.clone(), rmcp, AUDIT.to_vec()).unwrap());
+            Arc::new(PostgresMcpCatalog::new(pool.clone(), rmcp, AUDIT.to_vec()).unwrap());
         PostgresMcpConnections::new(
-            restored.pool.clone(),
+            pool.clone(),
             vault.clone(),
             McpOAuthClient::new(
                 SafeDialer::new(EgressPolicy::default()),
@@ -4537,7 +4538,7 @@ mod consumers {
             Some("http://127.0.0.1:9"),
             Some("http://app.example.test"),
             SchemePolicy::HttpOrHttps,
-            restored.read_gate(),
+            gate,
         )
         .unwrap()
     }
@@ -4571,19 +4572,136 @@ mod consumers {
         }
     }
 
-    /// Pre-restore states are retired; a state keyed under the old epoch is
-    /// refused by the restored runtime's OIDC, SSO and MCP stores without
-    /// being burned (no old-key retry), while the old key still opens it and
-    /// the new key opens its own.
+    /// The source runtime seals one state per store under its own epoch key,
+    /// through the production stores (OIDC login attempts; SSO OIDC attempts,
+    /// SAML attempts and route tickets; MCP OAuth attempts), and opens a
+    /// second of each there, so the kept ones are genuine. After the
+    /// restore they are retired: neither the restored key nor the old one
+    /// opens them. A state the old key seals afterwards is refused by the
+    /// restored store without being burned (no old-key retry) while the old
+    /// key still opens it, and the restored key opens its own.
     #[tokio::test]
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_27_old_oauth_state_and_old_epoch_keys_have_no_fallback() {
-        let restored = RestoreCurrentFixture::publish(
-            "INSERT INTO public.verifications(id,identifier,value,expires_at,created_at,updated_at)
-             SELECT 'pre-restore-'||p,p||':pre-restore','sealed',now()+interval '1 hour',now(),now()
-               FROM unnest(ARRAY['oidc-attempt','saml-attempt','mcp-oauth-attempt']) AS p;",
-        )
+        let (parent, ten) = ([0x27_u8; 32], TenantId::new("ten"));
+        let okta = ProviderId::parse("okta").unwrap();
+        let begin = |now| {
+            let redirect =
+                CanonicalRedirectUri::parse("https://app.example.test/auth/callback", HTTPS_ONLY)
+                    .unwrap();
+            LoginAttempt::begin(okta.clone(), redirect, now, Duration::minutes(10))
+        };
+        let oidc_store = |pool: &crate::db::pool::DatabasePool, key: &SecretBytes| {
+            PostgresLoginAttemptStore::new(pool.clone(), key.expose().to_vec(), &ten, 16).unwrap()
+        };
+        let saml_store = |pool: &crate::db::pool::DatabasePool, key: &SecretBytes| {
+            PostgresSamlAttemptStore::new(
+                pool.clone(),
+                key.expose().to_vec(),
+                &ten,
+                16,
+                Duration::minutes(10),
+            )
+            .unwrap()
+        };
+        let route_store = |pool: &crate::db::pool::DatabasePool, key: &SecretBytes| {
+            PostgresSsoRouteTicketStore::new(
+                pool.clone(),
+                key.expose().to_vec(),
+                &ten,
+                16,
+                Duration::minutes(10),
+            )
+            .unwrap()
+        };
+        let routed = (
+            &okta,
+            openbot_contracts::identity_provider::SsoProtocol::Saml,
+            Uuid::now_v7(),
+        );
+        let acs = "https://app.example.test/api/auth/sso/saml/acs";
+        let origin = "http://127.0.0.1:9";
+        let vault = CredentialRecordVault::single_key(
+            ten.clone(),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x27; 32]).unwrap(),
+        );
+        let oauth_client = Uuid::now_v7();
+        let sealed = vault
+            .seal(
+                &oauth_client,
+                SecretKind::McpOauthClient,
+                SecretPrincipal::Deployment,
+                SecretPrincipal::Service(ServiceId::new(SERVER)),
+                &SecretBytes::new(b"{}".to_vec()),
+            )
+            .unwrap();
+        // The MCP attempt names a current actor and server; the same rows
+        // are written in the source and, after the restore, in the target.
+        let actor_and_server = async |client: &tokio_postgres::Client| {
+            client.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('carol','carol@restored.example.test',0);
+                INSERT INTO public.user_roles(user_id,role) VALUES('carol','user');").await.unwrap();
+            client.execute("INSERT INTO public.credentials(id,kind,provider,key_id,encrypted_value,metadata) VALUES($1,'mcp_oauth_client',$2,'oauth-client',$3,'{}')",
+                &[&oauth_client, &SERVER, &sealed]).await.unwrap();
+            client.execute("INSERT INTO public.mcp_servers(id,title,vendor,url,provenance,transport,credential_id,credential_generation,egress_allow_cidrs)
+                VALUES($1,'Restored Notes','test','http://127.0.0.1:9/mcp','custom','mcp',$2,0,ARRAY['127.0.0.1/32'])",
+                &[&SERVER, &oauth_client]).await.unwrap();
+        };
+        let mut source_states = None;
+        let restored = RestoreCurrentFixture::publish("", async |pool| {
+            let now = OffsetDateTime::now_utc();
+            let mut kept_oidc = Vec::new();
+            for purpose in [AuthorizationPurpose::OidcState, AuthorizationPurpose::SsoState] {
+                let oidc = oidc_store(pool, &RestoreCurrentFixture::old_epoch_key(purpose, &parent));
+                let [kept, spent] = [begin(now), begin(now)];
+                let spent_state = spent.state().secret().clone();
+                kept_oidc.push((purpose, kept.state().secret().clone()));
+                oidc.insert(kept, now).await.unwrap();
+                oidc.insert(spent, now).await.unwrap();
+                oidc.consume(&spent_state, &okta, now).await.unwrap();
+            }
+            let sso_key =
+                RestoreCurrentFixture::old_epoch_key(AuthorizationPurpose::SsoState, &parent);
+            let saml = saml_store(pool, &sso_key);
+            let kept_relay = saml.issue(&okta, Uuid::now_v7(), "_source", acs, now).await.unwrap();
+            let spent_relay = saml.issue(&okta, Uuid::now_v7(), "_source", acs, now).await.unwrap();
+            saml.consume(&spent_relay, &okta, now).await.unwrap();
+            let routes = route_store(pool, &sso_key);
+            let kept_ticket = routes.issue(Some(routed), now).await.unwrap();
+            let spent_ticket = routes.issue(Some(routed), now).await.unwrap();
+            assert!(routes.consume(&spent_ticket, now).await.unwrap().is_some());
+            let client = pool.get().await.unwrap();
+            actor_and_server(&client).await;
+            let mcp = restored_connections(
+                pool,
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    pool,
+                    &DeploymentId::new("dep"),
+                    &ten,
+                ),
+                &vault,
+                RestoreCurrentFixture::old_epoch_key(AuthorizationPurpose::McpState, &parent)
+                    .expose(),
+            );
+            for state in ["source-kept", "source-spent"] {
+                mcp.insert_attempt(state, &attempt(&mcp, "carol", 0, oauth_client, origin))
+                    .await
+                    .unwrap();
+            }
+            mcp.consume_attempt(b"source-spent").await.unwrap();
+            drop(mcp);
+            client.batch_execute("DELETE FROM public.mcp_servers; DELETE FROM public.credentials;
+                DELETE FROM public.user_roles; DELETE FROM public.users;").await.unwrap();
+            let kept: i64 = client
+                .query_one("SELECT count(*)::bigint FROM public.verifications", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(kept, 5, "one sealed state per store stays in the source");
+            source_states = Some((kept_oidc, kept_relay, kept_ticket));
+        })
         .await;
+        let (kept_oidc, kept_relay, kept_ticket) = source_states.unwrap();
         let client = restored.pool.get().await.unwrap();
         let pending = || {
             let client = &client;
@@ -4600,11 +4718,7 @@ mod consumers {
             0,
             "pre-restore OAuth states survived the retirement"
         );
-        let (parent, now, ten) = (
-            [0x27_u8; 32],
-            OffsetDateTime::now_utc(),
-            TenantId::new("ten"),
-        );
+        let now = OffsetDateTime::now_utc();
         let keys = |purpose| {
             let old = RestoreCurrentFixture::old_epoch_key(purpose, &parent);
             let new = restored
@@ -4615,46 +4729,65 @@ mod consumers {
             [old, new]
         };
 
-        let okta = ProviderId::parse("okta").unwrap();
-        let begin = || {
-            let redirect =
-                CanonicalRedirectUri::parse("https://app.example.test/auth/callback", HTTPS_ONLY)
-                    .unwrap();
-            LoginAttempt::begin(okta.clone(), redirect, now, Duration::minutes(10))
-        };
-        let [old, new] = keys(AuthorizationPurpose::OidcState).map(|key| {
-            PostgresLoginAttemptStore::new(restored.pool.clone(), key.expose().to_vec(), &ten, 16)
-                .unwrap()
-        });
-        let started = begin();
-        let state = started.state().secret().clone();
-        old.insert(started, now).await.unwrap();
+        // Login and SSO OIDC attempts share the production store type.
+        for (purpose, kept) in kept_oidc {
+            let [old, new] = keys(purpose).map(|key| oidc_store(&restored.pool, &key));
+            for store in [&new, &old] {
+                assert_eq!(
+                    store.consume(&kept, &okta, now).await.err(),
+                    Some(PostgresAttemptError::Unknown),
+                    "a retired source OIDC state opened"
+                );
+            }
+            let started = begin(now);
+            let state = started.state().secret().clone();
+            old.insert(started, now).await.unwrap();
+            assert_eq!(
+                new.consume(&state, &okta, now).await.err(),
+                Some(PostgresAttemptError::Unknown)
+            );
+            assert_eq!(
+                pending().await,
+                1,
+                "the refused OIDC state was burned or retried"
+            );
+            old.consume(&state, &okta, now).await.unwrap();
+            let started = begin(now);
+            let state = started.state().secret().clone();
+            new.insert(started, now).await.unwrap();
+            new.consume(&state, &okta, now).await.unwrap();
+        }
+
+        let [old, new] = keys(AuthorizationPurpose::SsoState).map(|key| route_store(&restored.pool, &key));
+        for store in [&new, &old] {
+            assert_eq!(
+                store.consume(&kept_ticket, now).await.err(),
+                Some(SsoEphemeralError::Unknown),
+                "a retired source route ticket opened"
+            );
+        }
+        let ticket = old.issue(Some(routed), now).await.unwrap();
         assert_eq!(
-            new.consume(&state, &okta, now).await.err(),
-            Some(PostgresAttemptError::Unknown)
+            new.consume(&ticket, now).await.err(),
+            Some(SsoEphemeralError::Unknown)
         );
         assert_eq!(
             pending().await,
             1,
-            "the refused OIDC state was burned or retried"
+            "the refused route ticket was burned or retried"
         );
-        old.consume(&state, &okta, now).await.unwrap();
-        let started = begin();
-        let state = started.state().secret().clone();
-        new.insert(started, now).await.unwrap();
-        new.consume(&state, &okta, now).await.unwrap();
+        assert!(old.consume(&ticket, now).await.unwrap().is_some());
+        let ticket = new.issue(Some(routed), now).await.unwrap();
+        assert!(new.consume(&ticket, now).await.unwrap().is_some());
 
-        let [old, new] = keys(AuthorizationPurpose::SsoState).map(|key| {
-            PostgresSamlAttemptStore::new(
-                restored.pool.clone(),
-                key.expose().to_vec(),
-                &ten,
-                16,
-                Duration::minutes(10),
-            )
-            .unwrap()
-        });
-        let acs = "https://app.example.test/api/auth/sso/saml/acs";
+        let [old, new] = keys(AuthorizationPurpose::SsoState).map(|key| saml_store(&restored.pool, &key));
+        for store in [&new, &old] {
+            assert_eq!(
+                store.consume(&kept_relay, &okta, now).await.err(),
+                Some(SsoEphemeralError::Unknown),
+                "a retired source SAML state opened"
+            );
+        }
         let relay = old
             .issue(&okta, Uuid::now_v7(), "_restored", acs, now)
             .await
@@ -4675,31 +4808,19 @@ mod consumers {
             .unwrap();
         new.consume(&relay, &okta, now).await.unwrap();
 
-        let vault = CredentialRecordVault::single_key(
-            ten.clone(),
-            KeyVersion::new(1),
-            WrappingKey::from_bytes(vec![0x27; 32]).unwrap(),
-        );
-        let oauth_client = Uuid::now_v7();
-        let sealed = vault
-            .seal(
-                &oauth_client,
-                SecretKind::McpOauthClient,
-                SecretPrincipal::Deployment,
-                SecretPrincipal::Service(ServiceId::new(SERVER)),
-                &SecretBytes::new(b"{}".to_vec()),
-            )
-            .unwrap();
-        client.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('carol','carol@restored.example.test',0);
-            INSERT INTO public.user_roles(user_id,role) VALUES('carol','user');").await.unwrap();
-        client.execute("INSERT INTO public.credentials(id,kind,provider,key_id,encrypted_value,metadata) VALUES($1,'mcp_oauth_client',$2,'oauth-client',$3,'{}')",
-            &[&oauth_client, &SERVER, &sealed]).await.unwrap();
-        client.execute("INSERT INTO public.mcp_servers(id,title,vendor,url,provenance,transport,credential_id,credential_generation,egress_allow_cidrs)
-            VALUES($1,'Restored Notes','test','http://127.0.0.1:9/mcp','custom','mcp',$2,0,ARRAY['127.0.0.1/32'])",
-            &[&SERVER, &oauth_client]).await.unwrap();
-        let [old, new] = keys(AuthorizationPurpose::McpState)
-            .map(|key| restored_connections(&restored, &vault, key.expose()));
-        let origin = "http://127.0.0.1:9";
+        actor_and_server(&client).await;
+        let [old, new] = keys(AuthorizationPurpose::McpState).map(|key| {
+            restored_connections(&restored.pool, restored.read_gate(), &vault, key.expose())
+        });
+        for connections in [&new, &old] {
+            assert!(
+                matches!(
+                    connections.consume_attempt(b"source-kept").await,
+                    Err(McpConnectionError::NotVisible)
+                ),
+                "a retired source MCP state opened"
+            );
+        }
         old.insert_attempt(
             "old-epoch-state",
             &attempt(&old, "carol", 0, oauth_client, origin),
@@ -4851,7 +4972,7 @@ mod consumers {
             seal(&token, SecretKind::McpUserToken, alice(), "refresh-alice"),
             seal(&tombstone, SecretKind::McpUserToken, alice(), "refresh-retired"),
         );
-        let restored = RestoreCurrentFixture::publish(&seed).await;
+        let restored = RestoreCurrentFixture::publish(&seed, async |_| {}).await;
         let client = restored.pool.get().await.unwrap();
         for source in [oauth_client, token, tombstone] {
             let row = client.query_one(
@@ -4865,7 +4986,7 @@ mod consumers {
             };
             restored.confirm(row.get(0), row.get(2), proof).await;
         }
-        let connections = restored_connections(&restored, &vault, &[0x31; 32]);
+        let connections = restored_connections(&restored.pool, restored.read_gate(), &vault, &[0x31; 32]);
         let broker = PostgresMcpCredentialBroker::new(
             restored.pool.clone(),
             vault.clone(),

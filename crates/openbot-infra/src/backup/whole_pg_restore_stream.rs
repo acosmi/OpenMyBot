@@ -5973,7 +5973,8 @@ pub(crate) mod candidate_fixture {
             self.root.join("uds")
         }
 
-        async fn connect(&self, database: &str) -> tokio_postgres::Client {
+        /// The administrator's driver configuration for `database`.
+        pub(crate) fn config(&self, database: &str) -> tokio_postgres::Config {
             let mut config = tokio_postgres::Config::new();
             config
                 .host_path(self.uds())
@@ -5981,7 +5982,12 @@ pub(crate) mod candidate_fixture {
                 .user("desktop_admin")
                 .dbname(database)
                 .password(self.password.as_str());
-            let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+            config
+        }
+
+        async fn connect(&self, database: &str) -> tokio_postgres::Client {
+            let (client, connection) =
+                self.config(database).connect(tokio_postgres::NoTls).await.unwrap();
             tokio::spawn(connection);
             client
         }

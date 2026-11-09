@@ -3812,9 +3812,13 @@ pub(crate) mod tests {
         }
 
         impl RestoreCurrentFixture {
-            /// `seed` is SQL the source applies after its native layout and
-            /// before the restore claims, retires and publishes it.
-            pub(crate) async fn publish(seed: &str) -> Self {
+            /// `seed` is SQL the source applies after its native layout, then
+            /// `source` writes through a pool on the source; both precede the
+            /// restore's claim, retirement and publication.
+            pub(crate) async fn publish(
+                seed: &str,
+                source: impl AsyncFnOnce(&crate::db::pool::DatabasePool),
+            ) -> Self {
                 use std::os::unix::fs::DirBuilderExt as _;
                 let mut fixture = RestoreEntryFixture::new();
                 let capacity = &mut fixture.profile.capacity;
@@ -3837,6 +3841,17 @@ pub(crate) mod tests {
                     Some(root.join("data")),
                 )
                 .await;
+                let pool = crate::db::pool::connect_config(
+                    pg.config("openbot"),
+                    2,
+                    Duration::from_secs(5),
+                    "restore source",
+                )
+                .await
+                .unwrap();
+                source(&pool).await;
+                pool.close();
+                drop(pool);
                 let master = SecretBytes::new(vec![0x41; 32]);
                 let old = pg.scram();
                 let deadline = Instant::now() + Duration::from_secs(25);
@@ -3957,7 +3972,7 @@ pub(crate) mod tests {
         #[tokio::test]
         #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
         async fn restore_current_fixture_publishes_one_cohort_and_gates_its_pool() {
-            let restored = RestoreCurrentFixture::publish("").await;
+            let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
             eprintln!("restore fixture MetadataBytes admitted: candidate SQL {}, slots {}, SCRAM change {}, readback {}, publication {}",
                 restored.metadata[0], restored.metadata[1], restored.metadata[2], restored.metadata[3], restored.metadata[4]);
             let gate = restored.read_gate();

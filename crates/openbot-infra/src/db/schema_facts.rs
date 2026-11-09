@@ -146,16 +146,17 @@ pub async fn fetch(client: &tokio_postgres::Client) -> Result<SchemaFacts, Infra
         .simple_query(&format!("SET LOCAL timezone='UTC';\n{SCHEMA_FACTS_SQL}"))
         .await
         .map_err(|source| InfraError::query("提取 schema 事实", source))?;
+    // The observation always yields one non-NULL row; anything else is not
+    // a schema to decode.
     let payload = messages
         .iter()
         .find_map(|message| match message {
             tokio_postgres::SimpleQueryMessage::Row(row) => Some(row.try_get(0)),
             _ => None,
         })
-        .transpose()
+        .ok_or(InfraError::repository_invariant("schema_facts_missing"))?
         .map_err(|source| RowDecodeError::column(SCHEMA_FACTS_LABEL, "jsonb_pretty", source))?
-        .flatten()
-        .unwrap_or_default();
+        .ok_or(InfraError::repository_invariant("schema_facts_missing"))?;
     serde_json::from_str(payload)
         .map_err(|source| RowDecodeError::json(SCHEMA_FACTS_LABEL, "jsonb_pretty", source).into())
 }

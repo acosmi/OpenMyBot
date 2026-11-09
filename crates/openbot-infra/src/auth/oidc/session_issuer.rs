@@ -1094,7 +1094,7 @@ mod reconfirm {
              INSERT INTO public.sessions(id,user_id,token,expires_at,auth_generation)
                VALUES('source-session','alice','{}',now()+interval '1 day',0);",
             hashed(&old_token, &old_key),
-        ))
+        ), async |_| {})
         .await;
         let new_key = restored
             .runtime
@@ -1207,40 +1207,56 @@ mod reconfirm {
                 .err(),
             Some(SessionIssueError::DependencyUnavailable)
         );
-        // A rejected COMMIT returns no session and leaves no receipt: both
-        // were written in the one transaction that did not commit.
+        // A COMMIT rejected for either row returns no session and leaves no
+        // receipt: both were written in the one transaction that did not
+        // commit, whichever table's deferred check refuses it.
         client
             .batch_execute(
-                "CREATE FUNCTION public.t046_25_reject_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected session COMMIT rejection'; END $$;
-                 CREATE CONSTRAINT TRIGGER t046_25_reject_session AFTER INSERT ON public.sessions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.t046_25_reject_session();",
+                "CREATE FUNCTION public.t046_25_reject_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected COMMIT rejection'; END $$;",
             )
             .await
             .unwrap();
         let lease = gate.borrow_worker_before(deadline).await.unwrap();
         assert_eq!(lease.restore_cohort(), Some(restored.cohort));
-        let login = VerifiedCurrentFederatedLogin::from_oidc_callback(
-            identity(),
-            &provider,
-            now,
-            None,
-            None,
-            Some(&lease),
-        );
-        assert_eq!(
-            issuer.issue_current_login(login, request()).await.err(),
-            Some(SessionIssueError::DependencyUnavailable)
-        );
-        assert_eq!(
-            receipts().await,
-            0,
-            "a receipt outlived its rejected COMMIT"
-        );
-        assert_eq!(sessions(None).await, 0);
+        for table in [
+            "public.sessions",
+            "openbot_internal.restore_reconfirm_receipts",
+        ] {
+            client
+                .batch_execute(&format!(
+                    "CREATE CONSTRAINT TRIGGER t046_25_reject_commit AFTER INSERT ON {table} DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.t046_25_reject_commit();"
+                ))
+                .await
+                .unwrap();
+            let login = VerifiedCurrentFederatedLogin::from_oidc_callback(
+                identity(),
+                &provider,
+                now,
+                None,
+                None,
+                Some(&lease),
+            );
+            assert_eq!(
+                issuer.issue_current_login(login, request()).await.err(),
+                Some(SessionIssueError::DependencyUnavailable),
+                "{table}"
+            );
+            assert_eq!(
+                receipts().await,
+                0,
+                "a receipt outlived a COMMIT rejected on {table}"
+            );
+            assert_eq!(sessions(None).await, 0, "a session outlived a COMMIT rejected on {table}");
+            client
+                .batch_execute(&format!("DROP TRIGGER t046_25_reject_commit ON {table};"))
+                .await
+                .unwrap();
+        }
 
         // Positive control: the same callback after the injection is removed
         // returns a cookie only with the receipt already committed beside it.
         client
-            .batch_execute("DROP TRIGGER t046_25_reject_session ON public.sessions; DROP FUNCTION public.t046_25_reject_session();")
+            .batch_execute("DROP FUNCTION public.t046_25_reject_commit();")
             .await
             .unwrap();
         let login = VerifiedCurrentFederatedLogin::from_oidc_callback(

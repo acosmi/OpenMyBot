@@ -1901,7 +1901,7 @@ mod v2_vault_tests {
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_32_unconfirmed_model_secret_start_opens_no_vault_and_no_dns() {
         let restored =
-            crate::recovery_control::tests::restore_current::RestoreCurrentFixture::publish("").await;
+            crate::recovery_control::tests::restore_current::RestoreCurrentFixture::publish("", async |_| {}).await;
         let (p, dep, ten) = (restored.pool.clone(), DeploymentId::new("dep"), TenantId::new("ten"));
         p.get().await.unwrap().batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
             INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');

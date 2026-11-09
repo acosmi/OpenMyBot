@@ -485,7 +485,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_32_unconfirmed_sdk_secret_is_not_loaded() {
-        let restored = RestoreCurrentFixture::publish("").await;
+        let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
         let (dep, ten) = (DeploymentId::new("dep"), TenantId::new("ten"));
         let scope = Scope {
             auth: AuthContextBuilder::from_verified_session(dep.clone(), ten.clone(), ActorId::new("alice"), AuthGeneration::new(7), false)

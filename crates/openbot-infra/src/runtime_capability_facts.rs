@@ -1398,7 +1398,7 @@ mod consumers {
     #[tokio::test]
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_30_remote_device_capability_stays_disabled() {
-        let restored = RestoreCurrentFixture::publish("").await;
+        let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
         let (pool, dep, ten) = (
             restored.pool.clone(),
             DeploymentId::new("dep"),
