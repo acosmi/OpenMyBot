@@ -2127,6 +2127,14 @@ impl DesktopTauriProtocol {
         self.asset(&path)
     }
 
+    #[cfg(all(test, feature = "desktop-local-runtime", unix))]
+    pub(crate) fn bound_auth_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Option<AuthContext>, TauriHostError> {
+        self.authority(label).map(|authority| authority.map(|authority| authority.auth))
+    }
+
     fn authority(&self, label: &str) -> Result<Option<WindowAuthority>, TauriHostError> {
         self.window_registry
             .windows

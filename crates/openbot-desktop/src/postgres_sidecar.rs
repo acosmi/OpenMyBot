@@ -3159,6 +3159,8 @@ mod tests {
     #[cfg(feature = "postgres-key-store")]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(all(feature = "desktop-local-runtime", unix))]
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[cfg(all(feature = "desktop-vault", unix))]
     use openbot_application::tenant::package::{
@@ -4975,6 +4977,39 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    fn fixture_recovery_bootstrap() -> crate::tauri_background::DesktopRecoveryBootstrap {
+        crate::tauri_background::DesktopRecoveryBootstrap {
+            host_limits: openbot_infra::recovery_control::TrustedHostRecoveryLimits {
+                max_request_bytes: 65_536,
+                max_activation_bytes: 65_536,
+                max_journal_frame_bytes: 65_536,
+                max_journal_bytes: 1 << 20,
+                max_journal_records: 64,
+                max_runtime_record_bytes: 65_536,
+                max_registered_runtimes: 8,
+                max_retained_operations: 8,
+                max_root_entries: 64,
+                max_temp_entries: 8,
+                max_evidence_refs: 16,
+                max_runtime_resource_facts: 16,
+                max_id_bytes: 128,
+                max_component_bytes: 128,
+                max_relative_path_bytes: 1024,
+                max_path_depth: 16,
+                max_open_files: 64,
+                max_metadata_bytes: 1 << 24,
+                admission_ns: 5_000_000_000,
+            },
+            bounds: serde_json::from_value(json!({
+                "effectNs": 120_000_000_000u64,
+                "convergenceNs": 30_000_000_000u64,
+            }))
+            .unwrap(),
+            release_digest: [11; 32],
+        }
+    }
+
     #[cfg(all(feature = "desktop-local-runtime", unix))]
     pub(crate) fn materialize_desktop_dist() -> PathBuf {
         let dist = root("tauri-background-dist");
@@ -5123,19 +5158,19 @@ mod tests {
                 root_uid: String::new(),
             };
             let client = plane.pool().get().await.unwrap();
-            // The retired maxRowBytes 44540 refuses one catalog_functions row whose weighted
-            // size is 44594. With 65536, the G2' value ruled for the F03 profile above that
-            // need, every projection is read before the missing vault canary is reported, and
-            // the decode count still admits a credit.
-            for (max_row_bytes, expected) in [
-                (44_540, CaptureSqlFailure::Bounds),
-                (65_536, CaptureSqlFailure::SourceMismatch),
+            // Native 0054's largest catalog function measures 132464 weighted row bytes
+            // and 21983 field bytes. This fixture explicitly admits that schema; the old
+            // profile remains a rejection case (spec revision R484 ¶6870–6874, ¶7936).
+            for (max_row_bytes, max_field_bytes, expected) in [
+                (44_540, 8_192, CaptureSqlFailure::Bounds),
+                (65_536, 8_192, CaptureSqlFailure::Bounds),
+                (262_144, 32_768, CaptureSqlFailure::SourceMismatch),
             ] {
                 let mut budget = CaptureSqlBudget::new(
                     CaptureSqlLimits {
                         max_rows: 12_288,
                         max_row_bytes,
-                        max_field_bytes: 8_192,
+                        max_field_bytes,
                         max_pages: 1_024,
                         page_rows: 8,
                         max_catalog_objects: 8_192,
@@ -5215,7 +5250,10 @@ mod tests {
         let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
         let bundle =
             VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
-        let app_root = root("capture-reads-app");
+        let parent = root("capture-reads-app");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let app_root = parent.join("app");
         let dist = materialize_desktop_dist();
         let os_store: Arc<dyn OsSecretStore> = Arc::new(RuntimeMemorySecretStore::empty());
         let release = DesktopLocalReleaseInput::new(
@@ -5248,7 +5286,8 @@ mod tests {
             Ok(loaded_desktop_package(
                 authority.auth_context().tenant().as_str(),
             ))
-        });
+        })
+        .with_recovery_bootstrap(fixture_recovery_bootstrap());
         let prepared = prepare_desktop_local_runtime(
             CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap(),
             config,
@@ -5258,12 +5297,15 @@ mod tests {
         let decode = CaptureDecodeBudget::checked(65_536, 4_194_304).unwrap();
         decode.bind_original_clock(Arc::new(UnitClock)).unwrap();
         // pageRows 8 also proves the file-settings read no longer needs one 21-row page.
+        // Native 0054 measures 132464 weighted row bytes and 21983 field bytes at its
+        // largest catalog function. These are explicit fixture bounds, not production
+        // defaults (spec revision R484 ¶6870–6874, ¶7936).
         let budget = || {
             let mut budget = CaptureSqlBudget::new(
                 CaptureSqlLimits {
                     max_rows: 12_288,
-                    max_row_bytes: 65_536,
-                    max_field_bytes: 8_192,
+                    max_row_bytes: 262_144,
+                    max_field_bytes: 32_768,
                     max_pages: 1_024,
                     page_rows: 8,
                     max_catalog_objects: 8_192,
@@ -5394,7 +5436,7 @@ mod tests {
         drop(client);
         drop(repo);
         prepared.shutdown().await.unwrap();
-        fs::remove_dir_all(app_root).unwrap();
+        fs::remove_dir_all(parent).unwrap();
         fs::remove_dir_all(bundle_root).unwrap();
         fs::remove_dir_all(dist).unwrap();
     }
@@ -5411,11 +5453,37 @@ mod tests {
         let bin_dir = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
         let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
         let signing = signing_identity();
-        let app_root = root("tauri-background-missing-database");
+        let parent = root("tauri-background-missing-database");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let app_root = parent.join("app");
         let dist = materialize_desktop_dist();
         let authority_store = DesktopLocalAuthorityStore::new(
             CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap(),
         );
+        // Retain the real Fresh owner while its PostgreSQL cluster is created.
+        // The later startup must refuse the existing cluster's missing business DB.
+        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+        let recovery_fresh = {
+            use openbot_infra::recovery_control::{RecoveryControl, RecoveryControlConfig, RuntimeOwner};
+            let bootstrap = fixture_recovery_bootstrap();
+            let mut control = RecoveryControl::open(RecoveryControlConfig::local(
+                CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap(),
+                bootstrap.host_limits,
+            ).unwrap()).unwrap();
+            let intent = control.open_local_before(
+                &authority_store,
+                bootstrap.release_digest,
+                ["com.example.product.desktop-vault.missing-database",
+                 "com.example.product.postgresql.missing-database"],
+                bootstrap.bounds,
+                &[RuntimeOwner::PostgresSidecar, RuntimeOwner::SqlDriver,
+                  RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay,
+                  RuntimeOwner::DesktopAgent],
+            ).err().unwrap().into_unconsumed_intent().unwrap();
+            let deadline = intent.admission_deadline();
+            control.begin_ordinary_initialization_before(intent, deadline).unwrap()
+        };
         let installation = authority_store.load_or_create_installation().unwrap();
         let instance = installation.authority().instance_id().to_owned();
         let data_dir = installation.sidecar_data_dir().to_owned();
@@ -5469,6 +5537,10 @@ mod tests {
                 authority.auth_context().tenant().as_str(),
             ))
         });
+        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+        let config = config
+            .with_recovery_bootstrap(fixture_recovery_bootstrap())
+            .with_recovery_fresh(recovery_fresh);
         let root = CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap();
         assert!(matches!(
             prepare_desktop_local_runtime(root, config).await,
@@ -5496,7 +5568,7 @@ mod tests {
         assert!(!fixed_application_database_exists(&sidecar).await);
         sidecar.shutdown().await.unwrap();
         assert_eq!(store.writes.load(Ordering::SeqCst), 1);
-        fs::remove_dir_all(app_root).unwrap();
+        fs::remove_dir_all(parent).unwrap();
         fs::remove_dir_all(bundle_root).unwrap();
         fs::remove_dir_all(dist).unwrap();
     }
@@ -5685,7 +5757,10 @@ mod tests {
         let (bundle_root, digest) = materialize_host_postgres_bundle(&bin_dir);
         let bundle =
             VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
-        let app_root = root("tauri-background-app");
+        let parent = root("tauri-background-app");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let app_root = parent.join("app");
         let dist = materialize_desktop_dist();
         let store = Arc::new(RuntimeMemorySecretStore::empty());
         let os_store: Arc<dyn OsSecretStore> = store.clone();
@@ -5720,6 +5795,8 @@ mod tests {
                 authority.auth_context().tenant().as_str(),
             ))
         });
+        #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+        let config = config.with_recovery_bootstrap(fixture_recovery_bootstrap());
         let root = CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap();
         let prepared = prepare_desktop_local_runtime(root, config).await.unwrap();
         let reply = prepared
@@ -5801,30 +5878,34 @@ mod tests {
         );
         assert_eq!(store.writes.load(Ordering::Relaxed), 2);
         assert_eq!(prepared.active_window_count(), 0);
-        // The Computer screen-session port is now the real `ScreenSessionService`/`ScreenHub`
-        // (V6-PR-052), not the fail-closed `NoScreenSessionAdministration` stub. No engine stream
-        // is attached in this test, so ticket issuance must resolve target visibility for real and
-        // fail with `NotVisible`; the old stub always failed with `DependencyUnavailable` instead,
-        // regardless of the requested target.
+        // The background identity has no host request binding and cannot issue a ticket.
+        // With the actual protocol's window binding and recovery admission, the real
+        // ScreenHub must still reject the absent target as NotVisible.
+        let request = ScreenSessionRequest {
+            target: ScreenSessionTarget {
+                computer_id: ComputerId::new("desktop-background-computer"),
+                computer_generation: ComputerGeneration::new(1),
+                tab_id: TabId::new("desktop-background-tab"),
+            },
+            binding: ScreenViewerBindingRequest::Desktop {
+                origin: "tauri://localhost".to_owned(),
+                window_label: "main".to_owned(),
+                window_binding: 1,
+            },
+        };
         let screen_session = prepared
             .application()
             .execute(
                 prepared.auth_context().clone(),
-                AppCommand::IssueScreenSession(ScreenSessionRequest {
-                    target: ScreenSessionTarget {
-                        computer_id: ComputerId::new("desktop-background-computer"),
-                        computer_generation: ComputerGeneration::new(1),
-                        tab_id: TabId::new("desktop-background-tab"),
-                    },
-                    binding: ScreenViewerBindingRequest::Desktop {
-                        origin: "tauri://localhost".to_owned(),
-                        window_label: "main".to_owned(),
-                        window_binding: 1,
-                    },
-                }),
+                AppCommand::IssueScreenSession(request.clone()),
             )
             .await;
-        assert!(matches!(screen_session, Err(AppError::NotVisible)));
+        assert!(matches!(screen_session, Err(AppError::DependencyUnavailable { .. })), "{screen_session:?}");
+        prepared.protocol().bind_window("main", prepared.auth_context().clone(), None).unwrap();
+        let auth = prepared.protocol().bound_auth_for_test("main").unwrap().unwrap();
+        let screen_session = prepared.application().execute(auth, AppCommand::IssueScreenSession(request)).await;
+        assert!(matches!(screen_session, Err(AppError::NotVisible)), "{screen_session:?}");
+        assert!(prepared.protocol().unbind_window("main").unwrap());
         prepared.shutdown().await.unwrap();
         assert!(
             !fs::read_dir(&app_root)
@@ -5832,7 +5913,7 @@ mod tests {
                 .filter_map(Result::ok)
                 .any(|entry| entry.file_name().to_string_lossy().contains("start-lock"))
         );
-        fs::remove_dir_all(app_root).unwrap();
+        fs::remove_dir_all(parent).unwrap();
         fs::remove_dir_all(bundle_root).unwrap();
         fs::remove_dir_all(dist).unwrap();
     }
