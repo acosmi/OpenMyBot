@@ -229,7 +229,7 @@ async fn matrix(protocol: Protocol) {
             baseline::apply(&db).await.map_err(text)?;
             native::apply(&mut db).await.map_err(text)?;
             db.batch_execute(
-                "INSERT INTO public.users(id,email) VALUES('writer','writer@example.test');
+                "INSERT INTO public.users(id,email,auth_generation) VALUES('writer','writer@example.test',0);
                  INSERT INTO public.user_roles(user_id,role) VALUES('writer','admin');
                  INSERT INTO public.agents(id,name,type,configuration) VALUES('bot','Bot','built_in','{}');
                  INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility)
@@ -260,7 +260,7 @@ async fn matrix(protocol: Protocol) {
                     let token = format!("isolated-realtime-reader-session-token-{index}");
                     let other_token = format!("isolated-realtime-second-session-token-{index}");
                     let db = pool.get().await.map_err(text)?;
-                    db.execute("INSERT INTO public.users(id,email) VALUES($1,$2)", &[&reader,&format!("{reader}@example.test")]).await.map_err(text)?;
+                    db.execute("INSERT INTO public.users(id,email,auth_generation) VALUES($1,$2,0)", &[&reader,&format!("{reader}@example.test")]).await.map_err(text)?;
                     db.execute("INSERT INTO public.user_roles(user_id,role) VALUES($1,'user')", &[&reader]).await.map_err(text)?;
                     db.execute("INSERT INTO public.channel_memberships(channel_id,user_id) VALUES('channel',$1)", &[&reader]).await.map_err(text)?;
                     drop(db);

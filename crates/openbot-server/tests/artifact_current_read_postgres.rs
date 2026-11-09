@@ -514,11 +514,14 @@ async fn same_actor_generation_session_a_delete_refuses_only_original_a() {
 }
 
 async fn changed_original_session(tag: &str, sql: &'static str) {
+    refused_original_session(tag, sql, AppError::Unauthenticated).await;
+}
+async fn refused_original_session(tag: &str, sql: &'static str, expected: AppError) {
     with_fixture(tag, |fixture| async move {
         let auth = fixture.auth(COOKIE_A).await?;
         fixture.sql(sql).await?;
         require(
-            matches!(fixture.read(auth).await, Err(AppError::Unauthenticated)),
+            fixture.read(auth).await == Err(expected),
             "changed original session received bytes",
         )
     })
@@ -549,8 +552,11 @@ async fn raw_null_current_generation_is_not_original_zero() {
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]
-async fn raw_negative_current_generation_is_not_original_zero() {
-    changed_original_session("read-current-negative", "ALTER TABLE public.users DROP CONSTRAINT users_auth_generation_nonnegative; UPDATE public.users SET auth_generation=-1 WHERE id='current-read-owner'").await;
+async fn raw_negative_current_generation_is_refused_by_pinned_schema_before_generation_check() {
+    // Storing -1 needs a dropped pinned CHECK. The read path verifies the pinned public schema
+    // before BEGIN and refuses that drift as dependency_unavailable with nothing delivered; the
+    // raw negative-generation check is covered by the binding and capabilities suites.
+    refused_original_session("read-current-negative", "ALTER TABLE public.users DROP CONSTRAINT users_auth_generation_nonnegative; UPDATE public.users SET auth_generation=-1 WHERE id='current-read-owner'", AppError::DependencyUnavailable { dependency: "host_request_binding" }).await;
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]
@@ -563,8 +569,9 @@ async fn raw_null_issued_generation_is_not_original_zero() {
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]
-async fn raw_negative_issued_generation_is_not_original_zero() {
-    changed_original_session("read-issued-negative", "ALTER TABLE public.sessions DROP CONSTRAINT sessions_auth_generation_nonnegative; UPDATE public.sessions SET auth_generation=-1 WHERE id='actual-read-session-a'").await;
+async fn raw_negative_issued_generation_is_refused_by_pinned_schema_before_generation_check() {
+    // Same pinned-schema refusal as the current-generation case above.
+    refused_original_session("read-issued-negative", "ALTER TABLE public.sessions DROP CONSTRAINT sessions_auth_generation_nonnegative; UPDATE public.sessions SET auth_generation=-1 WHERE id='actual-read-session-a'", AppError::DependencyUnavailable { dependency: "host_request_binding" }).await;
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]

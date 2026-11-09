@@ -11,6 +11,8 @@ mod pending_inputs;
 mod recovery_admission;
 #[path = "custom_model_v2_dataset/work_control.rs"]
 mod work_control;
+#[path = "custom_model_v2_dataset/work_journey.rs"]
+mod work_journey;
 
 use async_trait::async_trait;
 use openbot_application::model_connections::ModelConnectionAdministration;

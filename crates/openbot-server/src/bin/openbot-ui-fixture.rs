@@ -4510,16 +4510,17 @@ mod approval_pg_tests {
         let threads = FixtureThreads::new(channels)
             .with_channel_unknown_facts(true)
             .unwrap();
-        let snapshots = threads.inner.snapshots.lock().unwrap();
-        let history = snapshots.get(FIXTURE_EXISTING_THREAD).unwrap();
-        let references: Vec<_> = history
-            .messages
-            .iter()
-            .filter(|message| message.id.starts_with("fixture-p3-tool-history-"))
-            .map(|message| message.agent_id.clone())
-            .collect();
-        assert_eq!(references, vec![Some(id.clone()); 3]);
-        drop(snapshots);
+        {
+            let snapshots = threads.inner.snapshots.lock().unwrap();
+            let history = snapshots.get(FIXTURE_EXISTING_THREAD).unwrap();
+            let references: Vec<_> = history
+                .messages
+                .iter()
+                .filter(|message| message.id.starts_with("fixture-p3-tool-history-"))
+                .map(|message| message.agent_id.clone())
+                .collect();
+            assert_eq!(references, vec![Some(id.clone()); 3]);
+        }
 
         let auth = AuthContext::for_test(
             DeploymentId::new(FIXTURE_DEPLOYMENT),

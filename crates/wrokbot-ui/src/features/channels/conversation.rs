@@ -1172,6 +1172,14 @@ fn ConversationSurface(
                 stop_receipt.set(None);
                 work.on_changed.run(());
             }
+            // A new work has no Server thread until its first accepted submission, so its
+            // queue is lawfully empty; the first acceptance flips this and reads again.
+            if allow_missing_snapshot.get() {
+                pending_items.set(Vec::new());
+                pending_failed.set(false);
+                pending_loading.set(false);
+                return run;
+            }
             pending_loading.set(true);
             pending_failed.set(false);
             #[cfg(target_arch = "wasm32")]
@@ -2304,7 +2312,7 @@ fn ConversationSurface(
                     <super::composer::presentation::DraftSuggestions disabled=textarea_disabled on_choose=UnsyncCallback::new(move |text| { if !textarea_disabled.get_untracked() { draft.set(text); } })/>
                 </Show>
             </div>
-            <Show when=move || direct && (can_stop_work.get() || matches!(state.get().active_run_state, Some(ThreadForegroundRunState::Cancelling)))>
+            <Show when=move || direct && (can_stop_work.get() || work_stopping.get() || matches!(state.get().active_run_state, Some(ThreadForegroundRunState::Cancelling)))>
                 <div class="ob-bot-work-actions">
                     <Button
                         variant=ButtonVariant::Ghost

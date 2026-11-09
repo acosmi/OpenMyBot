@@ -314,12 +314,15 @@ impl ServerState {
         &self,
         origin: Option<&str>,
     ) -> Result<(), openbot_contracts::error::AppError> {
+        let Some(origin) = origin else {
+            return Ok(());
+        };
         let Some(security) = &self.inner.sensitive_write else {
             return Err(openbot_contracts::error::AppError::DependencyUnavailable {
                 dependency: "sensitive_write_security",
             });
         };
-        security.authorize_origin(origin)
+        security.authorize_origin(Some(origin))
     }
 
     /// Fresh same-origin write whose per-resource authorization remains in application/infra.

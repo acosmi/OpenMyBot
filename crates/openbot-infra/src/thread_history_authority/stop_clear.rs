@@ -378,13 +378,6 @@ impl PostgresThreadHistoryAuthority {
         };
         if matches!(decision, Decision::Closed(_)) {
             execute(tx, deadline, "UPDATE openbot_internal.thread_pending_inputs SET state='withdrawn',held_reason=NULL,last_error='thread_deleted',state_changed_at=clock_timestamp() WHERE thread_id=$1 AND state IN ('pending','held')", &[&thread.as_str()]).await?;
-            execute(
-                tx,
-                deadline,
-                "UPDATE public.threads SET updated_at=clock_timestamp() WHERE thread_id=$1",
-                &[&thread.as_str()],
-            )
-            .await?;
         }
         current.check_attachment(deadline)?;
         // J2: a new statement after the lazy H and Q unique waits and every write, before the

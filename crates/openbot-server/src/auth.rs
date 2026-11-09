@@ -780,7 +780,7 @@ struct ServerSessionCurrentGuard {
 }
 
 const CURRENT_SESSION_SQL: &str = "SELECT s.id,s.user_id,s.token,s.expires_at,s.created_at,s.updated_at,s.auth_generation, \
-    coalesce(u.auth_generation,0) AS current_generation, \
+    u.auth_generation AS current_generation, \
     EXISTS(SELECT 1 FROM public.revoked_access ra WHERE ra.email=lower(u.email)) AS revoked, \
     ARRAY(SELECT ur.role::text FROM public.user_roles ur WHERE ur.user_id=u.id ORDER BY ur.role::text) AS roles \
     FROM public.sessions s JOIN public.users u ON u.id=s.user_id \
