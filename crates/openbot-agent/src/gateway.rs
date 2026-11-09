@@ -384,6 +384,13 @@ impl AgentToolGateway {
                 | AppReply::ThreadWorkStopped(_)
                 | AppReply::ThreadCompleted(_)
                 | AppReply::BotThreadPage(_)
+                | AppReply::AutomationDefinitions(_)
+                | AppReply::AutomationDefinitionCreated(_)
+                | AppReply::AutomationDefinition(_)
+                | AppReply::AutomationReceiptAccepted(_)
+                | AppReply::AutomationReceipt(_)
+                | AppReply::AutomationOccurrences(_)
+                | AppReply::AutomationDeliveries(_)
                 | AppReply::ThreadTitleSet(_)
                 | AppReply::ThreadRunStarted(_)
                 | AppReply::ThreadRunCancellation(_)
@@ -613,7 +620,24 @@ impl AuthorizedAgentToolGateway {
                 Err(AgentToolInvokeError::ReconciliationRequired)
             }
             Err(
-                AppError::Unauthenticated
+                AppError::EventOutsideWindow
+                | AppError::EventAdapterUnavailable
+                | AppError::UnknownDispositionUnavailable
+                | AppError::AutomationSourceUnauthorized
+                | AppError::AutomationNotAccepting
+                | AppError::EventNotAccepted
+                | AppError::AutomationRevisionConflict
+                | AppError::AutomationKeyRevisionConflict
+                | AppError::AutomationOperationConflict
+                | AppError::AutomationEventConflict
+                | AppError::AutomationDelegationInvalid
+                | AppError::AutomationBudgetUnconfigured
+                | AppError::AutomationTriggerUnavailable
+                | AppError::PayloadTooLarge
+                | AppError::AutomationCapacityExceeded
+                | AppError::AutomationReceiverFull
+                | AppError::AutomationRateLimited
+                | AppError::Unauthenticated
                 | AppError::AnchorUnsupported
                 | AppError::PendingInputLimit
                 | AppError::PendingInputState
@@ -700,7 +724,24 @@ impl AuthorizedAgentToolGateway {
                 Err(AgentToolInvokeError::ReconciliationRequired)
             }
             Err(
-                AppError::Unauthenticated
+                AppError::EventOutsideWindow
+                | AppError::EventAdapterUnavailable
+                | AppError::UnknownDispositionUnavailable
+                | AppError::AutomationSourceUnauthorized
+                | AppError::AutomationNotAccepting
+                | AppError::EventNotAccepted
+                | AppError::AutomationRevisionConflict
+                | AppError::AutomationKeyRevisionConflict
+                | AppError::AutomationOperationConflict
+                | AppError::AutomationEventConflict
+                | AppError::AutomationDelegationInvalid
+                | AppError::AutomationBudgetUnconfigured
+                | AppError::AutomationTriggerUnavailable
+                | AppError::PayloadTooLarge
+                | AppError::AutomationCapacityExceeded
+                | AppError::AutomationReceiverFull
+                | AppError::AutomationRateLimited
+                | AppError::Unauthenticated
                 | AppError::AnchorUnsupported
                 | AppError::PendingInputLimit
                 | AppError::PendingInputState
@@ -771,7 +812,24 @@ impl AuthorizedAgentToolGateway {
                 Err(AgentToolInvokeError::ReconciliationRequired)
             }
             Err(
-                AppError::Unauthenticated
+                AppError::EventOutsideWindow
+                | AppError::EventAdapterUnavailable
+                | AppError::UnknownDispositionUnavailable
+                | AppError::AutomationSourceUnauthorized
+                | AppError::AutomationNotAccepting
+                | AppError::EventNotAccepted
+                | AppError::AutomationRevisionConflict
+                | AppError::AutomationKeyRevisionConflict
+                | AppError::AutomationOperationConflict
+                | AppError::AutomationEventConflict
+                | AppError::AutomationDelegationInvalid
+                | AppError::AutomationBudgetUnconfigured
+                | AppError::AutomationTriggerUnavailable
+                | AppError::PayloadTooLarge
+                | AppError::AutomationCapacityExceeded
+                | AppError::AutomationReceiverFull
+                | AppError::AutomationRateLimited
+                | AppError::Unauthenticated
                 | AppError::AnchorUnsupported
                 | AppError::PendingInputLimit
                 | AppError::PendingInputState
@@ -898,7 +956,24 @@ fn map_application_reply(
             Err(AgentToolInvokeError::ReconciliationRequired)
         }
         Err(
-            AppError::Unauthenticated
+            AppError::EventOutsideWindow
+            | AppError::EventAdapterUnavailable
+            | AppError::UnknownDispositionUnavailable
+            | AppError::AutomationSourceUnauthorized
+            | AppError::AutomationNotAccepting
+            | AppError::EventNotAccepted
+            | AppError::AutomationRevisionConflict
+            | AppError::AutomationKeyRevisionConflict
+            | AppError::AutomationOperationConflict
+            | AppError::AutomationEventConflict
+            | AppError::AutomationDelegationInvalid
+            | AppError::AutomationBudgetUnconfigured
+            | AppError::AutomationTriggerUnavailable
+            | AppError::PayloadTooLarge
+            | AppError::AutomationCapacityExceeded
+            | AppError::AutomationReceiverFull
+            | AppError::AutomationRateLimited
+            | AppError::Unauthenticated
             | AppError::AnchorUnsupported
             | AppError::PendingInputLimit
             | AppError::PendingInputState

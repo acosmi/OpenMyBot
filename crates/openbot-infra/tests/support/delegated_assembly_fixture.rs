@@ -81,6 +81,7 @@ pub struct Fixture {
 pub struct Options {
     pub single_user: bool,
     pub delegated: bool,
+    pub automation: bool,
     pub subscribe: bool,
     pub extensions: Vec<(ProviderExtensionKey, Arc<dyn ProviderAdapter>)>,
     pub subscriber: Option<Arc<dyn RunTerminalSubscriber>>,
@@ -90,6 +91,7 @@ impl Default for Options {
         Self {
             single_user: true,
             delegated: true,
+            automation: false,
             subscribe: true,
             extensions: Vec::new(),
             subscriber: None,
@@ -153,7 +155,7 @@ impl Fixture {
         });
         let notices = Arc::new(Notices::default());
         let signer = Arc::new(RemoteRunAssertionSigner::new(vec![0x52; 32]).map_err(text)?);
-        let assembled = assemble_postgres_application(PostgresApplicationAssemblyInput {
+        let input = PostgresApplicationAssemblyInput {
             pool: pool.clone(),
             listener_database: config.clone().into(),
             deployment: deployment.clone(),
@@ -201,11 +203,14 @@ impl Fixture {
             } else {
                 None
             },
-            delegation_authority: options
-                .delegated
+            delegation_authority: (!options.automation && options.delegated)
                 .then(|| authority.clone() as Arc<dyn DelegationAuthority>),
-        })
-        .await;
+        };
+        let assembled = if options.automation {
+            assemble_postgres_server_application(input).await
+        } else {
+            assemble_postgres_application(input).await
+        };
         let assembly = match assembled {
             Ok(assembly) => assembly,
             Err(error) => {

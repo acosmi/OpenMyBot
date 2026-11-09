@@ -412,7 +412,7 @@ async fn native_0045_desktop_canary_preflight_accepts_fresh_and_upgrade_read_onl
                         .expect(
                             "current canary preflight must accept its registered public layout",
                         );
-                assert_eq!(layout.native_version(), native::NATIVE_0053_VERSION);
+                assert_eq!(layout.native_version(), native::NATIVE_0054_VERSION);
                 openbot_infra::db::desktop_vault_canary::verify_current_layout(&pool)
                     .await
                     .unwrap();
@@ -437,7 +437,7 @@ async fn fresh_and_upgrade_catalogs_match_frozen_cleanup_oracle() {
         "../../../fixtures/db/artifact-cleanup-fences-0045.json"
     ))
     .unwrap();
-    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0053_VERSION);
+    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0054_VERSION);
     for upgrade in [false, true] {
         let expected = expected.clone();
         harness::with_temp_database(
@@ -506,16 +506,16 @@ async fn fresh_and_upgrade_catalogs_match_frozen_cleanup_oracle() {
                 let current = ledger(&client).await;
                 assert_eq!(
                     current.iter().map(|row| row.0).collect::<Vec<_>>(),
-                    (13..=native::NATIVE_0053_VERSION).collect::<Vec<_>>()
+                    (13..=native::NATIVE_0054_VERSION).collect::<Vec<_>>()
                 );
-                assert_eq!(current.last().unwrap().1, native::NATIVE_0053_NAME);
+                assert_eq!(current.last().unwrap().1, native::NATIVE_0054_NAME);
                 assert_eq!(
                     current.last().unwrap().2,
-                    format!("{:x}", Sha256::digest(native::NATIVE_0053_SQL.as_bytes()))
+                    format!("{:x}", Sha256::digest(native::NATIVE_0054_SQL.as_bytes()))
                 );
                 if upgrade {
                     assert_eq!(&current[..old_ledger.len()], old_ledger.as_slice());
-                    assert_eq!(current.len(), old_ledger.len() + 9);
+                    assert_eq!(current.len(), old_ledger.len() + 10);
                     assert_eq!(
                         current[old_ledger.len()..]
                             .iter()
@@ -531,6 +531,7 @@ async fn fresh_and_upgrade_catalogs_match_frozen_cleanup_oracle() {
                             native::NATIVE_0051_VERSION,
                             native::NATIVE_0052_VERSION,
                             native::NATIVE_0053_VERSION,
+                            native::NATIVE_0054_VERSION,
                         ]
                     );
                     assert_eq!(legacy_rows(&client).await, old_rows);

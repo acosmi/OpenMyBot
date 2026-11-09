@@ -34,7 +34,7 @@
 //! ```text
 //! handler
 //!   ← DefaultBodyLimit::disable()        Axum 默认 2 MiB 让位
-//!   ← RequestBodyLimitLayer(1 MiB)       §5.2 的输入大小限制，唯一真源
+//!   ← RequestBodyLimitLayer(1 MiB for existing routes; automation streams enforce 64 KiB)
 //!   ← record_http_metrics                §16.4 的 latency / status / 在飞数
 //!   ← trace_request                      §16.4 的请求 span（最外层）
 //! ```
@@ -52,6 +52,7 @@ pub mod artifact_save_receipts;
 pub mod artifacts;
 pub mod auth_oidc;
 pub mod auth_sso;
+pub mod automations;
 pub mod channels;
 pub mod components;
 pub mod computers;
@@ -908,7 +909,7 @@ pub fn router(state: ServerState) -> Router {
             "/api/admin/people/{user_id}/access",
             post(admin::people_access),
         )
-        .with_state(state);
+        .with_state(state.clone());
     let router = match static_app {
         Some(app) => static_app::mount(router, app),
         None => router,
@@ -917,10 +918,13 @@ pub fn router(state: ServerState) -> Router {
     // retain the same request-id, tracing, metrics and bounded-body transport contract as APIs.
     // Axum only applies `Router::layer` to routes already present at the call site.
     router
-        // Axum 自带一个 2 MiB 的默认上限，且只对消费 body 的提取器生效。关掉它，让
-        // `REQUEST_BODY_LIMIT_BYTES` 成为唯一真源 —— 两个上限就是两个答案。
+        // Existing routes use the single legacy transport budget. Automation's smaller stream
+        // budget is enforced in its own framing handler before typed JSON is admitted.
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT_BYTES))
+        // Automation counts its stricter stream budget and returns the registered JSON 413,
+        // including bodies that exceed the legacy transport limit. Shared transport guards remain.
+        .merge(automations::routes(state))
         .layer(axum::middleware::from_fn_with_state(
             transport_policy,
             transport_gate::enforce,

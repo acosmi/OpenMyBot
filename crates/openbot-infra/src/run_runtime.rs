@@ -1168,6 +1168,9 @@ async fn mark_cancellation_signalled_in_transaction(
     claim: &ClaimedRunCancellation,
     lease_duration: Duration,
 ) -> Result<(), RunRuntimeError> {
+    crate::automation::dispatch::lock_existing_run(transaction, claim.lease().run_id().as_str())
+        .await
+        .map_err(|_| RunRuntimeError::Unavailable)?;
     let now = database_now(transaction).await?;
     let row = transaction
         .query_opt(
@@ -1225,6 +1228,9 @@ async fn finish_unstarted_cancellation_in_transaction(
     owner: &str,
     claim: &ClaimedRunCancellation,
 ) -> Result<RunWriteReceipt, RunRuntimeError> {
+    crate::automation::dispatch::lock_existing_run(transaction, claim.lease().run_id().as_str())
+        .await
+        .map_err(|_| RunRuntimeError::Unavailable)?;
     let schema = observe_writer_schema(transaction).await?;
     let row = transaction
         .query_opt(
@@ -1512,6 +1518,9 @@ async fn acknowledge_dispatch_in_transaction(
     owner: &str,
     claim: &ClaimedRunDispatch,
 ) -> Result<RunExecutionLease, RunRuntimeError> {
+    crate::automation::dispatch::lock_existing_run(transaction, claim.lease().run_id().as_str())
+        .await
+        .map_err(|_| RunRuntimeError::Unavailable)?;
     let now = database_now(transaction).await?;
     let row = transaction
         .query_opt(
@@ -1556,6 +1565,9 @@ async fn retry_dispatch_in_transaction(
     claim: &ClaimedRunDispatch,
     claim_duration: Duration,
 ) -> Result<(), RunRuntimeError> {
+    crate::automation::dispatch::lock_existing_run(transaction, claim.lease().run_id().as_str())
+        .await
+        .map_err(|_| RunRuntimeError::Unavailable)?;
     let now = database_now(transaction).await?;
     let exponent = claim.attempt().saturating_sub(1).min(6);
     let factor = 1_i32
@@ -1612,6 +1624,9 @@ async fn reject_dispatch_in_transaction(
     claim: &ClaimedRunDispatch,
     code: RunFailureCode,
 ) -> Result<RunWriteReceipt, RunRuntimeError> {
+    crate::automation::dispatch::lock_existing_run(transaction, claim.lease().run_id().as_str())
+        .await
+        .map_err(|_| RunRuntimeError::Unavailable)?;
     let expected = claim.lease().next_event_sequence();
     let schema = observe_writer_schema(transaction).await?;
     let row = transaction
@@ -2295,6 +2310,18 @@ async fn record_provider_usage_in_transaction(
             && stored.last_total_tokens == Some(total_tokens)
             && stored.max_output_tokens == max_output_tokens
             && stored_rate_card == rate_card;
+        if exact_last && let Some((deployment, tenant, _)) = &locked.automation {
+            crate::automation_budget::settle_sampling(
+                transaction,
+                deployment,
+                tenant,
+                lease.run_id().as_str(),
+                u32::try_from(sampling_index).map_err(|_| RunRuntimeError::Conflict)?,
+                Some(total_tokens),
+            )
+            .await
+            .map_err(|_| RunRuntimeError::Unavailable)?;
+        }
         return if exact_last {
             if stored
                 .max_output_tokens
@@ -2446,6 +2473,18 @@ async fn record_provider_usage_in_transaction(
         .map_err(|error| write_error("写 run provider usage", error))?;
     if updated != 1 {
         return Err(RunRuntimeError::StaleLease);
+    }
+    if let Some((deployment, tenant, _)) = &locked.automation {
+        crate::automation_budget::settle_sampling(
+            transaction,
+            deployment,
+            tenant,
+            lease.run_id().as_str(),
+            u32::try_from(sampling_index).map_err(|_| RunRuntimeError::Conflict)?,
+            Some(total_tokens),
+        )
+        .await
+        .map_err(|_| RunRuntimeError::Unavailable)?;
     }
     let aggregate = RunTokenUsage {
         input_tokens: sequence_u64(next_input, "usage_input_tokens")?,
@@ -2671,6 +2710,11 @@ async fn finish_run_in_transaction(
         .map_err(history_writer_error)?;
     }
     release_lease(transaction, lease.thread_id(), now).await?;
+    if locked.automation.is_some() {
+        crate::automation::dispatch::release_capacity(transaction, lease.run_id().as_str())
+            .await
+            .map_err(|_| RunRuntimeError::Unavailable)?;
+    }
     notify_thread(transaction).await?;
     Ok(RunWriteReceipt {
         run_event_sequence: expected_sequence,
@@ -2750,6 +2794,19 @@ async fn recover_one_in_transaction(
     owner: &str,
 ) -> Result<Option<(RunExecutionLease, RunWriteReceipt)>, RunRuntimeError> {
     let now = database_now(transaction).await?;
+    let automation_candidate = transaction.query_opt(
+        "SELECT r.run_id FROM public.runs r JOIN public.thread_leases l ON l.thread_id=r.thread_id
+         JOIN public.outbox o ON o.outbox_id=r.run_id||':agent_run_dispatch'
+         JOIN openbot_internal.automation_occurrences a ON a.run_id=r.run_id
+         WHERE r.status='running' AND l.expires_at<=$1 AND o.status IN ('delivered','dead_letter')
+           AND NOT EXISTS(SELECT 1 FROM public.outbox cx WHERE cx.aggregate_id=r.run_id AND cx.destination=$2 AND cx.status IN ('pending','delivering'))
+         ORDER BY l.expires_at,r.run_id LIMIT 1", &[&now,&RUN_CANCEL_DESTINATION]
+    ).await.map_err(|_| RunRuntimeError::Unavailable)?.map(|r|r.get::<_,String>(0));
+    if let Some(run) = &automation_candidate {
+        crate::automation::dispatch::lock_existing_run(transaction, run)
+            .await
+            .map_err(|_| RunRuntimeError::Unavailable)?;
+    }
     let row = transaction
         .query_opt(
             "SELECT r.run_id,o.status AS outbox_status \
@@ -2757,13 +2814,14 @@ async fn recover_one_in_transaction(
              JOIN public.thread_leases l ON l.thread_id=r.thread_id \
              JOIN public.outbox o ON o.outbox_id=r.run_id || ':agent_run_dispatch' \
              WHERE r.status='running' AND l.expires_at<=$1 \
+               AND (($3::text IS NULL AND NOT EXISTS(SELECT 1 FROM openbot_internal.automation_occurrences a WHERE a.run_id=r.run_id)) OR r.run_id=$3) \
                AND o.status IN ('delivered','dead_letter') \
                AND NOT EXISTS(SELECT 1 FROM public.outbox cx \
                  WHERE cx.aggregate_id=r.run_id AND cx.destination=$2 \
                    AND cx.status IN ('pending','delivering')) \
              ORDER BY l.expires_at,r.run_id \
              FOR UPDATE OF r,l,o SKIP LOCKED LIMIT 1",
-            &[&now, &RUN_CANCEL_DESTINATION],
+            &[&now, &RUN_CANCEL_DESTINATION, &automation_candidate],
         )
         .await
         .map_err(|error| unavailable("选择 stale running run", error))?;
@@ -2823,6 +2881,11 @@ async fn recover_one_in_transaction(
 }
 
 struct LockedRun {
+    automation: Option<(
+        openbot_contracts::ids::DeploymentId,
+        openbot_contracts::ids::TenantId,
+        openbot_contracts::automation::AutomationId,
+    )>,
     run_id: String,
     thread_id: String,
     bot_id: String,
@@ -2843,6 +2906,9 @@ async fn lock_run(
     transaction: &Transaction<'_>,
     run_id: &str,
 ) -> Result<Option<LockedRun>, RunRuntimeError> {
+    let automation = crate::automation::dispatch::lock_existing_run(transaction, run_id)
+        .await
+        .map_err(|_| RunRuntimeError::Unavailable)?;
     let row = transaction
         .query_opt(
             "SELECT r.run_id,r.thread_id,r.bot_id,r.actor_id,r.status,r.fencing_token, \
@@ -2858,7 +2924,12 @@ async fn lock_run(
         )
         .await
         .map_err(|error| unavailable("锁定 run/thread/lease", error))?;
-    row.as_ref().map(decode_locked_run).transpose()
+    row.as_ref().map(decode_locked_run).transpose().map(|row| {
+        row.map(|mut locked| {
+            locked.automation = automation;
+            locked
+        })
+    })
 }
 
 fn decode_locked_run(row: &Row) -> Result<LockedRun, RunRuntimeError> {
@@ -2888,6 +2959,7 @@ fn decode_locked_run(row: &Row) -> Result<LockedRun, RunRuntimeError> {
         None
     };
     Ok(LockedRun {
+        automation: None,
         run_id: decode(row, "run_id")?,
         thread_id: decode(row, "thread_id")?,
         bot_id: decode(row, "bot_id")?,

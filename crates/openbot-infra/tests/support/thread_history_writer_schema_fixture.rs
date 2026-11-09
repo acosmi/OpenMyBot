@@ -1,5 +1,5 @@
 // Reuse the original isolated-database, V1/V2, import and connection teardown controls.
-// Historical0051 and current0052 remain separate independently authored immutable fixtures.
+// The original 0051 and 0052 writer fixtures remain immutable.
 include!("thread_history_admission_schema_fixture.rs");
 const THREAD_INSERT: &str = "INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,title,status,next_message_seq,next_event_seq,created_at,updated_at,deleted_at) VALUES($1,'owned-origin-tenant','owned-origin-deployment','origin-a','direct_bot',$2,'Owned permanent ID','active',0,0,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',NULL)";
 const OP: &str = "019a1234-5678-7abc-8abc-000000000001";
@@ -37,12 +37,12 @@ async fn writer_check(c: &Client) -> TestResult {
         .await
         .map_err(|e| e.to_string())?;
     origin_schema::verify(c).await.map_err(|e| e.to_string())?;
-    let ledger = native::validate_known_prefix(c, native::NATIVE_0053_VERSION)
+    let ledger = native::validate_known_prefix(c, native::NATIVE_0054_VERSION)
         .await
         .map_err(|e| e.to_string())?;
     require(
-        ledger.latest_version() == native::NATIVE_0053_VERSION,
-        "current prefix not exact0053",
+        ledger.latest_version() == native::NATIVE_0054_VERSION,
+        "current prefix not exact0054",
     )?;
     Ok(())
 }

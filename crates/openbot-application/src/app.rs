@@ -145,6 +145,7 @@ pub struct OpenBotApplication<
     public_artifact_reads:
         std::sync::Arc<crate::artifact_read_protocol::PublicArtifactReadRegistry>,
     delegation_runtime: Option<std::sync::Arc<crate::DelegationRuntime>>,
+    automation_definitions: Option<std::sync::Arc<dyn crate::automation::AutomationDefinitions>>,
     runtime_capabilities:
         Option<std::sync::Arc<dyn crate::runtime_capabilities::RuntimeCapabilitiesCollector>>,
     heartbeat_period: Duration,
@@ -201,6 +202,7 @@ impl<R>
                 crate::artifact_read_protocol::PublicArtifactReadRegistry::new(),
             ),
             delegation_runtime: None,
+            automation_definitions: None,
             runtime_capabilities: None,
             heartbeat_period: DEFAULT_HEARTBEAT_PERIOD,
         }
@@ -241,6 +243,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
+            automation_definitions: self.automation_definitions,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -279,6 +282,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
+            automation_definitions: self.automation_definitions,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -317,6 +321,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
+            automation_definitions: self.automation_definitions,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -359,6 +364,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
+            automation_definitions: self.automation_definitions,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -397,6 +403,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
+            automation_definitions: self.automation_definitions,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -435,6 +442,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
+            automation_definitions: self.automation_definitions,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -476,6 +484,7 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
             thread_history_deletion: self.thread_history_deletion,
             public_artifact_reads: self.public_artifact_reads,
             delegation_runtime: self.delegation_runtime,
+            automation_definitions: self.automation_definitions,
             runtime_capabilities: self.runtime_capabilities,
             heartbeat_period: self.heartbeat_period,
         }
@@ -633,6 +642,26 @@ impl<R, P, A, K, C, J, T, M, B> OpenBotApplication<R, P, A, K, C, J, T, M, B> {
     pub fn with_artifacts(mut self, artifacts: std::sync::Arc<dyn ArtifactAdministration>) -> Self {
         self.artifacts = artifacts;
         self
+    }
+
+    /// Assemble Server-owned automation without making it available on an unconfigured host.
+    #[must_use]
+    pub fn with_automation_definitions(
+        mut self,
+        definitions: std::sync::Arc<dyn crate::automation::AutomationDefinitions>,
+    ) -> Self {
+        self.automation_definitions = Some(definitions);
+        self
+    }
+
+    fn automation_definitions(
+        &self,
+    ) -> Result<&dyn crate::automation::AutomationDefinitions, AppError> {
+        self.automation_definitions
+            .as_deref()
+            .ok_or(AppError::DependencyUnavailable {
+                dependency: "automations",
+            })
     }
 
     /// Attach the public Thread history deletion of the shared history authority.
@@ -942,15 +971,117 @@ where
             AppCommand::SetActionPolicy { policy } => Ok(AppReply::ActionPolicy {
                 policy: Some(set_action_policy(&self.policies, auth, policy).await?),
             }),
-            AppCommand::InvokeTool(invocation) => Ok(AppReply::Tool(
-                invoke_tool_guarded(
-                    &self.tool_control,
-                    &self.tool_journal,
-                    auth,
-                    invocation,
-                    delegated_guard,
+            AppCommand::InvokeTool(invocation) => {
+                let automation = auth.delegation().is_some_and(|delegation| {
+                    matches!(
+                        delegation.source(),
+                        openbot_contracts::auth::DelegationSource::AutomationDefinition { .. }
+                    )
+                });
+                let result = if automation {
+                    crate::automation::invoke_automation_tool(
+                        &self.tool_control,
+                        &self.tool_journal,
+                        self.automation_definitions()?,
+                        auth,
+                        invocation,
+                        delegated_guard,
+                    )
+                    .await?
+                } else {
+                    invoke_tool_guarded(
+                        &self.tool_control,
+                        &self.tool_journal,
+                        auth,
+                        invocation,
+                        delegated_guard,
+                    )
+                    .await?
+                };
+                Ok(AppReply::Tool(result))
+            }
+            AppCommand::ListAutomationDefinitions(input) => Ok(AppReply::AutomationDefinitions(
+                self.automation_definitions()?
+                    .list(auth, input.try_into()?)
+                    .await?,
+            )),
+            AppCommand::CreateAutomationDefinition(input) => {
+                let definitions = self.automation_definitions()?;
+                let config = openbot_domain::automation::AutomationConfig::try_from(input.config)?;
+                Ok(
+                    match definitions
+                        .create(auth, input.automation_id, config)
+                        .await?
+                    {
+                        crate::automation::AutomationCreation::Created(row) => {
+                            AppReply::AutomationDefinitionCreated(row)
+                        }
+                        crate::automation::AutomationCreation::Replayed(row) => {
+                            AppReply::AutomationDefinition(row)
+                        }
+                    },
                 )
-                .await?,
+            }
+            AppCommand::GetAutomationDefinition { automation_id } => {
+                Ok(AppReply::AutomationDefinition(
+                    self.automation_definitions()?
+                        .get(auth, automation_id)
+                        .await?,
+                ))
+            }
+            AppCommand::UpdateAutomationDefinition {
+                automation_id,
+                input,
+            } => Ok(AppReply::AutomationDefinition(
+                self.automation_definitions()?
+                    .update(auth, automation_id, input.try_into()?)
+                    .await?,
+            )),
+            AppCommand::TombstoneAutomationDefinition {
+                automation_id,
+                input,
+            } => Ok(AppReply::AutomationDefinition(
+                self.automation_definitions()?
+                    .tombstone(auth, automation_id, input.expected_revision)
+                    .await?,
+            )),
+            AppCommand::TriggerAutomationDefinition {
+                automation_id,
+                input,
+            } => Ok(
+                match self
+                    .automation_definitions()?
+                    .trigger(auth, automation_id, input)
+                    .await?
+                {
+                    crate::automation::AutomationAcceptance::Accepted(row) => {
+                        AppReply::AutomationReceiptAccepted(row)
+                    }
+                    crate::automation::AutomationAcceptance::Replayed(row) => {
+                        AppReply::AutomationReceipt(row)
+                    }
+                },
+            ),
+            AppCommand::ListAutomationOccurrences {
+                automation_id,
+                query,
+            } => Ok(AppReply::AutomationOccurrences(
+                self.automation_definitions()?
+                    .occurrences(auth, automation_id, query.try_into()?)
+                    .await?,
+            )),
+            AppCommand::ListAutomationDeliveries {
+                automation_id,
+                query,
+            } => Ok(AppReply::AutomationDeliveries(
+                self.automation_definitions()?
+                    .deliveries(auth, automation_id, query.try_into()?)
+                    .await?,
+            )),
+            AppCommand::GetAutomationReceipt { receipt_id } => Ok(AppReply::AutomationReceipt(
+                self.automation_definitions()?
+                    .receipt(auth, receipt_id)
+                    .await?,
             )),
             AppCommand::MintThreadId => Ok(AppReply::ThreadMinted(
                 mint_thread_id(&self.threads, auth).await?,

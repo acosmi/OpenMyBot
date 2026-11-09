@@ -422,7 +422,7 @@ async fn thread_history_clear_fresh52_upgrade51_complete_clear_schema_and_zero_d
             let retained: Value = c.query_one("SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM openbot_internal.schema_migrations m WHERE version<=51", &[]).await.map_err(text)?.get(0);
             require(old == retained, "upgrade changed prior migration evidence")?;
             let row = c.query_one("SELECT count(*),max(version),(SELECT count(*) FROM openbot_internal.thread_history_clear_batches),(SELECT count(*) FROM openbot_internal.thread_history_clear_completions) FROM openbot_internal.schema_migrations", &[]).await.map_err(text)?;
-            require(row.get::<_, i64>(0) == 41 && row.get::<_, i32>(1) == native::NATIVE_0053_VERSION && row.get::<_, i64>(2) == 0 && row.get::<_, i64>(3) == 0,
+            require(row.get::<_, i64>(0) == 42 && row.get::<_, i32>(1) == native::NATIVE_0054_VERSION && row.get::<_, i64>(2) == 0 && row.get::<_, i64>(3) == 0,
                 "current prefix not exact or invented clearing facts")?;
             for fault in [
                 "ALTER TABLE openbot_internal.thread_history_clear_batches ALTER COLUMN xact_id DROP DEFAULT",

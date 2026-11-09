@@ -12,6 +12,10 @@ pub const LOCAL_PACKAGE_DIRECTORY: &str = "examples/wrok-bot";
 
 /// 新品牌配置与兼容解析器字段的唯一映射。厂商自己的 OPENAI/BOT 变量保持原协议。
 const VARIABLES: &[(&str, &str)] = &[
+    (
+        "WROK_BOT_AUTOMATION_BUDGETS_FILE",
+        "OPENBOT_AUTOMATION_BUDGETS_FILE",
+    ),
     ("WROK_BOT_ARTIFACT_ROOT", "OPENBOT_ARTIFACT_ROOT"),
     ("WROK_BOT_APP_DIST_DIR", "APP_DIST_DIR"),
     ("WROK_BOT_APP_URL", "OPENBOT_APP_URL"),
@@ -52,6 +56,8 @@ pub enum LaunchError {
     LocalModeConflict,
     /// 本机自动 Origin 需要一个实际、非零端口。
     LocalPortInvalid,
+    /// The trusted absolute budget file could not be parsed as its closed finite snapshot.
+    AutomationBudgetsInvalid,
 }
 
 impl fmt::Display for LaunchError {
@@ -61,6 +67,7 @@ impl fmt::Display for LaunchError {
             Self::UnknownVariable => "wrok_bot_env_unknown",
             Self::LocalModeConflict => "wrok_bot_local_mode_conflict",
             Self::LocalPortInvalid => "wrok_bot_local_port_invalid",
+            Self::AutomationBudgetsInvalid => "wrok_bot_automation_budgets_invalid",
         })
     }
 }
@@ -117,6 +124,24 @@ pub fn prepare_environment(mut input: EnvMap, local: bool) -> Result<EnvMap, Lau
     Ok(input)
 }
 
+/// Read the explicit trusted startup budget file once, then admit its exact finite policies.
+///
+/// # Errors
+/// Relative paths, IO failures and malformed policies stop startup without echoing the path/body.
+pub fn load_automation_budgets(
+    path: &std::path::Path,
+) -> Result<openbot_domain::automation::AutomationBudgets, LaunchError> {
+    if !path.is_absolute() {
+        return Err(LaunchError::AutomationBudgetsInvalid);
+    }
+    let bytes = std::fs::read(path).map_err(|_| LaunchError::AutomationBudgetsInvalid)?;
+    let wire =
+        serde_json::from_slice::<openbot_contracts::automation::AutomationBudgetsFile>(&bytes)
+            .map_err(|_| LaunchError::AutomationBudgetsInvalid)?;
+    openbot_domain::automation::AutomationBudgets::try_from(wire)
+        .map_err(|_| LaunchError::AutomationBudgetsInvalid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +151,59 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).into(), (*v).into()))
             .collect()
+    }
+
+    #[test]
+    fn startup_automation_budget_file_is_explicit_closed_and_read_once() {
+        use std::io::Write;
+        assert_eq!(VARIABLES.len(), 19);
+        assert!(load_automation_budgets(std::path::Path::new("relative-budget.json")).is_err());
+        let name = format!(
+            "wrokbot-054-budgets-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(name);
+        let mut file = std::fs::File::create_new(&path).unwrap();
+        file.write_all(br#"{"schemaVersion":1,"revision":1,"workspaces":[],"owners":[]}"#)
+            .unwrap();
+        drop(file);
+        let mapped = prepare_environment(
+            values(&[("WROK_BOT_AUTOMATION_BUDGETS_FILE", path.to_str().unwrap())]),
+            false,
+        )
+        .unwrap();
+        let config = super::super::ServerConfig::from_env_map(&mapped).unwrap();
+        let admitted =
+            load_automation_budgets(config.automation_budgets_file.as_deref().unwrap()).unwrap();
+        assert_eq!(admitted.wire().revision.get(), 1);
+        std::fs::write(
+            &path,
+            br#"{"schemaVersion":1,"revision":1,"revision":2,"workspaces":[],"owners":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_automation_budgets(&path),
+            Err(LaunchError::AutomationBudgetsInvalid)
+        );
+        std::fs::write(
+            &path,
+            br#"{"schemaVersion":1,"revision":1,"workspaces":[],"owners":[],"session":"forged"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_automation_budgets(&path),
+            Err(LaunchError::AutomationBudgetsInvalid)
+        );
+        assert_eq!(
+            admitted.wire().revision.get(),
+            1,
+            "the admitted startup snapshot does not reread a changed file"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

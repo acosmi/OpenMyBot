@@ -8,6 +8,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use openbot_application::automation::AutomationExecutionBudgets;
 use openbot_application::{
     AgentAudit, AgentAuditKind, AgentContextError, AgentContextSource, DurableTextRun,
     NoRemoteInterruptCoordinator, ProviderAdapter, ProviderEvent, ProviderFailure,
@@ -18,7 +19,7 @@ use openbot_application::{
     RunTokenUsageReceipt, RunToolExchange, StopOutcome, ToolCancellationHandle,
     ToolCancellationReason, tool_execution_cancellation,
 };
-use openbot_contracts::components::is_component_human_decision_name;
+use openbot_contracts::{components::is_component_human_decision_name, error::AppError};
 use openbot_domain::agent::{
     AgentEffect, AgentEvent, AgentFailure, AgentState, AgentTerminal, AgentToolCall, reduce,
 };
@@ -93,6 +94,14 @@ impl BuiltInAgentConfig {
     }
 }
 
+/// Durable Run services supplied by the host before activation.
+pub struct BuiltInRunPorts {
+    /// Original Run lease and journal port.
+    pub runtime: Arc<dyn RunRuntime>,
+    /// Automation execution budgets, installed only by the Server host.
+    pub automation_budgets: Option<Arc<dyn AutomationExecutionBudgets>>,
+}
+
 /// Lifecycle owner；consumer clone is injected into RunRelay，handle stays in Server main。
 pub struct BuiltInAgentRuntime {
     consumer: Arc<BuiltInAgentConsumer>,
@@ -150,11 +159,36 @@ impl BuiltInAgentRuntime {
         remote_interrupts: Arc<dyn RemoteInterruptCoordinator>,
         config: BuiltInAgentConfig,
     ) -> Result<Self, RunFailureCode> {
+        Self::start_with_run_ports(
+            BuiltInRunPorts {
+                runtime,
+                automation_budgets: None,
+            },
+            context,
+            provider,
+            tools,
+            audit,
+            remote_interrupts,
+            config,
+        )
+    }
+
+    /// Start with the host's original Run services and optional automation budget gate.
+    pub fn start_with_run_ports(
+        ports: BuiltInRunPorts,
+        context: Arc<dyn AgentContextSource>,
+        provider: Arc<dyn ProviderAdapter>,
+        tools: Arc<dyn AgentToolInvoker>,
+        audit: Arc<dyn AgentAudit>,
+        remote_interrupts: Arc<dyn RemoteInterruptCoordinator>,
+        config: BuiltInAgentConfig,
+    ) -> Result<Self, RunFailureCode> {
         let config = config.validate()?;
         let (sender, receiver) = mpsc::channel(config.queue_capacity);
         let (stop, stop_rx) = watch::channel(false);
         let inner = Arc::new(Inner {
-            runtime,
+            runtime: ports.runtime,
+            automation_budgets: ports.automation_budgets,
             context,
             provider,
             tools,
@@ -304,6 +338,7 @@ impl RunDispatchConsumer for BuiltInAgentConsumer {
 
 struct Inner {
     runtime: Arc<dyn RunRuntime>,
+    automation_budgets: Option<Arc<dyn AutomationExecutionBudgets>>,
     context: Arc<dyn AgentContextSource>,
     provider: Arc<dyn ProviderAdapter>,
     tools: Arc<dyn AgentToolInvoker>,
@@ -1009,6 +1044,48 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
                     AgentEvent::ContextFailed(AgentFailure::ProviderInvalidResponse),
                 )
                 .await;
+                return;
+            }
+        }
+        if lease.delegation_required()
+            && let Some(budgets) = &inner.automation_budgets
+        {
+            let event = match await_run_child(
+                budgets.reserve_sampling(lease, sampling_index),
+                &mut activation.cancel,
+                &mut renew,
+                deadline,
+                inner.runtime.as_ref(),
+                lease,
+            )
+            .await
+            {
+                ControlledChild::Ready(Ok(())) => None,
+                ControlledChild::Ready(Err(AppError::PolicyRefused { rule, .. }))
+                    if rule == "automation_budget_exceeded" =>
+                {
+                    Some(AgentEvent::ContextFailed(
+                        AgentFailure::AutomationBudgetExceeded,
+                    ))
+                }
+                ControlledChild::Ready(Err(_)) => Some(AgentEvent::ContextFailed(
+                    AgentFailure::JournalCommitUnknown,
+                )),
+                ControlledChild::Cancelled(source) => {
+                    cancel_and_commit(
+                        &mut state,
+                        &mut journal,
+                        inner.audit.as_ref(),
+                        lease,
+                        source,
+                    )
+                    .await;
+                    return;
+                }
+                ControlledChild::LeaseLost => Some(AgentEvent::LeaseLost),
+            };
+            if let Some(event) = event {
+                drive_terminal_event(&mut state, &mut journal, event).await;
                 return;
             }
         }
@@ -2406,6 +2483,7 @@ const fn failure_code(failure: AgentFailure) -> RunFailureCode {
             RunFailureCode::RunCostBudgetCurrencyMismatch
         }
         AgentFailure::RunCostBudgetExceeded => RunFailureCode::RunCostBudgetExceeded,
+        AgentFailure::AutomationBudgetExceeded => RunFailureCode::AutomationBudgetExceeded,
         AgentFailure::ToolStepLimit => RunFailureCode::ToolStepLimit,
         AgentFailure::ToolLoopUnavailable => RunFailureCode::ToolLoopUnavailable,
         AgentFailure::ToolDenied => RunFailureCode::ToolDenied,

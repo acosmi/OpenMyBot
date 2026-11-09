@@ -265,6 +265,9 @@ pub struct ServerConfig {
     /// Explicit trusted startup-only artifact byte directory, verified by its real descriptor.
     /// Absence leaves the saving dependency unavailable; no root is inferred from a tenant.
     pub artifact_root: Option<std::path::PathBuf>,
+    /// Explicit trusted absolute file, loaded once by the launch boundary before policy persistence.
+    /// Omission leaves owner/workspace automation budgets unconfigured.
+    pub automation_budgets_file: Option<std::path::PathBuf>,
     /// 租户包目录。缺省 [`DEFAULT_TENANT_PACKAGE_DIR`]。
     pub tenant_package_directory: String,
     /// 审计留存窗口。
@@ -372,6 +375,8 @@ impl ServerConfig {
             app_url,
             app_dist_dir: env::optional(env_map, "APP_DIST_DIR").map(str::to_owned),
             artifact_root: env::optional(env_map, "OPENBOT_ARTIFACT_ROOT")
+                .map(std::path::PathBuf::from),
+            automation_budgets_file: env::optional(env_map, "OPENBOT_AUTOMATION_BUDGETS_FILE")
                 .map(std::path::PathBuf::from),
             tenant_package_directory: env::optional(env_map, "TENANT_PACKAGE_DIR")
                 .unwrap_or(DEFAULT_TENANT_PACKAGE_DIR)

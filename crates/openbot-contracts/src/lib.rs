@@ -79,6 +79,7 @@ pub mod artifact_read_protocol;
 pub mod artifacts;
 pub mod audit;
 pub mod auth;
+pub mod automation;
 pub mod begin_thread_run_wire;
 pub mod budget;
 pub mod command;
