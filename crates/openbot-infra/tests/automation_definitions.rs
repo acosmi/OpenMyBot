@@ -930,6 +930,7 @@ async fn delegation_lifecycle_and_current_generation() {
         ).await?;
         let mut original = config();
         original.permission_ceiling.tool_ids.push("remember".to_owned());
+        original.permission_ceiling.data_scopes.push("thread:owner".to_owned());
         f.assembly.application.execute(f.auth.clone(), AppCommand::CreateAutomationDefinition(
             CreateAutomationDefinition { automation_id: id("authority"), config: original.clone() },
         )).await.unwrap();
@@ -1059,20 +1060,34 @@ async fn delegation_lifecycle_and_current_generation() {
             automation_id: id("authority"),
             input: UpdateAutomationDefinition::Pause { expected_revision: revision(5) },
         }).await.unwrap();
+        let mut expanded = edited.clone();
+        expanded.permission_ceiling.tool_ids.push("draft_tool".to_owned());
+        expanded.permission_ceiling.data_scopes.push("thread:draft".to_owned());
+        for (expected, config) in [(6, expanded), (7, edited.clone())] {
+            let replaced = f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
+                automation_id: id("authority"),
+                input: UpdateAutomationDefinition::Replace { expected_revision: revision(expected), config },
+            }).await.unwrap();
+            assert!(matches!(replaced, AppReply::AutomationDefinition(ref d) if d.grant.valid && d.grant.revision == Some(revision(5))));
+            assert!(runtime.claim_cancellation().await.unwrap().is_none());
+        }
+        assert!(authority.verify_current(deployment, tenant, &source, 5).await.is_ok());
+        assert!(store.reserve_sampling(&restricted, 0).await.unwrap());
+
         edited.permission_ceiling.tool_ids.clear();
         f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
             automation_id: id("authority"),
-            input: UpdateAutomationDefinition::Replace { expected_revision: revision(6), config: edited },
+            input: UpdateAutomationDefinition::Replace { expected_revision: revision(8), config: edited },
         }).await.unwrap();
-        assert_eq!(store.reserve_sampling(&restricted, 0).await.unwrap_err(), AppError::AutomationDelegationInvalid);
+        assert_eq!(store.reserve_sampling(&restricted, 1).await.unwrap_err(), AppError::AutomationDelegationInvalid);
         let stop = runtime.claim_cancellation().await.unwrap().expect("narrower permission requested a durable stop");
         assert_eq!(stop.lease().run_id(), restricted.run_id());
         runtime.mark_cancellation_signalled(&stop).await.unwrap();
         runtime.finish_run(stop.lease(), stop.lease().next_event_sequence(), RunTerminal::Cancelled).await.unwrap();
         assert!(runtime.claim_cancellation().await.unwrap().is_none());
 
-        enable(&f, "authority", 7).await;
-        assert!(authority.verify_current(deployment, tenant, &source, 8).await.is_ok());
+        enable(&f, "authority", 9).await;
+        assert!(authority.verify_current(deployment, tenant, &source, 10).await.is_ok());
         let client = f.pool.get().await.unwrap();
         client.execute(
             "UPDATE public.users SET auth_generation=coalesce(auth_generation,0)+1 WHERE id=$1",
@@ -1080,7 +1095,7 @@ async fn delegation_lifecycle_and_current_generation() {
         ).await.unwrap();
         drop(client);
         assert!(matches!(
-            authority.verify_current(deployment, tenant, &source, 8).await,
+            authority.verify_current(deployment, tenant, &source, 10).await,
             Err(DelegationAuthorityError::NotCurrent),
         ));
         let before = image(&f).await;

@@ -573,14 +573,36 @@ impl PostgresAutomations {
                 if replacement.wire().bot_id != config.bot_id {
                     return Err(AppError::MalformedPayload { field: "bot_id" });
                 }
-                let old = &config.permission_ceiling;
                 let next = &replacement.wire().permission_ceiling;
-                let revoke = old_enabled
-                    || old.tool_ids.iter().any(|id| !next.tool_ids.contains(id))
-                    || old
-                        .data_scopes
-                        .iter()
-                        .any(|id| !next.data_scopes.contains(id));
+                let revoke = if old_enabled {
+                    true
+                } else if &config.permission_ceiling != next
+                    && let Some(grant_revision) = delegation_revision
+                    && let Some(grant) = tx
+                        .query_opt(
+                            "SELECT grant_snapshot FROM openbot_internal.automation_delegations
+                             WHERE deployment_id=$1 AND tenant_id=$2 AND automation_id=$3
+                               AND delegation_revision=$4 AND revoked_at IS NULL",
+                            &[
+                                &self.deployment.as_str(),
+                                &self.tenant.as_str(),
+                                &id.as_str(),
+                                &grant_revision,
+                            ],
+                        )
+                        .await
+                        .map_err(|_| unavailable())?
+                {
+                    // A paused draft can only reduce permissions in the frozen grant.
+                    let grant: AutomationDelegationV1 = stored(column(&grant, "grant_snapshot")?)?;
+                    grant.tool_ids.iter().any(|id| !next.tool_ids.contains(id))
+                        || grant
+                            .data_scopes
+                            .iter()
+                            .any(|id| !next.data_scopes.contains(id))
+                } else {
+                    false
+                };
                 config = replacement.wire().clone();
                 (
                     "paused",
