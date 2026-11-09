@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-const NOW: i64 = 1_800_000_000;
+pub(crate) const NOW: i64 = 1_800_000_000;
 const HASH_KEY: &[u8] = b"dynamic-sso-ephemeral-key-at-least-32";
 const SESSION_KEY: &[u8] = b"dynamic-sso-session-key-at-least-32bytes";
 const AUDIT_KEY: &[u8] = b"dynamic-sso-audit-key-at-least-32-bytes";
@@ -79,13 +79,13 @@ async fn seed(client: &tokio_postgres::Client) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn metadata() -> String {
+pub(crate) fn metadata() -> String {
     format!(
         r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" entityID="urn:example:idp:directory"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{TEST_CERT_DER_BASE64}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://idp.example/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>"#
     )
 }
 
-fn registration(provider: &str, domain: &str) -> RegisterIdentityProviderInput {
+pub(crate) fn registration(provider: &str, domain: &str) -> RegisterIdentityProviderInput {
     serde_json::from_value(serde_json::json!({
         "providerId": provider,
         "issuer": "urn:example:idp:directory",
@@ -109,6 +109,16 @@ fn service_with_dialer(
     pool: &openbot_infra::db::pool::DatabasePool,
     dialer: SafeDialer,
 ) -> DynamicSsoService {
+    service_with_gate(pool, dialer, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+        pool, &openbot_contracts::ids::DeploymentId::new("dep-1"), &TenantId::new("tenant-1"),
+    ))
+}
+
+pub(crate) fn service_with_gate(
+    pool: &openbot_infra::db::pool::DatabasePool,
+    dialer: SafeDialer,
+    recovery_gate: openbot_infra::recovery_control::RecoveryReadGate,
+) -> DynamicSsoService {
     DynamicSsoService::new(
         pool.clone(),
         &TenantId::new("tenant-1"),
@@ -126,11 +136,7 @@ fn service_with_dialer(
         ],
         dialer,
         "https://app.example".to_owned(),
-        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &pool,
-            &openbot_contracts::ids::DeploymentId::new("dep-1"),
-            &TenantId::new("tenant-1"),
-        ),
+        recovery_gate,
     )
     .unwrap()
 }
@@ -144,7 +150,7 @@ fn response(request_id: &str, assertion_id: &str) -> String {
     BASE64_STANDARD.encode(signed.as_bytes())
 }
 
-async fn start(
+pub(crate) async fn start(
     service: &DynamicSsoService,
     email: &str,
     now: OffsetDateTime,
@@ -524,7 +530,7 @@ async fn legacy_plaintext_saml_config_is_read_verified_and_resealed_as_v2() {
 }
 
 #[derive(Clone)]
-struct LocalResolver(SocketAddr);
+pub(crate) struct LocalResolver(pub(crate) SocketAddr);
 
 #[async_trait::async_trait]
 impl DnsResolver for LocalResolver {
@@ -534,9 +540,9 @@ impl DnsResolver for LocalResolver {
 }
 
 #[derive(Clone)]
-struct OidcAuthorizationParams {
-    nonce: String,
-    challenge: String,
+pub(crate) struct OidcAuthorizationParams {
+    pub(crate) nonce: String,
+    pub(crate) challenge: String,
 }
 
 #[tokio::test]
@@ -676,6 +682,14 @@ async fn spawn_oidc_idp(
     ),
     String,
 > {
+    spawn_oidc_idp_requests(auth_params,calls,5).await
+}
+
+pub(crate) async fn spawn_oidc_idp_requests(
+    auth_params: Arc<Mutex<Option<OidcAuthorizationParams>>>,
+    calls: Arc<AtomicUsize>,
+    requests: usize,
+) -> Result<(SocketAddr, CertificateDer<'static>, tokio::task::JoinHandle<Result<(), String>>), String> {
     let root = CertificateDer::from(
         BASE64_STANDARD
             .decode(TLS_CA_DER)
@@ -707,7 +721,7 @@ async fn spawn_oidc_idp(
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     let origin = format!("https://idp.test:{}", address.port());
     let server = tokio::spawn(async move {
-        for _ in 0..5 {
+        for _ in 0..requests {
             let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
             let mut tls = acceptor
                 .accept(stream)

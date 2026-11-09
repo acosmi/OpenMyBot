@@ -1300,6 +1300,69 @@ mod tests {
         assert_eq!(send(app, untrusted).await.status, StatusCode::FORBIDDEN);
     }
 
+    #[cfg(target_os = "macos")]
+    mod current_fixture {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-support/restore_current_fixture.rs"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires owned PostgreSQL 17.11 tools; real Current reader and session resolver"]
+    async fn t046_36_reconfirm_endpoint_confirms_only_the_callers_named_requirement() {
+        use crate::auth::{PostgresSessionAuthResolver, SESSION_COOKIE_NAME};
+        use openbot_domain::identity::session::{SessionHashKey, SessionToken, SessionTokenHash};
+        use openbot_domain::vault::{KeyVersion, SecretBytes, WrappingKey};
+        use openbot_infra::auth::config::default_session_lifetime;
+        use openbot_infra::vault::CredentialRecordVault;
+        use current_fixture::{CurrentFixture, AUDIT_KEY, DEP, TENANT};
+        const HASH_KEY: &[u8] = b"current-http-session-key-at-least-32-bytes";
+        let fixture = CurrentFixture::new("INSERT INTO public.users(id,email,email_verified,auth_generation) VALUES
+            ('reconfirm-owner','reconfirm-owner@example.test',true,1),('reconfirm-other','reconfirm-other@example.test',true,1);
+            INSERT INTO public.user_roles(user_id,role) VALUES('reconfirm-owner','admin'),('reconfirm-other','user');").await;
+        let own = fixture.requirement("subject","reconfirm-owner").await;
+        let other = fixture.requirement("subject","reconfirm-other").await;
+        let client = fixture.pool.get().await.unwrap();
+        let lifetime = default_session_lifetime();
+        let now = OffsetDateTime::now_utc();
+        let fresh_token = "current-http-fresh-session-token";
+        let stale_token = "current-http-stale-session-token";
+        for (token, created) in [(fresh_token,now),(stale_token,now-lifetime.fresh()-time::Duration::seconds(1))] {
+            let hash = SessionTokenHash::compute(SessionToken::new(token.as_bytes()),SessionHashKey::new(HASH_KEY)).to_column_value();
+            client.execute("INSERT INTO public.sessions(id,token,user_id,created_at,updated_at,expires_at,auth_generation) VALUES($1,$2,'reconfirm-owner',$3,$4,$5,1)",
+                &[&uuid::Uuid::now_v7().to_string(),&hash,&created,&now,&(now+time::Duration::hours(1))]).await.unwrap();
+        }
+        let resolver = Arc::new(PostgresSessionAuthResolver::new(fixture.pool.clone(),HASH_KEY,lifetime,DeploymentId::new(DEP),TenantId::new(TENANT)).unwrap());
+        resolver.install_recovery_read_gate(fixture.runtime.as_ref().unwrap().read_gate()).unwrap();
+        let vault = CredentialRecordVault::single_key(TenantId::new(TENANT),KeyVersion::new(1),WrappingKey::from_bytes(vec![0x42;32]).unwrap());
+        resolver.install_restore_reconfirmation(SecretBytes::new(AUDIT_KEY.to_vec()),vault).unwrap();
+        let state = ServerBuilder::new(app_with_rows(Vec::new()),resolver.clone())
+            .with_sensitive_write_security(SensitiveWriteSecurity::new(lifetime,TrustedOrigins::from_configured(["https://current.example.test"]).unwrap())).build();
+        let app = router(state);
+        for (token,body,status) in [
+            (fresh_token,serde_json::json!({"requirementId":other}),StatusCode::NOT_FOUND),
+            (stale_token,serde_json::json!({"requirementId":own}),StatusCode::UNAUTHORIZED),
+            (fresh_token,serde_json::json!({"requirementId":own,"fresh":true}),StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder().method("POST").uri("/api/auth/restore/reconfirm")
+                .header(http::header::CONTENT_TYPE,"application/json").header(http::header::ORIGIN,"https://current.example.test")
+                .header(http::header::COOKIE,format!("{SESSION_COOKIE_NAME}={token}")).body(Body::from(body.to_string())).unwrap();
+            assert_eq!(send(app.clone(),request).await.status,status);
+            assert_eq!(client.query_one("SELECT count(*)::bigint FROM openbot_internal.restore_reconfirm_receipts",&[]).await.unwrap().get::<_,i64>(0),0);
+        }
+        let request = Request::builder().method("POST").uri("/api/auth/restore/reconfirm")
+            .header(http::header::CONTENT_TYPE,"application/json").header(http::header::ORIGIN,"https://current.example.test")
+            .header(http::header::COOKIE,format!("{SESSION_COOKIE_NAME}={fresh_token}"))
+            .body(Body::from(serde_json::json!({"requirementId":own}).to_string())).unwrap();
+        assert_eq!(send(app,request).await.status,StatusCode::NO_CONTENT);
+        let receipt = client.query_one("SELECT requirement_id,confirmed_by,proof_kind FROM openbot_internal.restore_reconfirm_receipts",&[]).await.unwrap();
+        assert_eq!(receipt.get::<_,uuid::Uuid>(0),own);
+        assert_eq!(receipt.get::<_,String>(1),"reconfirm-owner");
+        assert_eq!(receipt.get::<_,String>(2),"fresh_actor");
+        assert_eq!(client.query_one("SELECT count(*)::bigint FROM public.audit_events WHERE target_id=$1",&[&own.to_string()]).await.unwrap().get::<_,i64>(0),1);
+        resolver.close_request_bindings();
+        drop(client);
+    }
+
     #[tokio::test]
     async fn reconfirmation_authentication_freshness_and_origin_precede_body_poll() {
         use crate::auth::ResolvedAuth;

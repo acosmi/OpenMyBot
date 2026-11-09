@@ -121,3 +121,8 @@ sha2.workspace = true
 # 这里不再重复声明。它进生产依赖**不等于**放开"自由 params"：那条禁令针对的是
 # `AppCommand` 面接受任意 JSON，而 `AppCommand` 仍是封闭 enum，本 crate 的路由一个
 # `serde_json::Value` 参数都不收。
+
+# The HTTP Current-consumer fixture uses the existing Local reader on an owned
+# macOS PG. This enables no Local feature in the production Server graph.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+openbot-infra = { workspace = true, features = ["desktop-local"] }
