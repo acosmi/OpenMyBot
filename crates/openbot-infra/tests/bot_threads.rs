@@ -1,5 +1,7 @@
 //! Actor-scoped directory, title and foreground projection checks against isolated PostgreSQL.
 
+#![cfg(feature = "server-runtime")]
+
 mod harness;
 
 use openbot_application::use_cases::thread::{list_bot_threads, set_thread_title};
