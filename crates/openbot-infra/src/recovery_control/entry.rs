@@ -2849,7 +2849,7 @@ impl RestoreControlSession {
         self.retain_failure(result)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "desktop-local"))]
     pub(crate) async fn verify_absent_artifacts_for_test(&mut self, deadline: Instant) {
         let candidate = self.candidate.as_mut().unwrap();
         let observed = crate::backup::whole_pg_restore_stream::candidate_sql::prepare_artifact_binding_before(

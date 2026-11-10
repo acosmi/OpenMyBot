@@ -469,7 +469,7 @@ impl LocalFixture {
             "local-binding-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
             openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-                &database,
+                database,
                 &openbot_contracts::ids::DeploymentId::new("outside"),
                 &openbot_contracts::ids::TenantId::new("outside"),
             ),
@@ -499,7 +499,7 @@ impl LocalFixture {
                 ArtifactQuotaPolicy::default(),
                 SecretBytes::new(vec![0x75; 32]),
                 openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-                    &database,
+                    database,
                     &openbot_contracts::ids::DeploymentId::new("outside"),
                     &openbot_contracts::ids::TenantId::new("outside"),
                 ),

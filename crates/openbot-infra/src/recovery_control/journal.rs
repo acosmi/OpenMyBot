@@ -1114,7 +1114,7 @@ impl JournalObservation {
         }
     }
 
-    #[cfg(any(feature = "desktop-local", test))]
+    #[cfg(feature = "desktop-local")]
     pub(super) fn first_context(&self) -> Option<(&str, &str, &str)> {
         let first = self.records.first()?;
         Some((&first.control_id, &first.operation_id, &first.epoch))

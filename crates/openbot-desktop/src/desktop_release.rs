@@ -256,11 +256,10 @@ impl ReleaseManifest {
         if let CaptureField::Request(request) = &manifest.normal_capture {
             request.validate()?;
         }
-        if let RecoveryControlField::Present(recovery) = &manifest.recovery_control {
-            if recovery.version != 1 || recovery.host_limits.clone().checked().is_err() {
+        if let RecoveryControlField::Present(recovery) = &manifest.recovery_control
+            && (recovery.version != 1 || recovery.host_limits.clone().checked().is_err()) {
                 return Err(DesktopReleaseError::Manifest);
             }
-        }
         manifest.ui.inventory(static_asset_max_bytes)?;
         let tenant_inventory = manifest.tenant.inventory(|_| TENANT_FILE_MAX_BYTES)?;
         if tenant_inventory.keys().copied().collect::<BTreeSet<_>>()

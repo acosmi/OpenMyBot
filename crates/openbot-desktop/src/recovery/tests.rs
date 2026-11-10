@@ -499,7 +499,7 @@ fn t046_02_unknown_duplicate_oversize_or_replaced_request_is_rejected() {
             _ => vec![b' '; fixture.host.max_request_bytes as usize + 1],
         };
         fs::write(&fixture.request, &bytes).unwrap();
-        let error = fixture.entry().err().expect("malformed real request refused before claim");
+        let error = fixture.entry().expect_err("malformed real request refused before claim");
         if case == "oversized" { assert_eq!(error, DesktopRestoreError::CapacityExceeded); }
         else { assert!(matches!(error, DesktopRestoreError::EntryInvalid | DesktopRestoreError::ControlInvalid), "{case}: {error:?}"); }
         assert_eq!(fs::read(&fixture.request).unwrap(), bytes);

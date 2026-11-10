@@ -2648,8 +2648,8 @@ pub(crate) async fn execute_local_legacy_adoption(
     let convergence = session.convergence_deadline();
     let DesktopLocalReleaseInput { postgres_bundle, postgres_key_store_service, vault_key_store_service, secret_store, .. } = config.release;
     let started = PostgresSidecarSupervisor::start_with_capture_limits(
-        postgres_bundle, app_data_root.as_path(), installation.authority().instance_id(),
-        installation.sidecar_data_dir(), secret_store.as_ref(), &postgres_key_store_service,
+        postgres_bundle, (app_data_root.as_path(), installation.authority().instance_id(),
+        installation.sidecar_data_dir()), secret_store.as_ref(), &postgres_key_store_service,
         None, owner.session.as_ref(),
     ).await;
     let sidecar = match started {
@@ -3240,9 +3240,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
         {
             return PostgresSidecarSupervisor::start_with_capture_limits(
                 postgres_bundle,
-                app_data_root.as_path(),
-                installation.authority().instance_id(),
-                installation.sidecar_data_dir(),
+                (app_data_root.as_path(), installation.authority().instance_id(), installation.sidecar_data_dir()),
                 secret_store.as_ref(),
                 &postgres_key_store_service,
                 capture_limits,

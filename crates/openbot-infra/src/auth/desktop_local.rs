@@ -109,7 +109,7 @@ impl CurrentOsUserAppDataRoot {
         &self.0
     }
 
-    #[cfg(feature = "desktop-local")]
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
     pub(crate) fn retained_path_bytes(&self) -> u64 {
         self.0.capacity() as u64
     }
@@ -335,7 +335,7 @@ impl core::fmt::Debug for OriginalFreshRoot {
 }
 
 impl OriginalFreshRoot {
-    #[cfg(any(feature = "desktop-local", test))]
+    #[cfg(any(all(feature = "desktop-local", feature = "server-runtime"), test))]
     pub(crate) fn into_root_for(
         self,
         authority: &DesktopLocalAuthority,
@@ -496,6 +496,7 @@ impl DesktopLocalInstallation {
 /// readback: business IDs, its `data` child and both target key references
 /// (spec revision R484 ¶8023, ¶8132). Only that runtime forms it; it carries no
 /// authority, opens no principal and is never an AuthContext source.
+#[cfg(feature = "server-runtime")]
 pub struct RestoredLocalSite {
     pub(crate) ids: [String; 4],
     pub(crate) data_dir: PathBuf,
@@ -503,12 +504,14 @@ pub struct RestoredLocalSite {
     pub(crate) postgres_account: String,
 }
 
+#[cfg(feature = "server-runtime")]
 impl core::fmt::Debug for RestoredLocalSite {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("RestoredLocalSite(<selected generation>)")
     }
 }
 
+#[cfg(feature = "server-runtime")]
 impl RestoredLocalSite {
     /// The target installation ID; the sidecar's lock and journal namespace.
     #[must_use]
@@ -558,6 +561,7 @@ impl RestoredLocalSite {
 /// new target-slot key: private IDs, the generation's PostgreSQL directory and
 /// tuple (spec revision R484 ¶8022). It carries no authority and is never an
 /// AuthContext source; it only feeds the same restore owner's publication.
+#[cfg(feature = "server-runtime")]
 pub struct VerifiedRestoreInstallationBinding {
     instance_id: String,
     deployment_id: String,
@@ -568,12 +572,14 @@ pub struct VerifiedRestoreInstallationBinding {
     database_oid: u32,
 }
 
+#[cfg(feature = "server-runtime")]
 impl core::fmt::Debug for VerifiedRestoreInstallationBinding {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("VerifiedRestoreInstallationBinding(<restored facts>)")
     }
 }
 
+#[cfg(feature = "server-runtime")]
 impl VerifiedRestoreInstallationBinding {
     /// Only the restore owner's installation readback forms these facts.
     pub(crate) fn from_readback(
@@ -610,10 +616,12 @@ impl VerifiedRestoreInstallationBinding {
 /// The same restored facts after the Current descriptor's publication was
 /// observed and read back and the Local subject confirmation gate succeeded
 /// (spec revision R484 ¶8024). Only that startup producer forms it.
+#[cfg(feature = "server-runtime")]
 pub struct VerifiedCurrentRestoreInstallationBinding {
     restored: VerifiedRestoreInstallationBinding,
 }
 
+#[cfg(feature = "server-runtime")]
 impl VerifiedCurrentRestoreInstallationBinding {
     /// The startup producer's single constructor, after its own Current and
     /// subject checks; it does not repeat or replace them. That producer is
@@ -624,6 +632,7 @@ impl VerifiedCurrentRestoreInstallationBinding {
     }
 }
 
+#[cfg(feature = "server-runtime")]
 impl DesktopLocalInstallation {
     /// The restored installation keeps its business IDs and uses the selected
     /// generation's PostgreSQL directory; ordinary Fresh/Existing are unchanged
@@ -722,7 +731,7 @@ struct StoreInner {
 }
 
 impl DesktopLocalAuthorityStore {
-    #[cfg(feature = "desktop-local")]
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
     pub(crate) fn original_app_data_root(&self) -> &Path {
         self.inner.root.as_path()
     }
@@ -1036,9 +1045,36 @@ fn prepare_root(root: &Path) -> Result<Option<File>, DesktopLocalAuthorityError>
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
         if created {
-            return crate::artifact_store::open_trusted_host_root(root)
-                .map(Some)
-                .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot);
+            use std::os::unix::fs::MetadataExt as _;
+            use std::path::Component;
+            use rustix::fs::{Mode, OFlags};
+            // Retain the same no-symlink walk and actual private-root checks
+            // at the OS-path boundary, including builds without artifact runtime.
+            let mut held = File::open("/")
+                .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?;
+            for component in root.components() {
+                match component {
+                    Component::RootDir => {}
+                    Component::Normal(name) => {
+                        held = File::from(rustix::fs::openat(
+                            &held, name,
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        ).map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?);
+                    }
+                    Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                        return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+                    }
+                }
+            }
+            let metadata = held.metadata()
+                .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?;
+            if !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+            {
+                return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+            }
+            return Ok(Some(held));
         }
     }
     #[cfg(not(unix))]

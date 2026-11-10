@@ -845,10 +845,12 @@ impl CandidateGeneration {
         session.release_candidate_before(deadline).await.map_err(|error| self.keep_control(error))
     }
 
+    #[cfg(test)]
     pub(super) fn data_directory(&self) -> Option<(&File, &std::path::Path)> {
         self.directories[1].as_ref().map(|file| (file, self.paths[1].as_path()))
     }
 
+    #[cfg(test)]
     pub(super) fn socket_directory(&self) -> Option<(&File, &std::path::Path)> {
         self.directories[4].as_ref().map(|file| (file, self.paths[4].as_path()))
     }

@@ -1928,9 +1928,7 @@ impl PostgresSidecarSupervisor {
     ) -> Result<RunningPostgresSidecar, PostgresSidecarError> {
         Self::start_inner(
             bundle,
-            app_data_root,
-            instance_id,
-            data_dir,
+            (app_data_root, instance_id, data_dir),
             store,
             service,
             StartControlInspection::Ordinary,
@@ -1948,9 +1946,7 @@ impl PostgresSidecarSupervisor {
     ))]
     pub(crate) async fn start_with_capture_limits<S: PostgresSecretStore + ?Sized>(
         bundle: VerifiedPostgresBundle,
-        app_data_root: &Path,
-        instance_id: &str,
-        data_dir: &Path,
+        (app_data_root, instance_id, data_dir): (&Path, &str, &Path),
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
         limits: Option<crate::tauri_background::capture::control::Limits>,
@@ -1958,9 +1954,7 @@ impl PostgresSidecarSupervisor {
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
         Self::start_inner(
             bundle,
-            app_data_root,
-            instance_id,
-            data_dir,
+            (app_data_root, instance_id, data_dir),
             store,
             service,
             match limits {
@@ -1988,9 +1982,7 @@ impl PostgresSidecarSupervisor {
             .ok_or((PostgresSidecarError::DataDirectoryInvalid, SidecarOutcome::NeverSpawned))?;
         Self::start_inner(
             bundle,
-            generation_root,
-            site.installation_id(),
-            site.data_dir(),
+            (generation_root, site.installation_id(), site.data_dir()),
             store,
             service,
             StartControlInspection::Ordinary,
@@ -2002,9 +1994,7 @@ impl PostgresSidecarSupervisor {
 
     async fn start_inner<S: PostgresSecretStore + ?Sized>(
         bundle: VerifiedPostgresBundle,
-        app_data_root: &Path,
-        instance_id: &str,
-        data_dir: &Path,
+        (app_data_root, instance_id, data_dir): (&Path, &str, &Path),
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
         control_inspection: StartControlInspection,
@@ -4220,7 +4210,7 @@ mod tests {
             VerifiedPostgresBundle::open(&bundle_root, digest, &signing_identity()).unwrap();
         assert!(matches!(
             PostgresSidecarSupervisor::start_with_capture_limits(
-                bundle, &app_root, &instance, &data_dir, &store, &service, None, None,
+                bundle, (&app_root, &instance, &data_dir), &store, &service, None, None,
             )
             .await,
             Err((
@@ -4278,7 +4268,7 @@ mod tests {
         )
         .unwrap();
         let (error, outcome) = match PostgresSidecarSupervisor::start_with_capture_limits(
-            bundle, &app_root, &instance, &data_dir, &store, &service, None, None,
+            bundle, (&app_root, &instance, &data_dir), &store, &service, None, None,
         )
         .await
         {

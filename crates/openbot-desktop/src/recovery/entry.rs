@@ -162,8 +162,8 @@ impl OwnedDesktopRestore {
 
         // Cleanup is driven by actual ownership, including a Child retained
         // after failed spawn post-checks. It never substitutes a fresh process.
-        if let Some(candidate) = self.candidate.as_mut() {
-            if candidate.original_program().is_some() {
+        if let Some(candidate) = self.candidate.as_mut()
+            && candidate.original_program().is_some() {
                 if self.first_fault.is_some() {
                     self.session.as_mut().expect("original session before wait").abandon_candidate_connections();
                 }
@@ -176,7 +176,6 @@ impl OwnedDesktopRestore {
                     Err(fault) => { self.first_fault.get_or_insert(fault); }
                 }
             }
-        }
         if let Some(fault) = self.first_fault { return Err(fault); }
         let candidate = self.candidate.as_ref().ok_or(DesktopRestoreError::ClosureUnproven)?;
         let exit = candidate.program_result().and_then(|result| result.candidate_exit())
@@ -528,11 +527,10 @@ impl LocalReconfirmationNative {
         app: &tauri::AppHandle<tauri::Wry>,
         convergence: Instant,
     ) -> Result<(), DesktopRestoreError> {
-        if let Some(Ok(attempt)) = &self.attempt {
-            if !attempt.is_stopped() {
+        if let Some(Ok(attempt)) = &self.attempt
+            && !attempt.is_stopped() {
                 attempt.cancel();
             }
-        }
         if let Some(Ok(owner)) = &self.owner {
             owner.stop();
         }

@@ -717,8 +717,8 @@ impl LocalFixture {
             recovery_gate:
                 openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
                     &desktop.database.clone_pool(),
-                    &original.deployment(),
-                    &original.tenant(),
+                    original.deployment(),
+                    original.tenant(),
                 ),
             pool: desktop.database.clone_pool(),
             listener_database: ThreadListenerDatabase::desktop_local(

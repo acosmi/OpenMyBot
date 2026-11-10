@@ -3016,8 +3016,7 @@ pub(crate) mod tests {
         let exclusive = super::entry::lock(&control.shared).unwrap();
         let started = std::time::Instant::now();
         let error = super::entry::share(&control.shared, |_| ())
-            .err()
-            .expect("taken custody");
+            .expect_err("taken custody");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(50),
             "no wait for the exclusive owner"
@@ -3497,10 +3496,8 @@ pub(crate) mod tests {
             result
         };
         case(&|_, _| ()).expect("the unchanged synthetic republication is accepted");
-        let refused: [(
-            &str,
-            &dyn Fn(&mut Value, &mut Vec<super::journal::JournalData>),
-        ); 6] = [
+        type CorruptPublication = dyn Fn(&mut Value, &mut Vec<super::journal::JournalData>);
+        let refused: [(&str, &CorruptPublication); 6] = [
             ("operationId", &|data, _| {
                 data["operationId"] = json!("abcdefabcdefabcdefabcdefabcdef09")
             }),

@@ -155,7 +155,7 @@ async fn assemble(
     // inject PostgresModelConnections: a missing production assembly edge must make it fail.
     let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
         recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &pool,
+            pool,
             &DeploymentId::new(DEPLOYMENT),
             &tenant,
         ),

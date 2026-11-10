@@ -199,7 +199,7 @@ impl VerifiedOrdinaryStartupIntent {
     }
 
     /// The below-latest head a shared-lock branch handed this intent back for.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "desktop-local"))]
     pub(super) fn expected_head(&self) -> Option<&ExpectedHead> {
         self.expected_head.as_ref()
     }

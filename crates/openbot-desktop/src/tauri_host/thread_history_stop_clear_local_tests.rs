@@ -382,7 +382,7 @@ async fn settle_dispatch(pool: &pool::DatabasePool, run: &RunId) -> TestResult {
         DEFAULT_THREAD_LEASE_DURATION,
         DEFAULT_DISPATCH_CLAIM_DURATION,
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &pool,
+            pool,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),
@@ -587,7 +587,7 @@ impl LocalFixture {
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
             openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-                &p,
+                p,
                 &openbot_contracts::ids::DeploymentId::new("outside"),
                 &openbot_contracts::ids::TenantId::new("outside"),
             ),

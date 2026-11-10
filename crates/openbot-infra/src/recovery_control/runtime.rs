@@ -24,8 +24,10 @@ use super::entry::{self, ControlFiles, ControlOwner, OwnedRecord, RuntimeEntry};
 use super::journal::ProcessStart;
 use super::journal::{NativeExit, PipeJoin};
 use super::{
-    RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, hex_array, id,
+    RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, id,
 };
+#[cfg(feature = "server-runtime")]
+use super::hex_array;
 use std::ops::{Deref, DerefMut};
 
 /// Private original startup input, not a parser, public constructor or proof

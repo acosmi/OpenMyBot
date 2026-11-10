@@ -13,11 +13,13 @@ use crate::recovery_control::{Hex32, RecoveryControlError, RecoveryControlFault}
 
 /// The Server bootstrap Pool and its first client, kept by the original
 /// control owner for the runtime's read gate. This is not a Fresh proof.
+#[cfg(feature = "server-runtime")]
 pub(crate) struct OwnedExistingServerDatabase {
     pub(crate) pool: Option<Result<Pool, InfraError>>,
     pub(crate) client: Option<Result<super::pool::PooledClient, super::pool::PoolError>>,
 }
 
+#[cfg(feature = "server-runtime")]
 impl OwnedExistingServerDatabase {
     pub(crate) fn new() -> Self {
         Self {
@@ -38,6 +40,7 @@ impl OwnedExistingServerDatabase {
     }
 }
 
+#[cfg(feature = "server-runtime")]
 pub(crate) const EXISTING_SERVER_IDENTITY_SQL: &str = "SELECT pcs.system_identifier::text AS system_identifier, d.oid AS database_oid, pg_catalog.current_setting('server_version_num')::integer / 10000 AS pg_major, session_user::text AS authenticated_principal, current_user::text AS current_principal, pg_catalog.pg_get_userbyid(d.datdba)::text AS database_owner FROM pg_catalog.pg_control_system() pcs JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database()";
 
 /// Plaintext sealed under the configured Server KEK in its site canary row.

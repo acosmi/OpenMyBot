@@ -350,6 +350,7 @@ impl RunningDesktopLocalDataPlane {
 
     /// Close the application pool, then stop the exact child through its verified `pg_ctl` before
     /// releasing the single-instance lock.
+    #[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
     pub async fn shutdown(
         mut self,
     ) -> Result<
@@ -510,6 +511,7 @@ impl PreparedDesktopLocalDataPlane {
         Ok(origin)
     }
 
+    #[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
     pub(crate) async fn complete_after_vault(
         mut self,
         package: &LoadedTenantPackage,
@@ -704,6 +706,7 @@ impl PreparedDesktopLocalDataPlane {
 }
 
 impl<S> PreparedDesktopLocalDataPlane<S> {
+    #[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
     pub(crate) async fn shutdown(
         mut self,
     ) -> Result<
@@ -863,6 +866,7 @@ pub async fn prepare_running_sidecar(
     feature = "postgres-maintenance",
     target_os = "macos"
 ))]
+#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
 pub(crate) async fn prepare_running_sidecar_retained(
     installation: DesktopLocalInstallation,
     sidecar: RunningPostgresSidecar,
@@ -894,6 +898,7 @@ pub(crate) async fn prepare_running_sidecar_retained(
 /// Prepare the selected restored generation's running child the same way, before any
 /// installation authority exists; no package or database creation is involved.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
 pub(crate) async fn prepare_restored_sidecar(
     site: RestoredLocalSite,
     sidecar: RunningPostgresSidecar,
@@ -936,6 +941,7 @@ pub(crate) struct OpenedRestoredGeneration {
 /// Start the selected generation `runtime` names with its SCRAM slot, attest it, open its Vault
 /// with its master slot and read it back against the published binding.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
 pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
     runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
     site: RestoredLocalSite,
@@ -990,6 +996,7 @@ pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecret
 /// its installation, which takes over the same running data plane (spec
 /// revision R484 ¶8024, ¶8089). A Pending binding never reaches a factory.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
 pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
     runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
     site: RestoredLocalSite,
@@ -1067,6 +1074,7 @@ impl DataPlaneSite for RestoredLocalSite {
     }
 }
 
+#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
 async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
     installation: S,
     sidecar: RunningPostgresSidecar,

@@ -363,7 +363,7 @@ fn matches_named(
         .and_then(|result| result.as_ref().ok())
         .ok_or(DesktopRestoreError::IoFailure)?;
     if named.st_dev as u64 != held.dev()
-        || named.st_ino as u64 != held.ino()
+        || named.st_ino != held.ino()
         || named.st_uid != held.uid()
         || u32::from(named.st_mode) != held.mode()
         || named.st_nlink as u64 != held.nlink()

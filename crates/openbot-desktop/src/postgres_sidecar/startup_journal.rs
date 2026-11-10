@@ -197,7 +197,7 @@ impl StartupJournalPreparation {
                 let validated = validate_record(
                     record,
                     &owner.instance_id,
-                    &*owner.data_dir_name,
+                    &owner.data_dir_name,
                 )?;
                 if record.phase != StartupJournalPhase::ExitConfirmed {
                     return Err(StartupJournalError::ReconciliationRequired);
@@ -340,7 +340,7 @@ impl StartupJournal {
         validate_record(
             &self.record,
             &owner.instance_id,
-            &*owner.data_dir_name,
+            &owner.data_dir_name,
         )?;
         Ok(())
     }
@@ -575,7 +575,7 @@ fn publish_absent(
     validate_record(
         record,
         &owner.instance_id,
-        &*owner.data_dir_name,
+        &owner.data_dir_name,
     )?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
@@ -653,7 +653,7 @@ fn replace_exact(
     validate_record(
         record,
         &owner.instance_id,
-        &*owner.data_dir_name,
+        &owner.data_dir_name,
     )?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
@@ -1285,7 +1285,7 @@ pub(super) fn recover_mid_phase(
             let bytes = read_bounded_file(&path, &file, root_uid)?;
             let record: StartupJournalRecord =
                 serde_json::from_slice(&bytes).map_err(|_| StartupJournalError::Invalid)?;
-            let _ = validate_record(&record, instance_id, &data_dir_name)?;
+            let _ = validate_record(&record, instance_id, data_dir_name)?;
             if record.data_dir_device != device || record.data_dir_inode != inode {
                 return Err(StartupJournalError::Invalid);
             }
@@ -1453,7 +1453,7 @@ pub(super) fn allows_quiescent_cleanup(
             let bytes = read_bounded_file(&path, &file, root_meta.uid())?;
             let record: StartupJournalRecord =
                 serde_json::from_slice(&bytes).map_err(|_| StartupJournalError::Invalid)?;
-            let _ = validate_record(&record, instance_id, &data_dir_name)?;
+            let _ = validate_record(&record, instance_id, data_dir_name)?;
             if record.phase != StartupJournalPhase::ExitConfirmed {
                 return Err(StartupJournalError::RecoveryRequired);
             }

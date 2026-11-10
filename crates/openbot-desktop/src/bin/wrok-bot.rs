@@ -82,9 +82,9 @@ fn run() -> Result<(), String> {
             handle.exit(0);
         });
         app.run_return(move |_, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                if !completed.load(Ordering::Acquire) { api.prevent_exit(); }
-            }
+            if let tauri::RunEvent::ExitRequested { api, .. } = event
+                && !completed.load(Ordering::Acquire)
+            { api.prevent_exit(); }
         });
         let result = runtime.block_on(async {
             let observed = receiver.await.map_err(|_| DesktopRestoreError::ClosureUnproven)?;

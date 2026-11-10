@@ -15,7 +15,7 @@ use openidconnect::{AuthorizationCode, ClientSecret};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
 use url::Url;
-#[cfg(any(feature = "server-sso", test))]
+#[cfg(feature = "server-sso")]
 use uuid::Uuid;
 
 use super::attempt::{CallbackLoginAttempt, ProviderIncarnationBinding};
@@ -150,7 +150,7 @@ impl OidcProviderRuntime {
     }
 
     /// The row incarnation is configuration DATA, not a Current provider admission.
-    #[cfg(any(feature = "server-sso", test))]
+    #[cfg(feature = "server-sso")]
     pub(crate) async fn discover_bound(
         config: OidcProviderConfig,
         client_secret: Option<SecretBytes>,
