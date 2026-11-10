@@ -663,8 +663,8 @@ impl PostgresAutomations {
                         });
                     }
                 };
-                tx.execute("UPDATE openbot_internal.automation_delegations SET revoked_at=statement_timestamp() WHERE deployment_id=$1 AND tenant_id=$2 AND automation_id=$3 AND revoked_at IS NULL",
-                    &[&self.deployment.as_str(),&self.tenant.as_str(),&id.as_str()]).await.map_err(|_|unavailable())?;
+                // Re-authorization only appends. Every un-revoked grant is already within this
+                // ceiling (a narrower paused edit revokes them), so an active Run keeps its grant.
                 let generation =
                     i64::try_from(auth.auth_generation().get()).map_err(|_| unavailable())?;
                 let thread = ThreadId::new(column::<String>(&row, "thread_id")?);

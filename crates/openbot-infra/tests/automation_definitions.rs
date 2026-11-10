@@ -791,6 +791,8 @@ async fn three_scope_reservations_race_and_settle_once() {
             let before=image(&f).await;
             assert!(store.install_budgets(Some(&budget_file(&f,2,call_rules("10"),call_rules("1")))).await.is_err());assert_eq!(image(&f).await,before);
             assert!(store.install_budgets(Some(&budget_file(&f,3,call_rules("20"),call_rules("10")))).await.is_err());assert_eq!(image(&f).await,before,"same policy revision is immutable");
+            let swapped=json!([{"metric":"tool_calls","totalLimit":"10"}]);
+            assert!(store.install_budgets(Some(&budget_file(&f,3,swapped,call_rules("10")))).await.is_err());assert_eq!(image(&f).await,before,"same revision cannot drop or add a metric");
             Ok(())
         }.await;
         f.assembly.shutdown().await;f.pool.close();result
@@ -999,14 +1001,32 @@ async fn delegation_lifecycle_and_current_generation() {
         let runtime = &f.assembly.run_runtime;
         assert!(runtime.claim_cancellation().await.unwrap().is_none());
 
+        // Re-enabling after a paused edit, and re-granting only to extend validity, append grants
+        // and keep the Run admitted under the original grant.
         enable(&f, "authority", 4).await;
-        assert!(matches!(
-            authority.verify_current(deployment, tenant, &source, 2).await,
-            Err(DelegationAuthorityError::NotCurrent),
-        ));
+        assert!(authority.verify_current(deployment, tenant, &source, 2).await.is_ok(),
+            "a non-tightening re-grant retains the running grant");
         assert!(authority.verify_current(deployment, tenant, &source, 5).await.is_ok());
+        assert!(store.reserve_sampling(&lease, 1).await.unwrap());
+        enable(&f, "authority", 5).await;
+        assert!(authority.verify_current(deployment, tenant, &source, 2).await.is_ok());
+        assert!(store.reserve_sampling(&lease, 2).await.unwrap());
+        store.maintain().await.unwrap();
+        assert!(runtime.claim_cancellation().await.unwrap().is_none());
+
+        // A real revoke still ends the Run admitted before the re-grants.
+        f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
+            automation_id: id("authority"),
+            input: UpdateAutomationDefinition::Revoke { expected_revision: revision(6) },
+        }).await.unwrap();
+        for revision in [2, 6] {
+            assert!(matches!(
+                authority.verify_current(deployment, tenant, &source, revision).await,
+                Err(DelegationAuthorityError::NotCurrent),
+            ));
+        }
         let before = image(&f).await;
-        assert_eq!(store.reserve_sampling(&lease, 1).await.unwrap_err(), AppError::AutomationDelegationInvalid);
+        assert_eq!(store.reserve_sampling(&lease, 3).await.unwrap_err(), AppError::AutomationDelegationInvalid);
         assert_eq!(image(&f).await, before);
         store.maintain().await.unwrap();
         let client = f.pool.get().await.unwrap();
@@ -1014,7 +1034,7 @@ async fn delegation_lifecycle_and_current_generation() {
             "SELECT r.status,
                     (SELECT status FROM public.outbox WHERE aggregate_id=r.run_id AND destination='agent_run_cancel') AS cancellation,
                     (SELECT active_count FROM openbot_internal.automation_workspace_capacity) AS active,
-                    (SELECT state FROM openbot_internal.automation_budget_attempts WHERE run_id=r.run_id) AS budget
+                    (SELECT string_agg(DISTINCT state,',') FROM openbot_internal.automation_budget_attempts WHERE run_id=r.run_id) AS budget
              FROM public.runs r WHERE run_id=$1",
             &[&run],
         ).await.unwrap();
@@ -1042,7 +1062,7 @@ async fn delegation_lifecycle_and_current_generation() {
             "SELECT r.status,
                     (SELECT status FROM public.outbox WHERE aggregate_id=r.run_id AND destination='agent_run_cancel') AS cancellation,
                     (SELECT active_count FROM openbot_internal.automation_workspace_capacity) AS active,
-                    (SELECT state FROM openbot_internal.automation_budget_attempts WHERE run_id=r.run_id) AS budget
+                    (SELECT string_agg(DISTINCT state,',') FROM openbot_internal.automation_budget_attempts WHERE run_id=r.run_id) AS budget
              FROM public.runs r WHERE run_id=$1",
             &[&run],
         ).await.unwrap();
@@ -1052,42 +1072,56 @@ async fn delegation_lifecycle_and_current_generation() {
         assert_eq!(row.get::<_, String>("budget"), "unknown");
         drop(client);
 
-        trigger(&f, "authority", "next-run", 5).await;
+        enable(&f, "authority", 7).await;
+        trigger(&f, "authority", "next-run", 8).await;
         let request = store.pending().await.unwrap().pop().unwrap();
         f.assembly.delegated_entry.as_ref().unwrap().begin(request).await.unwrap();
         let restricted = claim(&f).await;
         f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
             automation_id: id("authority"),
-            input: UpdateAutomationDefinition::Pause { expected_revision: revision(5) },
+            input: UpdateAutomationDefinition::Pause { expected_revision: revision(8) },
         }).await.unwrap();
         let mut expanded = edited.clone();
         expanded.permission_ceiling.tool_ids.push("draft_tool".to_owned());
         expanded.permission_ceiling.data_scopes.push("thread:draft".to_owned());
-        for (expected, config) in [(6, expanded), (7, edited.clone())] {
+        for (expected, config) in [(9, expanded.clone()), (10, edited.clone()), (11, expanded)] {
             let replaced = f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
                 automation_id: id("authority"),
                 input: UpdateAutomationDefinition::Replace { expected_revision: revision(expected), config },
             }).await.unwrap();
-            assert!(matches!(replaced, AppReply::AutomationDefinition(ref d) if d.grant.valid && d.grant.revision == Some(revision(5))));
+            assert!(matches!(replaced, AppReply::AutomationDefinition(ref d) if d.grant.valid && d.grant.revision == Some(revision(8))));
             assert!(runtime.claim_cancellation().await.unwrap().is_none());
         }
-        assert!(authority.verify_current(deployment, tenant, &source, 5).await.is_ok());
+        assert!(authority.verify_current(deployment, tenant, &source, 8).await.is_ok());
         assert!(store.reserve_sampling(&restricted, 0).await.unwrap());
+        // A wider re-grant keeps the Run on its own, narrower grant.
+        enable(&f, "authority", 12).await;
+        assert!(authority.verify_current(deployment, tenant, &source, 8).await.is_ok());
+        assert!(store.reserve_sampling(&restricted, 1).await.unwrap());
+        f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
+            automation_id: id("authority"),
+            input: UpdateAutomationDefinition::Pause { expected_revision: revision(13) },
+        }).await.unwrap();
 
+        // Dropping a tool the Run's grant had is a real tightening: both grants are revoked.
         edited.permission_ceiling.tool_ids.clear();
         f.assembly.application.execute(f.auth.clone(), AppCommand::UpdateAutomationDefinition {
             automation_id: id("authority"),
-            input: UpdateAutomationDefinition::Replace { expected_revision: revision(8), config: edited },
+            input: UpdateAutomationDefinition::Replace { expected_revision: revision(14), config: edited },
         }).await.unwrap();
-        assert_eq!(store.reserve_sampling(&restricted, 1).await.unwrap_err(), AppError::AutomationDelegationInvalid);
+        assert!(matches!(
+            authority.verify_current(deployment, tenant, &source, 8).await,
+            Err(DelegationAuthorityError::NotCurrent),
+        ));
+        assert_eq!(store.reserve_sampling(&restricted, 2).await.unwrap_err(), AppError::AutomationDelegationInvalid);
         let stop = runtime.claim_cancellation().await.unwrap().expect("narrower permission requested a durable stop");
         assert_eq!(stop.lease().run_id(), restricted.run_id());
         runtime.mark_cancellation_signalled(&stop).await.unwrap();
         runtime.finish_run(stop.lease(), stop.lease().next_event_sequence(), RunTerminal::Cancelled).await.unwrap();
         assert!(runtime.claim_cancellation().await.unwrap().is_none());
 
-        enable(&f, "authority", 9).await;
-        assert!(authority.verify_current(deployment, tenant, &source, 10).await.is_ok());
+        enable(&f, "authority", 15).await;
+        assert!(authority.verify_current(deployment, tenant, &source, 16).await.is_ok());
         let client = f.pool.get().await.unwrap();
         client.execute(
             "UPDATE public.users SET auth_generation=coalesce(auth_generation,0)+1 WHERE id=$1",
@@ -1095,7 +1129,7 @@ async fn delegation_lifecycle_and_current_generation() {
         ).await.unwrap();
         drop(client);
         assert!(matches!(
-            authority.verify_current(deployment, tenant, &source, 10).await,
+            authority.verify_current(deployment, tenant, &source, 16).await,
             Err(DelegationAuthorityError::NotCurrent),
         ));
         let before = image(&f).await;

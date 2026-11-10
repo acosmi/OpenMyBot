@@ -40,6 +40,8 @@ impl crate::automation::PostgresAutomations {
                 &[&self.deployment.as_str(),&self.tenant.as_str()]).await.map_err(|_|unavailable())?;
             if let Some(budgets)=budgets {
                 let revision=budgets.wire().revision.get();
+                let stored:i64=tx.query_one("SELECT count(*) FROM openbot_internal.automation_budget_policies WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind IN ('owner','workspace') AND revision=$3",
+                    &[&self.deployment.as_str(),&self.tenant.as_str(),&revision]).await.map_err(|_|unavailable())?.get(0);
                 for entry in &budgets.wire().workspaces {
                     if entry.deployment_id==self.deployment && entry.tenant_id==self.tenant {
                         install_policy(&tx,&self.deployment,&self.tenant,"workspace","workspace",revision,&entry.budget).await?;
@@ -50,6 +52,15 @@ impl crate::automation::PostgresAutomations {
                         install_policy(&tx,&self.deployment,&self.tenant,"owner",entry.owner_id.as_str(),revision,&entry.budget).await?;
                     }
                 }
+                if stored>0 {
+                    // An installed revision is read-only: the file must restate exactly its rows.
+                    let row=tx.query_one("SELECT count(*),count(*) FILTER (WHERE current) FROM openbot_internal.automation_budget_policies WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind IN ('owner','workspace') AND revision=$3",
+                        &[&self.deployment.as_str(),&self.tenant.as_str(),&revision]).await.map_err(|_|unavailable())?;
+                    if row.get::<_,i64>(0)!=stored || row.get::<_,i64>(1)!=stored {
+                        return Err(unavailable());
+                    }
+                }
+                refresh_current(&tx,&self.deployment,&self.tenant).await?;
             }
             tx.commit().await.map_err(|_|unavailable())?;
             Ok(true)
@@ -79,7 +90,8 @@ pub(crate) async fn replace_automation_policy(
         revision,
         rules,
     )
-    .await
+    .await?;
+    refresh_current(tx, deployment, tenant).await
 }
 
 async fn install_policy(
@@ -117,8 +129,7 @@ async fn install_policy(
                 &[&deployment.as_str(),&tenant.as_str(),&kind,&id,&revision,&metric,&origin,&seconds,&window_limit,&total_limit,&rule.currency]).await.map_err(|_|unavailable())?;
         }
     }
-    // Each revision starts from the original attempt ledger, not another revision's carried sums.
-    refresh_current(tx, deployment, tenant).await
+    Ok(())
 }
 
 pub(crate) async fn ensure_configured(
@@ -278,6 +289,7 @@ async fn buckets(
     Ok(out)
 }
 
+// Each revision starts from the original attempt ledger, not another revision's carried sums.
 async fn refresh_current(
     tx: &Transaction<'_>,
     deployment: &DeploymentId,
@@ -757,19 +769,35 @@ pub(crate) async fn execution_grant(
     definition: &Row,
     run: &str,
 ) -> Result<AutomationDelegationV1, AppError> {
-    let snapshot =
-        crate::automation::store::valid_grant(tx, deployment, tenant, definition).await?;
+    let current = crate::automation::store::valid_grant(tx, deployment, tenant, definition).await?;
     let row=tx.query_opt("SELECT (m.content->'delegation'->>'revision')::bigint AS revision,
         m.content->'delegation'->'source'->>'kind' AS kind,m.content->'delegation'->'source'->>'definitionId' AS definition_id
         FROM public.messages m WHERE m.message_id=$1||':input' AND m.run_id=$1",&[&run]).await.map_err(|_|unavailable())?.ok_or(AppError::AutomationDelegationInvalid)?;
-    if column::<Option<i64>>(&row, "revision")? != Some(snapshot.definition_revision.get())
-        || column::<Option<String>>(&row, "kind")?.as_deref() != Some("automation_definition")
-        || column::<Option<String>>(&row, "definition_id")?.as_deref()
-            != Some(column::<String>(definition, "automation_id")?.as_str())
+    let automation: String = column(definition, "automation_id")?;
+    if column::<Option<String>>(&row, "kind")?.as_deref() != Some("automation_definition")
+        || column::<Option<String>>(&row, "definition_id")?.as_deref() != Some(automation.as_str())
     {
         return Err(AppError::AutomationDelegationInvalid);
     }
-    Ok(snapshot)
+    let revision: i64 =
+        column::<Option<i64>>(&row, "revision")?.ok_or(AppError::AutomationDelegationInvalid)?;
+    if revision == current.definition_revision.get() {
+        return Ok(current);
+    }
+    // A Run admitted before a re-grant keeps its own grant only while it is still valid, and
+    // only what the current grant also allows.
+    let original=tx.query_opt("SELECT g.grant_snapshot FROM openbot_internal.automation_delegations g JOIN public.users u ON u.id=g.owner_id
+        WHERE g.deployment_id=$1 AND g.tenant_id=$2 AND g.automation_id=$3 AND g.delegation_revision=$4 AND g.revoked_at IS NULL
+          AND (g.expires_at IS NULL OR g.expires_at>statement_timestamp())
+          AND g.granted_auth_generation=COALESCE(u.auth_generation,0)
+        FOR SHARE OF g",
+        &[&deployment.as_str(),&tenant.as_str(),&automation,&revision]).await.map_err(|_|unavailable())?.ok_or(AppError::AutomationDelegationInvalid)?;
+    let mut original: AutomationDelegationV1 = stored(column(&original, "grant_snapshot")?)?;
+    original.tool_ids.retain(|id| current.tool_ids.contains(id));
+    original
+        .data_scopes
+        .retain(|id| current.data_scopes.contains(id));
+    Ok(original)
 }
 
 #[async_trait::async_trait]

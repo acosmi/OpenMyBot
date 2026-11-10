@@ -61,9 +61,11 @@ impl DelegationAuthority for PostgresAutomationAuthority {
             let row=tx.query_opt("SELECT d.*,v.delegation_revision,g.grant_snapshot,g.granted_auth_generation,g.expires_at,g.validity
                 FROM openbot_internal.automation_definitions d
                 JOIN openbot_internal.automation_definition_revisions v ON (v.deployment_id,v.tenant_id,v.automation_id,v.revision)=(d.deployment_id,d.tenant_id,d.automation_id,d.current_revision)
-                JOIN openbot_internal.automation_delegations g ON (g.deployment_id,g.tenant_id,g.automation_id,g.delegation_revision)=(d.deployment_id,d.tenant_id,d.automation_id,v.delegation_revision)
-                WHERE d.deployment_id=$1 AND d.tenant_id=$2 AND d.automation_id=$3 AND g.delegation_revision=$4
-                  AND d.state<>'tombstoned' AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at>statement_timestamp())",
+                JOIN openbot_internal.automation_delegations g ON (g.deployment_id,g.tenant_id,g.automation_id,g.delegation_revision)=(d.deployment_id,d.tenant_id,d.automation_id,$4)
+                JOIN openbot_internal.automation_delegations c ON (c.deployment_id,c.tenant_id,c.automation_id,c.delegation_revision)=(d.deployment_id,d.tenant_id,d.automation_id,v.delegation_revision)
+                WHERE d.deployment_id=$1 AND d.tenant_id=$2 AND d.automation_id=$3
+                  AND d.state<>'tombstoned' AND g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at>statement_timestamp())
+                  AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at>statement_timestamp())",
                 &[&deployment.as_str(),&tenant.as_str(),&definition_id,&revision]).await.map_err(|_|unavailable())?;
             let Some(row)=row else{return Ok::<_,openbot_contracts::error::AppError>(None);};
             let snapshot:AutomationDelegationV1=stored(column(&row,"grant_snapshot")?)?;
