@@ -20,7 +20,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(target_os = "macos")]
 fn run() -> Result<(), String> {
     use openbot_desktop::desktop_release::{
-        DesktopReleaseError, TrustedDesktopReleaseDigest, VerifiedDesktopRelease, validate_product_context,
+        DesktopReleaseError, TrustedDesktopReleaseDigest, VerifiedDesktopRelease,
+        validate_product_context,
     };
     use openbot_desktop::register_desktop_local_runtime;
 
@@ -41,7 +42,9 @@ fn run() -> Result<(), String> {
     let release_error = |error: DesktopReleaseError| {
         if args.mode == Mode::Restore {
             openbot_desktop::recovery::DesktopRestoreError::EntryInvalid.to_string()
-        } else { error.to_string() }
+        } else {
+            error.to_string()
+        }
     };
     let expected = TrustedDesktopReleaseDigest::from_reviewed_build(option_env!(
         "WROK_BOT_DESKTOP_RELEASE_SHA256"
@@ -51,8 +54,7 @@ fn run() -> Result<(), String> {
         Some(root) => root,
         None => bundled_resource_root()?,
     };
-    let release =
-        VerifiedDesktopRelease::open(&root, expected).map_err(&release_error)?;
+    let release = VerifiedDesktopRelease::open(&root, expected).map_err(&release_error)?;
     if args.mode == Mode::Check {
         println!("wrok_bot_release_resources_verified");
         return Ok(());
@@ -60,15 +62,22 @@ fn run() -> Result<(), String> {
     let context = product_context();
     validate_product_context(&context).map_err(&release_error)?;
     if args.mode == Mode::Restore {
-        use tauri::Manager;
         use openbot_desktop::recovery::DesktopRestoreError;
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-        let app = tauri::Builder::default().build(context)
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tauri::Manager;
+        let app = tauri::Builder::default()
+            .build(context)
             .map_err(|_| DesktopRestoreError::EntryInvalid.to_string())?;
         let actual = openbot_infra::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(
             app.path().app_data_dir().map_err(|_| DesktopRestoreError::EntryInvalid.to_string())?,
         ).map_err(|_| DesktopRestoreError::EntryInvalid.to_string())?;
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
             .map_err(|_| DesktopRestoreError::IoFailure.to_string())?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let completed = Arc::new(AtomicBool::new(false));
@@ -76,7 +85,11 @@ fn run() -> Result<(), String> {
         let handle = app.handle().clone();
         let request = args.restore_request.expect("closed Restore arguments");
         let worker = runtime.spawn(async move {
-            let result = openbot_desktop::recovery::run_restore_request(release, &request, actual, || handle.clone()).await;
+            let result =
+                openbot_desktop::recovery::run_restore_request(release, &request, actual, || {
+                    handle.clone()
+                })
+                .await;
             let _sent = sender.send(result);
             worker_completed.store(true, Ordering::Release);
             handle.exit(0);
@@ -84,17 +97,27 @@ fn run() -> Result<(), String> {
         app.run_return(move |_, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = event
                 && !completed.load(Ordering::Acquire)
-            { api.prevent_exit(); }
+            {
+                api.prevent_exit();
+            }
         });
-        let result = runtime.block_on(async {
-            let observed = receiver.await.map_err(|_| DesktopRestoreError::ClosureUnproven)?;
-            worker.await.map_err(|_| DesktopRestoreError::ClosureUnproven)?;
-            observed
-        }).map_err(|error| error.to_string())?;
+        let result = runtime
+            .block_on(async {
+                let observed = receiver
+                    .await
+                    .map_err(|_| DesktopRestoreError::ClosureUnproven)?;
+                worker
+                    .await
+                    .map_err(|_| DesktopRestoreError::ClosureUnproven)?;
+                observed
+            })
+            .map_err(|error| error.to_string())?;
         println!("{}", result.as_str());
         return Ok(());
     }
-    let config = release.into_runtime_config().map_err(|error| error.to_string())?;
+    let config = release
+        .into_runtime_config()
+        .map_err(|error| error.to_string())?;
     register_desktop_local_runtime(tauri::Builder::default(), config)
         .map_err(|error| error.to_string())?
         .run(context)
@@ -134,7 +157,9 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--help" | "--version")
-                if parsed.mode == Mode::Launch && parsed.resource_root.is_none() && parsed.restore_request.is_none() =>
+                if parsed.mode == Mode::Launch
+                    && parsed.resource_root.is_none()
+                    && parsed.restore_request.is_none() =>
             {
                 parsed.mode = if arg == "--help" {
                     Mode::Help
@@ -147,8 +172,12 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
                 return Ok(parsed);
             }
             Some("--check-release") if parsed.mode == Mode::Launch => parsed.mode = Mode::Check,
-            Some("--restore-request") if parsed.restore_request.is_none() && parsed.mode == Mode::Launch => {
-                let path = args.next().map(std::path::PathBuf::from)
+            Some("--restore-request")
+                if parsed.restore_request.is_none() && parsed.mode == Mode::Launch =>
+            {
+                let path = args
+                    .next()
+                    .map(std::path::PathBuf::from)
                     .filter(|path| path.is_absolute())
                     .ok_or_else(|| "wrok_bot_arguments_invalid".to_owned())?;
                 parsed.restore_request = Some(path);
@@ -165,7 +194,9 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Args
             _ => return Err("wrok_bot_arguments_invalid".to_owned()),
         }
     }
-    if parsed.mode == Mode::Restore && parsed.resource_root.is_none() { return Err("wrok_bot_arguments_invalid".to_owned()); }
+    if parsed.mode == Mode::Restore && parsed.resource_root.is_none() {
+        return Err("wrok_bot_arguments_invalid".to_owned());
+    }
     Ok(parsed)
 }
 
@@ -223,9 +254,18 @@ mod tests {
 
     #[test]
     fn cli_restore_requires_both_absolute_paths_and_excludes_other_modes() {
-        let parsed = parse_args(["--restore-request".into(), "/request".into(), "--resource-root".into(), "/release".into()]).unwrap();
+        let parsed = parse_args([
+            "--restore-request".into(),
+            "/request".into(),
+            "--resource-root".into(),
+            "/release".into(),
+        ])
+        .unwrap();
         assert_eq!(parsed.mode, Mode::Restore);
-        assert_eq!(parsed.restore_request.as_deref(), Some(std::path::Path::new("/request")));
+        assert_eq!(
+            parsed.restore_request.as_deref(),
+            Some(std::path::Path::new("/request"))
+        );
         for args in [
             vec!["--restore-request"],
             vec!["--restore-request", "/request"],

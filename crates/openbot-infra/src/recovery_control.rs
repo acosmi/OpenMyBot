@@ -17,28 +17,34 @@ mod ordinary;
 mod runtime;
 
 pub use activation::{ActivationBinding, ActivationPhase, OrdinaryStartupBounds};
-pub use journal::{NativeExit, PipeJoin, ProcessStart};
 pub(crate) use activation::{Hex32, ServerDatabaseSite};
-pub use entry::{
-    RestoreTargetSlotOutcome, RestoreOriginalObservation, OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
-    VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
-};
 #[cfg(feature = "desktop-local")]
 pub use entry::ReadOnlyRestoreOwner;
+pub use entry::{
+    OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RecoveryRequestExpected,
+    RecoveryRequestPurpose, RestoreCandidateIsolationInput, RestoreControlSession,
+    RestoreOriginalObservation, RestoreTargetSlotOutcome, VerifiedRecoveryHost,
+    VerifiedRecoveryHostIntent, VerifiedServiceRecoveryHost,
+    load_service_recovery_host_from_config,
+};
+pub(crate) use entry::{RestoreStageIntent, RestoreStages};
+pub(crate) use journal::{
+    CommitAck as RestoreCommitAck, Disposition as RestoreDisposition,
+    RollbackAck as RestoreRollbackAck, Stage as RestoreStage,
+};
+pub use journal::{NativeExit, PipeJoin, ProcessStart};
 #[cfg(feature = "desktop-local")]
 pub use ordinary::LocalFreshProof;
 pub(crate) use ordinary::OrdinaryStage;
-pub(crate) use entry::{RestoreStageIntent, RestoreStages};
-pub(crate) use journal::{Stage as RestoreStage, Disposition as RestoreDisposition, CommitAck as RestoreCommitAck, RollbackAck as RestoreRollbackAck};
 pub use ordinary::{
     OrdinaryActivationProof, OrdinaryDatabaseInitializationProof, OrdinaryInitializationSession,
     VerifiedOrdinaryLegacyProof, VerifiedOrdinaryStartupIntent,
 };
 #[cfg(feature = "server-runtime")]
 pub use runtime::AuthorizationPurpose;
-pub(crate) use runtime::RecoveryWorkerLease;
 #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
 pub use runtime::LocalSubjectReconfirmation;
+pub(crate) use runtime::RecoveryWorkerLease;
 pub use runtime::{
     PassiveObjectKind, RecoveryReadGate, RecoveryRuntimeOwner, RuntimeCloseFact,
     RuntimeCloseReceipt, RuntimeCloseResources, RuntimeOwner, RuntimePgAck, RuntimeTaskOutcome,
@@ -142,7 +148,13 @@ impl fmt::Debug for RecoveryControlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoveryControlError")
             .field("fault", &self.fault)
-            .field("retains_original_owner", &(self.retained.is_some() || self.retained_host.is_some() || self.retained_request.is_some() || self.retained_ordinary.is_some()))
+            .field(
+                "retains_original_owner",
+                &(self.retained.is_some()
+                    || self.retained_host.is_some()
+                    || self.retained_request.is_some()
+                    || self.retained_ordinary.is_some()),
+            )
             .finish()
     }
 }
@@ -421,7 +433,10 @@ pub struct RestoreStorageReservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RestoreNewChildKind { Directory, File }
+pub enum RestoreNewChildKind {
+    Directory,
+    File,
+}
 
 pub struct RestoreNewChildReservation {
     operation: activation::Hex32,
@@ -556,7 +571,12 @@ impl RestoreCapacityLedger {
         }
     }
 
-    fn settle_prepaid_observation(&mut self, resource: RestoreCapacityResource, reserved: u64, observed: u64) -> Result<(), RecoveryControlError> {
+    fn settle_prepaid_observation(
+        &mut self,
+        resource: RestoreCapacityResource,
+        reserved: u64,
+        observed: u64,
+    ) -> Result<(), RecoveryControlError> {
         let index = resource as usize;
         let peak = matches!(
             resource,
@@ -578,13 +598,17 @@ impl RestoreCapacityLedger {
         };
         match (actual, admitted) {
             (Some(actual), Some(admitted))
-                if observed <= reserved && admitted <= self.ceiling(resource) => {
-                    self.actual[index] = actual;
-                    self.admitted[index] = admitted;
-                }
+                if observed <= reserved && admitted <= self.ceiling(resource) =>
+            {
+                self.actual[index] = actual;
+                self.admitted[index] = admitted;
+            }
             _ => {
-                self.fault.get_or_insert(RecoveryControlFault::CapacityExceeded);
-                return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+                self.fault
+                    .get_or_insert(RecoveryControlFault::CapacityExceeded);
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
             }
         }
         Ok(())
@@ -621,16 +645,16 @@ impl RestoreCapacityLedger {
         } else {
             if self.inodes.len() == self.inodes.capacity() {
                 self.admit(
-                RestoreCapacityResource::MetadataBytes,
-                2 * std::mem::size_of::<RestoreInodeUse>() as u64,
+                    RestoreCapacityResource::MetadataBytes,
+                    2 * std::mem::size_of::<RestoreInodeUse>() as u64,
                 )?;
                 let old = self.inodes.capacity();
-                self.inodes
-                .try_reserve_exact(1)
-                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+                self.inodes.try_reserve_exact(1).map_err(|_| {
+                    RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                })?;
                 if self.inodes.capacity().saturating_sub(old) > 2 {
                     return Err(RecoveryControlError::new(
-                    RecoveryControlFault::CapacityExceeded,
+                        RecoveryControlFault::CapacityExceeded,
                     ));
                 }
             }
@@ -978,18 +1002,29 @@ impl RecoveryControl {
         let mut original_host = Some(host);
         let result = (|| {
             let host = original_host.as_ref().expect("original host retained");
-            let request = original_request.as_ref().expect("original request retained");
+            let request = original_request
+                .as_ref()
+                .expect("original request retained");
             let (host_bytes, host_files) = host.retained_usage()?;
             let (request_bytes, request_files) = request.retained_usage()?;
-            let usage = (host_bytes.checked_add(request_bytes), host_files.checked_add(request_files));
-            let (Some(bytes), Some(files)) = usage else { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); };
+            let usage = (
+                host_bytes.checked_add(request_bytes),
+                host_files.checked_add(request_files),
+            );
+            let (Some(bytes), Some(files)) = usage else {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
+            };
             let mut config = RecoveryControlConfig::local(actual, host.trusted_limits().clone())?;
             config.preheld_restore_usage = Some((bytes, files));
             config.original_admission_deadline = Some(deadline);
             before(deadline)?;
             let control = Self::open(config)?;
             let intent = control.verify_host_intent_before(
-                original_request.take().expect("original request moved once"),
+                original_request
+                    .take()
+                    .expect("original request moved once"),
                 original_host.take().expect("original host moved once"),
                 deadline,
             )?;
@@ -1016,17 +1051,37 @@ impl RecoveryControl {
         let result = (|| {
             let original = host.as_ref().expect("original host retained");
             let (hb, hf) = original.retained_usage()?;
-            let (rb, rf) = request.as_ref().expect("original request retained").retained_usage()?;
-            let mut config = RecoveryControlConfig::local(actual, original.trusted_limits().clone())?;
-            config.preheld_restore_usage = Some((hb.checked_add(rb).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?, hf.checked_add(rf).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?));
+            let (rb, rf) = request
+                .as_ref()
+                .expect("original request retained")
+                .retained_usage()?;
+            let mut config =
+                RecoveryControlConfig::local(actual, original.trusted_limits().clone())?;
+            config.preheld_restore_usage = Some((
+                hb.checked_add(rb).ok_or_else(|| {
+                    RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                })?,
+                hf.checked_add(rf).ok_or_else(|| {
+                    RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                })?,
+            ));
             config.original_admission_deadline = Some(deadline);
             let owner = entry::open_existing_control(config)?;
-            let intent = entry::verify_intent(&owner, request.take().expect("original request moved once"), host.take().expect("original host moved once"), deadline)?;
+            let intent = entry::verify_intent(
+                &owner,
+                request.take().expect("original request moved once"),
+                host.take().expect("original host moved once"),
+                deadline,
+            )?;
             ReadOnlyRestoreOwner::from_original(owner, intent, deadline)
         })();
         result.map_err(|mut error: RecoveryControlError| {
-            if host.is_some() { error.retained_host = host.take().map(Box::new); }
-            if request.is_some() { error._retained_restore_input = request.take().map(Box::new); }
+            if host.is_some() {
+                error.retained_host = host.take().map(Box::new);
+            }
+            if request.is_some() {
+                error._retained_restore_input = request.take().map(Box::new);
+            }
             error
         })
     }
@@ -1059,7 +1114,9 @@ impl RecoveryControl {
     /// Reuse the once-verified request retained by a refused claim to observe
     /// its existing operation. This cannot mint an operation or effect clock.
     #[cfg(feature = "desktop-local")]
-    pub fn observe_unclaimed_restore(&mut self) -> Result<ReadOnlyRestoreOwner, RecoveryControlError> {
+    pub fn observe_unclaimed_restore(
+        &mut self,
+    ) -> Result<ReadOnlyRestoreOwner, RecoveryControlError> {
         entry::observe_unclaimed_restore(&self.shared)
     }
 
@@ -1073,7 +1130,14 @@ impl RecoveryControl {
         creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
         owners: &[RuntimeOwner],
         cancel: crate::restore_reconfirmation::CancellationToken,
-    ) -> Result<(RecoveryRuntimeOwner, crate::restore_reconfirmation::OriginalReconfirmationRequest, Instant), RecoveryControlError> {
+    ) -> Result<
+        (
+            RecoveryRuntimeOwner,
+            crate::restore_reconfirmation::OriginalReconfirmationRequest,
+            Instant,
+        ),
+        RecoveryControlError,
+    > {
         entry::enter_current_reconfirmation(&self.shared, request, creator, owners, cancel)
             .map_err(|error| error.retain(&self.shared))
     }
@@ -1148,7 +1212,9 @@ impl RecoveryControl {
                 .await?;
             }
             _ => {
-                return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::EntryInvalid,
+                ));
             }
         }
         let owner = session.into_runtime_before()?;
@@ -1168,9 +1234,11 @@ impl RecoveryControl {
         owners: &[RuntimeOwner],
     ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
         let result = (|| {
-            let intent = entry::local_intent(&self.shared, creator, release, services, bounds, owners)?;
+            let intent =
+                entry::local_intent(&self.shared, creator, release, services, bounds, owners)?;
             let admission = intent.admission_deadline();
-            let (published, intent) = ordinary::shared_local_head(&self.shared, intent, admission, creator)?;
+            let (published, intent) =
+                ordinary::shared_local_head(&self.shared, intent, admission, creator)?;
             ordinary::enroll(&self.shared, published, &intent)
         })();
         result.map_err(|error| error.retain(&self.shared))
@@ -1232,7 +1300,10 @@ fn hex_array<const N: usize>(text: &str) -> [u8; N] {
         }
     };
     let mut bytes = [0u8; N];
-    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0.iter()) {
+    for (byte, pair) in bytes
+        .iter_mut()
+        .zip(text.as_bytes().as_chunks::<2>().0.iter())
+    {
         *byte = (digit(pair[0]) << 4) | digit(pair[1]);
     }
     bytes
@@ -1901,27 +1972,54 @@ pub(crate) mod tests {
                         "expectedManifestSha256": ZERO64, "target": selected("new-generation")}, "profile": self.profile})
         }
 
-        fn open_with_key_parent(&self, key_parent: &std::path::Path) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
+        fn open_with_key_parent(
+            &self,
+            key_parent: &std::path::Path,
+        ) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
             let mut request = self.request();
             request["trustedInputSelection"]["keyMedium"]["parent"] = json!(key_parent);
             self.open_request(request)
         }
 
-        pub(crate) fn open_request(&self, request: Value) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
+        pub(crate) fn open_request(
+            &self,
+            request: Value,
+        ) -> (super::RecoveryControl, super::VerifiedRecoveryHostIntent) {
             self.try_open_request(request).unwrap()
         }
 
-        pub(crate) fn try_open_request(&self, request: Value) -> Result<(super::RecoveryControl, super::VerifiedRecoveryHostIntent), super::RecoveryControlError> {
+        pub(crate) fn try_open_request(
+            &self,
+            request: Value,
+        ) -> Result<
+            (super::RecoveryControl, super::VerifiedRecoveryHostIntent),
+            super::RecoveryControlError,
+        > {
             let (actual, request, host) = self.original_inputs(request);
-            super::RecoveryControl::open_local_restore_before(actual, request, host, std::time::Instant::now() + std::time::Duration::from_secs(30))
+            super::RecoveryControl::open_local_restore_before(
+                actual,
+                request,
+                host,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
         }
 
-        fn reopen(&self, deadline: std::time::Instant) -> Result<super::ReadOnlyRestoreOwner, super::RecoveryControlError> {
+        fn reopen(
+            &self,
+            deadline: std::time::Instant,
+        ) -> Result<super::ReadOnlyRestoreOwner, super::RecoveryControlError> {
             let (actual, request, host) = self.original_inputs(self.request());
             super::RecoveryControl::reopen_local_restore_before(actual, request, host, deadline)
         }
 
-        fn original_inputs(&self, request: Value) -> (crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot, super::OwnedRecoveryRequestFile, super::VerifiedRecoveryHost) {
+        fn original_inputs(
+            &self,
+            request: Value,
+        ) -> (
+            crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
+            super::OwnedRecoveryRequestFile,
+            super::VerifiedRecoveryHost,
+        ) {
             use std::os::unix::fs::PermissionsExt;
             let root = self.directory.as_path();
             std::fs::write(root.join("request"), serde_json::to_vec(&request).unwrap()).unwrap();
@@ -1952,14 +2050,21 @@ pub(crate) mod tests {
     }
 
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
-    fn restore_control_bytes(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn restore_control_bytes(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
         let mut bytes = std::collections::BTreeMap::new();
-        if !root.exists() { return bytes; }
+        if !root.exists() {
+            return bytes;
+        }
         bytes.insert(root.to_owned(), Vec::new());
         for child in std::fs::read_dir(root).unwrap() {
             let child = child.unwrap();
-            if child.file_type().unwrap().is_dir() { bytes.extend(restore_control_bytes(&child.path())); }
-            else { bytes.insert(child.path(), std::fs::read(child.path()).unwrap()); }
+            if child.file_type().unwrap().is_dir() {
+                bytes.extend(restore_control_bytes(&child.path()));
+            } else {
+                bytes.insert(child.path(), std::fs::read(child.path()).unwrap());
+            }
         }
         bytes
     }
@@ -1967,8 +2072,13 @@ pub(crate) mod tests {
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
     fn closed_restore_claim(fixture: &RestoreEntryFixture) -> String {
         let (mut control, intent) = fixture.open();
-        let session = control.claim_restore(intent, fixture.profile.clone()).unwrap();
-        let record: Value = serde_json::from_slice(&std::fs::read(fixture.control_root().join("activation-v1")).unwrap()).unwrap();
+        let session = control
+            .claim_restore(intent, fixture.profile.clone())
+            .unwrap();
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(fixture.control_root().join("activation-v1")).unwrap(),
+        )
+        .unwrap();
         let epoch = record["data"]["epoch"].as_str().unwrap().to_owned();
         drop(session);
         drop(control);
@@ -1981,7 +2091,9 @@ pub(crate) mod tests {
         let fixture = RestoreEntryFixture::new();
         let epoch = closed_restore_claim(&fixture);
         let before = restore_control_bytes(&fixture.control_root());
-        let mut reader = fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).unwrap();
+        let mut reader = fixture
+            .reopen(std::time::Instant::now() + std::time::Duration::from_secs(10))
+            .unwrap();
         for _ in 0..2 {
             let observed = reader.observe_original().unwrap();
             assert_eq!(observed.operation_id(), OPERATION);
@@ -1997,23 +2109,36 @@ pub(crate) mod tests {
     fn t046_11_reopened_busy_preserves_every_control_byte() {
         let fixture = RestoreEntryFixture::new();
         let (mut control, intent) = fixture.open();
-        let session = control.claim_restore(intent, fixture.profile.clone()).unwrap();
+        let session = control
+            .claim_restore(intent, fixture.profile.clone())
+            .unwrap();
         let before = restore_control_bytes(&fixture.control_root());
-        assert!(matches!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)), Err(error) if error.fault() == super::RecoveryControlFault::OwnerBusy));
+        assert!(
+            matches!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)), Err(error) if error.fault() == super::RecoveryControlFault::OwnerBusy)
+        );
         assert_eq!(restore_control_bytes(&fixture.control_root()), before);
-        drop(session); drop(control);
+        drop(session);
+        drop(control);
     }
 
     #[test]
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
     fn t046_11_reopened_missing_layout_is_never_created() {
         let fixture = RestoreEntryFixture::new();
-        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert!(
+            fixture
+                .reopen(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                .is_err()
+        );
         assert!(!fixture.control_root().exists());
         closed_restore_claim(&fixture);
         std::fs::remove_file(fixture.control_root().join("owner.lock")).unwrap();
         let before = restore_control_bytes(&fixture.control_root());
-        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert!(
+            fixture
+                .reopen(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                .is_err()
+        );
         assert!(!fixture.control_root().join("owner.lock").exists());
         assert_eq!(restore_control_bytes(&fixture.control_root()), before);
     }
@@ -2024,10 +2149,23 @@ pub(crate) mod tests {
         use std::io::Write;
         let fixture = RestoreEntryFixture::new();
         closed_restore_claim(&fixture);
-        let journal = fixture.control_root().join("operations").join(OPERATION).join("journal-v1");
-        std::fs::OpenOptions::new().append(true).open(journal).unwrap().write_all(b"x").unwrap();
+        let journal = fixture
+            .control_root()
+            .join("operations")
+            .join(OPERATION)
+            .join("journal-v1");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(journal)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let before = restore_control_bytes(&fixture.control_root());
-        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert!(
+            fixture
+                .reopen(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                .is_err()
+        );
         assert_eq!(restore_control_bytes(&fixture.control_root()), before);
     }
 
@@ -2039,7 +2177,10 @@ pub(crate) mod tests {
         let before = restore_control_bytes(&fixture.control_root());
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         let mut reader = fixture.reopen(deadline).unwrap();
-        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + std::time::Duration::from_millis(10));
+        std::thread::sleep(
+            deadline.saturating_duration_since(std::time::Instant::now())
+                + std::time::Duration::from_millis(10),
+        );
         assert!(reader.observe_original().is_err());
         assert!(reader.observe_original().is_err());
         drop(reader);
@@ -2054,9 +2195,20 @@ pub(crate) mod tests {
         fixture.limits.admission_ns = 200_000_000;
         let (actual, request, host) = fixture.original_inputs(fixture.request());
         let original = host.admission_deadline();
-        std::thread::sleep(original.saturating_duration_since(std::time::Instant::now()) + std::time::Duration::from_millis(10));
+        std::thread::sleep(
+            original.saturating_duration_since(std::time::Instant::now())
+                + std::time::Duration::from_millis(10),
+        );
         let before = restore_control_bytes(&fixture.control_root());
-        assert!(super::RecoveryControl::reopen_local_restore_before(actual, request, host, std::time::Instant::now() + std::time::Duration::from_secs(30)).is_err());
+        assert!(
+            super::RecoveryControl::reopen_local_restore_before(
+                actual,
+                request,
+                host,
+                std::time::Instant::now() + std::time::Duration::from_secs(30)
+            )
+            .is_err()
+        );
         assert_eq!(restore_control_bytes(&fixture.control_root()), before);
     }
 
@@ -2074,7 +2226,11 @@ pub(crate) mod tests {
         assert_ne!(digest, wrong);
         std::fs::write(&path, bytes.replacen(digest, &wrong, 1)).unwrap();
         let before = restore_control_bytes(&fixture.control_root());
-        assert!(fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).is_err());
+        assert!(
+            fixture
+                .reopen(std::time::Instant::now() + std::time::Duration::from_secs(10))
+                .is_err()
+        );
         assert_eq!(restore_control_bytes(&fixture.control_root()), before);
     }
 
@@ -2085,7 +2241,11 @@ pub(crate) mod tests {
         use std::os::unix::fs::MetadataExt;
         let carrier_parent = std::fs::metadata(fixture.directory.join("carrier-medium")).unwrap();
         let key_parent = std::fs::metadata(fixture.directory.join("key-medium")).unwrap();
-        assert_eq!(carrier_parent.dev(), key_parent.dev(), "independent directories on the same device remain supported");
+        assert_eq!(
+            carrier_parent.dev(),
+            key_parent.dev(),
+            "independent directories on the same device remain supported"
+        );
         assert_ne!(carrier_parent.ino(), key_parent.ino());
         let reader = super::RecoveryControl::open(fixture.config()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2321,7 +2481,11 @@ pub(crate) mod tests {
         let replacement = fixture.directory.as_path().join("replacement");
         std::fs::write(&replacement, [4u8; 104]).unwrap();
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::rename(&replacement, fixture.directory.as_path().join("key-medium/key")).unwrap();
+        std::fs::rename(
+            &replacement,
+            fixture.directory.as_path().join("key-medium/key"),
+        )
+        .unwrap();
         assert_eq!(
             session.frozen_input().err().unwrap().fault(),
             RecoveryControlFault::InputInvalid
@@ -2340,7 +2504,6 @@ pub(crate) mod tests {
         );
     }
 
-
     #[test]
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
     fn t046_11_effect_convergence_and_owner_loss_are_read_only() {
@@ -2348,29 +2511,49 @@ pub(crate) mod tests {
         fixture.profile.effect_ns = 500_000_000;
         fixture.profile.convergence_ns = 200_000_000;
         let (mut control, entry) = fixture.open();
-        let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+        let mut session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .unwrap();
         let (_, t0, effect, close) = session.original_native_clock().unwrap();
         assert_eq!(effect - t0, fixture.profile.effect_ns);
         assert_eq!(close - effect, fixture.profile.convergence_ns);
         let before = restore_control_bytes(&fixture.control_root());
-        let descriptor: Value = serde_json::from_slice(&std::fs::read(fixture.control_root().join("activation-v1")).unwrap()).unwrap();
+        let descriptor: Value = serde_json::from_slice(
+            &std::fs::read(fixture.control_root().join("activation-v1")).unwrap(),
+        )
+        .unwrap();
         let epoch = descriptor["data"]["epoch"].as_str().unwrap().to_owned();
         let now = super::clock::monotonic_ns().unwrap();
-        std::thread::sleep(std::time::Duration::from_nanos(effect.saturating_sub(now) + 10_000_000));
-        let effect_error = session.admit_capacity(super::RestoreCapacityResource::NativeTasks, 1).err().expect("original E denies a new effect");
+        std::thread::sleep(std::time::Duration::from_nanos(
+            effect.saturating_sub(now) + 10_000_000,
+        ));
+        let effect_error = session
+            .admit_capacity(super::RestoreCapacityResource::NativeTasks, 1)
+            .err()
+            .expect("original E denies a new effect");
         assert_eq!(effect_error.fault(), RecoveryControlFault::EffectExpired);
         assert_eq!(restore_control_bytes(&fixture.control_root()), before);
         drop(effect_error);
         let now = super::clock::monotonic_ns().unwrap();
-        std::thread::sleep(std::time::Duration::from_nanos(close.saturating_sub(now) + 10_000_000));
+        std::thread::sleep(std::time::Duration::from_nanos(
+            close.saturating_sub(now) + 10_000_000,
+        ));
         assert!(super::clock::monotonic_ns().unwrap() >= close);
-        let close_error = session.admit_capacity(super::RestoreCapacityResource::NativeTasks, 1).err().expect("original C cannot admit a new effect");
-        assert_eq!(close_error.fault(), RecoveryControlFault::ConvergenceExpired);
+        let close_error = session
+            .admit_capacity(super::RestoreCapacityResource::NativeTasks, 1)
+            .err()
+            .expect("original C cannot admit a new effect");
+        assert_eq!(
+            close_error.fault(),
+            RecoveryControlFault::ConvergenceExpired
+        );
         assert_eq!(restore_control_bytes(&fixture.control_root()), before);
         drop(close_error);
         drop(session);
         drop(control);
-        let mut reader = fixture.reopen(std::time::Instant::now() + std::time::Duration::from_secs(10)).unwrap();
+        let mut reader = fixture
+            .reopen(std::time::Instant::now() + std::time::Duration::from_secs(10))
+            .unwrap();
         let observed = reader.observe_original().unwrap();
         assert_eq!(observed.operation_id(), OPERATION);
         assert_eq!(observed.epoch(), epoch);
@@ -2388,16 +2571,33 @@ pub(crate) mod tests {
             fixture.profile.effect_ns = 500_000_000;
             fixture.profile.convergence_ns = 200_000_000;
             let (mut control, entry) = fixture.open();
-            let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+            let mut session = control
+                .claim_restore(entry, fixture.profile.clone())
+                .unwrap();
             let (_, t0, effect, close) = session.original_native_clock().unwrap();
             assert_eq!(effect - t0, fixture.profile.effect_ns);
             assert_eq!(close - effect, fixture.profile.convergence_ns);
             let until = if convergence { close } else { effect };
             let now = super::clock::monotonic_ns().unwrap();
-            std::thread::sleep(std::time::Duration::from_nanos(until.saturating_sub(now) + 10_000_000));
-            let error = session.admit_capacity(super::RestoreCapacityResource::NativeTasks, 1).err().expect("original deadline denies a new effect");
-            assert_eq!(error.fault(), if convergence { RecoveryControlFault::ConvergenceExpired } else { RecoveryControlFault::EffectExpired });
-            let pending: Value = serde_json::from_slice(&std::fs::read(fixture.control_root().join("activation-v1")).unwrap()).unwrap();
+            std::thread::sleep(std::time::Duration::from_nanos(
+                until.saturating_sub(now) + 10_000_000,
+            ));
+            let error = session
+                .admit_capacity(super::RestoreCapacityResource::NativeTasks, 1)
+                .err()
+                .expect("original deadline denies a new effect");
+            assert_eq!(
+                error.fault(),
+                if convergence {
+                    RecoveryControlFault::ConvergenceExpired
+                } else {
+                    RecoveryControlFault::EffectExpired
+                }
+            );
+            let pending: Value = serde_json::from_slice(
+                &std::fs::read(fixture.control_root().join("activation-v1")).unwrap(),
+            )
+            .unwrap();
             assert_eq!(pending["phase"], "RestorePending");
             assert!(!fixture.directory.as_path().join("new-generation").exists());
         }
@@ -2409,17 +2609,35 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt;
         let fixture = RestoreEntryFixture::new();
         let (mut control, entry) = fixture.open();
-        let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+        let mut session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .unwrap();
         let root = fixture.control_root();
         let journal = root.join("operations").join(OPERATION).join("journal-v1");
         let before = std::fs::read(&journal).unwrap();
         let descriptor = std::fs::read(root.join("activation-v1")).unwrap();
         std::fs::rename(root.join("owner.lock"), root.join("old-owner.lock")).unwrap();
         std::fs::write(root.join("owner.lock"), b"WBRCOWN1").unwrap();
-        std::fs::set_permissions(root.join("owner.lock"), std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(session.check_capacity_before(std::time::Instant::now() + std::time::Duration::from_secs(10)).err().unwrap().fault(), RecoveryControlFault::OwnerLost);
+        std::fs::set_permissions(
+            root.join("owner.lock"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .check_capacity_before(
+                    std::time::Instant::now() + std::time::Duration::from_secs(10)
+                )
+                .err()
+                .unwrap()
+                .fault(),
+            RecoveryControlFault::OwnerLost
+        );
         assert_eq!(std::fs::read(&journal).unwrap(), before);
-        assert_eq!(std::fs::read(root.join("activation-v1")).unwrap(), descriptor);
+        assert_eq!(
+            std::fs::read(root.join("activation-v1")).unwrap(),
+            descriptor
+        );
     }
 
     #[test]
@@ -2432,8 +2650,20 @@ pub(crate) mod tests {
         std::fs::write(&key, [3u8; 104]).unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
         let (mut control, entry) = fixture.open_with_key_parent(&shared_parent);
-        assert_eq!(control.claim_restore(entry, fixture.profile.clone()).err().unwrap().fault(), RecoveryControlFault::InputInvalid);
-        assert_eq!(std::fs::read_dir(fixture.control_root().join("operations")).unwrap().count(), 0);
+        assert_eq!(
+            control
+                .claim_restore(entry, fixture.profile.clone())
+                .err()
+                .unwrap()
+                .fault(),
+            RecoveryControlFault::InputInvalid
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.control_root().join("operations"))
+                .unwrap()
+                .count(),
+            0
+        );
         assert!(!fixture.control_root().join("activation-v1").exists());
         assert_eq!(std::fs::read(&key).unwrap(), [3u8; 104]);
         assert!(!fixture.directory.join("new-generation").exists());
@@ -2485,7 +2715,8 @@ pub(crate) mod tests {
         let mut request = fixture.request();
         request["purpose"] = json!("adopt_ordinary_legacy");
         request.as_object_mut().unwrap().remove("profile");
-        request["trustedInputSelection"] = json!({"installation":{"parent":fixture.directory,"component":"old-app"}});
+        request["trustedInputSelection"] =
+            json!({"installation":{"parent":fixture.directory,"component":"old-app"}});
         request["limits"] = json!({"effectNs":30_000_000_000u64,"convergenceNs":30_000_000_000u64});
         request
     }
@@ -2496,27 +2727,55 @@ pub(crate) mod tests {
         let fixture = RestoreEntryFixture::new();
         let request = local_legacy_request(&fixture);
         let (mut control, entry) = fixture.open_request(request);
-        assert_eq!(entry.purpose(), super::RecoveryRequestPurpose::AdoptOrdinaryLegacy);
+        assert_eq!(
+            entry.purpose(),
+            super::RecoveryRequestPurpose::AdoptOrdinaryLegacy
+        );
         assert!(entry.restore_profile().is_none());
-        let intent = entry.into_ordinary_legacy_intent(&control, &[super::RuntimeOwner::PostgresSidecar, super::RuntimeOwner::SqlDriver]).unwrap();
+        let intent = entry
+            .into_ordinary_legacy_intent(
+                &control,
+                &[
+                    super::RuntimeOwner::PostgresSidecar,
+                    super::RuntimeOwner::SqlDriver,
+                ],
+            )
+            .unwrap();
         let deadline = intent.admission_deadline();
-        let mut session = control.begin_ordinary_initialization_before(intent, deadline).unwrap();
+        let mut session = control
+            .begin_ordinary_initialization_before(intent, deadline)
+            .unwrap();
         session.seal_local_legacy_before().unwrap();
         let root = fixture.control_root();
         let bytes = std::fs::read(root.join("activation-v1")).unwrap();
         let observation = observe(&bytes, &fixture.limits).unwrap();
-        assert_eq!(observation.record.phase, super::ActivationPhase::OrdinaryInitializing);
-        assert_eq!(std::fs::read_dir(fixture.directory.join("old-app")).unwrap().count(), 0, "no sidecar/schema/key effect precedes Initializing");
-        let journal = std::fs::read(root.join("operations").join(OPERATION).join("journal-v1")).unwrap();
+        assert_eq!(
+            observation.record.phase,
+            super::ActivationPhase::OrdinaryInitializing
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.directory.join("old-app"))
+                .unwrap()
+                .count(),
+            0,
+            "no sidecar/schema/key effect precedes Initializing"
+        );
+        let journal =
+            std::fs::read(root.join("operations").join(OPERATION).join("journal-v1")).unwrap();
         observe_chain(&journal, &fixture.limits).unwrap();
         let length = u32::from_be_bytes(journal[8..12].try_into().unwrap()) as usize;
-        let first: Value = serde_json::from_slice(&journal[12..12+length]).unwrap();
+        let first: Value = serde_json::from_slice(&journal[12..12 + length]).unwrap();
         assert_eq!(first["operationId"], OPERATION);
         assert_eq!(first["data"]["mode"], "legacy_adoption");
         assert_eq!(first["data"]["originalStartupIntent"], OPERATION);
         assert!(first["data"].get("request").is_none());
         // An actual EEXIST leaves the old first head and all its bytes intact.
-        assert!(super::entry::lock(&control.shared).unwrap().publish_activation(&observation.record, deadline).is_err());
+        assert!(
+            super::entry::lock(&control.shared)
+                .unwrap()
+                .publish_activation(&observation.record, deadline)
+                .is_err()
+        );
         assert_eq!(std::fs::read(root.join("activation-v1")).unwrap(), bytes);
     }
 
@@ -2528,12 +2787,20 @@ pub(crate) mod tests {
             let mut request = local_legacy_request(&fixture);
             match mutation {
                 0 => request["profile"] = serde_json::to_value(&fixture.profile).unwrap(),
-                1 => request["trustedInputSelection"]["carrier"] = json!({"parent":fixture.directory,"component":"carrier"}),
+                1 => {
+                    request["trustedInputSelection"]["carrier"] =
+                        json!({"parent":fixture.directory,"component":"carrier"})
+                }
                 _ => request["limits"]["effectNs"] = json!(30_000_000_001u64),
             }
             assert!(fixture.try_open_request(request).is_err());
             assert!(!fixture.control_root().join("activation-v1").exists());
-            assert_eq!(std::fs::read_dir(fixture.control_root().join("operations")).unwrap().count(), 0);
+            assert_eq!(
+                std::fs::read_dir(fixture.control_root().join("operations"))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
     }
 
@@ -3015,8 +3282,7 @@ pub(crate) mod tests {
         let control = super::RecoveryControl::open(fixture.config()).unwrap();
         let exclusive = super::entry::lock(&control.shared).unwrap();
         let started = std::time::Instant::now();
-        let error = super::entry::share(&control.shared, |_| ())
-            .expect_err("taken custody");
+        let error = super::entry::share(&control.shared, |_| ()).expect_err("taken custody");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(50),
             "no wait for the exclusive owner"
@@ -3121,25 +3387,48 @@ pub(crate) mod tests {
     #[tokio::test]
     #[cfg(all(feature = "desktop-local", target_os = "macos"))]
     async fn t046_51_never_started_and_start_exit_close_while_unknown_sidecar_stays_pending() {
-        use super::{NativeExit, PassiveObjectKind, PipeJoin, ProcessStart, RuntimeCloseFact, RuntimeCloseResources, RuntimeOwner};
+        use super::{
+            NativeExit, PassiveObjectKind, PipeJoin, ProcessStart, RuntimeCloseFact,
+            RuntimeCloseResources, RuntimeOwner,
+        };
         use crate::db::pool::ConnectionDestruction;
-        for case in ["never", "code", "signal", "missing", "duplicate", "drivers", "empty_drivers"] {
+        for case in [
+            "never",
+            "code",
+            "signal",
+            "missing",
+            "duplicate",
+            "drivers",
+            "empty_drivers",
+        ] {
             let fixture = RestoreEntryFixture::new();
             let writer = super::RecoveryControl::open(fixture.config()).unwrap();
-            publish_active(&fixture, &writer, crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs());
+            publish_active(
+                &fixture,
+                &writer,
+                crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+            );
             drop(writer);
             let control = super::RecoveryControl::open(fixture.config()).unwrap();
             let mut runtime = fixture.open_local(&control).unwrap();
             let root = fixture.control_root().join("runtimes");
             let original = restore_control_bytes(&root);
-            let enrollment = original.iter().find(|(path, _)| path.ends_with("enrollment-v1")).unwrap();
+            let enrollment = original
+                .iter()
+                .find(|(path, _)| path.ends_with("enrollment-v1"))
+                .unwrap();
             let passive = |owner| RuntimeCloseFact::PassiveRetirement {
                 object: PassiveObjectKind::NeverStarted(owner),
             };
-            let mut facts: Vec<_> = LOCAL_OWNERS.into_iter().filter(|owner| {
-                *owner != RuntimeOwner::PostgresSidecar &&
-                (!matches!(case, "drivers" | "empty_drivers") || *owner != RuntimeOwner::SqlDriver)
-            }).map(passive).collect();
+            let mut facts: Vec<_> = LOCAL_OWNERS
+                .into_iter()
+                .filter(|owner| {
+                    *owner != RuntimeOwner::PostgresSidecar
+                        && (!matches!(case, "drivers" | "empty_drivers")
+                            || *owner != RuntimeOwner::SqlDriver)
+                })
+                .map(passive)
+                .collect();
             // Receipt-side fixtures exercise the exact adapter fact shapes.
             // T046-50/52/54 separately observe the original native waits and
             // SQL driver destruction; these DATA do not claim an OS wait.
@@ -3149,33 +3438,72 @@ pub(crate) mod tests {
                 facts.push(RuntimeCloseFact::NativeWait {
                     original_program_id: RuntimeOwner::PostgresSidecar,
                     original_pid: 7,
-                    original_start_identity: ProcessStart { seconds: 1, nanos: 0 },
-                    exit: if case == "signal" { NativeExit::Signal { value: 9 } } else { NativeExit::Code { value: 17 } },
+                    original_start_identity: ProcessStart {
+                        seconds: 1,
+                        nanos: 0,
+                    },
+                    exit: if case == "signal" {
+                        NativeExit::Signal { value: 9 }
+                    } else {
+                        NativeExit::Code { value: 17 }
+                    },
                     observed_ns: super::clock::monotonic_ns().unwrap(),
                     pipes: [PipeJoin::Null, PipeJoin::Null, PipeJoin::Null],
                 });
             }
-            if case == "duplicate" { facts.push(passive(RuntimeOwner::PostgresSidecar)); }
+            if case == "duplicate" {
+                facts.push(passive(RuntimeOwner::PostgresSidecar));
+            }
             if matches!(case, "drivers" | "empty_drivers") {
                 let drivers = if case == "drivers" {
-                    vec![ConnectionDestruction::ConnectingFutureDestroyed, ConnectionDestruction::ConnectionDestroyed]
-                } else { Vec::new() };
-                facts.push(RuntimeCloseFact::PassiveRetirement { object: PassiveObjectKind::SqlDriver(drivers) });
+                    vec![
+                        ConnectionDestruction::ConnectingFutureDestroyed,
+                        ConnectionDestruction::ConnectionDestroyed,
+                    ]
+                } else {
+                    Vec::new()
+                };
+                facts.push(RuntimeCloseFact::PassiveRetirement {
+                    object: PassiveObjectKind::SqlDriver(drivers),
+                });
             }
             let closes = !matches!(case, "missing" | "duplicate");
-            let result = runtime.close_before(RuntimeCloseResources::new(facts),
-                std::time::Instant::now() + std::time::Duration::from_secs(30)).await;
+            let result = runtime
+                .close_before(
+                    RuntimeCloseResources::new(facts),
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await;
             assert_eq!(result.is_ok(), closes, "{case}");
             drop(result);
             drop(runtime);
             drop(control);
-            assert_eq!(std::fs::read(enrollment.0).unwrap(), *enrollment.1, "immutable enrollment: {case}");
-            assert_eq!(runtime_records(&fixture, "receipt-v1"), usize::from(closes), "{case}");
-            if !closes { assert_eq!(restore_control_bytes(&root), original); }
+            assert_eq!(
+                std::fs::read(enrollment.0).unwrap(),
+                *enrollment.1,
+                "immutable enrollment: {case}"
+            );
+            assert_eq!(
+                runtime_records(&fixture, "receipt-v1"),
+                usize::from(closes),
+                "{case}"
+            );
+            if !closes {
+                assert_eq!(restore_control_bytes(&root), original);
+            }
             let (mut control, intent) = fixture.open();
             let claim = control.claim_restore(intent, fixture.profile.clone());
-            assert_eq!(claim.is_ok(), closes, "only an actual complete receipt releases the runtime: {case}");
-            if !closes { assert_eq!(claim.err().unwrap().fault(), RecoveryControlFault::OwnerBusy); }
+            assert_eq!(
+                claim.is_ok(),
+                closes,
+                "only an actual complete receipt releases the runtime: {case}"
+            );
+            if !closes {
+                assert_eq!(
+                    claim.err().unwrap().fault(),
+                    RecoveryControlFault::OwnerBusy
+                );
+            }
         }
     }
 
@@ -3927,11 +4255,19 @@ pub(crate) mod tests {
                 let mut request = fixture.request();
                 request["trustedInputSelection"]["target"]["component"] = json!("old-app");
                 let (mut control, intent) = fixture.open_request(request);
-                let mut session = control.claim_restore(intent, fixture.profile.clone()).unwrap();
+                let mut session = control
+                    .claim_restore(intent, fixture.profile.clone())
+                    .unwrap();
                 let operation = session.operation_id().to_owned();
-                let epoch = super::head(&fixture)["data"]["epoch"].as_str().unwrap().to_owned();
+                let epoch = super::head(&fixture)["data"]["epoch"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
                 let root = fixture.directory.join("old-app");
-                std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&root)
+                    .unwrap();
                 let mut pg = OwnedCandidate::start_at(
                     crate::db::native::NATIVE_LATEST_VERSION,
                     seed,
@@ -3963,37 +4299,68 @@ pub(crate) mod tests {
                     )
                     .await
                     .unwrap();
-                session.upgrade_candidate_schema_before(deadline).await.unwrap();
+                session
+                    .upgrade_candidate_schema_before(deadline)
+                    .await
+                    .unwrap();
                 session.verify_absent_artifacts_for_test(deadline).await;
                 session.retire_cohort_before(deadline).await.unwrap();
                 session
-                    .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(deadline))
+                    .clear_restored_closed_history_before(RestoredClosedHistoryRequest::new(
+                        deadline,
+                    ))
                     .await
                     .unwrap();
                 let ceiling = fixture.profile.capacity.max_metadata_bytes;
                 let used = |session: &mut crate::recovery_control::RestoreControlSession| {
-                    ceiling - session.input_stages().capacity_available(Resource::MetadataBytes).unwrap()
+                    ceiling
+                        - session
+                            .input_stages()
+                            .capacity_available(Resource::MetadataBytes)
+                            .unwrap()
                 };
                 let mut metadata = [used(&mut session), 0, 0, 0, 0];
                 // The Desktop slot adapter's part: both fixed pairs written
                 // and read back by the store, then observed as matched.
                 let mut random = [0_u8; 32];
                 getrandom::fill(&mut random).unwrap();
-                let new = SecretBytes::new(random.iter().flat_map(|b| format!("{b:02x}").into_bytes()).collect());
-                for kind in [super::super::entry::TargetSlotKind::Master, super::super::entry::TargetSlotKind::Scram] {
-                    session.begin_target_slot_from_session_before(deadline, kind).unwrap();
+                let new = SecretBytes::new(
+                    random
+                        .iter()
+                        .flat_map(|b| format!("{b:02x}").into_bytes())
+                        .collect(),
+                );
+                for kind in [
+                    super::super::entry::TargetSlotKind::Master,
+                    super::super::entry::TargetSlotKind::Scram,
+                ] {
+                    session
+                        .begin_target_slot_from_session_before(deadline, kind)
+                        .unwrap();
                     match kind {
                         super::super::entry::TargetSlotKind::Master => session
-                            .observe_restore_master_slot_before(super::super::RestoreTargetSlotOutcome::ReadbackMatched, deadline),
+                            .observe_restore_master_slot_before(
+                                super::super::RestoreTargetSlotOutcome::ReadbackMatched,
+                                deadline,
+                            ),
                         super::super::entry::TargetSlotKind::Scram => session
-                            .observe_restore_scram_slot_before(super::super::RestoreTargetSlotOutcome::ReadbackMatched, deadline),
+                            .observe_restore_scram_slot_before(
+                                super::super::RestoreTargetSlotOutcome::ReadbackMatched,
+                                deadline,
+                            ),
                     }
                     .unwrap();
                 }
                 metadata[1] = used(&mut session);
-                let scram = session.rotate_candidate_scram_before(&new, &old, deadline).await.unwrap();
+                let scram = session
+                    .rotate_candidate_scram_before(&new, &old, deadline)
+                    .await
+                    .unwrap();
                 metadata[2] = used(&mut session);
-                let readbacks = session.verify_target_installation_before(&master, &new, deadline).await.unwrap();
+                let readbacks = session
+                    .verify_target_installation_before(&master, &new, deadline)
+                    .await
+                    .unwrap();
                 metadata[3] = used(&mut session);
                 let startup = wrok_bot_macos_process::ProcessIdentity::capture(pg.pid())
                     .unwrap()
@@ -4008,11 +4375,20 @@ pub(crate) mod tests {
                         seconds: u64::from_be_bytes(startup[4..12].try_into().unwrap()),
                         nanos: u32::from_be_bytes(startup[12..16].try_into().unwrap()) * 1000,
                     },
-                    exit: super::super::NativeExit::Code { value: status.code().unwrap() },
+                    exit: super::super::NativeExit::Code {
+                        value: status.code().unwrap(),
+                    },
                     observed_ns: super::super::clock::monotonic_ns().unwrap(),
-                    pipes: [super::super::PipeJoin::Null, super::super::PipeJoin::Null, super::super::PipeJoin::Null],
+                    pipes: [
+                        super::super::PipeJoin::Null,
+                        super::super::PipeJoin::Null,
+                        super::super::PipeJoin::Null,
+                    ],
                 };
-                session.publish_restore_current_before(scram, readbacks, exit, deadline).await.unwrap();
+                session
+                    .publish_restore_current_before(scram, readbacks, exit, deadline)
+                    .await
+                    .unwrap();
                 metadata[4] = used(&mut session);
                 drop(session);
                 drop(control);
@@ -4026,17 +4402,32 @@ pub(crate) mod tests {
                     .user("desktop_admin")
                     .dbname(crate::db::desktop_local::APPLICATION_DATABASE)
                     .password(new.expose());
-                let pool = crate::db::pool::connect_config(config, 4, Duration::from_secs(10), "restored target")
-                    .await
-                    .unwrap();
+                let pool = crate::db::pool::connect_config(
+                    config,
+                    4,
+                    Duration::from_secs(10),
+                    "restored target",
+                )
+                .await
+                .unwrap();
                 // The restored Local binding route is the next batch; the
                 // gate is bound to the same pool its verification would bind.
-                super::super::entry::lock(&control.shared).unwrap().bind_original_local_pool(&pool);
+                super::super::entry::lock(&control.shared)
+                    .unwrap()
+                    .bind_original_local_pool(&pool);
                 let cohort = RestoreCohortRef {
                     operation_id: super::super::hex_array(&operation),
                     epoch: super::super::hex_array(&epoch),
                 };
-                Self { runtime, pool, cohort, metadata, _control: control, _pg: pg, fixture }
+                Self {
+                    runtime,
+                    pool,
+                    cohort,
+                    metadata,
+                    _control: control,
+                    _pg: pg,
+                    fixture,
+                }
             }
 
             pub(crate) fn read_gate(&self) -> crate::recovery_control::RecoveryReadGate {
@@ -4050,12 +4441,21 @@ pub(crate) mod tests {
                 purpose: crate::recovery_control::AuthorizationPurpose,
                 parent: &[u8],
             ) -> SecretBytes {
-                super::super::runtime::authorization_key(&serde_json::from_value(super::binding()).unwrap(), purpose, parent)
+                super::super::runtime::authorization_key(
+                    &serde_json::from_value(super::binding()).unwrap(),
+                    purpose,
+                    parent,
+                )
             }
 
             /// One receipt for `requirement`, through the receipt insert
             /// guard every producer's INSERT passes.
-            pub(crate) async fn confirm(&self, requirement: uuid::Uuid, owner: &str, proof_kind: &str) {
+            pub(crate) async fn confirm(
+                &self,
+                requirement: uuid::Uuid,
+                owner: &str,
+                proof_kind: &str,
+            ) {
                 let inserted = self.pool.get().await.unwrap().execute(
                     "INSERT INTO openbot_internal.restore_reconfirm_receipts(operation_id,epoch,requirement_id,confirmation_id,proof_ref,confirmed_by,proof_kind)
                      VALUES($1,$2,$3,$4,$5,$6,$7)",
@@ -4070,8 +4470,14 @@ pub(crate) mod tests {
         #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
         async fn restore_current_fixture_publishes_one_cohort_and_gates_its_pool() {
             let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
-            eprintln!("restore fixture MetadataBytes admitted: candidate SQL {}, slots {}, SCRAM change {}, readback {}, publication {}",
-                restored.metadata[0], restored.metadata[1], restored.metadata[2], restored.metadata[3], restored.metadata[4]);
+            eprintln!(
+                "restore fixture MetadataBytes admitted: candidate SQL {}, slots {}, SCRAM change {}, readback {}, publication {}",
+                restored.metadata[0],
+                restored.metadata[1],
+                restored.metadata[2],
+                restored.metadata[3],
+                restored.metadata[4]
+            );
             let gate = restored.read_gate();
             assert!(gate.matches_pool(&restored.pool));
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -4082,7 +4488,11 @@ pub(crate) mod tests {
                 "SELECT count(*)::bigint FROM openbot_internal.restore_pg_operations o JOIN openbot_internal.restore_pg_seals s USING(operation_id,epoch) WHERE o.operation_id=$1 AND o.epoch=$2",
                 &[&uuid::Uuid::from_bytes(restored.cohort.operation_id), &restored.cohort.epoch.as_slice()],
             ).await.unwrap();
-            assert_eq!(row.get::<_, i64>(0), 1, "the published cohort is the target's sealed operation");
+            assert_eq!(
+                row.get::<_, i64>(0),
+                1,
+                "the published cohort is the target's sealed operation"
+            );
             let head = super::head(&restored.fixture);
             assert_eq!(head["phase"], "RestoreCurrent");
         }

@@ -642,7 +642,11 @@ impl ServiceControlSelection {
 
     fn excludes(&self, input: &ServiceOwnedInput) -> Result<(), RecoveryControlError> {
         if let Some(root) = &self.existing
-            && input.parent.ancestors.iter().any(|node| node.identity == root.identity)
+            && input
+                .parent
+                .ancestors
+                .iter()
+                .any(|node| node.identity == root.identity)
         {
             return Err(service_invalid());
         }
@@ -1072,7 +1076,13 @@ struct LegacyRequestWire {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-#[cfg_attr(feature = "desktop-local", expect(clippy::large_enum_variant, reason = "The bounded request decoder retains inline variants under its original prepayment instead of adding allocations"))]
+#[cfg_attr(
+    feature = "desktop-local",
+    expect(
+        clippy::large_enum_variant,
+        reason = "The bounded request decoder retains inline variants under its original prepayment instead of adding allocations"
+    )
+)]
 enum RecoveryRequestWire {
     Restore(RestoreRequestWire),
     #[cfg(feature = "desktop-local")]
@@ -1131,7 +1141,13 @@ struct LocalCurrentRequest {
     issued: bool,
 }
 
-#[cfg_attr(feature = "desktop-local", expect(clippy::large_enum_variant, reason = "The bounded request decoder retains inline variants under its original prepayment instead of adding allocations"))]
+#[cfg_attr(
+    feature = "desktop-local",
+    expect(
+        clippy::large_enum_variant,
+        reason = "The bounded request decoder retains inline variants under its original prepayment instead of adding allocations"
+    )
+)]
 enum DecodedRecoveryRequest {
     Restore(RecoveryRequestV1),
     #[cfg(feature = "desktop-local")]
@@ -1181,7 +1197,8 @@ fn decode_restore_request(
     raw: &[u8],
     limits: &TrustedHostRecoveryLimits,
 ) -> Result<DecodedRecoveryRequest, RecoveryControlError> {
-    let wire: RecoveryRequestWire = serde_json::from_slice(raw).map_err(RecoveryControlError::from_json)?;
+    let wire: RecoveryRequestWire =
+        serde_json::from_slice(raw).map_err(RecoveryControlError::from_json)?;
     #[cfg(not(feature = "desktop-local"))]
     let RecoveryRequestWire::Restore(wire) = wire;
     #[cfg(feature = "desktop-local")]
@@ -1189,28 +1206,65 @@ fn decode_restore_request(
         RecoveryRequestWire::Restore(wire) => wire,
         #[cfg(feature = "desktop-local")]
         RecoveryRequestWire::Current(wire) => {
-            if wire.format_version != 1 || wire.purpose != RecoveryRequestPurpose::ReconfirmCurrentBinding
+            if wire.format_version != 1
+                || wire.purpose != RecoveryRequestPurpose::ReconfirmCurrentBinding
                 || wire.limits.max_confirmations != 1
-            { return Err(service_invalid()); }
-            for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] { super::id(value, limits.max_id_bytes)?; }
+            {
+                return Err(service_invalid());
+            }
+            for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] {
+                super::id(value, limits.max_id_bytes)?;
+            }
             return Ok(DecodedRecoveryRequest::Current(LocalCurrentRequest {
                 request_id: wire.request_id,
-                expected: RecoveryRequestExpected { reviewed_release_digest: wire.expected_reviewed_release_digest, deployment_id: wire.expected_deployment_id, tenant_id: wire.expected_tenant_id, dataset_id: wire.expected_dataset_id, source_installation_id: wire.expected_source_installation_id, target_installation_id: wire.expected_target_installation_id },
-                limits: OrdinaryStartupBounds { effect_ns: wire.limits.effect_ns, convergence_ns: wire.limits.convergence_ns }, issued: false,
+                expected: RecoveryRequestExpected {
+                    reviewed_release_digest: wire.expected_reviewed_release_digest,
+                    deployment_id: wire.expected_deployment_id,
+                    tenant_id: wire.expected_tenant_id,
+                    dataset_id: wire.expected_dataset_id,
+                    source_installation_id: wire.expected_source_installation_id,
+                    target_installation_id: wire.expected_target_installation_id,
+                },
+                limits: OrdinaryStartupBounds {
+                    effect_ns: wire.limits.effect_ns,
+                    convergence_ns: wire.limits.convergence_ns,
+                },
+                issued: false,
             }));
         }
         #[cfg(feature = "desktop-local")]
         RecoveryRequestWire::Legacy(wire) => {
-            if wire.format_version != 1 || wire.purpose != RecoveryRequestPurpose::AdoptOrdinaryLegacy || wire.expected_source_installation_id != wire.expected_target_installation_id { return Err(service_invalid()); }
-            for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] { super::id(value, limits.max_id_bytes)?; }
+            if wire.format_version != 1
+                || wire.purpose != RecoveryRequestPurpose::AdoptOrdinaryLegacy
+                || wire.expected_source_installation_id != wire.expected_target_installation_id
+            {
+                return Err(service_invalid());
+            }
+            for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] {
+                super::id(value, limits.max_id_bytes)?;
+            }
             let selection = &wire.trusted_input_selection.installation;
             service_absolute(&selection.parent)?;
             component(&selection.component, limits)?;
-            if selection.parent.components().count() as u64 > limits.max_path_depth || selection.parent.as_os_str().len() as u64 > limits.max_relative_path_bytes { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); }
+            if selection.parent.components().count() as u64 > limits.max_path_depth
+                || selection.parent.as_os_str().len() as u64 > limits.max_relative_path_bytes
+            {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
+            }
             return Ok(DecodedRecoveryRequest::Legacy(LocalLegacyRequest {
                 request_id: wire.request_id,
-                expected: RecoveryRequestExpected { reviewed_release_digest: wire.expected_reviewed_release_digest, deployment_id: wire.expected_deployment_id, tenant_id: wire.expected_tenant_id, dataset_id: wire.expected_dataset_id, source_installation_id: wire.expected_source_installation_id, target_installation_id: wire.expected_target_installation_id },
-                selection: wire.trusted_input_selection, limits: wire.limits,
+                expected: RecoveryRequestExpected {
+                    reviewed_release_digest: wire.expected_reviewed_release_digest,
+                    deployment_id: wire.expected_deployment_id,
+                    tenant_id: wire.expected_tenant_id,
+                    dataset_id: wire.expected_dataset_id,
+                    source_installation_id: wire.expected_source_installation_id,
+                    target_installation_id: wire.expected_target_installation_id,
+                },
+                selection: wire.trusted_input_selection,
+                limits: wire.limits,
             }));
         }
     };
@@ -1317,9 +1371,14 @@ pub struct VerifiedRecoveryHost {
 
 impl VerifiedRecoveryHost {
     #[cfg(feature = "desktop-local")]
-    pub(super) fn trusted_limits(&self) -> &TrustedHostRecoveryLimits { &self.limits }
+    pub(super) fn trusted_limits(&self) -> &TrustedHostRecoveryLimits {
+        &self.limits
+    }
     #[cfg(feature = "desktop-local")]
-    pub(super) fn admission_deadline(&self) -> Instant { self.admission_deadline.expect("verified original host deadline") }
+    pub(super) fn admission_deadline(&self) -> Instant {
+        self.admission_deadline
+            .expect("verified original host deadline")
+    }
     /// Consume the original executable and verified release handles. Request
     /// facts and the control identity are sealed later by the control owner.
     #[cfg(feature = "desktop-local")]
@@ -1373,29 +1432,33 @@ impl VerifiedRecoveryHost {
 
     pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
         #[cfg(not(feature = "desktop-local"))]
-        { Err(service_invalid()) }
+        {
+            Err(service_invalid())
+        }
         #[cfg(feature = "desktop-local")]
         {
-        let fixed = (std::mem::size_of::<Self>() as u64)
-            .checked_add(self.services[0].capacity() as u64).and_then(|n| n.checked_add(self.services[1].capacity() as u64)).ok_or_else(service_invalid)?;
-        match &self.original {
-            #[cfg(feature = "desktop-local")]
-            HostOrigin::LocalRelease {
-                program,
-                release,
-                actual,
-                ..
-            } => {
-                let bytes = fixed
-                    .checked_add(program.1.capacity() as u64)
-                    .and_then(|n| n.checked_add(release.1.capacity() as u64))
-                    .and_then(|n| n.checked_add(actual.retained_path_bytes()))
-                    .ok_or_else(|| {
-                        RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
-                    })?;
-                Ok((bytes, 4))
+            let fixed = (std::mem::size_of::<Self>() as u64)
+                .checked_add(self.services[0].capacity() as u64)
+                .and_then(|n| n.checked_add(self.services[1].capacity() as u64))
+                .ok_or_else(service_invalid)?;
+            match &self.original {
+                #[cfg(feature = "desktop-local")]
+                HostOrigin::LocalRelease {
+                    program,
+                    release,
+                    actual,
+                    ..
+                } => {
+                    let bytes = fixed
+                        .checked_add(program.1.capacity() as u64)
+                        .and_then(|n| n.checked_add(release.1.capacity() as u64))
+                        .and_then(|n| n.checked_add(actual.retained_path_bytes()))
+                        .ok_or_else(|| {
+                            RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                        })?;
+                    Ok((bytes, 4))
+                }
             }
-        }
         }
     }
 
@@ -1489,7 +1552,9 @@ impl VerifiedRecoveryHost {
             }
         }
         #[cfg(not(feature = "desktop-local"))]
-        { Err(service_invalid()) }
+        {
+            Err(service_invalid())
+        }
     }
 }
 
@@ -1512,8 +1577,11 @@ pub(super) struct RequestOpenOwner {
 impl OwnedRecoveryRequestFile {
     #[cfg(feature = "desktop-local")]
     pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
-        if self.file.is_none() { return Err(service_invalid()); }
-        let bytes = (std::mem::size_of::<Self>() as u64).checked_add(self.component.capacity() as u64)
+        if self.file.is_none() {
+            return Err(service_invalid());
+        }
+        let bytes = (std::mem::size_of::<Self>() as u64)
+            .checked_add(self.component.capacity() as u64)
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
         Ok((bytes, 2))
     }
@@ -1650,7 +1718,11 @@ struct VerifiedRestoreHostIntent {
 impl VerifiedRecoveryHostIntent {
     /// Consume this original positive adoption request with its actual control owner.
     #[cfg(feature = "desktop-local")]
-    pub fn into_ordinary_legacy_intent(self, control: &super::RecoveryControl, owners: &[super::runtime::RuntimeOwner]) -> Result<super::ordinary::VerifiedOrdinaryStartupIntent, RecoveryControlError> {
+    pub fn into_ordinary_legacy_intent(
+        self,
+        control: &super::RecoveryControl,
+        owners: &[super::runtime::RuntimeOwner],
+    ) -> Result<super::ordinary::VerifiedOrdinaryStartupIntent, RecoveryControlError> {
         local_legacy_intent(&control.shared, self, owners)
     }
 
@@ -1696,10 +1768,14 @@ struct RestoreClosingAccess<'a> {
 }
 impl Deref for RestoreClosingAccess<'_> {
     type Target = ControlFiles;
-    fn deref(&self) -> &Self::Target { self.files }
+    fn deref(&self) -> &Self::Target {
+        self.files
+    }
 }
 impl DerefMut for RestoreClosingAccess<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target { self.files }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.files
+    }
 }
 impl Drop for RestoreClosingAccess<'_> {
     fn drop(&mut self) {
@@ -1707,7 +1783,9 @@ impl Drop for RestoreClosingAccess<'_> {
         if let Some(operation) = &mut self.files.restore_operation {
             operation.pending_closing = allowance;
         }
-        if std::thread::panicking() { self.files.latch(RecoveryControlFault::OwnerLost); }
+        if std::thread::panicking() {
+            self.files.latch(RecoveryControlFault::OwnerLost);
+        }
     }
 }
 
@@ -1725,17 +1803,31 @@ pub struct RestoreCandidateIsolationInput {
 
 impl RestoreCandidateIsolationInput {
     /// The original operation's checked finite profile, without a new ledger.
-    pub fn profile(&self) -> &super::RestoreOperationProfile { &self.profile }
+    pub fn profile(&self) -> &super::RestoreOperationProfile {
+        &self.profile
+    }
     /// Original Manager site, control root and key medium, in that order.
     pub fn excluded_locations(&self) -> [(&File, &Path, &std::ffi::OsStr); 3] {
-        std::array::from_fn(|index| (&self.parents[index], self.parent_paths[index].as_path(), self.components[index].as_os_str()))
+        std::array::from_fn(|index| {
+            (
+                &self.parents[index],
+                self.parent_paths[index].as_path(),
+                self.components[index].as_os_str(),
+            )
+        })
     }
     /// Original operation DATA; this identifier is not authority.
-    pub fn operation_id(&self) -> &str { self.operation.as_str() }
+    pub fn operation_id(&self) -> &str {
+        self.operation.as_str()
+    }
     /// Original authorization epoch DATA, without a new clock or grant.
-    pub fn authorization_epoch(&self) -> &str { self.epoch.as_str() }
+    pub fn authorization_epoch(&self) -> &str {
+        self.epoch.as_str()
+    }
     /// The original candidate generation DATA.
-    pub fn generation_id(&self) -> &str { &self.generation }
+    pub fn generation_id(&self) -> &str {
+        &self.generation
+    }
 }
 
 struct RestoreCandidateIsolationWork {
@@ -1759,12 +1851,35 @@ pub enum RestoreTargetSlotOutcome {
     ReadbackUnknown,
 }
 #[derive(Clone, Copy)]
-pub(crate) enum TargetSlotKind { Master, Scram }
+pub(crate) enum TargetSlotKind {
+    Master,
+    Scram,
+}
 impl TargetSlotKind {
-    fn index(self) -> usize { match self { Self::Master => 0, Self::Scram => 1 } }
-    fn prefix(self) -> &'static str { match self { Self::Master => "desktop-vault-master-v1-", Self::Scram => "postgresql-17-" } }
-    fn effect_id(self) -> &'static str { match self { Self::Master => "restore_master_slot", Self::Scram => "restore_scram_slot" } }
-    fn exact_length(self) -> u64 { match self { Self::Master => 33, Self::Scram => 64 } }
+    fn index(self) -> usize {
+        match self {
+            Self::Master => 0,
+            Self::Scram => 1,
+        }
+    }
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Master => "desktop-vault-master-v1-",
+            Self::Scram => "postgresql-17-",
+        }
+    }
+    fn effect_id(self) -> &'static str {
+        match self {
+            Self::Master => "restore_master_slot",
+            Self::Scram => "restore_scram_slot",
+        }
+    }
+    fn exact_length(self) -> u64 {
+        match self {
+            Self::Master => 33,
+            Self::Scram => 64,
+        }
+    }
 }
 struct RestoreTargetSlotJournal {
     intent: Option<RestoreStageIntent>,
@@ -1824,13 +1939,19 @@ impl RestoreStageIntent {
 }
 
 impl RestoreStages {
-    pub(crate) fn check_capacity_before(&self, deadline: Instant) -> Result<(), RecoveryControlError> {
+    pub(crate) fn check_capacity_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
         let result = (|| {
             let mut state = lock(&self.owner)?;
             state.verify_restore_live(self.operation, deadline)?;
             state.observe_restore_capacity(deadline)
         })();
-        result.map_err(|error: RecoveryControlError| { self.failure(error.fault()); error.retain(&self.owner) })
+        result.map_err(|error: RecoveryControlError| {
+            self.failure(error.fault());
+            error.retain(&self.owner)
+        })
     }
     pub(crate) fn convergence_deadline(&self) -> Result<Instant, RecoveryControlError> {
         let mut state = lock(&self.owner)?;
@@ -1840,7 +1961,12 @@ impl RestoreStages {
             .ok_or_else(service_invalid)?
             .clock
             .convergence_deadline();
-        state.restore_operation.as_ref().ok_or_else(service_invalid)?.clock.require_convergence()?;
+        state
+            .restore_operation
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .clock
+            .require_convergence()?;
         state.post_original_owner(deadline)?;
         Ok(deadline)
     }
@@ -1942,15 +2068,36 @@ impl RestoreStages {
                 .ok_or_else(service_invalid)?;
             state.prepay(bytes as u64, 0)?;
             let data = super::journal::JournalData::stage_intent(stage, effect_id);
-            let frame_cap = state.limits.max_journal_frame_bytes.checked_add(44).ok_or_else(service_invalid)?;
-            let metadata_paid = frame_cap.checked_mul(16)
-                .and_then(|n| n.checked_add((2 * std::mem::size_of::<super::journal::JournalData>() + 512) as u64))
+            let frame_cap = state
+                .limits
+                .max_journal_frame_bytes
+                .checked_add(44)
+                .ok_or_else(service_invalid)?;
+            let metadata_paid = frame_cap
+                .checked_mul(16)
+                .and_then(|n| {
+                    n.checked_add(
+                        (2 * std::mem::size_of::<super::journal::JournalData>() + 512) as u64,
+                    )
+                })
                 .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
             state.prepay(metadata_paid, 0)?;
-            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
-            operation.ledger.admit(super::RestoreCapacityResource::JournalBytes, frame_cap)?;
-            operation.ledger.admit(super::RestoreCapacityResource::JournalRecords, 1)?;
-            operation.pending_closing = Some(RestoreClosingAllowance { metadata_paid, metadata_left: metadata_paid, journal_reserved: frame_cap, journal_written: None });
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            operation
+                .ledger
+                .admit(super::RestoreCapacityResource::JournalBytes, frame_cap)?;
+            operation
+                .ledger
+                .admit(super::RestoreCapacityResource::JournalRecords, 1)?;
+            operation.pending_closing = Some(RestoreClosingAllowance {
+                metadata_paid,
+                metadata_left: metadata_paid,
+                journal_reserved: frame_cap,
+                journal_written: None,
+            });
             let reference = state.append_journal(&self.operation, &data, deadline)?;
             state
                 .restore_operation
@@ -1977,31 +2124,63 @@ impl RestoreStages {
     ) -> Result<(), RecoveryControlError> {
         let result = (|| {
             let mut state = lock(&self.owner)?;
-            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
-            if intent.operation != self.operation || operation.pending_stage.as_ref() != Some(&intent.reference) {
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            if intent.operation != self.operation
+                || operation.pending_stage.as_ref() != Some(&intent.reference)
+            {
                 return Err(service_invalid());
             }
-            let allowance = operation.pending_closing.take().ok_or_else(service_invalid)?;
+            let allowance = operation
+                .pending_closing
+                .take()
+                .ok_or_else(service_invalid)?;
             state.closing_observation = Some(allowance);
             let mut closing = RestoreClosingAccess { files: &mut state };
             closing.verify_restore_live(self.operation, deadline)?;
             let first_fault = closing.first_fault;
-            let data = super::journal::JournalData::stage_observed(intent.reference.sequence, disposition);
+            let data =
+                super::journal::JournalData::stage_observed(intent.reference.sequence, disposition);
             let confirmed = data.confirms_effect();
             let reference = closing.append_journal(&self.operation, &data, deadline)?;
-            let allowance = closing.closing_observation.as_ref().ok_or_else(service_invalid)?;
+            let allowance = closing
+                .closing_observation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
             let reserved = allowance.journal_reserved;
             let written = allowance.journal_written.ok_or_else(service_invalid)?;
             let metadata_paid = allowance.metadata_paid;
             {
-                let operation = closing.restore_operation.as_mut().ok_or_else(service_invalid)?;
-                operation.ledger.settle_prepaid_observation(super::RestoreCapacityResource::JournalBytes, reserved, written)?;
-                operation.ledger.settle_prepaid_observation(super::RestoreCapacityResource::JournalRecords, 1, 1)?;
+                let operation = closing
+                    .restore_operation
+                    .as_mut()
+                    .ok_or_else(service_invalid)?;
+                operation.ledger.settle_prepaid_observation(
+                    super::RestoreCapacityResource::JournalBytes,
+                    reserved,
+                    written,
+                )?;
+                operation.ledger.settle_prepaid_observation(
+                    super::RestoreCapacityResource::JournalRecords,
+                    1,
+                    1,
+                )?;
                 if confirmed {
-                    if operation.confirmed_stages.len() as u64 >= operation.profile.capacity.max_journal_records {
-                        return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+                    if operation.confirmed_stages.len() as u64
+                        >= operation.profile.capacity.max_journal_records
+                    {
+                        return Err(RecoveryControlError::new(
+                            RecoveryControlFault::CapacityExceeded,
+                        ));
                     }
-                    operation.confirmed_stages.try_reserve_exact(1).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+                    operation
+                        .confirmed_stages
+                        .try_reserve_exact(1)
+                        .map_err(|_| {
+                            RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                        })?;
                     operation.confirmed_stages.push((intent.stage, reference));
                     operation.pending_stage = None;
                 }
@@ -2010,15 +2189,27 @@ impl RestoreStages {
             // The original failure and persistent evidence remain resident.
             drop(data);
             drop(intent);
-            closing.budget.metadata = closing.budget.metadata.checked_sub(metadata_paid).ok_or_else(service_invalid)?;
-            let operation = closing.restore_operation.as_mut().ok_or_else(service_invalid)?;
-            let metadata = &mut operation.ledger.admitted[super::RestoreCapacityResource::MetadataBytes as usize];
-            *metadata = metadata.checked_sub(metadata_paid).ok_or_else(service_invalid)?;
+            closing.budget.metadata = closing
+                .budget
+                .metadata
+                .checked_sub(metadata_paid)
+                .ok_or_else(service_invalid)?;
+            let operation = closing
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
+            let metadata = &mut operation.ledger.admitted
+                [super::RestoreCapacityResource::MetadataBytes as usize];
+            *metadata = metadata
+                .checked_sub(metadata_paid)
+                .ok_or_else(service_invalid)?;
             closing.closing_observation = None;
             match (first_fault, confirmed) {
                 (Some(fault), _) => Err(RecoveryControlError::new(fault)),
                 (None, true) => Ok(()),
-                (None, false) => Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)),
+                (None, false) => Err(RecoveryControlError::new(
+                    RecoveryControlFault::ClosureUnproven,
+                )),
             }
         })();
         result.map_err(|error: RecoveryControlError| {
@@ -2174,11 +2365,29 @@ pub(super) fn claim_restore(
         if state.restore_operation.is_some() || state.pending_restore_intent.is_some() {
             return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
         }
-        state.pending_restore_intent = Some(match incoming.take().expect("original entry retained") {
-            VerifiedRecoveryHostIntent { host, request, request_bytes, control_root, decoded: DecodedRecoveryRequest::Restore(decoded), original_deadline } => VerifiedRestoreHostIntent { host, request, request_bytes, control_root, decoded, original_deadline },
-            #[cfg(feature = "desktop-local")]
-            other => { incoming = Some(other); return Err(service_invalid()); }
-        });
+        state.pending_restore_intent =
+            Some(match incoming.take().expect("original entry retained") {
+                VerifiedRecoveryHostIntent {
+                    host,
+                    request,
+                    request_bytes,
+                    control_root,
+                    decoded: DecodedRecoveryRequest::Restore(decoded),
+                    original_deadline,
+                } => VerifiedRestoreHostIntent {
+                    host,
+                    request,
+                    request_bytes,
+                    control_root,
+                    decoded,
+                    original_deadline,
+                },
+                #[cfg(feature = "desktop-local")]
+                other => {
+                    incoming = Some(other);
+                    return Err(service_invalid());
+                }
+            });
         let original = state
             .pending_restore_intent
             .as_ref()
@@ -2296,12 +2505,20 @@ pub(super) fn claim_restore(
         for (slot, (parent, component, limit)) in selection_paths.iter().enumerate() {
             state.open_restore_selection(slot, parent, component, *limit, deadline)?;
         }
-        let carrier_parent = state.restore_selections[0].as_ref()
-            .and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.identity;
-        let key_parent = state.restore_selections[1].as_ref()
-            .and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.identity;
+        let carrier_parent = state.restore_selections[0]
+            .as_ref()
+            .and_then(|selection| selection.ancestors.last())
+            .ok_or_else(service_invalid)?
+            .identity;
+        let key_parent = state.restore_selections[1]
+            .as_ref()
+            .and_then(|selection| selection.ancestors.last())
+            .ok_or_else(service_invalid)?
+            .identity;
         if carrier_parent.device == key_parent.device && carrier_parent.inode == key_parent.inode {
-            return Err(RecoveryControlError::new(RecoveryControlFault::InputInvalid));
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::InputInvalid,
+            ));
         }
         state.raw_random = Some(getrandom::fill(&mut state.restore_entropy));
         state.post(deadline)?;
@@ -2496,17 +2713,39 @@ pub(super) fn claim_restore(
 }
 
 #[cfg(feature = "desktop-local")]
-pub(super) fn observe_unclaimed_restore(owner: &ControlOwner) -> Result<ReadOnlyRestoreOwner, RecoveryControlError> {
+pub(super) fn observe_unclaimed_restore(
+    owner: &ControlOwner,
+) -> Result<ReadOnlyRestoreOwner, RecoveryControlError> {
     let original = {
         let mut state = lock(owner)?;
-        if state.restore_operation.is_some() { return Err(service_invalid()); }
-        state.pending_restore_intent.take().ok_or_else(service_invalid)?
+        if state.restore_operation.is_some() {
+            return Err(service_invalid());
+        }
+        state
+            .pending_restore_intent
+            .take()
+            .ok_or_else(service_invalid)?
     };
-    let VerifiedRestoreHostIntent { host, request, request_bytes, control_root, decoded, original_deadline } = original;
-    ReadOnlyRestoreOwner::from_original(Arc::clone(owner), VerifiedRecoveryHostIntent {
-        host, request, request_bytes, control_root,
-        decoded: DecodedRecoveryRequest::Restore(decoded), original_deadline,
-    }, original_deadline)
+    let VerifiedRestoreHostIntent {
+        host,
+        request,
+        request_bytes,
+        control_root,
+        decoded,
+        original_deadline,
+    } = original;
+    ReadOnlyRestoreOwner::from_original(
+        Arc::clone(owner),
+        VerifiedRecoveryHostIntent {
+            host,
+            request,
+            request_bytes,
+            control_root,
+            decoded: DecodedRecoveryRequest::Restore(decoded),
+            original_deadline,
+        },
+        original_deadline,
+    )
 }
 
 /// Bounded same-operation reader after the original restore owner has gone.
@@ -2529,29 +2768,57 @@ pub struct RestoreOriginalObservation {
 }
 impl RestoreOriginalObservation {
     /// The existing operation, selected by the original authenticated request.
-    pub fn operation_id(&self) -> &str { self.operation.as_str() }
+    pub fn operation_id(&self) -> &str {
+        self.operation.as_str()
+    }
     /// The old journal epoch, observed without minting or restoring a clock.
-    pub fn epoch(&self) -> &str { &self.epoch }
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
     /// The existing external control identity.
-    pub fn control_id(&self) -> &str { &self.control_id }
+    pub fn control_id(&self) -> &str {
+        &self.control_id
+    }
     /// The observed descriptor phase; it does not authorize that phase's effects.
-    pub fn phase(&self) -> super::ActivationPhase { self.phase }
+    pub fn phase(&self) -> super::ActivationPhase {
+        self.phase
+    }
 }
 #[cfg(feature = "desktop-local")]
 impl Drop for ReadOnlyRestoreOwner {
-    fn drop(&mut self) { if let Ok(mut state) = lock(&self.owner) { state.release_writer(); } }
+    fn drop(&mut self) {
+        if let Ok(mut state) = lock(&self.owner) {
+            state.release_writer();
+        }
+    }
 }
 #[cfg(feature = "desktop-local")]
 impl ReadOnlyRestoreOwner {
-    pub(super) fn from_original(owner: ControlOwner, intent: VerifiedRecoveryHostIntent, deadline: Instant) -> Result<Self, RecoveryControlError> {
+    pub(super) fn from_original(
+        owner: ControlOwner,
+        intent: VerifiedRecoveryHostIntent,
+        deadline: Instant,
+    ) -> Result<Self, RecoveryControlError> {
         let operation = match &intent.decoded {
             DecodedRecoveryRequest::Restore(request) => request.request_id,
-            _ => { let mut error = service_invalid(); error.retained_restore_intent = Some(Box::new(intent)); return Err(error.retain(&owner)); }
+            _ => {
+                let mut error = service_invalid();
+                error.retained_restore_intent = Some(Box::new(intent));
+                return Err(error.retain(&owner));
+            }
         };
-        let mut reader = Self { owner, operation, deadline: deadline.min(intent.original_deadline), intent: Some(intent), observation: None };
+        let mut reader = Self {
+            owner,
+            operation,
+            deadline: deadline.min(intent.original_deadline),
+            intent: Some(intent),
+            observation: None,
+        };
         let result: Result<(), RecoveryControlError> = (|| {
             let mut state = lock(&reader.owner)?;
-            let wrapper = std::mem::size_of::<ReadOnlyRestoreOwner>().checked_sub(std::mem::size_of::<VerifiedRecoveryHostIntent>()).ok_or_else(service_invalid)?;
+            let wrapper = std::mem::size_of::<ReadOnlyRestoreOwner>()
+                .checked_sub(std::mem::size_of::<VerifiedRecoveryHostIntent>())
+                .ok_or_else(service_invalid)?;
             state.prepay(wrapper as u64, 0)?;
             state.acquire_writer_before(reader.deadline)?;
             Ok(())
@@ -2566,13 +2833,17 @@ impl ReadOnlyRestoreOwner {
     }
 
     /// Re-read within this same host admission period; never renew E/C or the read period.
-    pub fn observe_original(&mut self) -> Result<&RestoreOriginalObservation, RecoveryControlError> {
+    pub fn observe_original(
+        &mut self,
+    ) -> Result<&RestoreOriginalObservation, RecoveryControlError> {
         let result: Result<RestoreOriginalObservation, RecoveryControlError> = (|| {
             let mut state = lock(&self.owner)?;
             state.post(self.deadline)?;
             let intent = self.intent.as_mut().ok_or_else(service_invalid)?;
             recheck_legacy_request_before(&mut state, intent, self.deadline)?;
-            if !state.holds_writer() || state.root_identity(self.deadline)? != intent.control_root { return Err(service_invalid()); }
+            if !state.holds_writer() || state.root_identity(self.deadline)? != intent.control_root {
+                return Err(service_invalid());
+            }
             for index in 0..3 {
                 let (file, name) = match index {
                     0 => (state.pending_owner.take(), "owner.lock"),
@@ -2581,17 +2852,24 @@ impl ReadOnlyRestoreOwner {
                 };
                 let file = file.ok_or_else(service_invalid)?;
                 let checked = state.verify_held_lock(&file, name, self.deadline);
-                match index { 0 => state.pending_owner = Some(file), 1 => state.pending_admission = Some(file), _ => state.pending_runtime = Some(file) }
+                match index {
+                    0 => state.pending_owner = Some(file),
+                    1 => state.pending_admission = Some(file),
+                    _ => state.pending_runtime = Some(file),
+                }
                 checked?;
             }
             state.read_original_restore_before(self.operation, self.deadline)
         })();
         match result {
-            Ok(observation) => { self.observation = Some(observation); Ok(self.observation.as_ref().expect("observed original data")) }
+            Ok(observation) => {
+                self.observation = Some(observation);
+                Ok(self.observation.as_ref().expect("observed original data"))
+            }
             Err(mut error) => {
                 error.retained_restore_intent = self.intent.take().map(Box::new);
                 Err(error.retain(&self.owner))
-            },
+            }
         }
     }
 }
@@ -2613,11 +2891,20 @@ pub struct RestoreControlSession {
 impl RestoreControlSession {
     /// Observe original cumulative counters without a clock, admission or
     /// accounting mutation. Unknown work keeps its original admitted charge.
-    pub fn capacity_observation(&self, resource: super::RestoreCapacityResource) -> Result<super::RestoreCapacityObservation, RecoveryControlError> {
+    pub fn capacity_observation(
+        &self,
+        resource: super::RestoreCapacityResource,
+    ) -> Result<super::RestoreCapacityObservation, RecoveryControlError> {
         let state = lock(&self.stages.owner)?;
-        let ledger = &state.restore_operation.as_ref().ok_or_else(service_invalid)?.ledger;
+        let ledger = &state
+            .restore_operation
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .ledger;
         Ok(super::RestoreCapacityObservation {
-            limit: ledger.ceiling(resource), admitted: ledger.admitted[resource as usize], actual: ledger.actual[resource as usize],
+            limit: ledger.ceiling(resource),
+            admitted: ledger.admitted[resource as usize],
+            actual: ledger.actual[resource as usize],
         })
     }
 
@@ -2653,7 +2940,10 @@ impl RestoreControlSession {
     /// The production entry above takes them from the verified staging.
     pub(crate) async fn bind_candidate_from_source_before(
         &mut self,
-        (child_id, program): (Option<u32>, crate::backup::whole_pg_restore_stream::CandidateProgramIdentity),
+        (child_id, program): (
+            Option<u32>,
+            crate::backup::whole_pg_restore_stream::CandidateProgramIdentity,
+        ),
         socket_dir: &Path,
         (system_identifier, database_oid): (String, u32),
         (scram, master): (
@@ -2807,15 +3097,27 @@ impl RestoreControlSession {
         new_password: &openbot_domain::vault::SecretBytes,
         old_password: &openbot_domain::vault::SecretBytes,
         deadline: Instant,
-    ) -> Result<crate::backup::whole_pg_restore_stream::RestoreScramAcknowledged, RecoveryControlError> {
-        if !self.target_slots[TargetSlotKind::Scram.index()].as_ref().is_some_and(|slot| slot.matched) {
-            return self.retain_failure(Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)));
+    ) -> Result<
+        crate::backup::whole_pg_restore_stream::RestoreScramAcknowledged,
+        RecoveryControlError,
+    > {
+        if !self.target_slots[TargetSlotKind::Scram.index()]
+            .as_ref()
+            .is_some_and(|slot| slot.matched)
+        {
+            return self.retain_failure(Err(RecoveryControlError::new(
+                RecoveryControlFault::ClosureUnproven,
+            )));
         }
         let Some(candidate) = self.candidate.as_mut() else {
             return self.retain_failure(Err(service_invalid()));
         };
         let result = crate::backup::whole_pg_restore_stream::rotate_candidate_scram_before(
-            &mut self.stages, candidate, new_password, old_password, deadline,
+            &mut self.stages,
+            candidate,
+            new_password,
+            old_password,
+            deadline,
         )
         .await;
         self.retain_failure(result)
@@ -2829,7 +3131,10 @@ impl RestoreControlSession {
         &mut self,
         staging: &mut crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging,
         deadline: Instant,
-    ) -> Result<crate::backup::whole_pg_restore_stream::RestoreArtifactRebindOutcome, RecoveryControlError> {
+    ) -> Result<
+        crate::backup::whole_pg_restore_stream::RestoreArtifactRebindOutcome,
+        RecoveryControlError,
+    > {
         let result = async {
             if staging.candidate_plan().operation_id() != self.operation_id() {
                 return Err(service_invalid());
@@ -2852,19 +3157,38 @@ impl RestoreControlSession {
     #[cfg(all(test, feature = "desktop-local"))]
     pub(crate) async fn verify_absent_artifacts_for_test(&mut self, deadline: Instant) {
         let candidate = self.candidate.as_mut().unwrap();
-        let observed = crate::backup::whole_pg_restore_stream::candidate_sql::prepare_artifact_binding_before(
-            &mut self.stages, candidate, None, deadline,
-        ).await.unwrap();
-        assert_eq!(observed, Some(crate::backup::whole_pg_restore_stream::RestoreArtifactRebindOutcome::Acknowledged));
+        let observed =
+            crate::backup::whole_pg_restore_stream::candidate_sql::prepare_artifact_binding_before(
+                &mut self.stages,
+                candidate,
+                None,
+                deadline,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            observed,
+            Some(
+                crate::backup::whole_pg_restore_stream::RestoreArtifactRebindOutcome::Acknowledged
+            )
+        );
     }
 
     /// Release the candidate's clients and pool before the Desktop owner's one
     /// original TERM (¶8132); publication then requires that closed pool.
-    pub async fn release_candidate_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
+    pub async fn release_candidate_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
         let Some(candidate) = self.candidate.as_mut() else {
             return self.retain_failure(Err(service_invalid()));
         };
-        let result = crate::backup::whole_pg_restore_stream::release_candidate_before(&mut self.stages, candidate, deadline).await;
+        let result = crate::backup::whole_pg_restore_stream::release_candidate_before(
+            &mut self.stages,
+            candidate,
+            deadline,
+        )
+        .await;
         self.retain_failure(result)
     }
 
@@ -2872,7 +3196,9 @@ impl RestoreControlSession {
     /// This is cleanup, never a successful release or publication fact.
     pub fn abandon_candidate_connections(&mut self) {
         if let Some(candidate) = self.candidate.as_mut() {
-            crate::backup::whole_pg_restore_stream::candidate_sql::abandon_candidate_connections(candidate);
+            crate::backup::whole_pg_restore_stream::candidate_sql::abandon_candidate_connections(
+                candidate,
+            );
         }
     }
 
@@ -2883,15 +3209,27 @@ impl RestoreControlSession {
         master: &openbot_domain::vault::SecretBytes,
         password: &openbot_domain::vault::SecretBytes,
         deadline: Instant,
-    ) -> Result<crate::backup::whole_pg_restore_stream::RestoreInstallationReadbacks, RecoveryControlError> {
-        if !self.target_slots[TargetSlotKind::Master.index()].as_ref().is_some_and(|slot| slot.matched) {
-            return self.retain_failure(Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven)));
+    ) -> Result<
+        crate::backup::whole_pg_restore_stream::RestoreInstallationReadbacks,
+        RecoveryControlError,
+    > {
+        if !self.target_slots[TargetSlotKind::Master.index()]
+            .as_ref()
+            .is_some_and(|slot| slot.matched)
+        {
+            return self.retain_failure(Err(RecoveryControlError::new(
+                RecoveryControlFault::ClosureUnproven,
+            )));
         }
         let Some(candidate) = self.candidate.as_mut() else {
             return self.retain_failure(Err(service_invalid()));
         };
         let result = crate::backup::whole_pg_restore_stream::verify_target_installation_before(
-            &mut self.stages, candidate, master, password, deadline,
+            &mut self.stages,
+            candidate,
+            master,
+            password,
+            deadline,
         )
         .await;
         self.retain_failure(result)
@@ -2914,16 +3252,29 @@ impl RestoreControlSession {
         deadline: Instant,
     ) -> Result<(), RecoveryControlError> {
         let result = async {
-            let operation_uuid = uuid::Uuid::from_bytes(super::hex_array(self.stages.operation.as_str()));
+            let operation_uuid =
+                uuid::Uuid::from_bytes(super::hex_array(self.stages.operation.as_str()));
             if scram.operation() != operation_uuid || readbacks.operation() != operation_uuid {
                 return Err(service_invalid());
             }
-            if !self.target_slots.iter().all(|slot| slot.as_ref().is_some_and(|slot| slot.matched)) {
-                return Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven));
+            if !self
+                .target_slots
+                .iter()
+                .all(|slot| slot.as_ref().is_some_and(|slot| slot.matched))
+            {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ClosureUnproven,
+                ));
             }
             let bound_root = self.generation_root.ok_or_else(service_invalid)?;
             let candidate = self.candidate.as_mut().ok_or_else(service_invalid)?;
-            crate::backup::whole_pg_restore_stream::close_candidate_before(&mut self.stages, candidate, exit, deadline).await?;
+            crate::backup::whole_pg_restore_stream::close_candidate_before(
+                &mut self.stages,
+                candidate,
+                exit,
+                deadline,
+            )
+            .await?;
             let closing = self.stages.convergence_deadline()?;
             self.stages.check_capacity_before(closing)?;
             let effect = self.stages.effect_before(deadline)?;
@@ -2931,40 +3282,71 @@ impl RestoreControlSession {
             let mut state = lock(&self.stages.owner)?;
             state.verify_restore_live(operation, effect)?;
             let limits = state.limits.clone();
-            let frame_cap = limits.max_journal_frame_bytes.checked_add(44).ok_or_else(service_invalid)?;
+            let frame_cap = limits
+                .max_journal_frame_bytes
+                .checked_add(44)
+                .ok_or_else(service_invalid)?;
             // Two descriptors, each encoded, written and read back, and four
             // journal frames with their serialization scratch; then the
             // binding's owned strings (bounded by the host ID limit).
-            let fee = limits.max_activation_bytes.checked_mul(8)
+            let fee = limits
+                .max_activation_bytes
+                .checked_mul(8)
                 .and_then(|n| n.checked_add(frame_cap.checked_mul(64)?))
                 .and_then(|n| n.checked_add(limits.max_id_bytes.checked_mul(32)?))
-                .and_then(|n| n.checked_add(4 * std::mem::size_of::<super::activation::ActivationRecord>() as u64))
+                .and_then(|n| {
+                    n.checked_add(
+                        4 * std::mem::size_of::<super::activation::ActivationRecord>() as u64,
+                    )
+                })
                 .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
             state.prepay(fee, 0)?;
             {
-                let ledger = &mut state.restore_operation.as_mut().ok_or_else(service_invalid)?.ledger;
-                ledger.admit(super::RestoreCapacityResource::JournalBytes, frame_cap.checked_mul(4).ok_or_else(service_invalid)?)?;
+                let ledger = &mut state
+                    .restore_operation
+                    .as_mut()
+                    .ok_or_else(service_invalid)?
+                    .ledger;
+                ledger.admit(
+                    super::RestoreCapacityResource::JournalBytes,
+                    frame_cap.checked_mul(4).ok_or_else(service_invalid)?,
+                )?;
                 ledger.admit(super::RestoreCapacityResource::JournalRecords, 4)?;
             }
             // The selected generation root is observed under the held trusted
             // parent; its identity, never a path, enters the binding.
-            let component = state.restore_operation.as_ref().ok_or_else(service_invalid)?.candidate_plan.entry_component.clone();
+            let component = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .candidate_plan
+                .entry_component
+                .clone();
             state.reserve_io(0)?;
             state.raw.named = Some(rustix::fs::statat(
-                &state.restore_selections[2].as_ref().and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.file,
+                &state.restore_selections[2]
+                    .as_ref()
+                    .and_then(|selection| selection.ancestors.last())
+                    .ok_or_else(service_invalid)?
+                    .file,
                 component.as_str(),
                 AtFlags::SYMLINK_NOFOLLOW,
             ));
             state.post(effect)?;
             let root = match state.raw.named.as_ref() {
-                Some(Ok(stat)) if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() => RecoveryFileIdentity {
-                    device: stat.st_dev as u64,
-                    inode: stat.st_ino,
-                    uid: stat.st_uid,
-                },
+                Some(Ok(stat)) if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() => {
+                    RecoveryFileIdentity {
+                        device: stat.st_dev as u64,
+                        inode: stat.st_ino,
+                        uid: stat.st_uid,
+                    }
+                }
                 _ => return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
             };
-            let owner = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let owner = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
             let expected = &owner.intent.decoded.expected;
             let restored = readbacks.binding();
             let [target, deployment, tenant, dataset] = restored.ids();
@@ -2979,29 +3361,44 @@ impl RestoreControlSession {
             {
                 return Err(service_invalid());
             }
-            let key = |index: usize, kind: TargetSlotKind, key_id: String| super::activation::KeyReference {
-                kind: match kind {
-                    TargetSlotKind::Master => super::activation::KeyKind::HistoricalMaster,
-                    TargetSlotKind::Scram => super::activation::KeyKind::PostgresScram,
-                },
-                reviewed_service: owner.intent.host.services[index].clone(),
-                account: format!("{}{target}-r-{}", kind.prefix(), operation.as_str()),
-                key_id,
-                key_version: 1,
-                target_installation_id: target.to_owned(),
-                operation_id: operation.as_str().to_owned(),
+            let key = |index: usize, kind: TargetSlotKind, key_id: String| {
+                super::activation::KeyReference {
+                    kind: match kind {
+                        TargetSlotKind::Master => super::activation::KeyKind::HistoricalMaster,
+                        TargetSlotKind::Scram => super::activation::KeyKind::PostgresScram,
+                    },
+                    reviewed_service: owner.intent.host.services[index].clone(),
+                    account: format!("{}{target}-r-{}", kind.prefix(), operation.as_str()),
+                    key_id,
+                    key_version: 1,
+                    target_installation_id: target.to_owned(),
+                    operation_id: operation.as_str().to_owned(),
+                }
             };
-            let postgres_account = format!("{}{target}-r-{}", TargetSlotKind::Scram.prefix(), operation.as_str());
+            let postgres_account = format!(
+                "{}{target}-r-{}",
+                TargetSlotKind::Scram.prefix(),
+                operation.as_str()
+            );
             let (native_version, migration_digest) = readbacks.schema();
             let binding = super::activation::ActivationBinding::restored(
-                [dataset, deployment, tenant, expected.source_installation_id.as_str(), target].map(str::to_owned),
+                [
+                    dataset,
+                    deployment,
+                    tenant,
+                    expected.source_installation_id.as_str(),
+                    target,
+                ]
+                .map(str::to_owned),
                 owner.candidate_plan.generation_id.clone(),
                 root,
                 restored.postgres(),
                 (native_version, migration_digest.to_owned()),
                 owner.epoch.as_str().to_owned(),
-                [key(0, TargetSlotKind::Master, readbacks.key_id().to_owned()),
-                 key(1, TargetSlotKind::Scram, postgres_account)],
+                [
+                    key(0, TargetSlotKind::Master, readbacks.key_id().to_owned()),
+                    key(1, TargetSlotKind::Scram, postgres_account),
+                ],
             );
             binding.validate(&limits)?;
             // The closure evidence names the confirmed stage of each fact class
@@ -3009,12 +3406,20 @@ impl RestoreControlSession {
             let evidence: Vec<super::activation::JournalReference> = {
                 use super::RestoreStage as S;
                 let confirmed = &owner.confirmed_stages;
-                [S::Import, S::Isolation, S::PgUpgrade, S::Retire, S::HqAck2, S::ScramChange, S::ResourceClose]
-                    .into_iter()
-                    .filter_map(|stage| confirmed.iter().rev().find(|(kind, _)| *kind == stage))
-                    .chain(confirmed.iter().filter(|(kind, _)| *kind == S::KeySlot))
-                    .map(|(_, reference)| reference.clone())
-                    .collect()
+                [
+                    S::Import,
+                    S::Isolation,
+                    S::PgUpgrade,
+                    S::Retire,
+                    S::HqAck2,
+                    S::ScramChange,
+                    S::ResourceClose,
+                ]
+                .into_iter()
+                .filter_map(|stage| confirmed.iter().rev().find(|(kind, _)| *kind == stage))
+                .chain(confirmed.iter().filter(|(kind, _)| *kind == S::KeySlot))
+                .map(|(_, reference)| reference.clone())
+                .collect()
             };
             let pending = owner.pending.as_ref().ok_or_else(service_invalid)?;
             let raw = pending.bytes.clone();
@@ -3033,12 +3438,18 @@ impl RestoreControlSession {
                 profile_digest: profile_digest.clone(),
                 binding: binding.clone(),
                 closure_evidence: evidence.clone(),
-                publish_intent: super::activation::JournalPositionRef { context_id: operation, sequence: state.next_journal_sequence()? },
+                publish_intent: super::activation::JournalPositionRef {
+                    context_id: operation,
+                    sequence: state.next_journal_sequence()?,
+                },
             };
             let (switched, readback) = publish_restore_head(
-                &mut state, operation, (&prior.record, &prior.digest),
+                &mut state,
+                operation,
+                (&prior.record, &prior.digest),
                 super::ActivationPhase::SwitchedPending,
-                super::activation::ActivationPayload::Switched(switched), effect,
+                super::activation::ActivationPayload::Switched(switched),
+                effect,
             )?;
             let current = super::activation::Current {
                 operation_id: operation.as_str().to_owned(),
@@ -3047,12 +3458,18 @@ impl RestoreControlSession {
                 binding,
                 closure_evidence: evidence,
                 switch_readback: readback,
-                publish_intent: super::activation::JournalPositionRef { context_id: operation, sequence: state.next_journal_sequence()? },
+                publish_intent: super::activation::JournalPositionRef {
+                    context_id: operation,
+                    sequence: state.next_journal_sequence()?,
+                },
             };
             publish_restore_head(
-                &mut state, operation, (&switched.0, &switched.1),
+                &mut state,
+                operation,
+                (&switched.0, &switched.1),
                 super::ActivationPhase::RestoreCurrent,
-                super::activation::ActivationPayload::Current(current), effect,
+                super::activation::ActivationPayload::Current(current),
+                effect,
             )?;
             state.observe_restore_capacity(effect)
         }
@@ -3072,17 +3489,35 @@ fn publish_restore_head(
     phase: super::ActivationPhase,
     data: super::activation::ActivationPayload,
     effect: Instant,
-) -> Result<((super::activation::ActivationRecord, String), super::activation::JournalReference), RecoveryControlError> {
+) -> Result<
+    (
+        (super::activation::ActivationRecord, String),
+        super::activation::JournalReference,
+    ),
+    RecoveryControlError,
+> {
     let next = prior.successor(prior_digest, phase, data)?;
     let (_, digest) = next.encoded()?;
-    let intent = state.append_journal(&operation, &super::journal::JournalData::publish_intent(phase, &digest), effect)?;
+    let intent = state.append_journal(
+        &operation,
+        &super::journal::JournalData::publish_intent(phase, &digest),
+        effect,
+    )?;
     let published = state.publish_activation(&next, effect)?;
     let observed = state.append_journal(
         &operation,
-        &super::journal::JournalData::publish_observed(intent.sequence, &digest, published.identity),
+        &super::journal::JournalData::publish_observed(
+            intent.sequence,
+            &digest,
+            published.identity,
+        ),
         effect,
     )?;
-    state.restore_operation.as_mut().ok_or_else(service_invalid)?.pending = Some(published);
+    state
+        .restore_operation
+        .as_mut()
+        .ok_or_else(service_invalid)?
+        .pending = Some(published);
     Ok(((next, digest), observed))
 }
 
@@ -3107,45 +3542,124 @@ impl Drop for RestoreControlSession {
 
 impl RestoreControlSession {
     /// Same original owner/E check before each native slot-store effect.
-    pub fn check_restore_slot_effect_before(&mut self, deadline: Instant) -> Result<Instant, RecoveryControlError> { self.stages.effect_before(deadline) }
+    pub fn check_restore_slot_effect_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Instant, RecoveryControlError> {
+        self.stages.effect_before(deadline)
+    }
     /// Original C for observing already-entered native results, without renewal.
-    pub fn restore_slot_convergence_deadline(&self) -> Result<Instant, RecoveryControlError> { self.stages.convergence_deadline() }
+    pub fn restore_slot_convergence_deadline(&self) -> Result<Instant, RecoveryControlError> {
+        self.stages.convergence_deadline()
+    }
     /// Record the master's native result against its fixed intent/refs (matched33B).
-    pub fn observe_restore_master_slot_before(&mut self, outcome: RestoreTargetSlotOutcome, deadline: Instant) -> Result<(), RecoveryControlError> { self.observe_target_slot_before(outcome, deadline, TargetSlotKind::Master) }
+    pub fn observe_restore_master_slot_before(
+        &mut self,
+        outcome: RestoreTargetSlotOutcome,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.observe_target_slot_before(outcome, deadline, TargetSlotKind::Master)
+    }
     /// Record the SCRAM native result against its fixed intent/refs (matched64B).
-    pub fn observe_restore_scram_slot_before(&mut self, outcome: RestoreTargetSlotOutcome, deadline: Instant) -> Result<(), RecoveryControlError> { self.observe_target_slot_before(outcome, deadline, TargetSlotKind::Scram) }
-    fn observe_target_slot_before(&mut self, outcome: RestoreTargetSlotOutcome, deadline: Instant, kind: TargetSlotKind) -> Result<(), RecoveryControlError> {
+    pub fn observe_restore_scram_slot_before(
+        &mut self,
+        outcome: RestoreTargetSlotOutcome,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.observe_target_slot_before(outcome, deadline, TargetSlotKind::Scram)
+    }
+    fn observe_target_slot_before(
+        &mut self,
+        outcome: RestoreTargetSlotOutcome,
+        deadline: Instant,
+        kind: TargetSlotKind,
+    ) -> Result<(), RecoveryControlError> {
         let closing = self.stages.convergence_deadline()?.min(deadline);
-        let slot = self.target_slots[kind.index()].as_mut().ok_or_else(service_invalid)?;
+        let slot = self.target_slots[kind.index()]
+            .as_mut()
+            .ok_or_else(service_invalid)?;
         let intent = slot.intent.take().ok_or_else(service_invalid)?;
         let (service_ref, account_ref) = slot.refs.take().ok_or_else(service_invalid)?;
         let intent_ref = intent.reference.clone();
         let disposition = match outcome {
-            RestoreTargetSlotOutcome::ReadbackMatched => super::RestoreDisposition::OsStoreReadbackMatched { intent_ref, service_ref, account_ref, exact_length: kind.exact_length() },
-            RestoreTargetSlotOutcome::WriteUnknown => super::RestoreDisposition::OsStoreWriteUnknown { intent_ref, service_ref, account_ref },
-            RestoreTargetSlotOutcome::ReadbackUnknown => super::RestoreDisposition::OsStoreReadbackUnknown { intent_ref, service_ref, account_ref },
+            RestoreTargetSlotOutcome::ReadbackMatched => {
+                super::RestoreDisposition::OsStoreReadbackMatched {
+                    intent_ref,
+                    service_ref,
+                    account_ref,
+                    exact_length: kind.exact_length(),
+                }
+            }
+            RestoreTargetSlotOutcome::WriteUnknown => {
+                super::RestoreDisposition::OsStoreWriteUnknown {
+                    intent_ref,
+                    service_ref,
+                    account_ref,
+                }
+            }
+            RestoreTargetSlotOutcome::ReadbackUnknown => {
+                super::RestoreDisposition::OsStoreReadbackUnknown {
+                    intent_ref,
+                    service_ref,
+                    account_ref,
+                }
+            }
         };
         // Only a matched readback confirms the stage; it is the slot fact
         // the SCRAM change and the publication require.
-        self.stages.observe_stage_before(intent, disposition, closing)?;
-        self.target_slots[kind.index()].as_mut().ok_or_else(service_invalid)?.matched = true;
+        self.stages
+            .observe_stage_before(intent, disposition, closing)?;
+        self.target_slots[kind.index()]
+            .as_mut()
+            .ok_or_else(service_invalid)?
+            .matched = true;
         Ok(())
     }
 
     /// Fixed historical-master service/account DATA and original E.
     #[cfg(feature = "server-runtime")]
-    pub fn begin_restore_master_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant) -> Result<(String, String, Instant), RecoveryControlError> { self.begin_target_slot_before(staging, deadline, TargetSlotKind::Master) }
+    pub fn begin_restore_master_slot_before(
+        &mut self,
+        staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging,
+        deadline: Instant,
+    ) -> Result<(String, String, Instant), RecoveryControlError> {
+        self.begin_target_slot_before(staging, deadline, TargetSlotKind::Master)
+    }
     /// Fixed new-SCRAM service/account DATA and original E.
     #[cfg(feature = "server-runtime")]
-    pub fn begin_restore_scram_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant) -> Result<(String, String, Instant), RecoveryControlError> { self.begin_target_slot_before(staging, deadline, TargetSlotKind::Scram) }
+    pub fn begin_restore_scram_slot_before(
+        &mut self,
+        staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging,
+        deadline: Instant,
+    ) -> Result<(String, String, Instant), RecoveryControlError> {
+        self.begin_target_slot_before(staging, deadline, TargetSlotKind::Scram)
+    }
     #[cfg(feature = "server-runtime")]
-    fn begin_target_slot_before(&mut self, staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging, deadline: Instant, kind: TargetSlotKind) -> Result<(String, String, Instant), RecoveryControlError> {
+    fn begin_target_slot_before(
+        &mut self,
+        staging: &crate::backup::whole_pg_restore_stream::VerifiedWholePgRestoreStaging,
+        deadline: Instant,
+        kind: TargetSlotKind,
+    ) -> Result<(String, String, Instant), RecoveryControlError> {
         let matches = (|| {
             let state = lock(&self.stages.owner)?;
-            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let operation = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
             let plan = staging.candidate_plan();
-            if plan.operation_id() != self.operation_id() || plan.generation_id() != operation.candidate_plan.generation_id
-                || plan.target_installation_id() != operation.intent.decoded.expected.target_installation_id.as_str() { return Err(service_invalid()); }
+            if plan.operation_id() != self.operation_id()
+                || plan.generation_id() != operation.candidate_plan.generation_id
+                || plan.target_installation_id()
+                    != operation
+                        .intent
+                        .decoded
+                        .expected
+                        .target_installation_id
+                        .as_str()
+            {
+                return Err(service_invalid());
+            }
             Ok(())
         })();
         if let Err(error) = matches {
@@ -3157,41 +3671,96 @@ impl RestoreControlSession {
     /// The same slot intent from this session's own claimed plan. The
     /// production entries above first match the verified staging to it.
     #[cfg(feature = "server-runtime")]
-    pub(crate) fn begin_target_slot_from_session_before(&mut self, deadline: Instant, kind: TargetSlotKind) -> Result<(String, String, Instant), RecoveryControlError> {
+    pub(crate) fn begin_target_slot_from_session_before(
+        &mut self,
+        deadline: Instant,
+        kind: TargetSlotKind,
+    ) -> Result<(String, String, Instant), RecoveryControlError> {
         let result = (|| {
             let index = kind.index();
-            if self.target_slots[index].is_some() { return Err(service_invalid()); }
+            if self.target_slots[index].is_some() {
+                return Err(service_invalid());
+            }
             let effect = self.stages.effect_before(deadline)?;
             {
                 let state = lock(&self.stages.owner)?;
-                let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
-                super::id(&operation.intent.host.services[index], state.limits.max_id_bytes)?;
-                if (kind.prefix().len() + 64 + 3 + 32) as u64 > state.limits.max_id_bytes { return Err(service_invalid()); }
+                let operation = state
+                    .restore_operation
+                    .as_ref()
+                    .ok_or_else(service_invalid)?;
+                super::id(
+                    &operation.intent.host.services[index],
+                    state.limits.max_id_bytes,
+                )?;
+                if (kind.prefix().len() + 64 + 3 + 32) as u64 > state.limits.max_id_bytes {
+                    return Err(service_invalid());
+                }
             }
-            let intent = self.stages.begin_stage_before(super::RestoreStage::KeySlot, kind.effect_id(), effect)?;
-            self.target_slots[index] = Some(RestoreTargetSlotJournal { intent: Some(intent), refs: None, matched: false });
+            let intent = self.stages.begin_stage_before(
+                super::RestoreStage::KeySlot,
+                kind.effect_id(),
+                effect,
+            )?;
+            self.target_slots[index] = Some(RestoreTargetSlotJournal {
+                intent: Some(intent),
+                refs: None,
+                matched: false,
+            });
             let mut state = lock(&self.stages.owner)?;
-            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let operation = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
             let service_len = operation.intent.host.services[index].len();
             let account_len = kind.prefix().len() + 64 + 3 + 32;
-            let prepaid = service_len.checked_add(account_len).and_then(|n| n.checked_mul(4))
-                .and_then(|n| n.checked_add(std::mem::size_of::<(String, String, Instant)>())).ok_or_else(service_invalid)?;
+            let prepaid = service_len
+                .checked_add(account_len)
+                .and_then(|n| n.checked_mul(4))
+                .and_then(|n| n.checked_add(std::mem::size_of::<(String, String, Instant)>()))
+                .ok_or_else(service_invalid)?;
             state.prepay(prepaid as u64, 0)?;
-            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let operation = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
             let service = operation.intent.host.services[index].clone();
             let mut account = String::new();
-            account.try_reserve_exact(account_len).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            account
+                .try_reserve_exact(account_len)
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
             account.push_str(kind.prefix());
-            account.push_str(operation.intent.decoded.expected.target_installation_id.as_str());
+            account.push_str(
+                operation
+                    .intent
+                    .decoded
+                    .expected
+                    .target_installation_id
+                    .as_str(),
+            );
             account.push_str("-r-");
             account.push_str(self.operation_id());
             let service_reply = service.clone();
             let account_reply = account.clone();
             let observed = std::mem::size_of::<(String, String, Instant)>()
-                .checked_add(service.capacity()).and_then(|n| n.checked_add(account.capacity()))
-                .and_then(|n| n.checked_add(service_reply.capacity())).and_then(|n| n.checked_add(account_reply.capacity())).ok_or_else(service_invalid)?;
-            self.target_slots[index].as_mut().expect("original slot intent retained").refs = Some((service, account));
-            state.restore_operation.as_mut().ok_or_else(service_invalid)?.ledger.settle(super::RestoreCapacityResource::MetadataBytes, prepaid as u64, observed as u64)?;
+                .checked_add(service.capacity())
+                .and_then(|n| n.checked_add(account.capacity()))
+                .and_then(|n| n.checked_add(service_reply.capacity()))
+                .and_then(|n| n.checked_add(account_reply.capacity()))
+                .ok_or_else(service_invalid)?;
+            self.target_slots[index]
+                .as_mut()
+                .expect("original slot intent retained")
+                .refs = Some((service, account));
+            state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?
+                .ledger
+                .settle(
+                    super::RestoreCapacityResource::MetadataBytes,
+                    prepaid as u64,
+                    observed as u64,
+                )?;
             state.post(effect)?;
             Ok((service_reply, account_reply, effect))
         })();
@@ -3207,72 +3776,145 @@ impl RestoreControlSession {
         deadline: Instant,
     ) -> Result<RestoreCandidateIsolationInput, RecoveryControlError> {
         let result = (|| {
-            if self.isolation_intent.is_some() { return Err(service_invalid()); }
+            if self.isolation_intent.is_some() {
+                return Err(service_invalid());
+            }
             let effect = self.stages.effect_before(deadline)?;
             {
                 let state = lock(&self.stages.owner)?;
-                let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+                let operation = state
+                    .restore_operation
+                    .as_ref()
+                    .ok_or_else(service_invalid)?;
                 if staging.candidate_plan().operation_id() != self.operation_id()
-                    || staging.candidate_plan().generation_id() != operation.candidate_plan.generation_id
+                    || staging.candidate_plan().generation_id()
+                        != operation.candidate_plan.generation_id
                     || state.restore_isolation_work.is_some()
-                { return Err(service_invalid()); }
+                {
+                    return Err(service_invalid());
+                }
             }
             self.isolation_intent = Some(self.stages.begin_stage_before(
-                super::RestoreStage::Isolation, "candidate_isolation", effect,
+                super::RestoreStage::Isolation,
+                "candidate_isolation",
+                effect,
             )?);
             let mut state = lock(&self.stages.owner)?;
             state.verify_restore_live(self.stages.operation, effect)?;
-            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let operation = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
             let key = &operation.intent.decoded.selection.key_medium;
             let parent = state.root_path.parent().ok_or_else(service_invalid)?;
             let app = state.app_component.as_ref().ok_or_else(service_invalid)?;
-            let allocation = parent.as_os_str().len().checked_mul(2)
+            let allocation = parent
+                .as_os_str()
+                .len()
+                .checked_mul(2)
                 .and_then(|bytes| bytes.checked_add(key.parent.as_os_str().len()))
                 .and_then(|bytes| bytes.checked_add(app.len()))
                 .and_then(|bytes| bytes.checked_add(state.root_component.len()))
                 .and_then(|bytes| bytes.checked_add(key.component.len()))
                 .and_then(|bytes| bytes.checked_add(operation.candidate_plan.generation_id.len()))
                 .and_then(|bytes| bytes.checked_mul(2))
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RestoreCandidateIsolationInput>()))
+                .and_then(|bytes| {
+                    bytes.checked_add(std::mem::size_of::<RestoreCandidateIsolationInput>())
+                })
                 .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
             state.prepay(allocation as u64, 3)?;
-            let operation = state.restore_operation.as_ref().ok_or_else(service_invalid)?;
+            let operation = state
+                .restore_operation
+                .as_ref()
+                .ok_or_else(service_invalid)?;
             let key = &operation.intent.decoded.selection.key_medium;
             let parent = state.root_path.parent().ok_or_else(service_invalid)?;
             state.restore_isolation_work = Some(RestoreCandidateIsolationWork {
                 parents: std::array::from_fn(|_| None),
                 parent_paths: [parent.to_owned(), parent.to_owned(), key.parent.clone()],
-                components: [state.app_component.as_ref().ok_or_else(service_invalid)?.clone(), state.root_component.clone().into(), key.component.clone().into()],
-                profile: operation.profile.clone(), operation: operation.operation, epoch: operation.epoch,
+                components: [
+                    state
+                        .app_component
+                        .as_ref()
+                        .ok_or_else(service_invalid)?
+                        .clone(),
+                    state.root_component.clone().into(),
+                    key.component.clone().into(),
+                ],
+                profile: operation.profile.clone(),
+                operation: operation.operation,
+                epoch: operation.epoch,
                 generation: operation.candidate_plan.generation_id.clone(),
             });
             for index in 0..3 {
                 let original = if index < 2 {
                     state.parent.as_ref().ok_or_else(service_invalid)?
                 } else {
-                    &state.restore_selections[1].as_ref().and_then(|selection| selection.ancestors.last()).ok_or_else(service_invalid)?.file
+                    &state.restore_selections[1]
+                        .as_ref()
+                        .and_then(|selection| selection.ancestors.last())
+                        .ok_or_else(service_invalid)?
+                        .file
                 };
                 let copied = original.try_clone();
-                state.restore_isolation_work.as_mut().expect("original projection retained").parents[index] = Some(copied);
+                state
+                    .restore_isolation_work
+                    .as_mut()
+                    .expect("original projection retained")
+                    .parents[index] = Some(copied);
                 state.post(effect)?;
-                if !matches!(state.restore_isolation_work.as_ref().and_then(|work| work.parents[index].as_ref()), Some(Ok(_))) {
+                if !matches!(
+                    state
+                        .restore_isolation_work
+                        .as_ref()
+                        .and_then(|work| work.parents[index].as_ref()),
+                    Some(Ok(_))
+                ) {
                     return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
                 }
             }
-            let work = state.restore_isolation_work.as_ref().expect("original projection retained");
-            let observed = work.parent_paths.iter().map(|path| path.capacity()).chain(work.components.iter().map(|component| component.capacity()))
-                .try_fold(std::mem::size_of::<RestoreCandidateIsolationInput>(), |bytes, capacity| bytes.checked_add(capacity))
+            let work = state
+                .restore_isolation_work
+                .as_ref()
+                .expect("original projection retained");
+            let observed = work
+                .parent_paths
+                .iter()
+                .map(|path| path.capacity())
+                .chain(work.components.iter().map(|component| component.capacity()))
+                .try_fold(
+                    std::mem::size_of::<RestoreCandidateIsolationInput>(),
+                    |bytes, capacity| bytes.checked_add(capacity),
+                )
                 .and_then(|bytes| bytes.checked_add(work.generation.capacity()))
                 .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-            state.restore_operation.as_mut().ok_or_else(service_invalid)?.ledger.settle(
-                super::RestoreCapacityResource::MetadataBytes, allocation as u64, observed as u64,
-            )?;
+            state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?
+                .ledger
+                .settle(
+                    super::RestoreCapacityResource::MetadataBytes,
+                    allocation as u64,
+                    observed as u64,
+                )?;
             state.post(effect)?;
-            let work = state.restore_isolation_work.take().expect("original projection retained");
+            let work = state
+                .restore_isolation_work
+                .take()
+                .expect("original projection retained");
             Ok(RestoreCandidateIsolationInput {
-                parents: work.parents.map(|result| result.expect("original duplicate result").expect("checked original duplicate")),
-                parent_paths: work.parent_paths, components: work.components,
-                profile: work.profile, operation: work.operation, epoch: work.epoch, generation: work.generation,
+                parents: work.parents.map(|result| {
+                    result
+                        .expect("original duplicate result")
+                        .expect("checked original duplicate")
+                }),
+                parent_paths: work.parent_paths,
+                components: work.components,
+                profile: work.profile,
+                operation: work.operation,
+                epoch: work.epoch,
+                generation: work.generation,
             })
         })();
         self.retain_failure(result)
@@ -3312,7 +3954,9 @@ impl RestoreControlSession {
                     state.restore_selections[slot]
                         .as_ref()
                         .and_then(|s| s.original.as_ref())
-                        .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::InputInvalid))?
+                        .ok_or_else(|| {
+                            RecoveryControlError::new(RecoveryControlFault::InputInvalid)
+                        })?
                         .metadata(),
                 );
                 state.post(effect)?;
@@ -3328,7 +3972,8 @@ impl RestoreControlSession {
                         .and_then(|r| r.as_ref().ok())
                         .ok_or_else(service_invalid)?,
                     state.uid,
-                ).map_err(|_| RecoveryControlError::new(RecoveryControlFault::InputInvalid))?;
+                )
+                .map_err(|_| RecoveryControlError::new(RecoveryControlFault::InputInvalid))?;
                 if original != observed {
                     return Err(RecoveryControlError::new(
                         RecoveryControlFault::InputInvalid,
@@ -3437,7 +4082,9 @@ impl RestoreControlSession {
                 .ledger;
             let metadata = ledger
                 .ceiling(super::RestoreCapacityResource::MetadataBytes)
-                .checked_sub(ledger.admitted[super::RestoreCapacityResource::MetadataBytes as usize])
+                .checked_sub(
+                    ledger.admitted[super::RestoreCapacityResource::MetadataBytes as usize],
+                )
                 .ok_or_else(service_invalid)?;
             let bounds = WholePgCarrierBounds {
                 max_material_files: capacity.max_material_files,
@@ -3501,8 +4148,18 @@ impl RestoreControlSession {
             state.restore_input = Some(
                 crate::backup::whole_pg_restore_stream::input::from_original_held(
                     self.stages.operation,
-                    (carrier, state.restore_input_metadata[0].take().expect("original carrier metadata")),
-                    (key, state.restore_input_metadata[1].take().expect("original key metadata")),
+                    (
+                        carrier,
+                        state.restore_input_metadata[0]
+                            .take()
+                            .expect("original carrier metadata"),
+                    ),
+                    (
+                        key,
+                        state.restore_input_metadata[1]
+                            .take()
+                            .expect("original key metadata"),
+                    ),
                     bounds,
                     state
                         .restore_input_buffer
@@ -3521,65 +4178,180 @@ impl RestoreControlSession {
         self.retain_failure(result)
     }
 
-    pub fn admit_new_child_before(&mut self, parent: &File, name: &std::ffi::OsStr, bytes: u64, kind: super::RestoreNewChildKind, deadline: Instant) -> Result<super::RestoreNewChildReservation, RecoveryControlError> {
-        let result = (|| {
-            let mut state = lock(&self.stages.owner)?;
-            state.verify_restore_live(self.stages.operation, deadline)?;
-            component(name.to_str().ok_or_else(service_invalid)?, &state.limits)?;
-            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
-            operation.clock.require_effect()?;
-            let ledger = &mut operation.ledger;
-            ledger.observe_file(parent, false, deadline)?;
-            let metadata = ledger.raw_metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
-            if !metadata.is_dir() || bytes == 0 { return Err(service_invalid()); }
-            let parent = identity(metadata);
-            let fee = name.len().checked_mul(2).and_then(|n| n.checked_add(std::mem::size_of::<super::RestoreNewChildReservation>() + 2 * std::mem::size_of::<super::RestoreInodeUse>())).ok_or_else(service_invalid)?;
-            ledger.admit(super::RestoreCapacityResource::MetadataBytes, fee as u64)?;
-            ledger.admit(super::RestoreCapacityResource::OpenFiles, 1)?;
-            let old = ledger.inodes.capacity();
-            let additional = old.checked_add(1).and_then(|n| n.checked_sub(ledger.inodes.len())).ok_or_else(service_invalid)?;
-            ledger.inodes.try_reserve_exact(additional).map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-            if ledger.inodes.capacity().saturating_sub(old) > 2 { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); }
-            let device = ledger.devices.iter_mut().find(|device| device.device == parent.device).ok_or_else(service_invalid)?;
-            device.pending_new = device.pending_new.checked_add(bytes).ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-            ledger.check_storage()?;
-            Ok(super::RestoreNewChildReservation { operation: self.stages.operation, parent, component: name.to_os_string(), bytes, kind })
-        })();
+    pub fn admit_new_child_before(
+        &mut self,
+        parent: &File,
+        name: &std::ffi::OsStr,
+        bytes: u64,
+        kind: super::RestoreNewChildKind,
+        deadline: Instant,
+    ) -> Result<super::RestoreNewChildReservation, RecoveryControlError> {
+        let result =
+            (|| {
+                let mut state = lock(&self.stages.owner)?;
+                state.verify_restore_live(self.stages.operation, deadline)?;
+                component(name.to_str().ok_or_else(service_invalid)?, &state.limits)?;
+                let operation = state
+                    .restore_operation
+                    .as_mut()
+                    .ok_or_else(service_invalid)?;
+                operation.clock.require_effect()?;
+                let ledger = &mut operation.ledger;
+                ledger.observe_file(parent, false, deadline)?;
+                let metadata = ledger
+                    .raw_metadata
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?;
+                if !metadata.is_dir() || bytes == 0 {
+                    return Err(service_invalid());
+                }
+                let parent = identity(metadata);
+                let fee = name
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|n| {
+                        n.checked_add(
+                            std::mem::size_of::<super::RestoreNewChildReservation>()
+                                + 2 * std::mem::size_of::<super::RestoreInodeUse>(),
+                        )
+                    })
+                    .ok_or_else(service_invalid)?;
+                ledger.admit(super::RestoreCapacityResource::MetadataBytes, fee as u64)?;
+                ledger.admit(super::RestoreCapacityResource::OpenFiles, 1)?;
+                let old = ledger.inodes.capacity();
+                let additional = old
+                    .checked_add(1)
+                    .and_then(|n| n.checked_sub(ledger.inodes.len()))
+                    .ok_or_else(service_invalid)?;
+                ledger.inodes.try_reserve_exact(additional).map_err(|_| {
+                    RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                })?;
+                if ledger.inodes.capacity().saturating_sub(old) > 2 {
+                    return Err(RecoveryControlError::new(
+                        RecoveryControlFault::CapacityExceeded,
+                    ));
+                }
+                let device = ledger
+                    .devices
+                    .iter_mut()
+                    .find(|device| device.device == parent.device)
+                    .ok_or_else(service_invalid)?;
+                device.pending_new = device.pending_new.checked_add(bytes).ok_or_else(|| {
+                    RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)
+                })?;
+                ledger.check_storage()?;
+                Ok(super::RestoreNewChildReservation {
+                    operation: self.stages.operation,
+                    parent,
+                    component: name.to_os_string(),
+                    bytes,
+                    kind,
+                })
+            })();
         self.retain_failure(result)
     }
 
-    pub fn settle_new_child_before(&mut self, original: super::RestoreNewChildReservation, parent: &File, child: &File, deadline: Instant) -> Result<(), RecoveryControlError> {
+    pub fn settle_new_child_before(
+        &mut self,
+        original: super::RestoreNewChildReservation,
+        parent: &File,
+        child: &File,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
         let result = (|| {
             let mut state = lock(&self.stages.owner)?;
-            if original.operation != self.stages.operation { return Err(service_invalid()); }
+            if original.operation != self.stages.operation {
+                return Err(service_invalid());
+            }
             state.verify_restore_live(self.stages.operation, deadline)?;
             let uid = state.uid;
-            let operation = state.restore_operation.as_mut().ok_or_else(service_invalid)?;
+            let operation = state
+                .restore_operation
+                .as_mut()
+                .ok_or_else(service_invalid)?;
             let ledger = &mut operation.ledger;
             before(deadline)?;
             ledger.raw_metadata = Some(parent.metadata());
             operation.clock.require_convergence()?;
-            if identity(ledger.raw_metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?) != original.parent { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)); }
+            if identity(
+                ledger
+                    .raw_metadata
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .ok_or_else(service_invalid)?,
+            ) != original.parent
+            {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+            }
             ledger.raw_metadata = Some(child.metadata());
             operation.clock.require_convergence()?;
-            let metadata = ledger.raw_metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
+            let metadata = ledger
+                .raw_metadata
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?;
             let actual = identity(metadata);
-            let allocated = metadata.blocks().checked_mul(512).ok_or_else(service_invalid)?;
+            let allocated = metadata
+                .blocks()
+                .checked_mul(512)
+                .ok_or_else(service_invalid)?;
             let valid_type = match original.kind {
-                super::RestoreNewChildKind::Directory => metadata.is_dir() && metadata.mode() & 0o7777 == 0o700,
-                super::RestoreNewChildKind::File => metadata.is_file() && metadata.mode() & 0o7777 == 0o600 && metadata.nlink() == 1,
+                super::RestoreNewChildKind::Directory => {
+                    metadata.is_dir() && metadata.mode() & 0o7777 == 0o700
+                }
+                super::RestoreNewChildKind::File => {
+                    metadata.is_file() && metadata.mode() & 0o7777 == 0o600 && metadata.nlink() == 1
+                }
             };
-            if !valid_type || actual.device != original.parent.device || actual.uid != uid || allocated > original.bytes { return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded)); }
-            ledger.raw_named = Some(rustix::fs::statat(parent, &original.component, AtFlags::SYMLINK_NOFOLLOW));
+            if !valid_type
+                || actual.device != original.parent.device
+                || actual.uid != uid
+                || allocated > original.bytes
+            {
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
+            }
+            ledger.raw_named = Some(rustix::fs::statat(
+                parent,
+                &original.component,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ));
             operation.clock.require_convergence()?;
-            let named = ledger.raw_named.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
-            if named.st_dev as u64 != actual.device || named.st_ino != actual.inode || named.st_uid != actual.uid || u32::from(named.st_mode) != metadata.mode() { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)); }
-            let device = ledger.devices.iter_mut().find(|device| device.device == actual.device).ok_or_else(service_invalid)?;
-            device.pending_new = device.pending_new.checked_sub(original.bytes).ok_or_else(service_invalid)?;
+            let named = ledger
+                .raw_named
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(service_invalid)?;
+            if named.st_dev as u64 != actual.device
+                || named.st_ino != actual.inode
+                || named.st_uid != actual.uid
+                || u32::from(named.st_mode) != metadata.mode()
+            {
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost));
+            }
+            let device = ledger
+                .devices
+                .iter_mut()
+                .find(|device| device.device == actual.device)
+                .ok_or_else(service_invalid)?;
+            device.pending_new = device
+                .pending_new
+                .checked_sub(original.bytes)
+                .ok_or_else(service_invalid)?;
             let observed = ledger.observe_file(child, false, deadline);
             if observed.is_err()
-                && let Some(device) = ledger.devices.iter_mut().find(|device| device.device == actual.device)
-            { device.pending_new = device.pending_new.checked_add(original.bytes).ok_or_else(service_invalid)?; }
+                && let Some(device) = ledger
+                    .devices
+                    .iter_mut()
+                    .find(|device| device.device == actual.device)
+            {
+                device.pending_new = device
+                    .pending_new
+                    .checked_add(original.bytes)
+                    .ok_or_else(service_invalid)?;
+            }
             observed?;
             operation.clock.require_convergence()
         })();
@@ -4084,7 +4856,10 @@ pub(super) struct ControlFiles {
     #[cfg(feature = "server-runtime")]
     restore_input_metadata: [Option<Metadata>; 2],
     #[cfg(feature = "server-runtime")]
-    restore_input: Option<(crate::backup::whole_pg_restore_stream::FrozenWholePgRestoreInput, crate::backup::whole_pg_restore_stream::ReviewedWholePgRestoreIntent)>,
+    restore_input: Option<(
+        crate::backup::whole_pg_restore_stream::FrozenWholePgRestoreInput,
+        crate::backup::whole_pg_restore_stream::ReviewedWholePgRestoreIntent,
+    )>,
     restore_selections: [Option<RestoreHeldSelection>; 3],
     restore_isolation_work: Option<RestoreCandidateIsolationWork>,
     restore_entropy: [u8; 96],
@@ -4391,8 +5166,11 @@ impl ControlFiles {
         self.reserve_io(0)?;
         self.raw.named = Some(rustix::fs::statat(
             self.parent.as_ref().ok_or_else(service_invalid)?,
-            self.selected_local_component.as_deref().map(std::ffi::OsStr::new)
-                .or(self.app_component.as_deref()).ok_or_else(service_invalid)?,
+            self.selected_local_component
+                .as_deref()
+                .map(std::ffi::OsStr::new)
+                .or(self.app_component.as_deref())
+                .ok_or_else(service_invalid)?,
             AtFlags::SYMLINK_NOFOLLOW,
         ));
         self.post(deadline)?;
@@ -4422,22 +5200,36 @@ impl ControlFiles {
     ) -> Result<RecoveryFileIdentity, RecoveryControlError> {
         let plan = published.restore_plan().ok_or_else(service_invalid)?;
         let expected = published.binding().ordinary_local()?.generation_root;
-        self.prepay((plan.entry_component.len() as u64).checked_mul(4).ok_or_else(service_invalid)?, 0)?;
+        self.prepay(
+            (plan.entry_component.len() as u64)
+                .checked_mul(4)
+                .ok_or_else(service_invalid)?,
+            0,
+        )?;
         self.reserve_io(0)?;
         self.raw.metadata = Some(self.parent.as_ref().ok_or_else(service_invalid)?.metadata());
         self.post(deadline)?;
-        if self.raw.metadata.as_ref().and_then(|r| r.as_ref().ok()).map(identity)
+        if self
+            .raw
+            .metadata
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .map(identity)
             != Some(plan.trusted_parent)
         {
             return Err(service_invalid());
         }
         self.reserve_io(1)?;
-        self.raw.file = Some(rustix::fs::openat(
-            self.parent.as_ref().ok_or_else(service_invalid)?,
-            plan.entry_component.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ).map(File::from).map_err(io::Error::from));
+        self.raw.file = Some(
+            rustix::fs::openat(
+                self.parent.as_ref().ok_or_else(service_invalid)?,
+                plan.entry_component.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from),
+        );
         self.post(deadline)?;
         if self.check_opened(true, deadline)? != expected {
             return Err(service_invalid());
@@ -4454,7 +5246,8 @@ impl ControlFiles {
         published: &super::activation::PublishedActivation,
         app: &crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
         deadline: Instant,
-    ) -> Result<crate::auth::single_user::desktop_local::RestoredLocalSite, RecoveryControlError> {
+    ) -> Result<crate::auth::single_user::desktop_local::RestoredLocalSite, RecoveryControlError>
+    {
         let plan = published.restore_plan().ok_or_else(service_invalid)?;
         if app.as_path().parent() != self.root_path.parent()
             || app.as_path().file_name() != self.app_component.as_deref()
@@ -4465,19 +5258,44 @@ impl ControlFiles {
         let site = published.binding().ordinary_local()?;
         self.verify_local_root_before(site.generation_root, deadline)?;
         let parent = self.root_path.parent().ok_or_else(service_invalid)?;
-        let paths = parent.as_os_str().len().checked_add(plan.entry_component.len())
-            .and_then(|n| n.checked_add(6)).and_then(|n| n.checked_mul(4)).ok_or_else(service_invalid)?;
-        let strings = [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id,
-            &site.master.account, &site.master.key_id, &site.postgres.account]
-            .iter().try_fold(0usize, |n, s| n.checked_add(s.len()))
-            .and_then(|n| n.checked_mul(2)).ok_or_else(service_invalid)?;
-        let fee = paths.checked_add(strings)
-            .and_then(|n| n.checked_add(std::mem::size_of::<crate::auth::single_user::desktop_local::RestoredLocalSite>()))
+        let paths = parent
+            .as_os_str()
+            .len()
+            .checked_add(plan.entry_component.len())
+            .and_then(|n| n.checked_add(6))
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(service_invalid)?;
+        let strings = [
+            site.installation_id,
+            site.deployment_id,
+            site.tenant_id,
+            site.dataset_id,
+            &site.master.account,
+            &site.master.key_id,
+            &site.postgres.account,
+        ]
+        .iter()
+        .try_fold(0usize, |n, s| n.checked_add(s.len()))
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(service_invalid)?;
+        let fee = paths
+            .checked_add(strings)
+            .and_then(|n| {
+                n.checked_add(std::mem::size_of::<
+                    crate::auth::single_user::desktop_local::RestoredLocalSite,
+                >())
+            })
             .ok_or_else(service_invalid)?;
         self.prepay(fee as u64, 0)?;
         let parent = self.root_path.parent().ok_or_else(service_invalid)?;
         Ok(crate::auth::single_user::desktop_local::RestoredLocalSite {
-            ids: [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id].map(str::to_owned),
+            ids: [
+                site.installation_id,
+                site.deployment_id,
+                site.tenant_id,
+                site.dataset_id,
+            ]
+            .map(str::to_owned),
             data_dir: parent.join(&plan.entry_component).join("data"),
             master: (site.master.account.clone(), site.master.key_id.clone()),
             postgres_account: site.postgres.account.clone(),
@@ -4658,8 +5476,10 @@ impl ControlFiles {
             }
         };
         self.held_owner_identity(deadline).map_err(original_lock)?;
-        self.held_lock_identity(true, deadline).map_err(original_lock)?;
-        self.held_lock_identity(false, deadline).map_err(original_lock)?;
+        self.held_lock_identity(true, deadline)
+            .map_err(original_lock)?;
+        self.held_lock_identity(false, deadline)
+            .map_err(original_lock)?;
         self.restore_operation
             .as_mut()
             .ok_or_else(service_invalid)?
@@ -4748,19 +5568,42 @@ impl ControlFiles {
         }
         for (index, selection) in restore_selections.iter().enumerate() {
             if let Some(selection) = selection {
-                for ancestor in &selection.ancestors { ledger.observe_file(&ancestor.file, false, deadline)?; }
-                if let Some(file) = &selection.original { ledger.observe_file(file, index == 1, deadline)?; }
+                for ancestor in &selection.ancestors {
+                    ledger.observe_file(&ancestor.file, false, deadline)?;
+                }
+                if let Some(file) = &selection.original {
+                    ledger.observe_file(file, index == 1, deadline)?;
+                }
             }
         }
-        if let Some(plan) = &original.candidate_plan_output { ledger.observe_file(&plan.parent, false, deadline)?; }
+        if let Some(plan) = &original.candidate_plan_output {
+            ledger.observe_file(&plan.parent, false, deadline)?;
+        }
         ledger.check_storage()
     }
 
     #[cfg(feature = "desktop-local")]
-    pub(super) fn require_empty_legacy_control_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
-        let operations = self.inventory_count(Directory::Operations, self.limits.max_retained_operations, None, deadline)?;
-        let runtimes = self.inventory_count(Directory::Runtimes, self.limits.max_registered_runtimes, None, deadline)?;
-        if operations != 0 || runtimes != 0 { return Err(RecoveryControlError::new(RecoveryControlFault::InitializationRequired)); }
+    pub(super) fn require_empty_legacy_control_before(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let operations = self.inventory_count(
+            Directory::Operations,
+            self.limits.max_retained_operations,
+            None,
+            deadline,
+        )?;
+        let runtimes = self.inventory_count(
+            Directory::Runtimes,
+            self.limits.max_registered_runtimes,
+            None,
+            deadline,
+        )?;
+        if operations != 0 || runtimes != 0 {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::InitializationRequired,
+            ));
+        }
         Ok(())
     }
 
@@ -4953,7 +5796,9 @@ impl ControlFiles {
         // process/boot/clock drift is; raw IO and results remain resident.
         if let Some(fault) = self.first_fault
             && (self.closing_observation.is_none() || fault == RecoveryControlFault::OwnerLost)
-        { return Err(RecoveryControlError::new(fault)); }
+        {
+            return Err(RecoveryControlError::new(fault));
+        }
         self.post_original_owner(deadline)
     }
 
@@ -5043,7 +5888,9 @@ impl ControlFiles {
     pub(super) fn prepay(&mut self, bytes: u64, files: u64) -> Result<(), RecoveryControlError> {
         if let Some(allowance) = &mut self.closing_observation {
             if files != 0 || bytes > allowance.metadata_left {
-                return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::CapacityExceeded,
+                ));
             }
             allowance.metadata_left -= bytes;
             return Ok(());
@@ -5052,8 +5899,12 @@ impl ControlFiles {
             return Err(RecoveryControlError::new(fault));
         }
         if let Some(operation) = &mut self.restore_operation {
-            operation.ledger.admit(super::RestoreCapacityResource::MetadataBytes, bytes)?;
-            operation.ledger.admit(super::RestoreCapacityResource::OpenFiles, files)?;
+            operation
+                .ledger
+                .admit(super::RestoreCapacityResource::MetadataBytes, bytes)?;
+            operation
+                .ledger
+                .admit(super::RestoreCapacityResource::OpenFiles, files)?;
         }
         self.budget.charge(bytes, files)
     }
@@ -6356,8 +7207,7 @@ impl ControlFiles {
                         observation.record.phase,
                         super::ActivationPhase::OrdinaryActive
                             | super::ActivationPhase::RestoreCurrent
-                    ) =>
-            {}
+                    ) => {}
             Some(Err(error)) => return Err(RecoveryControlError::new(error.fault())),
             _ => {
                 return Err(RecoveryControlError::new(
@@ -6990,55 +7840,172 @@ pub(super) fn local_legacy_intent(
     request: VerifiedRecoveryHostIntent,
     owners: &[super::runtime::RuntimeOwner],
 ) -> Result<super::ordinary::VerifiedOrdinaryStartupIntent, RecoveryControlError> {
-    use super::ordinary::{LocalSiteExpectation, OrdinaryInitializationSource, OrdinarySite, SiteExpectation, VerifiedOrdinaryStartupIntent};
+    use super::ordinary::{
+        LocalSiteExpectation, OrdinaryInitializationSource, OrdinarySite, SiteExpectation,
+        VerifiedOrdinaryStartupIntent,
+    };
     let mut original = Some(request);
     let result = (|| {
         let mut files = lock(owner)?;
         let request = original.as_mut().expect("original request retained");
         let deadline = request.original_deadline;
-        if files.root_identity(deadline)? != request.control_root { return Err(service_invalid()); }
+        if files.root_identity(deadline)? != request.control_root {
+            return Err(service_invalid());
+        }
         request.host.recheck_original(deadline)?;
-        let DecodedRecoveryRequest::Legacy(decoded) = &request.decoded else { return Err(service_invalid()); };
-        let metadata = request.request_bytes.len().checked_mul(4).and_then(|n| n.checked_add(std::mem::size_of::<VerifiedOrdinaryStartupIntent>() + owners.len() * 2 * std::mem::size_of::<super::runtime::RuntimeOwner>())).ok_or_else(service_invalid)?;
+        let DecodedRecoveryRequest::Legacy(decoded) = &request.decoded else {
+            return Err(service_invalid());
+        };
+        let metadata = request
+            .request_bytes
+            .len()
+            .checked_mul(4)
+            .and_then(|n| {
+                n.checked_add(
+                    std::mem::size_of::<VerifiedOrdinaryStartupIntent>()
+                        + owners.len() * 2 * std::mem::size_of::<super::runtime::RuntimeOwner>(),
+                )
+            })
+            .ok_or_else(service_invalid)?;
         files.prepay(metadata as u64, 0)?;
         let (root, parent, component) = files.observe_local_root(deadline)?;
         let root = root.ok_or_else(service_invalid)?;
         let expected = &decoded.expected;
-        let ids = super::journal::BusinessAndInstallation { deployment_id: expected.deployment_id.clone(), tenant_id: expected.tenant_id.clone(), dataset_id: expected.dataset_id.as_str().to_owned(), source_installation_id: expected.source_installation_id.as_str().to_owned(), target_installation_id: expected.target_installation_id.as_str().to_owned() };
-        let source = (OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical }, decoded.request_id, request.request.identity);
-        let site = SiteExpectation::Local(LocalSiteExpectation { root: Some(root), parent, component, release: Hex64::of(&request.host.reviewed_release_digest), master_service: request.host.services[0].clone(), postgres_service: request.host.services[1].clone(), installation_id: Some(ids.target_installation_id.clone()), legacy_expected: Some(ids) });
+        let ids = super::journal::BusinessAndInstallation {
+            deployment_id: expected.deployment_id.clone(),
+            tenant_id: expected.tenant_id.clone(),
+            dataset_id: expected.dataset_id.as_str().to_owned(),
+            source_installation_id: expected.source_installation_id.as_str().to_owned(),
+            target_installation_id: expected.target_installation_id.as_str().to_owned(),
+        };
+        let source = (
+            OrdinaryInitializationSource::LegacyAdoption {
+                site: OrdinarySite::LocalPhysical,
+            },
+            decoded.request_id,
+            request.request.identity,
+        );
+        let site = SiteExpectation::Local(LocalSiteExpectation {
+            root: Some(root),
+            parent,
+            component,
+            release: Hex64::of(&request.host.reviewed_release_digest),
+            master_service: request.host.services[0].clone(),
+            postgres_service: request.host.services[1].clone(),
+            installation_id: Some(ids.target_installation_id.clone()),
+            legacy_expected: Some(ids),
+        });
         let bounds = decoded.limits;
         let admission_ns = files.limits.admission_ns;
         drop(files);
-        VerifiedOrdinaryStartupIntent::seal_local_legacy(source, site, bounds, admission_ns, owners, original.take().expect("original entry transferred once"), deadline)
+        VerifiedOrdinaryStartupIntent::seal_local_legacy(
+            source,
+            site,
+            bounds,
+            admission_ns,
+            owners,
+            original.take().expect("original entry transferred once"),
+            deadline,
+        )
     })();
-    result.map_err(|mut error: RecoveryControlError| { if original.is_some() { error.retained_restore_intent = original.take().map(Box::new); } error.retain(owner) })
+    result.map_err(|mut error: RecoveryControlError| {
+        if original.is_some() {
+            error.retained_restore_intent = original.take().map(Box::new);
+        }
+        error.retain(owner)
+    })
 }
 
 #[cfg(feature = "desktop-local")]
-pub(super) fn recheck_legacy_request_before(files: &mut ControlFiles, request: &mut VerifiedRecoveryHostIntent, deadline: Instant) -> Result<(), RecoveryControlError> {
+pub(super) fn recheck_legacy_request_before(
+    files: &mut ControlFiles,
+    request: &mut VerifiedRecoveryHostIntent,
+    deadline: Instant,
+) -> Result<(), RecoveryControlError> {
     request.host.recheck_original(deadline)?;
-    files.raw.metadata = Some(request.request.file.as_ref().ok_or_else(service_invalid)?.metadata());
+    files.raw.metadata = Some(
+        request
+            .request
+            .file
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .metadata(),
+    );
     files.post(deadline)?;
-    let metadata = files.raw.metadata.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
+    let metadata = files
+        .raw
+        .metadata
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .ok_or_else(service_invalid)?;
     let stamp = ServiceFileStamp::of(metadata, files.uid)?;
-    if stamp.identity != request.request.identity || stamp.length != request.request_bytes.len() as u64 { return Err(service_invalid()); }
-    files.raw.named = Some(rustix::fs::statat(&request.request.parent, request.request.component.as_str(), AtFlags::SYMLINK_NOFOLLOW));
+    if stamp.identity != request.request.identity
+        || stamp.length != request.request_bytes.len() as u64
+    {
+        return Err(service_invalid());
+    }
+    files.raw.named = Some(rustix::fs::statat(
+        &request.request.parent,
+        request.request.component.as_str(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    ));
     files.post(deadline)?;
-    let named = files.raw.named.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
-    if named.st_dev as u64 != stamp.identity.device || named.st_ino != stamp.identity.inode || named.st_size as u64 != stamp.length || named.st_nlink != 1 || named.st_mode & 0o7777 != 0o600 || named.st_uid != files.uid { return Err(service_invalid()); }
+    let named = files
+        .raw
+        .named
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .ok_or_else(service_invalid)?;
+    if named.st_dev as u64 != stamp.identity.device
+        || named.st_ino != stamp.identity.inode
+        || named.st_size as u64 != stamp.length
+        || named.st_nlink != 1
+        || named.st_mode & 0o7777 != 0o600
+        || named.st_uid != files.uid
+    {
+        return Err(service_invalid());
+    }
     let mut offset = 0;
     while offset < request.request_bytes.len() {
         let count = (request.request_bytes.len() - offset).min(8);
         before(deadline)?;
-        files.raw.unit = Some(request.request.file.as_ref().ok_or_else(service_invalid)?.read_exact_at(&mut files.raw.small[..count], offset as u64));
+        files.raw.unit = Some(
+            request
+                .request
+                .file
+                .as_ref()
+                .ok_or_else(service_invalid)?
+                .read_exact_at(&mut files.raw.small[..count], offset as u64),
+        );
         files.post(deadline)?;
-        if !matches!(files.raw.unit, Some(Ok(()))) || files.raw.small[..count] != request.request_bytes[offset..offset+count] { return Err(service_invalid()); }
+        if !matches!(files.raw.unit, Some(Ok(())))
+            || files.raw.small[..count] != request.request_bytes[offset..offset + count]
+        {
+            return Err(service_invalid());
+        }
         offset += count;
     }
-    files.raw.metadata = Some(request.request.file.as_ref().ok_or_else(service_invalid)?.metadata());
+    files.raw.metadata = Some(
+        request
+            .request
+            .file
+            .as_ref()
+            .ok_or_else(service_invalid)?
+            .metadata(),
+    );
     files.post(deadline)?;
-    if ServiceFileStamp::of(files.raw.metadata.as_ref().and_then(|result| result.as_ref().ok()).ok_or_else(service_invalid)?, files.uid)? != stamp { return Err(service_invalid()); }
+    if ServiceFileStamp::of(
+        files
+            .raw
+            .metadata
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .ok_or_else(service_invalid)?,
+        files.uid,
+    )? != stamp
+    {
+        return Err(service_invalid());
+    }
     Ok(())
 }
 
@@ -7049,21 +8016,45 @@ pub(super) fn enter_current_reconfirmation(
     creator: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
     owners: &[super::runtime::RuntimeOwner],
     cancel: crate::restore_reconfirmation::CancellationToken,
-) -> Result<(super::runtime::RecoveryRuntimeOwner, crate::restore_reconfirmation::OriginalReconfirmationRequest, Instant), RecoveryControlError> {
+) -> Result<
+    (
+        super::runtime::RecoveryRuntimeOwner,
+        crate::restore_reconfirmation::OriginalReconfirmationRequest,
+        Instant,
+    ),
+    RecoveryControlError,
+> {
     {
         let mut files = lock(owner)?;
         let deadline = request.original_deadline;
         recheck_legacy_request_before(&mut files, request, deadline)?;
-        if files.root_identity(deadline)? != request.control_root { return Err(service_invalid()); }
-        files.prepay(std::mem::size_of::<crate::restore_reconfirmation::OriginalReconfirmationRequest>() as u64, 0)?;
+        if files.root_identity(deadline)? != request.control_root {
+            return Err(service_invalid());
+        }
+        files.prepay(
+            std::mem::size_of::<crate::restore_reconfirmation::OriginalReconfirmationRequest>()
+                as u64,
+            0,
+        )?;
     }
-    let DecodedRecoveryRequest::Current(current) = &mut request.decoded else { return Err(service_invalid()); };
-    if current.issued { return Err(service_invalid()); }
+    let DecodedRecoveryRequest::Current(current) = &mut request.decoded else {
+        return Err(service_invalid());
+    };
+    if current.issued {
+        return Err(service_invalid());
+    }
     current.issued = true;
-    let intent = local_intent(owner, creator, request.host.reviewed_release_digest,
-        [&request.host.services[0], &request.host.services[1]], current.limits, owners)?;
+    let intent = local_intent(
+        owner,
+        creator,
+        request.host.reviewed_release_digest,
+        [&request.host.services[0], &request.host.services[1]],
+        current.limits,
+        owners,
+    )?;
     let admission = intent.admission_deadline().min(request.original_deadline);
-    let (published, intent) = super::ordinary::shared_local_head(owner, intent, admission, creator)?;
+    let (published, intent) =
+        super::ordinary::shared_local_head(owner, intent, admission, creator)?;
     let binding = published.binding().ordinary_local()?;
     let expected = &current.expected;
     if published.restore_cohort().is_none()
@@ -7072,9 +8063,14 @@ pub(super) fn enter_current_reconfirmation(
         || binding.tenant_id != expected.tenant_id
         || binding.dataset_id != expected.dataset_id.as_str()
         || binding.installation_id != expected.target_installation_id.as_str()
-    { lock(owner)?.release_registration_attempt(); return Err(service_invalid()); }
+    {
+        lock(owner)?.release_registration_attempt();
+        return Err(service_invalid());
+    }
     let sql = crate::restore_reconfirmation::OriginalReconfirmationRequest::for_current_local(
-        intent.effect_deadline(), cancel, uuid::Uuid::from_bytes(super::hex_array(current.request_id.as_str())),
+        intent.effect_deadline(),
+        cancel,
+        uuid::Uuid::from_bytes(super::hex_array(current.request_id.as_str())),
     );
     let convergence = intent.convergence_deadline();
     let runtime = super::ordinary::enroll(owner, published, &intent)?;
@@ -7148,7 +8144,10 @@ pub(super) async fn verify_local_binding_before(
             }
             authority.instance_id().to_owned()
         }
-        None => format!("{}-r-{}", expected.installation_id, expected.postgres.operation_id),
+        None => format!(
+            "{}-r-{}",
+            expected.installation_id, expected.postgres.operation_id
+        ),
     };
     if !canary
         .matches_database(database)
@@ -7361,11 +8360,16 @@ pub(super) fn open_control(
 }
 
 #[cfg(feature = "desktop-local")]
-pub(super) fn open_existing_control(config: RecoveryControlConfig) -> Result<ControlOwner, RecoveryControlError> {
+pub(super) fn open_existing_control(
+    config: RecoveryControlConfig,
+) -> Result<ControlOwner, RecoveryControlError> {
     open_control_inner(config, false)
 }
 
-fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Result<ControlOwner, RecoveryControlError> {
+fn open_control_inner(
+    config: RecoveryControlConfig,
+    create_layout: bool,
+) -> Result<ControlOwner, RecoveryControlError> {
     if !config.root.is_absolute() {
         return Err(RecoveryControlError::new(
             RecoveryControlFault::EntryInvalid,
@@ -7395,7 +8399,9 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
     let deadline = Instant::now()
         .checked_add(Duration::from_nanos(config.limits.admission_ns))
         .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ProfileInvalid))?;
-    let deadline = config.original_admission_deadline.map_or(deadline, |original| original.min(deadline));
+    let deadline = config
+        .original_admission_deadline
+        .map_or(deadline, |original| original.min(deadline));
     let mut budget = ControlBudget {
         metadata: 0,
         files: 0,
@@ -7416,7 +8422,9 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
         )
         .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
     budget.charge(fixed as u64, u64::from(config.service_source.is_some()))?;
-    if let Some((bytes, files)) = config.preheld_restore_usage { budget.charge(bytes, files)?; }
+    if let Some((bytes, files)) = config.preheld_restore_usage {
+        budget.charge(bytes, files)?;
+    }
     // The original fixed fee contains the source object's inline storage and
     // one configuration FD. Its actual additional retained backing/FDs remain
     // in the same original control budget; they are never counted as zero.
@@ -7650,35 +8658,38 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
             }
         }
         if create_layout {
-        state.reserve_io(0)?;
-        before(deadline)?;
-        state.raw.unit = Some({
-            let parent = state
-                .parent
-                .as_ref()
-                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
-            rustix::fs::mkdirat(parent, state.root_component.as_str(), Mode::RWXU)
-                .map_err(io::Error::from)
-        });
-        state.post(deadline)?;
-        if let Some(Err(error)) = &state.raw.unit
-            && error.kind() != io::ErrorKind::AlreadyExists
-        { return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)); }
-        if matches!(state.raw.unit, Some(Ok(()))) {
             state.reserve_io(0)?;
             before(deadline)?;
-            state.raw.unit = Some(
-                state
-                    .parent
-                    .as_ref()
-                    .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?
-                    .sync_all(),
-            );
+            state.raw.unit = Some({
+                let parent = state.parent.as_ref().ok_or_else(|| {
+                    RecoveryControlError::new(RecoveryControlFault::ControlInvalid)
+                })?;
+                rustix::fs::mkdirat(parent, state.root_component.as_str(), Mode::RWXU)
+                    .map_err(io::Error::from)
+            });
             state.post(deadline)?;
-            if !matches!(state.raw.unit, Some(Ok(()))) {
+            if let Some(Err(error)) = &state.raw.unit
+                && error.kind() != io::ErrorKind::AlreadyExists
+            {
                 return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
             }
-        }
+            if matches!(state.raw.unit, Some(Ok(()))) {
+                state.reserve_io(0)?;
+                before(deadline)?;
+                state.raw.unit = Some(
+                    state
+                        .parent
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RecoveryControlError::new(RecoveryControlFault::ControlInvalid)
+                        })?
+                        .sync_all(),
+                );
+                state.post(deadline)?;
+                if !matches!(state.raw.unit, Some(Ok(()))) {
+                    return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
+                }
+            }
         }
         state.reserve_io(1)?;
         before(deadline)?;
@@ -7704,7 +8715,9 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
             .and_then(|source| source.control_selection.existing.as_ref())
             .map(|root| root.identity)
             && root != expected
-        { return Err(service_invalid()); }
+        {
+            return Err(service_invalid());
+        }
         if state.app_component.is_some() {
             state.reserve_io(0)?;
             before(deadline)?;
@@ -7729,8 +8742,7 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
                         == rustix::fs::FileType::Directory
                         && s.st_uid == state.uid
                         && s.st_mode & 0o7777 == 0o700
-                        && (s.st_dev as u64 != root.device || s.st_ino != root.inode) =>
-                {}
+                        && (s.st_dev as u64 != root.device || s.st_ino != root.inode) => {}
                 Some(Err(e)) if *e == rustix::io::Errno::NOENT => (),
                 _ => {
                     return Err(RecoveryControlError::new(
@@ -7744,7 +8756,9 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
             ("operations", Directory::Operations),
             ("runtimes", Directory::Runtimes),
         ] {
-            if create_layout { state.ensure_directory(name, deadline)?; }
+            if create_layout {
+                state.ensure_directory(name, deadline)?;
+            }
             state.reserve_io(1)?;
             before(deadline)?;
             state.raw.file = Some(
@@ -7777,7 +8791,9 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
             ("admission.lock", b"WBRCADM1"),
             ("runtime.lock", b"WBRCRUN1"),
         ] {
-            if create_layout { state.ensure_lock(name, marker, deadline)?; }
+            if create_layout {
+                state.ensure_lock(name, marker, deadline)?;
+            }
         }
         state.check_root_namespace(deadline)?;
         if let Some(source) = &mut state.service_source {
@@ -7838,7 +8854,10 @@ pub(super) fn verify_intent(
             .checked_add(std::mem::size_of::<OwnedRecoveryRequestFile>() as u64)
             .and_then(|n| n.checked_add(request.component.capacity() as u64))
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-        let usage = (input_bytes, host_files.checked_add(2).ok_or_else(service_invalid)?);
+        let usage = (
+            input_bytes,
+            host_files.checked_add(2).ok_or_else(service_invalid)?,
+        );
         match state.preheld_restore_usage.take() {
             Some(original) if original == usage => (),
             Some(_) => return Err(service_invalid()),
@@ -8082,20 +9101,33 @@ pub(super) fn verify_intent(
         #[cfg(feature = "desktop-local")]
         match &host.original {
             #[cfg(feature = "desktop-local")]
-            HostOrigin::LocalRelease { actual, .. } => {
-                match decoded {
-                    DecodedRecoveryRequest::Restore(decoded) => {
-                        if Some(decoded.selection.target.parent.as_path()) != actual.as_path().parent() || decoded.selection.target.component == state.root_component { return Err(service_invalid()); }
-                    }
-                    DecodedRecoveryRequest::Legacy(decoded) => {
-                        let selection = &decoded.selection.installation;
-                        if Some(selection.parent.as_path()) != actual.as_path().parent() || actual.as_path().file_name() != Some(std::ffi::OsStr::new(&selection.component)) || decoded.limits.effect_ns > host.ordinary_bounds.effect_ns || decoded.limits.convergence_ns > host.ordinary_bounds.convergence_ns { return Err(service_invalid()); }
-                    }
-                    DecodedRecoveryRequest::Current(decoded) => {
-                        if decoded.limits.effect_ns > host.ordinary_bounds.effect_ns || decoded.limits.convergence_ns > host.ordinary_bounds.convergence_ns { return Err(service_invalid()); }
+            HostOrigin::LocalRelease { actual, .. } => match decoded {
+                DecodedRecoveryRequest::Restore(decoded) => {
+                    if Some(decoded.selection.target.parent.as_path()) != actual.as_path().parent()
+                        || decoded.selection.target.component == state.root_component
+                    {
+                        return Err(service_invalid());
                     }
                 }
-            }
+                DecodedRecoveryRequest::Legacy(decoded) => {
+                    let selection = &decoded.selection.installation;
+                    if Some(selection.parent.as_path()) != actual.as_path().parent()
+                        || actual.as_path().file_name()
+                            != Some(std::ffi::OsStr::new(&selection.component))
+                        || decoded.limits.effect_ns > host.ordinary_bounds.effect_ns
+                        || decoded.limits.convergence_ns > host.ordinary_bounds.convergence_ns
+                    {
+                        return Err(service_invalid());
+                    }
+                }
+                DecodedRecoveryRequest::Current(decoded) => {
+                    if decoded.limits.effect_ns > host.ordinary_bounds.effect_ns
+                        || decoded.limits.convergence_ns > host.ordinary_bounds.convergence_ns
+                    {
+                        return Err(service_invalid());
+                    }
+                }
+            },
         }
         let file = state.take_opened()?;
         let mut request = state

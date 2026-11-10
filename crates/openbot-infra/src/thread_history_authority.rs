@@ -503,7 +503,10 @@ pub(crate) enum RestoredHistoryBatch {
 
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub(crate) async fn clear_restored_history_batch_before(
-    source: &mut crate::backup::whole_pg_restore_stream::candidate_sql::PendingHistoryClearSource<'_, '_>,
+    source: &mut crate::backup::whole_pg_restore_stream::candidate_sql::PendingHistoryClearSource<
+        '_,
+        '_,
+    >,
     thread: &ThreadId,
     deadline: std::time::Instant,
 ) -> Result<RestoredHistoryBatch, ThreadHistoryStopClearError> {

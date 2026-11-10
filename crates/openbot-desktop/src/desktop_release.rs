@@ -34,13 +34,13 @@ use crate::recovery::entry::{
     OwnedVerifiedCurrentReconfirmationEntry,
 };
 use crate::tauri_background::{DesktopRecoveryBootstrap, DesktopUiResource};
-use openbot_infra::restore_reconfirmation::ReconfirmationCommitFact;
 use crate::tauri_host::{VerifiedUiAssets, static_asset_max_bytes};
 use crate::{
     DesktopAgentBudgets, DesktopLocalApplicationInput, DesktopLocalReleaseInput,
     DesktopLocalRuntimeConfig, DesktopOpenAiProviderInput, MacOsKeychainSecretStore, OsSecretStore,
     OsSecretStoreError, ReviewedDesktopVaultKeyStoreService,
 };
+use openbot_infra::restore_reconfirmation::ReconfirmationCommitFact;
 
 /// Reviewed external product name; internal crate/protocol compatibility names are unchanged.
 pub const PRODUCT_NAME: &str = "Wrok Bot";
@@ -257,9 +257,10 @@ impl ReleaseManifest {
             request.validate()?;
         }
         if let RecoveryControlField::Present(recovery) = &manifest.recovery_control
-            && (recovery.version != 1 || recovery.host_limits.clone().checked().is_err()) {
-                return Err(DesktopReleaseError::Manifest);
-            }
+            && (recovery.version != 1 || recovery.host_limits.clone().checked().is_err())
+        {
+            return Err(DesktopReleaseError::Manifest);
+        }
         manifest.ui.inventory(static_asset_max_bytes)?;
         let tenant_inventory = manifest.tenant.inventory(|_| TENANT_FILE_MAX_BYTES)?;
         if tenant_inventory.keys().copied().collect::<BTreeSet<_>>()
@@ -366,7 +367,10 @@ impl core::fmt::Debug for VerifiedDesktopRelease {
 impl VerifiedDesktopRelease {
     /// Transfer this verified release and its original request to one bounded
     /// restore owner. No process, SQL or secret-store effect starts here.
-    pub fn begin_restore(self, entry: crate::recovery::VerifiedRestoreEntry) -> Result<crate::recovery::OwnedDesktopRestore, DesktopRestoreError> {
+    pub fn begin_restore(
+        self,
+        entry: crate::recovery::VerifiedRestoreEntry,
+    ) -> Result<crate::recovery::OwnedDesktopRestore, DesktopRestoreError> {
         crate::recovery::OwnedDesktopRestore::new(self, entry)
     }
 
@@ -553,7 +557,10 @@ impl VerifiedDesktopRelease {
     /// The same path over a test secret store; the native owner is the
     /// request's, never a window or an authority.
     #[cfg(test)]
-    pub(crate) async fn reconfirm_restored_local_owner_for_test<N: OriginalLocalConfirmation, S: OsSecretStore + ?Sized>(
+    pub(crate) async fn reconfirm_restored_local_owner_for_test<
+        N: OriginalLocalConfirmation,
+        S: OsSecretStore + ?Sized,
+    >(
         self,
         entry: OwnedVerifiedCurrentReconfirmationEntry,
         request: OriginalLocalConfirmationRequest<N>,
@@ -568,7 +575,9 @@ impl VerifiedDesktopRelease {
         mut request: OriginalLocalConfirmationRequest<N>,
         store: &S,
     ) -> Result<ReconfirmationCommitFact, DesktopRestoreError> {
-        use crate::desktop_local_bootstrap::{OpenedRestoredGeneration, RestoredOpenFailure, SqlDriverOutcome};
+        use crate::desktop_local_bootstrap::{
+            OpenedRestoredGeneration, RestoredOpenFailure, SqlDriverOutcome,
+        };
         use openbot_infra::restore_reconfirmation::RestoreReconfirmationError;
         let reconfirmation = |error| match error {
             RestoreReconfirmationError::NotConfirmed | RestoreReconfirmationError::NotVisible => {
@@ -578,13 +587,18 @@ impl VerifiedDesktopRelease {
                 DesktopRestoreError::OwnerLost
             }
             RestoreReconfirmationError::CommitUnknown => DesktopRestoreError::DatabaseUnknown,
-            RestoreReconfirmationError::CommitAcknowledgedAfterDeadline => DesktopRestoreError::EffectExpired,
+            RestoreReconfirmationError::CommitAcknowledgedAfterDeadline => {
+                DesktopRestoreError::EffectExpired
+            }
         };
-        let postgres_service =
-            ReviewedPostgresKeyStoreService::from_reviewed_release(POSTGRES_KEY_STORE_SERVICE.to_owned())
-                .map_err(|_| DesktopRestoreError::EntryInvalid)?;
-        let vault_service = ReviewedDesktopVaultKeyStoreService::from_reviewed_release(VAULT_KEY_STORE_SERVICE.to_owned())
-            .map_err(|_| DesktopRestoreError::EntryInvalid)?;
+        let postgres_service = ReviewedPostgresKeyStoreService::from_reviewed_release(
+            POSTGRES_KEY_STORE_SERVICE.to_owned(),
+        )
+        .map_err(|_| DesktopRestoreError::EntryInvalid)?;
+        let vault_service = ReviewedDesktopVaultKeyStoreService::from_reviewed_release(
+            VAULT_KEY_STORE_SERVICE.to_owned(),
+        )
+        .map_err(|_| DesktopRestoreError::EntryInvalid)?;
         let OwnedVerifiedCurrentReconfirmationEntry { mut runtime, site } = entry;
         let opened = crate::desktop_local_bootstrap::open_restored_generation(
             &mut runtime,
@@ -595,16 +609,26 @@ impl VerifiedDesktopRelease {
             &vault_service,
         )
         .await;
-        let OpenedRestoredGeneration { data_plane, vault, pending } = match opened {
+        let OpenedRestoredGeneration {
+            data_plane,
+            vault,
+            pending,
+        } = match opened {
             Ok(opened) => opened,
             Err((failure, sidecar, sql)) => {
-                let _ = close_reconfirmation_runtime(&mut runtime, sidecar, sql, request.convergence).await;
+                let _ =
+                    close_reconfirmation_runtime(&mut runtime, sidecar, sql, request.convergence)
+                        .await;
                 return Err(match failure {
                     RestoredOpenFailure::Sidecar(_) => DesktopRestoreError::IoFailure,
                     RestoredOpenFailure::DataPlane(_) => DesktopRestoreError::DatabaseUnknown,
                     RestoredOpenFailure::Vault(_) => DesktopRestoreError::KeyStoreUnknown,
-                    RestoredOpenFailure::Control(error) => DesktopRestoreError::from_control(&error),
-                    RestoredOpenFailure::Gate(_) | RestoredOpenFailure::Authority => DesktopRestoreError::EntryInvalid,
+                    RestoredOpenFailure::Control(error) => {
+                        DesktopRestoreError::from_control(&error)
+                    }
+                    RestoredOpenFailure::Gate(_) | RestoredOpenFailure::Authority => {
+                        DesktopRestoreError::EntryInvalid
+                    }
                 });
             }
         };
@@ -616,7 +640,10 @@ impl VerifiedDesktopRelease {
             let admission = runtime
                 .admit_restored_local_subject_before(&pending, native_bytes, request.effect)
                 .map_err(reconfirmation)?;
-            request.native.confirm_once(request.effect, request.convergence).await?;
+            request
+                .native
+                .confirm_once(request.effect, request.convergence)
+                .await?;
             let owner = request.native.take_confirmation()?;
             let now = (std::time::Instant::now(), std::time::SystemTime::now());
             if request.cancel.is_cancelled() || owner.at > now.0 || owner.wall > now.1 {
@@ -626,11 +653,7 @@ impl VerifiedDesktopRelease {
                 return Err(DesktopRestoreError::EffectExpired);
             }
             admission
-                .confirm_before(
-                    data_plane.pool(),
-                    vault.audit_key(),
-                    request.sql,
-                )
+                .confirm_before(data_plane.pool(), vault.audit_key(), request.sql)
                 .await
                 .map_err(reconfirmation)
         }
@@ -638,10 +661,18 @@ impl VerifiedDesktopRelease {
         drop(vault);
         let closed = match data_plane.shutdown().await {
             Ok((exit, observations)) => {
-                close_reconfirmation_runtime(&mut runtime, Ok(exit), SqlDriverOutcome::Observed(observations), request.convergence).await
+                close_reconfirmation_runtime(
+                    &mut runtime,
+                    Ok(exit),
+                    SqlDriverOutcome::Observed(observations),
+                    request.convergence,
+                )
+                .await
             }
             Err((_, sidecar, sql)) => {
-                let _ = close_reconfirmation_runtime(&mut runtime, sidecar, sql, request.convergence).await;
+                let _ =
+                    close_reconfirmation_runtime(&mut runtime, sidecar, sql, request.convergence)
+                        .await;
                 Err(DesktopRestoreError::ClosureUnproven)
             }
         };
@@ -661,11 +692,19 @@ async fn close_reconfirmation_runtime(
     sql: crate::desktop_local_bootstrap::SqlDriverOutcome,
     deadline: std::time::Instant,
 ) -> Result<(), DesktopRestoreError> {
-    use openbot_infra::recovery_control::{PassiveObjectKind, RuntimeCloseFact, RuntimeCloseResources, RuntimeOwner};
-    let mut facts: Vec<_> = [RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay, RuntimeOwner::DesktopAgent]
-        .into_iter()
-        .map(|owner| RuntimeCloseFact::PassiveRetirement { object: PassiveObjectKind::NeverStarted(owner) })
-        .collect();
+    use openbot_infra::recovery_control::{
+        PassiveObjectKind, RuntimeCloseFact, RuntimeCloseResources, RuntimeOwner,
+    };
+    let mut facts: Vec<_> = [
+        RuntimeOwner::ApplicationAssembly,
+        RuntimeOwner::DesktopAgentRelay,
+        RuntimeOwner::DesktopAgent,
+    ]
+    .into_iter()
+    .map(|owner| RuntimeCloseFact::PassiveRetirement {
+        object: PassiveObjectKind::NeverStarted(owner),
+    })
+    .collect();
     facts.extend(crate::desktop_local_bootstrap::sidecar_close_fact(sidecar));
     facts.extend(crate::desktop_local_bootstrap::sql_driver_close_fact(sql, deadline).await);
     runtime

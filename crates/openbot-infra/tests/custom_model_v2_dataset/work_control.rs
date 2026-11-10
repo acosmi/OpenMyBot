@@ -13,7 +13,11 @@ fn runtime(f: &Fixture) -> PostgresRunRuntime {
         "owned-v2-runtime".into(),
         time::Duration::seconds(30),
         DEFAULT_DISPATCH_CLAIM_DURATION,
-        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &f.pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .unwrap()
 }

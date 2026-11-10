@@ -21,13 +21,11 @@ use sha2::{Digest, Sha256};
 
 use super::activation::ActivationBinding;
 use super::entry::{self, ControlFiles, ControlOwner, OwnedRecord, RuntimeEntry};
-use super::journal::ProcessStart;
-use super::journal::{NativeExit, PipeJoin};
-use super::{
-    RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, id,
-};
 #[cfg(feature = "server-runtime")]
 use super::hex_array;
+use super::journal::ProcessStart;
+use super::journal::{NativeExit, PipeJoin};
+use super::{RecoveryControlError, RecoveryControlFault, RecoveryFileIdentity, before, hex, id};
 use std::ops::{Deref, DerefMut};
 
 /// Private original startup input, not a parser, public constructor or proof
@@ -76,7 +74,10 @@ pub enum RuntimePgAck {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum PassiveObjectKind {
-    SqlDriver(#[serde(serialize_with = "serialize_destructions")] Vec<crate::db::pool::ConnectionDestruction>),
+    SqlDriver(
+        #[serde(serialize_with = "serialize_destructions")]
+        Vec<crate::db::pool::ConnectionDestruction>,
+    ),
     ScreenHub,
     NeverStarted(RuntimeOwner),
 }
@@ -90,7 +91,9 @@ fn serialize_destructions<S: serde::Serializer>(
     let mut sequence = serializer.serialize_seq(Some(facts.len()))?;
     for fact in facts {
         sequence.serialize_element(match fact {
-            ConnectionDestruction::ConnectingOwnerDestroyedBeforeStart => "connecting_owner_destroyed_before_start",
+            ConnectionDestruction::ConnectingOwnerDestroyedBeforeStart => {
+                "connecting_owner_destroyed_before_start"
+            }
             ConnectionDestruction::ConnectingFutureDestroyed => "connecting_future_destroyed",
             ConnectionDestruction::ConnectionDestroyed => "connection_destroyed",
         })?;
@@ -119,14 +122,21 @@ pub enum RuntimeCloseFact {
         original_owner: RuntimeOwner,
         disposition: RuntimePgAck,
     },
-    PassiveRetirement { object: PassiveObjectKind },
+    PassiveRetirement {
+        object: PassiveObjectKind,
+    },
 }
 
 impl RuntimeCloseFact {
     fn owner(&self) -> RuntimeOwner {
         match self {
-            Self::NativeWait { original_program_id, .. } => *original_program_id,
-            Self::TaskJoin { original_task_id, .. } => *original_task_id,
+            Self::NativeWait {
+                original_program_id,
+                ..
+            } => *original_program_id,
+            Self::TaskJoin {
+                original_task_id, ..
+            } => *original_task_id,
             Self::PgAck { original_owner, .. } => *original_owner,
             Self::PassiveRetirement { object } => match object {
                 PassiveObjectKind::SqlDriver(_) => RuntimeOwner::SqlDriver,
@@ -138,17 +148,33 @@ impl RuntimeCloseFact {
 
     fn observed_closed(&self, now: u64) -> bool {
         match self {
-            Self::NativeWait { original_pid, original_start_identity, observed_ns, pipes, .. } => {
-                *original_pid != 0 && original_start_identity.nanos < 1_000_000_000
-                    && *observed_ns != 0 && *observed_ns <= now
+            Self::NativeWait {
+                original_pid,
+                original_start_identity,
+                observed_ns,
+                pipes,
+                ..
+            } => {
+                *original_pid != 0
+                    && original_start_identity.nanos < 1_000_000_000
+                    && *observed_ns != 0
+                    && *observed_ns <= now
                     && pipes.iter().all(|pipe| match pipe {
                         PipeJoin::Null => true,
-                        PipeJoin::Returned { observed_ns } => *observed_ns != 0 && *observed_ns <= now,
+                        PipeJoin::Returned { observed_ns } => {
+                            *observed_ns != 0 && *observed_ns <= now
+                        }
                         PipeJoin::Panicked { .. } | PipeJoin::JoinUnknown => false,
                     })
             }
-            Self::TaskJoin { outcome, observed_ns, .. } => {
-                matches!(outcome, RuntimeTaskOutcome::Returned) && *observed_ns != 0 && *observed_ns <= now
+            Self::TaskJoin {
+                outcome,
+                observed_ns,
+                ..
+            } => {
+                matches!(outcome, RuntimeTaskOutcome::Returned)
+                    && *observed_ns != 0
+                    && *observed_ns <= now
             }
             Self::PgAck { .. } | Self::PassiveRetirement { .. } => true,
         }
@@ -377,10 +403,23 @@ impl RecoveryRuntimeOwner {
         services: [&str; 2],
     ) -> Result<(), RecoveryControlError> {
         let (control, binding, deadline) = share_runtime(&self.state, |state| {
-            (Arc::clone(&state.control), state.original.published.binding().clone(), state.original.original_deadline)
+            (
+                Arc::clone(&state.control),
+                state.original.published.binding().clone(),
+                state.original.original_deadline,
+            )
         })?;
-        entry::verify_local_binding_before(&control, &binding, Some(authority), database, canary, services, deadline).await
-            .map_err(|error| error.retain(&control))
+        entry::verify_local_binding_before(
+            &control,
+            &binding,
+            Some(authority),
+            database,
+            canary,
+            services,
+            deadline,
+        )
+        .await
+        .map_err(|error| error.retain(&control))
     }
 
     /// The selected generation this runtime's published head names when it
@@ -391,15 +430,22 @@ impl RecoveryRuntimeOwner {
     pub fn restored_local_site(
         &self,
         app_data_root: &crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot,
-    ) -> Result<Option<crate::auth::single_user::desktop_local::RestoredLocalSite>, RecoveryControlError> {
+    ) -> Result<
+        Option<crate::auth::single_user::desktop_local::RestoredLocalSite>,
+        RecoveryControlError,
+    > {
         share_runtime(&self.state, |state| {
             if state.original.published.restore_cohort().is_none() {
                 return Ok(None);
             }
             entry::share(&state.control, |files| {
-                files.restored_local_site_before(
-                    &state.original.published, app_data_root, state.original.original_deadline,
-                ).map(Some)
+                files
+                    .restored_local_site_before(
+                        &state.original.published,
+                        app_data_root,
+                        state.original.original_deadline,
+                    )
+                    .map(Some)
             })?
         })?
     }
@@ -416,7 +462,10 @@ impl RecoveryRuntimeOwner {
         canary: &crate::db::desktop_vault_canary::VerifiedDesktopVaultCanary,
         services: [&str; 2],
         restored: &crate::auth::single_user::desktop_local::RestoredLocalSite,
-    ) -> Result<crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding, RecoveryControlError> {
+    ) -> Result<
+        crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
+        RecoveryControlError,
+    > {
         let data_dir = restored.data_dir();
         let (control, binding, cohort, deadline) = share_runtime(&self.state, |state| {
             (
@@ -465,24 +514,41 @@ impl RecoveryRuntimeOwner {
         pending: &crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
         native_bytes: u64,
         deadline: Instant,
-    ) -> Result<LocalSubjectReconfirmation<'_>, crate::restore_reconfirmation::RestoreReconfirmationError> {
+    ) -> Result<
+        LocalSubjectReconfirmation<'_>,
+        crate::restore_reconfirmation::RestoreReconfirmationError,
+    > {
         use crate::restore_reconfirmation::RestoreReconfirmationError as Error;
-        let binding = share_runtime(&self.state, |state| state.original.published.binding().clone())
-            .map_err(|_| Error::Unavailable)?;
+        let binding = share_runtime(&self.state, |state| {
+            state.original.published.binding().clone()
+        })
+        .map_err(|_| Error::Unavailable)?;
         let site = binding.ordinary_local().map_err(|_| Error::Unavailable)?;
-        if pending.ids() != [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id]
+        if pending.ids()
+            != [
+                site.installation_id,
+                site.deployment_id,
+                site.tenant_id,
+                site.dataset_id,
+            ]
             || pending.postgres() != (site.pg_system_id, site.database_oid)
         {
             return Err(Error::NotVisible);
         }
         let reservation = (std::mem::size_of::<RecoveryWorkerLease<'_>>() as u64)
-            .checked_add(std::mem::size_of::<crate::restore_reconfirmation::OriginalReconfirmationRequest>() as u64)
+            .checked_add(std::mem::size_of::<
+                crate::restore_reconfirmation::OriginalReconfirmationRequest,
+            >() as u64)
             .and_then(|n| n.checked_add(native_bytes))
             .ok_or(Error::Unavailable)?;
         let hold = AdmissionHold::acquire(&Arc::downgrade(&self.state), reservation, deadline)
             .map_err(|_| Error::Unavailable)?;
         Ok(LocalSubjectReconfirmation {
-            lease: RecoveryWorkerLease { hold: Some(hold), deadline, _gate: std::marker::PhantomData },
+            lease: RecoveryWorkerLease {
+                hold: Some(hold),
+                deadline,
+                _gate: std::marker::PhantomData,
+            },
         })
     }
 
@@ -495,15 +561,27 @@ impl RecoveryRuntimeOwner {
         pool: &crate::db::pool::DatabasePool,
         pending: crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
         deadline: Instant,
-    ) -> Result<crate::auth::single_user::desktop_local::VerifiedCurrentRestoreInstallationBinding, crate::restore_reconfirmation::RestoreReconfirmationError> {
+    ) -> Result<
+        crate::auth::single_user::desktop_local::VerifiedCurrentRestoreInstallationBinding,
+        crate::restore_reconfirmation::RestoreReconfirmationError,
+    > {
         use crate::restore_reconfirmation::RestoreReconfirmationError as Error;
         let (binding, cohort) = share_runtime(&self.state, |state| {
-            (state.original.published.binding().clone(), state.original.published.restore_cohort())
+            (
+                state.original.published.binding().clone(),
+                state.original.published.restore_cohort(),
+            )
         })
         .map_err(|_| Error::Unavailable)?;
         let site = binding.ordinary_local().map_err(|_| Error::Unavailable)?;
         if cohort.is_none()
-            || pending.ids() != [site.installation_id, site.deployment_id, site.tenant_id, site.dataset_id]
+            || pending.ids()
+                != [
+                    site.installation_id,
+                    site.deployment_id,
+                    site.tenant_id,
+                    site.dataset_id,
+                ]
             || pending.postgres() != (site.pg_system_id, site.database_oid)
         {
             return Err(Error::NotVisible);
@@ -540,18 +618,28 @@ impl RecoveryRuntimeOwner {
         let control = Arc::clone(&state.control);
         let result = (|| {
             if state.close_resources.is_some() {
-                return Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven));
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ClosureUnproven,
+                ));
             }
             state.close_resources = Some(original);
             before(deadline)?;
             let observed_ns = super::clock::monotonic_ns()?;
-            let facts = &state.close_resources.as_ref().expect("original close facts retained").facts;
+            let facts = &state
+                .close_resources
+                .as_ref()
+                .expect("original close facts retained")
+                .facts;
             let owners = &state.original.enrollment.original_owner_set;
             if facts.len() != owners.len()
-                || owners.iter().any(|owner| facts.iter().filter(|fact| fact.owner() == *owner).count() != 1)
+                || owners
+                    .iter()
+                    .any(|owner| facts.iter().filter(|fact| fact.owner() == *owner).count() != 1)
                 || facts.iter().any(|fact| !fact.observed_closed(observed_ns))
             {
-                return Err(RecoveryControlError::new(RecoveryControlFault::ClosureUnproven));
+                return Err(RecoveryControlError::new(
+                    RecoveryControlFault::ClosureUnproven,
+                ));
             }
             self.handle_alive.store(false, Ordering::SeqCst);
             let mut files = entry::lock(&control)?;
@@ -563,17 +651,28 @@ impl RecoveryRuntimeOwner {
                 deadline,
             )?;
             files.pending_owner = Some(files.acquire(
-                "owner.lock", b"WBRCOWN1", FlockOperation::NonBlockingLockExclusive, deadline,
+                "owner.lock",
+                b"WBRCOWN1",
+                FlockOperation::NonBlockingLockExclusive,
+                deadline,
             )?);
             files.pending_admission = Some(files.acquire(
-                "admission.lock", b"WBRCADM1", FlockOperation::NonBlockingLockExclusive, deadline,
+                "admission.lock",
+                b"WBRCADM1",
+                FlockOperation::NonBlockingLockExclusive,
+                deadline,
             )?);
             let admission = files.held_lock_identity(true, deadline)?;
             files.verify_head_digest(state.original.published.digest(), deadline)?;
             let record = CloseRecord {
                 record_type: "wrokbot-runtime-close",
                 version: 1,
-                same_identity_tuple: enrollment(&state.original, state.root, admission, state.runtime_identity),
+                same_identity_tuple: enrollment(
+                    &state.original,
+                    state.root,
+                    admission,
+                    state.runtime_identity,
+                ),
                 enrollment_digest: format!("{:x}", Sha256::digest(&state.enrollment_file.bytes)),
                 original_resource_facts: facts,
                 retained_unknown_effect_refs: [],
@@ -584,18 +683,26 @@ impl RecoveryRuntimeOwner {
             let mut count = Count { used: 0, cap };
             serde_json::to_writer(&mut count, &record)
                 .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-            let backing = count.used.checked_mul(2)
+            let backing = count
+                .used
+                .checked_mul(2)
                 .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
             files.prepay(backing as u64, 0)?;
-            let mut output = FixedBytes { bytes: Vec::new(), cap: count.used };
-            output.bytes.try_reserve_exact(count.used)
+            let mut output = FixedBytes {
+                bytes: Vec::new(),
+                cap: count.used,
+            };
+            output
+                .bytes
+                .try_reserve_exact(count.used)
                 .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
             serde_json::to_writer(&mut output, &record)
                 .map_err(|_| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
             files.runtime_input = output.bytes;
             files.post(deadline)?;
             let input = std::mem::take(&mut files.runtime_input);
-            let published = files.publish_runtime_close_record(&state.runtime_directory, &input, deadline);
+            let published =
+                files.publish_runtime_close_record(&state.runtime_directory, &input, deadline);
             files.runtime_input = input;
             let receipt = published?;
             files.pending_admission = None;
@@ -1407,7 +1514,10 @@ impl LocalSubjectReconfirmation<'_> {
         pool: &crate::db::pool::DatabasePool,
         audit_key: &[u8],
         request: crate::restore_reconfirmation::OriginalReconfirmationRequest,
-    ) -> Result<crate::restore_reconfirmation::ReconfirmationCommitFact, crate::restore_reconfirmation::RestoreReconfirmationError> {
+    ) -> Result<
+        crate::restore_reconfirmation::ReconfirmationCommitFact,
+        crate::restore_reconfirmation::RestoreReconfirmationError,
+    > {
         crate::restore_reconfirmation::confirm_restored_local_subject(
             &self.lease,
             pool,

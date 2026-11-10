@@ -800,21 +800,28 @@ impl DesktopLocalAuthorityStore {
     pub fn load_existing_installation(
         &self,
     ) -> Result<DesktopLocalInstallation, DesktopLocalAuthorityError> {
-        let _guard = self.inner.mutation.lock()
+        let _guard = self
+            .inner
+            .mutation
+            .lock()
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
         let root = self.inner.root.as_path();
         // The recovery owner has already checked the held root; this reader never repairs it.
-        let metadata = fs::symlink_metadata(root)
-            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        let metadata =
+            fs::symlink_metadata(root).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
         }
-        let instance = read_instance(&root.join(FILE_NAME))?
-            .ok_or(DesktopLocalAuthorityError::Corrupt)?;
+        let instance =
+            read_instance(&root.join(FILE_NAME))?.ok_or(DesktopLocalAuthorityError::Corrupt)?;
         let authority = authority(instance);
-        let sidecar_data_dir = root.join(format!("{SIDECAR_DATA_PREFIX}{}", authority.instance_id()));
+        let sidecar_data_dir =
+            root.join(format!("{SIDECAR_DATA_PREFIX}{}", authority.instance_id()));
         validate_existing_sidecar_data_dir(root, &sidecar_data_dir)?;
-        Ok(DesktopLocalInstallation { authority, sidecar_data_dir })
+        Ok(DesktopLocalInstallation {
+            authority,
+            sidecar_data_dir,
+        })
     }
 
     fn load_or_create_locked(
@@ -846,7 +853,7 @@ fn prepare_sidecar_data_dir(
     }
     let path = root.join(format!("{SIDECAR_DATA_PREFIX}{instance_id}"));
     match fs::symlink_metadata(&path) {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let builder = fs::DirBuilder::new();
             #[cfg(unix)]
@@ -867,8 +874,12 @@ fn prepare_sidecar_data_dir(
     Ok(path)
 }
 
-fn validate_existing_sidecar_data_dir(root: &Path, path: &Path) -> Result<(), DesktopLocalAuthorityError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+fn validate_existing_sidecar_data_dir(
+    root: &Path,
+    path: &Path,
+) -> Result<(), DesktopLocalAuthorityError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
     }
@@ -1045,31 +1056,40 @@ fn prepare_root(root: &Path) -> Result<Option<File>, DesktopLocalAuthorityError>
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
         if created {
+            use rustix::fs::{Mode, OFlags};
             use std::os::unix::fs::MetadataExt as _;
             use std::path::Component;
-            use rustix::fs::{Mode, OFlags};
             // Retain the same no-symlink walk and actual private-root checks
             // at the OS-path boundary, including builds without artifact runtime.
-            let mut held = File::open("/")
-                .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?;
+            let mut held =
+                File::open("/").map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?;
             for component in root.components() {
                 match component {
                     Component::RootDir => {}
                     Component::Normal(name) => {
-                        held = File::from(rustix::fs::openat(
-                            &held, name,
-                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                            Mode::empty(),
-                        ).map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?);
+                        held = File::from(
+                            rustix::fs::openat(
+                                &held,
+                                name,
+                                OFlags::RDONLY
+                                    | OFlags::DIRECTORY
+                                    | OFlags::NOFOLLOW
+                                    | OFlags::CLOEXEC,
+                                Mode::empty(),
+                            )
+                            .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?,
+                        );
                     }
                     Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
                         return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
                     }
                 }
             }
-            let metadata = held.metadata()
+            let metadata = held
+                .metadata()
                 .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?;
-            if !metadata.is_dir() || metadata.mode() & 0o7777 != 0o700
+            if !metadata.is_dir()
+                || metadata.mode() & 0o7777 != 0o700
                 || metadata.uid() != rustix::process::geteuid().as_raw()
             {
                 return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
@@ -1313,7 +1333,8 @@ mod tests {
         assert!(store(&missing).load_existing_installation().is_err());
         assert!(!missing.exists());
         let fixture_name = root("existing-reader-positive");
-        let existing = fs::canonicalize(std::env::temp_dir()).unwrap()
+        let existing = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
             .join(fixture_name.file_name().unwrap());
         let installation = store(&existing).load_or_create_installation().unwrap();
         let bytes = fs::read(existing.join(FILE_NAME)).unwrap();

@@ -150,27 +150,35 @@ impl<'a> VerifiedQuiescentInstance<'a> {
                 Err(_) => return Err(PostgresSidecarError::ProcessIdentityInvalid),
             }
         }
-        startup_journal::allows_quiescent_cleanup(app_data_root, instance_id, data_dir, data_dir_name).map_err(
-            |error| match error {
-                StartupJournalError::RecoveryRequired => {
-                    PostgresSidecarError::StartupJournalRecoveryRequired
-                }
-                StartupJournalError::ReconciliationRequired => {
-                    PostgresSidecarError::StartLockGuardInvalid
-                }
-                StartupJournalError::Invalid => PostgresSidecarError::StartLockGuardInvalid,
-            },
-        )?;
-        helper_journal::allows_quiescent_cleanup(app_data_root, instance_id, data_dir, data_dir_name).map_err(
-            |error| match error {
-                HelperJournalError::RecoveryRequired => {
-                    PostgresSidecarError::HelperJournalRecoveryRequired
-                }
-                HelperJournalError::ReconciliationRequired | HelperJournalError::Invalid => {
-                    PostgresSidecarError::StartLockGuardInvalid
-                }
-            },
-        )?;
+        startup_journal::allows_quiescent_cleanup(
+            app_data_root,
+            instance_id,
+            data_dir,
+            data_dir_name,
+        )
+        .map_err(|error| match error {
+            StartupJournalError::RecoveryRequired => {
+                PostgresSidecarError::StartupJournalRecoveryRequired
+            }
+            StartupJournalError::ReconciliationRequired => {
+                PostgresSidecarError::StartLockGuardInvalid
+            }
+            StartupJournalError::Invalid => PostgresSidecarError::StartLockGuardInvalid,
+        })?;
+        helper_journal::allows_quiescent_cleanup(
+            app_data_root,
+            instance_id,
+            data_dir,
+            data_dir_name,
+        )
+        .map_err(|error| match error {
+            HelperJournalError::RecoveryRequired => {
+                PostgresSidecarError::HelperJournalRecoveryRequired
+            }
+            HelperJournalError::ReconciliationRequired | HelperJournalError::Invalid => {
+                PostgresSidecarError::StartLockGuardInvalid
+            }
+        })?;
         if !evidence.is_current(owner) {
             return Err(PostgresSidecarError::StartLockGuardInvalid);
         }
@@ -235,8 +243,8 @@ pub(super) fn recover_mid_phase_journals(
             Err(_) => return Err(PostgresSidecarError::ProcessIdentityInvalid),
         }
     }
-    startup_journal::recover_mid_phase(owner, app_data_root, instance_id, data_dir, data_dir_name).map_err(
-        |error| match error {
+    startup_journal::recover_mid_phase(owner, app_data_root, instance_id, data_dir, data_dir_name)
+        .map_err(|error| match error {
             StartupJournalError::RecoveryRequired => {
                 PostgresSidecarError::StartupJournalRecoveryRequired
             }
@@ -244,18 +252,14 @@ pub(super) fn recover_mid_phase_journals(
                 PostgresSidecarError::StartLockGuardInvalid
             }
             StartupJournalError::Invalid => PostgresSidecarError::StartLockGuardInvalid,
-        },
-    )?;
-    helper_journal::recover_mid_phase(owner, app_data_root, instance_id, data_dir, data_dir_name).map_err(
-        |error| match error {
-            HelperJournalError::RecoveryRequired => {
-                PostgresSidecarError::HelperJournalRecoveryRequired
-            }
-            HelperJournalError::ReconciliationRequired | HelperJournalError::Invalid => {
-                PostgresSidecarError::StartLockGuardInvalid
-            }
-        },
-    )?;
+        })?;
+    helper_journal::recover_mid_phase(owner, app_data_root, instance_id, data_dir, data_dir_name)
+        .map_err(|error| match error {
+        HelperJournalError::RecoveryRequired => PostgresSidecarError::HelperJournalRecoveryRequired,
+        HelperJournalError::ReconciliationRequired | HelperJournalError::Invalid => {
+            PostgresSidecarError::StartLockGuardInvalid
+        }
+    })?;
     if !owner.is_current() {
         return Err(PostgresSidecarError::StartLockGuardInvalid);
     }
@@ -485,7 +489,12 @@ mod tests {
             write_private(&data, b"owned data stays");
             let before = evidence_snapshots(std::slice::from_ref(&data));
             let verified = super::VerifiedQuiescentInstance::try_verify(
-                &owner, &root, &instance, &data_dir, &format!("postgresql-17-{instance}"), &evidence,
+                &owner,
+                &root,
+                &instance,
+                &data_dir,
+                &format!("postgresql-17-{instance}"),
+                &evidence,
             )
             .unwrap();
             assert!(evidence.is_current(&owner));
@@ -865,7 +874,12 @@ mod tests {
             let observed = fs::symlink_metadata(&lock_path).unwrap();
             let verified = after_verify.then(|| {
                 super::VerifiedQuiescentInstance::try_verify(
-                    &owner, &root, &instance, &data_dir, &format!("postgresql-17-{instance}"), &evidence,
+                    &owner,
+                    &root,
+                    &instance,
+                    &data_dir,
+                    &format!("postgresql-17-{instance}"),
+                    &evidence,
                 )
                 .unwrap()
             });
@@ -885,7 +899,12 @@ mod tests {
             assert!(!evidence.is_current(&owner));
             assert!(matches!(
                 super::VerifiedQuiescentInstance::try_verify(
-                    &owner, &root, &instance, &data_dir, &format!("postgresql-17-{instance}"), &evidence
+                    &owner,
+                    &root,
+                    &instance,
+                    &data_dir,
+                    &format!("postgresql-17-{instance}"),
+                    &evidence
                 ),
                 Err(PostgresSidecarError::StartLockGuardInvalid)
             ));
@@ -1024,7 +1043,12 @@ mod tests {
             assert!(!evidence.is_current(&owner));
             assert!(matches!(
                 super::VerifiedQuiescentInstance::try_verify(
-                    &owner, &root, &instance, &data_dir, &format!("postgresql-17-{instance}"), &evidence
+                    &owner,
+                    &root,
+                    &instance,
+                    &data_dir,
+                    &format!("postgresql-17-{instance}"),
+                    &evidence
                 ),
                 Err(PostgresSidecarError::StartLockGuardInvalid)
             ));
@@ -1050,7 +1074,12 @@ mod tests {
         let owner = KernelStartLock::acquire(&root, &instance).unwrap();
         let evidence = super::StartLockEvidence::inspect(&owner, &root, &instance).unwrap();
         let verified = super::VerifiedQuiescentInstance::try_verify(
-            &owner, &root, &instance, &data_dir, &format!("postgresql-17-{instance}"), &evidence,
+            &owner,
+            &root,
+            &instance,
+            &data_dir,
+            &format!("postgresql-17-{instance}"),
+            &evidence,
         )
         .unwrap();
         let epoch = crate::postgres_sidecar::recovery_epoch::mint_or_replace_for_reclaim(
@@ -1299,7 +1328,14 @@ mod tests {
         });
         write_private(&journal, &serde_json::to_vec(&record).unwrap());
         let kernel = KernelStartLock::acquire(&root, &instance).unwrap();
-        super::recover_mid_phase_journals(&kernel, &root, &instance, &data_dir, &format!("postgresql-17-{instance}")).unwrap();
+        super::recover_mid_phase_journals(
+            &kernel,
+            &root,
+            &instance,
+            &data_dir,
+            &format!("postgresql-17-{instance}"),
+        )
+        .unwrap();
         let after_crash_point: serde_json::Value =
             serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
         assert_eq!(after_crash_point["phase"], "exit_confirmed");

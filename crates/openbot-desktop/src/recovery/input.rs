@@ -86,16 +86,25 @@ impl RestoreEntryInput {
         program: &Path,
         request: &Path,
     ) -> Result<Self, DesktopRestoreError> {
-        let bootstrap = release.recovery.as_ref()
-            .ok_or(DesktopRestoreError::InitializationRequired)?.clone();
-        let held_path_bytes = program.as_os_str().len().checked_add(request.as_os_str().len())
+        let bootstrap = release
+            .recovery
+            .as_ref()
+            .ok_or(DesktopRestoreError::InitializationRequired)?
+            .clone();
+        let held_path_bytes = program
+            .as_os_str()
+            .len()
+            .checked_add(request.as_os_str().len())
             .and_then(|bytes| bytes.checked_mul(2))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
             .ok_or(DesktopRestoreError::CapacityExceeded)?;
         if held_path_bytes as u64 > bootstrap.host_limits.max_metadata_bytes {
             return Err(DesktopRestoreError::CapacityExceeded);
         }
-        let original = release.original_release.take().ok_or(DesktopRestoreError::EntryInvalid)?;
+        let original = release
+            .original_release
+            .take()
+            .ok_or(DesktopRestoreError::EntryInvalid)?;
         let mut owner = Self::new();
         owner.release = Some(original);
         owner.bootstrap = Some(bootstrap);
@@ -107,12 +116,22 @@ impl RestoreEntryInput {
         &mut self,
         actual: CurrentOsUserAppDataRoot,
     ) -> Result<(RecoveryControl, VerifiedRecoveryHostIntent), DesktopRestoreError> {
-        let bootstrap = self.bootstrap.as_ref().ok_or(DesktopRestoreError::EntryInvalid)?.clone();
-        let (program_path, request_path) = self.paths.as_ref().ok_or(DesktopRestoreError::EntryInvalid)?.clone();
+        let bootstrap = self
+            .bootstrap
+            .as_ref()
+            .ok_or(DesktopRestoreError::EntryInvalid)?
+            .clone();
+        let (program_path, request_path) = self
+            .paths
+            .as_ref()
+            .ok_or(DesktopRestoreError::EntryInvalid)?
+            .clone();
         let program_path = program_path.as_path();
         let request_path = request_path.as_path();
         let limits = &bootstrap.host_limits;
-        if self.release.is_none() { return Err(DesktopRestoreError::EntryInvalid); }
+        if self.release.is_none() {
+            return Err(DesktopRestoreError::EntryInvalid);
+        }
         let deadline = Instant::now()
             .checked_add(Duration::from_nanos(limits.admission_ns))
             .ok_or(DesktopRestoreError::ProfileInvalid)?;
@@ -203,15 +222,17 @@ impl RestoreEntryInput {
         before(deadline)?;
         let host = VerifiedRecoveryHost::from_local_release(
             self.program.take().expect("original program retained"),
-            self
-                .release
+            self.release
                 .take()
                 .expect("original release retained before source transfer"),
             actual.clone(),
             bootstrap.release_digest,
             limits.clone(),
             bootstrap.bounds,
-            [crate::desktop_release::VAULT_KEY_STORE_SERVICE, crate::desktop_release::POSTGRES_KEY_STORE_SERVICE],
+            [
+                crate::desktop_release::VAULT_KEY_STORE_SERVICE,
+                crate::desktop_release::POSTGRES_KEY_STORE_SERVICE,
+            ],
         );
         match host {
             Ok(host) => self.host = Some(host),

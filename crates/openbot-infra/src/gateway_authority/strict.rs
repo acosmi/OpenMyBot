@@ -488,9 +488,15 @@ mod tests {
         let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
         let (dep, ten) = (DeploymentId::new("dep"), TenantId::new("ten"));
         let scope = Scope {
-            auth: AuthContextBuilder::from_verified_session(dep.clone(), ten.clone(), ActorId::new("alice"), AuthGeneration::new(7), false)
-                .with_role(Role::User)
-                .build(),
+            auth: AuthContextBuilder::from_verified_session(
+                dep.clone(),
+                ten.clone(),
+                ActorId::new("alice"),
+                AuthGeneration::new(7),
+                false,
+            )
+            .with_role(Role::User)
+            .build(),
             deployment: dep,
             tenant: ten.clone(),
             connection_id: Uuid::now_v7(),
@@ -503,7 +509,11 @@ mod tests {
             cancel: CancellationToken::new(),
             deadline: Instant::now() + Duration::from_secs(60),
         };
-        let vault = crate::vault::CredentialRecordVault::single_key(ten, KeyVersion::new(1), WrappingKey::from_bytes(vec![0x46; 32]).unwrap());
+        let vault = crate::vault::CredentialRecordVault::single_key(
+            ten,
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x46; 32]).unwrap(),
+        );
         let secret = Uuid::now_v7();
         let tokens = acosmi::TokenSet {
             access_token: "restored-access-token".into(),
@@ -526,16 +536,36 @@ mod tests {
             VALUES($1,$2,'dep','ten','alice',1,$3,clock_timestamp())", &[&secret, &scope.connection_id, &sealed]).await.unwrap();
         tx.commit().await.unwrap();
         drop(client);
-        let requirement = crate::restore_reconfirmation::tests::bound_requirement(&restored, "sdk_secret", &scope.connection_id.to_string()).await;
-        let inner = AuthorityInner::new(restored.pool.clone(), vault.clone(), SecretBytes::new(vec![0x55; 32]), scope, restored.read_gate());
+        let requirement = crate::restore_reconfirmation::tests::bound_requirement(
+            &restored,
+            "sdk_secret",
+            &scope.connection_id.to_string(),
+        )
+        .await;
+        let inner = AuthorityInner::new(
+            restored.pool.clone(),
+            vault.clone(),
+            SecretBytes::new(vec![0x55; 32]),
+            scope,
+            restored.read_gate(),
+        );
         let _guard = inner.lock().await.unwrap();
 
-        assert!(matches!(inner.load_inner().await, Err(GatewayAuthorityError::ReconciliationRequired)), "unconfirmed sdk secret");
+        assert!(
+            matches!(
+                inner.load_inner().await,
+                Err(GatewayAuthorityError::ReconciliationRequired)
+            ),
+            "unconfirmed sdk secret"
+        );
         assert_eq!(vault.open_calls(), 0, "Vault-open before the receipt");
 
         // Positive control: one receipt for the same requirement loads READY.
         restored.confirm(requirement, "alice", "fresh_actor").await;
-        assert!(matches!(inner.load_inner().await, Ok(AuthorityState::Ready(_))));
+        assert!(matches!(
+            inner.load_inner().await,
+            Ok(AuthorityState::Ready(_))
+        ));
         assert_eq!(vault.open_calls(), 1);
     }
 }

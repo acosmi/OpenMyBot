@@ -195,11 +195,7 @@ impl HelperJournalPreparation {
                 bytes,
                 record,
             } => {
-                let validated = validate_record(
-                    record,
-                    &owner.instance_id,
-                    &owner.data_dir_name,
-                )?;
+                let validated = validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
                 if record.phase != HelperJournalPhase::HelpersComplete {
                     return Err(HelperJournalError::ReconciliationRequired);
                 }
@@ -308,11 +304,7 @@ impl HelperJournal {
         {
             return Err(HelperJournalError::ReconciliationRequired);
         }
-        validate_record(
-            &self.record,
-            &owner.instance_id,
-            &owner.data_dir_name,
-        )?;
+        validate_record(&self.record, &owner.instance_id, &owner.data_dir_name)?;
         Ok(())
     }
 
@@ -472,11 +464,7 @@ fn publish_absent(
     record: &HelperJournalRecord,
     bytes: Vec<u8>,
 ) -> Result<(File, Vec<u8>), HelperJournalError> {
-    validate_record(
-        record,
-        &owner.instance_id,
-        &owner.data_dir_name,
-    )?;
+    validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
         .write_all(&bytes)
@@ -550,11 +538,7 @@ fn replace_exact(
     record: &HelperJournalRecord,
     bytes: Vec<u8>,
 ) -> Result<(File, Vec<u8>), HelperJournalError> {
-    validate_record(
-        record,
-        &owner.instance_id,
-        &owner.data_dir_name,
-    )?;
+    validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
         .write_all(&bytes)

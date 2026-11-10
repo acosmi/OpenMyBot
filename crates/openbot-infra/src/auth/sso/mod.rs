@@ -8,7 +8,9 @@ mod store;
 mod vault;
 
 #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
-pub(crate) use ephemeral::{PostgresSamlAttemptStore, PostgresSsoRouteTicketStore, SsoEphemeralError};
+pub(crate) use ephemeral::{
+    PostgresSamlAttemptStore, PostgresSsoRouteTicketStore, SsoEphemeralError,
+};
 
 pub use config::{
     RegisterIdentityProviderInput, RegisteredIdentityProvider, SsoConfigError, SsoProtocol,

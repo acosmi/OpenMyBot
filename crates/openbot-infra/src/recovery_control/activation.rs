@@ -451,7 +451,13 @@ impl ActivationBinding {
     /// actual PostgreSQL tuple, the restored business IDs, the operation's
     /// epoch and its two target-slot key references (spec revision R484 ¶8134).
     pub(super) fn restored(
-        [dataset_id, deployment_id, tenant_id, source_installation_id, target_installation_id]: [String; 5],
+        [
+            dataset_id,
+            deployment_id,
+            tenant_id,
+            source_installation_id,
+            target_installation_id,
+        ]: [String; 5],
         generation_id: String,
         generation_root: RecoveryFileIdentity,
         (pg_system_id, database_oid): (u64, u32),
@@ -842,8 +848,19 @@ pub(super) struct CandidatePlan {
     pub(super) generation_id: String,
 }
 impl CandidatePlan {
-    pub(super) fn local(trusted_parent: RecoveryFileIdentity, entry_component: String, installation_id: String, generation_id: String) -> Self {
-        Self { site_kind: LocalPhysicalSiteKind::LocalPhysical, trusted_parent, entry_component, installation_id, generation_id }
+    pub(super) fn local(
+        trusted_parent: RecoveryFileIdentity,
+        entry_component: String,
+        installation_id: String,
+        generation_id: String,
+    ) -> Self {
+        Self {
+            site_kind: LocalPhysicalSiteKind::LocalPhysical,
+            trusted_parent,
+            entry_component,
+            installation_id,
+            generation_id,
+        }
     }
     pub(super) fn validate(
         &self,
@@ -954,10 +971,13 @@ pub(super) struct PublishedActivation {
 impl ActivationRecord {
     pub(super) fn first_pending(control_id: &str, pending: Pending) -> Self {
         Self {
-            record_type: "wrokbot-recovery-activation".to_owned(), version: 1,
-            control_id: control_id.to_owned(), revision: 1,
+            record_type: "wrokbot-recovery-activation".to_owned(),
+            version: 1,
+            control_id: control_id.to_owned(),
+            revision: 1,
             previous_digest: RequiredNullable::Null(()),
-            phase: ActivationPhase::RestorePending, data: ActivationPayload::Pending(pending),
+            phase: ActivationPhase::RestorePending,
+            data: ActivationPayload::Pending(pending),
         }
     }
     /// Revision 1 of a new control root.

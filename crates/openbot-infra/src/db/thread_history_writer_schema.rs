@@ -1623,9 +1623,7 @@ pub(crate) async fn observation_bytes_in_transaction(
     let payload: i64 = row.try_get(0).map_err(|source| {
         RowDecodeError::column("(thread_history_writer_schema)", "bytes", source)
     })?;
-    u64::try_from(payload)
-        .ok()
-        .ok_or_else(|| corrupt("facts"))
+    u64::try_from(payload).ok().ok_or_else(|| corrupt("facts"))
 }
 /// Schema-only historical51 helper after an explicit exact pre-upgrade prefix proof.
 pub(crate) async fn verify_schema_legacy0051(client: &Client) -> Result<(), InfraError> {

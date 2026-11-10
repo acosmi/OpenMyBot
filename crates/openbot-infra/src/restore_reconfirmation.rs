@@ -143,8 +143,13 @@ impl OriginalReconfirmationRequest {
         cancel: CancellationToken,
         request_id: Uuid,
     ) -> Self {
-        Self { deadline, cancel, confirmation_id: Uuid::now_v7(), proof_ref: request_id,
-            confirmations_left: 1 }
+        Self {
+            deadline,
+            cancel,
+            confirmation_id: Uuid::now_v7(),
+            proof_ref: request_id,
+            confirmations_left: 1,
+        }
     }
 }
 #[cfg(feature = "server-runtime")]
@@ -602,12 +607,21 @@ pub(crate) async fn confirm_restored_local_subject(
     mut request: OriginalReconfirmationRequest,
 ) -> Result<ReconfirmationCommitFact, RestoreReconfirmationError> {
     let deadline = request.deadline;
-    let cohort = lease.restore_cohort().ok_or(RestoreReconfirmationError::Unavailable)?;
-    if request.confirmations_left != 1 || request.cancel.is_cancelled() || deadline > lease.deadline() {
+    let cohort = lease
+        .restore_cohort()
+        .ok_or(RestoreReconfirmationError::Unavailable)?;
+    if request.confirmations_left != 1
+        || request.cancel.is_cancelled()
+        || deadline > lease.deadline()
+    {
         return Err(RestoreReconfirmationError::Unavailable);
     }
     request.confirmations_left = 0;
-    let current = || lease.verify_current_before(deadline).map_err(|_| RestoreReconfirmationError::Unavailable);
+    let current = || {
+        lease
+            .verify_current_before(deadline)
+            .map_err(|_| RestoreReconfirmationError::Unavailable)
+    };
     current()?;
     let operation_id = Uuid::from_bytes(cohort.operation_id);
     let mut client = pool
@@ -621,7 +635,10 @@ pub(crate) async fn confirm_restored_local_subject(
     let tx = owner.as_transaction();
     let prepare = async {
         let birth: OffsetDateTime = tx
-            .query_opt("SELECT created_at FROM public.users WHERE id=$1 FOR SHARE", &[&actor])
+            .query_opt(
+                "SELECT created_at FROM public.users WHERE id=$1 FOR SHARE",
+                &[&actor],
+            )
             .await
             .map_err(|_| RestoreReconfirmationError::Unavailable)?
             .ok_or(RestoreReconfirmationError::NotVisible)?
@@ -666,8 +683,17 @@ pub(crate) async fn confirm_restored_local_subject(
             "INSERT INTO openbot_internal.restore_reconfirm_receipts \
              (operation_id,epoch,requirement_id,confirmation_id,proof_ref,confirmed_by,proof_kind) \
              VALUES($1,$2,$3,$4,$5,$6,'fresh_local_os') ON CONFLICT(requirement_id) DO NOTHING",
-            &[&operation_id, &cohort.epoch.as_slice(), &requirement, &request.confirmation_id, &request.proof_ref, &actor],
-        ).await.map_err(|_| RestoreReconfirmationError::Unavailable)?;
+            &[
+                &operation_id,
+                &cohort.epoch.as_slice(),
+                &requirement,
+                &request.confirmation_id,
+                &request.proof_ref,
+                &actor,
+            ],
+        )
+        .await
+        .map_err(|_| RestoreReconfirmationError::Unavailable)?;
         Ok::<_, RestoreReconfirmationError>(requirement)
     };
     let requirement = tokio::select! {
@@ -702,11 +728,16 @@ pub(crate) async fn confirm_restored_local_subject(
         // The consumers' own readback must accept this receipt as confirming.
         require_confirmed_before(
             client.as_client(),
-            RequirementSource { cohort: Some(cohort), kind: RequirementKind::Subject, source_ref: actor },
+            RequirementSource {
+                cohort: Some(cohort),
+                kind: RequirementKind::Subject,
+                source_ref: actor,
+            },
             deadline,
         )
         .await?;
-        row.try_get::<_, Uuid>(0).map_err(|_| RestoreReconfirmationError::Unavailable)
+        row.try_get::<_, Uuid>(0)
+            .map_err(|_| RestoreReconfirmationError::Unavailable)
     };
     let confirmation_id = tokio::select! {
         biased;
@@ -714,7 +745,10 @@ pub(crate) async fn confirm_restored_local_subject(
         result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), readback) => result.map_err(|_| RestoreReconfirmationError::Unavailable)??,
     };
     current()?;
-    Ok(ReconfirmationCommitFact { requirement_id: requirement, confirmation_id })
+    Ok(ReconfirmationCommitFact {
+        requirement_id: requirement,
+        confirmation_id,
+    })
 }
 
 #[cfg(feature = "server-runtime")]
@@ -1044,11 +1078,20 @@ mod local_subject {
         };
 
         assert!(matches!(
-            restored.runtime.current_restore_installation_before(&restored.pool, pending(oid), deadline()).await,
+            restored
+                .runtime
+                .current_restore_installation_before(&restored.pool, pending(oid), deadline())
+                .await,
             Err(RestoreReconfirmationError::NotConfirmed)
         ));
-        let other = restored.runtime.admit_restored_local_subject_before(&pending(oid + 1), 0, deadline());
-        assert!(matches!(other, Err(RestoreReconfirmationError::NotVisible)), "another installation's facts");
+        let other =
+            restored
+                .runtime
+                .admit_restored_local_subject_before(&pending(oid + 1), 0, deadline());
+        assert!(
+            matches!(other, Err(RestoreReconfirmationError::NotVisible)),
+            "another installation's facts"
+        );
         let cancel = CancellationToken::new();
         cancel.cancel();
         let cancelled = restored
@@ -1057,14 +1100,21 @@ mod local_subject {
             .unwrap()
             .confirm_before(&restored.pool, audit_key.expose(), request(cancel))
             .await;
-        assert!(matches!(cancelled, Err(RestoreReconfirmationError::Unavailable)));
+        assert!(matches!(
+            cancelled,
+            Err(RestoreReconfirmationError::Unavailable)
+        ));
         assert_eq!(receipts().await, 0, "a cancelled request wrote a receipt");
 
         let fact = restored
             .runtime
             .admit_restored_local_subject_before(&pending(oid), 0, deadline())
             .unwrap()
-            .confirm_before(&restored.pool, audit_key.expose(), request(CancellationToken::new()))
+            .confirm_before(
+                &restored.pool,
+                audit_key.expose(),
+                request(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert_eq!(receipts().await, 1);
@@ -1076,13 +1126,20 @@ mod local_subject {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(audited, 1, "the receipt's audit event is in its transaction");
+        assert_eq!(
+            audited, 1,
+            "the receipt's audit event is in its transaction"
+        );
         // A second request adds no receipt and reads back the first.
         let again = restored
             .runtime
             .admit_restored_local_subject_before(&pending(oid), 0, deadline())
             .unwrap()
-            .confirm_before(&restored.pool, audit_key.expose(), request(CancellationToken::new()))
+            .confirm_before(
+                &restored.pool,
+                audit_key.expose(),
+                request(CancellationToken::new()),
+            )
             .await
             .unwrap();
         assert_eq!(again.confirmation_id(), fact.confirmation_id());

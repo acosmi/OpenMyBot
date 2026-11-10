@@ -48,7 +48,14 @@ impl<'a> PostgresDataDisposition<'a> {
         let Some(root) = owner.path.parent() else {
             return false;
         };
-        if validate_supervisor_paths(root, &owner.instance_id, &owner.data_dir_name, &self.data_dir).is_err() {
+        if validate_supervisor_paths(
+            root,
+            &owner.instance_id,
+            &owner.data_dir_name,
+            &self.data_dir,
+        )
+        .is_err()
+        {
             return false;
         }
         data_directory_origin(&self.data_dir).is_ok_and(|origin| origin == self.origin)
@@ -76,11 +83,7 @@ impl<'a> PostgresDataDisposition<'a> {
 
     #[cfg(test)]
     pub(crate) fn for_test(owner: &'a PostgresStartLock, origin: PostgresSidecarOrigin) -> Self {
-        let data = owner
-            .path
-            .parent()
-            .unwrap()
-            .join(&*owner.data_dir_name);
+        let data = owner.path.parent().unwrap().join(&*owner.data_dir_name);
         std::fs::create_dir_all(&data).unwrap();
         #[cfg(unix)]
         {

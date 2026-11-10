@@ -11,12 +11,12 @@ use openbot_application::tenant::package::LoadedTenantPackage;
 use openbot_contracts::auth::AuthContext;
 use openbot_domain::vault::secret::SecretBytes;
 use openbot_infra::artifact_registry::ArtifactDatasetRegistry;
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+use openbot_infra::auth::single_user::desktop_local::RestoredLocalSite;
 use openbot_infra::auth::single_user::desktop_local::{
     DesktopLocalAuthority, DesktopLocalBootstrapError, DesktopLocalBootstrapReport,
     DesktopLocalInstallation,
 };
-#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-use openbot_infra::auth::single_user::desktop_local::RestoredLocalSite;
 use openbot_infra::db::desktop_local::{
     DesktopLocalDatabase, DesktopLocalDatabaseError, DesktopLocalDatabaseOrigin,
     connect_for_attestation,
@@ -350,7 +350,10 @@ impl RunningDesktopLocalDataPlane {
 
     /// Close the application pool, then stop the exact child through its verified `pg_ctl` before
     /// releasing the single-instance lock.
-    #[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+    )]
     pub async fn shutdown(
         mut self,
     ) -> Result<
@@ -426,7 +429,10 @@ impl PreparedDesktopLocalDataPlane<RestoredLocalSite> {
 
     /// The installation formed only after this generation's Current gate
     /// (spec revision R484 ¶8024) takes over the same running data plane.
-    pub(crate) fn into_current(self, installation: DesktopLocalInstallation) -> PreparedDesktopLocalDataPlane {
+    pub(crate) fn into_current(
+        self,
+        installation: DesktopLocalInstallation,
+    ) -> PreparedDesktopLocalDataPlane {
         PreparedDesktopLocalDataPlane {
             initialization_deadlines: self.initialization_deadlines,
             database: self.database,
@@ -462,7 +468,10 @@ impl<S> PreparedDesktopLocalDataPlane<S> {
     }
 
     pub(crate) fn ensure_owner_current(&self) -> Result<(), DesktopLocalCompositionError> {
-        if self.initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+        if self
+            .initialization_deadlines
+            .is_some_and(|(effect, _)| std::time::Instant::now() >= effect)
+        {
             return Err(DesktopLocalCompositionError::InstallationMismatch);
         }
         self.sidecar
@@ -471,7 +480,6 @@ impl<S> PreparedDesktopLocalDataPlane<S> {
             .ensure_owner_current()
             .map_err(|_| DesktopLocalCompositionError::InstallationMismatch)
     }
-
 }
 
 impl PreparedDesktopLocalDataPlane {
@@ -511,7 +519,10 @@ impl PreparedDesktopLocalDataPlane {
         Ok(origin)
     }
 
-    #[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+    )]
     pub(crate) async fn complete_after_vault(
         mut self,
         package: &LoadedTenantPackage,
@@ -702,11 +713,13 @@ impl PreparedDesktopLocalDataPlane {
             artifact_datasets: std::sync::Arc::new(artifact_datasets),
         })
     }
-
 }
 
 impl<S> PreparedDesktopLocalDataPlane<S> {
-    #[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+    )]
     pub(crate) async fn shutdown(
         mut self,
     ) -> Result<
@@ -761,8 +774,13 @@ impl<S> PreparedDesktopLocalDataPlane<S> {
             },
             Err((error, outcome)) => Err((
                 if self.initialization_deadlines.is_some() {
-                    DesktopLocalCompositionError::LegacySidecarShutdown { original: None, error }
-                } else { DesktopLocalCompositionError::SidecarShutdown },
+                    DesktopLocalCompositionError::LegacySidecarShutdown {
+                        original: None,
+                        error,
+                    }
+                } else {
+                    DesktopLocalCompositionError::SidecarShutdown
+                },
                 Err(outcome),
                 sql,
             )),
@@ -866,7 +884,10 @@ pub async fn prepare_running_sidecar(
     feature = "postgres-maintenance",
     target_os = "macos"
 ))]
-#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+)]
 pub(crate) async fn prepare_running_sidecar_retained(
     installation: DesktopLocalInstallation,
     sidecar: RunningPostgresSidecar,
@@ -898,7 +919,10 @@ pub(crate) async fn prepare_running_sidecar_retained(
 /// Prepare the selected restored generation's running child the same way, before any
 /// installation authority exists; no package or database creation is involved.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+)]
 pub(crate) async fn prepare_restored_sidecar(
     site: RestoredLocalSite,
     sidecar: RunningPostgresSidecar,
@@ -935,13 +959,17 @@ pub(crate) enum RestoredOpenFailure {
 pub(crate) struct OpenedRestoredGeneration {
     pub(crate) data_plane: PreparedDesktopLocalDataPlane<RestoredLocalSite>,
     pub(crate) vault: crate::desktop_vault::VaultReadyDesktopMaterial,
-    pub(crate) pending: openbot_infra::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
+    pub(crate) pending:
+        openbot_infra::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding,
 }
 
 /// Start the selected generation `runtime` names with its SCRAM slot, attest it, open its Vault
 /// with its master slot and read it back against the published binding.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+)]
 pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
     runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
     site: RestoredLocalSite,
@@ -965,27 +993,47 @@ pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecret
     )
     .await
     .map_err(|(error, outcome)| {
-        (RestoredOpenFailure::Sidecar(error), Err(outcome), SqlDriverOutcome::NeverStarted)
+        (
+            RestoredOpenFailure::Sidecar(error),
+            Err(outcome),
+            SqlDriverOutcome::NeverStarted,
+        )
     })?;
     let data_plane = prepare_restored_sidecar(site, sidecar)
         .await
         .map_err(|(error, sidecar, sql)| (RestoredOpenFailure::DataPlane(error), sidecar, sql))?;
-    let vault = match data_plane.verify_restored_key_material(store, vault_service).await {
+    let vault = match data_plane
+        .verify_restored_key_material(store, vault_service)
+        .await
+    {
         Ok(vault) => vault,
         Err(error) => {
-            let (_, sidecar, sql) = data_plane.cleanup_with(DesktopLocalCompositionError::SidecarShutdown).await;
+            let (_, sidecar, sql) = data_plane
+                .cleanup_with(DesktopLocalCompositionError::SidecarShutdown)
+                .await;
             return Err((RestoredOpenFailure::Vault(error), sidecar, sql));
         }
     };
     let services = [vault_service.as_str(), postgres_service.as_str()];
     let pending = runtime
-        .verify_restored_local_before(data_plane.database(), vault.canary(), services, data_plane.site())
+        .verify_restored_local_before(
+            data_plane.database(),
+            vault.canary(),
+            services,
+            data_plane.site(),
+        )
         .await;
     match pending {
-        Ok(pending) => Ok(OpenedRestoredGeneration { data_plane, vault, pending }),
+        Ok(pending) => Ok(OpenedRestoredGeneration {
+            data_plane,
+            vault,
+            pending,
+        }),
         Err(error) => {
             drop(vault);
-            let (_, sidecar, sql) = data_plane.cleanup_with(DesktopLocalCompositionError::SidecarShutdown).await;
+            let (_, sidecar, sql) = data_plane
+                .cleanup_with(DesktopLocalCompositionError::SidecarShutdown)
+                .await;
             Err((RestoredOpenFailure::Control(error), sidecar, sql))
         }
     }
@@ -996,7 +1044,10 @@ pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecret
 /// its installation, which takes over the same running data plane (spec
 /// revision R484 ¶8024, ¶8089). A Pending binding never reaches a factory.
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+)]
 pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecretStore + ?Sized>(
     runtime: &mut openbot_infra::recovery_control::RecoveryRuntimeOwner,
     site: RestoredLocalSite,
@@ -1005,21 +1056,41 @@ pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecre
     postgres_service: &crate::postgres_sidecar::ReviewedPostgresKeyStoreService,
     vault_service: &crate::desktop_vault::ReviewedDesktopVaultKeyStoreService,
 ) -> Result<
-    (DesktopLocalInstallation, PreparedDesktopLocalDataPlane, crate::desktop_vault::VaultReadyDesktopMaterial),
+    (
+        DesktopLocalInstallation,
+        PreparedDesktopLocalDataPlane,
+        crate::desktop_vault::VaultReadyDesktopMaterial,
+    ),
     (
         RestoredOpenFailure,
         Result<SidecarExit, SidecarOutcome>,
         SqlDriverOutcome,
     ),
 > {
-    let OpenedRestoredGeneration { data_plane, vault, pending } =
-        open_restored_generation(runtime, site, bundle, store, postgres_service, vault_service).await?;
+    let OpenedRestoredGeneration {
+        data_plane,
+        vault,
+        pending,
+    } = open_restored_generation(
+        runtime,
+        site,
+        bundle,
+        store,
+        postgres_service,
+        vault_service,
+    )
+    .await?;
     let gate = runtime
-        .current_restore_installation_before(data_plane.pool(), pending, std::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT)
+        .current_restore_installation_before(
+            data_plane.pool(),
+            pending,
+            std::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT,
+        )
         .await
         .map_err(RestoredOpenFailure::Gate)
         .and_then(|current| {
-            DesktopLocalInstallation::from_verified_current_restore(current).map_err(|_| RestoredOpenFailure::Authority)
+            DesktopLocalInstallation::from_verified_current_restore(current)
+                .map_err(|_| RestoredOpenFailure::Authority)
         });
     match gate {
         Ok(installation) => {
@@ -1028,7 +1099,9 @@ pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecre
         }
         Err(failure) => {
             drop(vault);
-            let (_, sidecar, sql) = data_plane.cleanup_with(DesktopLocalCompositionError::SidecarShutdown).await;
+            let (_, sidecar, sql) = data_plane
+                .cleanup_with(DesktopLocalCompositionError::SidecarShutdown)
+                .await;
             Err((failure, sidecar, sql))
         }
     }
@@ -1041,7 +1114,10 @@ trait DataPlaneSite {
         &self,
         admin: openbot_infra::db::desktop_local::UnattestedDesktopLocalAdmin,
     ) -> impl std::future::Future<
-        Output = Result<openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin, DesktopLocalBootstrapError>,
+        Output = Result<
+            openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin,
+            DesktopLocalBootstrapError,
+        >,
     > + Send;
 }
 
@@ -1053,7 +1129,10 @@ impl DataPlaneSite for DesktopLocalInstallation {
         &self,
         admin: openbot_infra::db::desktop_local::UnattestedDesktopLocalAdmin,
     ) -> impl std::future::Future<
-        Output = Result<openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin, DesktopLocalBootstrapError>,
+        Output = Result<
+            openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin,
+            DesktopLocalBootstrapError,
+        >,
     > + Send {
         self.attest_postgres_admin(admin)
     }
@@ -1068,13 +1147,19 @@ impl DataPlaneSite for RestoredLocalSite {
         &self,
         admin: openbot_infra::db::desktop_local::UnattestedDesktopLocalAdmin,
     ) -> impl std::future::Future<
-        Output = Result<openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin, DesktopLocalBootstrapError>,
+        Output = Result<
+            openbot_infra::db::desktop_local::AttestedDesktopLocalAdmin,
+            DesktopLocalBootstrapError,
+        >,
     > + Send {
         self.attest_postgres_admin(admin)
     }
 }
 
-#[expect(clippy::result_large_err, reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission")]
+#[expect(
+    clippy::result_large_err,
+    reason = "Return the original sidecar and SQL-driver failure custody without allocating after failed admission"
+)]
 async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
     installation: S,
     sidecar: RunningPostgresSidecar,
@@ -1089,8 +1174,14 @@ async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
         SqlDriverOutcome,
     ),
 > {
-    let step_deadline = || initialization_deadlines.map(|(effect, _)| tokio::time::Instant::from_std(effect))
-        .map_or(tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT, |effect| effect.min(tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT));
+    let step_deadline = || {
+        initialization_deadlines
+            .map(|(effect, _)| tokio::time::Instant::from_std(effect))
+            .map_or(
+                tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT,
+                |effect| effect.min(tokio::time::Instant::now() + STARTUP_DB_STEP_TIMEOUT),
+            )
+    };
     if sidecar.data_dir() != installation.data_dir() {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
@@ -1112,7 +1203,9 @@ async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
 
-    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+    if sidecar.ensure_owner_current().is_err()
+        || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect)
+    {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
@@ -1160,7 +1253,9 @@ async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
             return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
         }
     };
-    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+    if sidecar.ensure_owner_current().is_err()
+        || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect)
+    {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
@@ -1170,13 +1265,10 @@ async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
         .await;
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
-    let admin = match tokio::time::timeout_at(
-        step_deadline(),
-        installation.attest(admin),
-    )
-    .await
-    .map_err(|_| DesktopLocalBootstrapError::PostgresAttestationUnavailable)
-    .and_then(std::convert::identity)
+    let admin = match tokio::time::timeout_at(step_deadline(), installation.attest(admin))
+        .await
+        .map_err(|_| DesktopLocalBootstrapError::PostgresAttestationUnavailable)
+        .and_then(std::convert::identity)
     {
         Ok(admin) => admin,
         Err(error) => {
@@ -1190,7 +1282,9 @@ async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
             return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
         }
     };
-    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
+    if sidecar.ensure_owner_current().is_err()
+        || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect)
+    {
         let (error, sidecar, _) = cleanup_after_failure_with_custody(
             sidecar,
             DesktopLocalCompositionError::InstallationMismatch,
@@ -1201,46 +1295,46 @@ async fn prepare_running_sidecar_inner<S: DataPlaneSite>(
         return Err((error, sidecar, SqlDriverOutcome::NeverStarted));
     }
     let allow_create = sidecar.origin() == PostgresSidecarOrigin::Fresh;
-    let database = match tokio::time::timeout_at(
-        step_deadline(),
-        admin.connect_application(allow_create),
-    )
-    .await
-    .map_err(|_| DesktopLocalDatabaseError::ShapeInvalid)
-    .and_then(std::convert::identity)
+    let database =
+        match tokio::time::timeout_at(step_deadline(), admin.connect_application(allow_create))
+            .await
+            .map_err(|_| DesktopLocalDatabaseError::ShapeInvalid)
+            .and_then(std::convert::identity)
+        {
+            Ok(database) => database,
+            Err(error) => {
+                let never_started = matches!(
+                    error,
+                    DesktopLocalDatabaseError::Missing
+                        | DesktopLocalDatabaseError::Inspect(_)
+                        | DesktopLocalDatabaseError::Create(_)
+                );
+                let (error, sidecar, joined) = cleanup_after_failure_with_custody(
+                    sidecar,
+                    DesktopLocalCompositionError::Database(error),
+                    &mut custody,
+                    initialization_deadlines.map(|(_, convergence)| convergence),
+                )
+                .await;
+                let sql = if never_started {
+                    SqlDriverOutcome::NeverStarted
+                } else {
+                    match joined {
+                        #[cfg(all(
+                            feature = "desktop-launcher",
+                            feature = "postgres-maintenance",
+                            target_os = "macos"
+                        ))]
+                        Some(destructions) => SqlDriverOutcome::Joined(destructions),
+                        _ => SqlDriverOutcome::Unknown,
+                    }
+                };
+                return Err((error, sidecar, sql));
+            }
+        };
+    if sidecar.ensure_owner_current().is_err()
+        || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect)
     {
-        Ok(database) => database,
-        Err(error) => {
-            let never_started = matches!(
-                error,
-                DesktopLocalDatabaseError::Missing
-                    | DesktopLocalDatabaseError::Inspect(_)
-                    | DesktopLocalDatabaseError::Create(_)
-            );
-            let (error, sidecar, joined) = cleanup_after_failure_with_custody(
-                sidecar,
-                DesktopLocalCompositionError::Database(error),
-                &mut custody,
-                initialization_deadlines.map(|(_, convergence)| convergence),
-            )
-            .await;
-            let sql = if never_started {
-                SqlDriverOutcome::NeverStarted
-            } else {
-                match joined {
-                    #[cfg(all(
-                        feature = "desktop-launcher",
-                        feature = "postgres-maintenance",
-                        target_os = "macos"
-                    ))]
-                    Some(destructions) => SqlDriverOutcome::Joined(destructions),
-                    _ => SqlDriverOutcome::Unknown,
-                }
-            };
-            return Err((error, sidecar, sql));
-        }
-    };
-    if sidecar.ensure_owner_current().is_err() || initialization_deadlines.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
         let observations = database.pool().connection_observations();
         database.close();
         let (error, sidecar, joined) = cleanup_after_failure_with_custody(
@@ -1388,8 +1482,13 @@ async fn cleanup_after_failure(
         Ok(exit) => (original, Ok(exit)),
         Err((error, outcome)) => (
             if convergence.is_some() {
-                DesktopLocalCompositionError::LegacySidecarShutdown { original: Some(Box::new(original)), error }
-            } else { DesktopLocalCompositionError::FailureCleanup },
+                DesktopLocalCompositionError::LegacySidecarShutdown {
+                    original: Some(Box::new(original)),
+                    error,
+                }
+            } else {
+                DesktopLocalCompositionError::FailureCleanup
+            },
             Err(outcome),
         ),
     }

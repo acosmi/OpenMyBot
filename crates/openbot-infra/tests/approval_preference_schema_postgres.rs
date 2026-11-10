@@ -305,14 +305,20 @@ async fn native43_fresh_keeps_public_and_artifact_oracles_and_is_idempotent() {
             // migrations are no-ops. The original approval oracle and prefix stay fixed.
             native::apply(&mut client).await.unwrap();
             approval_preference_schema::verify(&client).await.unwrap();
-            assert_eq!(approval_preference_schema::capture(&client).await.unwrap(), expected);
+            assert_eq!(
+                approval_preference_schema::capture(&client).await.unwrap(),
+                expected
+            );
             let current = ledger(&client).await;
             assert_eq!(&current[..before.len()], before.as_slice());
             assert_eq!(
                 current.iter().map(|row| row.0).collect::<Vec<_>>(),
                 (13..=native::NATIVE_LATEST_VERSION).collect::<Vec<_>>()
             );
-            assert_eq!(native::apply(&mut client).await.unwrap(), native::ApplyOutcome::AlreadyApplied);
+            assert_eq!(
+                native::apply(&mut client).await.unwrap(),
+                native::ApplyOutcome::AlreadyApplied
+            );
             assert_eq!(ledger(&client).await, current);
             assert_eq!(business_rows(&client).await, empty);
             drop(client);

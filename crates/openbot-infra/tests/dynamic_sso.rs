@@ -109,9 +109,15 @@ fn service_with_dialer(
     pool: &openbot_infra::db::pool::DatabasePool,
     dialer: SafeDialer,
 ) -> DynamicSsoService {
-    service_with_gate(pool, dialer, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-        pool, &openbot_contracts::ids::DeploymentId::new("dep-1"), &TenantId::new("tenant-1"),
-    ))
+    service_with_gate(
+        pool,
+        dialer,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            pool,
+            &openbot_contracts::ids::DeploymentId::new("dep-1"),
+            &TenantId::new("tenant-1"),
+        ),
+    )
 }
 
 pub(crate) fn service_with_gate(
@@ -682,14 +688,21 @@ async fn spawn_oidc_idp(
     ),
     String,
 > {
-    spawn_oidc_idp_requests(auth_params,calls,5).await
+    spawn_oidc_idp_requests(auth_params, calls, 5).await
 }
 
 pub(crate) async fn spawn_oidc_idp_requests(
     auth_params: Arc<Mutex<Option<OidcAuthorizationParams>>>,
     calls: Arc<AtomicUsize>,
     requests: usize,
-) -> Result<(SocketAddr, CertificateDer<'static>, tokio::task::JoinHandle<Result<(), String>>), String> {
+) -> Result<
+    (
+        SocketAddr,
+        CertificateDer<'static>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ),
+    String,
+> {
     let root = CertificateDer::from(
         BASE64_STANDARD
             .decode(TLS_CA_DER)

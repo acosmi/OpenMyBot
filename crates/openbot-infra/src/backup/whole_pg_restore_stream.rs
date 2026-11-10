@@ -358,7 +358,10 @@ pub(crate) mod input {
         secrets: AuthenticatedRestoreSecrets,
     }
 
-    #[expect(clippy::result_large_err, reason = "Failure keeps the original inline input custody without a new allocation after admission failure")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure keeps the original inline input custody without a new allocation after admission failure"
+    )]
     fn authenticate_whole_pg_restore_carrier_before(
         mut input: FrozenWholePgRestoreInput,
         intent: ReviewedWholePgRestoreIntent,
@@ -1202,8 +1205,14 @@ pub(crate) mod input {
 
         pub(crate) fn placed_artifact_root(&self) -> Option<&File> {
             let work = self.work();
-            if !work.artifact_placed { return None; }
-            work.directories.iter().find(|directory| directory.relative.as_deref() == Some("artifacts"))?.file.as_ref()
+            if !work.artifact_placed {
+                return None;
+            }
+            work.directories
+                .iter()
+                .find(|directory| directory.relative.as_deref() == Some("artifacts"))?
+                .file
+                .as_ref()
         }
 
         /// Called only after the bound candidate's source binding has matched.
@@ -1219,30 +1228,57 @@ pub(crate) mod input {
             let mut control_error = None;
             let result = (|| -> Result<(), WholePgCarrierFault> {
                 let work = input.staging.as_ref().expect("verified staging owner");
-                if let Some(fault) = work.artifact_fault { return Err(fault); }
+                if let Some(fault) = work.artifact_fault {
+                    return Err(fault);
+                }
                 if work.artifact_placed || work.artifact_source.is_none() {
                     return Err(WholePgCarrierFault::IntentMismatch);
                 }
-                verify_staging_directory_membership(input, session, deadline, &mut control_error, true)?;
+                verify_staging_directory_membership(
+                    input,
+                    session,
+                    deadline,
+                    &mut control_error,
+                    true,
+                )?;
                 let manifest = input.manifest.as_ref().expect("verified manifest");
                 let work = input.staging.as_mut().expect("verified staging owner");
-                let root = work.directories.iter().position(|directory| {
-                    directory.relative.as_deref() == Some("materials/artifact-spool")
-                }).ok_or(WholePgCarrierFault::MaterialMissing)?;
-                let source_parent = work.directories[root].parent.ok_or(WholePgCarrierFault::PathUnsafe)?;
+                let root = work
+                    .directories
+                    .iter()
+                    .position(|directory| {
+                        directory.relative.as_deref() == Some("materials/artifact-spool")
+                    })
+                    .ok_or(WholePgCarrierFault::MaterialMissing)?;
+                let source_parent = work.directories[root]
+                    .parent
+                    .ok_or(WholePgCarrierFault::PathUnsafe)?;
                 let mut marker = None;
                 // Reuse the original prepaid decode buffer; no artifact-sized allocation.
                 let chunk = input.buffer.capacity().min(65536);
-                if chunk == 0 { return Err(WholePgCarrierFault::CapacityExceeded); }
+                if chunk == 0 {
+                    return Err(WholePgCarrierFault::CapacityExceeded);
+                }
                 for (ordinal, material) in manifest.materials().iter().enumerate() {
-                    if material.kind != WholePgMaterialKind::Artifact { continue; }
-                    let source = work.materials[ordinal].file.as_ref().ok_or(WholePgCarrierFault::MaterialMissing)?;
+                    if material.kind != WholePgMaterialKind::Artifact {
+                        continue;
+                    }
+                    let source = work.materials[ordinal]
+                        .file
+                        .as_ref()
+                        .ok_or(WholePgCarrierFault::MaterialMissing)?;
                     stage_effect(session, deadline, &mut control_error)?;
                     work.metadata = Some(source.metadata());
                     stage_effect(session, deadline, &mut control_error)?;
-                    let before = RestoreInputFileIdentity::from_metadata(work.metadata.as_ref()
-                        .and_then(|raw| raw.as_ref().ok()).ok_or(WholePgCarrierFault::IoFailure)?)?;
-                    if Some(before) != work.materials[ordinal].stamp || before.length != material.plain_len {
+                    let before = RestoreInputFileIdentity::from_metadata(
+                        work.metadata
+                            .as_ref()
+                            .and_then(|raw| raw.as_ref().ok())
+                            .ok_or(WholePgCarrierFault::IoFailure)?,
+                    )?;
+                    if Some(before) != work.materials[ordinal].stamp
+                        || before.length != material.plain_len
+                    {
                         return Err(WholePgCarrierFault::SourceChanged);
                     }
                     let mut hash = Sha256::new();
@@ -1251,61 +1287,118 @@ pub(crate) mod input {
                         let count = (material.plain_len - offset).min(chunk as u64) as usize;
                         input.buffer.resize(count, 0);
                         stage_effect(session, deadline, &mut control_error)?;
-                        input.raw_read = Some(source.read_exact_at(input.buffer.as_mut_slice(), offset));
+                        input.raw_read =
+                            Some(source.read_exact_at(input.buffer.as_mut_slice(), offset));
                         stage_effect(session, deadline, &mut control_error)?;
-                        if !matches!(input.raw_read, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                        if !matches!(input.raw_read, Some(Ok(()))) {
+                            return Err(WholePgCarrierFault::IoFailure);
+                        }
                         hash.update(input.buffer.as_slice());
                         input.buffer.as_mut_slice().zeroize();
                         input.buffer.clear();
                         offset += count as u64;
                     }
                     let observed: [u8; 32] = hash.finalize().into();
-                    if observed != material.plain_sha256 { return Err(WholePgCarrierFault::ReadbackFailed); }
+                    if observed != material.plain_sha256 {
+                        return Err(WholePgCarrierFault::ReadbackFailed);
+                    }
                     work.metadata = Some(source.metadata());
                     stage_effect(session, deadline, &mut control_error)?;
-                    if RestoreInputFileIdentity::from_metadata(work.metadata.as_ref()
-                        .and_then(|raw| raw.as_ref().ok()).ok_or(WholePgCarrierFault::IoFailure)?)? != before
+                    if RestoreInputFileIdentity::from_metadata(
+                        work.metadata
+                            .as_ref()
+                            .and_then(|raw| raw.as_ref().ok())
+                            .ok_or(WholePgCarrierFault::IoFailure)?,
+                    )? != before
                     {
                         return Err(WholePgCarrierFault::SourceChanged);
                     }
-                    if material.material_id == "artifact:.artifact-store-v1" { marker = Some(ordinal); }
+                    if material.material_id == "artifact:.artifact-store-v1" {
+                        marker = Some(ordinal);
+                    }
                     work.synced = Some(source.sync_all());
                     stage_effect(session, deadline, &mut control_error)?;
-                    if !matches!(work.synced, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                    if !matches!(work.synced, Some(Ok(()))) {
+                        return Err(WholePgCarrierFault::IoFailure);
+                    }
                 }
                 let marker = marker.ok_or(WholePgCarrierFault::MaterialMissing)?;
                 // Empty directories have no manifest leaf but are part of the fixed spool layout.
-                for relative in ["materials/artifact-spool/objects", "materials/artifact-spool/staging"] {
-                    if work.directories.iter().any(|directory| directory.relative.as_deref() == Some(relative)) { continue; }
+                for relative in [
+                    "materials/artifact-spool/objects",
+                    "materials/artifact-spool/staging",
+                ] {
+                    if work
+                        .directories
+                        .iter()
+                        .any(|directory| directory.relative.as_deref() == Some(relative))
+                    {
+                        continue;
+                    }
                     if work.directories.len() as u64 >= input.bounds.max_directories {
                         return Err(WholePgCarrierFault::CapacityExceeded);
                     }
-                    let fee = (2 * std::mem::size_of::<StagingDirectory>() + 2 * relative.len()) as u64;
-                    let _metadata = session.admit_capacity(Capacity::MetadataBytes, fee)
+                    let fee =
+                        (2 * std::mem::size_of::<StagingDirectory>() + 2 * relative.len()) as u64;
+                    let _metadata = session
+                        .admit_capacity(Capacity::MetadataBytes, fee)
                         .map_err(|error| retain_stage_control(error, &mut control_error))?;
-                    let _allocation = session.admit_capacity(Capacity::TotalAllocationBytes, fee)
+                    let _allocation = session
+                        .admit_capacity(Capacity::TotalAllocationBytes, fee)
                         .map_err(|error| retain_stage_control(error, &mut control_error))?;
                     if work.directories.len() == work.directories.capacity() {
                         let previous = work.directories.capacity();
-                        work.directories.try_reserve_exact(1).map_err(|_| WholePgCarrierFault::CapacityExceeded)?;
+                        work.directories
+                            .try_reserve_exact(1)
+                            .map_err(|_| WholePgCarrierFault::CapacityExceeded)?;
                         if work.directories.capacity().saturating_sub(previous) > 2 {
                             return Err(WholePgCarrierFault::CapacityExceeded);
                         }
                     }
-                    work.create_directory(Some(root), Some(relative), session, deadline, &mut control_error)?;
+                    work.create_directory(
+                        Some(root),
+                        Some(relative),
+                        session,
+                        deadline,
+                        &mut control_error,
+                    )?;
                 }
                 let StagingMaterial { file, stamp, .. } = &mut work.materials[marker];
                 let file = file.as_ref().ok_or(WholePgCarrierFault::MaterialMissing)?;
-                work.written = Some(rustix::fs::fchmod(file, Mode::from_bits_truncate(0o400)).map_err(io::Error::from));
+                work.written = Some(
+                    rustix::fs::fchmod(file, Mode::from_bits_truncate(0o400))
+                        .map_err(io::Error::from),
+                );
                 stage_effect(session, deadline, &mut control_error)?;
-                if !matches!(work.written, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                if !matches!(work.written, Some(Ok(()))) {
+                    return Err(WholePgCarrierFault::IoFailure);
+                }
                 work.metadata = Some(file.metadata());
                 stage_effect(session, deadline, &mut control_error)?;
-                let actual = work.metadata.as_ref().and_then(|raw| raw.as_ref().ok()).ok_or(WholePgCarrierFault::IoFailure)?;
+                let actual = work
+                    .metadata
+                    .as_ref()
+                    .and_then(|raw| raw.as_ref().ok())
+                    .ok_or(WholePgCarrierFault::IoFailure)?;
                 let before = stamp.as_mut().ok_or(WholePgCarrierFault::SourceChanged)?;
-                if !actual.is_file() || actual.mode() & 0o7777 != 0o400 || actual.nlink() != 1
-                    || (actual.dev(), actual.ino(), actual.uid(), actual.len(), actual.mtime(), actual.mtime_nsec())
-                        != (before.device, before.inode, before.uid, before.length, before.modified_seconds, before.modified_nanos)
+                if !actual.is_file()
+                    || actual.mode() & 0o7777 != 0o400
+                    || actual.nlink() != 1
+                    || (
+                        actual.dev(),
+                        actual.ino(),
+                        actual.uid(),
+                        actual.len(),
+                        actual.mtime(),
+                        actual.mtime_nsec(),
+                    ) != (
+                        before.device,
+                        before.inode,
+                        before.uid,
+                        before.length,
+                        before.modified_seconds,
+                        before.modified_nanos,
+                    )
                 {
                     return Err(WholePgCarrierFault::SourceChanged);
                 }
@@ -1314,66 +1407,142 @@ pub(crate) mod input {
                 before.changed_nanos = actual.ctime_nsec();
                 work.synced = Some(file.sync_all());
                 stage_effect(session, deadline, &mut control_error)?;
-                if !matches!(work.synced, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
-                verify_staging_directory_membership(input, session, deadline, &mut control_error, true)?;
+                if !matches!(work.synced, Some(Ok(()))) {
+                    return Err(WholePgCarrierFault::IoFailure);
+                }
+                verify_staging_directory_membership(
+                    input,
+                    session,
+                    deadline,
+                    &mut control_error,
+                    true,
+                )?;
                 let work = input.staging.as_mut().expect("verified staging owner");
                 work.space = Some(rustix::fs::fstatvfs(work.directory_file(0)));
                 stage_effect(session, deadline, &mut control_error)?;
-                let grain = work.space.as_ref().and_then(|raw| raw.as_ref().ok())
-                    .map(|space| space.f_frsize.max(space.f_bsize)).filter(|grain| *grain > 0)
+                let grain = work
+                    .space
+                    .as_ref()
+                    .and_then(|raw| raw.as_ref().ok())
+                    .map(|space| space.f_frsize.max(space.f_bsize))
+                    .filter(|grain| *grain > 0)
                     .ok_or(WholePgCarrierFault::IoFailure)?;
-                let target_growth = session.admit_storage_before(work.directory_file(0), grain, RestoreStorageKind::Working, deadline)
+                let target_growth = session
+                    .admit_storage_before(
+                        work.directory_file(0),
+                        grain,
+                        RestoreStorageKind::Working,
+                        deadline,
+                    )
                     .map_err(|error| retain_stage_control(error, &mut control_error))?;
-                let source_growth = session.admit_storage_before(work.directory_file(source_parent), grain, RestoreStorageKind::Working, deadline)
+                let source_growth = session
+                    .admit_storage_before(
+                        work.directory_file(source_parent),
+                        grain,
+                        RestoreStorageKind::Working,
+                        deadline,
+                    )
                     .map_err(|error| retain_stage_control(error, &mut control_error))?;
-                let target = session.admit_new_child_before(work.directory_file(0), OsStr::new("artifacts"), grain, RestoreNewChildKind::Directory, deadline)
+                let target = session
+                    .admit_new_child_before(
+                        work.directory_file(0),
+                        OsStr::new("artifacts"),
+                        grain,
+                        RestoreNewChildKind::Directory,
+                        deadline,
+                    )
                     .map_err(|error| retain_stage_control(error, &mut control_error))?;
                 work.created = Some(rustix::fs::renameat_with(
-                    work.directory_file(source_parent), "artifact-spool", work.directory_file(0), "artifacts",
+                    work.directory_file(source_parent),
+                    "artifact-spool",
+                    work.directory_file(0),
+                    "artifacts",
                     rustix::fs::RenameFlags::NOREPLACE,
                 ));
                 if matches!(work.created, Some(Ok(()))) {
                     work.artifact_placed = true;
                     work.directories[root].parent = Some(0);
-                    let name = work.directories[root].relative.as_mut().expect("original spool component");
+                    let name = work.directories[root]
+                        .relative
+                        .as_mut()
+                        .expect("original spool component");
                     name.clear();
                     name.push_str("artifacts"); // Original string backing is longer; no allocation.
                 }
                 stage_effect(session, deadline, &mut control_error)?;
-                if !work.artifact_placed { return Err(WholePgCarrierFault::PathUnsafe); }
-                session.settle_new_child_before(target, work.directory_file(0), work.directory_file(root), deadline)
+                if !work.artifact_placed {
+                    return Err(WholePgCarrierFault::PathUnsafe);
+                }
+                session
+                    .settle_new_child_before(
+                        target,
+                        work.directory_file(0),
+                        work.directory_file(root),
+                        deadline,
+                    )
                     .map_err(|error| retain_stage_control(error, &mut control_error))?;
                 for index in [root, source_parent, 0] {
                     work.synced = Some(work.directory_file(index).sync_all());
                     stage_effect(session, deadline, &mut control_error)?;
-                    if !matches!(work.synced, Some(Ok(()))) { return Err(WholePgCarrierFault::IoFailure); }
+                    if !matches!(work.synced, Some(Ok(()))) {
+                        return Err(WholePgCarrierFault::IoFailure);
+                    }
                 }
-                session.settle_storage_before(source_growth, work.directory_file(source_parent), deadline)
+                session
+                    .settle_storage_before(
+                        source_growth,
+                        work.directory_file(source_parent),
+                        deadline,
+                    )
                     .map_err(|error| retain_stage_control(error, &mut control_error))?;
-                session.settle_storage_before(target_growth, work.directory_file(0), deadline)
+                session
+                    .settle_storage_before(target_growth, work.directory_file(0), deadline)
                     .map_err(|error| retain_stage_control(error, &mut control_error))?;
                 Ok(())
             })();
             result.map_err(|fault| {
-                input.staging.as_mut().expect("verified staging owner").artifact_fault.get_or_insert(fault);
-                control_error.unwrap_or_else(|| RecoveryControlError::new(match fault {
-                    WholePgCarrierFault::CapacityExceeded | WholePgCarrierFault::BoundsOverflow => crate::recovery_control::RecoveryControlFault::CapacityExceeded,
-                    WholePgCarrierFault::DeadlineExpired => crate::recovery_control::RecoveryControlFault::EffectExpired,
-                    WholePgCarrierFault::IoFailure => crate::recovery_control::RecoveryControlFault::IoFailure,
-                    _ => crate::recovery_control::RecoveryControlFault::InputInvalid,
-                }))
+                input
+                    .staging
+                    .as_mut()
+                    .expect("verified staging owner")
+                    .artifact_fault
+                    .get_or_insert(fault);
+                control_error.unwrap_or_else(|| {
+                    RecoveryControlError::new(match fault {
+                        WholePgCarrierFault::CapacityExceeded
+                        | WholePgCarrierFault::BoundsOverflow => {
+                            crate::recovery_control::RecoveryControlFault::CapacityExceeded
+                        }
+                        WholePgCarrierFault::DeadlineExpired => {
+                            crate::recovery_control::RecoveryControlFault::EffectExpired
+                        }
+                        WholePgCarrierFault::IoFailure => {
+                            crate::recovery_control::RecoveryControlFault::IoFailure
+                        }
+                        _ => crate::recovery_control::RecoveryControlFault::InputInvalid,
+                    })
+                })
             })
         }
     }
 
-    #[expect(clippy::result_large_err, reason = "Failure retains the original input and raw errors without allocating after a capacity rejection")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Failure retains the original input and raw errors without allocating after a capacity rejection"
+    )]
     pub async fn verify_whole_pg_restore_input(
         input: FrozenWholePgRestoreInput,
         intent: ReviewedWholePgRestoreIntent,
         session: &mut RestoreControlSession,
     ) -> Result<VerifiedWholePgRestoreStaging, RetainedRestoreInputFailure> {
-        if input.operation != intent.operation || input.operation.as_str() != session.operation_id() {
-            return Err(RetainedRestoreInputFailure { fault: WholePgCarrierFault::IntentMismatch, _input: input, _intent: intent, _control_error: None });
+        if input.operation != intent.operation || input.operation.as_str() != session.operation_id()
+        {
+            return Err(RetainedRestoreInputFailure {
+                fault: WholePgCarrierFault::IntentMismatch,
+                _input: input,
+                _intent: intent,
+                _control_error: None,
+            });
         }
         let mut carrier = authenticate_whole_pg_restore_carrier_before(input, intent, session)?;
         let mut control_error = None;
@@ -1506,7 +1675,16 @@ pub(crate) mod input {
         {
             return Err(WholePgCarrierFault::CapacityExceeded);
         }
-        work.import_intent = Some(session.input_stages().begin_stage_before(crate::recovery_control::RestoreStage::Import, "stable_staging", deadline).map_err(|e| retain_stage_control(e, error))?);
+        work.import_intent = Some(
+            session
+                .input_stages()
+                .begin_stage_before(
+                    crate::recovery_control::RestoreStage::Import,
+                    "stable_staging",
+                    deadline,
+                )
+                .map_err(|e| retain_stage_control(e, error))?,
+        );
         work.plan = Some(
             session
                 .take_candidate_plan()
@@ -1640,26 +1818,64 @@ pub(crate) mod input {
             .settle_capacity(depth, deepest)
             .map_err(|e| retain_stage_control(e, error))?;
         stage_effect(session, deadline, error)?;
-        let receipt_memory = session.admit_capacity(Capacity::MetadataBytes, 128 + std::mem::size_of::<crate::recovery_control::RestoreDisposition>() as u64).map_err(|e| retain_stage_control(e, error))?;
-        let host = input.manifest.as_ref().expect("original manifest retained").materials().iter().position(|material| material.material_id == "host-inventory").expect("fixed host material checked");
-        let digest = &input.manifest.as_ref().expect("original manifest retained").materials()[host].plain_sha256;
+        let receipt_memory = session
+            .admit_capacity(
+                Capacity::MetadataBytes,
+                128 + std::mem::size_of::<crate::recovery_control::RestoreDisposition>() as u64,
+            )
+            .map_err(|e| retain_stage_control(e, error))?;
+        let host = input
+            .manifest
+            .as_ref()
+            .expect("original manifest retained")
+            .materials()
+            .iter()
+            .position(|material| material.material_id == "host-inventory")
+            .expect("fixed host material checked");
+        let digest = &input
+            .manifest
+            .as_ref()
+            .expect("original manifest retained")
+            .materials()[host]
+            .plain_sha256;
         let mut expected_digest = String::new();
-        expected_digest.try_reserve_exact(64).map_err(|_| WholePgCarrierFault::CapacityExceeded)?;
-        if expected_digest.capacity() > 64 { return Err(WholePgCarrierFault::CapacityExceeded); }
+        expected_digest
+            .try_reserve_exact(64)
+            .map_err(|_| WholePgCarrierFault::CapacityExceeded)?;
+        if expected_digest.capacity() > 64 {
+            return Err(WholePgCarrierFault::CapacityExceeded);
+        }
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in digest { expected_digest.push(HEX[usize::from(byte >> 4)] as char); expected_digest.push(HEX[usize::from(byte & 15)] as char); }
+        for byte in digest {
+            expected_digest.push(HEX[usize::from(byte >> 4)] as char);
+            expected_digest.push(HEX[usize::from(byte & 15)] as char);
+        }
         let work = input.staging.as_mut().expect("staging owner retained");
-        let stamp = work.materials[host].stamp.expect("actual host file fully read back");
-        let intent = work.import_intent.take().expect("original Import intent retained");
+        let stamp = work.materials[host]
+            .stamp
+            .expect("actual host file fully read back");
+        let intent = work
+            .import_intent
+            .take()
+            .expect("original Import intent retained");
         let disposition = crate::recovery_control::RestoreDisposition::FilePublishMatched {
             intent_ref: intent.reference().clone(),
-            held_file_identity: crate::recovery_control::RecoveryFileIdentity { device: stamp.device, inode: stamp.inode, uid: stamp.uid },
+            held_file_identity: crate::recovery_control::RecoveryFileIdentity {
+                device: stamp.device,
+                inode: stamp.inode,
+                uid: stamp.uid,
+            },
             expected_digest,
         };
         // This records only the actual host-inventory file publication. The
         // private complete-tree proof above cannot be replaced by this one file.
-        session.input_stages().observe_stage_before(intent, disposition, closing).map_err(|e| retain_stage_control(e, error))?;
-        session.settle_capacity(receipt_memory, 0).map_err(|e| retain_stage_control(e, error))?;
+        session
+            .input_stages()
+            .observe_stage_before(intent, disposition, closing)
+            .map_err(|e| retain_stage_control(e, error))?;
+        session
+            .settle_capacity(receipt_memory, 0)
+            .map_err(|e| retain_stage_control(e, error))?;
         Ok(())
     }
 
@@ -1985,9 +2201,17 @@ pub(crate) mod input {
         let manifest = input.manifest.as_ref().expect("original manifest retained");
         let work = input.staging.as_mut().expect("staging owner retained");
         for index in (0..work.directories.len()).rev() {
-            if artifacts_only && !work.directories[index].relative.as_deref().is_some_and(|path| {
-                path == "materials/artifact-spool" || path.starts_with("materials/artifact-spool/")
-            }) { continue; }
+            if artifacts_only
+                && !work.directories[index]
+                    .relative
+                    .as_deref()
+                    .is_some_and(|path| {
+                        path == "materials/artifact-spool"
+                            || path.starts_with("materials/artifact-spool/")
+                    })
+            {
+                continue;
+            }
             stage_effect(session, deadline, error)?;
             work.synced = Some(work.directory_file(index).sync_all());
             stage_effect(session, deadline, error)?;
@@ -2252,23 +2476,47 @@ pub(crate) mod input {
             struct Preference;
             impl<'de> serde::de::Visitor<'de> for Preference {
                 type Value = CapturedPreferences;
-                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("the closed original preference fact") }
-                fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("the closed original preference fact")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
                     let mut presence = None;
                     let mut byte_length = None;
                     let mut sha256 = None;
                     while let Some(key) = map.next_key::<&str>()? {
                         match key {
-                            "presence" if presence.is_none() => presence = Some(map.next_value::<&str>()?),
-                            "byte_length" if byte_length.is_none() => byte_length = Some(map.next_value::<u64>()?),
-                            "sha256" if sha256.is_none() => sha256 = Some(map.next_value::<[u8; 32]>()?),
-                            _ => return Err(serde::de::Error::custom("duplicate or unknown preference field")),
+                            "presence" if presence.is_none() => {
+                                presence = Some(map.next_value::<&str>()?)
+                            }
+                            "byte_length" if byte_length.is_none() => {
+                                byte_length = Some(map.next_value::<u64>()?)
+                            }
+                            "sha256" if sha256.is_none() => {
+                                sha256 = Some(map.next_value::<[u8; 32]>()?)
+                            }
+                            _ => {
+                                return Err(serde::de::Error::custom(
+                                    "duplicate or unknown preference field",
+                                ));
+                            }
                         }
                     }
                     match (presence, byte_length, sha256) {
-                        (Some("absent_original_parent_enoent"), None, None) => Ok(CapturedPreferences::AbsentOriginalParentEnoent),
-                        (Some("present_original_snapshot"), Some(byte_length), Some(sha256)) => Ok(CapturedPreferences::PresentOriginalSnapshot { byte_length, sha256 }),
-                        _ => Err(serde::de::Error::custom("incomplete or cross-mode preference fact")),
+                        (Some("absent_original_parent_enoent"), None, None) => {
+                            Ok(CapturedPreferences::AbsentOriginalParentEnoent)
+                        }
+                        (Some("present_original_snapshot"), Some(byte_length), Some(sha256)) => {
+                            Ok(CapturedPreferences::PresentOriginalSnapshot {
+                                byte_length,
+                                sha256,
+                            })
+                        }
+                        _ => Err(serde::de::Error::custom(
+                            "incomplete or cross-mode preference fact",
+                        )),
                     }
                 }
             }
@@ -2619,10 +2867,16 @@ pub(crate) mod input {
         {
             return Err(WholePgCarrierFault::IntentMismatch);
         }
-        input.staging.as_mut().expect("staging owner").artifact_source = Some(super::RestoreArtifactSource {
+        input
+            .staging
+            .as_mut()
+            .expect("staging owner")
+            .artifact_source = Some(super::RestoreArtifactSource {
             store_id,
             root: crate::recovery_control::RecoveryFileIdentity {
-                device: artifact.0, inode: artifact.1, uid: artifact.2,
+                device: artifact.0,
+                inode: artifact.1,
+                uid: artifact.2,
             },
         });
         input.buffer.as_mut_slice().zeroize();
@@ -2631,39 +2885,96 @@ pub(crate) mod input {
     }
 
     #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
-    fn real_staging_request() -> (crate::recovery_control::tests::RestoreEntryFixture, serde_json::Value) {
+    fn real_staging_request() -> (
+        crate::recovery_control::tests::RestoreEntryFixture,
+        serde_json::Value,
+    ) {
         use std::os::unix::fs::PermissionsExt;
         let mut fixture = crate::recovery_control::tests::RestoreEntryFixture::new();
-        let source = std::path::PathBuf::from(std::env::var_os("OPENBOT_TEST_WHOLE_PG_CARRIER_DIR").expect("explicit task-owned CAR"));
-        for (directory, destination) in [("carrier", "carrier-medium/carrier"), ("key", "key-medium/key")] {
-            let mut entries = std::fs::read_dir(source.join(directory)).expect("CAR source directory");
-            let file = entries.next().expect("one fixture file").expect("fixture entry").path(); assert!(entries.next().is_none());
-            std::fs::copy(file, fixture.directory.join(destination)).expect("copy into real fixture medium");
-            std::fs::set_permissions(fixture.directory.join(destination), std::fs::Permissions::from_mode(0o600)).expect("private fixture medium");
+        let source = std::path::PathBuf::from(
+            std::env::var_os("OPENBOT_TEST_WHOLE_PG_CARRIER_DIR").expect("explicit task-owned CAR"),
+        );
+        for (directory, destination) in [
+            ("carrier", "carrier-medium/carrier"),
+            ("key", "key-medium/key"),
+        ] {
+            let mut entries =
+                std::fs::read_dir(source.join(directory)).expect("CAR source directory");
+            let file = entries
+                .next()
+                .expect("one fixture file")
+                .expect("fixture entry")
+                .path();
+            assert!(entries.next().is_none());
+            std::fs::copy(file, fixture.directory.join(destination))
+                .expect("copy into real fixture medium");
+            std::fs::set_permissions(
+                fixture.directory.join(destination),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .expect("private fixture medium");
         }
-        std::fs::copy(source.join("expected.json"), fixture.directory.join("expected.json")).expect("copy independent expected file");
-        let expected: serde_json::Value = serde_json::from_slice(&std::fs::read(fixture.directory.join("expected.json")).expect("copied expected")).expect("fixture expected JSON");
+        std::fs::copy(
+            source.join("expected.json"),
+            fixture.directory.join("expected.json"),
+        )
+        .expect("copy independent expected file");
+        let expected: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.directory.join("expected.json")).expect("copied expected"),
+        )
+        .expect("fixture expected JSON");
         let capacity = &mut fixture.profile.capacity;
-        capacity.max_input_wire_bytes = 64 * 1024 * 1024; capacity.max_manifest_bytes = 4 * 1024 * 1024;
-        capacity.max_material_files = 4096; capacity.max_material_directories = 512;
-        capacity.max_single_material_bytes = 32 * 1024 * 1024; capacity.max_material_plain_bytes = 64 * 1024 * 1024;
-        capacity.max_candidate_data_bytes = 64 * 1024 * 1024; capacity.max_candidate_wal_bytes = 64 * 1024 * 1024;
-        capacity.max_candidate_temp_bytes = 16 * 1024 * 1024; capacity.max_spool_bytes = 64 * 1024 * 1024;
-        capacity.max_retained_prior_bytes = 64 * 1024 * 1024; capacity.max_secret_memory_bytes = 8 * 1024 * 1024;
+        capacity.max_input_wire_bytes = 64 * 1024 * 1024;
+        capacity.max_manifest_bytes = 4 * 1024 * 1024;
+        capacity.max_material_files = 4096;
+        capacity.max_material_directories = 512;
+        capacity.max_single_material_bytes = 32 * 1024 * 1024;
+        capacity.max_material_plain_bytes = 64 * 1024 * 1024;
+        capacity.max_candidate_data_bytes = 64 * 1024 * 1024;
+        capacity.max_candidate_wal_bytes = 64 * 1024 * 1024;
+        capacity.max_candidate_temp_bytes = 16 * 1024 * 1024;
+        capacity.max_spool_bytes = 64 * 1024 * 1024;
+        capacity.max_retained_prior_bytes = 64 * 1024 * 1024;
+        capacity.max_secret_memory_bytes = 8 * 1024 * 1024;
         fixture.profile.effect_ns = 120_000_000_000;
         let mut request = fixture.request();
-        let mut operation = [0u8; 16]; getrandom::fill(&mut operation).expect("real fixture request producer");
-        request["requestId"] = serde_json::json!(operation.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        let mut operation = [0u8; 16];
+        getrandom::fill(&mut operation).expect("real fixture request producer");
+        request["requestId"] = serde_json::json!(
+            operation
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         request["purpose"] = serde_json::json!("restore_new_installation");
-        for (request_key, expected_key) in [("expectedDeploymentId","deploymentId"),("expectedTenantId","tenantId"),("expectedDatasetId","datasetId"),("expectedSourceInstallationId","sourceInstallationId")] { request[request_key] = expected[expected_key].clone(); }
-        for (request_key, expected_key) in [("expectedBundleId","bundleId"),("expectedSourceOperationId","sourceOperationId"),("expectedManifestSha256","manifestSha256")] { request["trustedInputSelection"][request_key] = expected[expected_key].clone(); }
+        for (request_key, expected_key) in [
+            ("expectedDeploymentId", "deploymentId"),
+            ("expectedTenantId", "tenantId"),
+            ("expectedDatasetId", "datasetId"),
+            ("expectedSourceInstallationId", "sourceInstallationId"),
+        ] {
+            request[request_key] = expected[expected_key].clone();
+        }
+        for (request_key, expected_key) in [
+            ("expectedBundleId", "bundleId"),
+            ("expectedSourceOperationId", "sourceOperationId"),
+            ("expectedManifestSha256", "manifestSha256"),
+        ] {
+            request["trustedInputSelection"][request_key] = expected[expected_key].clone();
+        }
         (fixture, request)
     }
     #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
-    fn real_staging_fixture() -> (crate::recovery_control::tests::RestoreEntryFixture, crate::recovery_control::RecoveryControl, RestoreControlSession) {
+    fn real_staging_fixture() -> (
+        crate::recovery_control::tests::RestoreEntryFixture,
+        crate::recovery_control::RecoveryControl,
+        RestoreControlSession,
+    ) {
         let (fixture, request) = real_staging_request();
         let (mut control, entry) = fixture.open_request(request);
-        let session = control.claim_restore(entry, fixture.profile.clone()).expect("actual original FS restore claim");
+        let session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .expect("actual original FS restore claim");
         (fixture, control, session)
     }
 
@@ -2672,8 +2983,14 @@ pub(crate) mod input {
     #[ignore = "explicit CAR; real claim/frozen input and task-owned FS only"]
     async fn t046_13_real_045_same_machine_carrier_authenticates_into_staging() {
         let (fixture, _control, mut session) = real_staging_fixture();
-        let (input, intent) = session.frozen_input().expect("one actual frozen input transfer");
-        assert_eq!(input.bounds.max_chunk_plain_bytes, 4 * 1024 * 1024, "profile is chunk upper bound");
+        let (input, intent) = session
+            .frozen_input()
+            .expect("one actual frozen input transfer");
+        assert_eq!(
+            input.bounds.max_chunk_plain_bytes,
+            4 * 1024 * 1024,
+            "profile is chunk upper bound"
+        );
         let staged = verify_whole_pg_restore_input(input, intent, &mut session).await.unwrap_or_else(|failure| {
             if let Some(work) = &failure._input.staging {
                 eprintln!("staging progress plan={} dirs={} materials={} readers={} import_intent={}", work.plan.is_some(), work.directories.len(), work.materials.len(), work.materials.iter().filter(|material| material.stamp.is_some()).count(), work.import_intent.is_some());
@@ -2690,19 +3007,68 @@ pub(crate) mod input {
             for resource in [Capacity::MetadataBytes, Capacity::OpenFiles, Capacity::MaterialDirectories, Capacity::MaterialFiles, Capacity::MaterialPlainBytes, Capacity::SecretMemoryBytes, Capacity::JournalBytes, Capacity::JournalRecords] { eprintln!("remaining {resource:?}={:?}", session.input_stages().capacity_available(resource).map_err(|error| error.fault())); }
             panic!("real staging failed: {:?} control={:?}", failure.fault(), failure._control_error.as_ref().map(RecoveryControlError::fault));
         });
-        assert_eq!(staged.candidate_plan().operation_id(), session.operation_id());
-        assert_eq!(u32::from_be_bytes(staged.manifest().header()[32..36].try_into().expect("fixed chunk bytes")), 65536, "actual authenticated F07 chunk");
-        assert!(fixture.directory.join("new-generation/materials/staging/pgdata").is_dir());
-        assert_eq!(staged.work().materials.len(), staged.manifest().materials().len());
-        assert_eq!(staged.work().materials.iter().filter(|material| material.file.is_some()).count() + 2, staged.work().materials.len());
+        assert_eq!(
+            staged.candidate_plan().operation_id(),
+            session.operation_id()
+        );
+        assert_eq!(
+            u32::from_be_bytes(
+                staged.manifest().header()[32..36]
+                    .try_into()
+                    .expect("fixed chunk bytes")
+            ),
+            65536,
+            "actual authenticated F07 chunk"
+        );
+        assert!(
+            fixture
+                .directory
+                .join("new-generation/materials/staging/pgdata")
+                .is_dir()
+        );
+        assert_eq!(
+            staged.work().materials.len(),
+            staged.manifest().materials().len()
+        );
+        assert_eq!(
+            staged
+                .work()
+                .materials
+                .iter()
+                .filter(|material| material.file.is_some())
+                .count()
+                + 2,
+            staged.work().materials.len()
+        );
         for (ordinal, material) in staged.manifest().materials().iter().enumerate() {
-            if material.kind.is_secret() { assert!(staged.material_file(ordinal).is_none()); continue; }
-            let file = staged.material_file(ordinal).expect("stable original material FD");
-            assert_eq!(file.metadata().expect("stable material metadata").len(), material.plain_len);
-            assert_eq!(rustix::fs::fcntl_getfl(file).expect("actual reader flags") & OFlags::ACCMODE, OFlags::RDONLY);
+            if material.kind.is_secret() {
+                assert!(staged.material_file(ordinal).is_none());
+                continue;
+            }
+            let file = staged
+                .material_file(ordinal)
+                .expect("stable original material FD");
+            assert_eq!(
+                file.metadata().expect("stable material metadata").len(),
+                material.plain_len
+            );
+            assert_eq!(
+                rustix::fs::fcntl_getfl(file).expect("actual reader flags") & OFlags::ACCMODE,
+                OFlags::RDONLY
+            );
         }
-        assert!(!fixture.directory.join("com.acosmi.wrokbot.restore-control/staging").exists());
-        assert!(!fixture.directory.join("new-generation/materials/staging/secrets").exists());
+        assert!(
+            !fixture
+                .directory
+                .join("com.acosmi.wrokbot.restore-control/staging")
+                .exists()
+        );
+        assert!(
+            !fixture
+                .directory
+                .join("new-generation/materials/staging/secrets")
+                .exists()
+        );
     }
 
     #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
@@ -2711,16 +3077,55 @@ pub(crate) mod input {
     async fn t046_18_replacing_original_package_after_staging_has_no_effect() {
         let (fixture, _control, mut session) = real_staging_fixture();
         let (input, intent) = session.frozen_input().expect("actual frozen input");
-        let staged = verify_whole_pg_restore_input(input, intent, &mut session).await.unwrap_or_else(|failure| panic!("real staging failed: {:?} control={:?}", failure.fault(), failure._control_error.as_ref().map(RecoveryControlError::fault)));
-        std::fs::rename(fixture.directory.join("carrier-medium/carrier"), fixture.directory.join("carrier-medium/old-carrier")).expect("replace owned original name");
-        std::fs::write(fixture.directory.join("carrier-medium/carrier"), b"replacement").expect("owned replacement package");
-        std::fs::OpenOptions::new().write(true).open(fixture.directory.join("carrier-medium/old-carrier")).expect("original package inode").set_len(0).expect("change original package bytes");
+        let staged = verify_whole_pg_restore_input(input, intent, &mut session)
+            .await
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "real staging failed: {:?} control={:?}",
+                    failure.fault(),
+                    failure
+                        ._control_error
+                        .as_ref()
+                        .map(RecoveryControlError::fault)
+                )
+            });
+        std::fs::rename(
+            fixture.directory.join("carrier-medium/carrier"),
+            fixture.directory.join("carrier-medium/old-carrier"),
+        )
+        .expect("replace owned original name");
+        std::fs::write(
+            fixture.directory.join("carrier-medium/carrier"),
+            b"replacement",
+        )
+        .expect("owned replacement package");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(fixture.directory.join("carrier-medium/old-carrier"))
+            .expect("original package inode")
+            .set_len(0)
+            .expect("change original package bytes");
         let mut buffer = zeroize::Zeroizing::new(vec![0u8; 65536]);
         for (ordinal, material) in staged.manifest().materials().iter().enumerate() {
-            if material.kind.is_secret() { continue; }
-            let file = staged.material_file(ordinal).expect("stable stage-only consumer"); let mut hash = Sha256::new(); let mut at = 0u64;
-            while at < material.plain_len { let length = (material.plain_len - at).min(buffer.len() as u64) as usize; file.read_exact_at(&mut buffer[..length], at).expect("stable FD read"); hash.update(&buffer[..length]); at += length as u64; }
-            let mut digest: [u8; 32] = hash.finalize().into(); let equal = digest == material.plain_sha256; digest.zeroize(); assert!(equal, "stage unaffected by original replacement");
+            if material.kind.is_secret() {
+                continue;
+            }
+            let file = staged
+                .material_file(ordinal)
+                .expect("stable stage-only consumer");
+            let mut hash = Sha256::new();
+            let mut at = 0u64;
+            while at < material.plain_len {
+                let length = (material.plain_len - at).min(buffer.len() as u64) as usize;
+                file.read_exact_at(&mut buffer[..length], at)
+                    .expect("stable FD read");
+                hash.update(&buffer[..length]);
+                at += length as u64;
+            }
+            let mut digest: [u8; 32] = hash.finalize().into();
+            let equal = digest == material.plain_sha256;
+            digest.zeroize();
+            assert!(equal, "stage unaffected by original replacement");
         }
     }
     #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
@@ -2730,21 +3135,55 @@ pub(crate) mod input {
         for variant in 0..6 {
             let (fixture, mut request) = real_staging_request();
             match variant {
-                0 => request["trustedInputSelection"]["expectedBundleId"] = serde_json::json!("01234567-89ab-4def-8123-456789abcdef"),
-                1 => request["trustedInputSelection"]["expectedSourceOperationId"] = serde_json::json!("11234567-89ab-4def-8123-456789abcdef"),
-                2 => request["trustedInputSelection"]["expectedManifestSha256"] = serde_json::json!("00".repeat(32)),
+                0 => {
+                    request["trustedInputSelection"]["expectedBundleId"] =
+                        serde_json::json!("01234567-89ab-4def-8123-456789abcdef")
+                }
+                1 => {
+                    request["trustedInputSelection"]["expectedSourceOperationId"] =
+                        serde_json::json!("11234567-89ab-4def-8123-456789abcdef")
+                }
+                2 => {
+                    request["trustedInputSelection"]["expectedManifestSha256"] =
+                        serde_json::json!("00".repeat(32))
+                }
                 _ => {
-                    let (name, at) = match variant { 3 => ("key-medium/key", 72), 4 => ("carrier-medium/carrier", 12), _ => ("carrier-medium/carrier", 101) };
-                    let file = std::fs::OpenOptions::new().read(true).write(true).open(fixture.directory.join(name)).expect("owned mutation input");
-                    let mut byte = [0u8; 1]; file.read_exact_at(&mut byte, at).expect("mutation source byte"); byte[0] ^= 1; file.write_all_at(&byte, at).expect("change owned fixture byte");
+                    let (name, at) = match variant {
+                        3 => ("key-medium/key", 72),
+                        4 => ("carrier-medium/carrier", 12),
+                        _ => ("carrier-medium/carrier", 101),
+                    };
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(fixture.directory.join(name))
+                        .expect("owned mutation input");
+                    let mut byte = [0u8; 1];
+                    file.read_exact_at(&mut byte, at)
+                        .expect("mutation source byte");
+                    byte[0] ^= 1;
+                    file.write_all_at(&byte, at)
+                        .expect("change owned fixture byte");
                 }
             }
             let (mut control, entry) = fixture.open_request(request);
-            let mut session = control.claim_restore(entry, fixture.profile.clone()).expect("real claim before input authentication");
+            let mut session = control
+                .claim_restore(entry, fixture.profile.clone())
+                .expect("real claim before input authentication");
             let (input, intent) = session.frozen_input().expect("actual frozen mutated input");
-            let failure = verify_whole_pg_restore_input(input, intent, &mut session).await.err().expect("mixed input rejected");
-            assert!(matches!(failure.fault(), WholePgCarrierFault::KeyMediumInvalid | WholePgCarrierFault::IntentMismatch | WholePgCarrierFault::AuthenticationFailed));
-            assert!(failure._input.staging.is_none()); assert!(failure._input.carrier.metadata().is_ok()); assert!(failure._input.key_medium.metadata().is_ok());
+            let failure = verify_whole_pg_restore_input(input, intent, &mut session)
+                .await
+                .err()
+                .expect("mixed input rejected");
+            assert!(matches!(
+                failure.fault(),
+                WholePgCarrierFault::KeyMediumInvalid
+                    | WholePgCarrierFault::IntentMismatch
+                    | WholePgCarrierFault::AuthenticationFailed
+            ));
+            assert!(failure._input.staging.is_none());
+            assert!(failure._input.carrier.metadata().is_ok());
+            assert!(failure._input.key_medium.metadata().is_ok());
             assert!(!fixture.directory.join("new-generation").exists());
         }
         eprintln!("T15 original six mismatch/corruption cases rejected before staging");
@@ -2755,53 +3194,102 @@ pub(crate) mod input {
     #[tokio::test]
     #[ignore = "explicit CAR copied into an owned synthetic codec fixture; no PG or capture producer"]
     async fn nonempty_artifact_spool_placement_preserves_every_path_length_and_hash() {
-        use openbot_domain::backup::whole_pg_carrier::{WholePgManifestClaim, WholePgMaterialClaim, WholePgSealCodec};
+        use openbot_domain::backup::whole_pg_carrier::{
+            WholePgManifestClaim, WholePgMaterialClaim, WholePgSealCodec,
+        };
         use std::collections::BTreeMap;
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let (source_fixture, _source_control, mut source_session) = real_staging_fixture();
         let (input, intent) = source_session.frozen_input().unwrap();
-        let mut source = verify_whole_pg_restore_input(input, intent, &mut source_session).await
-            .unwrap_or_else(|failure| panic!("original fixture authentication: {:?}", failure.fault()));
+        let mut source = verify_whole_pg_restore_input(input, intent, &mut source_session)
+            .await
+            .unwrap_or_else(|failure| {
+                panic!("original fixture authentication: {:?}", failure.fault())
+            });
         let bounds = source.carrier.input.bounds;
         let mut buffer = std::mem::take(&mut source.carrier.input.buffer);
         source.manifest().encode_manifest_into(&mut buffer).unwrap();
         let mut claim: WholePgManifestClaim = serde_json::from_slice(&buffer).unwrap();
-        buffer.as_mut_slice().zeroize(); buffer.clear();
+        buffer.as_mut_slice().zeroize();
+        buffer.clear();
         let extras = [
-            (format!("objects/{}", uuid::Uuid::now_v7()), vec![0x41; 65_537]),
-            (format!("objects/{}", uuid::Uuid::now_v7()), b"second retained object".to_vec()),
-            (format!("staging/{}", uuid::Uuid::now_v7()), b"unfinished staged bytes".to_vec()),
+            (
+                format!("objects/{}", uuid::Uuid::now_v7()),
+                vec![0x41; 65_537],
+            ),
+            (
+                format!("objects/{}", uuid::Uuid::now_v7()),
+                b"second retained object".to_vec(),
+            ),
+            (
+                format!("staging/{}", uuid::Uuid::now_v7()),
+                b"unfinished staged bytes".to_vec(),
+            ),
         ];
         // The existing capture names are flat UUID leaves. This is codec
         // fixture DATA, not a new capture producer or source-PG save proof.
         for (path, bytes) in &extras {
             claim.materials.push(WholePgMaterialClaim {
-                material_id: format!("artifact:{path}"), kind: WholePgMaterialKind::Artifact,
+                material_id: format!("artifact:{path}"),
+                kind: WholePgMaterialKind::Artifact,
                 relative_path: format!("materials/artifact-spool/{path}"),
-                plain_len: bytes.len() as u64, plain_sha256: Sha256::digest(bytes).into(),
-                chunk_count: u32::try_from((bytes.len() as u64).div_ceil(bounds.max_chunk_plain_bytes)).unwrap(),
+                plain_len: bytes.len() as u64,
+                plain_sha256: Sha256::digest(bytes).into(),
+                chunk_count: u32::try_from(
+                    (bytes.len() as u64).div_ceil(bounds.max_chunk_plain_bytes),
+                )
+                .unwrap(),
             });
         }
-        claim.materials.sort_by(|a, b| (a.kind, &a.relative_path, &a.material_id).cmp(&(b.kind, &b.relative_path, &b.material_id)));
-        let mut bundle_bytes = [0; 16]; getrandom::fill(&mut bundle_bytes).unwrap();
+        claim.materials.sort_by(|a, b| {
+            (a.kind, &a.relative_path, &a.material_id).cmp(&(
+                b.kind,
+                &b.relative_path,
+                &b.material_id,
+            ))
+        });
+        let mut bundle_bytes = [0; 16];
+        getrandom::fill(&mut bundle_bytes).unwrap();
         bundle_bytes[6] = (bundle_bytes[6] & 15) | 0x40;
         bundle_bytes[8] = (bundle_bytes[8] & 63) | 0x80;
         let bundle = uuid::Uuid::from_bytes(bundle_bytes);
         claim.bundle_id = bundle.to_string();
         let manifest = FrozenWholePgManifest::check(claim, bounds).unwrap();
         let header = manifest.header();
-        let expected: BTreeMap<_, _> = manifest.materials().iter()
+        let expected: BTreeMap<_, _> = manifest
+            .materials()
+            .iter()
             .filter(|material| material.kind == WholePgMaterialKind::Artifact)
-            .map(|material| (material.relative_path.strip_prefix("materials/artifact-spool/").unwrap().to_owned(),
-                (material.plain_len, material.plain_sha256))).collect();
-        assert_eq!(expected.len(), 4, "one marker, two objects and one staging file");
-        let mut raw_key = Zeroizing::new([0u8; 32]); getrandom::fill(&mut raw_key[..]).unwrap();
-        let key = SecretBytes::new(raw_key.to_vec()); raw_key.zeroize();
+            .map(|material| {
+                (
+                    material
+                        .relative_path
+                        .strip_prefix("materials/artifact-spool/")
+                        .unwrap()
+                        .to_owned(),
+                    (material.plain_len, material.plain_sha256),
+                )
+            })
+            .collect();
+        assert_eq!(
+            expected.len(),
+            4,
+            "one marker, two objects and one staging file"
+        );
+        let mut raw_key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut raw_key[..]).unwrap();
+        let key = SecretBytes::new(raw_key.to_vec());
+        raw_key.zeroize();
         let carrier_path = source_fixture.directory.join("nonempty-fixture-carrier");
         let key_path = source_fixture.directory.join("nonempty-fixture-key");
-        let mut carrier = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&carrier_path).unwrap();
+        let mut carrier = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&carrier_path)
+            .unwrap();
         carrier.write_all(&header).unwrap();
         let mut codec = WholePgSealCodec::new(&key, &manifest).unwrap();
         while let Some(spec) = codec.next_frame() {
@@ -2810,16 +3298,31 @@ pub(crate) mod input {
                 1 => {
                     buffer.resize(spec.plain_len() as usize, 0);
                     let material = &manifest.materials()[spec.material_ordinal() as usize];
-                    if let Some((_, bytes)) = extras.iter().find(|(path, _)| material.material_id.strip_prefix("artifact:") == Some(path.as_str())) {
+                    if let Some((_, bytes)) = extras.iter().find(|(path, _)| {
+                        material.material_id.strip_prefix("artifact:") == Some(path.as_str())
+                    }) {
                         let start = usize::try_from(spec.offset()).unwrap();
                         buffer.copy_from_slice(&bytes[start..start + spec.plain_len() as usize]);
                     } else {
                         match material.kind {
-                            WholePgMaterialKind::MasterSecret => buffer.copy_from_slice(source.authenticated_secrets().historical_master().expose()),
-                            WholePgMaterialKind::ScramSecret => buffer.copy_from_slice(source.authenticated_secrets().postgres_scram().expose()),
+                            WholePgMaterialKind::MasterSecret => buffer.copy_from_slice(
+                                source.authenticated_secrets().historical_master().expose(),
+                            ),
+                            WholePgMaterialKind::ScramSecret => buffer.copy_from_slice(
+                                source.authenticated_secrets().postgres_scram().expose(),
+                            ),
                             _ => {
-                                let original = source.manifest().materials().iter().position(|entry| entry.material_id == material.material_id).unwrap();
-                                source.material_file(original).unwrap().read_exact_at(&mut buffer, spec.offset()).unwrap();
+                                let original = source
+                                    .manifest()
+                                    .materials()
+                                    .iter()
+                                    .position(|entry| entry.material_id == material.material_id)
+                                    .unwrap();
+                                source
+                                    .material_file(original)
+                                    .unwrap()
+                                    .read_exact_at(&mut buffer, spec.offset())
+                                    .unwrap();
                             }
                         }
                     }
@@ -2828,50 +3331,120 @@ pub(crate) mod input {
                 _ => unreachable!("closed codec frame kinds"),
             }
             let parts = codec.seal_next_in_place(&mut buffer).unwrap();
-            carrier.write_all(&parts.header).and_then(|_| carrier.write_all(&buffer)).and_then(|_| carrier.write_all(&parts.tag)).unwrap();
-            buffer.as_mut_slice().zeroize(); buffer.clear();
+            carrier
+                .write_all(&parts.header)
+                .and_then(|_| carrier.write_all(&buffer))
+                .and_then(|_| carrier.write_all(&parts.tag))
+                .unwrap();
+            buffer.as_mut_slice().zeroize();
+            buffer.clear();
         }
         carrier.sync_all().unwrap();
-        assert_eq!(carrier.metadata().unwrap().len(), manifest.wire_bytes().unwrap());
+        assert_eq!(
+            carrier.metadata().unwrap().len(),
+            manifest.wire_bytes().unwrap()
+        );
         let mut medium = Zeroizing::new([0u8; 104]);
-        medium[..8].copy_from_slice(b"WBPGKEY1"); medium[8..24].copy_from_slice(bundle.as_bytes());
-        medium[24..40].copy_from_slice(uuid::Uuid::parse_str(&manifest.claim().operation_id).unwrap().as_bytes());
-        medium[40..72].copy_from_slice(&header[48..80]); medium[72..].copy_from_slice(key.expose());
-        let mut key_file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path).unwrap();
-        key_file.write_all(&medium[..]).and_then(|_| key_file.sync_all()).unwrap();
+        medium[..8].copy_from_slice(b"WBPGKEY1");
+        medium[8..24].copy_from_slice(bundle.as_bytes());
+        medium[24..40].copy_from_slice(
+            uuid::Uuid::parse_str(&manifest.claim().operation_id)
+                .unwrap()
+                .as_bytes(),
+        );
+        medium[40..72].copy_from_slice(&header[48..80]);
+        medium[72..].copy_from_slice(key.expose());
+        let mut key_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_path)
+            .unwrap();
+        key_file
+            .write_all(&medium[..])
+            .and_then(|_| key_file.sync_all())
+            .unwrap();
         drop((medium, key_file, codec, key, carrier, buffer, source));
 
         let (fixture, mut request) = real_staging_request();
-        std::fs::copy(&carrier_path, fixture.directory.join("carrier-medium/carrier")).unwrap();
+        std::fs::copy(
+            &carrier_path,
+            fixture.directory.join("carrier-medium/carrier"),
+        )
+        .unwrap();
         std::fs::copy(&key_path, fixture.directory.join("key-medium/key")).unwrap();
-        request["trustedInputSelection"]["expectedBundleId"] = serde_json::json!(bundle.to_string());
-        request["trustedInputSelection"]["expectedManifestSha256"] = serde_json::json!(header[48..80].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        request["trustedInputSelection"]["expectedBundleId"] =
+            serde_json::json!(bundle.to_string());
+        request["trustedInputSelection"]["expectedManifestSha256"] = serde_json::json!(
+            header[48..80]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         let (mut control, entry) = fixture.open_request(request);
-        let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+        let mut session = control
+            .claim_restore(entry, fixture.profile.clone())
+            .unwrap();
         let (input, intent) = session.frozen_input().unwrap();
-        let mut staged = verify_whole_pg_restore_input(input, intent, &mut session).await
+        let mut staged = verify_whole_pg_restore_input(input, intent, &mut session)
+            .await
             .unwrap_or_else(|failure| panic!("nonempty fixture staging: {:?}", failure.fault()));
-        staged.place_artifact_spool_before(&mut session, Instant::now() + std::time::Duration::from_secs(30)).unwrap();
+        staged
+            .place_artifact_spool_before(
+                &mut session,
+                Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
         let artifact_root = fixture.directory.join("new-generation/artifacts");
-        assert_eq!(std::fs::metadata(&artifact_root).unwrap().permissions().mode() & 0o7777, 0o700);
-        assert!(!fixture.directory.join("new-generation/materials/artifact-spool").exists());
+        assert_eq!(
+            std::fs::metadata(&artifact_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert!(
+            !fixture
+                .directory
+                .join("new-generation/materials/artifact-spool")
+                .exists()
+        );
         let mut observed = BTreeMap::new();
         for entry in std::fs::read_dir(&artifact_root).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_dir() {
                 for child in std::fs::read_dir(entry.path()).unwrap() {
-                    let child = child.unwrap(); assert!(child.file_type().unwrap().is_file());
+                    let child = child.unwrap();
+                    assert!(child.file_type().unwrap().is_file());
                     let bytes = std::fs::read(child.path()).unwrap();
-                    let path = format!("{}/{}", entry.file_name().to_str().unwrap(), child.file_name().to_str().unwrap());
-                    assert!(observed.insert(path, (bytes.len() as u64, <[u8; 32]>::from(Sha256::digest(&bytes)))).is_none());
+                    let path = format!(
+                        "{}/{}",
+                        entry.file_name().to_str().unwrap(),
+                        child.file_name().to_str().unwrap()
+                    );
+                    assert!(
+                        observed
+                            .insert(
+                                path,
+                                (bytes.len() as u64, <[u8; 32]>::from(Sha256::digest(&bytes)))
+                            )
+                            .is_none()
+                    );
                 }
             } else {
                 assert!(entry.file_type().unwrap().is_file());
                 let bytes = std::fs::read(entry.path()).unwrap();
-                observed.insert(entry.file_name().into_string().unwrap(), (bytes.len() as u64, Sha256::digest(&bytes).into()));
+                observed.insert(
+                    entry.file_name().into_string().unwrap(),
+                    (bytes.len() as u64, Sha256::digest(&bytes).into()),
+                );
             }
         }
-        assert_eq!(observed, expected, "the complete manifest inventory survives the production placement loop");
+        assert_eq!(
+            observed, expected,
+            "the complete manifest inventory survives the production placement loop"
+        );
     }
 
     #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
@@ -2881,118 +3454,294 @@ pub(crate) mod input {
         use std::os::unix::fs::OpenOptionsExt;
 
         let (source_fixture, _source_control, mut source_session) = real_staging_fixture();
-        let (input, intent) = source_session.frozen_input().expect("original held CAR inputs");
-        let mut source = verify_whole_pg_restore_input(input, intent, &mut source_session).await
+        let (input, intent) = source_session
+            .frozen_input()
+            .expect("original held CAR inputs");
+        let mut source = verify_whole_pg_restore_input(input, intent, &mut source_session)
+            .await
             .unwrap_or_else(|failure| panic!("original full CAR invalid: {:?}", failure.fault()));
         let original_header = source.manifest().header();
         let bounds = source.carrier.input.bounds;
         // Reuse the original bounded single-frame allocation. Material bytes
         // come only from real authenticated stage FDs or its private secrets.
         let mut buffer = std::mem::take(&mut source.carrier.input.buffer);
-        source.manifest().encode_manifest_into(&mut buffer).expect("original canonical manifest");
-        let mut claim: WholePgManifestClaim = serde_json::from_slice(&buffer).expect("original typed manifest DATA");
-        buffer.as_mut_slice().zeroize(); buffer.clear();
-        let mut bundle_bytes = [0u8; 16]; getrandom::fill(&mut bundle_bytes).expect("independent bundle DATA");
+        source
+            .manifest()
+            .encode_manifest_into(&mut buffer)
+            .expect("original canonical manifest");
+        let mut claim: WholePgManifestClaim =
+            serde_json::from_slice(&buffer).expect("original typed manifest DATA");
+        buffer.as_mut_slice().zeroize();
+        buffer.clear();
+        let mut bundle_bytes = [0u8; 16];
+        getrandom::fill(&mut bundle_bytes).expect("independent bundle DATA");
         bundle_bytes[6] = (bundle_bytes[6] & 15) | 0x40;
         bundle_bytes[8] = (bundle_bytes[8] & 63) | 0x80;
         let other_bundle = uuid::Uuid::from_bytes(bundle_bytes);
         claim.bundle_id = other_bundle.to_string();
-        let manifest = FrozenWholePgManifest::check(claim, bounds).expect("other complete frozen layout");
+        let manifest =
+            FrozenWholePgManifest::check(claim, bounds).expect("other complete frozen layout");
         let other_header = manifest.header();
         assert_ne!(original_header, other_header);
-        assert_eq!(&original_header[28..48], &other_header[28..48], "same complete material lengths and chunk layout");
+        assert_eq!(
+            &original_header[28..48],
+            &other_header[28..48],
+            "same complete material lengths and chunk layout"
+        );
         let mut raw_key = Zeroizing::new([0u8; 32]);
-        getrandom::fill(&mut raw_key[..]).expect("fresh independent K, never reuse the capture nonce key");
-        let key = SecretBytes::new(raw_key.to_vec()); raw_key.zeroize();
+        getrandom::fill(&mut raw_key[..])
+            .expect("fresh independent K, never reuse the capture nonce key");
+        let key = SecretBytes::new(raw_key.to_vec());
+        raw_key.zeroize();
         let carrier_path = source_fixture.directory.join("other-complete-carrier");
         let key_path = source_fixture.directory.join("other-complete-key");
-        let mut carrier = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&carrier_path).expect("owned complete carrier output");
-        carrier.write_all(&other_header).expect("complete other carrier header");
+        let mut carrier = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&carrier_path)
+            .expect("owned complete carrier output");
+        carrier
+            .write_all(&other_header)
+            .expect("complete other carrier header");
         let mut codec = WholePgSealCodec::new(&key, &manifest).expect("original 045 sealing codec");
         let mut frames = 0u64;
         while let Some(spec) = codec.next_frame() {
             match spec.kind() {
-                0 => manifest.encode_manifest_into(&mut buffer).expect("complete other manifest plaintext"),
+                0 => manifest
+                    .encode_manifest_into(&mut buffer)
+                    .expect("complete other manifest plaintext"),
                 1 => {
                     buffer.resize(spec.plain_len() as usize, 0);
                     let ordinal = spec.material_ordinal() as usize;
                     match manifest.materials()[ordinal].kind {
-                        WholePgMaterialKind::MasterSecret => buffer.copy_from_slice(source.authenticated_secrets().historical_master().expose()),
-                        WholePgMaterialKind::ScramSecret => buffer.copy_from_slice(source.authenticated_secrets().postgres_scram().expose()),
-                        _ => source.material_file(ordinal).expect("actual authenticated readonly material FD")
-                            .read_exact_at(&mut buffer, spec.offset()).expect("original authenticated material frame"),
+                        WholePgMaterialKind::MasterSecret => buffer.copy_from_slice(
+                            source.authenticated_secrets().historical_master().expose(),
+                        ),
+                        WholePgMaterialKind::ScramSecret => buffer.copy_from_slice(
+                            source.authenticated_secrets().postgres_scram().expose(),
+                        ),
+                        _ => source
+                            .material_file(ordinal)
+                            .expect("actual authenticated readonly material FD")
+                            .read_exact_at(&mut buffer, spec.offset())
+                            .expect("original authenticated material frame"),
                     }
                 }
-                2 => manifest.encode_terminal_into(&mut buffer).expect("complete other terminal"),
+                2 => manifest
+                    .encode_terminal_into(&mut buffer)
+                    .expect("complete other terminal"),
                 _ => unreachable!("original closed codec frame kinds"),
             }
-            let parts = codec.seal_next_in_place(&mut buffer).expect("seal actual complete frame");
-            carrier.write_all(&parts.header).and_then(|_| carrier.write_all(&buffer)).and_then(|_| carrier.write_all(&parts.tag)).expect("write entire original-format frame");
-            buffer.as_mut_slice().zeroize(); buffer.clear(); frames += 1;
+            let parts = codec
+                .seal_next_in_place(&mut buffer)
+                .expect("seal actual complete frame");
+            carrier
+                .write_all(&parts.header)
+                .and_then(|_| carrier.write_all(&buffer))
+                .and_then(|_| carrier.write_all(&parts.tag))
+                .expect("write entire original-format frame");
+            buffer.as_mut_slice().zeroize();
+            buffer.clear();
+            frames += 1;
         }
         carrier.sync_all().expect("complete other carrier fsync");
-        assert_eq!(carrier.metadata().expect("actual complete wire length").len(), manifest.wire_bytes().expect("full frozen wire length"));
-        assert!(frames > 2, "manifest, all material frames and terminal, not a prefix");
+        assert_eq!(
+            carrier
+                .metadata()
+                .expect("actual complete wire length")
+                .len(),
+            manifest.wire_bytes().expect("full frozen wire length")
+        );
+        assert!(
+            frames > 2,
+            "manifest, all material frames and terminal, not a prefix"
+        );
         let mut key_medium = Zeroizing::new([0u8; 104]);
         key_medium[..8].copy_from_slice(b"WBPGKEY1");
         key_medium[8..24].copy_from_slice(other_bundle.as_bytes());
-        key_medium[24..40].copy_from_slice(uuid::Uuid::parse_str(&manifest.claim().operation_id).expect("unchanged source operation").as_bytes());
+        key_medium[24..40].copy_from_slice(
+            uuid::Uuid::parse_str(&manifest.claim().operation_id)
+                .expect("unchanged source operation")
+                .as_bytes(),
+        );
         key_medium[40..72].copy_from_slice(&other_header[48..80]);
         key_medium[72..104].copy_from_slice(key.expose());
-        let mut key_file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path).expect("owned independent original-format key medium");
-        key_file.write_all(&key_medium[..]).and_then(|_| key_file.sync_all()).expect("complete other key medium");
-        drop(key_medium); drop(key_file); drop(codec); drop(key); drop(carrier); drop(buffer); drop(source);
+        let mut key_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_path)
+            .expect("owned independent original-format key medium");
+        key_file
+            .write_all(&key_medium[..])
+            .and_then(|_| key_file.sync_all())
+            .expect("complete other key medium");
+        drop(key_medium);
+        drop(key_file);
+        drop(codec);
+        drop(key);
+        drop(carrier);
+        drop(buffer);
+        drop(source);
 
         // The original production whole-carrier authentication checks all
         // materials, terminal and EOF. Its three inputs come from one real claim.
         let (valid_fixture, mut valid_request) = real_staging_request();
-        std::fs::copy(&carrier_path, valid_fixture.directory.join("carrier-medium/carrier")).expect("other carrier verification copy");
-        std::fs::copy(&key_path, valid_fixture.directory.join("key-medium/key")).expect("other key verification copy");
-        valid_request["trustedInputSelection"]["expectedBundleId"] = serde_json::json!(other_bundle.to_string());
-        valid_request["trustedInputSelection"]["expectedManifestSha256"] = serde_json::json!(other_header[48..80].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        std::fs::copy(
+            &carrier_path,
+            valid_fixture.directory.join("carrier-medium/carrier"),
+        )
+        .expect("other carrier verification copy");
+        std::fs::copy(&key_path, valid_fixture.directory.join("key-medium/key"))
+            .expect("other key verification copy");
+        valid_request["trustedInputSelection"]["expectedBundleId"] =
+            serde_json::json!(other_bundle.to_string());
+        valid_request["trustedInputSelection"]["expectedManifestSha256"] = serde_json::json!(
+            other_header[48..80]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         let (mut valid_control, entry) = valid_fixture.open_request(valid_request);
-        let mut valid_session = valid_control.claim_restore(entry, valid_fixture.profile.clone()).expect("real independent complete-carrier claim");
-        let (input, intent) = valid_session.frozen_input().expect("independent original held input");
+        let mut valid_session = valid_control
+            .claim_restore(entry, valid_fixture.profile.clone())
+            .expect("real independent complete-carrier claim");
+        let (input, intent) = valid_session
+            .frozen_input()
+            .expect("independent original held input");
         assert_eq!(input.operation.as_str(), valid_session.operation_id());
         assert_eq!(intent.operation.as_str(), valid_session.operation_id());
         let valid = authenticate_whole_pg_restore_carrier_before(input, intent, &mut valid_session)
-            .unwrap_or_else(|failure| panic!("independent complete other CAR invalid: {:?}", failure.fault()));
-        assert_eq!(valid.input.manifest.as_ref().expect("complete other manifest").header(), other_header);
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "independent complete other CAR invalid: {:?}",
+                    failure.fault()
+                )
+            });
+        assert_eq!(
+            valid
+                .input
+                .manifest
+                .as_ref()
+                .expect("complete other manifest")
+                .header(),
+            other_header
+        );
         assert_eq!(valid.input.authenticated_frames, frames);
         assert!(valid.input.staging.is_none());
-        eprintln!("T15 independent complete alternate carrier: frames={} materials={} wire_bytes={}", frames, manifest.materials().len(), valid.input.carrier.metadata().expect("actual alternate length").len());
-        drop(valid); drop(valid_session); drop(valid_control); drop(valid_fixture);
+        eprintln!(
+            "T15 independent complete alternate carrier: frames={} materials={} wire_bytes={}",
+            frames,
+            manifest.materials().len(),
+            valid
+                .input
+                .carrier
+                .metadata()
+                .expect("actual alternate length")
+                .len()
+        );
+        drop(valid);
+        drop(valid_session);
+        drop(valid_control);
+        drop(valid_fixture);
 
         for mix_header in [true, false] {
             let (fixture, request) = real_staging_request();
-            let other = File::open(&carrier_path).expect("independently validated complete other carrier");
-            let mixed = std::fs::OpenOptions::new().read(true).write(true).open(fixture.directory.join("carrier-medium/carrier")).expect("original CAR copy to mix");
+            let other =
+                File::open(&carrier_path).expect("independently validated complete other carrier");
+            let mixed = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(fixture.directory.join("carrier-medium/carrier"))
+                .expect("original CAR copy to mix");
             if mix_header {
-                mixed.write_all_at(&other_header, 0).expect("literal entire valid-other header splice");
+                mixed
+                    .write_all_at(&other_header, 0)
+                    .expect("literal entire valid-other header splice");
             } else {
-                let length = u32::from_be_bytes(other_header[28..32].try_into().expect("fixed manifest length")) as usize;
-                let mut frame_header = [0u8; 21]; let mut tag = [0u8; 16];
+                let length = u32::from_be_bytes(
+                    other_header[28..32]
+                        .try_into()
+                        .expect("fixed manifest length"),
+                ) as usize;
+                let mut frame_header = [0u8; 21];
+                let mut tag = [0u8; 16];
                 let mut frame = Zeroizing::new(vec![0u8; length]);
-                other.read_exact_at(&mut frame_header, 80).expect("valid-other manifest frame header");
-                other.read_exact_at(&mut frame, 101).expect("entire valid-other manifest ciphertext");
-                other.read_exact_at(&mut tag, 101 + length as u64).expect("valid-other manifest tag");
-                mixed.write_all_at(&frame_header, 80).and_then(|_| mixed.write_all_at(&frame, 101)).and_then(|_| mixed.write_all_at(&tag, 101 + length as u64)).expect("literal entire valid-other manifest frame splice");
+                other
+                    .read_exact_at(&mut frame_header, 80)
+                    .expect("valid-other manifest frame header");
+                other
+                    .read_exact_at(&mut frame, 101)
+                    .expect("entire valid-other manifest ciphertext");
+                other
+                    .read_exact_at(&mut tag, 101 + length as u64)
+                    .expect("valid-other manifest tag");
+                mixed
+                    .write_all_at(&frame_header, 80)
+                    .and_then(|_| mixed.write_all_at(&frame, 101))
+                    .and_then(|_| mixed.write_all_at(&tag, 101 + length as u64))
+                    .expect("literal entire valid-other manifest frame splice");
             }
             mixed.sync_all().expect("owned literal mixture fsync");
             let carrier_before = mixed.metadata().expect("actual mixed carrier identity");
-            let key_before = std::fs::metadata(fixture.directory.join("key-medium/key")).expect("original independent key identity");
+            let key_before = std::fs::metadata(fixture.directory.join("key-medium/key"))
+                .expect("original independent key identity");
             let (mut control, entry) = fixture.open_request(request);
-            let mut session = control.claim_restore(entry, fixture.profile.clone()).expect("real mixture claim");
-            let (input, intent) = session.frozen_input().expect("original expected/key remain unchanged");
-            let failure = verify_whole_pg_restore_input(input, intent, &mut session).await.err().expect("literal cross-package mixture rejected");
-            assert_eq!(failure.fault(), if mix_header { WholePgCarrierFault::IntentMismatch } else { WholePgCarrierFault::AuthenticationFailed });
-            let carrier_after = failure._input.carrier.metadata().expect("original rejected carrier FD retained");
-            let key_after = failure._input.key_medium.metadata().expect("original independent key FD retained");
-            assert_eq!((carrier_before.dev(), carrier_before.ino(), carrier_before.len()), (carrier_after.dev(), carrier_after.ino(), carrier_after.len()));
-            assert_eq!((key_before.dev(), key_before.ino(), key_before.len()), (key_after.dev(), key_after.ino(), key_after.len()));
+            let mut session = control
+                .claim_restore(entry, fixture.profile.clone())
+                .expect("real mixture claim");
+            let (input, intent) = session
+                .frozen_input()
+                .expect("original expected/key remain unchanged");
+            let failure = verify_whole_pg_restore_input(input, intent, &mut session)
+                .await
+                .err()
+                .expect("literal cross-package mixture rejected");
+            assert_eq!(
+                failure.fault(),
+                if mix_header {
+                    WholePgCarrierFault::IntentMismatch
+                } else {
+                    WholePgCarrierFault::AuthenticationFailed
+                }
+            );
+            let carrier_after = failure
+                ._input
+                .carrier
+                .metadata()
+                .expect("original rejected carrier FD retained");
+            let key_after = failure
+                ._input
+                .key_medium
+                .metadata()
+                .expect("original independent key FD retained");
+            assert_eq!(
+                (
+                    carrier_before.dev(),
+                    carrier_before.ino(),
+                    carrier_before.len()
+                ),
+                (
+                    carrier_after.dev(),
+                    carrier_after.ino(),
+                    carrier_after.len()
+                )
+            );
+            assert_eq!(
+                (key_before.dev(), key_before.ino(), key_before.len()),
+                (key_after.dev(), key_after.ino(), key_after.len())
+            );
             assert!(failure._input.staging.is_none());
             assert!(!fixture.directory.join("new-generation").exists());
-            eprintln!("T15 literal valid-other {} rejected with retained original FDs and zero staging", if mix_header { "header" } else { "complete manifest frame" });
+            eprintln!(
+                "T15 literal valid-other {} rejected with retained original FDs and zero staging",
+                if mix_header {
+                    "header"
+                } else {
+                    "complete manifest frame"
+                }
+            );
         }
     }
 
@@ -3003,61 +3752,181 @@ pub(crate) mod input {
         for variant in 0..7 {
             let (fixture, mut request) = real_staging_request();
             if variant < 3 {
-                let file = std::fs::OpenOptions::new().read(true).write(true).open(fixture.directory.join("carrier-medium/carrier")).expect("owned carrier");
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(fixture.directory.join("carrier-medium/carrier"))
+                    .expect("owned carrier");
                 match variant {
-                    0 => file.set_len(file.metadata().expect("actual carrier length").len() - 1).expect("truncate owned carrier"),
-                    1 => file.write_all_at(&[1], file.metadata().expect("actual carrier length").len()).expect("add owned tail"),
+                    0 => file
+                        .set_len(file.metadata().expect("actual carrier length").len() - 1)
+                        .expect("truncate owned carrier"),
+                    1 => file
+                        .write_all_at(&[1], file.metadata().expect("actual carrier length").len())
+                        .expect("add owned tail"),
                     _ => {
-                        let mut length = [0u8; 4]; file.read_exact_at(&mut length, 28).expect("original manifest length");
+                        let mut length = [0u8; 4];
+                        file.read_exact_at(&mut length, 28)
+                            .expect("original manifest length");
                         let first = 80 + 37 + u64::from(u32::from_be_bytes(length));
-                        let mut header = [0u8; 21]; file.read_exact_at(&mut header, first).expect("first data frame");
-                        let first_length = 37 + u32::from_be_bytes(header[17..21].try_into().expect("fixed frame length")) as usize;
-                        file.read_exact_at(&mut header, first + first_length as u64).expect("next data frame");
-                        let second_length = 37 + u32::from_be_bytes(header[17..21].try_into().expect("fixed frame length")) as usize;
-                        assert!(first_length <= 4 * 1024 * 1024 + 37 && second_length <= 4 * 1024 * 1024 + 37);
-                        let mut first_frame = vec![0u8; first_length]; let mut second_frame = vec![0u8; second_length];
-                        file.read_exact_at(&mut first_frame, first).expect("owned first ciphertext frame"); file.read_exact_at(&mut second_frame, first + first_length as u64).expect("owned second ciphertext frame");
-                        file.write_all_at(&second_frame, first).expect("swap actual ciphertext frames"); file.write_all_at(&first_frame, first + second_length as u64).expect("complete frame swap");
+                        let mut header = [0u8; 21];
+                        file.read_exact_at(&mut header, first)
+                            .expect("first data frame");
+                        let first_length = 37
+                            + u32::from_be_bytes(
+                                header[17..21].try_into().expect("fixed frame length"),
+                            ) as usize;
+                        file.read_exact_at(&mut header, first + first_length as u64)
+                            .expect("next data frame");
+                        let second_length = 37
+                            + u32::from_be_bytes(
+                                header[17..21].try_into().expect("fixed frame length"),
+                            ) as usize;
+                        assert!(
+                            first_length <= 4 * 1024 * 1024 + 37
+                                && second_length <= 4 * 1024 * 1024 + 37
+                        );
+                        let mut first_frame = vec![0u8; first_length];
+                        let mut second_frame = vec![0u8; second_length];
+                        file.read_exact_at(&mut first_frame, first)
+                            .expect("owned first ciphertext frame");
+                        file.read_exact_at(&mut second_frame, first + first_length as u64)
+                            .expect("owned second ciphertext frame");
+                        file.write_all_at(&second_frame, first)
+                            .expect("swap actual ciphertext frames");
+                        file.write_all_at(&first_frame, first + second_length as u64)
+                            .expect("complete frame swap");
                     }
                 }
             } else {
                 match variant {
-                    3 => { std::fs::remove_file(fixture.directory.join("key-medium/key")).expect("owned original key name"); std::os::unix::fs::symlink("../carrier-medium/carrier", fixture.directory.join("key-medium/key")).expect("owned symlink negative"); },
-                    4 => std::fs::hard_link(fixture.directory.join("key-medium/key"), fixture.directory.join("key-medium/hard-key")).expect("owned hardlink negative"),
-                    5 => request["trustedInputSelection"]["keyMedium"]["component"] = serde_json::json!("../key"),
-                    _ => request["trustedInputSelection"]["keyMedium"]["component"] = serde_json::json!("key/child"),
+                    3 => {
+                        std::fs::remove_file(fixture.directory.join("key-medium/key"))
+                            .expect("owned original key name");
+                        std::os::unix::fs::symlink(
+                            "../carrier-medium/carrier",
+                            fixture.directory.join("key-medium/key"),
+                        )
+                        .expect("owned symlink negative");
+                    }
+                    4 => std::fs::hard_link(
+                        fixture.directory.join("key-medium/key"),
+                        fixture.directory.join("key-medium/hard-key"),
+                    )
+                    .expect("owned hardlink negative"),
+                    5 => {
+                        request["trustedInputSelection"]["keyMedium"]["component"] =
+                            serde_json::json!("../key")
+                    }
+                    _ => {
+                        request["trustedInputSelection"]["keyMedium"]["component"] =
+                            serde_json::json!("key/child")
+                    }
                 }
                 let medium = fixture.directory.join("key-medium/key");
-                let before = std::fs::symlink_metadata(&medium).expect("original medium retained before admission");
-                let carrier_before = std::fs::metadata(fixture.directory.join("carrier-medium/carrier")).expect("original carrier before admission");
+                let before = std::fs::symlink_metadata(&medium)
+                    .expect("original medium retained before admission");
+                let carrier_before =
+                    std::fs::metadata(fixture.directory.join("carrier-medium/carrier"))
+                        .expect("original carrier before admission");
                 if variant < 5 {
                     // The request parser seals selection DATA. The original
                     // claim then opens the actual medium with O_NOFOLLOW and
                     // checks regular/single-link shape before minting an op.
-                    let (mut control, entry) = fixture.try_open_request(request).expect("closed linked selection DATA parses");
-                    let error = control.claim_restore(entry, fixture.profile.clone()).err().expect("actual medium admission rejects links");
-                    let expected = if variant == 3 { crate::recovery_control::RecoveryControlFault::IoFailure } else { crate::recovery_control::RecoveryControlFault::EntryInvalid };
+                    let (mut control, entry) = fixture
+                        .try_open_request(request)
+                        .expect("closed linked selection DATA parses");
+                    let error = control
+                        .claim_restore(entry, fixture.profile.clone())
+                        .err()
+                        .expect("actual medium admission rejects links");
+                    let expected = if variant == 3 {
+                        crate::recovery_control::RecoveryControlFault::IoFailure
+                    } else {
+                        crate::recovery_control::RecoveryControlFault::EntryInvalid
+                    };
                     assert_eq!(error.fault(), expected);
                 } else {
-                    let error = fixture.try_open_request(request).err().expect("closed parser rejects traversal components");
-                    assert_eq!(error.fault(), crate::recovery_control::RecoveryControlFault::ControlInvalid);
+                    let error = fixture
+                        .try_open_request(request)
+                        .err()
+                        .expect("closed parser rejects traversal components");
+                    assert_eq!(
+                        error.fault(),
+                        crate::recovery_control::RecoveryControlFault::ControlInvalid
+                    );
                 }
-                let after = std::fs::symlink_metadata(&medium).expect("original medium remains after rejection");
-                assert_eq!((after.dev(), after.ino(), after.mode(), after.nlink(), after.len()), (before.dev(), before.ino(), before.mode(), before.nlink(), before.len()));
-                let carrier_after = std::fs::metadata(fixture.directory.join("carrier-medium/carrier")).expect("original carrier remains after rejection");
-                assert_eq!((carrier_after.dev(), carrier_after.ino(), carrier_after.len()), (carrier_before.dev(), carrier_before.ino(), carrier_before.len()));
+                let after = std::fs::symlink_metadata(&medium)
+                    .expect("original medium remains after rejection");
+                assert_eq!(
+                    (
+                        after.dev(),
+                        after.ino(),
+                        after.mode(),
+                        after.nlink(),
+                        after.len()
+                    ),
+                    (
+                        before.dev(),
+                        before.ino(),
+                        before.mode(),
+                        before.nlink(),
+                        before.len()
+                    )
+                );
+                let carrier_after =
+                    std::fs::metadata(fixture.directory.join("carrier-medium/carrier"))
+                        .expect("original carrier remains after rejection");
+                assert_eq!(
+                    (
+                        carrier_after.dev(),
+                        carrier_after.ino(),
+                        carrier_after.len()
+                    ),
+                    (
+                        carrier_before.dev(),
+                        carrier_before.ino(),
+                        carrier_before.len()
+                    )
+                );
                 let control_root = fixture.directory.join("com.acosmi.wrokbot.restore-control");
                 let operations = control_root.join("operations");
-                if operations.exists() { assert_eq!(std::fs::read_dir(operations).expect("original operation directory").count(), 0, "no operation was minted before medium admission"); }
-                assert!(!control_root.join("activation-v1").exists(), "no Pending descriptor before medium admission");
-                assert!(!fixture.directory.join("new-generation").exists()); continue;
+                if operations.exists() {
+                    assert_eq!(
+                        std::fs::read_dir(operations)
+                            .expect("original operation directory")
+                            .count(),
+                        0,
+                        "no operation was minted before medium admission"
+                    );
+                }
+                assert!(
+                    !control_root.join("activation-v1").exists(),
+                    "no Pending descriptor before medium admission"
+                );
+                assert!(!fixture.directory.join("new-generation").exists());
+                continue;
             }
             let (mut control, entry) = fixture.open_request(request);
-            let mut session = control.claim_restore(entry, fixture.profile.clone()).expect("real claim before carrier rejection");
-            let (input, intent) = session.frozen_input().expect("actual frozen mutated carrier");
-            let failure = verify_whole_pg_restore_input(input, intent, &mut session).await.err().expect("malformed carrier rejected");
-            assert!(matches!(failure.fault(), WholePgCarrierFault::ShortRead | WholePgCarrierFault::ExtraTail | WholePgCarrierFault::FrameInvalid));
-            assert!(failure._input.staging.is_none()); assert!(failure._input.carrier.metadata().is_ok()); assert!(!fixture.directory.join("new-generation").exists());
+            let mut session = control
+                .claim_restore(entry, fixture.profile.clone())
+                .expect("real claim before carrier rejection");
+            let (input, intent) = session
+                .frozen_input()
+                .expect("actual frozen mutated carrier");
+            let failure = verify_whole_pg_restore_input(input, intent, &mut session)
+                .await
+                .err()
+                .expect("malformed carrier rejected");
+            assert!(matches!(
+                failure.fault(),
+                WholePgCarrierFault::ShortRead
+                    | WholePgCarrierFault::ExtraTail
+                    | WholePgCarrierFault::FrameInvalid
+            ));
+            assert!(failure._input.staging.is_none());
+            assert!(failure._input.carrier.metadata().is_ok());
+            assert!(!fixture.directory.join("new-generation").exists());
         }
     }
 
@@ -3184,8 +4053,12 @@ pub(crate) mod input {
             let key_medium = File::open(temp.path().join("key")).expect("held key medium");
             let mut operation_bytes = [0u8; 16];
             getrandom::fill(&mut operation_bytes).expect("fixture operation DATA");
-            let operation_text: String = operation_bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-            let operation = crate::recovery_control::Hex32::parse(&operation_text).expect("fixture operation DATA shape");
+            let operation_text: String = operation_bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let operation = crate::recovery_control::Hex32::parse(&operation_text)
+                .expect("fixture operation DATA shape");
             let input = FrozenWholePgRestoreInput {
                 operation,
                 carrier_identity: RestoreInputFileIdentity::from_metadata(
@@ -3459,7 +4332,11 @@ pub(crate) mod candidate_sql {
 
     type TimedResult<T, E> = Result<Result<T, E>, Elapsed>;
     type HistoryClearParts<'a, 'transaction> = (
-        &'a Transaction<'transaction>, &'a str, &'a str, &'a [u8], &'a mut RestoreStages,
+        &'a Transaction<'transaction>,
+        &'a str,
+        &'a str,
+        &'a [u8],
+        &'a mut RestoreStages,
         &'a mut Option<TimedResult<Row, tokio_postgres::Error>>,
         &'a mut Option<TimedResult<(), tokio_postgres::Error>>,
     );
@@ -3478,7 +4355,15 @@ pub(crate) mod candidate_sql {
 
     impl<'transaction> PendingHistoryClearSource<'_, 'transaction> {
         pub(crate) fn parts(&mut self) -> HistoryClearParts<'_, 'transaction> {
-            (self.owner.as_transaction(), &self.binding.deployment_id, &self.binding.tenant_id, self.audit_key.expose(), self.stages, self.control, self.key_result)
+            (
+                self.owner.as_transaction(),
+                &self.binding.deployment_id,
+                &self.binding.tenant_id,
+                self.audit_key.expose(),
+                self.stages,
+                self.control,
+                self.key_result,
+            )
         }
     }
 
@@ -3739,8 +4624,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
     }
 
     struct AuditResults {
-        coordinates:
-            Option<TimedResult<(AuditEventId, time::OffsetDateTime), InfraError>>,
+        coordinates: Option<TimedResult<(AuditEventId, time::OffsetDateTime), InfraError>>,
         appended: Option<Result<Result<StoredAuditRow, InfraError>, Elapsed>>,
     }
 
@@ -3757,7 +4641,12 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         rollback: Option<Result<(), TransactionOwnerError>>,
         audit: AuditResults,
         readback: Option<QueryResult>,
-        history: Option<Result<crate::thread_history_authority::RestoredHistoryBatch, crate::thread_history_authority::ThreadHistoryStopClearError>>,
+        history: Option<
+            Result<
+                crate::thread_history_authority::RestoredHistoryBatch,
+                crate::thread_history_authority::ThreadHistoryStopClearError,
+            >,
+        >,
         history_control: Option<Result<Result<Row, tokio_postgres::Error>, Elapsed>>,
         history_keys: Option<Result<Result<(), tokio_postgres::Error>, Elapsed>>,
     }
@@ -3852,7 +4741,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             && let Some(intent) = intent.take()
         {
             let _observed = stages.observe_stage_before(
-                intent, RestoreDisposition::PgRollback(RestoreRollbackAck::RollbackUnproven), closing,
+                intent,
+                RestoreDisposition::PgRollback(RestoreRollbackAck::RollbackUnproven),
+                closing,
             );
         }
         original
@@ -3974,21 +4865,43 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         deadline: Instant,
     ) -> Result<Option<super::RestoreArtifactRebindOutcome>, RecoveryControlError> {
         use super::RestoreArtifactRebindOutcome as Outcome;
-        if candidate.sql.artifacts == StageResult::Acknowledged { return Ok(Some(Outcome::Acknowledged)); }
-        if candidate.sql.artifacts == StageResult::InFlight {
-            return observe_artifact_rebind_before(stages, candidate).await.map(Some);
+        if candidate.sql.artifacts == StageResult::Acknowledged {
+            return Ok(Some(Outcome::Acknowledged));
         }
-        if candidate.sql.artifact_prepared { return Ok(None); }
-        if candidate.sql.schema != StageResult::Acknowledged || candidate.sql.scram != StageResult::Unstarted {
+        if candidate.sql.artifacts == StageResult::InFlight {
+            return observe_artifact_rebind_before(stages, candidate)
+                .await
+                .map(Some);
+        }
+        if candidate.sql.artifact_prepared {
+            return Ok(None);
+        }
+        if candidate.sql.schema != StageResult::Acknowledged
+            || candidate.sql.scram != StageResult::Unstarted
+        {
             return Err(invalid_candidate());
         }
         checkout_before(stages, candidate, deadline).await?;
         let transaction_charge = stages.admit_capacity(Capacity::PgTransactions, 1)?;
-        let CandidateSqlState { client, raw, intent, .. } = &mut candidate.sql;
-        let client = client.as_mut().and_then(|raw| raw.as_mut().ok()).ok_or_else(invalid_candidate)?;
+        let CandidateSqlState {
+            client,
+            raw,
+            intent,
+            ..
+        } = &mut candidate.sql;
+        let client = client
+            .as_mut()
+            .and_then(|raw| raw.as_mut().ok())
+            .ok_or_else(invalid_candidate)?;
         let owner = match client.begin_read_committed_read_only().await {
-            Ok(owner) => { raw.begin = Some(Ok(())); owner }
-            Err(error) => { raw.begin = Some(Err(error)); return Err(retain_begin_failure(stages, intent, error)); }
+            Ok(owner) => {
+                raw.begin = Some(Ok(()));
+                owner
+            }
+            Err(error) => {
+                raw.begin = Some(Err(error));
+                return Err(retain_begin_failure(stages, intent, error));
+            }
         };
         let mut absent = false;
         let prepared = async {
@@ -4030,39 +4943,79 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         deadline: Instant,
     ) -> Result<super::RestoreArtifactRebindOutcome, RecoveryControlError> {
         use super::RestoreArtifactRebindOutcome as Outcome;
-        if candidate.sql.artifacts == StageResult::Acknowledged { return Ok(Outcome::Acknowledged); }
+        if candidate.sql.artifacts == StageResult::Acknowledged {
+            return Ok(Outcome::Acknowledged);
+        }
         if candidate.sql.artifacts == StageResult::InFlight {
             return observe_artifact_rebind_before(stages, candidate).await;
         }
-        if !candidate.sql.artifact_prepared { return Err(invalid_candidate()); }
+        if !candidate.sql.artifact_prepared {
+            return Err(invalid_candidate());
+        }
         let source = staging.artifact_source().ok_or_else(invalid_candidate)?;
         stages.effect_before(deadline)?;
-        let root = staging.placed_artifact_root().ok_or_else(invalid_candidate)?;
+        let root = staging
+            .placed_artifact_root()
+            .ok_or_else(invalid_candidate)?;
         candidate.sql.raw.artifact_metadata = Some(rustix::fs::fstat(root));
         stages.effect_before(deadline)?;
-        let target = candidate.sql.raw.artifact_metadata.as_ref().and_then(|raw| raw.as_ref().ok())
+        let target = candidate
+            .sql
+            .raw
+            .artifact_metadata
+            .as_ref()
+            .and_then(|raw| raw.as_ref().ok())
             .ok_or_else(|| stages.failure(RecoveryControlFault::IoFailure))?;
         if rustix::fs::FileType::from_raw_mode(target.st_mode) != rustix::fs::FileType::Directory
-            || target.st_mode & 0o7777 != 0o700 || target.st_uid != rustix::process::geteuid().as_raw()
-        { return Err(invalid_candidate()); }
+            || target.st_mode & 0o7777 != 0o700
+            || target.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(invalid_candidate());
+        }
         let memory = std::mem::size_of::<[String; 7]>() as u64 + 2 * (36 + 6 * 20);
         let _metadata = stages.admit_capacity(Capacity::MetadataBytes, memory)?;
         let _allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, memory)?;
         candidate.sql.artifact_coordinates = Some([
-            source.store_id.to_string(), source.root.device.to_string(), source.root.inode.to_string(), source.root.uid.to_string(),
-            (target.st_dev as u64).to_string(), (target.st_ino).to_string(), target.st_uid.to_string(),
+            source.store_id.to_string(),
+            source.root.device.to_string(),
+            source.root.inode.to_string(),
+            source.root.uid.to_string(),
+            (target.st_dev as u64).to_string(),
+            (target.st_ino).to_string(),
+            target.st_uid.to_string(),
         ]);
         checkout_before(stages, candidate, deadline).await?;
-        candidate.sql.intent = Some(stages.begin_stage_before(RestoreStage::Import, "artifact_root_rebind", deadline)?);
+        candidate.sql.intent = Some(stages.begin_stage_before(
+            RestoreStage::Import,
+            "artifact_root_rebind",
+            deadline,
+        )?);
         candidate.sql.artifacts = StageResult::InFlight;
         let transaction_charge = stages.admit_capacity(Capacity::PgTransactions, 1)?;
         let row_charge = stages.admit_capacity(Capacity::PgRows, 1)?;
-        let CandidateSqlState { client, raw, intent, artifact_coordinates, .. } = &mut candidate.sql;
-        let coordinates = artifact_coordinates.as_ref().ok_or_else(invalid_candidate)?;
-        let client = client.as_mut().and_then(|raw| raw.as_mut().ok()).ok_or_else(invalid_candidate)?;
+        let CandidateSqlState {
+            client,
+            raw,
+            intent,
+            artifact_coordinates,
+            ..
+        } = &mut candidate.sql;
+        let coordinates = artifact_coordinates
+            .as_ref()
+            .ok_or_else(invalid_candidate)?;
+        let client = client
+            .as_mut()
+            .and_then(|raw| raw.as_mut().ok())
+            .ok_or_else(invalid_candidate)?;
         let owner = match client.begin_read_committed().await {
-            Ok(owner) => { raw.begin = Some(Ok(())); owner }
-            Err(error) => { raw.begin = Some(Err(error)); return Err(retain_begin_failure(stages, intent, error)); }
+            Ok(owner) => {
+                raw.begin = Some(Ok(()));
+                owner
+            }
+            Err(error) => {
+                raw.begin = Some(Err(error));
+                return Err(retain_begin_failure(stages, intent, error));
+            }
         };
         let prepared = async {
             stages.settle_capacity(transaction_charge, 1)?;
@@ -4082,7 +5035,10 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         }.await;
         let finished = finish(owner, prepared, raw, intent, stages, deadline).await;
         if let Err(error) = finished {
-            if matches!(candidate.sql.raw.commit, Some(Err(TransactionOwnerError::CommitUnknown))) {
+            if matches!(
+                candidate.sql.raw.commit,
+                Some(Err(TransactionOwnerError::CommitUnknown))
+            ) {
                 // The prepaid original connection may only read under C.
                 // Its raw result remains resident even if the connection died;
                 // no readback can replace the missing original COMMIT ACK.
@@ -4102,9 +5058,22 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
     ) -> Result<super::RestoreArtifactRebindOutcome, RecoveryControlError> {
         let closing = stages.convergence_deadline()?;
         if candidate.sql.raw.readback.is_none() {
-            let reservation = candidate.sql.readback_rows.take().ok_or_else(database_unknown)?;
-            let client = candidate.sql.client.as_ref().and_then(|raw| raw.as_ref().ok()).ok_or_else(database_unknown)?;
-            let coordinates = candidate.sql.artifact_coordinates.as_ref().ok_or_else(database_unknown)?;
+            let reservation = candidate
+                .sql
+                .readback_rows
+                .take()
+                .ok_or_else(database_unknown)?;
+            let client = candidate
+                .sql
+                .client
+                .as_ref()
+                .and_then(|raw| raw.as_ref().ok())
+                .ok_or_else(database_unknown)?;
+            let coordinates = candidate
+                .sql
+                .artifact_coordinates
+                .as_ref()
+                .ok_or_else(database_unknown)?;
             let binding = &candidate.binding;
             candidate.sql.raw.readback = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(closing),
                 client.as_client().query(
@@ -4118,7 +5087,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             }
         }
         if let Some(Ok(Ok(rows))) = candidate.sql.raw.readback.as_ref()
-            && (rows.len() != 1 || rows[0].try_get::<_, bool>(2).ok() != Some(true)
+            && (rows.len() != 1
+                || rows[0].try_get::<_, bool>(2).ok() != Some(true)
                 || (rows[0].try_get::<_, bool>(0).ok() != Some(true)
                     && rows[0].try_get::<_, bool>(1).ok() != Some(true)))
         {
@@ -5797,9 +6767,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             std::mem::size_of::<zeroize::Zeroizing<String>>() as u64,
         )?;
         let mut frame = zeroize::Zeroizing::new(String::new());
-        frame.try_reserve_exact(length).map_err(|_| {
-            stages.failure(RecoveryControlFault::CapacityExceeded)
-        })?;
+        frame
+            .try_reserve_exact(length)
+            .map_err(|_| stages.failure(RecoveryControlFault::CapacityExceeded))?;
         frame.push_str(ALTER);
         frame.push_str(new_text);
         frame.push('\'');
@@ -5858,7 +6828,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             .map_err(|_| stages.failure(RecoveryControlFault::ClosureUnproven))?;
         close_probe_before(stages, accepted).await?;
         match probe_before(stages, &candidate.socket_path, old_text, deadline).await? {
-            Err(error) if error.code() == Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD) => {}
+            Err(error)
+                if error.code() == Some(&tokio_postgres::error::SqlState::INVALID_PASSWORD) => {}
             Err(_) => return Err(stages.failure(RecoveryControlFault::IoFailure)),
             Ok(accepted) => {
                 close_probe_before(stages, accepted).await?;
@@ -5954,15 +6925,32 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         let system = text(0)
             .filter(|text| *text == binding.pg_system_identifier)
             .and_then(|text| text.parse::<u64>().ok());
-        let (Some(pg_system_id), Some(oid), Some(version), Some(checksum), Some(true), Some(key_id), Some(canary)) = (
+        let (
+            Some(pg_system_id),
+            Some(oid),
+            Some(version),
+            Some(checksum),
+            Some(true),
+            Some(key_id),
+            Some(canary),
+        ) = (
             system,
-            observed.try_get::<_, Option<u32>>(1).ok().flatten().filter(|oid| *oid == binding.candidate_database_oid),
-            observed.try_get::<_, Option<i32>>(2).ok().flatten().filter(|version| *version == native::NATIVE_LATEST_VERSION),
+            observed
+                .try_get::<_, Option<u32>>(1)
+                .ok()
+                .flatten()
+                .filter(|oid| *oid == binding.candidate_database_oid),
+            observed
+                .try_get::<_, Option<i32>>(2)
+                .ok()
+                .flatten()
+                .filter(|version| *version == native::NATIVE_LATEST_VERSION),
             text(3),
             observed.try_get::<_, Option<bool>>(4).ok().flatten(),
             text(5),
             text(6),
-        ) else {
+        )
+        else {
             return Err(stages.failure(RecoveryControlFault::InputInvalid));
         };
         let opened = DesktopVaultCanaryBinding::new(
@@ -5973,7 +6961,11 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             KeyVersion::new(1),
         )
         .and_then(|crypto| {
-            open_desktop_vault_canary(master, &crypto, &DesktopVaultCanaryEnvelope::parse(&canary)?)
+            open_desktop_vault_canary(
+                master,
+                &crypto,
+                &DesktopVaultCanaryEnvelope::parse(&canary)?,
+            )
         });
         if opened.is_err() {
             return Err(stages.failure(RecoveryControlFault::InputInvalid));
@@ -5991,7 +6983,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             + checksum.capacity() as u64
             + key_id.capacity() as u64;
         let _retained_metadata = stages.admit_capacity(Capacity::MetadataBytes, retained)?;
-        let _retained_allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, retained)?;
+        let _retained_allocation =
+            stages.admit_capacity(Capacity::TotalAllocationBytes, retained)?;
         let restored = crate::auth::single_user::desktop_local::VerifiedRestoreInstallationBinding::from_readback(
             ids.map(String::clone),
             candidate.data_path.clone(),
@@ -6033,7 +7026,9 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         let metadata = stages.admit_capacity(Capacity::MetadataBytes, memory)?;
         let allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, memory)?;
         let observations = candidate.pool.connection_observations();
-        let actual = (observations.capacity() * std::mem::size_of::<crate::db::pool::ConnectionObservation>()) as u64;
+        let actual = (observations.capacity()
+            * std::mem::size_of::<crate::db::pool::ConnectionObservation>())
+            as u64;
         stages.settle_capacity(metadata, actual)?;
         stages.settle_capacity(allocation, actual)?;
         candidate.sql.client.take();
@@ -6041,7 +7036,11 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         candidate.pool.close();
         let closing = stages.convergence_deadline()?;
         for observation in &observations {
-            if observation.wait_for_destruction_before(closing).await.is_err() {
+            if observation
+                .wait_for_destruction_before(closing)
+                .await
+                .is_err()
+            {
                 return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
             }
         }
@@ -6092,7 +7091,11 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         {
             return Err(stages.failure(RecoveryControlFault::ClosureUnproven));
         }
-        let intent = stages.begin_stage_before(RestoreStage::ResourceClose, "restore_candidate", deadline)?;
+        let intent = stages.begin_stage_before(
+            RestoreStage::ResourceClose,
+            "restore_candidate",
+            deadline,
+        )?;
         stages.observe_stage_before(
             intent,
             RestoreDisposition::NativeWait {
@@ -6422,9 +7425,18 @@ pub(crate) mod candidate_fixture {
             // A genuine canary sealed under the fixed test master `bind` uses.
             let canary = openbot_domain::vault::seal_desktop_vault_canary(
                 &SecretBytes::new(vec![0x41; 32]),
-                &openbot_domain::vault::DesktopVaultCanaryBinding::new(DATASET, DEP, TENANT, "a".repeat(32), openbot_domain::vault::KeyVersion::new(1)).unwrap(),
+                &openbot_domain::vault::DesktopVaultCanaryBinding::new(
+                    DATASET,
+                    DEP,
+                    TENANT,
+                    "a".repeat(32),
+                    openbot_domain::vault::KeyVersion::new(1),
+                )
+                .unwrap(),
                 openbot_domain::vault::Nonce::from_slice(&[9; 12]).unwrap(),
-            ).unwrap().to_column_value();
+            )
+            .unwrap()
+            .to_column_value();
             client.execute(
                 "INSERT INTO openbot_internal.desktop_vault_canaries(dataset_id,deployment_id,tenant_id,key_id,key_version,canary_schema,encrypted_canary) VALUES($1,$2,$3,repeat('a',32),1,1,$4)",
                 &[&DATASET, &DEP, &TENANT, &canary]).await.unwrap();
@@ -6479,7 +7491,10 @@ pub(crate) mod candidate_fixture {
                 if let Some(status) = self.child.try_wait().unwrap() {
                     return status;
                 }
-                assert!(Instant::now() < until, "the smart shutdown did not complete");
+                assert!(
+                    Instant::now() < until,
+                    "the smart shutdown did not complete"
+                );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -6512,8 +7527,11 @@ pub(crate) mod candidate_fixture {
         }
 
         async fn connect(&self, database: &str) -> tokio_postgres::Client {
-            let (client, connection) =
-                self.config(database).connect(tokio_postgres::NoTls).await.unwrap();
+            let (client, connection) = self
+                .config(database)
+                .connect(tokio_postgres::NoTls)
+                .await
+                .unwrap();
             tokio::spawn(connection);
             client
         }

@@ -152,28 +152,40 @@ impl<'a> RestoreIsolationPolicy<'a> {
         args: &[std::ffi::OsString],
     ) -> Result<Command, super::RestoreProgramFailure> {
         self.revalidate()
-            .map_err(|original| super::RestoreProgramFailure::Isolation { _original: original })?;
+            .map_err(|original| super::RestoreProgramFailure::Isolation {
+                _original: original,
+            })?;
         let resource = bundle.root();
         for location in &self.excluded {
             let excluded = location.parent.path.join(location.component);
             if overlaps(resource, &excluded) {
-                return Err(super::RestoreProgramFailure::Isolation { _original: unproven() });
+                return Err(super::RestoreProgramFailure::Isolation {
+                    _original: unproven(),
+                });
             }
         }
         if overlaps(resource, self.generation.root.path) {
-            return Err(super::RestoreProgramFailure::Isolation { _original: unproven() });
+            return Err(super::RestoreProgramFailure::Isolation {
+                _original: unproven(),
+            });
         }
         let executable = bundle.postgres();
-        let profile = self
-            .render(resource, executable)
-            .map_err(|original| super::RestoreProgramFailure::Isolation { _original: original })?;
+        let profile = self.render(resource, executable).map_err(|original| {
+            super::RestoreProgramFailure::Isolation {
+                _original: original,
+            }
+        })?;
         // Render first, then recheck the complete original authenticated program
         // and loader tree. The runner repeats directory identity checks at spawn.
         let verified = bundle
             .checked_command(PostgresProgram::Server)
-            .map_err(|original| super::RestoreProgramFailure::Bundle { _original: original })?;
+            .map_err(|original| super::RestoreProgramFailure::Bundle {
+                _original: original,
+            })?;
         if verified.as_std().get_program() != executable.as_os_str() {
-            return Err(super::RestoreProgramFailure::Isolation { _original: unproven() });
+            return Err(super::RestoreProgramFailure::Isolation {
+                _original: unproven(),
+            });
         }
         let mut command = Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(profile).arg(executable).args(args);

@@ -1019,7 +1019,5 @@ pub(crate) async fn observation_bytes_in_transaction(
     let payload: i64 = row
         .try_get(0)
         .map_err(|source| RowDecodeError::column("(thread_origin_schema)", "bytes", source))?;
-    u64::try_from(payload)
-        .ok()
-        .ok_or_else(|| corrupt("facts"))
+    u64::try_from(payload).ok().ok_or_else(|| corrupt("facts"))
 }

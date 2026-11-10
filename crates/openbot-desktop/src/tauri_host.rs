@@ -2132,7 +2132,8 @@ impl DesktopTauriProtocol {
         &self,
         label: &str,
     ) -> Result<Option<AuthContext>, TauriHostError> {
-        self.authority(label).map(|authority| authority.map(|authority| authority.auth))
+        self.authority(label)
+            .map(|authority| authority.map(|authority| authority.auth))
     }
 
     fn authority(&self, label: &str) -> Result<Option<WindowAuthority>, TauriHostError> {

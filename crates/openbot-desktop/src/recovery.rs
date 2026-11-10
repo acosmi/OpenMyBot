@@ -7,8 +7,8 @@ mod slots;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use input::VerifiedRestoreEntry;
 pub use entry::OwnedDesktopRestore;
+pub use input::VerifiedRestoreEntry;
 
 /// Completed work or read-only descriptor DATA; never runtime authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,10 +49,16 @@ pub async fn run_restore_request(
     use openbot_infra::restore_reconfirmation::CancellationToken;
     let mut original = input::RestoreEntryInput::new();
     let program = std::env::current_exe().map_err(|_| DesktopRestoreError::EntryInvalid)?;
-    let (control, intent) = original.verify(&mut release, actual.clone(), &program, request_path)?;
-    let mut verified = VerifiedRestoreEntry { control, intent, original };
+    let (control, intent) =
+        original.verify(&mut release, actual.clone(), &program, request_path)?;
+    let mut verified = VerifiedRestoreEntry {
+        control,
+        intent,
+        original,
+    };
     match verified.intent.purpose() {
-        RecoveryRequestPurpose::RestoreSameInstallation | RecoveryRequestPurpose::RestoreNewInstallation => {
+        RecoveryRequestPurpose::RestoreSameInstallation
+        | RecoveryRequestPurpose::RestoreNewInstallation => {
             let mut owner = release.begin_restore(verified)?;
             match owner.execute().await {
                 Err(DesktopRestoreError::OwnerLost) => owner.observe_original().await,
@@ -60,27 +66,56 @@ pub async fn run_restore_request(
             }
         }
         RecoveryRequestPurpose::AdoptOrdinaryLegacy => {
-            let config = release.into_runtime_config().map_err(|_| DesktopRestoreError::EntryInvalid)?;
-            crate::tauri_background::execute_local_legacy_adoption(actual, config, verified).await
+            let config = release
+                .into_runtime_config()
+                .map_err(|_| DesktopRestoreError::EntryInvalid)?;
+            crate::tauri_background::execute_local_legacy_adoption(actual, config, verified)
+                .await
                 .map(|_| RestoreExecutionObservation::OrdinaryAdopted)
                 .map_err(|error| match error {
-                    crate::tauri_background::DesktopLocalRuntimeError::RecoveryControl(error) => DesktopRestoreError::from_control(&error),
+                    crate::tauri_background::DesktopLocalRuntimeError::RecoveryControl(error) => {
+                        DesktopRestoreError::from_control(&error)
+                    }
                     crate::tauri_background::DesktopLocalRuntimeError::ClosureUnproven
-                    | crate::tauri_background::DesktopLocalRuntimeError::FailureCleanup => DesktopRestoreError::ClosureUnproven,
+                    | crate::tauri_background::DesktopLocalRuntimeError::FailureCleanup => {
+                        DesktopRestoreError::ClosureUnproven
+                    }
                     _ => DesktopRestoreError::EntryInvalid,
                 })
         }
         RecoveryRequestPurpose::ReconfirmCurrentBinding => {
             let cancel = CancellationToken::new();
-            let owners = [RuntimeOwner::PostgresSidecar, RuntimeOwner::SqlDriver,
-                RuntimeOwner::ApplicationAssembly, RuntimeOwner::DesktopAgentRelay, RuntimeOwner::DesktopAgent];
-            let (runtime, sql, convergence) = verified.control.enter_current_reconfirmation(
-                &mut verified.intent, &DesktopLocalAuthorityStore::new(actual.clone()), &owners, cancel.clone(),
-            ).map_err(|error| DesktopRestoreError::from_control(&error))?;
+            let owners = [
+                RuntimeOwner::PostgresSidecar,
+                RuntimeOwner::SqlDriver,
+                RuntimeOwner::ApplicationAssembly,
+                RuntimeOwner::DesktopAgentRelay,
+                RuntimeOwner::DesktopAgent,
+            ];
+            let (runtime, sql, convergence) = verified
+                .control
+                .enter_current_reconfirmation(
+                    &mut verified.intent,
+                    &DesktopLocalAuthorityStore::new(actual.clone()),
+                    &owners,
+                    cancel.clone(),
+                )
+                .map_err(|error| DesktopRestoreError::from_control(&error))?;
             let current = entry::OwnedVerifiedCurrentReconfirmationEntry::new(actual, runtime)?;
-            let native = entry::MacLocalReconfirmation::new(app(), wrok_bot_macos_local_auth::ConfirmationLocale::English);
-            let request = entry::OriginalLocalConfirmationRequest::new(native, sql.deadline(), convergence, cancel, sql)?;
-            let result = release.reconfirm_restored_local_owner(current, request).await;
+            let native = entry::MacLocalReconfirmation::new(
+                app(),
+                wrok_bot_macos_local_auth::ConfirmationLocale::English,
+            );
+            let request = entry::OriginalLocalConfirmationRequest::new(
+                native,
+                sql.deadline(),
+                convergence,
+                cancel,
+                sql,
+            )?;
+            let result = release
+                .reconfirm_restored_local_owner(current, request)
+                .await;
             // Keep the original request's held FD and complete bytes until all
             // native/PG results and the runtime close have returned.
             drop(verified);
@@ -143,7 +178,9 @@ pub enum DesktopRestoreError {
 }
 
 impl DesktopRestoreError {
-    pub(crate) fn from_control(error: &openbot_infra::recovery_control::RecoveryControlError) -> Self {
+    pub(crate) fn from_control(
+        error: &openbot_infra::recovery_control::RecoveryControlError,
+    ) -> Self {
         use openbot_infra::recovery_control::RecoveryControlFault as Fault;
         match error.fault() {
             Fault::EntryInvalid => Self::EntryInvalid,

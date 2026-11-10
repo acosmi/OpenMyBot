@@ -118,7 +118,9 @@ impl OsSecretStore for MacOsKeychainSecretStore {
                 Some((password, _item)) if password.as_ref().len() > max_bytes => {
                     Err(OsSecretStoreError::Unknown)
                 }
-                entry => Ok(entry.map(|(password, _item)| SecretBytes::new(password.as_ref().to_vec()))),
+                entry => {
+                    Ok(entry.map(|(password, _item)| SecretBytes::new(password.as_ref().to_vec())))
+                }
             }
         })
     }

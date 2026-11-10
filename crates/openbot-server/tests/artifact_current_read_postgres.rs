@@ -548,13 +548,23 @@ async fn negative_generation_and_schema_drift(
         // Recovery admission checks the original session before the artifact schema observer.
         let refused = fixture.read(auth.clone()).await;
         if refused != Err(AppError::Unauthenticated) {
-            return Err(format!("negative generation refusal: {:?}", refused.as_ref().err()));
+            return Err(format!(
+                "negative generation refusal: {:?}",
+                refused.as_ref().err()
+            ));
         }
         // Restore only the row value: the dropped pinned CHECK must still refuse the read.
         fixture.sql(restore_generation).await?;
         let refused = fixture.read(auth).await;
-        if refused != Err(AppError::DependencyUnavailable { dependency: "host_request_binding" }) {
-            return Err(format!("pinned schema refusal: {:?}", refused.as_ref().err()));
+        if refused
+            != Err(AppError::DependencyUnavailable {
+                dependency: "host_request_binding",
+            })
+        {
+            return Err(format!(
+                "pinned schema refusal: {:?}",
+                refused.as_ref().err()
+            ));
         }
         Ok(())
     })

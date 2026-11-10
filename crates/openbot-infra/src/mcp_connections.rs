@@ -4354,9 +4354,7 @@ async fn require_credential<C: tokio_postgres::GenericClient + Sync>(
         crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
             McpConnectionError::NotVisible
         }
-        _ => {
-            McpConnectionError::Unavailable
-        }
+        _ => McpConnectionError::Unavailable,
     })
 }
 
@@ -4499,7 +4497,9 @@ mod consumers {
     use crate::auth::oidc::attempt::LoginAttempt;
     use crate::auth::oidc::redirect::{CanonicalRedirectUri, HTTPS_ONLY};
     use crate::auth::oidc::{PostgresAttemptError, PostgresLoginAttemptStore, ProviderId};
-    use crate::auth::sso::{PostgresSamlAttemptStore, PostgresSsoRouteTicketStore, SsoEphemeralError};
+    use crate::auth::sso::{
+        PostgresSamlAttemptStore, PostgresSsoRouteTicketStore, SsoEphemeralError,
+    };
     use crate::net::safe_http::{EgressPolicy, SafeDialer};
     use crate::recovery_control::AuthorizationPurpose;
     use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
@@ -4651,8 +4651,14 @@ mod consumers {
         let restored = RestoreCurrentFixture::publish("", async |pool| {
             let now = OffsetDateTime::now_utc();
             let mut kept_oidc = Vec::new();
-            for purpose in [AuthorizationPurpose::OidcState, AuthorizationPurpose::SsoState] {
-                let oidc = oidc_store(pool, &RestoreCurrentFixture::old_epoch_key(purpose, &parent));
+            for purpose in [
+                AuthorizationPurpose::OidcState,
+                AuthorizationPurpose::SsoState,
+            ] {
+                let oidc = oidc_store(
+                    pool,
+                    &RestoreCurrentFixture::old_epoch_key(purpose, &parent),
+                );
                 let [kept, spent] = [begin(now), begin(now)];
                 let spent_state = spent.state().secret().clone();
                 kept_oidc.push((purpose, kept.state().secret().clone()));
@@ -4663,8 +4669,14 @@ mod consumers {
             let sso_key =
                 RestoreCurrentFixture::old_epoch_key(AuthorizationPurpose::SsoState, &parent);
             let saml = saml_store(pool, &sso_key);
-            let kept_relay = saml.issue(&okta, Uuid::now_v7(), "_source", acs, now).await.unwrap();
-            let spent_relay = saml.issue(&okta, Uuid::now_v7(), "_source", acs, now).await.unwrap();
+            let kept_relay = saml
+                .issue(&okta, Uuid::now_v7(), "_source", acs, now)
+                .await
+                .unwrap();
+            let spent_relay = saml
+                .issue(&okta, Uuid::now_v7(), "_source", acs, now)
+                .await
+                .unwrap();
             saml.consume(&spent_relay, &okta, now).await.unwrap();
             let routes = route_store(pool, &sso_key);
             let kept_ticket = routes.issue(Some(routed), now).await.unwrap();
@@ -4690,8 +4702,13 @@ mod consumers {
             }
             mcp.consume_attempt(b"source-spent").await.unwrap();
             drop(mcp);
-            client.batch_execute("DELETE FROM public.mcp_servers; DELETE FROM public.credentials;
-                DELETE FROM public.user_roles; DELETE FROM public.users;").await.unwrap();
+            client
+                .batch_execute(
+                    "DELETE FROM public.mcp_servers; DELETE FROM public.credentials;
+                DELETE FROM public.user_roles; DELETE FROM public.users;",
+                )
+                .await
+                .unwrap();
             let kept: i64 = client
                 .query_one("SELECT count(*)::bigint FROM public.verifications", &[])
                 .await
@@ -4758,7 +4775,8 @@ mod consumers {
             new.consume(&state, &okta, now).await.unwrap();
         }
 
-        let [old, new] = keys(AuthorizationPurpose::SsoState).map(|key| route_store(&restored.pool, &key));
+        let [old, new] =
+            keys(AuthorizationPurpose::SsoState).map(|key| route_store(&restored.pool, &key));
         for store in [&new, &old] {
             assert_eq!(
                 store.consume(&kept_ticket, now).await.err(),
@@ -4780,7 +4798,8 @@ mod consumers {
         let ticket = new.issue(Some(routed), now).await.unwrap();
         assert!(new.consume(&ticket, now).await.unwrap().is_some());
 
-        let [old, new] = keys(AuthorizationPurpose::SsoState).map(|key| saml_store(&restored.pool, &key));
+        let [old, new] =
+            keys(AuthorizationPurpose::SsoState).map(|key| saml_store(&restored.pool, &key));
         for store in [&new, &old] {
             assert_eq!(
                 store.consume(&kept_relay, &okta, now).await.err(),
@@ -4986,7 +5005,8 @@ mod consumers {
             };
             restored.confirm(row.get(0), row.get(2), proof).await;
         }
-        let connections = restored_connections(&restored.pool, restored.read_gate(), &vault, &[0x31; 32]);
+        let connections =
+            restored_connections(&restored.pool, restored.read_gate(), &vault, &[0x31; 32]);
         let broker = PostgresMcpCredentialBroker::new(
             restored.pool.clone(),
             vault.clone(),

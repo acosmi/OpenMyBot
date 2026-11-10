@@ -4565,26 +4565,75 @@ mod restore_consumer_tests {
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_32_unconfirmed_model_selection_begins_no_run() {
         let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
-        let (p, dep, ten) = (restored.pool.clone(), DeploymentId::new("dep"), TenantId::new("ten"));
+        let (p, dep, ten) = (
+            restored.pool.clone(),
+            DeploymentId::new("dep"),
+            TenantId::new("ten"),
+        );
         p.get().await.unwrap().batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
             INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');
             INSERT INTO public.agents(id,name,type,configuration) VALUES('bot','Restored bot','built_in','{\"systemPrompt\":\"Restored prompt\",\"providerSource\":\"managed\"}');
             INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility) VALUES('bot','alice','Restored bot','','restored','public');").await.unwrap();
-        let vault = CredentialRecordVault::single_key(ten.clone(), KeyVersion::new(1), WrappingKey::from_bytes(vec![0x76; 32]).unwrap());
+        let vault = CredentialRecordVault::single_key(
+            ten.clone(),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x76; 32]).unwrap(),
+        );
         let listener = ThreadListenerDatabase::desktop_local(5432, &[b'a'; 64]).unwrap();
-        let directory = PostgresThreadDirectory::with_runtime(p.clone(), listener, "restored-runtime".into(), Duration::seconds(30), restored.read_gate()).unwrap();
-        let model = crate::restore_reconfirmation::tests::model_connection(&restored, &vault, "alice").await.to_string();
-        let requirement = crate::restore_reconfirmation::tests::bound_requirement(&restored, "model_secret", &model).await;
-        let req = BeginThreadRunRequest { deployment: dep.clone(), tenant: ten.clone(), actor: ActorId::new("alice"), auth_generation: AuthGeneration::new(7),
-            command: BeginThreadRun { artifact_refs: Vec::new(), thread_id: ThreadIdentity::new(&dep).mint_from_entropy([7; 16]),
-                run_id: RunId::new("restored-run"), bot_id: BotId::new("bot"), anchor: ThreadRunAnchor::DirectBot,
-                message: "Restored selection words".into(), selected_skill_slugs: vec![],
-                model_selection: Some(RunModelSelection { connection_id: model.clone(), expected_revision: 1 }) } };
+        let directory = PostgresThreadDirectory::with_runtime(
+            p.clone(),
+            listener,
+            "restored-runtime".into(),
+            Duration::seconds(30),
+            restored.read_gate(),
+        )
+        .unwrap();
+        let model =
+            crate::restore_reconfirmation::tests::model_connection(&restored, &vault, "alice")
+                .await
+                .to_string();
+        let requirement = crate::restore_reconfirmation::tests::bound_requirement(
+            &restored,
+            "model_secret",
+            &model,
+        )
+        .await;
+        let req = BeginThreadRunRequest {
+            deployment: dep.clone(),
+            tenant: ten.clone(),
+            actor: ActorId::new("alice"),
+            auth_generation: AuthGeneration::new(7),
+            command: BeginThreadRun {
+                artifact_refs: Vec::new(),
+                thread_id: ThreadIdentity::new(&dep).mint_from_entropy([7; 16]),
+                run_id: RunId::new("restored-run"),
+                bot_id: BotId::new("bot"),
+                anchor: ThreadRunAnchor::DirectBot,
+                message: "Restored selection words".into(),
+                selected_skill_slugs: vec![],
+                model_selection: Some(RunModelSelection {
+                    connection_id: model.clone(),
+                    expected_revision: 1,
+                }),
+            },
+        };
         let runs = || async {
-            p.get().await.unwrap().query_one("SELECT count(*)::bigint FROM public.runs WHERE run_id='restored-run'", &[]).await.unwrap().get::<_, i64>(0)
+            p.get()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT count(*)::bigint FROM public.runs WHERE run_id='restored-run'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
         };
 
-        assert!(matches!(directory.begin_thread_run(req.clone()).await, Err(ThreadDirectoryError::NotVisible)));
+        assert!(matches!(
+            directory.begin_thread_run(req.clone()).await,
+            Err(ThreadDirectoryError::NotVisible)
+        ));
         assert_eq!(runs().await, 0, "the refused begin wrote a run");
 
         // Positive control: one receipt for the same requirement admits the same begin.

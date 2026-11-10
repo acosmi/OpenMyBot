@@ -415,7 +415,11 @@ impl VaultReadyDesktopMaterial {
 }
 
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
-impl PreparedDesktopLocalDataPlane<openbot_infra::auth::single_user::desktop_local::RestoredLocalSite> {
+impl
+    PreparedDesktopLocalDataPlane<
+        openbot_infra::auth::single_user::desktop_local::RestoredLocalSite,
+    >
+{
     /// Open the restored generation's Vault with the historical master its
     /// target slot holds and verify the restored canary under the published
     /// business IDs and key ID (spec revision R484 ¶8132). Nothing is created:

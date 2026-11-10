@@ -194,11 +194,7 @@ impl StartupJournalPreparation {
                 bytes,
                 record,
             } => {
-                let validated = validate_record(
-                    record,
-                    &owner.instance_id,
-                    &owner.data_dir_name,
-                )?;
+                let validated = validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
                 if record.phase != StartupJournalPhase::ExitConfirmed {
                     return Err(StartupJournalError::ReconciliationRequired);
                 }
@@ -337,11 +333,7 @@ impl StartupJournal {
         {
             return Err(StartupJournalError::ReconciliationRequired);
         }
-        validate_record(
-            &self.record,
-            &owner.instance_id,
-            &owner.data_dir_name,
-        )?;
+        validate_record(&self.record, &owner.instance_id, &owner.data_dir_name)?;
         Ok(())
     }
 
@@ -572,11 +564,7 @@ fn publish_absent(
     record: &StartupJournalRecord,
     bytes: Vec<u8>,
 ) -> Result<(File, Vec<u8>), StartupJournalError> {
-    validate_record(
-        record,
-        &owner.instance_id,
-        &owner.data_dir_name,
-    )?;
+    validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
         .write_all(&bytes)
@@ -650,11 +638,7 @@ fn replace_exact(
     record: &StartupJournalRecord,
     bytes: Vec<u8>,
 ) -> Result<(File, Vec<u8>), StartupJournalError> {
-    validate_record(
-        record,
-        &owner.instance_id,
-        &owner.data_dir_name,
-    )?;
+    validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
         .write_all(&bytes)

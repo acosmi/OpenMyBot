@@ -1246,7 +1246,11 @@ mod reconfirm {
                 0,
                 "a receipt outlived a COMMIT rejected on {table}"
             );
-            assert_eq!(sessions(None).await, 0, "a session outlived a COMMIT rejected on {table}");
+            assert_eq!(
+                sessions(None).await,
+                0,
+                "a session outlived a COMMIT rejected on {table}"
+            );
             client
                 .batch_execute(&format!("DROP TRIGGER t046_25_reject_commit ON {table};"))
                 .await

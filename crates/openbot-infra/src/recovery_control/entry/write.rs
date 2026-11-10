@@ -57,25 +57,47 @@ impl ControlFiles {
         before(deadline)?;
         if record.previous_digest().is_none() {
             // Initializing and a first RestorePending never replace an existing head.
-            self.raw.unit = Some(rustix::fs::linkat(
-                self.directory(Directory::Root)?, temporary.as_str(),
-                self.directory(Directory::Root)?, "activation-v1", rustix::fs::AtFlags::empty(),
-            ).map_err(io::Error::from));
+            self.raw.unit = Some(
+                rustix::fs::linkat(
+                    self.directory(Directory::Root)?,
+                    temporary.as_str(),
+                    self.directory(Directory::Root)?,
+                    "activation-v1",
+                    rustix::fs::AtFlags::empty(),
+                )
+                .map_err(io::Error::from),
+            );
             self.post(deadline)?;
-            if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) { return Err(io_failure()); }
+            if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) {
+                return Err(io_failure());
+            }
             // nlink is temporarily two until this original temp name is retired.
             // No valid_meta/readback is performed in that intermediate state.
             self.reserve_io(0)?;
             before(deadline)?;
-            self.raw.unit = Some(rustix::fs::unlinkat(self.directory(Directory::Root)?, temporary.as_str(), rustix::fs::AtFlags::empty()).map_err(io::Error::from));
+            self.raw.unit = Some(
+                rustix::fs::unlinkat(
+                    self.directory(Directory::Root)?,
+                    temporary.as_str(),
+                    rustix::fs::AtFlags::empty(),
+                )
+                .map_err(io::Error::from),
+            );
         } else {
-            self.raw.unit = Some(rustix::fs::renameat(
-                self.directory(Directory::Root)?, temporary.as_str(),
-                self.directory(Directory::Root)?, "activation-v1",
-            ).map_err(io::Error::from));
+            self.raw.unit = Some(
+                rustix::fs::renameat(
+                    self.directory(Directory::Root)?,
+                    temporary.as_str(),
+                    self.directory(Directory::Root)?,
+                    "activation-v1",
+                )
+                .map_err(io::Error::from),
+            );
         }
         self.post(deadline)?;
-        if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) { return Err(io_failure()); }
+        if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) {
+            return Err(io_failure());
+        }
         self.sync_directory(Directory::Root, deadline)?;
         if self.check_opened(false, deadline)? != original {
             return Err(invalid());
@@ -118,10 +140,17 @@ impl ControlFiles {
         )?;
         let frame_length = u64::try_from(frame.bytes.len()).map_err(|_| capacity())?;
         if let Some(allowance) = &self.closing_observation {
-            if allowance.journal_written.is_some() || frame_length > allowance.journal_reserved { return Err(capacity()); }
+            if allowance.journal_written.is_some() || frame_length > allowance.journal_reserved {
+                return Err(capacity());
+            }
         } else if let Some(original) = &mut self.restore_operation {
-            original.ledger.admit(super::super::RestoreCapacityResource::JournalBytes, frame_length)?;
-            original.ledger.admit(super::super::RestoreCapacityResource::JournalRecords, 1)?;
+            original.ledger.admit(
+                super::super::RestoreCapacityResource::JournalBytes,
+                frame_length,
+            )?;
+            original
+                .ledger
+                .admit(super::super::RestoreCapacityResource::JournalRecords, 1)?;
         }
         let length = tail.length.checked_add(frame_length).ok_or_else(capacity)?;
         if length > self.limits.max_journal_bytes || sequence > self.limits.max_journal_records {
@@ -186,7 +215,9 @@ impl ControlFiles {
         tail.sequence = sequence;
         tail.digest = frame.digest;
         tail.length = length;
-        if let Some(allowance) = &mut self.closing_observation { allowance.journal_written = Some(frame_length); }
+        if let Some(allowance) = &mut self.closing_observation {
+            allowance.journal_written = Some(frame_length);
+        }
         Ok(JournalReference {
             context_id: operation.as_str().to_owned(),
             sequence,

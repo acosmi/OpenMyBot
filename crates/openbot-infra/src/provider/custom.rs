@@ -1902,37 +1902,110 @@ mod v2_vault_tests {
     #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
     async fn t046_32_unconfirmed_model_secret_start_opens_no_vault_and_no_dns() {
         let restored =
-            crate::recovery_control::tests::restore_current::RestoreCurrentFixture::publish("", async |_| {}).await;
-        let (p, dep, ten) = (restored.pool.clone(), DeploymentId::new("dep"), TenantId::new("ten"));
+            crate::recovery_control::tests::restore_current::RestoreCurrentFixture::publish(
+                "",
+                async |_| {},
+            )
+            .await;
+        let (p, dep, ten) = (
+            restored.pool.clone(),
+            DeploymentId::new("dep"),
+            TenantId::new("ten"),
+        );
         p.get().await.unwrap().batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
             INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');
             INSERT INTO public.agents(id,name,type,configuration) VALUES('bot','Restored bot','built_in','{\"systemPrompt\":\"Restored prompt\",\"providerSource\":\"managed\"}');
             INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility) VALUES('bot','alice','Restored bot','','restored','public');").await.unwrap();
-        let vault = CredentialRecordVault::single_key(ten.clone(), KeyVersion::new(1), WrappingKey::from_bytes(vec![0x76; 32]).unwrap());
-        let listener = crate::thread_listener::ThreadListenerDatabase::desktop_local(5432, &[b'a'; 64]).unwrap();
-        let directory = PostgresThreadDirectory::with_runtime(p.clone(), listener, "restored-runtime".into(), time::Duration::seconds(30), restored.read_gate()).unwrap();
-        let context = PostgresAgentContextSource::new(p.clone(), dep.clone(), ten.clone(), Some(32)).unwrap();
-        let model = crate::restore_reconfirmation::tests::model_connection(&restored, &vault, "alice").await.to_string();
-        let req = openbot_application::BeginThreadRunRequest { deployment: dep.clone(), tenant: ten.clone(), actor: ActorId::new("alice"), auth_generation: AuthGeneration::new(7),
-            command: openbot_contracts::command::BeginThreadRun { artifact_refs: Vec::new(), thread_id: ThreadIdentity::new(&dep).mint_from_entropy([7; 16]),
-                run_id: RunId::new("restored-run"), bot_id: BotId::new("bot"), anchor: ThreadRunAnchor::DirectBot,
-                message: "Restored start words".into(), selected_skill_slugs: vec![],
-                model_selection: Some(openbot_contracts::model_connections::RunModelSelection { connection_id: model.clone(), expected_revision: 1 }) } };
+        let vault = CredentialRecordVault::single_key(
+            ten.clone(),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x76; 32]).unwrap(),
+        );
+        let listener =
+            crate::thread_listener::ThreadListenerDatabase::desktop_local(5432, &[b'a'; 64])
+                .unwrap();
+        let directory = PostgresThreadDirectory::with_runtime(
+            p.clone(),
+            listener,
+            "restored-runtime".into(),
+            time::Duration::seconds(30),
+            restored.read_gate(),
+        )
+        .unwrap();
+        let context =
+            PostgresAgentContextSource::new(p.clone(), dep.clone(), ten.clone(), Some(32)).unwrap();
+        let model =
+            crate::restore_reconfirmation::tests::model_connection(&restored, &vault, "alice")
+                .await
+                .to_string();
+        let req = openbot_application::BeginThreadRunRequest {
+            deployment: dep.clone(),
+            tenant: ten.clone(),
+            actor: ActorId::new("alice"),
+            auth_generation: AuthGeneration::new(7),
+            command: openbot_contracts::command::BeginThreadRun {
+                artifact_refs: Vec::new(),
+                thread_id: ThreadIdentity::new(&dep).mint_from_entropy([7; 16]),
+                run_id: RunId::new("restored-run"),
+                bot_id: BotId::new("bot"),
+                anchor: ThreadRunAnchor::DirectBot,
+                message: "Restored start words".into(),
+                selected_skill_slugs: vec![],
+                model_selection: Some(openbot_contracts::model_connections::RunModelSelection {
+                    connection_id: model.clone(),
+                    expected_revision: 1,
+                }),
+            },
+        };
         // Begun before the requirement exists: a source absent from the cohort passes.
         directory.begin_thread_run(req.clone()).await.unwrap();
-        let lease = RunExecutionLease::new(req.command.run_id.clone(), req.command.thread_id.clone(), req.command.bot_id.clone(), req.actor.clone(), FencingToken::new(1).unwrap(), 0).unwrap();
+        let lease = RunExecutionLease::new(
+            req.command.run_id.clone(),
+            req.command.thread_id.clone(),
+            req.command.bot_id.clone(),
+            req.actor.clone(),
+            FencingToken::new(1).unwrap(),
+            0,
+        )
+        .unwrap();
         let request = context.load(&lease).await.unwrap();
-        let requirement = crate::restore_reconfirmation::tests::bound_requirement(&restored, "model_secret", &model).await;
+        let requirement = crate::restore_reconfirmation::tests::bound_requirement(
+            &restored,
+            "model_secret",
+            &model,
+        )
+        .await;
         let adapter = |dns: &Arc<CountedDns>| {
-            PostgresCustomModelProvider::new(p.clone(), vault.clone(), dep.clone(), ten.clone(),
-                SafeDialer::with_resolver(crate::net::safe_http::EgressPolicy::default(), dns.clone()),
-                SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).unwrap(), Some(Duration::from_secs(2)), restored.read_gate())
-                .unwrap()
+            PostgresCustomModelProvider::new(
+                p.clone(),
+                vault.clone(),
+                dep.clone(),
+                ten.clone(),
+                SafeDialer::with_resolver(
+                    crate::net::safe_http::EgressPolicy::default(),
+                    dns.clone(),
+                ),
+                SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).unwrap(),
+                Some(Duration::from_secs(2)),
+                restored.read_gate(),
+            )
+            .unwrap()
         };
 
-        let (dns, opens) = (Arc::new(CountedDns(AtomicUsize::new(0))), vault.open_calls());
+        let (dns, opens) = (
+            Arc::new(CountedDns(AtomicUsize::new(0))),
+            vault.open_calls(),
+        );
         let result = adapter(&dns).start(request.clone()).await;
-        assert!(matches!(result, Err(ProviderPortError::InvalidRequest { field: "custom_model_credential" })), "unconfirmed model secret");
+        assert!(
+            matches!(
+                result,
+                Err(ProviderPortError::InvalidRequest {
+                    field: "custom_model_credential"
+                })
+            ),
+            "unconfirmed model secret"
+        );
         assert_eq!(vault.open_calls(), opens, "Vault-open before the receipt");
         assert_eq!(dns.0.load(Ordering::SeqCst), 0, "DNS before the receipt");
 
@@ -1940,7 +2013,10 @@ mod v2_vault_tests {
         // request reaches the original Vault call and the counted resolver.
         restored.confirm(requirement, "alice", "fresh_actor").await;
         let dns = Arc::new(CountedDns(AtomicUsize::new(0)));
-        assert!(matches!(adapter(&dns).start(request).await, Err(ProviderPortError::CommitUnknown)));
+        assert!(matches!(
+            adapter(&dns).start(request).await,
+            Err(ProviderPortError::CommitUnknown)
+        ));
         assert_eq!(vault.open_calls(), opens + 1);
         assert_eq!(dns.0.load(Ordering::SeqCst), 1);
         drop((context, directory));

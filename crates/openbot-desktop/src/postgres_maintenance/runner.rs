@@ -63,11 +63,21 @@ impl From<std::io::Error> for NativeSpawnFailure {
 }
 #[cfg(feature = "postgres-supervisor")]
 pub(crate) enum RestoreProgramFailure {
-    Isolation { _original: IsolationFailure },
-    Bundle { _original: PostgresSidecarError },
-    OriginalSpawn { _original: NativeSpawnFailure },
-    Identity { _original: wrok_bot_macos_process::ProcessObservationError },
-    ClosingGate { _original: MaintenanceError },
+    Isolation {
+        _original: IsolationFailure,
+    },
+    Bundle {
+        _original: PostgresSidecarError,
+    },
+    OriginalSpawn {
+        _original: NativeSpawnFailure,
+    },
+    Identity {
+        _original: wrok_bot_macos_process::ProcessObservationError,
+    },
+    ClosingGate {
+        _original: MaintenanceError,
+    },
     OriginalStopUnknown,
 }
 
@@ -97,7 +107,12 @@ impl RestoreProgramOwner {
         &self.original.child
     }
 
-    pub(crate) fn original_identity(&self) -> &Result<wrok_bot_macos_process::ProcessIdentity, wrok_bot_macos_process::ProcessObservationError> {
+    pub(crate) fn original_identity(
+        &self,
+    ) -> &Result<
+        wrok_bot_macos_process::ProcessIdentity,
+        wrok_bot_macos_process::ProcessObservationError,
+    > {
         &self.identity
     }
 
@@ -112,7 +127,6 @@ impl RestoreProgramOwner {
     pub(crate) fn post_software(&self) -> &Result<(), PostgresSidecarError> {
         &self.post_software
     }
-
 }
 
 // The full restore session/candidate/config producer is a separately registered
@@ -126,13 +140,18 @@ pub(crate) fn spawn_restore_program(
     secret: Arc<SecretBytes>,
     limits: (u64, u64, bool),
 ) -> Result<RestoreProgramOwner, RestoreProgramFailure> {
-    let generation = policy
-        .generation_identity()
-        .map_err(|original| RestoreProgramFailure::Isolation { _original: original })?;
+    let generation =
+        policy
+            .generation_identity()
+            .map_err(|original| RestoreProgramFailure::Isolation {
+                _original: original,
+            })?;
     let command = policy.checked_postgres_command(bundle, authenticated_config_args)?;
     policy
         .revalidate()
-        .map_err(|original| RestoreProgramFailure::Isolation { _original: original })?;
+        .map_err(|original| RestoreProgramFailure::Isolation {
+            _original: original,
+        })?;
     // This real sandbox-exec Command enters the original spawn body; no second
     // Child/pipe abstraction, optional sandbox or unisolated fallback is used.
     let original = spawn_program_retaining_io(
@@ -144,11 +163,16 @@ pub(crate) fn spawn_restore_program(
         limits,
         false,
     )
-    .map_err(|original| RestoreProgramFailure::OriginalSpawn { _original: original })?;
+    .map_err(|original| RestoreProgramFailure::OriginalSpawn {
+        _original: original,
+    })?;
     // No fallible return drops a spawned Child. Capture failure remains resident
     // with that owner and cannot authorize another native request.
     let identity = wrok_bot_macos_process::ProcessIdentity::capture(original.pid);
-    let birth = identity.as_ref().map_err(|error| *error).and_then(|identity| identity.evidence_bytes());
+    let birth = identity
+        .as_ref()
+        .map_err(|error| *error)
+        .and_then(|identity| identity.evidence_bytes());
     let post_software = bundle.checked_command(PostgresProgram::Server).map(|_| ());
     let post_directories = policy.revalidate();
     // Post-check failure stays WITH the original Child and raw identity outcome.
@@ -187,7 +211,9 @@ pub(crate) fn request_restore_stop(
         .as_ref()
         .map_err(|error| RestoreProgramFailure::Identity { _original: *error })?
         .revalidate()
-        .map_err(|original| RestoreProgramFailure::Identity { _original: original })?;
+        .map_err(|original| RestoreProgramFailure::Identity {
+            _original: original,
+        })?;
     let pid = i32::try_from(owner.original.pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
@@ -196,7 +222,9 @@ pub(crate) fn request_restore_stop(
         })?;
     clock
         .permit_closing_request()
-        .map_err(|original| RestoreProgramFailure::ClosingGate { _original: original })?;
+        .map_err(|original| RestoreProgramFailure::ClosingGate {
+            _original: original,
+        })?;
     owner.stop = Some(RestoreStopState::Entered);
     let result = rustix::process::kill_process(pid, rustix::process::Signal::TERM)
         .map_err(std::io::Error::from);
@@ -252,18 +280,26 @@ impl RestoreProgramResult {
     /// Project only observations made by the original process and pipe owners.
     /// This does not sample a new clock or turn a signal request into an exit.
     #[cfg(feature = "desktop-launcher")]
-    pub(crate) fn candidate_exit(&self) -> Option<openbot_infra::backup::whole_pg_restore_stream::RestoreCandidateExit> {
+    pub(crate) fn candidate_exit(
+        &self,
+    ) -> Option<openbot_infra::backup::whole_pg_restore_stream::RestoreCandidateExit> {
         use openbot_infra::recovery_control::{NativeExit, PipeJoin, ProcessStart};
         let tool = self.tool.as_ref().ok()?;
         let observation = &tool.observation;
-        if self.retained_error().is_some() || !observation.original_child_wait
-            || self.post_directories.is_err() || self.post_software.is_err()
+        if self.retained_error().is_some()
+            || !observation.original_child_wait
+            || self.post_directories.is_err()
+            || self.post_software.is_err()
             || !matches!(self.stop, Some(RestoreStopState::Returned(Ok(()))))
-        { return None; }
+        {
+            return None;
+        }
         let identity = self.birth.as_ref().ok()?;
         let pid = u32::from_be_bytes(identity[..4].try_into().ok()?);
         let (wait_pid, code, signal) = self.native_wait()?;
-        if pid != wait_pid { return None; }
+        if pid != wait_pid {
+            return None;
+        }
         let exit = match (code, signal) {
             (Some(value), None) => NativeExit::Code { value },
             (None, Some(value)) => NativeExit::Signal { value },
@@ -271,21 +307,28 @@ impl RestoreProgramResult {
         };
         let joined = observation.pipe_joins_observed_ns?;
         let pipes = self.pipes().map(|pipe| match pipe {
-            RestorePipeJoin::Returned => PipeJoin::Returned { observed_ns: joined },
-            RestorePipeJoin::Panicked => PipeJoin::Panicked { observed_ns: joined },
+            RestorePipeJoin::Returned => PipeJoin::Returned {
+                observed_ns: joined,
+            },
+            RestorePipeJoin::Panicked => PipeJoin::Panicked {
+                observed_ns: joined,
+            },
             RestorePipeJoin::JoinUnknown => PipeJoin::JoinUnknown,
             RestorePipeJoin::Absent => PipeJoin::Null,
         });
-        Some(openbot_infra::backup::whole_pg_restore_stream::RestoreCandidateExit {
-            pid,
-            start: ProcessStart {
-                seconds: u64::from_be_bytes(identity[4..12].try_into().ok()?),
-                nanos: u32::from_be_bytes(identity[12..16].try_into().ok()?).checked_mul(1000)?,
+        Some(
+            openbot_infra::backup::whole_pg_restore_stream::RestoreCandidateExit {
+                pid,
+                start: ProcessStart {
+                    seconds: u64::from_be_bytes(identity[4..12].try_into().ok()?),
+                    nanos: u32::from_be_bytes(identity[12..16].try_into().ok()?)
+                        .checked_mul(1000)?,
+                },
+                exit,
+                observed_ns: observation.wait_observed_ns?,
+                pipes,
             },
-            exit,
-            observed_ns: observation.wait_observed_ns?,
-            pipes,
-        })
+        )
     }
 
     /// The original Child's pid, exit code and signal, only after its own wait.
@@ -326,13 +369,27 @@ impl RestoreProgramResult {
 
     pub(crate) fn retained_join_bytes(&self) -> Option<usize> {
         let reports = self.tool.as_ref().ok().map_or(Some(0usize), |tool| {
-            tool.observation.stdout.as_ref().map_or(0, |report| report.sha256.capacity())
-                .checked_add(tool.observation.stderr.as_ref().map_or(0, |report| report.sha256.capacity()))
+            tool.observation
+                .stdout
+                .as_ref()
+                .map_or(0, |report| report.sha256.capacity())
+                .checked_add(
+                    tool.observation
+                        .stderr
+                        .as_ref()
+                        .map_or(0, |report| report.sha256.capacity()),
+                )
         })?;
-        [&self.joins.stdout, &self.joins.stderr].iter().try_fold(reports, |bytes, join| {
-            let preview = join.as_ref().and_then(|join| join.as_ref().ok()).and_then(|task| task.as_ref().ok()).map_or(0, |result| result.preview.capacity());
-            bytes.checked_add(preview)
-        })
+        [&self.joins.stdout, &self.joins.stderr]
+            .iter()
+            .try_fold(reports, |bytes, join| {
+                let preview = join
+                    .as_ref()
+                    .and_then(|join| join.as_ref().ok())
+                    .and_then(|task| task.as_ref().ok())
+                    .map_or(0, |result| result.preview.capacity());
+                bytes.checked_add(preview)
+            })
     }
 }
 #[cfg(feature = "postgres-supervisor")]
@@ -356,8 +413,20 @@ pub(crate) async fn wait_restore_program(
     // Only request_restore_stop may issue this restore owner's one TERM. The
     // original wait's optional deadline TERM is disabled, so Unknown cannot send
     // another native request. It still waits the same Child and joins all pipes.
-    let mut joins = RestorePipeJoins { stdin: None, stdout: None, stderr: None };
-    let tool = wait_program_with_capacity(original, clock, observe_capacity, closing, false, Some(&mut joins)).await;
+    let mut joins = RestorePipeJoins {
+        stdin: None,
+        stdout: None,
+        stderr: None,
+    };
+    let tool = wait_program_with_capacity(
+        original,
+        clock,
+        observe_capacity,
+        closing,
+        false,
+        Some(&mut joins),
+    )
+    .await;
     RestoreProgramResult {
         tool,
         joins,
@@ -2701,8 +2770,14 @@ async fn wait_program_with_capacity(
     let input_joined = input.as_ref().map(|r| r.is_ok());
     let output_joined = output.as_ref().is_some_and(Result::is_ok);
     let stderr_joined = stderr.as_ref().is_some_and(Result::is_ok);
-    let output_result = output.as_ref().and_then(|join| join.as_ref().ok()).and_then(|task| task.as_ref().ok());
-    let stderr_result = stderr.as_ref().and_then(|join| join.as_ref().ok()).and_then(|task| task.as_ref().ok());
+    let output_result = output
+        .as_ref()
+        .and_then(|join| join.as_ref().ok())
+        .and_then(|task| task.as_ref().ok());
+    let stderr_result = stderr
+        .as_ref()
+        .and_then(|join| join.as_ref().ok())
+        .and_then(|task| task.as_ref().ok());
     let bad_secret = output_result.is_some_and(|r| r.report.secret_found)
         || stderr_result.is_some_and(|r| r.report.secret_found);
     let capacity = output_result.is_some_and(|r| r.report.limit_exceeded)
@@ -2727,9 +2802,7 @@ async fn wait_program_with_capacity(
     } else {
         None
     };
-    let preview = output_result
-        .map(|r| r.preview.clone())
-        .unwrap_or_default();
+    let preview = output_result.map(|r| r.preview.clone()).unwrap_or_default();
     let (stdout_report, stderr_report) = if let Some(joins) = restore_joins {
         let stdout_report = output_result.map(|r| r.report.clone());
         let stderr_report = stderr_result.map(|r| r.report.clone());
@@ -2740,8 +2813,16 @@ async fn wait_program_with_capacity(
     } else {
         // The normal maintenance/capture path still moves its original reports
         // into the same observation and allocates no additional report copies.
-        (output.and_then(|join| join.ok()).and_then(|task| task.ok()).map(|r| r.report),
-         stderr.and_then(|join| join.ok()).and_then(|task| task.ok()).map(|r| r.report))
+        (
+            output
+                .and_then(|join| join.ok())
+                .and_then(|task| task.ok())
+                .map(|r| r.report),
+            stderr
+                .and_then(|join| join.ok())
+                .and_then(|task| task.ok())
+                .map(|r| r.report),
+        )
     };
     // A clock failure retains an absent timestamp; it never fabricates an on-time observation.
     let observed = now.ok();
@@ -4015,10 +4096,15 @@ mod restore_pipe_tests {
 
     #[tokio::test]
     async fn restore_original_pipe_results_survive_task_error_and_panic() {
-        let clock = OperationClock::start(5_000_000_000, 5_000_000_000).expect("real component clock");
+        let clock =
+            OperationClock::start(5_000_000_000, 5_000_000_000).expect("real component clock");
         let mut command = tokio::process::Command::new("/bin/sh");
-        command.args(["-c", "printf pipe-output; printf pipe-error >&2"])
-            .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .args(["-c", "printf pipe-output; printf pipe-error >&2"])
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let clean = command_secret_absent(&command, b"component-secret");
         let mut child = command.spawn().expect("original native component child");
         let pid = child.id().expect("actual component pid");
@@ -4026,11 +4112,17 @@ mod restore_pipe_tests {
         let stdout = child.stdout.take().expect("original stdout");
         let stderr = child.stderr.take().expect("original stderr");
         let owner = ProgramOwner {
-            role: "restore_pipe_component", child, pid,
+            role: "restore_pipe_component",
+            child,
+            pid,
             started: clock.observed().expect("original clock observation"),
-            setup_error: false, args_env_clean: clean,
+            setup_error: false,
+            args_env_clean: clean,
             input: Some(tokio::spawn(async move {
-                stdin.shutdown().await.map_err(|_| MaintenanceError::IoFailure)?;
+                stdin
+                    .shutdown()
+                    .await
+                    .map_err(|_| MaintenanceError::IoFailure)?;
                 Err(MaintenanceError::ProtocolInvalid)
             })),
             output: Some(tokio::spawn(async move {
@@ -4042,40 +4134,118 @@ mod restore_pipe_tests {
                 Err(MaintenanceError::ProtocolInvalid)
             })),
         };
-        let mut joins = RestorePipeJoins { stdin: None, stdout: None, stderr: None };
-        let tool = wait_program_with_capacity(owner, &clock, || Ok(()), false, false, Some(&mut joins))
-            .await.unwrap_or_else(|_| panic!("original wait failed"));
-        assert!(matches!(tool.error, Some(MaintenanceError::PipeJoinUnknown)));
+        let mut joins = RestorePipeJoins {
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        };
+        let tool =
+            wait_program_with_capacity(owner, &clock, || Ok(()), false, false, Some(&mut joins))
+                .await
+                .unwrap_or_else(|_| panic!("original wait failed"));
+        assert!(matches!(
+            tool.error,
+            Some(MaintenanceError::PipeJoinUnknown)
+        ));
         assert!(tool.observation.original_child_wait);
-        assert!(matches!(joins.stdin, Some(Ok(Err(MaintenanceError::ProtocolInvalid)))));
-        assert!(matches!(joins.stderr, Some(Ok(Err(MaintenanceError::ProtocolInvalid)))));
-        assert!(joins.stdout.as_ref().is_some_and(|result| result.as_ref().is_err_and(|error| error.is_panic())));
+        assert!(matches!(
+            joins.stdin,
+            Some(Ok(Err(MaintenanceError::ProtocolInvalid)))
+        ));
+        assert!(matches!(
+            joins.stderr,
+            Some(Ok(Err(MaintenanceError::ProtocolInvalid)))
+        ));
+        assert!(
+            joins
+                .stdout
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_err_and(|error| error.is_panic()))
+        );
     }
 
     #[tokio::test]
     async fn restore_success_keeps_original_reports_and_capture_projection() {
         for (retain, preview) in [(false, false), (true, false), (true, true)] {
-            let clock = OperationClock::start(5_000_000_000, 5_000_000_000).expect("real component clock");
+            let clock =
+                OperationClock::start(5_000_000_000, 5_000_000_000).expect("real component clock");
             let mut command = tokio::process::Command::new("/bin/sh");
-            command.args(["-c", "/bin/cat >/dev/null; printf pipe-output; printf pipe-error >&2"])
-                .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            let owner = spawn_program_retaining_io(command, "restore_pipe_component", &clock,
-                Arc::new(SecretBytes::new(b"component-secret".to_vec())), true, (1024, 1024, preview), false)
-                .unwrap_or_else(|_| panic!("original native spawn failed"));
-            let mut joins = RestorePipeJoins { stdin: None, stdout: None, stderr: None };
+            command
+                .args([
+                    "-c",
+                    "/bin/cat >/dev/null; printf pipe-output; printf pipe-error >&2",
+                ])
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let owner = spawn_program_retaining_io(
+                command,
+                "restore_pipe_component",
+                &clock,
+                Arc::new(SecretBytes::new(b"component-secret".to_vec())),
+                true,
+                (1024, 1024, preview),
+                false,
+            )
+            .unwrap_or_else(|_| panic!("original native spawn failed"));
+            let mut joins = RestorePipeJoins {
+                stdin: None,
+                stdout: None,
+                stderr: None,
+            };
             let sink = if retain { Some(&mut joins) } else { None };
             let tool = wait_program_with_capacity(owner, &clock, || Ok(()), false, false, sink)
-                .await.unwrap_or_else(|_| panic!("original wait failed"));
+                .await
+                .unwrap_or_else(|_| panic!("original wait failed"));
             assert!(tool.error.is_none());
             assert_eq!(tool.observation.stdin_writer_joined, Some(true));
-            assert_eq!(tool.observation.stdout.as_ref().expect("stdout report").bytes, 11);
-            assert_eq!(tool.observation.stderr.as_ref().expect("stderr report").bytes, 10);
+            assert_eq!(
+                tool.observation
+                    .stdout
+                    .as_ref()
+                    .expect("stdout report")
+                    .bytes,
+                11
+            );
+            assert_eq!(
+                tool.observation
+                    .stderr
+                    .as_ref()
+                    .expect("stderr report")
+                    .bytes,
+                10
+            );
             if retain {
                 assert!(matches!(joins.stdin, Some(Ok(Ok(())))));
-                let output = joins.stdout.as_ref().and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok()).expect("original stdout task result");
-                let error = joins.stderr.as_ref().and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok()).expect("original stderr task result");
-                assert_eq!(output.report.sha256, tool.observation.stdout.as_ref().expect("stdout observation").sha256);
-                assert_eq!(error.report.sha256, tool.observation.stderr.as_ref().expect("stderr observation").sha256);
+                let output = joins
+                    .stdout
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(|result| result.as_ref().ok())
+                    .expect("original stdout task result");
+                let error = joins
+                    .stderr
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(|result| result.as_ref().ok())
+                    .expect("original stderr task result");
+                assert_eq!(
+                    output.report.sha256,
+                    tool.observation
+                        .stdout
+                        .as_ref()
+                        .expect("stdout observation")
+                        .sha256
+                );
+                assert_eq!(
+                    error.report.sha256,
+                    tool.observation
+                        .stderr
+                        .as_ref()
+                        .expect("stderr observation")
+                        .sha256
+                );
                 assert_eq!(output.preview.len(), if preview { 11 } else { 0 });
                 assert_eq!(tool.preview, output.preview);
                 assert!(output.preview.capacity() <= 512);

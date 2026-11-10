@@ -314,7 +314,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &config,
             &pool,
             &tenant,
-            (session_key.expose(), oidc_state_key.expose(), sso_state_key.expose(), audit_key.expose()),
+            (
+                session_key.expose(),
+                oidc_state_key.expose(),
+                sso_state_key.expose(),
+                audit_key.expose(),
+            ),
             key_encryption.into_wrapping_key(),
             server.public_transport().cookie_secure(),
             recovery_read_gate.clone(),
@@ -900,7 +905,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             });
         }
         if let Err(error) = recovery_runtime_owner
-            .close_before(RuntimeCloseResources::new(close_facts), deadline).await
+            .close_before(RuntimeCloseResources::new(close_facts), deadline)
+            .await
         {
             tracing::warn!(fault = ?error.fault(), "runtime closure remains unproven");
         }

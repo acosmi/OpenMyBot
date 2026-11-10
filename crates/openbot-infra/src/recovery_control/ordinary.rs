@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 
 use sha2::Digest as _;
 
+#[cfg(feature = "desktop-local")]
+use super::activation::OrdinaryLocalSite;
 use super::activation::{
     ActivationBinding, ActivationPayload, ActivationPhase, ActivationRecord, Active, ActualOsOwner,
     ExpectedServerDatabase, Hex32, Hex64, HostBinding, Initializing, JournalPositionRef,
     JournalReference, OrdinaryMode, OrdinaryStartupBounds, PlannedInstallation,
     PublishedActivation, ServerDatabaseSite, ServiceConfigRef,
 };
-#[cfg(feature = "desktop-local")]
-use super::activation::OrdinaryLocalSite;
 use super::entry::{self, ControlOwner, Head};
 use super::journal::{
     BusinessAndInstallation, CommitAck, Disposition, JournalData, RollbackAck, SiteSelection, Stage,
@@ -38,7 +38,9 @@ pub(super) enum OrdinaryInitializationSource {
     #[cfg(feature = "desktop-local")]
     LocalPhysicalFresh,
     ServerDatabaseFresh,
-    LegacyAdoption { site: OrdinarySite },
+    LegacyAdoption {
+        site: OrdinarySite,
+    },
 }
 
 pub(super) type SealedSource = (OrdinaryInitializationSource, Hex32, RecoveryFileIdentity);
@@ -193,8 +195,15 @@ impl VerifiedOrdinaryStartupIntent {
         request_deadline: Instant,
     ) -> Result<Self, RecoveryControlError> {
         match Self::seal(Some(source), site, bounds, admission_ns, owners) {
-            Ok(mut intent) => { intent.admission = intent.admission.min(request_deadline); intent.local_request = Some(request); Ok(intent) }
-            Err(mut error) => { error.retained_restore_intent = Some(Box::new(request)); Err(error) }
+            Ok(mut intent) => {
+                intent.admission = intent.admission.min(request_deadline);
+                intent.local_request = Some(request);
+                Ok(intent)
+            }
+            Err(mut error) => {
+                error.retained_restore_intent = Some(Box::new(request));
+                Err(error)
+            }
         }
     }
 
@@ -335,16 +344,16 @@ fn shared_head_inner(
             if let (SiteExpectation::Local(local), Some(creator)) = (&mut intent.site, creator)
                 && local.root.is_none()
             {
-                    let (installation, root) =
-                        files.create_original_local_installation(creator, intent.effect)?;
-                    local.root = Some(root);
-                    local.installation_id = Some(installation.authority().instance_id().to_owned());
-                    intent.source = Some((
-                        OrdinaryInitializationSource::LocalPhysicalFresh,
-                        Hex32::mint(&mint::<16>()?)?,
-                        root,
-                    ));
-                    intent.fresh_installation = Some(installation);
+                let (installation, root) =
+                    files.create_original_local_installation(creator, intent.effect)?;
+                local.root = Some(root);
+                local.installation_id = Some(installation.authority().instance_id().to_owned());
+                intent.source = Some((
+                    OrdinaryInitializationSource::LocalPhysicalFresh,
+                    Hex32::mint(&mint::<16>()?)?,
+                    root,
+                ));
+                intent.fresh_installation = Some(installation);
             }
             files.release_registration_attempt();
             return Err(initialization_required(
@@ -365,7 +374,9 @@ fn shared_head_inner(
     if published.observation().record.phase == ActivationPhase::RestoreCurrent
         && let SiteExpectation::Local(expected) = &mut intent.site
     {
-        let plan = published.restore_plan().ok_or_else(|| fault(RecoveryControlFault::ControlInvalid))?;
+        let plan = published
+            .restore_plan()
+            .ok_or_else(|| fault(RecoveryControlFault::ControlInvalid))?;
         if expected.parent != plan.trusted_parent {
             files.release_registration_attempt();
             return Err(fault(RecoveryControlFault::EntryInvalid));
@@ -438,12 +449,34 @@ enum LocalLegacyTerminal {
 #[cfg(feature = "desktop-local")]
 struct LocalLegacySql {
     client: Option<crate::db::pool::GuardedClient>,
-    checkout: Option<Result<Result<crate::db::pool::GuardedClient, crate::db::pool::PoolError>, tokio::time::error::Elapsed>>,
-    begin: Option<Result<Result<(), crate::db::pool::TransactionOwnerError>, tokio::time::error::Elapsed>>,
-    canary: Option<Result<Result<bool, crate::db::desktop_vault_canary::DesktopVaultCanaryError>, tokio::time::error::Elapsed>>,
-    layout: Option<Result<Result<crate::db::desktop_vault_canary::ValidatedDesktopVaultLayout, crate::db::InfraError>, tokio::time::error::Elapsed>>,
+    checkout: Option<
+        Result<
+            Result<crate::db::pool::GuardedClient, crate::db::pool::PoolError>,
+            tokio::time::error::Elapsed,
+        >,
+    >,
+    begin: Option<
+        Result<Result<(), crate::db::pool::TransactionOwnerError>, tokio::time::error::Elapsed>,
+    >,
+    canary: Option<
+        Result<
+            Result<bool, crate::db::desktop_vault_canary::DesktopVaultCanaryError>,
+            tokio::time::error::Elapsed,
+        >,
+    >,
+    layout: Option<
+        Result<
+            Result<
+                crate::db::desktop_vault_canary::ValidatedDesktopVaultLayout,
+                crate::db::InfraError,
+            >,
+            tokio::time::error::Elapsed,
+        >,
+    >,
     validation: Option<Result<Result<(), crate::db::InfraError>, tokio::time::error::Elapsed>>,
-    row: Option<Result<Result<tokio_postgres::Row, tokio_postgres::Error>, tokio::time::error::Elapsed>>,
+    row: Option<
+        Result<Result<tokio_postgres::Row, tokio_postgres::Error>, tokio::time::error::Elapsed>,
+    >,
     statement: Option<Result<Result<(), tokio_postgres::Error>, tokio::time::error::Elapsed>>,
     count: Option<Result<Result<u64, tokio_postgres::Error>, tokio::time::error::Elapsed>>,
     terminal: Option<LocalLegacyTerminal>,
@@ -491,11 +524,20 @@ pub struct VerifiedOrdinaryLegacyProof {
     pub(crate) migration_digest: String,
 }
 
-#[cfg_attr(feature = "desktop-local", expect(clippy::large_enum_variant, reason = "Original Local site proofs stay inline in the already admitted session custody"))]
+#[cfg_attr(
+    feature = "desktop-local",
+    expect(
+        clippy::large_enum_variant,
+        reason = "Original Local site proofs stay inline in the already admitted session custody"
+    )
+)]
 pub(super) enum LegacySite {
     #[cfg(feature = "desktop-local")]
     Local(OrdinaryLocalSite),
-    Server { site: ServerDatabaseSite, key_id: Hex32 },
+    Server {
+        site: ServerDatabaseSite,
+        key_id: Hex32,
+    },
 }
 
 /// Server Fresh facts read back on the initializing connection (S7).
@@ -629,12 +671,20 @@ impl OrdinaryInitializationSession {
     pub fn load_local_legacy_installation_before(
         &self,
         store: &crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
-    ) -> Result<crate::auth::single_user::desktop_local::DesktopLocalInstallation, RecoveryControlError> {
+    ) -> Result<
+        crate::auth::single_user::desktop_local::DesktopLocalInstallation,
+        RecoveryControlError,
+    > {
         let invalid = || fault(RecoveryControlFault::EntryInvalid);
-        if !self.is_local_legacy() || self.head.is_none() { return Err(invalid()); }
-        let SiteExpectation::Local(expected) = &self.intent.site else { return Err(invalid()); };
+        if !self.is_local_legacy() || self.head.is_none() {
+            return Err(invalid());
+        }
+        let SiteExpectation::Local(expected) = &self.intent.site else {
+            return Err(invalid());
+        };
         let installation = store.load_existing_installation().map_err(|_| invalid())?;
-        entry::lock(&self.control)?.verify_local_root_before(expected.root.ok_or_else(invalid)?, self.intent.effect)?;
+        entry::lock(&self.control)?
+            .verify_local_root_before(expected.root.ok_or_else(invalid)?, self.intent.effect)?;
         if expected.installation_id.as_deref() != Some(installation.authority().instance_id()) {
             return Err(invalid());
         }
@@ -676,14 +726,21 @@ impl OrdinaryInitializationSession {
     }
 
     /// Original effect deadline; borrowing it never renews this initialization.
-    pub fn effect_deadline(&self) -> Instant { self.intent.effect }
+    pub fn effect_deadline(&self) -> Instant {
+        self.intent.effect
+    }
 
     /// Original convergence deadline for retiring this owner's resources.
-    pub fn convergence_deadline(&self) -> Instant { self.intent.convergence }
+    pub fn convergence_deadline(&self) -> Instant {
+        self.intent.convergence
+    }
 
     /// Whether this owner consumed a Local legacy adoption request.
     pub fn is_local_legacy(&self) -> bool {
-        self.initialization_source() == Some(OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical })
+        self.initialization_source()
+            == Some(OrdinaryInitializationSource::LegacyAdoption {
+                site: OrdinarySite::LocalPhysical,
+            })
     }
 
     /// Whether this writer adopts a published head below the latest native
@@ -827,8 +884,13 @@ impl OrdinaryInitializationSession {
             _ => return Err(invalid()),
         };
         let (dataset, ids, database, service_config, owner) = match &self.intent.site {
-            SiteExpectation::Server { dataset, ids, database, service_config, owner } =>
-                (dataset, ids, database, service_config, owner),
+            SiteExpectation::Server {
+                dataset,
+                ids,
+                database,
+                service_config,
+                owner,
+            } => (dataset, ids, database, service_config, owner),
             #[cfg(feature = "desktop-local")]
             SiteExpectation::Local(_) => return Err(invalid()),
         };
@@ -875,7 +937,9 @@ impl OrdinaryInitializationSession {
         planned: PlannedInstallation,
         legacy: Option<(SiteSelection, BusinessAndInstallation)>,
     ) -> Result<(), RecoveryControlError> {
-        if self.operation.is_some() { return Err(fault(RecoveryControlFault::EntryInvalid)); }
+        if self.operation.is_some() {
+            return Err(fault(RecoveryControlFault::EntryInvalid));
+        }
         let (_, intent_id, intent_file) = self
             .intent
             .source
@@ -889,7 +953,11 @@ impl OrdinaryInitializationSession {
         let mut files = entry::lock(&self.control)?;
         host.validate_plan(&planned, &files.limits)?;
         let control_id = Hex32::mint(&mint::<16>()?)?;
-        let operation = if legacy.is_some() { intent_id } else { Hex32::mint(&mint::<16>()?)? };
+        let operation = if legacy.is_some() {
+            intent_id
+        } else {
+            Hex32::mint(&mint::<16>()?)?
+        };
         let epoch = Hex64::mint(&mint::<32>()?)?;
         let limits = serde_json::to_vec(&files.limits).map_err(RecoveryControlError::from_json)?;
         let limits_digest = Hex64::of(&sha2::Sha256::digest(&limits).into());
@@ -987,15 +1055,42 @@ impl OrdinaryInitializationSession {
     #[cfg(feature = "desktop-local")]
     pub fn seal_local_legacy_before(&mut self) -> Result<(), RecoveryControlError> {
         let invalid = || fault(RecoveryControlFault::EntryInvalid);
-        if self.initialization_source() != Some(OrdinaryInitializationSource::LegacyAdoption { site: OrdinarySite::LocalPhysical }) || self.head.is_some() { return Err(invalid()); }
-        let SiteExpectation::Local(local) = &self.intent.site else { return Err(invalid()); };
+        if self.initialization_source()
+            != Some(OrdinaryInitializationSource::LegacyAdoption {
+                site: OrdinarySite::LocalPhysical,
+            })
+            || self.head.is_some()
+        {
+            return Err(invalid());
+        }
+        let SiteExpectation::Local(local) = &self.intent.site else {
+            return Err(invalid());
+        };
         let expected = local.legacy_expected.as_ref().ok_or_else(invalid)?.clone();
         let mut files = entry::lock(&self.control)?;
         files.verify_local_root_before(local.root.ok_or_else(invalid)?, self.intent.effect)?;
-        entry::recheck_legacy_request_before(&mut files, self.intent.local_request.as_mut().ok_or_else(invalid)?, self.intent.effect)?;
-        let host = HostBinding::LocalPhysical { actual_os_owner: ActualOsOwner::LocalUid { uid: local.root.ok_or_else(invalid)?.uid }, app_data_parent: local.parent, control_root: files.root_identity(self.intent.effect)?, reviewed_release_digest: local.release.as_str().to_owned() };
-        let planned = PlannedInstallation::LocalPhysical { trusted_parent: local.parent, entry_component: local.component.clone(), installation_id: expected.target_installation_id.clone() };
-        let selection = SiteSelection::LocalPhysical { trusted_parent: local.parent, entry_component: local.component.clone() };
+        entry::recheck_legacy_request_before(
+            &mut files,
+            self.intent.local_request.as_mut().ok_or_else(invalid)?,
+            self.intent.effect,
+        )?;
+        let host = HostBinding::LocalPhysical {
+            actual_os_owner: ActualOsOwner::LocalUid {
+                uid: local.root.ok_or_else(invalid)?.uid,
+            },
+            app_data_parent: local.parent,
+            control_root: files.root_identity(self.intent.effect)?,
+            reviewed_release_digest: local.release.as_str().to_owned(),
+        };
+        let planned = PlannedInstallation::LocalPhysical {
+            trusted_parent: local.parent,
+            entry_component: local.component.clone(),
+            installation_id: expected.target_installation_id.clone(),
+        };
+        let selection = SiteSelection::LocalPhysical {
+            trusted_parent: local.parent,
+            entry_component: local.component.clone(),
+        };
         drop(files);
         self.seal_site(host, planned, Some((selection, expected)))?;
         self.intend(OrdinaryStage::Verify)
@@ -1047,7 +1142,12 @@ impl OrdinaryInitializationSession {
         let root = local.root.ok_or_else(invalid)?;
         let master_service = local.master_service.clone();
         let postgres_service = local.postgres_service.clone();
-        self.local_sql.canary = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async { canary.matches_database(database).await }).await);
+        self.local_sql.canary = Some(
+            tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async {
+                canary.matches_database(database).await
+            })
+            .await,
+        );
         self.local_effect_before()?;
         if !matches!(self.local_sql.canary, Some(Ok(Ok(true)))) {
             return Err(invalid());
@@ -1057,26 +1157,46 @@ impl OrdinaryInitializationSession {
                 + std::mem::size_of::<crate::db::pool::GuardedClient>()) as u64,
             0,
         )?;
-        self.local_sql.checkout = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), database.pool().get_guarded(self.intent.convergence)).await);
+        self.local_sql.checkout = Some(
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(self.intent.effect),
+                database.pool().get_guarded(self.intent.convergence),
+            )
+            .await,
+        );
         self.local_effect_before()?;
-        if !matches!(self.local_sql.checkout, Some(Ok(Ok(_)))) { return Err(fault(RecoveryControlFault::IoFailure)); }
-        self.local_sql.client = match self.local_sql.checkout.take().expect("resident checkout") { Ok(Ok(client)) => Some(client), _ => unreachable!("checked original checkout") };
+        if !matches!(self.local_sql.checkout, Some(Ok(Ok(_)))) {
+            return Err(fault(RecoveryControlFault::IoFailure));
+        }
+        self.local_sql.client = match self.local_sql.checkout.take().expect("resident checkout") {
+            Ok(Ok(client)) => Some(client),
+            _ => unreachable!("checked original checkout"),
+        };
         let client = self
             .local_sql
             .client
             .as_ref()
             .ok_or_else(|| fault(RecoveryControlFault::IoFailure))?;
-        self.local_sql.layout =
-            Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client.as_client())).await);
+        self.local_sql.layout = Some(
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(self.intent.effect),
+                crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client.as_client()),
+            )
+            .await,
+        );
         self.local_effect_before()?;
         let version = self
             .local_sql
             .layout
             .as_ref()
-            .and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
             .ok_or_else(invalid)?
             .native_version();
-        if version != native::NATIVE_0052_VERSION && version != native::NATIVE_0053_VERSION && version != native::NATIVE_LATEST_VERSION {
+        if version != native::NATIVE_0052_VERSION
+            && version != native::NATIVE_0053_VERSION
+            && version != native::NATIVE_LATEST_VERSION
+        {
             return Err(invalid());
         }
         let mut client = self
@@ -1085,11 +1205,26 @@ impl OrdinaryInitializationSession {
             .take()
             .expect("original client resident");
         let stage_result = {
-            match tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async {
-                if version == native::NATIVE_LATEST_VERSION { client.begin_read_committed_read_only().await } else { client.begin_read_committed().await }
-            }).await {
-                Err(error) => { self.local_sql.begin = Some(Err(error)); Err(fault(RecoveryControlFault::EffectExpired)) }
-                Ok(Err(error)) => { self.local_sql.begin = Some(Ok(Err(error))); Err(fault(RecoveryControlFault::IoFailure)) }
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(self.intent.effect),
+                async {
+                    if version == native::NATIVE_LATEST_VERSION {
+                        client.begin_read_committed_read_only().await
+                    } else {
+                        client.begin_read_committed().await
+                    }
+                },
+            )
+            .await
+            {
+                Err(error) => {
+                    self.local_sql.begin = Some(Err(error));
+                    Err(fault(RecoveryControlFault::EffectExpired))
+                }
+                Ok(Err(error)) => {
+                    self.local_sql.begin = Some(Ok(Err(error)));
+                    Err(fault(RecoveryControlFault::IoFailure))
+                }
                 Ok(Ok(owner)) => {
                     self.local_sql.begin = Some(Ok(Ok(())));
                     let transaction = owner.as_transaction();
@@ -1146,7 +1281,9 @@ impl OrdinaryInitializationSession {
                     self.local_sql.terminal = Some(if matches!(verified, Ok(true)) {
                         LocalLegacyTerminal::Commit(owner.commit_before(self.intent.effect).await)
                     } else {
-                        LocalLegacyTerminal::Rollback(owner.rollback_before(self.intent.convergence).await)
+                        LocalLegacyTerminal::Rollback(
+                            owner.rollback_before(self.intent.convergence).await,
+                        )
                     });
                     verified
                 }
@@ -1155,38 +1292,83 @@ impl OrdinaryInitializationSession {
         self.local_sql.client = Some(client);
         let returned = Instant::now();
         let observation = match self.local_sql.terminal.as_ref() {
-            Some(LocalLegacyTerminal::Commit(Ok(()))) => Some((Disposition::PgCommit(CommitAck::TimelyAck), true, None)),
-            Some(LocalLegacyTerminal::Commit(Err(TransactionOwnerError::CommitAcknowledgedAfterDeadline))) => Some((Disposition::PgCommit(CommitAck::AcknowledgedAfterDeadline), false, Some(RecoveryControlFault::EffectExpired))),
-            Some(LocalLegacyTerminal::Commit(Err(TransactionOwnerError::CommitUnknown))) => Some((Disposition::PgCommit(CommitAck::CommitUnknown), false, Some(RecoveryControlFault::DatabaseUnknown))),
-            Some(LocalLegacyTerminal::Commit(Err(_))) => Some((Disposition::PgRollback(RollbackAck::RollbackUnproven), false, Some(RecoveryControlFault::EffectExpired))),
+            Some(LocalLegacyTerminal::Commit(Ok(()))) => {
+                Some((Disposition::PgCommit(CommitAck::TimelyAck), true, None))
+            }
+            Some(LocalLegacyTerminal::Commit(Err(
+                TransactionOwnerError::CommitAcknowledgedAfterDeadline,
+            ))) => Some((
+                Disposition::PgCommit(CommitAck::AcknowledgedAfterDeadline),
+                false,
+                Some(RecoveryControlFault::EffectExpired),
+            )),
+            Some(LocalLegacyTerminal::Commit(Err(TransactionOwnerError::CommitUnknown))) => Some((
+                Disposition::PgCommit(CommitAck::CommitUnknown),
+                false,
+                Some(RecoveryControlFault::DatabaseUnknown),
+            )),
+            Some(LocalLegacyTerminal::Commit(Err(_))) => Some((
+                Disposition::PgRollback(RollbackAck::RollbackUnproven),
+                false,
+                Some(RecoveryControlFault::EffectExpired),
+            )),
             Some(LocalLegacyTerminal::Rollback(Ok(()))) => {
                 let timely = returned <= self.intent.effect;
-                Some((Disposition::PgRollback(if timely { RollbackAck::TimelyAck } else { RollbackAck::AcknowledgedAfterDeadline }), timely, (!timely).then_some(RecoveryControlFault::EffectExpired)))
+                Some((
+                    Disposition::PgRollback(if timely {
+                        RollbackAck::TimelyAck
+                    } else {
+                        RollbackAck::AcknowledgedAfterDeadline
+                    }),
+                    timely,
+                    (!timely).then_some(RecoveryControlFault::EffectExpired),
+                ))
             }
-            Some(LocalLegacyTerminal::Rollback(Err(TransactionOwnerError::RollbackAcknowledgedAfterDeadline))) => Some((Disposition::PgRollback(RollbackAck::AcknowledgedAfterDeadline), false, Some(RecoveryControlFault::ConvergenceExpired))),
-            Some(LocalLegacyTerminal::Rollback(Err(_))) => Some((Disposition::PgRollback(RollbackAck::RollbackUnproven), false, Some(RecoveryControlFault::DatabaseUnknown))),
+            Some(LocalLegacyTerminal::Rollback(Err(
+                TransactionOwnerError::RollbackAcknowledgedAfterDeadline,
+            ))) => Some((
+                Disposition::PgRollback(RollbackAck::AcknowledgedAfterDeadline),
+                false,
+                Some(RecoveryControlFault::ConvergenceExpired),
+            )),
+            Some(LocalLegacyTerminal::Rollback(Err(_))) => Some((
+                Disposition::PgRollback(RollbackAck::RollbackUnproven),
+                false,
+                Some(RecoveryControlFault::DatabaseUnknown),
+            )),
             None => None,
         };
         let recorded = match observation {
-            Some((disposition, timely, failure)) => { self.observe(disposition, timely).map(|_| ())?; failure }
+            Some((disposition, timely, failure)) => {
+                self.observe(disposition, timely).map(|_| ())?;
+                failure
+            }
             None => None,
         };
         stage_result?;
-        if let Some(failure) = recorded { return Err(fault(failure)); }
+        if let Some(failure) = recorded {
+            return Err(fault(failure));
+        }
         self.local_effect_before()?;
         let client = self
             .local_sql
             .client
             .as_ref()
             .expect("original client restored before clock checks");
-        self.local_sql.layout =
-            Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client.as_client())).await);
+        self.local_sql.layout = Some(
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(self.intent.effect),
+                crate::db::desktop_vault_canary::verify_pre_upgrade_layout_on(client.as_client()),
+            )
+            .await,
+        );
         self.local_effect_before()?;
         if self
             .local_sql
             .layout
             .as_ref()
-            .and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
             .ok_or_else(invalid)?
             .native_version()
             != native::NATIVE_LATEST_VERSION
@@ -1204,7 +1386,8 @@ impl OrdinaryInitializationSession {
             .local_sql
             .row
             .as_ref()
-            .and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
             .ok_or_else(invalid)?;
         let system: String = row.try_get("system_identifier").map_err(|_| invalid())?;
         let pg_system_id = system
@@ -1216,7 +1399,12 @@ impl OrdinaryInitializationSession {
         if database_oid == 0 || row.try_get::<_, i32>("pg_major").ok() != Some(17) {
             return Err(invalid());
         }
-        self.local_sql.canary = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async { canary.matches_database(database).await }).await);
+        self.local_sql.canary = Some(
+            tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async {
+                canary.matches_database(database).await
+            })
+            .await,
+        );
         self.local_effect_before()?;
         if !matches!(self.local_sql.canary, Some(Ok(Ok(true)))) {
             return Err(invalid());
@@ -1254,13 +1442,27 @@ impl OrdinaryInitializationSession {
             target_installation_id: installation.clone(),
             operation_id: operation.as_str().to_owned(),
         };
-        let client = self.local_sql.client.as_ref().expect("original client retained");
+        let client = self
+            .local_sql
+            .client
+            .as_ref()
+            .expect("original client retained");
         self.local_sql.row = Some(tokio::time::timeout_at(tokio::time::Instant::from_std(self.intent.effect), async { client.as_client().query_one("SELECT version,checksum FROM openbot_internal.schema_migrations WHERE version=$1", &[&native::NATIVE_LATEST_VERSION]).await }).await);
         self.local_effect_before()?;
-        let row = self.local_sql.row.as_ref().and_then(|result| result.as_ref().ok()).and_then(|result| result.as_ref().ok()).ok_or_else(invalid)?;
+        let row = self
+            .local_sql
+            .row
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
+            .ok_or_else(invalid)?;
         let actual_version: i32 = row.try_get("version").map_err(|_| invalid())?;
         let migration_digest: String = row.try_get("checksum").map_err(|_| invalid())?;
-        if actual_version != native::NATIVE_LATEST_VERSION || migration_digest != native::native_0054_checksum() { return Err(invalid()); }
+        if actual_version != native::NATIVE_LATEST_VERSION
+            || migration_digest != native::native_0054_checksum()
+        {
+            return Err(invalid());
+        }
         Ok(VerifiedOrdinaryLegacyProof {
             operation,
             site: LegacySite::Local(OrdinaryLocalSite {
@@ -1657,13 +1859,39 @@ impl OrdinaryInitializationSession {
                     service_config,
                     ..
                 },
-                OrdinaryActivationProof::Legacy(VerifiedOrdinaryLegacyProof { site: LegacySite::Server { site, key_id }, native_version, migration_digest, .. }),
+                OrdinaryActivationProof::Legacy(VerifiedOrdinaryLegacyProof {
+                    site: LegacySite::Server { site, key_id },
+                    native_version,
+                    migration_digest,
+                    ..
+                }),
             ) => ActivationBinding::server(
-                dataset, ids, service_config, site, native_version, &migration_digest,
-                &initializing.initial_epoch, key_id.as_str(), operation.as_str(),
+                dataset,
+                ids,
+                service_config,
+                site,
+                native_version,
+                &migration_digest,
+                &initializing.initial_epoch,
+                key_id.as_str(),
+                operation.as_str(),
             ),
             #[cfg(feature = "desktop-local")]
-            (SiteExpectation::Local(_), OrdinaryActivationProof::Legacy(VerifiedOrdinaryLegacyProof { site: LegacySite::Local(site), native_version, migration_digest, .. })) => ActivationBinding::local(site, native_version, migration_digest, initializing.initial_epoch.clone(), operation),
+            (
+                SiteExpectation::Local(_),
+                OrdinaryActivationProof::Legacy(VerifiedOrdinaryLegacyProof {
+                    site: LegacySite::Local(site),
+                    native_version,
+                    migration_digest,
+                    ..
+                }),
+            ) => ActivationBinding::local(
+                site,
+                native_version,
+                migration_digest,
+                initializing.initial_epoch.clone(),
+                operation,
+            ),
             #[cfg(feature = "desktop-local")]
             _ => return Err(invalid()),
         };
@@ -1755,33 +1983,38 @@ impl OrdinaryInitializationSession {
     /// latest native version.
     pub fn into_runtime_before(self) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
         let result = (|| {
-        let latest_head = self
-            .head
-            .as_ref()
-            .is_some_and(|(record, _)| match record.data() {
-                ActivationPayload::Active(active) => active.binding.native_version() == latest(),
-                ActivationPayload::Current(current) => current.binding.native_version() == latest(),
-                _ => false,
-            });
-        if !latest_head || self.pending.is_some() {
-            return Err(fault(RecoveryControlFault::InitializationRequired));
-        }
-        let effect = self.intent.effect;
-        let entry = {
-            let mut files = entry::lock(&self.control)?;
-            files.downgrade_runtime_before(effect)?;
-            let published = match files.read_head_before(effect)? {
-                Head::Published(published)
-                    if Some(published.digest()) == self.head.as_ref().map(|(_, d)| d.as_str()) =>
-                {
-                    published
-                }
-                _ => return Err(fault(RecoveryControlFault::ControlInvalid)),
+            let latest_head = self
+                .head
+                .as_ref()
+                .is_some_and(|(record, _)| match record.data() {
+                    ActivationPayload::Active(active) => {
+                        active.binding.native_version() == latest()
+                    }
+                    ActivationPayload::Current(current) => {
+                        current.binding.native_version() == latest()
+                    }
+                    _ => false,
+                });
+            if !latest_head || self.pending.is_some() {
+                return Err(fault(RecoveryControlFault::InitializationRequired));
+            }
+            let effect = self.intent.effect;
+            let entry = {
+                let mut files = entry::lock(&self.control)?;
+                files.downgrade_runtime_before(effect)?;
+                let published = match files.read_head_before(effect)? {
+                    Head::Published(published)
+                        if Some(published.digest())
+                            == self.head.as_ref().map(|(_, d)| d.as_str()) =>
+                    {
+                        published
+                    }
+                    _ => return Err(fault(RecoveryControlFault::ControlInvalid)),
+                };
+                self.intent.expects(published.binding())?;
+                files.runtime_entry(published, &self.intent)?
             };
-            self.intent.expects(published.binding())?;
-            files.runtime_entry(published, &self.intent)?
-        };
-        runtime::enter_runtime(&self.control, entry, effect)
+            runtime::enter_runtime(&self.control, entry, effect)
         })();
         result.map_err(|mut error: RecoveryControlError| {
             error.retained_ordinary = Some(Box::new(self));

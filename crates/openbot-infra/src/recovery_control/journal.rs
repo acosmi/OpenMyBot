@@ -566,7 +566,10 @@ pub(super) struct JournalFrame {
 
 impl JournalData {
     pub(super) fn restore(intent: RestoreIntent) -> Self {
-        Self { kind: Kind::OperationIntent, data: Data::Operation(OperationIntent::Restore(intent)) }
+        Self {
+            kind: Kind::OperationIntent,
+            data: Data::Operation(OperationIntent::Restore(intent)),
+        }
     }
     pub(super) fn fresh_init(
         host_binding: HostBinding,
@@ -1082,28 +1085,47 @@ fn unproven() -> RecoveryControlError {
 impl JournalObservation {
     /// Match Pending DATA to its actual first RestoreIntent and full reference.
     #[cfg(feature = "desktop-local")]
-    pub(super) fn matches_restore_pending(&self, pending: &super::activation::Pending) -> Result<(), RecoveryControlError> {
+    pub(super) fn matches_restore_pending(
+        &self,
+        pending: &super::activation::Pending,
+    ) -> Result<(), RecoveryControlError> {
         let invalid = || RecoveryControlError::new(RecoveryControlFault::ControlInvalid);
         let first = self.records.first().ok_or_else(invalid)?;
-        let Data::Operation(OperationIntent::Restore(intent)) = &first.data else { return Err(invalid()); };
+        let Data::Operation(OperationIntent::Restore(intent)) = &first.data else {
+            return Err(invalid());
+        };
         let reference = &pending.journal_prefix;
         let old = &intent.owner_clock;
         let shown = &pending.owner_clock;
         let plan = &intent.candidate_plan;
         let selected = &pending.candidate_plan;
-        let profile = serde_json::to_vec(&intent.profile).map_err(RecoveryControlError::from_json)?;
-        let input = serde_json::to_vec(&intent.input_identities).map_err(RecoveryControlError::from_json)?;
-        if first.operation_id != pending.operation_id || first.epoch != pending.epoch
-            || reference.context_id != first.operation_id || reference.sequence != 1
+        let profile =
+            serde_json::to_vec(&intent.profile).map_err(RecoveryControlError::from_json)?;
+        let input = serde_json::to_vec(&intent.input_identities)
+            .map_err(RecoveryControlError::from_json)?;
+        if first.operation_id != pending.operation_id
+            || first.epoch != pending.epoch
+            || reference.context_id != first.operation_id
+            || reference.sequence != 1
             || self.digests.first().map(digest_hex).as_ref() != Some(&reference.digest)
             || !hex_matches(&Sha256::digest(profile).into(), &pending.profile_digest)
             || !hex_matches(&Sha256::digest(input).into(), &pending.input_plan_digest)
-            || plan.trusted_parent != selected.trusted_parent || plan.entry_component != selected.entry_component
-            || plan.installation_id != selected.installation_id || plan.generation_id != selected.generation_id
-            || old.clock_kind != shown.clock_kind || old.boot_identity != shown.boot_identity || old.pid != shown.pid
-            || old.process_start.seconds != shown.process_start.seconds || old.process_start.nanos != shown.process_start.nanos || old.owner_nonce != shown.owner_nonce
-            || old.t0_ns != shown.t0_ns || old.effect_deadline_ns != shown.effect_deadline_ns || old.convergence_deadline_ns != shown.convergence_deadline_ns
-        { return Err(invalid()); }
+            || plan.trusted_parent != selected.trusted_parent
+            || plan.entry_component != selected.entry_component
+            || plan.installation_id != selected.installation_id
+            || plan.generation_id != selected.generation_id
+            || old.clock_kind != shown.clock_kind
+            || old.boot_identity != shown.boot_identity
+            || old.pid != shown.pid
+            || old.process_start.seconds != shown.process_start.seconds
+            || old.process_start.nanos != shown.process_start.nanos
+            || old.owner_nonce != shown.owner_nonce
+            || old.t0_ns != shown.t0_ns
+            || old.effect_deadline_ns != shown.effect_deadline_ns
+            || old.convergence_deadline_ns != shown.convergence_deadline_ns
+        {
+            return Err(invalid());
+        }
         Ok(())
     }
 

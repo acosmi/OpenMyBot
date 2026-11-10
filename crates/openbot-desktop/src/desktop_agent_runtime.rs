@@ -231,7 +231,6 @@ impl DesktopAgentHost {
         self.agent.is_some()
     }
 
-
     /// Both original stop futures are polled. The outer capture owner retains this host and
     /// applies its one original clock; no handle is moved into a disposable timeout future.
     pub(crate) async fn stop_for_capture(&mut self) -> Result<(), DesktopAgentStopFailure> {
