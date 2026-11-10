@@ -19,14 +19,14 @@ use openbot_contracts::command::{
     ThreadRunStarted,
 };
 use openbot_contracts::ids::thread::ThreadIdentity;
-use openbot_contracts::ids::{ActorId, BotId, DeploymentId, TenantId, ThreadId};
+use openbot_contracts::ids::{ActorId, BotId, DeploymentId, RunId, TenantId, ThreadId};
 use openbot_domain::run::{Run, RunEvent, RunEventKind};
 use openbot_domain::thread::{FencingToken, Message, MessageId, MessageRole};
 use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{mpsc, watch};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{AsyncMessage, Client, Connection, NoTls, Socket, Transaction};
+use tokio_postgres::{AsyncMessage, Client, Connection, NoTls, Row, Socket, Transaction};
 
 use crate::db::{InfraError, occupancy};
 use crate::run_runtime::{
@@ -233,6 +233,9 @@ impl PostgresThreadDirectory {
         let schema = crate::thread_history_writer::CurrentWriterSchema::observe(&tx)
             .await
             .map_err(|e| origin_error(e).into_app_error())?;
+        let mut automation =
+            crate::automation::dispatch::AutomationBeginAdmission::observe(&tx, &delegated).await?;
+        let automation_source = automation.is_some();
         let facts = crate::delegation::owner_snapshot(
             &tx,
             &delegated.deployment,
@@ -258,12 +261,29 @@ impl PostgresThreadDirectory {
                 model_selection: None,
             },
         };
-        let result =
-            apply_begin_observed(&tx, runtime, &request, &[], &schema, Some(&delegated)).await;
+        let result = apply_begin_observed(
+            &tx,
+            runtime,
+            &request,
+            &[],
+            &schema,
+            Some(&delegated),
+            automation.as_ref(),
+        )
+        .await;
         match result {
             Ok(BeginOutcome::Created(receipt)) => {
+                if let Some(admission) = automation.take() {
+                    admission.associate(&tx, &delegated).await?;
+                }
                 tx.commit().await.map_err(|_| {
-                    openbot_contracts::error::AppError::ReconciliationRequired { accepted: true }
+                    if automation_source {
+                        crate::automation::store::unavailable()
+                    } else {
+                        openbot_contracts::error::AppError::ReconciliationRequired {
+                            accepted: true,
+                        }
+                    }
                 })?;
                 Ok(receipt)
             }
@@ -417,6 +437,13 @@ impl PostgresThreadDirectory {
         .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
 
     let existing_thread = load_thread(transaction, request).await?;
+    if existing_thread.is_some() {
+        let bound: bool = transaction.query_one(
+            "SELECT EXISTS(SELECT 1 FROM openbot_internal.automation_definitions WHERE thread_id=$1)",
+            &[&command.thread_id.as_str()],
+        ).await.map_err(|_| ThreadDirectoryError::Unavailable)?.get(0);
+        if bound { return Err(ThreadDirectoryError::AnchorUnsupported); }
+    }
     if existing_thread.is_some() {
         crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
             .await
@@ -642,6 +669,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
             "SELECT DISTINCT p.thread_id FROM openbot_internal.thread_pending_inputs p
              JOIN public.threads t ON t.thread_id=p.thread_id
              WHERE p.state='pending' AND t.status<>'deleted'
+               AND NOT EXISTS(SELECT 1 FROM openbot_internal.automation_definitions a WHERE a.thread_id=t.thread_id)
                AND NOT EXISTS(SELECT 1 FROM public.thread_run_occupancy o WHERE o.thread_id=p.thread_id)
                AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_intents q WHERE q.thread_id=p.thread_id
                  AND NOT EXISTS(SELECT 1 FROM openbot_internal.thread_history_clear_completions c WHERE c.operation_id=q.operation_id))
@@ -883,12 +911,24 @@ impl ThreadDirectory for PostgresThreadDirectory {
                  AND t.status=$5 AND t.deleted_at IS NULL
                  AND EXISTS(SELECT 1 FROM public.thread_memberships tm
                    WHERE tm.thread_id=t.thread_id AND tm.user_id=$2)
+                 AND NOT EXISTS(SELECT 1 FROM openbot_internal.automation_definitions a
+                   WHERE a.thread_id=t.thread_id)
                  AND ($6::timestamptz IS NULL OR t.updated_at<$6
                    OR (t.updated_at=$6 AND t.thread_id>$7))
                ORDER BY t.updated_at DESC,t.thread_id ASC LIMIT $8
              ), occupancy_scope AS (SELECT thread_id FROM candidates)
              {}
-             SELECT b.visible,t.thread_id,t.title,t.updated_at,i.bad_occupancy,
+             SELECT b.visible, EXISTS(
+                 SELECT 1 FROM public.threads cursor_thread
+                 JOIN openbot_internal.automation_definitions a ON a.thread_id=cursor_thread.thread_id
+                 WHERE cursor_thread.thread_id=$7 AND cursor_thread.created_by=$2
+                   AND cursor_thread.deployment_id=$3 AND cursor_thread.tenant_id=$4
+                   AND cursor_thread.anchor_kind='direct_bot' AND cursor_thread.anchor_id=$1
+                   AND cursor_thread.status<>'deleted' AND cursor_thread.deleted_at IS NULL
+                   AND EXISTS(SELECT 1 FROM public.thread_memberships tm
+                     WHERE tm.thread_id=cursor_thread.thread_id AND tm.user_id=$2)
+               ) AS automation_bound,
+               t.thread_id,t.title,t.updated_at,i.bad_occupancy,
                r.run_id,r.status AS run_status,
                (SELECT count(*) FROM openbot_internal.thread_pending_inputs p
                  WHERE p.thread_id=t.thread_id AND p.state IN ('pending','held')) AS pending_inputs,
@@ -922,6 +962,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         for row in &rows {
             if !decode::<bool>(row, "visible")? {
                 return Err(ThreadDirectoryError::NotVisible);
+            }
+            if decode::<bool>(row, "automation_bound")? {
+                return Err(ThreadDirectoryError::AnchorUnsupported);
             }
             let Some(thread_id) = decode::<Option<String>>(row, "thread_id")? else {
                 continue;
@@ -1032,6 +1075,13 @@ impl ThreadDirectory for PostgresThreadDirectory {
             return Err(ThreadDirectoryError::NotVisible);
         }
         if decode::<String>(&row, "anchor_kind")? != "direct_bot" {
+            return Err(ThreadDirectoryError::AnchorUnsupported);
+        }
+        let automation: bool = tx.query_one(
+            "SELECT EXISTS(SELECT 1 FROM openbot_internal.automation_definitions WHERE thread_id=$1)",
+            &[&thread_id.as_str()],
+        ).await.map_err(|_| ThreadDirectoryError::Unavailable)?.get(0);
+        if automation {
             return Err(ThreadDirectoryError::AnchorUnsupported);
         }
         let bot_id: String = decode(&row, "anchor_id")?;
@@ -1930,15 +1980,21 @@ impl ThreadDirectory for PostgresThreadDirectory {
     }
 }
 
-enum CancelRequestOutcome {
+pub(crate) enum CancelRequestOutcome {
     Created(ThreadRunCancellation),
     Observed(ThreadRunCancellation),
 }
 
-async fn request_run_cancellation(
+pub(crate) async fn request_run_cancellation(
     transaction: &Transaction<'_>,
     request: &CancelThreadRunRequest,
 ) -> Result<CancelRequestOutcome, ThreadDirectoryError> {
+    let automation = crate::automation::dispatch::lock_existing_run(
+        transaction,
+        request.command.run_id.as_str(),
+    )
+    .await
+    .map_err(|_| ThreadDirectoryError::Unavailable)?;
     let row = transaction
         .query_opt(
             "SELECT r.status \
@@ -1968,13 +2024,82 @@ async fn request_run_cancellation(
         return Err(ThreadDirectoryError::NotVisible);
     };
     let status: String = decode(&row, "status")?;
+    record_run_cancellation(
+        transaction,
+        request,
+        &status,
+        if automation.is_some() {
+            CancellationSource::Automation
+        } else {
+            CancellationSource::Interactive
+        },
+    )
+    .await
+}
+
+enum CancellationSource {
+    Interactive,
+    Automation,
+}
+
+pub(crate) async fn cancel_automation_run(
+    transaction: &Transaction<'_>,
+    deployment: &DeploymentId,
+    tenant: &TenantId,
+    definition: &Row,
+    run: &RunId,
+) -> Result<CancelRequestOutcome, ThreadDirectoryError> {
+    crate::automation::dispatch::lock_existing_run(transaction, run.as_str())
+        .await
+        .map_err(|_| ThreadDirectoryError::Unavailable)?;
+    crate::automation_budget::verify_core_run(
+        transaction,
+        deployment,
+        tenant,
+        definition,
+        run.as_str(),
+    )
+    .await
+    .map_err(|_| ThreadDirectoryError::Unavailable)?;
+    let request = CancelThreadRunRequest {
+        deployment: deployment.clone(),
+        tenant: tenant.clone(),
+        actor: ActorId::new(decode::<String>(definition, "owner_id")?),
+        command: openbot_contracts::command::CancelThreadRun {
+            thread_id: ThreadId::new(decode::<String>(definition, "thread_id")?),
+            run_id: run.clone(),
+        },
+    };
+    let status: String = transaction
+        .query_one(
+            "SELECT status FROM public.runs WHERE run_id=$1 FOR UPDATE",
+            &[&run.as_str()],
+        )
+        .await
+        .map_err(|_| ThreadDirectoryError::Unavailable)?
+        .get(0);
+    record_run_cancellation(
+        transaction,
+        &request,
+        &status,
+        CancellationSource::Automation,
+    )
+    .await
+}
+
+async fn record_run_cancellation(
+    transaction: &Transaction<'_>,
+    request: &CancelThreadRunRequest,
+    status: &str,
+    source: CancellationSource,
+) -> Result<CancelRequestOutcome, ThreadDirectoryError> {
     let reply = |state| ThreadRunCancellation {
         thread_id: request.command.thread_id.clone(),
         run_id: request.command.run_id.clone(),
         state,
     };
     if matches!(
-        status.as_str(),
+        status,
         "completed" | "failed" | "cancelled" | "reconciliation_required"
     ) {
         return Ok(CancelRequestOutcome::Observed(reply(
@@ -1996,9 +2121,13 @@ async fn request_run_cancellation(
     // One statement reads the acceptance and, for a system acceptance, whether the Thread's head is
     // closed by exactly the operation it names. Only the acceptance row is locked: the head and
     // intent tables are read without a lock.
+    let lock_tail = match source {
+        CancellationSource::Interactive => "",
+        CancellationSource::Automation => " NOWAIT",
+    };
     let existing_sql = format!(
         "SELECT o.aggregate_kind,o.aggregate_id,o.seq,o.destination,o.delivery_class,o.payload,\
-         o.status,{} AS system_bound FROM public.outbox o WHERE o.outbox_id=$1 FOR UPDATE OF o",
+         o.status,{} AS system_bound FROM public.outbox o WHERE o.outbox_id=$1 FOR UPDATE OF o{lock_tail}",
         thread_history_closed_by_sql("o.payload->>'operationId'", "$2")
     );
     if let Some(existing) = transaction
@@ -2915,7 +3044,16 @@ async fn apply_begin(
     let schema = crate::thread_history_writer::CurrentWriterSchema::observe(transaction)
         .await
         .map_err(origin_error)?;
-    apply_begin_observed(transaction, runtime, request, materials, &schema, None).await
+    apply_begin_observed(
+        transaction,
+        runtime,
+        request,
+        materials,
+        &schema,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn apply_begin_observed(
@@ -2925,6 +3063,7 @@ async fn apply_begin_observed(
     materials: &[RunInputArtifactMaterial],
     schema: &crate::thread_history_writer::CurrentWriterSchema<'_, '_>,
     delegated: Option<&openbot_application::DelegatedBegin>,
+    automation: Option<&crate::automation::dispatch::AutomationBeginAdmission>,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     // New artifact inputs must serialize with the original cleanup actor UPDATE
     // before any Thread/lease/artifact locks. Empty legacy begins keep their path.
@@ -2952,6 +3091,15 @@ async fn apply_begin_observed(
         .map_err(|error| unavailable("获取 thread transaction lock 失败", error))?;
 
     let existing_thread = load_thread(transaction, request).await?;
+    if existing_thread.is_some() && automation.is_none() {
+        let bound: bool = transaction.query_one(
+            "SELECT EXISTS(SELECT 1 FROM openbot_internal.automation_definitions WHERE thread_id=$1)",
+            &[&command.thread_id.as_str()],
+        ).await.map_err(|_| ThreadDirectoryError::Unavailable)?.get(0);
+        if bound {
+            return Err(ThreadDirectoryError::AnchorUnsupported);
+        }
+    }
     if existing_thread.is_some() {
         crate::thread_origin::observe_on(transaction, command.thread_id.as_str())
             .await
@@ -2984,7 +3132,7 @@ async fn apply_begin_observed(
             .map_err(|e| unavailable("delegated source lock", e))?;
         if existing_thread.is_some() {
             let rows=transaction.query("SELECT content->'delegation'->'source' AS source FROM public.messages WHERE thread_id=$1 AND message_id=run_id||':input'",&[&command.thread_id.as_str()]).await.map_err(|e|unavailable("delegated thread source",e))?;
-            if rows.is_empty()
+            if (rows.is_empty() && !automation.is_some_and(|witness| witness.allows_empty_thread()))
                 || rows.iter().any(|r| {
                     r.try_get::<_, Option<Value>>("source")
                         .ok()
@@ -3575,11 +3723,43 @@ async fn target_visible(
     })
 }
 
+pub(crate) struct NewNativeThread<'a> {
+    pub deployment: &'a DeploymentId,
+    pub tenant: &'a TenantId,
+    pub actor: &'a openbot_contracts::ids::ActorId,
+    pub auth_generation: openbot_contracts::auth::AuthGeneration,
+    pub thread_id: &'a ThreadId,
+    pub bot_id: &'a BotId,
+    pub anchor: &'a ThreadRunAnchor,
+    pub now: OffsetDateTime,
+}
+
 async fn insert_thread(
     transaction: &Transaction<'_>,
     request: &BeginThreadRunRequest,
     now: OffsetDateTime,
 ) -> Result<(), ThreadDirectoryError> {
+    insert_native_thread(
+        transaction,
+        NewNativeThread {
+            deployment: &request.deployment,
+            tenant: &request.tenant,
+            actor: &request.actor,
+            auth_generation: request.auth_generation,
+            thread_id: &request.command.thread_id,
+            bot_id: &request.command.bot_id,
+            anchor: &request.command.anchor,
+            now,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn insert_native_thread(
+    transaction: &Transaction<'_>,
+    request: NewNativeThread<'_>,
+) -> Result<(), ThreadDirectoryError> {
+    let now = request.now;
     crate::thread_origin::current_native_actor(
         transaction,
         request.actor.as_str(),
@@ -3588,9 +3768,8 @@ async fn insert_thread(
     .await
     .map_err(origin_error)?
     .ok_or(ThreadDirectoryError::NotVisible)?;
-    let command = &request.command;
-    let (anchor_kind, anchor_id) = match &command.anchor {
-        ThreadRunAnchor::DirectBot => ("direct_bot", command.bot_id.as_str()),
+    let (anchor_kind, anchor_id) = match &request.anchor {
+        ThreadRunAnchor::DirectBot => ("direct_bot", request.bot_id.as_str()),
         ThreadRunAnchor::Channel { channel_id } => ("channel", channel_id.as_str()),
     };
     transaction
@@ -3600,7 +3779,7 @@ async fn insert_thread(
                next_message_seq,next_event_seq,created_at,updated_at,deleted_at \
              ) VALUES($1,$2,$3,$4,$5,$6,NULL,'active',0,0,$7,$7,NULL)",
             &[
-                &command.thread_id.as_str(),
+                &request.thread_id.as_str(),
                 &request.tenant.as_str(),
                 &request.deployment.as_str(),
                 &request.actor.as_str(),
@@ -3613,7 +3792,7 @@ async fn insert_thread(
         .map_err(|error| write_error("创建 native thread 失败", error))?;
     crate::thread_origin::record_new_native(
         transaction,
-        command.thread_id.as_str(),
+        request.thread_id.as_str(),
         crate::thread_origin::NativeOriginKind::BeginV1,
     )
     .await
@@ -3622,7 +3801,7 @@ async fn insert_thread(
         .execute(
             "INSERT INTO public.thread_memberships(thread_id,user_id,created_at) \
              VALUES($1,$2,$3)",
-            &[&command.thread_id.as_str(), &request.actor.as_str(), &now],
+            &[&request.thread_id.as_str(), &request.actor.as_str(), &now],
         )
         .await
         .map_err(|error| write_error("创建 thread membership 失败", error))?;
@@ -4237,6 +4416,13 @@ async fn load_visible_thread(
     let member: bool = decode(&row, "member")?;
     if stored_deployment != deployment.as_str() || stored_tenant != tenant.as_str() || !member {
         return Err(ThreadDirectoryError::NotVisible);
+    }
+    let automation: bool = transaction.query_one(
+        "SELECT EXISTS(SELECT 1 FROM openbot_internal.automation_definitions WHERE thread_id=$1)",
+        &[&thread_id.as_str()],
+    ).await.map_err(|_| ThreadDirectoryError::Unavailable)?.get(0);
+    if automation {
+        return Err(ThreadDirectoryError::AnchorUnsupported);
     }
     Ok(Some((
         ThreadState {

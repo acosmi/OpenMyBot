@@ -126,7 +126,7 @@ pub struct PostgresApplicationAssemblyInput {
     )>,
     /// Optional process-local terminal wakeup consumer.
     pub run_event_subscriber: Option<Arc<dyn openbot_application::RunTerminalSubscriber>>,
-    /// Optional trusted current delegation resolver; local single-user assembly only.
+    /// Optional trusted downstream delegation resolver; local single-user assembly only.
     pub delegation_authority: Option<Arc<dyn openbot_application::DelegationAuthority>>,
 }
 
@@ -209,6 +209,8 @@ pub struct PostgresApplicationAssembly {
     pub custom_model_catalog_inventory: Arc<PostgresCustomModelCatalogInventory>,
     pub runtime_capability_facts: Option<Arc<PostgresRuntimeCapabilityFacts>>,
     pub application: Arc<dyn ApplicationService>,
+    /// The Server's original-Pool automation management, dispatch and execution budget adapter.
+    pub automations: Option<Arc<crate::automation::PostgresAutomations>>,
     pub run_runtime: Arc<dyn RunRuntime>,
     pub remote_interrupts: Arc<PostgresRemoteInterruptCoordinator>,
     pub mcp_catalog: Arc<PostgresMcpCatalog>,
@@ -309,9 +311,31 @@ impl PostgresApplicationAssembly {
 #[error("postgres_application_assembly_failed")]
 pub struct PostgresApplicationAssemblyError;
 
-/// Assemble the one PostgreSQL-backed application boundary shared by Server and Desktop.
+/// Assemble the original PostgreSQL boundary for Desktop and downstream hosts.
 pub async fn assemble_postgres_application(
     input: PostgresApplicationAssemblyInput,
+) -> Result<PostgresApplicationAssembly, PostgresApplicationAssemblyError> {
+    assemble_with_automation(input, None).await
+}
+
+/// Assemble the Server with its own scoped PostgreSQL automation authority.
+pub async fn assemble_postgres_server_application(
+    input: PostgresApplicationAssemblyInput,
+) -> Result<PostgresApplicationAssembly, PostgresApplicationAssemblyError> {
+    if input.delegation_authority.is_some() {
+        return Err(fail("server_automation_authority"));
+    }
+    let authority = crate::automation::PostgresAutomationAuthority::new(
+        input.pool.clone(),
+        input.deployment.clone(),
+        input.tenant.clone(),
+    );
+    assemble_with_automation(input, Some(authority)).await
+}
+
+async fn assemble_with_automation(
+    input: PostgresApplicationAssemblyInput,
+    automation_authority: Option<crate::automation::PostgresAutomationAuthority>,
 ) -> Result<PostgresApplicationAssembly, PostgresApplicationAssemblyError> {
     let PostgresApplicationAssemblyInput {
         pool,
@@ -348,6 +372,10 @@ pub async fn assemble_postgres_application(
     {
         return Err(fail("delegated_single_user"));
     }
+    let automation_enabled = automation_authority.is_some();
+    let delegation_authority = automation_authority
+        .map(|authority| Arc::new(authority) as Arc<dyn openbot_application::DelegationAuthority>)
+        .or(delegation_authority);
     let provider_extensions =
         openbot_application::ProviderExtensions::try_new(extra_provider_adapters)
             .map_err(|_| fail("provider_extensions"))?;
@@ -647,6 +675,18 @@ pub async fn assemble_postgres_application(
     );
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
     let capture_screen = Arc::downgrade(&screen_sessions);
+    let automations = automation_enabled
+        .then(|| {
+            crate::automation::PostgresAutomations::new(
+                pool.clone(),
+                deployment.clone(),
+                tenant.clone(),
+                SecretBytes::new(audit_key.to_vec()),
+            )
+        })
+        .transpose()
+        .map_err(|_| fail("automations"))?
+        .map(Arc::new);
     let application = OpenBotApplication::new(channels.clone())
         .with_people(people)
         .with_audit(PostgresAuditReader::new(pool.clone()))
@@ -673,6 +713,10 @@ pub async fn assemble_postgres_application(
         .with_remote_interrupts(remote_interrupts.clone())
         .with_screen_sessions(screen_sessions)
         .with_thread_history_deletion(thread_history_authority.clone());
+    let application = match &automations {
+        Some(automations) => application.with_automation_definitions(automations.clone()),
+        None => application,
+    };
     let application = match artifacts {
         Some(artifacts) => application.with_artifacts(artifacts),
         None => application,
@@ -698,6 +742,7 @@ pub async fn assemble_postgres_application(
         custom_model_catalog_inventory,
         runtime_capability_facts,
         application,
+        automations,
         terminal_runtime: terminal_enabled.then(|| run_runtime.clone()),
         run_runtime,
         provider_extensions,

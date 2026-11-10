@@ -433,6 +433,18 @@ fn http_route_of(command: &AppCommand) -> Option<String> {
         // `ApplicationService`（见 `openbot_server::http::health`）。所以
         // `AppCommand::Health` 在 Axum 侧没有落点，不进对拍矩阵。
         AppCommand::Health => None,
+        // Automation is Server-only. Its HTTP framing is tested separately; Desktop's
+        // unassembled application port returns 503 for every command below.
+        AppCommand::ListAutomationDefinitions(_)
+        | AppCommand::CreateAutomationDefinition(_)
+        | AppCommand::GetAutomationDefinition { .. }
+        | AppCommand::UpdateAutomationDefinition { .. }
+        | AppCommand::TombstoneAutomationDefinition { .. }
+        | AppCommand::TriggerAutomationDefinition { .. }
+        | AppCommand::ListAutomationOccurrences { .. }
+        | AppCommand::ListAutomationDeliveries { .. }
+        | AppCommand::GetAutomationReceipt { .. } => None,
+
         AppCommand::ListVisibleChannels { limit, cursor } => {
             let mut uri = String::from("/api/channels");
             let mut sep = '?';
@@ -1361,4 +1373,74 @@ async fn the_matrix_goes_red_when_a_transport_substitutes_the_page_size() {
     // 还原：`substituted` 只是本条测试自己造的一个命令，从来没有进过 `Fixture` 的常规腿。
     let restored = fx.run(ACTOR_A, &honest).await;
     assert_legs_agree("负向对照 2/还原后", &restored);
+}
+
+#[tokio::test]
+async fn automation_commands_are_server_only_and_unassembled_desktop_returns_503() {
+    use openbot_contracts::automation::*;
+    let f = Fixture::new();
+    assert!(Arc::ptr_eq(&f.service, f.transport.service()));
+    let id = AutomationId::try_from("automation".to_owned()).unwrap();
+    let revision = AutomationRevision::try_from(1).unwrap();
+    let config: AutomationConfigV1 = serde_json::from_value(serde_json::json!({
+        "schemaVersion":1,"title":"Manual","botId":"bot","promptTemplate":"Inspect the authorized input",
+        "trigger":{"kind":"manual"},"modelPolicy":"bot_current",
+        "permissionCeiling":{"toolIds":[],"dataScopes":[]},
+        "budget":[{"metric":"sampling_calls","totalLimit":"2"}],"runDeadlineSeconds":60
+    })).unwrap();
+    let commands = vec![
+        AppCommand::ListAutomationDefinitions(ListAutomationDefinitions::default()),
+        AppCommand::CreateAutomationDefinition(CreateAutomationDefinition {
+            automation_id: id.clone(),
+            config,
+        }),
+        AppCommand::GetAutomationDefinition {
+            automation_id: id.clone(),
+        },
+        AppCommand::UpdateAutomationDefinition {
+            automation_id: id.clone(),
+            input: UpdateAutomationDefinition::Pause {
+                expected_revision: revision,
+            },
+        },
+        AppCommand::TombstoneAutomationDefinition {
+            automation_id: id.clone(),
+            input: TombstoneAutomationDefinition {
+                expected_revision: revision,
+            },
+        },
+        AppCommand::TriggerAutomationDefinition {
+            automation_id: id.clone(),
+            input: TriggerAutomationDefinition {
+                operation_id: AutomationOperationId::try_from("manual:one".to_owned()).unwrap(),
+                expected_revision: revision,
+            },
+        },
+        AppCommand::ListAutomationOccurrences {
+            automation_id: id.clone(),
+            query: AutomationPageQuery::default(),
+        },
+        AppCommand::ListAutomationDeliveries {
+            automation_id: id,
+            query: AutomationPageQuery::default(),
+        },
+        AppCommand::GetAutomationReceipt {
+            receipt_id: AutomationReceiptId::try_from("aocc:one".to_owned()).unwrap(),
+        },
+    ];
+    assert_eq!(commands.len(), 9);
+    for command in commands {
+        assert_eq!(
+            http_route_of(&command),
+            None,
+            "Server-only command entered the shared channel matrix"
+        );
+        let error = f
+            .transport
+            .execute(auth_for(ACTOR_A), command)
+            .await
+            .unwrap_err();
+        assert_eq!(error.http_status(), 503);
+        assert_eq!(error.code(), ErrorCode::DEPENDENCY_UNAVAILABLE);
+    }
 }

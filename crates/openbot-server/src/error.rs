@@ -132,7 +132,24 @@ impl IntoResponse for HttpError {
         let (rule, gone_status) = match &self.0 {
             AppError::PolicyRefused { rule, .. } => (Some(rule.as_str()), None),
             AppError::ArtifactGone { status } => (None, Some(*status)),
-            AppError::Unauthenticated
+            AppError::EventOutsideWindow
+            | AppError::EventAdapterUnavailable
+            | AppError::UnknownDispositionUnavailable
+            | AppError::AutomationSourceUnauthorized
+            | AppError::AutomationNotAccepting
+            | AppError::EventNotAccepted
+            | AppError::AutomationRevisionConflict
+            | AppError::AutomationKeyRevisionConflict
+            | AppError::AutomationOperationConflict
+            | AppError::AutomationEventConflict
+            | AppError::AutomationDelegationInvalid
+            | AppError::AutomationBudgetUnconfigured
+            | AppError::AutomationTriggerUnavailable
+            | AppError::PayloadTooLarge
+            | AppError::AutomationCapacityExceeded
+            | AppError::AutomationReceiverFull
+            | AppError::AutomationRateLimited
+            | AppError::Unauthenticated
             | AppError::ForbiddenRole { .. }
             | AppError::NotVisible
             | AppError::MalformedPayload { .. }
@@ -160,12 +177,127 @@ impl IntoResponse for HttpError {
             http::header::CACHE_CONTROL,
             http::HeaderValue::from_static("no-store"),
         );
+        if matches!(
+            &self.0,
+            AppError::AutomationCapacityExceeded
+                | AppError::AutomationReceiverFull
+                | AppError::AutomationRateLimited
+        ) {
+            response.headers_mut().insert(
+                http::header::RETRY_AFTER,
+                http::HeaderValue::from_static("1"),
+            );
+        }
         response
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn automation_errors_project_exact_status_and_retry_after() {
+        for (error, status, code) in [
+            (AppError::EventOutsideWindow, 400, "event_outside_window"),
+            (
+                AppError::EventAdapterUnavailable,
+                400,
+                "event_adapter_unavailable",
+            ),
+            (
+                AppError::UnknownDispositionUnavailable,
+                400,
+                "unknown_disposition_unavailable",
+            ),
+            (
+                AppError::AutomationSourceUnauthorized,
+                401,
+                "automation_source_unauthorized",
+            ),
+            (
+                AppError::AutomationNotAccepting,
+                403,
+                "automation_not_accepting",
+            ),
+            (AppError::EventNotAccepted, 403, "event_not_accepted"),
+            (
+                AppError::AutomationRevisionConflict,
+                409,
+                "automation_revision_conflict",
+            ),
+            (
+                AppError::AutomationKeyRevisionConflict,
+                409,
+                "automation_key_revision_conflict",
+            ),
+            (
+                AppError::AutomationOperationConflict,
+                409,
+                "automation_operation_conflict",
+            ),
+            (
+                AppError::AutomationEventConflict,
+                409,
+                "automation_event_conflict",
+            ),
+            (
+                AppError::AutomationDelegationInvalid,
+                409,
+                "automation_delegation_invalid",
+            ),
+            (
+                AppError::AutomationBudgetUnconfigured,
+                409,
+                "automation_budget_unconfigured",
+            ),
+            (
+                AppError::AutomationTriggerUnavailable,
+                409,
+                "automation_trigger_unavailable",
+            ),
+            (AppError::PayloadTooLarge, 413, "payload_too_large"),
+            (
+                AppError::AutomationCapacityExceeded,
+                429,
+                "automation_capacity_exceeded",
+            ),
+            (
+                AppError::AutomationReceiverFull,
+                429,
+                "automation_receiver_full",
+            ),
+            (
+                AppError::AutomationRateLimited,
+                429,
+                "automation_rate_limited",
+            ),
+        ] {
+            let quota = matches!(
+                &error,
+                AppError::AutomationCapacityExceeded
+                    | AppError::AutomationReceiverFull
+                    | AppError::AutomationRateLimited
+            );
+            let response = HttpError::from(error).into_response();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                response.headers().get(http::header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::RETRY_AFTER)
+                    .map(|v| v.to_str().unwrap()),
+                quota.then_some("1")
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 2048)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body, serde_json::json!({"code":code}));
+        }
+    }
+
     use super::*;
     use axum::body::to_bytes;
     use openbot_contracts::auth::Role;

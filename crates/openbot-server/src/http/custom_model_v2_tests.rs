@@ -16,6 +16,7 @@ use openbot_contracts::command::{AppCommand, AppReply, ThreadRunStarted};
 use openbot_contracts::ids::thread::ThreadIdentity;
 use openbot_domain::identity::session::{SessionHashKey, SessionToken, SessionTokenHash};
 use openbot_infra::application_assembly::PostgresApplicationAssembly;
+use openbot_infra::application_assembly::assemble_postgres_application;
 use openbot_infra::artifact_registry::ArtifactDatasetRegistry;
 use openbot_infra::db::fresh;
 use openbot_infra::net::safe_http::{DnsResolver, DnsUnavailable};
@@ -233,6 +234,7 @@ impl ServerFixture {
             deployment: DeploymentId::new(DEP),
             tenant: TenantId::new(TENANT),
             runtime: Arc::clone(&assembly.run_runtime),
+            automation_budgets: None,
             required: true,
             requires_managed: false,
             model: "unselected-package-model".to_owned(),

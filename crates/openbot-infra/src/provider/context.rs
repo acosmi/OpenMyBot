@@ -1079,7 +1079,7 @@ fn required_content_string(
         .ok_or(AgentContextError::Corrupt { field })
 }
 
-fn provider_route(configuration: &Value) -> Result<ProviderRoute, AgentContextError> {
+pub(crate) fn provider_route(configuration: &Value) -> Result<ProviderRoute, AgentContextError> {
     match configuration
         .as_object()
         .and_then(|value| value.get("providerSource"))

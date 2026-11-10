@@ -55,6 +55,7 @@ pub mod agent;
 pub mod artifact;
 pub mod artifact_cleanup;
 pub mod audit;
+pub mod automation;
 pub mod backup;
 pub mod channel;
 pub mod components;

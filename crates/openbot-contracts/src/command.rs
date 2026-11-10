@@ -124,6 +124,55 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AppCommand {
+    /// Read the current owner's definition keyset page.
+    ListAutomationDefinitions(crate::automation::ListAutomationDefinitions),
+    /// Create one paused definition and its dedicated Thread atomically.
+    CreateAutomationDefinition(crate::automation::CreateAutomationDefinition),
+    /// Read one current-owner definition.
+    GetAutomationDefinition {
+        /// Candidate namespace; never an authority token.
+        automation_id: crate::automation::AutomationId,
+    },
+    /// Apply one owner CAS operation, with fresh consent enforced by its actual host.
+    UpdateAutomationDefinition {
+        /// Candidate current-owner definition.
+        automation_id: crate::automation::AutomationId,
+        /// Closed replace, enable, pause or revoke intent.
+        input: crate::automation::UpdateAutomationDefinition,
+    },
+    /// Retire a namespace without deleting permanent receipts.
+    TombstoneAutomationDefinition {
+        /// Candidate current-owner definition.
+        automation_id: crate::automation::AutomationId,
+        /// Closed expected revision.
+        input: crate::automation::TombstoneAutomationDefinition,
+    },
+    /// Durably accept one manual operation from the current owner.
+    TriggerAutomationDefinition {
+        /// Candidate enabled definition.
+        automation_id: crate::automation::AutomationId,
+        /// Original operation and expected revision; no actor or model override.
+        input: crate::automation::TriggerAutomationDefinition,
+    },
+    /// Read this owner's durable occurrences.
+    ListAutomationOccurrences {
+        /// Candidate current-owner definition.
+        automation_id: crate::automation::AutomationId,
+        /// Closed keyset input.
+        query: crate::automation::AutomationPageQuery,
+    },
+    /// Read only real external deliveries for this owner's definition.
+    ListAutomationDeliveries {
+        /// Candidate current-owner definition.
+        automation_id: crate::automation::AutomationId,
+        /// Closed keyset input.
+        query: crate::automation::AutomationPageQuery,
+    },
+    /// Read an original receipt without resubmitting its work.
+    GetAutomationReceipt {
+        /// Prefix locates the receipt; current owner scope still authorizes it.
+        receipt_id: crate::automation::AutomationReceiptId,
+    },
     /// Read the actual current host's closed capability projection without inputs.
     #[serde(deserialize_with = "deserialize_runtime_capabilities_input")]
     GetRuntimeCapabilities,
@@ -724,6 +773,20 @@ pub enum AppCommand {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppReply {
+    /// Current-owner definitions and their next scoped cursor.
+    AutomationDefinitions(crate::automation::AutomationDefinitionPage),
+    /// First creation, distinguished internally so HTTP may return 201.
+    AutomationDefinitionCreated(crate::automation::AutomationDefinition),
+    /// Current definition or exact creation replay.
+    AutomationDefinition(crate::automation::AutomationDefinition),
+    /// First durable manual acceptance; no Run completion is implied.
+    AutomationReceiptAccepted(crate::automation::AutomationReceipt),
+    /// Original accepted receipt or exact manual replay.
+    AutomationReceipt(crate::automation::AutomationReceipt),
+    /// Durable occurrences only.
+    AutomationOccurrences(crate::automation::AutomationOccurrencePage),
+    /// Real external deliveries only.
+    AutomationDeliveries(crate::automation::AutomationDeliveryPage),
     /// Current-authenticated closed runtime capability projection.
     RuntimeCapabilities(crate::runtime_capabilities::RuntimeCapabilitiesResponse),
     /// Content-free positive local registration fact.

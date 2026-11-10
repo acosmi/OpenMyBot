@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openbot_agent::{
-    AgentToolInvoker, AuthorizedAgentToolGateway, BuiltInAgentConfig, BuiltInAgentRuntime,
-    ProviderRouter, RemoteAgentToolInvoker, RemoteAguiProvider, RetryingProvider,
-    RetryingProviderConfig,
+    AgentToolInvoker, AuthorizedAgentToolGateway, AutomationSamplingPorts, BuiltInAgentConfig,
+    BuiltInAgentRuntime, BuiltInRunPorts, ProviderRouter, RemoteAgentToolInvoker,
+    RemoteAguiProvider, RetryingProvider, RetryingProviderConfig,
 };
 use openbot_application::tenant::package::{
     BuiltInProviderSource, TenantAgentConfiguration, TenantAgentType, TenantPackageAudienceContext,
@@ -16,7 +16,8 @@ use openbot_application::tenant::package::{
 };
 use openbot_application::{
     AgentAudit, NoRunDispatchConsumer, ProviderAdapter, ProviderRateCard,
-    RemoteInterruptCoordinator, RunDispatchConsumer, RunRuntime, remember_provider_tool,
+    RemoteInterruptCoordinator, RunDispatchConsumer, RunRuntime,
+    automation::AutomationExecutionBudgets, remember_provider_tool,
 };
 use openbot_computer::screen::{
     DEFAULT_SCREEN_VIEWERS_PER_STREAM, ScreenHub, ScreenSessionService,
@@ -31,7 +32,8 @@ use openbot_domain::vault::{
 use openbot_infra::agent_audit::PostgresAgentAudit;
 use openbot_infra::agent_tools::{PostgresAgentAuthorizationSource, PostgresAgentToolSequence};
 use openbot_infra::application_assembly::{
-    ChannelRoutingProviderInput, PostgresApplicationAssemblyInput, assemble_postgres_application,
+    ChannelRoutingProviderInput, PostgresApplicationAssemblyInput,
+    assemble_postgres_server_application,
 };
 use openbot_infra::auth::config::{
     AuthConfig, BindingExposure, ExampleKeyPolicy, KeyEncryptionKey, SingleUserAdmission,
@@ -107,6 +109,7 @@ struct BuiltInAgentAssemblyInput {
     deployment: DeploymentId,
     tenant: TenantId,
     runtime: Arc<dyn RunRuntime>,
+    automation_budgets: Option<Arc<dyn AutomationExecutionBudgets>>,
     required: bool,
     requires_managed: bool,
     model: String,
@@ -146,6 +149,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     telemetry::init(LogFormat::Json)?;
     let env = openbot_server::config::launch::prepare_environment(env_map_from_process(), local)?;
     let server = ServerConfig::from_env_map(&env)?;
+    let automation_budgets = server
+        .automation_budgets_file
+        .as_deref()
+        .map(openbot_server::config::launch::load_automation_budgets)
+        .transpose()?;
     if let Some(warning) = server.public_transport().startup_warning() {
         tracing::warn!(code = server.public_transport().as_str(), "{warning}");
     }
@@ -475,58 +483,73 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let screen_hub = ScreenHub::new(DEFAULT_SCREEN_VIEWERS_PER_STREAM)?;
     let screen_sessions = Arc::new(ScreenSessionService::new(screen_hub.clone()));
-    let application_assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
-        pool: pool.clone(),
-        listener_database: database.clone().into(),
-        deployment: deployment.clone(),
-        tenant: tenant.clone(),
-        single_user,
-        admin_floor: floor,
-        model: tenant_package.package.model.default_model.clone(),
-        credential_key_id: tenant_package.package.model.credential_secret_ref.clone(),
-        credential_vault: model_credential_vault.clone(),
-        audit_key: SecretBytes::new(audit_key.expose().to_vec()),
-        remote_assertions: remote_assertions.clone(),
-        mcp_oauth_state_key: SecretBytes::new(mcp_oauth_state_key.expose().to_vec()),
-        policy_store: policy_store.clone(),
-        ui_preferences: Arc::new(PostgresUiPreferenceAdministration::new(
-            pool.clone(),
-            deployment.clone(),
-            tenant.clone(),
-            SecretBytes::new(audit_key.expose().to_vec()),
-        )?),
-        screen_sessions,
-        artifacts,
-        runtime_capabilities: Some(
-            auth.runtime_capability_factory(
-                oidc_login
-                    .as_ref()
-                    .map(|(_, sso, _, _, _)| sso.capability_source()),
-            )
-            .map_err(|_| startup_error("runtime_capabilities"))?,
-        ),
-        remote_agent_probe,
-        managed_slot_available: managed_provider_for_slot(&server).is_some(),
-        channel_routing_provider: ChannelRoutingProviderInput {
-            endpoint: channel_endpoint,
-            environment_api_key: channel_environment_api_key
-                .map(|key| SecretBytes::new(key.expose().as_bytes().to_vec())),
-            egress_allow_cidrs: channel_egress_allow_cidrs,
-            allow_http: channel_allow_http,
-        },
-        stall_timeout: server.agent_budgets.stall_timeout,
-        oauth_public_url: oauth_public_url.map(|url| url.as_str().to_owned()),
-        app_url: server.app_url.clone(),
-        extra_provider_adapters: Vec::new(),
-        run_event_subscriber: None,
-        delegation_authority: None,
-    })
-    .await?;
-    if application_assembly
-        .model_dataset_binding
-        .enroll_original_registry(&artifact_datasets)
-        .is_err()
-    {
+    let application_assembly =
+        assemble_postgres_server_application(PostgresApplicationAssemblyInput {
+            pool: pool.clone(),
+            listener_database: database.clone().into(),
+            deployment: deployment.clone(),
+            tenant: tenant.clone(),
+            single_user,
+            admin_floor: floor,
+            model: tenant_package.package.model.default_model.clone(),
+            credential_key_id: tenant_package.package.model.credential_secret_ref.clone(),
+            credential_vault: model_credential_vault.clone(),
+            audit_key: SecretBytes::new(audit_key.expose().to_vec()),
+            remote_assertions: remote_assertions.clone(),
+            mcp_oauth_state_key: SecretBytes::new(mcp_oauth_state_key.expose().to_vec()),
+            policy_store: policy_store.clone(),
+            ui_preferences: Arc::new(PostgresUiPreferenceAdministration::new(
+                pool.clone(),
+                deployment.clone(),
+                tenant.clone(),
+                SecretBytes::new(audit_key.expose().to_vec()),
+            )?),
+            screen_sessions,
+            artifacts,
+            runtime_capabilities: Some(
+                auth.runtime_capability_factory(
+                    oidc_login
+                        .as_ref()
+                        .map(|(_, sso, _, _, _)| sso.capability_source()),
+                )
+                .map_err(|_| startup_error("runtime_capabilities"))?,
+            ),
+            remote_agent_probe,
+            managed_slot_available: managed_provider_for_slot(&server).is_some(),
+            channel_routing_provider: ChannelRoutingProviderInput {
+                endpoint: channel_endpoint,
+                environment_api_key: channel_environment_api_key
+                    .map(|key| SecretBytes::new(key.expose().as_bytes().to_vec())),
+                egress_allow_cidrs: channel_egress_allow_cidrs,
+                allow_http: channel_allow_http,
+            },
+            stall_timeout: server.agent_budgets.stall_timeout,
+            oauth_public_url: oauth_public_url.map(|url| url.as_str().to_owned()),
+            app_url: server.app_url.clone(),
+            extra_provider_adapters: Vec::new(),
+            run_event_subscriber: None,
+            delegation_authority: None,
+        })
+        .await?;
+    let startup_binding_error = match &application_assembly.automations {
+        Some(automations) => automations
+            .install_budgets(automation_budgets.as_ref())
+            .await
+            .err()
+            .map(|error| match error {
+                openbot_infra::automation_budget::AutomationBudgetStartupError::RevisionRegressed => "automation_budget_revision_regressed",
+                openbot_infra::automation_budget::AutomationBudgetStartupError::Invalid => "automation_budgets_invalid",
+            }),
+        None => Some("automation_port"),
+    }
+    .or_else(|| {
+        application_assembly
+            .model_dataset_binding
+            .enroll_original_registry(&artifact_datasets)
+            .err()
+            .map(|_| "model_dataset_binding")
+    });
+    if let Some(code) = startup_binding_error {
         auth.close_request_bindings();
         let _ = application_assembly
             .application
@@ -539,7 +562,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         application_assembly.shutdown().await;
         policy_listener.stop().await;
         pool.close();
-        return Err(startup_error("model_dataset_binding").into());
+        return Err(startup_error(code).into());
     }
     let thread_history_enrollment = application_assembly
         .thread_history_authority
@@ -589,6 +612,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         return Err(startup_error("custom_model_catalog").into());
     }
+    let automations = application_assembly
+        .automations
+        .clone()
+        .ok_or_else(|| startup_error("automation_port"))?;
+    let manual_dispatcher = openbot_application::automation::AutomationDispatcher::new(
+        automations.clone(),
+        application_assembly
+            .delegated_entry
+            .clone()
+            .ok_or_else(|| startup_error("automation_entry"))?,
+    );
     let application = application_assembly.application.clone();
     let runtime_capability_facts = application_assembly.runtime_capability_facts.clone();
     let run_runtime = application_assembly.run_runtime.clone();
@@ -626,6 +660,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         deployment: deployment.clone(),
         tenant: tenant.clone(),
         runtime: run_runtime.clone(),
+        automation_budgets: Some(automations),
         required: requires_agent_runtime,
         requires_managed: requires_managed_agent,
         model: tenant_package.package.model.default_model.clone(),
@@ -711,6 +746,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // A public URL and forwarded headers never authorize a public plaintext backend listener.
     let address = format!("127.0.0.1:{}", server.port);
     let listener = tokio::net::TcpListener::bind(&address).await?;
+    // Only durable manual occurrences are eligible; cron and event remain unavailable.
+    // The same Server owns this scan and recovers lost notifications or a previous process exit.
+    let (manual_stop, mut manual_stopping) = tokio::sync::watch::channel(false);
+    let manual_worker = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                changed = manual_stopping.changed() => {
+                    if changed.is_err() || *manual_stopping.borrow() { break; }
+                },
+                _ = ticks.tick() => {
+                    match tokio::time::timeout(Duration::from_secs(5), manual_dispatcher.scan()).await {
+                        Ok(Ok(_)) => {},
+                        Ok(Err(error)) => tracing::warn!(error.code = error.code().as_str(), "manual automation scan unavailable"),
+                        Err(_) => tracing::warn!(error.code = "dependency_unavailable", "manual automation scan deadline exceeded"),
+                    }
+                },
+            }
+        }
+    });
     tracing::info!(bind = %address, single_user, "Wrok Bot Server 已启动");
     let serve_result = axum::serve(
         listener,
@@ -719,6 +775,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown({
+        let shutdown_manual = manual_stop.clone();
         let shutdown_auth = Arc::clone(&auth_owner);
         let shutdown_gateway_authorization_runtime = gateway_authorization_journal
             .as_ref()
@@ -728,6 +785,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let shutdown_artifact_reads = artifact_read_lifecycle.clone();
         async move {
             shutdown_signal().await;
+            shutdown_manual.send_replace(true);
             // Revoke current observations before axum waits for in-flight requests to drain.
             shutdown_auth.close_request_bindings();
             if let Some(runtime) = &shutdown_gateway_authorization_runtime {
@@ -766,6 +824,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         facts.close();
         facts.drain().await;
     }
+    manual_stop.send_replace(true);
+    let manual_join = manual_worker.await;
     run_relay.stop().await;
     if let Some(agent) = built_in_agent {
         agent.stop().await;
@@ -774,8 +834,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     policy_listener.stop().await;
     drop(artifact_datasets);
     drop(gateway_authorization_journal);
-    serve_result?;
     pool.close();
+    manual_join.map_err(|_| startup_error("automation_worker_join"))?;
+    serve_result?;
     Ok(())
 }
 
@@ -788,6 +849,7 @@ fn build_built_in_agent(input: BuiltInAgentAssemblyInput) -> Result<AgentAssembl
         deployment,
         tenant,
         runtime,
+        automation_budgets,
         required,
         requires_managed,
         model,
@@ -878,15 +940,16 @@ fn build_built_in_agent(input: BuiltInAgentAssemblyInput) -> Result<AgentAssembl
         )?
         .with_model_dataset_binding(Arc::clone(&model_dataset_binding))?,
     );
+    let single_attempt: Arc<dyn ProviderAdapter> = Arc::new(
+        ProviderRouter::new(
+            package_provider,
+            managed.as_ref().map(|(provider, _)| Arc::clone(provider)),
+        )
+        .with_remote_agui(remote_provider)
+        .with_custom(custom_provider),
+    );
     let provider = Arc::new(RetryingProvider::new(
-        Arc::new(
-            ProviderRouter::new(
-                package_provider,
-                managed.as_ref().map(|(provider, _)| Arc::clone(provider)),
-            )
-            .with_remote_agui(remote_provider)
-            .with_custom(custom_provider),
-        ),
+        single_attempt.clone(),
         RetryingProviderConfig::default(),
     )?);
     let context = Arc::new(
@@ -903,8 +966,14 @@ fn build_built_in_agent(input: BuiltInAgentAssemblyInput) -> Result<AgentAssembl
             .with_sandboxed_components(sandboxed_components)
             .with_agent_credential_vault(credential_vault),
     );
-    let agent = BuiltInAgentRuntime::start_with_remote_interrupts(
-        runtime,
+    let agent = BuiltInAgentRuntime::start_with_run_ports(
+        BuiltInRunPorts {
+            runtime,
+            automation_sampling: automation_budgets.map(|budgets| AutomationSamplingPorts {
+                budgets,
+                provider: single_attempt,
+            }),
+        },
         context,
         provider,
         tools,
