@@ -20,14 +20,18 @@ pub use activation::{ActivationBinding, ActivationPhase, OrdinaryStartupBounds};
 pub use journal::{NativeExit, PipeJoin, ProcessStart};
 pub(crate) use activation::{Hex32, ServerDatabaseSite};
 pub use entry::{
-    RestoreTargetSlotOutcome, ReadOnlyRestoreOwner, RestoreOriginalObservation, OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
+    RestoreTargetSlotOutcome, RestoreOriginalObservation, OwnedRecoveryRequestFile, OwnedRestoreCandidatePlan, RestoreCandidateIsolationInput, RecoveryRequestExpected, RecoveryRequestPurpose, RestoreControlSession, VerifiedRecoveryHost, VerifiedRecoveryHostIntent,
     VerifiedServiceRecoveryHost, load_service_recovery_host_from_config,
 };
+#[cfg(feature = "desktop-local")]
+pub use entry::ReadOnlyRestoreOwner;
+#[cfg(feature = "desktop-local")]
+pub use ordinary::LocalFreshProof;
 pub(crate) use ordinary::OrdinaryStage;
 pub(crate) use entry::{RestoreStageIntent, RestoreStages};
 pub(crate) use journal::{Stage as RestoreStage, Disposition as RestoreDisposition, CommitAck as RestoreCommitAck, RollbackAck as RestoreRollbackAck};
 pub use ordinary::{
-    LocalFreshProof, OrdinaryActivationProof, OrdinaryDatabaseInitializationProof, OrdinaryInitializationSession,
+    OrdinaryActivationProof, OrdinaryDatabaseInitializationProof, OrdinaryInitializationSession,
     VerifiedOrdinaryLegacyProof, VerifiedOrdinaryStartupIntent,
 };
 #[cfg(feature = "server-runtime")]
@@ -67,7 +71,7 @@ pub struct RecoveryControlError {
     unconsumed: Option<Box<VerifiedOrdinaryStartupIntent>>,
     retained_host: Option<Box<VerifiedRecoveryHost>>,
     retained_request: Option<Box<entry::RequestOpenOwner>>,
-    retained_restore_input: Option<Box<OwnedRecoveryRequestFile>>,
+    _retained_restore_input: Option<Box<OwnedRecoveryRequestFile>>,
     retained_restore_intent: Option<Box<VerifiedRecoveryHostIntent>>,
     retained_ordinary: Option<Box<OrdinaryInitializationSession>>,
 }
@@ -81,7 +85,7 @@ impl RecoveryControlError {
             unconsumed: None,
             retained_host: None,
             retained_request: None,
-            retained_restore_input: None,
+            _retained_restore_input: None,
             retained_restore_intent: None,
             retained_ordinary: None,
         }
@@ -95,7 +99,7 @@ impl RecoveryControlError {
             unconsumed: None,
             retained_host: None,
             retained_request: None,
-            retained_restore_input: None,
+            _retained_restore_input: None,
             retained_restore_intent: None,
             retained_ordinary: None,
         }
@@ -114,7 +118,7 @@ impl RecoveryControlError {
             unconsumed: None,
             retained_host: None,
             retained_request: None,
-            retained_restore_input: None,
+            _retained_restore_input: None,
             retained_restore_intent: None,
             retained_ordinary: None,
         }
@@ -572,17 +576,16 @@ impl RestoreCapacityLedger {
                 .checked_sub(reserved)
                 .and_then(|n| n.checked_add(observed))
         };
-        if observed > reserved
-            || actual.is_none()
-            || admitted.is_none()
-            || admitted.is_some_and(|n| n > self.ceiling(resource))
-        {
-            self.fault
-                .get_or_insert(RecoveryControlFault::CapacityExceeded);
-            return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
-        } else {
-            self.actual[index] = actual.expect("checked actual addition");
-            self.admitted[index] = admitted.expect("checked reserved settlement");
+        match (actual, admitted) {
+            (Some(actual), Some(admitted))
+                if observed <= reserved && admitted <= self.ceiling(resource) => {
+                    self.actual[index] = actual;
+                    self.admitted[index] = admitted;
+                }
+            _ => {
+                self.fault.get_or_insert(RecoveryControlFault::CapacityExceeded);
+                return Err(RecoveryControlError::new(RecoveryControlFault::CapacityExceeded));
+            }
         }
         Ok(())
     }
@@ -994,7 +997,7 @@ impl RecoveryControl {
         })();
         result.map_err(|mut error: RecoveryControlError| {
             error.retained_host = original_host.take().map(Box::new);
-            error.retained_restore_input = original_request.take().map(Box::new);
+            error._retained_restore_input = original_request.take().map(Box::new);
             error
         })
     }
@@ -1023,7 +1026,7 @@ impl RecoveryControl {
         })();
         result.map_err(|mut error: RecoveryControlError| {
             if host.is_some() { error.retained_host = host.take().map(Box::new); }
-            if request.is_some() { error.retained_restore_input = request.take().map(Box::new); }
+            if request.is_some() { error._retained_restore_input = request.take().map(Box::new); }
             error
         })
     }
@@ -1229,7 +1232,7 @@ fn hex_array<const N: usize>(text: &str) -> [u8; N] {
         }
     };
     let mut bytes = [0u8; N];
-    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0.iter()) {
         *byte = (digit(pair[0]) << 4) | digit(pair[1]);
     }
     bytes
@@ -3954,8 +3957,7 @@ pub(crate) mod tests {
                 let deadline = Instant::now() + Duration::from_secs(25);
                 session
                     .bind_candidate_from_source_before(
-                        Some(pg.pid()),
-                        pg.identity(),
+                        (Some(pg.pid()), pg.identity()),
                         &pg.uds(),
                         (pg.system_identifier.clone(), pg.database_oid),
                         (&old, &master),

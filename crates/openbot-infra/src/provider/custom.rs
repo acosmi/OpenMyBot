@@ -545,8 +545,7 @@ mod v2_test_harness {
 // The integration tests' outside-domain request binding: model writes
 // borrow a Normal admission with no restore cohort.
 #[cfg(test)]
-#[path = "../../tests/support/recovery_admission.rs"]
-mod recovery_admission;
+use crate::recovery_admission;
 
 #[cfg(test)]
 mod v2_vault_tests {

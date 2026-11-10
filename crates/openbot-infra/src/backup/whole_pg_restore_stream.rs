@@ -358,6 +358,7 @@ pub(crate) mod input {
         secrets: AuthenticatedRestoreSecrets,
     }
 
+    #[expect(clippy::result_large_err, reason = "Failure keeps the original inline input custody without a new allocation after admission failure")]
     fn authenticate_whole_pg_restore_carrier_before(
         mut input: FrozenWholePgRestoreInput,
         intent: ReviewedWholePgRestoreIntent,
@@ -1365,6 +1366,7 @@ pub(crate) mod input {
         }
     }
 
+    #[expect(clippy::result_large_err, reason = "Failure retains the original input and raw errors without allocating after a capacity rejection")]
     pub async fn verify_whole_pg_restore_input(
         input: FrozenWholePgRestoreInput,
         intent: ReviewedWholePgRestoreIntent,
@@ -2022,7 +2024,7 @@ pub(crate) mod input {
                 .ok_or(WholePgCarrierFault::IoFailure)?;
             if Some((
                 named.st_dev as u64,
-                named.st_ino as u64,
+                named.st_ino,
                 named.st_uid,
                 u32::from(named.st_mode),
             )) != work.directories[index].identity
@@ -2105,7 +2107,7 @@ pub(crate) mod input {
                     .ok_or(WholePgCarrierFault::IoFailure)?;
                 if (
                     named.st_dev as u64,
-                    named.st_ino as u64,
+                    named.st_ino,
                     named.st_uid,
                     u32::from(named.st_mode),
                 ) != expected
@@ -2750,6 +2752,129 @@ pub(crate) mod input {
     }
 
     #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+    #[tokio::test]
+    #[ignore = "explicit CAR copied into an owned synthetic codec fixture; no PG or capture producer"]
+    async fn nonempty_artifact_spool_placement_preserves_every_path_length_and_hash() {
+        use openbot_domain::backup::whole_pg_carrier::{WholePgManifestClaim, WholePgMaterialClaim, WholePgSealCodec};
+        use std::collections::BTreeMap;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let (source_fixture, _source_control, mut source_session) = real_staging_fixture();
+        let (input, intent) = source_session.frozen_input().unwrap();
+        let mut source = verify_whole_pg_restore_input(input, intent, &mut source_session).await
+            .unwrap_or_else(|failure| panic!("original fixture authentication: {:?}", failure.fault()));
+        let bounds = source.carrier.input.bounds;
+        let mut buffer = std::mem::take(&mut source.carrier.input.buffer);
+        source.manifest().encode_manifest_into(&mut buffer).unwrap();
+        let mut claim: WholePgManifestClaim = serde_json::from_slice(&buffer).unwrap();
+        buffer.as_mut_slice().zeroize(); buffer.clear();
+        let extras = [
+            (format!("objects/{}", uuid::Uuid::now_v7()), vec![0x41; 65_537]),
+            (format!("objects/{}", uuid::Uuid::now_v7()), b"second retained object".to_vec()),
+            (format!("staging/{}", uuid::Uuid::now_v7()), b"unfinished staged bytes".to_vec()),
+        ];
+        // The existing capture names are flat UUID leaves. This is codec
+        // fixture DATA, not a new capture producer or source-PG save proof.
+        for (path, bytes) in &extras {
+            claim.materials.push(WholePgMaterialClaim {
+                material_id: format!("artifact:{path}"), kind: WholePgMaterialKind::Artifact,
+                relative_path: format!("materials/artifact-spool/{path}"),
+                plain_len: bytes.len() as u64, plain_sha256: Sha256::digest(bytes).into(),
+                chunk_count: u32::try_from((bytes.len() as u64).div_ceil(bounds.max_chunk_plain_bytes)).unwrap(),
+            });
+        }
+        claim.materials.sort_by(|a, b| (a.kind, &a.relative_path, &a.material_id).cmp(&(b.kind, &b.relative_path, &b.material_id)));
+        let mut bundle_bytes = [0; 16]; getrandom::fill(&mut bundle_bytes).unwrap();
+        bundle_bytes[6] = (bundle_bytes[6] & 15) | 0x40;
+        bundle_bytes[8] = (bundle_bytes[8] & 63) | 0x80;
+        let bundle = uuid::Uuid::from_bytes(bundle_bytes);
+        claim.bundle_id = bundle.to_string();
+        let manifest = FrozenWholePgManifest::check(claim, bounds).unwrap();
+        let header = manifest.header();
+        let expected: BTreeMap<_, _> = manifest.materials().iter()
+            .filter(|material| material.kind == WholePgMaterialKind::Artifact)
+            .map(|material| (material.relative_path.strip_prefix("materials/artifact-spool/").unwrap().to_owned(),
+                (material.plain_len, material.plain_sha256))).collect();
+        assert_eq!(expected.len(), 4, "one marker, two objects and one staging file");
+        let mut raw_key = Zeroizing::new([0u8; 32]); getrandom::fill(&mut raw_key[..]).unwrap();
+        let key = SecretBytes::new(raw_key.to_vec()); raw_key.zeroize();
+        let carrier_path = source_fixture.directory.join("nonempty-fixture-carrier");
+        let key_path = source_fixture.directory.join("nonempty-fixture-key");
+        let mut carrier = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&carrier_path).unwrap();
+        carrier.write_all(&header).unwrap();
+        let mut codec = WholePgSealCodec::new(&key, &manifest).unwrap();
+        while let Some(spec) = codec.next_frame() {
+            match spec.kind() {
+                0 => manifest.encode_manifest_into(&mut buffer).unwrap(),
+                1 => {
+                    buffer.resize(spec.plain_len() as usize, 0);
+                    let material = &manifest.materials()[spec.material_ordinal() as usize];
+                    if let Some((_, bytes)) = extras.iter().find(|(path, _)| material.material_id.strip_prefix("artifact:") == Some(path.as_str())) {
+                        let start = usize::try_from(spec.offset()).unwrap();
+                        buffer.copy_from_slice(&bytes[start..start + spec.plain_len() as usize]);
+                    } else {
+                        match material.kind {
+                            WholePgMaterialKind::MasterSecret => buffer.copy_from_slice(source.authenticated_secrets().historical_master().expose()),
+                            WholePgMaterialKind::ScramSecret => buffer.copy_from_slice(source.authenticated_secrets().postgres_scram().expose()),
+                            _ => {
+                                let original = source.manifest().materials().iter().position(|entry| entry.material_id == material.material_id).unwrap();
+                                source.material_file(original).unwrap().read_exact_at(&mut buffer, spec.offset()).unwrap();
+                            }
+                        }
+                    }
+                }
+                2 => manifest.encode_terminal_into(&mut buffer).unwrap(),
+                _ => unreachable!("closed codec frame kinds"),
+            }
+            let parts = codec.seal_next_in_place(&mut buffer).unwrap();
+            carrier.write_all(&parts.header).and_then(|_| carrier.write_all(&buffer)).and_then(|_| carrier.write_all(&parts.tag)).unwrap();
+            buffer.as_mut_slice().zeroize(); buffer.clear();
+        }
+        carrier.sync_all().unwrap();
+        assert_eq!(carrier.metadata().unwrap().len(), manifest.wire_bytes().unwrap());
+        let mut medium = Zeroizing::new([0u8; 104]);
+        medium[..8].copy_from_slice(b"WBPGKEY1"); medium[8..24].copy_from_slice(bundle.as_bytes());
+        medium[24..40].copy_from_slice(uuid::Uuid::parse_str(&manifest.claim().operation_id).unwrap().as_bytes());
+        medium[40..72].copy_from_slice(&header[48..80]); medium[72..].copy_from_slice(key.expose());
+        let mut key_file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_path).unwrap();
+        key_file.write_all(&medium[..]).and_then(|_| key_file.sync_all()).unwrap();
+        drop((medium, key_file, codec, key, carrier, buffer, source));
+
+        let (fixture, mut request) = real_staging_request();
+        std::fs::copy(&carrier_path, fixture.directory.join("carrier-medium/carrier")).unwrap();
+        std::fs::copy(&key_path, fixture.directory.join("key-medium/key")).unwrap();
+        request["trustedInputSelection"]["expectedBundleId"] = serde_json::json!(bundle.to_string());
+        request["trustedInputSelection"]["expectedManifestSha256"] = serde_json::json!(header[48..80].iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        let (mut control, entry) = fixture.open_request(request);
+        let mut session = control.claim_restore(entry, fixture.profile.clone()).unwrap();
+        let (input, intent) = session.frozen_input().unwrap();
+        let mut staged = verify_whole_pg_restore_input(input, intent, &mut session).await
+            .unwrap_or_else(|failure| panic!("nonempty fixture staging: {:?}", failure.fault()));
+        staged.place_artifact_spool_before(&mut session, Instant::now() + std::time::Duration::from_secs(30)).unwrap();
+        let artifact_root = fixture.directory.join("new-generation/artifacts");
+        assert_eq!(std::fs::metadata(&artifact_root).unwrap().permissions().mode() & 0o7777, 0o700);
+        assert!(!fixture.directory.join("new-generation/materials/artifact-spool").exists());
+        let mut observed = BTreeMap::new();
+        for entry in std::fs::read_dir(&artifact_root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                for child in std::fs::read_dir(entry.path()).unwrap() {
+                    let child = child.unwrap(); assert!(child.file_type().unwrap().is_file());
+                    let bytes = std::fs::read(child.path()).unwrap();
+                    let path = format!("{}/{}", entry.file_name().to_str().unwrap(), child.file_name().to_str().unwrap());
+                    assert!(observed.insert(path, (bytes.len() as u64, <[u8; 32]>::from(Sha256::digest(&bytes)))).is_none());
+                }
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                let bytes = std::fs::read(entry.path()).unwrap();
+                observed.insert(entry.file_name().into_string().unwrap(), (bytes.len() as u64, Sha256::digest(&bytes).into()));
+            }
+        }
+        assert_eq!(observed, expected, "the complete manifest inventory survives the production placement loop");
+    }
+
+    #[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
     async fn assert_valid_other_bundle_mixtures_rejected() {
         use openbot_domain::backup::whole_pg_carrier::{WholePgManifestClaim, WholePgSealCodec};
         use std::io::Write;
@@ -3332,6 +3457,14 @@ pub(crate) mod candidate_sql {
     use tokio::time::error::Elapsed;
     use tokio_postgres::{Row, Transaction, types::ToSql};
 
+    type TimedResult<T, E> = Result<Result<T, E>, Elapsed>;
+    type HistoryClearParts<'a, 'transaction> = (
+        &'a Transaction<'transaction>, &'a str, &'a str, &'a [u8], &'a mut RestoreStages,
+        &'a mut Option<TimedResult<Row, tokio_postgres::Error>>,
+        &'a mut Option<TimedResult<(), tokio_postgres::Error>>,
+    );
+    type PendingMigration = (i32, &'static str, &'static str, fn() -> String);
+
     /// Borrowed only here from a real candidate and its original guarded owner.
     /// No pool, namespace or audit-key constructor is exposed to callers.
     pub(crate) struct PendingHistoryClearSource<'a, 'transaction> {
@@ -3344,7 +3477,7 @@ pub(crate) mod candidate_sql {
     }
 
     impl<'transaction> PendingHistoryClearSource<'_, 'transaction> {
-        pub(crate) fn parts(&mut self) -> (&Transaction<'transaction>, &str, &str, &[u8], &mut RestoreStages, &mut Option<Result<Result<Row, tokio_postgres::Error>, Elapsed>>, &mut Option<Result<Result<(), tokio_postgres::Error>, Elapsed>>) {
+        pub(crate) fn parts(&mut self) -> HistoryClearParts<'_, 'transaction> {
             (self.owner.as_transaction(), &self.binding.deployment_id, &self.binding.tenant_id, self.audit_key.expose(), self.stages, self.control, self.key_result)
         }
     }
@@ -3607,7 +3740,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
 
     struct AuditResults {
         coordinates:
-            Option<Result<Result<(AuditEventId, time::OffsetDateTime), InfraError>, Elapsed>>,
+            Option<TimedResult<(AuditEventId, time::OffsetDateTime), InfraError>>,
         appended: Option<Result<Result<StoredAuditRow, InfraError>, Elapsed>>,
     }
 
@@ -3618,8 +3751,8 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         command: Option<Result<Result<u64, tokio_postgres::Error>, Elapsed>>,
         unit: Option<Result<Result<(), tokio_postgres::Error>, Elapsed>>,
         validation: Option<Result<Result<(), InfraError>, Elapsed>>,
-        layout_measure: Option<Result<Result<(i64, [u64; 6]), InfraError>, Elapsed>>,
-        catalog: Option<Result<Result<(u64, u64), CaptureSqlFailure>, Elapsed>>,
+        layout_measure: Option<TimedResult<(i64, [u64; 6]), InfraError>>,
+        catalog: Option<TimedResult<(u64, u64), CaptureSqlFailure>>,
         commit: Option<Result<(), TransactionOwnerError>>,
         rollback: Option<Result<(), TransactionOwnerError>>,
         audit: AuditResults,
@@ -3715,14 +3848,12 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             _ => RecoveryControlFault::ControlInvalid,
         };
         let original = stages.failure(fault);
-        if let Ok(closing) = stages.convergence_deadline() {
-            if let Some(intent) = intent.take() {
-                let _observed = stages.observe_stage_before(
-                    intent,
-                    RestoreDisposition::PgRollback(RestoreRollbackAck::RollbackUnproven),
-                    closing,
-                );
-            }
+        if let Ok(closing) = stages.convergence_deadline()
+            && let Some(intent) = intent.take()
+        {
+            let _observed = stages.observe_stage_before(
+                intent, RestoreDisposition::PgRollback(RestoreRollbackAck::RollbackUnproven), closing,
+            );
         }
         original
     }
@@ -3764,7 +3895,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
     }
 
     fn catalog_observation_error(
-        raw: Option<&Result<Result<(u64, u64), CaptureSqlFailure>, Elapsed>>,
+        raw: Option<&TimedResult<(u64, u64), CaptureSqlFailure>>,
     ) -> RecoveryControlError {
         let fault = match raw {
             Some(Err(_)) | Some(Ok(Err(CaptureSqlFailure::Clock))) => {
@@ -3919,7 +4050,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         let _allocation = stages.admit_capacity(Capacity::TotalAllocationBytes, memory)?;
         candidate.sql.artifact_coordinates = Some([
             source.store_id.to_string(), source.root.device.to_string(), source.root.inode.to_string(), source.root.uid.to_string(),
-            (target.st_dev as u64).to_string(), (target.st_ino as u64).to_string(), target.st_uid.to_string(),
+            (target.st_dev as u64).to_string(), (target.st_ino).to_string(), target.st_uid.to_string(),
         ]);
         checkout_before(stages, candidate, deadline).await?;
         candidate.sql.intent = Some(stages.begin_stage_before(RestoreStage::Import, "artifact_root_rebind", deadline)?);
@@ -3986,13 +4117,12 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                 let _settled = stages.settle_capacity(reservation, rows.len() as u64);
             }
         }
-        if let Some(Ok(Ok(rows))) = candidate.sql.raw.readback.as_ref() {
-            if rows.len() != 1 || rows[0].try_get::<_, bool>(2).ok() != Some(true)
+        if let Some(Ok(Ok(rows))) = candidate.sql.raw.readback.as_ref()
+            && (rows.len() != 1 || rows[0].try_get::<_, bool>(2).ok() != Some(true)
                 || (rows[0].try_get::<_, bool>(0).ok() != Some(true)
-                    && rows[0].try_get::<_, bool>(1).ok() != Some(true))
-            {
-                return Ok(super::RestoreArtifactRebindOutcome::IsolationUnproven);
-            }
+                    && rows[0].try_get::<_, bool>(1).ok() != Some(true)))
+        {
+            return Ok(super::RestoreArtifactRebindOutcome::IsolationUnproven);
         }
         Err(stages.failure(RecoveryControlFault::DatabaseUnknown))
     }
@@ -4381,7 +4511,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             verify_layout(raw, stages, transaction, &candidate.binding, version, deadline).await?;
             // A strict prior source (52 or 53) upgrades through every registered increment up to
             // the current layout; a current source only observes.
-            let pending: &[(i32, &str, &str, fn() -> String)] = match version {
+            let pending: &[PendingMigration] = match version {
                 52 => &[
                     (native::NATIVE_0053_VERSION, native::NATIVE_0053_NAME, native::NATIVE_0053_SQL, native::native_0053_checksum),
                     (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
@@ -6454,8 +6584,7 @@ pub(crate) mod candidate_fixture {
         claimed
             .session
             .bind_candidate_from_source_before(
-                Some(pg.pid()),
-                pg.identity(),
+                (Some(pg.pid()), pg.identity()),
                 &pg.uds(),
                 (system_identifier.to_owned(), pg.database_oid),
                 (&pg.scram(), &master),

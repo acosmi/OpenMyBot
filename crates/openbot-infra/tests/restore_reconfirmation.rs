@@ -1,7 +1,10 @@
 //! V7-IMPL-046 retirement, consumer-gate and reconfirmation cases on explicitly
 //! owned PostgreSQL 17.11 (spec revision R484, task card section 5.1, INF-R).
 #![cfg(feature = "server-runtime")]
+#[cfg(not(all(feature = "desktop-local", feature = "server-sso", target_os = "macos")))]
 mod harness;
+#[cfg(all(feature = "desktop-local", feature = "server-sso", target_os = "macos"))]
+use sso_fixture::harness;
 
 // Reuse the existing owned TLS/SAML fixtures and their regressions. Their
 // nested tests remain in the reported target denominator.

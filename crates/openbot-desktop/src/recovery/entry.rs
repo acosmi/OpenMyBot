@@ -139,6 +139,8 @@ impl OwnedDesktopRestore {
                     return Err(fault);
                 }
             };
+            #[cfg(test)]
+            if let Some(test) = &self.test_publication { test.observe_staging(&staging); }
             self.candidate = Some(super::candidate::CandidateGeneration::new(staging));
             let candidate = self.candidate.as_mut().expect("original candidate retained");
             candidate.prepare_directories(session)?;

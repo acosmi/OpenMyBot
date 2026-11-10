@@ -202,7 +202,7 @@ pub async fn pipeline_with_journal_ids(
         policy,
         memory.clone(),
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &pool,
+            pool,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),

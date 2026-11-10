@@ -725,7 +725,7 @@ pub(super) fn hex_matches(bytes: &[u8; 32], expected: &str) -> bool {
     expected.len() == 64
         && bytes
             .iter()
-            .zip(expected.as_bytes().chunks_exact(2))
+            .zip(expected.as_bytes().as_chunks::<2>().0.iter())
             .all(|(byte, pair)| {
                 pair[0] == HEX[usize::from(byte >> 4)] && pair[1] == HEX[usize::from(byte & 15)]
             })
@@ -1081,6 +1081,7 @@ fn unproven() -> RecoveryControlError {
 
 impl JournalObservation {
     /// Match Pending DATA to its actual first RestoreIntent and full reference.
+    #[cfg(feature = "desktop-local")]
     pub(super) fn matches_restore_pending(&self, pending: &super::activation::Pending) -> Result<(), RecoveryControlError> {
         let invalid = || RecoveryControlError::new(RecoveryControlFault::ControlInvalid);
         let first = self.records.first().ok_or_else(invalid)?;
@@ -1113,6 +1114,7 @@ impl JournalObservation {
         }
     }
 
+    #[cfg(any(feature = "desktop-local", test))]
     pub(super) fn first_context(&self) -> Option<(&str, &str, &str)> {
         let first = self.records.first()?;
         Some((&first.control_id, &first.operation_id, &first.epoch))

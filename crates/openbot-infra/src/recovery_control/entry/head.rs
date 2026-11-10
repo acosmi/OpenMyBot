@@ -25,6 +25,7 @@ fn invalid() -> RecoveryControlError {
 }
 
 impl ControlFiles {
+    #[cfg(feature = "desktop-local")]
     pub(super) fn read_original_restore_before(
         &mut self,
         operation: super::super::activation::Hex32,

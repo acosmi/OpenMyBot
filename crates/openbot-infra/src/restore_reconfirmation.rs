@@ -137,6 +137,7 @@ impl OriginalReconfirmationRequest {
         self.deadline
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(crate) fn for_current_local(
         deadline: Instant,
         cancel: CancellationToken,

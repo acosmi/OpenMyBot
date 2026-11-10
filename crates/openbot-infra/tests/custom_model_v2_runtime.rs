@@ -86,7 +86,7 @@ async fn assemble(
     policy_store.load().await.unwrap();
     assemble_postgres_application(PostgresApplicationAssemblyInput {
         recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &p,
+            p,
             &DeploymentId::new(DEP),
             &TenantId::new(TENANT),
         ),

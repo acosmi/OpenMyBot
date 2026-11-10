@@ -226,3 +226,7 @@ pub mod tool_approval;
 pub mod ui_preferences;
 #[cfg(any(feature = "server-runtime", feature = "desktop-local-vault"))]
 pub mod vault;
+
+#[cfg(all(test, feature = "server-runtime"))]
+#[path = "../tests/support/recovery_admission.rs"]
+mod recovery_admission;

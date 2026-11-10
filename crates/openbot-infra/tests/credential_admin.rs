@@ -113,7 +113,7 @@ async fn setup(
             None,
             SchemePolicy::HttpsOnly,
             openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-                &pool,
+                pool,
                 &openbot_contracts::ids::DeploymentId::new("outside"),
                 &openbot_contracts::ids::TenantId::new("outside"),
             ),

@@ -9,9 +9,11 @@ use sha2::Digest as _;
 use super::activation::{
     ActivationBinding, ActivationPayload, ActivationPhase, ActivationRecord, Active, ActualOsOwner,
     ExpectedServerDatabase, Hex32, Hex64, HostBinding, Initializing, JournalPositionRef,
-    JournalReference, OrdinaryLocalSite, OrdinaryMode, OrdinaryStartupBounds, PlannedInstallation,
+    JournalReference, OrdinaryMode, OrdinaryStartupBounds, PlannedInstallation,
     PublishedActivation, ServerDatabaseSite, ServiceConfigRef,
 };
+#[cfg(feature = "desktop-local")]
+use super::activation::OrdinaryLocalSite;
 use super::entry::{self, ControlOwner, Head};
 use super::journal::{
     BusinessAndInstallation, CommitAck, Disposition, JournalData, RollbackAck, SiteSelection, Stage,
@@ -33,6 +35,7 @@ pub(super) enum OrdinarySite {
 /// The closed sealed source of an ordinary initialization (spec 8067).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum OrdinaryInitializationSource {
+    #[cfg(feature = "desktop-local")]
     LocalPhysicalFresh,
     ServerDatabaseFresh,
     LegacyAdoption { site: OrdinarySite },
@@ -69,9 +72,11 @@ pub(super) enum SiteExpectation {
         service_config: ServiceConfigRef,
         owner: ActualOsOwner,
     },
+    #[cfg(feature = "desktop-local")]
     Local(LocalSiteExpectation),
 }
 
+#[cfg(feature = "desktop-local")]
 pub(super) struct LocalSiteExpectation {
     pub(super) root: Option<RecoveryFileIdentity>,
     pub(super) parent: RecoveryFileIdentity,
@@ -96,6 +101,7 @@ pub struct VerifiedOrdinaryStartupIntent {
     convergence: Instant,
     resource_model: ResourceModel,
     owners: Vec<RuntimeOwner>,
+    #[cfg(feature = "desktop-local")]
     local_request: Option<entry::VerifiedRecoveryHostIntent>,
     expected_head: Option<ExpectedHead>,
     #[cfg(feature = "desktop-local")]
@@ -155,6 +161,7 @@ impl VerifiedOrdinaryStartupIntent {
         }
         let resource_model = match site {
             SiteExpectation::Server { .. } => ResourceModel::Server,
+            #[cfg(feature = "desktop-local")]
             SiteExpectation::Local(_) => ResourceModel::Local,
         };
         Ok(Self {
@@ -167,6 +174,7 @@ impl VerifiedOrdinaryStartupIntent {
             convergence,
             resource_model,
             owners: owners.to_vec(),
+            #[cfg(feature = "desktop-local")]
             local_request: None,
             expected_head: None,
             #[cfg(feature = "desktop-local")]
@@ -174,6 +182,7 @@ impl VerifiedOrdinaryStartupIntent {
         })
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(super) fn seal_local_legacy(
         source: SealedSource,
         site: SiteExpectation,
@@ -204,6 +213,7 @@ impl VerifiedOrdinaryStartupIntent {
     pub(super) fn server_dataset(&self) -> Result<Hex32, RecoveryControlError> {
         match &self.site {
             SiteExpectation::Server { dataset, .. } => Ok(*dataset),
+            #[cfg(feature = "desktop-local")]
             SiteExpectation::Local(_) => Err(fault(RecoveryControlFault::EntryInvalid)),
         }
     }
@@ -212,6 +222,7 @@ impl VerifiedOrdinaryStartupIntent {
         self.effect
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(super) fn convergence_deadline(&self) -> Instant {
         self.convergence
     }
@@ -253,6 +264,7 @@ impl VerifiedOrdinaryStartupIntent {
                     return Err(fault(RecoveryControlFault::EntryInvalid));
                 }
             }
+            #[cfg(feature = "desktop-local")]
             SiteExpectation::Local(expected) => {
                 let actual = binding.ordinary_local()?;
                 if Some(actual.generation_root) != expected.root {
@@ -320,8 +332,9 @@ fn shared_head_inner(
         Ok(Head::Published(published)) => published,
         Ok(Head::Absent) => {
             #[cfg(feature = "desktop-local")]
-            if let (SiteExpectation::Local(local), Some(creator)) = (&mut intent.site, creator) {
-                if local.root.is_none() {
+            if let (SiteExpectation::Local(local), Some(creator)) = (&mut intent.site, creator)
+                && local.root.is_none()
+            {
                     let (installation, root) =
                         files.create_original_local_installation(creator, intent.effect)?;
                     local.root = Some(root);
@@ -332,7 +345,6 @@ fn shared_head_inner(
                         root,
                     ));
                     intent.fresh_installation = Some(installation);
-                }
             }
             files.release_registration_attempt();
             return Err(initialization_required(
@@ -416,12 +428,14 @@ pub(super) fn enter_runtime(
     enroll(control, published, &intent)
 }
 
+#[cfg(feature = "desktop-local")]
 enum LocalLegacyTerminal {
     Commit(Result<(), crate::db::pool::TransactionOwnerError>),
     Rollback(Result<(), crate::db::pool::TransactionOwnerError>),
 }
 
 #[derive(Default)]
+#[cfg(feature = "desktop-local")]
 struct LocalLegacySql {
     client: Option<crate::db::pool::GuardedClient>,
     checkout: Option<Result<Result<crate::db::pool::GuardedClient, crate::db::pool::PoolError>, tokio::time::error::Elapsed>>,
@@ -448,6 +462,7 @@ pub struct OrdinaryInitializationSession {
     /// Final disposition of the operation's last transaction or task.
     last: Option<Disposition>,
     evidence: Vec<JournalReference>,
+    #[cfg(feature = "desktop-local")]
     local_sql: LocalLegacySql,
 }
 
@@ -455,11 +470,13 @@ pub struct OrdinaryInitializationSession {
 /// constructible.
 pub enum OrdinaryActivationProof {
     ServerFresh(OrdinaryDatabaseInitializationProof),
+    #[cfg(feature = "desktop-local")]
     LocalFresh(LocalFreshProof),
     Legacy(VerifiedOrdinaryLegacyProof),
 }
 
 /// Facts of the original Local Fresh chain, observed after its canary and schema succeed.
+#[cfg(feature = "desktop-local")]
 pub struct LocalFreshProof {
     pub(super) site: OrdinaryLocalSite,
     pub(super) native_version: u32,
@@ -474,7 +491,9 @@ pub struct VerifiedOrdinaryLegacyProof {
     pub(crate) migration_digest: String,
 }
 
+#[cfg_attr(feature = "desktop-local", expect(clippy::large_enum_variant, reason = "Original Local site proofs stay inline in the already admitted session custody"))]
 pub(super) enum LegacySite {
+    #[cfg(feature = "desktop-local")]
     Local(OrdinaryLocalSite),
     Server { site: ServerDatabaseSite, key_id: Hex32 },
 }
@@ -526,6 +545,7 @@ pub(super) fn begin(
                 let digest = published.digest().to_owned();
                 // A known Local site has no request file: the held published
                 // descriptor is the positive intent.
+                #[cfg(feature = "desktop-local")]
                 if let SiteExpectation::Local(local) = &mut intent.site {
                     let binding = published.binding().ordinary_local()?;
                     let identity = files
@@ -564,11 +584,10 @@ pub(super) fn begin(
                         site: OrdinarySite::LocalPhysical,
                     }
             })
+            && let Err(error) = files.require_empty_legacy_control_before(admission)
         {
-            if let Err(error) = files.require_empty_legacy_control_before(admission) {
-                files.release_writer();
-                return Err(error);
-            }
+            files.release_writer();
+            return Err(error);
         }
         #[cfg(feature = "desktop-local")]
         if let SiteExpectation::Local(local) = &intent.site {
@@ -588,6 +607,7 @@ pub(super) fn begin(
             pending: None,
             last: None,
             evidence: Vec::new(),
+            #[cfg(feature = "desktop-local")]
             local_sql: LocalLegacySql::default(),
         })
     })();
@@ -650,6 +670,7 @@ impl OrdinaryInitializationSession {
                 *dataset,
                 self.intent.effect,
             )),
+            #[cfg(feature = "desktop-local")]
             SiteExpectation::Local(_) => Err(fault(RecoveryControlFault::EntryInvalid)),
         }
     }
@@ -727,6 +748,7 @@ impl OrdinaryInitializationSession {
                     },
                 )
             }
+            #[cfg(feature = "desktop-local")]
             SiteExpectation::Local(local) => {
                 let root = local.root.ok_or_else(invalid)?;
                 (
@@ -804,15 +826,11 @@ impl OrdinaryInitializationSession {
             } => OrdinaryMode::LegacyAdoption,
             _ => return Err(invalid()),
         };
-        let SiteExpectation::Server {
-            dataset,
-            ids,
-            database,
-            service_config,
-            owner,
-        } = &self.intent.site
-        else {
-            return Err(invalid());
+        let (dataset, ids, database, service_config, owner) = match &self.intent.site {
+            SiteExpectation::Server { dataset, ids, database, service_config, owner } =>
+                (dataset, ids, database, service_config, owner),
+            #[cfg(feature = "desktop-local")]
+            SiteExpectation::Local(_) => return Err(invalid()),
         };
         if !database.matches(&actual) {
             return Err(fault(RecoveryControlFault::ControlInvalid));
@@ -983,6 +1001,7 @@ impl OrdinaryInitializationSession {
         self.intend(OrdinaryStage::Verify)
     }
 
+    #[cfg(feature = "desktop-local")]
     fn local_effect_before(&self) -> Result<(), RecoveryControlError> {
         entry::lock(&self.control)?.post(self.intent.effect)
     }
@@ -1098,7 +1117,8 @@ impl OrdinaryInitializationSession {
                             if self.local_sql.row.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.as_ref().ok()).ok_or_else(invalid)?.try_get::<_,bool>(0).map_err(|_| invalid())? { return Err(invalid()); }
                         }
                         // A strict prior layout (52 or 53) upgrades through every registered increment.
-                        let pending: &[(i32, &str, &str, fn() -> String)] = match version {
+                        type PendingMigration = (i32, &'static str, &'static str, fn() -> String);
+                        let pending: &[PendingMigration] = match version {
                             native::NATIVE_0052_VERSION => &[
                                 (native::NATIVE_0053_VERSION, native::NATIVE_0053_NAME, native::NATIVE_0053_SQL, native::native_0053_checksum),
                                 (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
@@ -1584,6 +1604,7 @@ impl OrdinaryInitializationSession {
             if legacy.operation != operation {
                 return Err(invalid());
             }
+            #[cfg(feature = "desktop-local")]
             if let (SiteExpectation::Local(expected), LegacySite::Local(site)) =
                 (&self.intent.site, &legacy.site)
             {
@@ -1600,6 +1621,7 @@ impl OrdinaryInitializationSession {
             }
         }
         let binding = match (&self.intent.site, proof) {
+            #[cfg(feature = "desktop-local")]
             (SiteExpectation::Local(_), OrdinaryActivationProof::LocalFresh(proof)) => {
                 ActivationBinding::local(
                     proof.site,
@@ -1640,7 +1662,9 @@ impl OrdinaryInitializationSession {
                 dataset, ids, service_config, site, native_version, &migration_digest,
                 &initializing.initial_epoch, key_id.as_str(), operation.as_str(),
             ),
+            #[cfg(feature = "desktop-local")]
             (SiteExpectation::Local(_), OrdinaryActivationProof::Legacy(VerifiedOrdinaryLegacyProof { site: LegacySite::Local(site), native_version, migration_digest, .. })) => ActivationBinding::local(site, native_version, migration_digest, initializing.initial_epoch.clone(), operation),
+            #[cfg(feature = "desktop-local")]
             _ => return Err(invalid()),
         };
         binding.validate(&entry::lock(&self.control)?.limits)?;
@@ -1668,6 +1692,7 @@ impl OrdinaryInitializationSession {
         };
         let binding = self.published_binding()?;
         let matches = match &proof.site {
+            #[cfg(feature = "desktop-local")]
             LegacySite::Local(site) => binding.ordinary_local().is_ok_and(|expected| {
                 expected.dataset_id == site.dataset_id
                     && expected.deployment_id == site.deployment_id
@@ -1693,8 +1718,12 @@ impl OrdinaryInitializationSession {
             return Err(fault(RecoveryControlFault::ControlInvalid));
         }
         let mut binding = binding.with_native(proof.native_version, proof.migration_digest);
-        if let SiteExpectation::Server { service_config, .. } = &self.intent.site {
-            binding = binding.with_service_config(service_config);
+        match &self.intent.site {
+            SiteExpectation::Server { service_config, .. } => {
+                binding = binding.with_service_config(service_config);
+            }
+            #[cfg(feature = "desktop-local")]
+            SiteExpectation::Local(_) => {}
         }
         binding.validate(&entry::lock(&self.control)?.limits)?;
         let evidence = self.evidence.clone();
@@ -1762,6 +1791,7 @@ impl OrdinaryInitializationSession {
 }
 
 /// Ledger checksum of one exact native version.
+#[cfg(feature = "desktop-local")]
 async fn ledger_checksum(
     client: &tokio_postgres::Client,
     version: u32,

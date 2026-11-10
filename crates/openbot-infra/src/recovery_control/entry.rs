@@ -303,7 +303,7 @@ impl ServiceNamedParent {
                 .map_err(service_io)?;
             service_time(deadline)?;
             if named.st_dev as u64 != actual.device
-                || named.st_ino as u64 != actual.inode
+                || named.st_ino != actual.inode
                 || named.st_uid != actual.uid
                 || named.st_mode & 0o022 != 0
                 || rustix::fs::FileType::from_raw_mode(named.st_mode)
@@ -358,7 +358,7 @@ impl ServiceNamedParent {
             .map_err(service_io)?;
             service_time(deadline)?;
             if named.st_dev as u64 != current.identity.device
-                || named.st_ino as u64 != current.identity.inode
+                || named.st_ino != current.identity.inode
                 || named.st_uid != current.identity.uid
                 || named.st_mode & 0o022 != 0
                 || rustix::fs::FileType::from_raw_mode(named.st_mode)
@@ -492,7 +492,7 @@ impl ServiceOwnedInput {
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(service_invalid)?;
         if named.st_dev as u64 != current.identity.device
-            || named.st_ino as u64 != current.identity.inode
+            || named.st_ino != current.identity.inode
             || named.st_uid != uid
             || named.st_nlink != 1
             || named.st_mode & 0o7777 != 0o600
@@ -560,7 +560,7 @@ impl ServiceOwnedInput {
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(service_invalid)?;
         if named.st_dev as u64 != self.stamp.identity.device
-            || named.st_ino as u64 != self.stamp.identity.inode
+            || named.st_ino != self.stamp.identity.inode
             || named.st_uid != uid
             || named.st_nlink != 1
             || named.st_mode & 0o7777 != 0o600
@@ -624,7 +624,7 @@ impl ServiceControlSelection {
                 before(deadline)?;
                 let actual = service_directory(&file.metadata().map_err(service_io)?, uid)?;
                 if actual.device != named.st_dev as u64
-                    || actual.inode != named.st_ino as u64
+                    || actual.inode != named.st_ino
                     || actual.uid != uid
                 {
                     return Err(service_invalid());
@@ -641,15 +641,10 @@ impl ServiceControlSelection {
     }
 
     fn excludes(&self, input: &ServiceOwnedInput) -> Result<(), RecoveryControlError> {
-        if let Some(root) = &self.existing {
-            if input
-                .parent
-                .ancestors
-                .iter()
-                .any(|node| node.identity == root.identity)
-            {
-                return Err(service_invalid());
-            }
+        if let Some(root) = &self.existing
+            && input.parent.ancestors.iter().any(|node| node.identity == root.identity)
+        {
+            return Err(service_invalid());
         }
         Ok(())
     }
@@ -753,7 +748,7 @@ impl VerifiedServiceRecoveryHost {
             .map_err(service_io)?;
             before(deadline)?;
             if named.st_dev as u64 != root.identity.device
-                || named.st_ino as u64 != root.identity.inode
+                || named.st_ino != root.identity.inode
                 || named.st_uid != self.uid
                 || named.st_mode & 0o7777 != 0o700
                 || rustix::fs::FileType::from_raw_mode(named.st_mode)
@@ -1051,12 +1046,14 @@ struct RestoreRequestWire {
     profile: super::RestoreOperationProfile,
 }
 
+#[cfg(feature = "desktop-local")]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LegacyInputSelection {
     installation: RestoreFileSelection,
 }
 
+#[cfg(feature = "desktop-local")]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LegacyRequestWire {
@@ -1075,18 +1072,23 @@ struct LegacyRequestWire {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[cfg_attr(feature = "desktop-local", expect(clippy::large_enum_variant, reason = "The bounded request decoder retains inline variants under its original prepayment instead of adding allocations"))]
 enum RecoveryRequestWire {
     Restore(RestoreRequestWire),
+    #[cfg(feature = "desktop-local")]
     Legacy(LegacyRequestWire),
+    #[cfg(feature = "desktop-local")]
     Current(CurrentRequestWire),
 }
 
+#[cfg(feature = "desktop-local")]
 #[derive(Deserialize)]
 enum CurrentLocalSubject {
     #[serde(rename = "current_os_owner")]
     CurrentOsOwner,
 }
 
+#[cfg(feature = "desktop-local")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CurrentSelection {
@@ -1094,6 +1096,7 @@ struct CurrentSelection {
     _local_subject: CurrentLocalSubject,
 }
 
+#[cfg(feature = "desktop-local")]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CurrentRequestLimits {
@@ -1102,6 +1105,7 @@ struct CurrentRequestLimits {
     max_confirmations: u8,
 }
 
+#[cfg(feature = "desktop-local")]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CurrentRequestWire {
@@ -1119,6 +1123,7 @@ struct CurrentRequestWire {
     limits: CurrentRequestLimits,
 }
 
+#[cfg(feature = "desktop-local")]
 struct LocalCurrentRequest {
     request_id: Hex32,
     expected: RecoveryRequestExpected,
@@ -1126,12 +1131,16 @@ struct LocalCurrentRequest {
     issued: bool,
 }
 
+#[cfg_attr(feature = "desktop-local", expect(clippy::large_enum_variant, reason = "The bounded request decoder retains inline variants under its original prepayment instead of adding allocations"))]
 enum DecodedRecoveryRequest {
     Restore(RecoveryRequestV1),
+    #[cfg(feature = "desktop-local")]
     Legacy(LocalLegacyRequest),
+    #[cfg(feature = "desktop-local")]
     Current(LocalCurrentRequest),
 }
 
+#[cfg(feature = "desktop-local")]
 struct LocalLegacyRequest {
     request_id: Hex32,
     expected: RecoveryRequestExpected,
@@ -1143,14 +1152,18 @@ impl DecodedRecoveryRequest {
     fn purpose(&self) -> RecoveryRequestPurpose {
         match self {
             Self::Restore(request) => request.purpose,
+            #[cfg(feature = "desktop-local")]
             Self::Legacy(_) => RecoveryRequestPurpose::AdoptOrdinaryLegacy,
+            #[cfg(feature = "desktop-local")]
             Self::Current(_) => RecoveryRequestPurpose::ReconfirmCurrentBinding,
         }
     }
     fn expected(&self) -> &RecoveryRequestExpected {
         match self {
             Self::Restore(request) => &request.expected,
+            #[cfg(feature = "desktop-local")]
             Self::Legacy(request) => &request.expected,
+            #[cfg(feature = "desktop-local")]
             Self::Current(request) => &request.expected,
         }
     }
@@ -1169,8 +1182,12 @@ fn decode_restore_request(
     limits: &TrustedHostRecoveryLimits,
 ) -> Result<DecodedRecoveryRequest, RecoveryControlError> {
     let wire: RecoveryRequestWire = serde_json::from_slice(raw).map_err(RecoveryControlError::from_json)?;
+    #[cfg(not(feature = "desktop-local"))]
+    let RecoveryRequestWire::Restore(wire) = wire;
+    #[cfg(feature = "desktop-local")]
     let wire = match wire {
         RecoveryRequestWire::Restore(wire) => wire,
+        #[cfg(feature = "desktop-local")]
         RecoveryRequestWire::Current(wire) => {
             if wire.format_version != 1 || wire.purpose != RecoveryRequestPurpose::ReconfirmCurrentBinding
                 || wire.limits.max_confirmations != 1
@@ -1182,6 +1199,7 @@ fn decode_restore_request(
                 limits: OrdinaryStartupBounds { effect_ns: wire.limits.effect_ns, convergence_ns: wire.limits.convergence_ns }, issued: false,
             }));
         }
+        #[cfg(feature = "desktop-local")]
         RecoveryRequestWire::Legacy(wire) => {
             if wire.format_version != 1 || wire.purpose != RecoveryRequestPurpose::AdoptOrdinaryLegacy || wire.expected_source_installation_id != wire.expected_target_installation_id { return Err(service_invalid()); }
             for value in [&wire.expected_deployment_id, &wire.expected_tenant_id] { super::id(value, limits.max_id_bytes)?; }
@@ -1283,6 +1301,7 @@ impl RecoveryRequestExpected {
 
 /// Original live host evidence, never Deserialize/Clone or a supplied digest.
 pub struct VerifiedRecoveryHost {
+    #[cfg(feature = "desktop-local")]
     admission_deadline: Option<Instant>,
     reviewed_release_digest: [u8; 32],
     limits: TrustedHostRecoveryLimits,
@@ -1290,13 +1309,16 @@ pub struct VerifiedRecoveryHost {
     #[cfg(feature = "desktop-local")]
     original: HostOrigin,
     #[cfg(not(feature = "desktop-local"))]
-    _unavailable: std::convert::Infallible,
+    _unavailable: (),
+    #[cfg(feature = "desktop-local")]
     ordinary_bounds: OrdinaryStartupBounds,
     services: [String; 2],
 }
 
 impl VerifiedRecoveryHost {
+    #[cfg(feature = "desktop-local")]
     pub(super) fn trusted_limits(&self) -> &TrustedHostRecoveryLimits { &self.limits }
+    #[cfg(feature = "desktop-local")]
     pub(super) fn admission_deadline(&self) -> Instant { self.admission_deadline.expect("verified original host deadline") }
     /// Consume the original executable and verified release handles. Request
     /// facts and the control identity are sealed later by the control owner.
@@ -1454,7 +1476,7 @@ impl VerifiedRecoveryHost {
                         })?;
                     let h = held[index];
                     if n.st_dev as u64 != h.dev()
-                        || n.st_ino as u64 != h.ino()
+                        || n.st_ino != h.ino()
                         || n.st_uid != h.uid()
                         || u32::from(n.st_mode) != h.mode()
                         || rustix::fs::FileType::from_raw_mode(n.st_mode) != kind
@@ -1488,6 +1510,7 @@ pub(super) struct RequestOpenOwner {
 }
 
 impl OwnedRecoveryRequestFile {
+    #[cfg(feature = "desktop-local")]
     pub(super) fn retained_usage(&self) -> Result<(u64, u64), RecoveryControlError> {
         if self.file.is_none() { return Err(service_invalid()); }
         let bytes = (std::mem::size_of::<Self>() as u64).checked_add(self.component.capacity() as u64)
@@ -1571,7 +1594,7 @@ impl OwnedRecoveryRequestFile {
                 .and_then(|r| r.as_ref().ok())
                 .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
             if named.st_dev as u64 != stamp.identity.device
-                || named.st_ino as u64 != stamp.identity.inode
+                || named.st_ino != stamp.identity.inode
                 || named.st_uid != uid
                 || named.st_mode & 0o7777 != 0o600
                 || named.st_nlink != 1
@@ -1635,7 +1658,11 @@ impl VerifiedRecoveryHostIntent {
         self.decoded.purpose()
     }
     pub fn restore_profile(&self) -> Option<&super::RestoreOperationProfile> {
-        match &self.decoded { DecodedRecoveryRequest::Restore(request) => Some(&request.profile), DecodedRecoveryRequest::Legacy(_) | DecodedRecoveryRequest::Current(_) => None }
+        match &self.decoded {
+            DecodedRecoveryRequest::Restore(request) => Some(&request.profile),
+            #[cfg(feature = "desktop-local")]
+            DecodedRecoveryRequest::Legacy(_) | DecodedRecoveryRequest::Current(_) => None,
+        }
     }
     pub fn expected(&self) -> &RecoveryRequestExpected {
         self.decoded.expected()
@@ -2149,6 +2176,7 @@ pub(super) fn claim_restore(
         }
         state.pending_restore_intent = Some(match incoming.take().expect("original entry retained") {
             VerifiedRecoveryHostIntent { host, request, request_bytes, control_root, decoded: DecodedRecoveryRequest::Restore(decoded), original_deadline } => VerifiedRestoreHostIntent { host, request, request_bytes, control_root, decoded, original_deadline },
+            #[cfg(feature = "desktop-local")]
             other => { incoming = Some(other); return Err(service_invalid()); }
         });
         let original = state
@@ -2458,10 +2486,10 @@ pub(super) fn claim_restore(
     })();
     result.map_err(|mut error: RecoveryControlError| {
         error.retained_restore_intent = incoming.map(Box::new);
-        if error.fault() != RecoveryControlFault::OwnerBusy {
-            if let Ok(mut state) = lock(owner) {
-                state.latch(error.fault());
-            }
+        if error.fault() != RecoveryControlFault::OwnerBusy
+            && let Ok(mut state) = lock(owner)
+        {
+            state.latch(error.fault());
         }
         error.retain(owner)
     })
@@ -2483,6 +2511,7 @@ pub(super) fn observe_unclaimed_restore(owner: &ControlOwner) -> Result<ReadOnly
 
 /// Bounded same-operation reader after the original restore owner has gone.
 /// It carries no effect clock, stages, candidate or execution API.
+#[cfg(feature = "desktop-local")]
 pub struct ReadOnlyRestoreOwner {
     owner: ControlOwner,
     intent: Option<VerifiedRecoveryHostIntent>,
@@ -2508,6 +2537,7 @@ impl RestoreOriginalObservation {
     /// The observed descriptor phase; it does not authorize that phase's effects.
     pub fn phase(&self) -> super::ActivationPhase { self.phase }
 }
+#[cfg(feature = "desktop-local")]
 impl Drop for ReadOnlyRestoreOwner {
     fn drop(&mut self) { if let Ok(mut state) = lock(&self.owner) { state.release_writer(); } }
 }
@@ -2609,8 +2639,7 @@ impl RestoreControlSession {
         let source = &staging.manifest().claim().source;
         let secrets = staging.authenticated_secrets();
         self.bind_candidate_from_source_before(
-            child_id,
-            program,
+            (child_id, program),
             socket_dir,
             (source.system_identifier.clone(), source.database_oid),
             (secrets.postgres_scram(), secrets.historical_master()),
@@ -2624,8 +2653,7 @@ impl RestoreControlSession {
     /// The production entry above takes them from the verified staging.
     pub(crate) async fn bind_candidate_from_source_before(
         &mut self,
-        child_id: Option<u32>,
-        program: crate::backup::whole_pg_restore_stream::CandidateProgramIdentity,
+        (child_id, program): (Option<u32>, crate::backup::whole_pg_restore_stream::CandidateProgramIdentity),
         socket_dir: &Path,
         (system_identifier, database_oid): (String, u32),
         (scram, master): (
@@ -2688,7 +2716,7 @@ impl RestoreControlSession {
             self.candidate = Some(candidate);
             self.generation_root = Some(RecoveryFileIdentity {
                 device: root.st_dev as u64,
-                inode: root.st_ino as u64,
+                inode: root.st_ino,
                 uid: root.st_uid,
             });
             if let Some(intent) = self.isolation_intent.take() {
@@ -2931,7 +2959,7 @@ impl RestoreControlSession {
             let root = match state.raw.named.as_ref() {
                 Some(Ok(stat)) if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir() => RecoveryFileIdentity {
                     device: stat.st_dev as u64,
-                    inode: stat.st_ino as u64,
+                    inode: stat.st_ino,
                     uid: stat.st_uid,
                 },
                 _ => return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
@@ -2972,8 +3000,8 @@ impl RestoreControlSession {
                 restored.postgres(),
                 (native_version, migration_digest.to_owned()),
                 owner.epoch.as_str().to_owned(),
-                key(0, TargetSlotKind::Master, readbacks.key_id().to_owned()),
-                key(1, TargetSlotKind::Scram, postgres_account),
+                [key(0, TargetSlotKind::Master, readbacks.key_id().to_owned()),
+                 key(1, TargetSlotKind::Scram, postgres_account)],
             );
             binding.validate(&limits)?;
             // The closure evidence names the confirmed stage of each fact class
@@ -3319,7 +3347,7 @@ impl RestoreControlSession {
                     .and_then(|r| r.as_ref().ok())
                     .ok_or_else(service_invalid)?;
                 if named.st_dev as u64 != original.identity.device
-                    || named.st_ino as u64 != original.identity.inode
+                    || named.st_ino != original.identity.inode
                     || named.st_uid != original.identity.uid
                     || named.st_size as u64 != original.length
                     || named.st_nlink != 1
@@ -3545,13 +3573,13 @@ impl RestoreControlSession {
             ledger.raw_named = Some(rustix::fs::statat(parent, &original.component, AtFlags::SYMLINK_NOFOLLOW));
             operation.clock.require_convergence()?;
             let named = ledger.raw_named.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
-            if named.st_dev as u64 != actual.device || named.st_ino as u64 != actual.inode || named.st_uid != actual.uid || u32::from(named.st_mode) != metadata.mode() { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)); }
+            if named.st_dev as u64 != actual.device || named.st_ino != actual.inode || named.st_uid != actual.uid || u32::from(named.st_mode) != metadata.mode() { return Err(RecoveryControlError::new(RecoveryControlFault::OwnerLost)); }
             let device = ledger.devices.iter_mut().find(|device| device.device == actual.device).ok_or_else(service_invalid)?;
             device.pending_new = device.pending_new.checked_sub(original.bytes).ok_or_else(service_invalid)?;
             let observed = ledger.observe_file(child, false, deadline);
-            if observed.is_err() {
-                if let Some(device) = ledger.devices.iter_mut().find(|device| device.device == actual.device) { device.pending_new = device.pending_new.checked_add(original.bytes).ok_or_else(service_invalid)?; }
-            }
+            if observed.is_err()
+                && let Some(device) = ledger.devices.iter_mut().find(|device| device.device == actual.device)
+            { device.pending_new = device.pending_new.checked_add(original.bytes).ok_or_else(service_invalid)?; }
             observed?;
             operation.clock.require_convergence()
         })();
@@ -4375,7 +4403,7 @@ impl ControlFiles {
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(service_invalid)?;
         if named.st_dev as u64 != expected.device
-            || named.st_ino as u64 != expected.inode
+            || named.st_ino != expected.inode
             || named.st_uid != expected.uid
             || named.st_mode & 0o7777 != 0o700
             || rustix::fs::FileType::from_raw_mode(named.st_mode) != rustix::fs::FileType::Directory
@@ -4728,6 +4756,7 @@ impl ControlFiles {
         ledger.check_storage()
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(super) fn require_empty_legacy_control_before(&mut self, deadline: Instant) -> Result<(), RecoveryControlError> {
         let operations = self.inventory_count(Directory::Operations, self.limits.max_retained_operations, None, deadline)?;
         let runtimes = self.inventory_count(Directory::Runtimes, self.limits.max_registered_runtimes, None, deadline)?;
@@ -4922,11 +4951,9 @@ impl ControlFiles {
         // A process observation neither starts nor restarts operation E/C.
         // Ordinary expiry alone is not permanent owner loss. Actual native
         // process/boot/clock drift is; raw IO and results remain resident.
-        if let Some(fault) = self.first_fault {
-            if self.closing_observation.is_none() || fault == RecoveryControlFault::OwnerLost {
-                return Err(RecoveryControlError::new(fault));
-            }
-        }
+        if let Some(fault) = self.first_fault
+            && (self.closing_observation.is_none() || fault == RecoveryControlFault::OwnerLost)
+        { return Err(RecoveryControlError::new(fault)); }
         self.post_original_owner(deadline)
     }
 
@@ -5124,7 +5151,7 @@ impl ControlFiles {
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
         if s.st_dev as u64 != expected.device
-            || s.st_ino as u64 != expected.inode
+            || s.st_ino != expected.inode
             || s.st_uid != expected.uid
         {
             return Err(RecoveryControlError::new(
@@ -5378,7 +5405,7 @@ impl ControlFiles {
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
         if named.st_dev as u64 != held.device
-            || named.st_ino as u64 != held.inode
+            || named.st_ino != held.inode
             || named.st_uid != held.uid
             || named.st_mode & 0o7777 != 0o700
         {
@@ -6123,7 +6150,7 @@ impl ControlFiles {
                 .and_then(|r| r.as_ref().ok())
                 .ok_or_else(service_invalid)?;
             if named.st_dev as u64 != actual.device
-                || named.st_ino as u64 != actual.inode
+                || named.st_ino != actual.inode
                 || named.st_uid != actual.uid
                 || rustix::fs::FileType::from_raw_mode(named.st_mode)
                     != rustix::fs::FileType::Directory
@@ -6217,7 +6244,7 @@ impl ControlFiles {
                 .and_then(|r| r.as_ref().ok())
                 .ok_or_else(service_invalid)?;
             if named.st_dev as u64 != stamp.identity.device
-                || named.st_ino as u64 != stamp.identity.inode
+                || named.st_ino != stamp.identity.inode
                 || named.st_uid != self.uid
                 || named.st_size as u64 != stamp.length
                 || named.st_nlink != 1
@@ -6330,9 +6357,7 @@ impl ControlFiles {
                         super::ActivationPhase::OrdinaryActive
                             | super::ActivationPhase::RestoreCurrent
                     ) =>
-            {
-                ()
-            }
+            {}
             Some(Err(error)) => return Err(RecoveryControlError::new(error.fault())),
             _ => {
                 return Err(RecoveryControlError::new(
@@ -6619,7 +6644,7 @@ impl ControlFiles {
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
         if named.st_dev as u64 != original.identity.device
-            || named.st_ino as u64 != original.identity.inode
+            || named.st_ino != original.identity.inode
             || named.st_uid != original.identity.uid
             || named.st_size as u64 != original.bytes.len() as u64
             || named.st_mode & 0o7777 != 0o600
@@ -7001,7 +7026,7 @@ pub(super) fn recheck_legacy_request_before(files: &mut ControlFiles, request: &
     files.raw.named = Some(rustix::fs::statat(&request.request.parent, request.request.component.as_str(), AtFlags::SYMLINK_NOFOLLOW));
     files.post(deadline)?;
     let named = files.raw.named.as_ref().and_then(|r| r.as_ref().ok()).ok_or_else(service_invalid)?;
-    if named.st_dev as u64 != stamp.identity.device || named.st_ino as u64 != stamp.identity.inode || named.st_size as u64 != stamp.length || named.st_nlink != 1 || named.st_mode & 0o7777 != 0o600 || named.st_uid != files.uid { return Err(service_invalid()); }
+    if named.st_dev as u64 != stamp.identity.device || named.st_ino != stamp.identity.inode || named.st_size as u64 != stamp.length || named.st_nlink != 1 || named.st_mode & 0o7777 != 0o600 || named.st_uid != files.uid { return Err(service_invalid()); }
     let mut offset = 0;
     while offset < request.request_bytes.len() {
         let count = (request.request_bytes.len() - offset).min(8);
@@ -7335,6 +7360,7 @@ pub(super) fn open_control(
     open_control_inner(config, true)
 }
 
+#[cfg(feature = "desktop-local")]
 pub(super) fn open_existing_control(config: RecoveryControlConfig) -> Result<ControlOwner, RecoveryControlError> {
     open_control_inner(config, false)
 }
@@ -7635,11 +7661,9 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
                 .map_err(io::Error::from)
         });
         state.post(deadline)?;
-        if let Some(Err(error)) = &state.raw.unit {
-            if error.kind() != io::ErrorKind::AlreadyExists {
-                return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
-            }
-        }
+        if let Some(Err(error)) = &state.raw.unit
+            && error.kind() != io::ErrorKind::AlreadyExists
+        { return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)); }
         if matches!(state.raw.unit, Some(Ok(()))) {
             state.reserve_io(0)?;
             before(deadline)?;
@@ -7679,11 +7703,8 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
             .as_ref()
             .and_then(|source| source.control_selection.existing.as_ref())
             .map(|root| root.identity)
-        {
-            if root != expected {
-                return Err(service_invalid());
-            }
-        }
+            && root != expected
+        { return Err(service_invalid()); }
         if state.app_component.is_some() {
             state.reserve_io(0)?;
             before(deadline)?;
@@ -7708,10 +7729,8 @@ fn open_control_inner(config: RecoveryControlConfig, create_layout: bool) -> Res
                         == rustix::fs::FileType::Directory
                         && s.st_uid == state.uid
                         && s.st_mode & 0o7777 == 0o700
-                        && (s.st_dev as u64 != root.device || s.st_ino as u64 != root.inode) =>
-                {
-                    ()
-                }
+                        && (s.st_dev as u64 != root.device || s.st_ino != root.inode) =>
+                {}
                 Some(Err(e)) if *e == rustix::io::Errno::NOENT => (),
                 _ => {
                     return Err(RecoveryControlError::new(
@@ -8012,7 +8031,7 @@ pub(super) fn verify_intent(
             .and_then(|r| r.as_ref().ok())
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::IoFailure))?;
         if named.st_dev as u64 != original_identity.device
-            || named.st_ino as u64 != original_identity.inode
+            || named.st_ino != original_identity.inode
             || named.st_uid != original_identity.uid
             || named.st_size as u64 != length
             || named.st_mode & 0o7777 != 0o600

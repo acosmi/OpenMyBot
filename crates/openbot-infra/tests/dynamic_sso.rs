@@ -1,7 +1,7 @@
 //! W-7b 动态 SAML/SSO vault、routing、replay、account cleanup 的 PG17 真库闭环。
 #![cfg(feature = "server-sso")]
 
-mod harness;
+pub(crate) mod harness;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};

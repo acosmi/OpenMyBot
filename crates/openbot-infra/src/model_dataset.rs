@@ -296,8 +296,7 @@ impl ModelDatasetFacts {
 // The integration tests' outside-domain request binding: model writes
 // borrow a Normal admission with no restore cohort.
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-#[path = "../tests/support/recovery_admission.rs"]
-mod recovery_admission;
+use crate::recovery_admission;
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod physical_lineage_tests {

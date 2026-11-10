@@ -57,16 +57,11 @@ pub(super) fn verify_process_evidence(
         boot[2 * index] = HEX[usize::from(byte >> 4)];
         boot[2 * index + 1] = HEX[usize::from(byte & 15)];
     }
-    if let Some((boot_identity, original_pid, start)) = expected {
-        if boot_identity.as_bytes() != boot
-            || original_pid != pid
-            || start.seconds != seconds
-            || start.nanos != nanos
-        {
-            return Err(RecoveryControlError::new(
-                RecoveryControlFault::EntryInvalid,
-            ));
-        }
+    if let Some((boot_identity, original_pid, start)) = expected
+        && (boot_identity.as_bytes() != boot || original_pid != pid
+            || start.seconds != seconds || start.nanos != nanos)
+    {
+        return Err(RecoveryControlError::new(RecoveryControlFault::EntryInvalid));
     }
     Ok(())
 }

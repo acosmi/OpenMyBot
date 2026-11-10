@@ -219,7 +219,7 @@ fn directory(
         OWNER.into(),
         DEFAULT_THREAD_LEASE_DURATION,
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &p,
+            p,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),

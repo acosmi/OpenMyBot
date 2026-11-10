@@ -113,7 +113,7 @@ impl<const N: usize, const NONZERO: bool> HexText<N, NONZERO> {
             return Err(invalid());
         }
         let mut text = [0u8; N];
-        for (pair, byte) in text.chunks_exact_mut(2).zip(bytes) {
+        for (pair, byte) in text.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
             pair[0] = DIGITS[usize::from(byte >> 4)];
             pair[1] = DIGITS[usize::from(byte & 15)];
         }
@@ -269,6 +269,7 @@ pub(super) struct OrdinaryServerBinding<'a> {
     pub(super) postgres: &'a KeyReference,
 }
 
+#[cfg(feature = "desktop-local")]
 pub(super) struct OrdinaryLocalBinding<'a> {
     pub(super) dataset_id: &'a str,
     pub(super) deployment_id: &'a str,
@@ -278,10 +279,12 @@ pub(super) struct OrdinaryLocalBinding<'a> {
     pub(super) pg_system_id: u64,
     pub(super) database_oid: u32,
     pub(super) master: &'a KeyReference,
+    #[cfg(feature = "desktop-local")]
     pub(super) postgres: &'a KeyReference,
 }
 
 /// Actual Local site observations made by the ordinary initialization owner.
+#[cfg(feature = "desktop-local")]
 pub(super) struct OrdinaryLocalSite {
     pub(super) dataset_id: String,
     pub(super) deployment_id: String,
@@ -385,6 +388,7 @@ impl ActivationBinding {
         matches!(self.site, ActivationSiteBinding::LocalPhysical { .. })
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(super) fn ordinary_local(&self) -> Result<OrdinaryLocalBinding<'_>, RecoveryControlError> {
         match &self.site {
             ActivationSiteBinding::LocalPhysical {
@@ -406,12 +410,14 @@ impl ActivationBinding {
                 pg_system_id: *pg_system_id,
                 database_oid: *database_oid,
                 master: &key_refs[0],
+                #[cfg(feature = "desktop-local")]
                 postgres: &key_refs[1],
             }),
             _ => Err(invalid()),
         }
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(super) fn local(
         mut actual: OrdinaryLocalSite,
         native_version: u32,
@@ -451,8 +457,7 @@ impl ActivationBinding {
         (pg_system_id, database_oid): (u64, u32),
         (native_version, migration_digest): (u32, String),
         authorization_epoch: String,
-        master: KeyReference,
-        postgres: KeyReference,
+        [master, postgres]: [KeyReference; 2],
     ) -> Self {
         Self {
             site: ActivationSiteBinding::LocalPhysical {
@@ -943,7 +948,7 @@ pub(super) struct ActivationObservation {
 pub(super) struct PublishedActivation {
     observation: std::sync::Arc<ActivationObservation>,
     _publication: super::journal::VerifiedPublication,
-    restore_plan: Option<CandidatePlan>,
+    _restore_plan: Option<CandidatePlan>,
 }
 
 impl ActivationRecord {
@@ -1221,12 +1226,13 @@ impl PublishedActivation {
         Ok(Self {
             observation,
             _publication: publication,
-            restore_plan,
+            _restore_plan: restore_plan,
         })
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(super) fn restore_plan(&self) -> Option<&CandidatePlan> {
-        self.restore_plan.as_ref()
+        self._restore_plan.as_ref()
     }
 
     pub(super) fn binding(&self) -> &ActivationBinding {

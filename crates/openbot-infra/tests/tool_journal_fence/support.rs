@@ -104,7 +104,7 @@ pub fn runtime(pool: &Pool) -> Result<PostgresRunRuntime, String> {
         DEFAULT_THREAD_LEASE_DURATION,
         DEFAULT_DISPATCH_CLAIM_DURATION,
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &pool,
+            pool,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),

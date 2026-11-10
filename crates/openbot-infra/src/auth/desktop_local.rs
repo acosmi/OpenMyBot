@@ -109,6 +109,7 @@ impl CurrentOsUserAppDataRoot {
         &self.0
     }
 
+    #[cfg(feature = "desktop-local")]
     pub(crate) fn retained_path_bytes(&self) -> u64 {
         self.0.capacity() as u64
     }
@@ -323,8 +324,8 @@ pub struct DesktopLocalInstallation {
 /// The original app-data directory created by this installation attempt.
 /// Only a successful exclusive leaf creation can produce this non-Clone witness.
 pub struct OriginalFreshRoot {
-    root: File,
-    instance_id: Arc<str>,
+    _root: File,
+    _instance_id: Arc<str>,
 }
 
 impl core::fmt::Debug for OriginalFreshRoot {
@@ -334,14 +335,15 @@ impl core::fmt::Debug for OriginalFreshRoot {
 }
 
 impl OriginalFreshRoot {
+    #[cfg(any(feature = "desktop-local", test))]
     pub(crate) fn into_root_for(
         self,
         authority: &DesktopLocalAuthority,
     ) -> Result<File, DesktopLocalAuthorityError> {
-        if self.instance_id != authority.instance_id {
+        if self._instance_id != authority.instance_id {
             return Err(DesktopLocalAuthorityError::Corrupt);
         }
-        Ok(self.root)
+        Ok(self._root)
     }
 }
 
@@ -616,7 +618,7 @@ impl VerifiedCurrentRestoreInstallationBinding {
     /// The startup producer's single constructor, after its own Current and
     /// subject checks; it does not repeat or replace them. That producer is
     /// `RecoveryRuntimeOwner::current_restore_installation_before`.
-    #[cfg(feature = "server-runtime")]
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
     pub(crate) fn after_current_gate(restored: VerifiedRestoreInstallationBinding) -> Self {
         Self { restored }
     }
@@ -720,6 +722,7 @@ struct StoreInner {
 }
 
 impl DesktopLocalAuthorityStore {
+    #[cfg(feature = "desktop-local")]
     pub(crate) fn original_app_data_root(&self) -> &Path {
         self.inner.root.as_path()
     }
@@ -772,8 +775,8 @@ impl DesktopLocalAuthorityStore {
         let sidecar_data_dir =
             prepare_sidecar_data_dir(self.inner.root.as_path(), authority.instance_id())?;
         let fresh = root.map(|root| OriginalFreshRoot {
-            root,
-            instance_id: Arc::clone(&authority.instance_id),
+            _root: root,
+            _instance_id: Arc::clone(&authority.instance_id),
         });
         Ok((
             DesktopLocalInstallation {
@@ -870,7 +873,7 @@ fn validate_existing_sidecar_data_dir(root: &Path, path: &Path) -> Result<(), De
     let canonical_root =
         fs::canonicalize(root).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
     let canonical_path =
-        fs::canonicalize(&path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        fs::canonicalize(path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
     if canonical_path.parent() != Some(canonical_root.as_path()) {
         return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
     }

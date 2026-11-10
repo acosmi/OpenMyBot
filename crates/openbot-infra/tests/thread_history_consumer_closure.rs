@@ -298,7 +298,7 @@ fn directory(
         PROCESS.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &p,
+            p,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),
@@ -783,7 +783,7 @@ impl V2 {
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
             recovery_gate:
                 openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-                    &p,
+                    p,
                     &DeploymentId::new(DEP),
                     &TenantId::new(TENANT),
                 ),
@@ -829,7 +829,7 @@ impl V2 {
             PROCESS.to_owned(),
             time::Duration::seconds(30),
             openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-                &p,
+                p,
                 &openbot_contracts::ids::DeploymentId::new("outside"),
                 &openbot_contracts::ids::TenantId::new("outside"),
             ),
@@ -2037,7 +2037,7 @@ async fn capture_remember(
         policy,
         memory.clone(),
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &p,
+            p,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),
@@ -2935,7 +2935,7 @@ async fn not_closed_case(
         PROCESS.to_owned(),
         time::Duration::minutes(10),
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &p,
+            p,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),
@@ -2970,7 +2970,7 @@ async fn not_closed_case(
         lease_for,
         DEFAULT_DISPATCH_CLAIM_DURATION,
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &p,
+            p,
             &openbot_contracts::ids::DeploymentId::new("outside"),
             &openbot_contracts::ids::TenantId::new("outside"),
         ),
@@ -3001,7 +3001,7 @@ async fn not_closed_case(
         budget,
         Some(Duration::from_secs(2)),
         openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
-            &p,
+            p,
             &DeploymentId::new(DEP),
             &TenantId::new(TENANT),
         ),
@@ -3021,7 +3021,7 @@ async fn not_closed_case(
         .await
         .map_err(text)?;
     let registry = v2.registry.clone().ok_or("the dataset registry is gone")?;
-    let (administration, _root) = artifact_admin(&p, registry).await?;
+    let (administration, _root) = artifact_admin(p, registry).await?;
     let owner = auth();
     let save_asked = save_request(&save);
 

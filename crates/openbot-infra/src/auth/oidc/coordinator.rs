@@ -15,6 +15,7 @@ use openidconnect::{AuthorizationCode, ClientSecret};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
 use url::Url;
+#[cfg(any(feature = "server-sso", test))]
 use uuid::Uuid;
 
 use super::attempt::{CallbackLoginAttempt, ProviderIncarnationBinding};
