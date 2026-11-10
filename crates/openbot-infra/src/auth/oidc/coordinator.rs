@@ -439,8 +439,8 @@ impl OidcLoginCoordinator {
             let http =
                 SafeOauthHttpClient::new(self.dialer.clone(), token_endpoint, self.token_budget)
                     .map_err(|_| OidcError::MetadataEndpointRejected)?;
-            // 长寿命 runtime 只持有会 zeroize 且不可 Clone 的 SecretBytes；协议库要求的
-            // ClientSecret 仅在这一次 callback 栈帧内临时物化。
+            // The long-lived runtime retains only zeroizing, non-Clone SecretBytes.
+            // Materialize the protocol library's ClientSecret only in this callback frame.
             let client_secret = materialize_client_secret(runtime.client_secret.as_ref())?;
             let raw_id_token = exchange_authorization_code(
                 &runtime.metadata,

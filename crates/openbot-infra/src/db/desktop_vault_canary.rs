@@ -667,7 +667,7 @@ pub(crate) async fn verify_pre_upgrade_layout_on(
             &[],
         )
         .await
-        .map_err(|source| InfraError::query("只读核验 public 未知关系", source))?
+        .map_err(|source| InfraError::query("read-only public relation check", source))?
         .try_get(0)
         .map_err(|source| RowDecodeError::column("(pg_class)", "exists", source))?;
     if unknown_views {

@@ -624,7 +624,8 @@ impl DynamicSsoService {
             {
                 return Err(DynamicSsoError::RateLimited);
             }
-            // RelayState 必须先烧；provider 删除、metadata 坏、签名错都不允许重试同一 request。
+            // Burn RelayState first; provider removal, bad metadata or a bad signature
+            // must not permit another attempt with the same request.
             self.saml_attempts
                 .consume(relay_state, provider, now)
                 .await
