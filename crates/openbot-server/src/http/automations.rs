@@ -90,14 +90,14 @@ pub async fn list(
     State(state): State<ServerState>,
     Authenticated(auth): Authenticated,
     query: Result<Query<ListAutomationDefinitions>, QueryRejection>,
-) -> Result<(HeaderMap, Json<AutomationDefinitionPage>), HttpError> {
+) -> Result<Json<AutomationDefinitionPage>, HttpError> {
     let Query(query) = query.map_err(|_| malformed("query"))?;
     match state
         .application()
         .execute(auth, AppCommand::ListAutomationDefinitions(query))
         .await?
     {
-        AppReply::AutomationDefinitions(page) => Ok((headers(), Json(page))),
+        AppReply::AutomationDefinitions(page) => Ok(Json(page)),
         _ => Err(contract_error()),
     }
 }
@@ -109,7 +109,7 @@ pub async fn create(
     RawQuery(query): RawQuery,
     request_headers: HeaderMap,
     body: Body,
-) -> Result<(StatusCode, HeaderMap, Json<AutomationDefinition>), HttpError> {
+) -> Result<(StatusCode, Json<AutomationDefinition>), HttpError> {
     reject_query(query)?;
     let input = json_input::<CreateAutomationDefinition>(&request_headers, body).await?;
     match state
@@ -117,10 +117,8 @@ pub async fn create(
         .execute(auth, AppCommand::CreateAutomationDefinition(input))
         .await?
     {
-        AppReply::AutomationDefinitionCreated(row) => {
-            Ok((StatusCode::CREATED, headers(), Json(row)))
-        }
-        AppReply::AutomationDefinition(row) => Ok((StatusCode::OK, headers(), Json(row))),
+        AppReply::AutomationDefinitionCreated(row) => Ok((StatusCode::CREATED, Json(row))),
+        AppReply::AutomationDefinition(row) => Ok((StatusCode::OK, Json(row))),
         _ => Err(contract_error()),
     }
 }
@@ -131,14 +129,14 @@ pub async fn get(
     Authenticated(auth): Authenticated,
     RawQuery(query): RawQuery,
     Path(id): Path<String>,
-) -> Result<(HeaderMap, Json<AutomationDefinition>), HttpError> {
+) -> Result<Json<AutomationDefinition>, HttpError> {
     reject_query(query)?;
     let automation_id = AutomationId::try_from(id).map_err(|_| malformed("automation_id"))?;
     let reply = state
         .application()
         .execute(auth, AppCommand::GetAutomationDefinition { automation_id })
         .await?;
-    Ok((headers(), Json(definition(reply)?)))
+    Ok(Json(definition(reply)?))
 }
 
 /// Resolve the real session once; enable additionally requires its existing fresh-Origin guard.
@@ -149,7 +147,7 @@ pub async fn update(
     Path(id): Path<String>,
     request_headers: HeaderMap,
     body: Body,
-) -> Result<(HeaderMap, Json<AutomationDefinition>), HttpError> {
+) -> Result<Json<AutomationDefinition>, HttpError> {
     let origin = request_headers
         .get(ORIGIN)
         .map(|v| v.to_str().unwrap_or(""));
@@ -181,7 +179,7 @@ pub async fn update(
             },
         )
         .await?;
-    Ok((headers(), Json(definition(reply)?)))
+    Ok(Json(definition(reply)?))
 }
 
 /// Retire the namespace using the owner's observed revision; receipts remain readable.
@@ -192,7 +190,7 @@ pub async fn tombstone(
     Path(id): Path<String>,
     request_headers: HeaderMap,
     body: Body,
-) -> Result<(HeaderMap, Json<AutomationDefinition>), HttpError> {
+) -> Result<Json<AutomationDefinition>, HttpError> {
     reject_query(query)?;
     let automation_id = AutomationId::try_from(id).map_err(|_| malformed("automation_id"))?;
     let input = json_input::<TombstoneAutomationDefinition>(&request_headers, body).await?;
@@ -206,7 +204,7 @@ pub async fn tombstone(
             },
         )
         .await?;
-    Ok((headers(), Json(definition(reply)?)))
+    Ok(Json(definition(reply)?))
 }
 
 /// Accept only manual intent from the current owner, with no event data or model override.
@@ -217,7 +215,7 @@ pub async fn trigger(
     Path(id): Path<String>,
     request_headers: HeaderMap,
     body: Body,
-) -> Result<(StatusCode, HeaderMap, Json<AutomationReceipt>), HttpError> {
+) -> Result<(StatusCode, Json<AutomationReceipt>), HttpError> {
     reject_query(query)?;
     let automation_id = AutomationId::try_from(id).map_err(|_| malformed("automation_id"))?;
     let input = json_input::<ManualInput>(&request_headers, body).await?;
@@ -239,10 +237,8 @@ pub async fn trigger(
         )
         .await?
     {
-        AppReply::AutomationReceiptAccepted(row) => {
-            Ok((StatusCode::ACCEPTED, headers(), Json(row)))
-        }
-        AppReply::AutomationReceipt(row) => Ok((StatusCode::OK, headers(), Json(row))),
+        AppReply::AutomationReceiptAccepted(row) => Ok((StatusCode::ACCEPTED, Json(row))),
+        AppReply::AutomationReceipt(row) => Ok((StatusCode::OK, Json(row))),
         _ => Err(contract_error()),
     }
 }
@@ -253,7 +249,7 @@ pub async fn occurrences(
     Authenticated(auth): Authenticated,
     Path(id): Path<String>,
     query: Result<Query<AutomationPageQuery>, QueryRejection>,
-) -> Result<(HeaderMap, Json<AutomationOccurrencePage>), HttpError> {
+) -> Result<Json<AutomationOccurrencePage>, HttpError> {
     let automation_id = AutomationId::try_from(id).map_err(|_| malformed("automation_id"))?;
     let Query(query) = query.map_err(|_| malformed("query"))?;
     match state
@@ -267,7 +263,7 @@ pub async fn occurrences(
         )
         .await?
     {
-        AppReply::AutomationOccurrences(page) => Ok((headers(), Json(page))),
+        AppReply::AutomationOccurrences(page) => Ok(Json(page)),
         _ => Err(contract_error()),
     }
 }
@@ -278,7 +274,7 @@ pub async fn deliveries(
     Authenticated(auth): Authenticated,
     Path(id): Path<String>,
     query: Result<Query<AutomationPageQuery>, QueryRejection>,
-) -> Result<(HeaderMap, Json<AutomationDeliveryPage>), HttpError> {
+) -> Result<Json<AutomationDeliveryPage>, HttpError> {
     let automation_id = AutomationId::try_from(id).map_err(|_| malformed("automation_id"))?;
     let Query(query) = query.map_err(|_| malformed("query"))?;
     match state
@@ -292,7 +288,7 @@ pub async fn deliveries(
         )
         .await?
     {
-        AppReply::AutomationDeliveries(page) => Ok((headers(), Json(page))),
+        AppReply::AutomationDeliveries(page) => Ok(Json(page)),
         _ => Err(contract_error()),
     }
 }
@@ -303,7 +299,7 @@ pub async fn receipt(
     Authenticated(auth): Authenticated,
     RawQuery(query): RawQuery,
     Path(id): Path<String>,
-) -> Result<(HeaderMap, Json<AutomationReceipt>), HttpError> {
+) -> Result<Json<AutomationReceipt>, HttpError> {
     reject_query(query)?;
     let receipt_id = AutomationReceiptId::try_from(id).map_err(|_| malformed("receipt_id"))?;
     match state
@@ -311,7 +307,7 @@ pub async fn receipt(
         .execute(auth, AppCommand::GetAutomationReceipt { receipt_id })
         .await?
     {
-        AppReply::AutomationReceipt(row) => Ok((headers(), Json(row))),
+        AppReply::AutomationReceipt(row) => Ok(Json(row)),
         _ => Err(contract_error()),
     }
 }
@@ -390,9 +386,6 @@ fn definition(reply: AppReply) -> Result<AutomationDefinition, HttpError> {
     }
 }
 
-fn headers() -> HeaderMap {
-    HeaderMap::from_iter([(CACHE_CONTROL, HeaderValue::from_static("no-store"))])
-}
 fn reject_query(query: Option<String>) -> Result<(), AppError> {
     match query {
         None => Ok(()),

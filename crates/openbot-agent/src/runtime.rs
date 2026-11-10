@@ -1082,6 +1082,9 @@ async fn execute_run(inner: &Inner, activation: &mut Activation) {
                         AgentFailure::AutomationBudgetExceeded,
                     ))
                 }
+                ControlledChild::Ready(Err(AppError::AutomationDelegationInvalid)) => Some(
+                    AgentEvent::ContextFailed(AgentFailure::DelegationNotCurrent),
+                ),
                 ControlledChild::Ready(Err(_)) => Some(AgentEvent::ContextFailed(
                     AgentFailure::JournalCommitUnknown,
                 )),

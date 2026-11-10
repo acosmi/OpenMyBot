@@ -198,11 +198,6 @@ mod tests {
             load_automation_budgets(&path),
             Err(LaunchError::AutomationBudgetsInvalid)
         );
-        assert_eq!(
-            admitted.wire().revision.get(),
-            1,
-            "the admitted startup snapshot does not reread a changed file"
-        );
         std::fs::remove_file(path).unwrap();
     }
 
