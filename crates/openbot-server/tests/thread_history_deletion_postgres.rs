@@ -342,6 +342,15 @@ impl Fixture {
         resolver
             .install_thread_history_authority(&authority)
             .map_err(text)?;
+        resolver
+            .install_recovery_read_gate(
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
+            )
+            .map_err(text)?;
         if let Some(artifacts) = &artifacts {
             resolver
                 .install_artifact_read_authority(&artifacts.read_authority())
