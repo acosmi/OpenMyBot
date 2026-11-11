@@ -1419,8 +1419,21 @@ fn tenant_package_directory_for_startup(configured: &str) -> PathBuf {
     }
 }
 
+/// SIGINT and, on unix, SIGTERM both start the graceful shutdown.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            terminate.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = terminate => {}
+    }
 }
 
 fn startup_error(code: &'static str) -> std::io::Error {
