@@ -12,8 +12,21 @@ const REGISTERED_SCHEMA: &str = include_str!("schema-0054.json");
 /// # Errors
 /// Database or catalog decoding failure returns a redacted infrastructure error.
 pub async fn capture(client: &impl GenericClient) -> Result<Value, InfraError> {
+    // pg_get_constraintdef renders timestamptz literals in the session TimeZone, which a
+    // cluster inherits from its host at initdb; the savepoint scopes UTC to this
+    // observation inside the caller's transaction.
+    client
+        .batch_execute("SAVEPOINT automation_schema; SET LOCAL timezone='UTC'")
+        .await
+        .map_err(|source| InfraError::query("observe automation schema", source))?;
     let row = client
         .query_one(CAPTURE_SQL, &[])
+        .await
+        .map_err(|source| InfraError::query("observe automation schema", source))?;
+    client
+        .batch_execute(
+            "ROLLBACK TO SAVEPOINT automation_schema; RELEASE SAVEPOINT automation_schema",
+        )
         .await
         .map_err(|source| InfraError::query("observe automation schema", source))?;
     row.try_get(0).map_err(|source| {
@@ -45,6 +58,9 @@ pub(crate) const ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
 pub(crate) async fn observation_bytes_in_transaction(
     tx: &tokio_postgres::Transaction<'_>,
 ) -> Result<u64, InfraError> {
+    tx.batch_execute("SAVEPOINT automation_schema; SET LOCAL timezone='UTC'")
+        .await
+        .map_err(|source| InfraError::query("measure automation schema observation", source))?;
     let row = tx
         .query_one(
             &format!(
@@ -55,6 +71,11 @@ pub(crate) async fn observation_bytes_in_transaction(
         )
         .await
         .map_err(|source| InfraError::query("measure automation schema observation", source))?;
+    tx.batch_execute(
+        "ROLLBACK TO SAVEPOINT automation_schema; RELEASE SAVEPOINT automation_schema",
+    )
+    .await
+    .map_err(|source| InfraError::query("measure automation schema observation", source))?;
     let payload: i64 = row
         .try_get(0)
         .map_err(|source| RowDecodeError::column("(automation schema)", "bytes", source))?;
