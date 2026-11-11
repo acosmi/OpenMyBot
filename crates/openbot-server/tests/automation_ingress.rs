@@ -697,7 +697,8 @@ async fn commit_unknown_and_restart_converge_on_one_run() {
         let proxy_pool = openbot_infra::db::pool::connect(&proxy.config).await.unwrap();
         let through_proxy = openbot_infra::automation::PostgresAutomations::new(
             proxy_pool.clone(), f.auth.deployment().clone(), f.auth.tenant().clone(),
-            openbot_domain::vault::SecretBytes::new(vec![0x51; 32]), vault(&f)).unwrap();
+            openbot_domain::vault::SecretBytes::new(vec![0x51; 32]), vault(&f),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&proxy_pool, f.auth.deployment(), f.auth.tenant())).unwrap();
         let unknown = router(&f, Some(AutomationDeliveryEntry::new(Arc::new(through_proxy))));
         proxy.drop_next_commit_ack();
         let (status, _, error) = deliver(&unknown, "receiver-c", &key, body.clone()).await;

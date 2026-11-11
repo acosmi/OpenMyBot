@@ -706,6 +706,7 @@ async fn assemble_with_automation(
                 tenant.clone(),
                 SecretBytes::new(audit_key.to_vec()),
                 credential_vault,
+                recovery_gate.clone(),
             )
         })
         .transpose()

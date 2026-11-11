@@ -865,6 +865,11 @@ async fn manual_commit_faults_and_lost_notify_converge() {
                 openbot_domain::vault::KeyVersion::new(1),
                 openbot_domain::vault::WrappingKey::from_bytes(vec![0x42; 32]).unwrap(),
             ),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &proxy_pool,
+                f.auth.deployment(),
+                f.auth.tenant(),
+            ),
         )
         .unwrap();
         proxy.drop_next_commit_ack();
