@@ -56,6 +56,16 @@ fn router(
         f.auth.tenant().clone(),
     )
     .unwrap();
+    // The owned database is outside every recovery domain; requests borrow admission from it.
+    resolver
+        .install_recovery_read_gate(
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &f.pool,
+                f.auth.deployment(),
+                f.auth.tenant(),
+            ),
+        )
+        .unwrap();
     let security = SensitiveWriteSecurity::new(
         default_session_lifetime(),
         TrustedOrigins::from_configured([ORIGIN]).unwrap(),
