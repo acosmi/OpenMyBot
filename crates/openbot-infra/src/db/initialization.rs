@@ -11,21 +11,18 @@ use super::{InfraError, fresh, native};
 #[cfg(feature = "server-runtime")]
 use crate::recovery_control::{Hex32, RecoveryControlError, RecoveryControlFault};
 
-/// The Server bootstrap Pool and its first client, kept by the original
-/// control owner for the runtime's read gate. This is not a Fresh proof.
+/// The Server bootstrap Pool, kept by the original control owner for the
+/// runtime's read gate. It holds no checked-out client, so closing the Pool
+/// lets every original connection be destroyed. This is not a Fresh proof.
 #[cfg(feature = "server-runtime")]
 pub(crate) struct OwnedExistingServerDatabase {
     pub(crate) pool: Option<Result<Pool, InfraError>>,
-    pub(crate) client: Option<Result<super::pool::PooledClient, super::pool::PoolError>>,
 }
 
 #[cfg(feature = "server-runtime")]
 impl OwnedExistingServerDatabase {
     pub(crate) fn new() -> Self {
-        Self {
-            pool: None,
-            client: None,
-        }
+        Self { pool: None }
     }
 
     pub(crate) fn pool(&self) -> Result<&Pool, crate::recovery_control::RecoveryControlError> {

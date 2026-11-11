@@ -8215,7 +8215,6 @@ pub(super) async fn connect_server_before(
     let mut packet = crate::db::initialization::OwnedExistingServerDatabase::new();
     packet.pool = Some(crate::db::pool::connect(database).await);
     let pool = packet.pool()?.clone();
-    packet.client = Some(pool.get().await);
     let mut files = lock(owner)?;
     if files.existing_server.is_some() {
         return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
