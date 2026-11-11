@@ -1633,6 +1633,7 @@ mod tests {
         assert!(!Probe::<AutomationIngressOutcome>(core::marker::PhantomData).implemented());
         // Positive control: the probe does detect an implementation.
         assert!(Probe::<AutomationIngressReceipt>(core::marker::PhantomData).implemented());
+        assert!(DeProbe::<AutomationEventFilter>(core::marker::PhantomData).implemented());
         let receiver = AutomationReceiverId::try_from("receiver".to_owned()).unwrap();
         let delivery = VerifiedAutomationDelivery::from_verified_source(
             receiver.clone(),
