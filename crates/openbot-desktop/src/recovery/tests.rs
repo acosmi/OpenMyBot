@@ -1566,7 +1566,7 @@ fn t046_65_limits() -> TrustedHostRecoveryLimits {
         max_activation_bytes: 65_536,
         max_journal_frame_bytes: 65_536,
         max_journal_bytes: 1 << 20,
-        max_journal_records: 64,
+        max_journal_records: 128,
         max_runtime_record_bytes: 65_536,
         max_registered_runtimes: 2,
         max_retained_operations: 8,
@@ -1576,10 +1576,11 @@ fn t046_65_limits() -> TrustedHostRecoveryLimits {
         max_runtime_resource_facts: 16,
         max_id_bytes: 128,
         max_component_bytes: 128,
-        max_relative_path_bytes: 1024,
-        max_path_depth: 16,
-        max_open_files: 64,
-        max_metadata_bytes: 1 << 24,
+        // Room for the final restore claim's request profile.
+        max_relative_path_bytes: 4096,
+        max_path_depth: 64,
+        max_open_files: 256,
+        max_metadata_bytes: 256 << 20,
         admission_ns: 5_000_000_000,
     }
 }
@@ -1787,6 +1788,96 @@ async fn t046_65_run() {
     assert!(!killed[0].exists());
     prepared.shutdown().await.unwrap();
     assert!(runtimes[0].join("receipt-v1").is_file());
+    // With the crash settled, a same-installation restore claim passes.
+    use openbot_infra::recovery_control::{
+        OwnedRecoveryRequestFile, RecoveryControl, VerifiedRecoveryHost,
+    };
+    let inputs = parent.join("inputs");
+    DirBuilder::new().mode(0o700).create(&inputs).unwrap();
+    // The key medium needs its own parent, apart from the carrier.
+    let keys = parent.join("keys");
+    DirBuilder::new().mode(0o700).create(&keys).unwrap();
+    for (path, bytes) in [
+        (
+            inputs.join("carrier"),
+            &b"unconsumed input identity fixture\n"[..],
+        ),
+        (keys.join("key-medium"), &[3u8; 104][..]),
+        (inputs.join("request.json"), b"{}"),
+    ] {
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let binding = local_head(&control_root)["data"]["binding"].clone();
+    let mut request = EntryFixture::new().request_value();
+    request["purpose"] = json!("restore_same_installation");
+    request["expectedReviewedReleaseDigest"] = json!("0b".repeat(32));
+    for (field, key) in [
+        ("expectedDeploymentId", "deploymentId"),
+        ("expectedTenantId", "tenantId"),
+        ("expectedDatasetId", "datasetId"),
+        ("expectedSourceInstallationId", "sourceInstallationId"),
+        ("expectedTargetInstallationId", "targetInstallationId"),
+    ] {
+        request[field] = binding[key].clone();
+    }
+    request["trustedInputSelection"]["carrier"] = json!({"parent":inputs,"component":"carrier"});
+    request["trustedInputSelection"]["keyMedium"] = json!({"parent":keys,"component":"key-medium"});
+    request["trustedInputSelection"]["target"] =
+        json!({"parent":parent,"component":"new-generation"});
+    // The entry-only 64 MiB ceiling is below this test executable's allocation.
+    request["profile"]["capacity"]["maxTotalAllocationBytes"] = json!(1u64 << 32);
+    let profile: RestoreOperationProfile =
+        serde_json::from_value(request["profile"].clone()).unwrap();
+    fs::write(
+        inputs.join("request.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let program = std::env::current_exe().unwrap();
+    // The held release is a directory; the inputs directory stands in for it.
+    let host = VerifiedRecoveryHost::from_local_release(
+        (
+            fs::File::open(program.parent().unwrap()).unwrap(),
+            program.file_name().unwrap().into(),
+            fs::File::open(&program).unwrap(),
+        ),
+        (
+            fs::File::open(&parent).unwrap(),
+            "inputs".into(),
+            fs::File::open(&inputs).unwrap(),
+        ),
+        app(),
+        [11; 32],
+        t046_65_limits(),
+        serde_json::from_value(
+            json!({ "effectNs": 120_000_000_000u64, "convergenceNs": 30_000_000_000u64 }),
+        )
+        .unwrap(),
+        [
+            "com.example.product.desktop-vault.t046-local",
+            "com.example.product.postgresql.t046-local",
+        ],
+    )
+    .unwrap();
+    let request = OwnedRecoveryRequestFile::from_held(
+        fs::File::open(&inputs).unwrap(),
+        std::ffi::OsStr::new("request.json"),
+        rustix::process::getuid().as_raw(),
+    )
+    .unwrap();
+    let (mut control, intent) = RecoveryControl::open_local_restore_before(
+        app(),
+        request,
+        host,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    let session = control
+        .claim_restore(intent, profile)
+        .expect("the settled runtime no longer blocks the claim");
+    drop(session);
+    drop(control);
     fs::remove_dir_all(parent).unwrap();
 }
 

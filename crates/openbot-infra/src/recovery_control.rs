@@ -3598,6 +3598,50 @@ pub(crate) mod tests {
                 .map(|error| error.fault()),
             Some(RecoveryControlFault::OwnerBusy)
         );
+        drop(control);
+        // An entry whose enrollment cannot be read back (here empty) is
+        // kept and counted; the start still succeeds.
+        let fixture = RestoreEntryFixture::new();
+        let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_active(
+            &fixture,
+            &writer,
+            crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+        );
+        drop(writer);
+        let empty = fixture
+            .control_root()
+            .join("runtimes")
+            .join("abcdefabcdefabcdefabcdefabcde005");
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(empty.join("enrollment-v1"), b"").unwrap();
+        std::fs::set_permissions(
+            empty.join("enrollment-v1"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let mut runtime = fixture
+            .open_local(&control)
+            .expect("an unreadable entry does not block the start");
+        assert!(empty.join("enrollment-v1").exists(), "the entry is kept");
+        assert_eq!(runtime_entries(&fixture).len(), 2, "and counted");
+        runtime
+            .close_before(never_started(), deadline)
+            .await
+            .unwrap();
+        drop(runtime);
+        drop(control);
+        let (mut control, entry) = fixture.open();
+        // The restore claim itself is unchanged: its record read refuses.
+        assert_eq!(
+            control
+                .claim_restore(entry, fixture.profile.clone())
+                .err()
+                .map(|error| error.fault()),
+            Some(RecoveryControlFault::CapacityExceeded)
+        );
     }
 
     /// The registering process of t046_62: it enrolls under the parent's

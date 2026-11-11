@@ -6712,18 +6712,30 @@ impl ControlFiles {
         );
         self.post(deadline)?;
         let settle = match self.raw.unit.as_ref() {
-            Some(Ok(())) => true,
+            Some(Ok(())) => {
+                if self.held_lock_identity(false, deadline)? != identities[2] {
+                    return Err(RecoveryControlError::new(
+                        RecoveryControlFault::ControlInvalid,
+                    ));
+                }
+                true
+            }
             Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
                 self.share_runtime_lock(identities[2], deadline)?;
                 false
             }
             _ => return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
         };
-        if self.held_lock_identity(false, deadline)? != identities[2] {
-            return Err(RecoveryControlError::new(
-                RecoveryControlFault::ControlInvalid,
-            ));
-        }
+        // A record this entry cannot have read back (empty, oversized or
+        // changed while read) keeps the entry counted, like an invalid one.
+        let unreadable = |error: &RecoveryControlError| {
+            matches!(
+                error.fault(),
+                RecoveryControlFault::OwnerBusy
+                    | RecoveryControlFault::ControlInvalid
+                    | RecoveryControlFault::CapacityExceeded
+            )
+        };
         for nonce in names {
             self.open_runtime_entry(nonce, deadline)?;
             if !self.runtime_record_present("enrollment-v1", deadline)? {
@@ -6757,14 +6769,7 @@ impl ControlFiles {
                             deadline,
                         )?;
                     }
-                    Err(error)
-                        if matches!(
-                            error.fault(),
-                            RecoveryControlFault::OwnerBusy | RecoveryControlFault::ControlInvalid
-                        ) =>
-                    {
-                        self.runtime_work = None;
-                    }
+                    Err(error) if unreadable(&error) => self.runtime_work = None,
                     Err(error) => return Err(error),
                 }
                 continue;
@@ -6775,7 +6780,14 @@ impl ControlFiles {
             }
             let cap = self.limits.max_runtime_record_bytes;
             let record =
-                self.read_record(Directory::RuntimeWork, "enrollment-v1", cap, deadline)?;
+                match self.read_record(Directory::RuntimeWork, "enrollment-v1", cap, deadline) {
+                    Ok(record) => record,
+                    Err(error) if unreadable(&error) => {
+                        self.runtime_work = None;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             let decode = record
                 .bytes
                 .len()

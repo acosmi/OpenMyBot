@@ -1424,8 +1424,12 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let terminate = async {
         use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
-            terminate.recv().await;
+        // Without a SIGTERM handler only SIGINT stops the server.
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
         }
     };
     #[cfg(not(unix))]
