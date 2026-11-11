@@ -239,7 +239,8 @@ impl Bucket {
             currency: column(row, "currency")?,
         })
     }
-    async fn usage(&self, tx: &Transaction<'_>) -> Result<(i64, i64), AppError> {
+    // Full recompute from the original attempt ledger; only a policy install pays this scan.
+    async fn sync(&self, tx: &Transaction<'_>) -> Result<(), AppError> {
         let row=tx.query_one("SELECT
             COALESCE(sum(CASE WHEN a.state='settled' THEN COALESCE((a.actual_usage->>$5)::bigint,0) ELSE 0 END),0)::bigint AS used,
             COALESCE(sum(CASE WHEN a.state<>'settled' THEN COALESCE((a.reserved_bound->>$5)::bigint,0) ELSE 0 END),0)::bigint AS reserved
@@ -252,14 +253,18 @@ impl Bucket {
                     AND q.scope_kind=$3 AND q.scope_id=$4 AND q.policy_revision<=$9)
               AND ($6 OR ((a.reserved_bound->>'chargeAt')::timestamptz >=$7 AND (a.reserved_bound->>'chargeAt')::timestamptz <$8))",
             &[&self.deployment,&self.tenant,&self.kind,&self.id,&self.metric,&self.total,&self.start,&self.end,&self.revision]).await.map_err(|_|unavailable())?;
-        Ok((column(&row, "used")?, column(&row, "reserved")?))
-    }
-    async fn sync(&self, tx: &Transaction<'_>) -> Result<(i64, i64), AppError> {
-        let (used, reserved) = self.usage(tx).await?;
+        let (used, reserved): (i64, i64) = (column(&row, "used")?, column(&row, "reserved")?);
         tx.execute("INSERT INTO openbot_internal.automation_budget_balances(deployment_id,tenant_id,scope_kind,scope_id,policy_revision,metric,bucket_start,is_total,used,reserved)
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(deployment_id,tenant_id,scope_kind,scope_id,policy_revision,metric,bucket_start,is_total) DO UPDATE SET used=excluded.used,reserved=excluded.reserved",
             &[&self.deployment,&self.tenant,&self.kind,&self.id,&self.revision,&self.metric,&self.start,&self.total,&used,&reserved]).await.map_err(|_|unavailable())?;
-        Ok((used, reserved))
+        Ok(())
+    }
+    /// Apply one attempt's change to its stored balance, exactly as a ledger recompute would.
+    async fn add(&self, tx: &Transaction<'_>, used: i64, reserved: i64) -> Result<(), AppError> {
+        tx.execute("UPDATE openbot_internal.automation_budget_balances SET used=used+$9,reserved=reserved+$10
+            WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind=$3 AND scope_id=$4 AND policy_revision=$5 AND metric=$6 AND bucket_start=$7 AND is_total=$8",
+            &[&self.deployment,&self.tenant,&self.kind,&self.id,&self.revision,&self.metric,&self.start,&self.total,&used,&reserved]).await.map_err(|_|unavailable())?;
+        Ok(())
     }
 }
 
@@ -315,7 +320,11 @@ pub(crate) async fn projection(
     let at = budget_time(tx, deployment, tenant).await?;
     let mut items = Vec::new();
     for bucket in buckets(tx, &rows, at).await? {
-        let (used, reserved) = bucket.usage(tx).await?;
+        let (used, reserved) = match tx.query_opt("SELECT used,reserved FROM openbot_internal.automation_budget_balances WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind=$3 AND scope_id=$4 AND policy_revision=$5 AND metric=$6 AND bucket_start=$7 AND is_total=$8",
+            &[&bucket.deployment,&bucket.tenant,&bucket.kind,&bucket.id,&bucket.revision,&bucket.metric,&bucket.start,&bucket.total]).await.map_err(|_|unavailable())? {
+            Some(row) => (column(&row, "used")?, column(&row, "reserved")?),
+            None => (0, 0),
+        };
         items.push(AutomationBudgetProjection {
             scope: stored(serde_json::Value::String(bucket.kind))?,
             scope_id: bucket.id,
@@ -408,11 +417,15 @@ impl AutomationBudgetPlan {
         let buckets = buckets(tx, &policies, at).await?;
         for bucket in &buckets {
             let amount = bound.amount(&bucket.metric)?;
-            let (used, reserved) = bucket.sync(tx).await?;
-            tx.query_one("SELECT used,reserved FROM openbot_internal.automation_budget_balances WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind=$3 AND scope_id=$4 AND policy_revision=$5 AND metric=$6 AND bucket_start=$7 AND is_total=$8 FOR UPDATE",
+            // A current bucket without a row has no attempt yet: every reservation creates its row
+            // and a newly current revision is seeded from the ledger by refresh_current.
+            tx.execute("INSERT INTO openbot_internal.automation_budget_balances(deployment_id,tenant_id,scope_kind,scope_id,policy_revision,metric,bucket_start,is_total)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING",
                 &[&bucket.deployment,&bucket.tenant,&bucket.kind,&bucket.id,&bucket.revision,&bucket.metric,&bucket.start,&bucket.total]).await.map_err(|_|unavailable())?;
-            if used
-                .checked_add(reserved)
+            let row=tx.query_one("SELECT used,reserved FROM openbot_internal.automation_budget_balances WHERE deployment_id=$1 AND tenant_id=$2 AND scope_kind=$3 AND scope_id=$4 AND policy_revision=$5 AND metric=$6 AND bucket_start=$7 AND is_total=$8 FOR UPDATE",
+                &[&bucket.deployment,&bucket.tenant,&bucket.kind,&bucket.id,&bucket.revision,&bucket.metric,&bucket.start,&bucket.total]).await.map_err(|_|unavailable())?;
+            if column::<i64>(&row, "used")?
+                .checked_add(column(&row, "reserved")?)
                 .and_then(|v| v.checked_add(amount))
                 .is_none_or(|v| v > bucket.limit)
             {
@@ -469,9 +482,7 @@ impl AutomationBudgetPlan {
             tx.execute("INSERT INTO openbot_internal.automation_budget_reservations(deployment_id,tenant_id,attempt_id,scope_kind,scope_id,policy_revision,metric,bucket_start,is_total,reserved)
                 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
                 &[&bucket.deployment,&bucket.tenant,&attempt,&bucket.kind,&bucket.id,&bucket.revision,&bucket.metric,&bucket.start,&bucket.total,&amount]).await.map_err(|_|unavailable())?;
-        }
-        for bucket in self.buckets {
-            bucket.sync(tx).await?;
+            bucket.add(tx, 0, amount).await?;
         }
         Ok(())
     }
@@ -546,29 +557,34 @@ impl crate::automation::PostgresAutomations {
         )
         .await?;
         let source = format!("sampling:{index}");
-        let existing=tx.query_opt("SELECT attempt_id,state,(reserved_bound->>'chargeAt')::timestamptz AS charge_at FROM openbot_internal.automation_budget_attempts WHERE deployment_id=$1 AND tenant_id=$2 AND run_id=$3 AND usage_kind='sampling' AND source_attempt_ref=$4",
+        let existing=tx.query_opt("SELECT attempt_id,state,reserved_bound,(reserved_bound->>'chargeAt')::timestamptz AS charge_at FROM openbot_internal.automation_budget_attempts WHERE deployment_id=$1 AND tenant_id=$2 AND run_id=$3 AND usage_kind='sampling' AND source_attempt_ref=$4",
             &[&self.deployment.as_str(),&self.tenant.as_str(),&lease.run_id().as_str(),&source]).await.map_err(|_|unavailable())?;
-        let previous_buckets = if let Some(existing) = &existing {
+        if let Some(existing) = &existing {
             if column::<String>(existing, "state")? != "reserved" {
                 return Err(AppError::ReconciliationRequired { accepted: true });
             }
             let attempt: String = column(existing, "attempt_id")?;
-            let previous_buckets = attempt_buckets(
+            // Move only the unsent start reservation. A refusal rolls this back, and the
+            // original attempt stays bound to its old buckets until a send is permitted.
+            let bound: serde_json::Value = column(existing, "reserved_bound")?;
+            for bucket in attempt_buckets(
                 &tx,
                 &self.deployment,
                 &self.tenant,
                 &attempt,
                 column(existing, "charge_at")?,
             )
-            .await?;
-            // Move only the unsent start reservation. A refusal rolls this back, and the
-            // original attempt stays bound to its old buckets until a send is permitted.
+            .await?
+            {
+                let amount = bound
+                    .get(&bucket.metric)
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                bucket.add(&tx, 0, -amount).await?;
+            }
             tx.execute("DELETE FROM openbot_internal.automation_budget_reservations WHERE deployment_id=$1 AND tenant_id=$2 AND attempt_id=$3",
                 &[&self.deployment.as_str(),&self.tenant.as_str(),&attempt]).await.map_err(|_|unavailable())?;
-            previous_buckets
-        } else {
-            Vec::new()
-        };
+        }
         let plan = AutomationBudgetPlan::prepare(
             &tx,
             &self.deployment,
@@ -594,9 +610,6 @@ impl crate::automation::PostgresAutomations {
                 "unknown",
             )
             .await?;
-        }
-        for bucket in previous_buckets {
-            bucket.sync(&tx).await?;
         }
         tx.commit().await.map_err(|_| unavailable())?;
         Ok(true)
@@ -664,7 +677,7 @@ async fn settle(
     attempt: &str,
     actual: serde_json::Value,
 ) -> Result<(), AppError> {
-    let row=tx.query_one("SELECT state,actual_usage,automation_id,run_id,root_run_id,(reserved_bound->>'chargeAt')::timestamptz AS charge_at FROM openbot_internal.automation_budget_attempts WHERE deployment_id=$1 AND tenant_id=$2 AND attempt_id=$3 FOR UPDATE",
+    let row=tx.query_one("SELECT state,actual_usage,reserved_bound,automation_id,run_id,root_run_id,(reserved_bound->>'chargeAt')::timestamptz AS charge_at FROM openbot_internal.automation_budget_attempts WHERE deployment_id=$1 AND tenant_id=$2 AND attempt_id=$3 FOR UPDATE",
         &[&deployment.as_str(),&tenant.as_str(),&attempt]).await.map_err(|_|unavailable())?;
     if column::<String>(&row, "run_id")? != run
         || column::<String>(&row, "root_run_id")? != run
@@ -695,16 +708,23 @@ async fn settle(
         &[&deployment.as_str(),&tenant.as_str(),&attempt,&actual]).await.map_err(|_|unavailable())?;
     tx.execute("UPDATE openbot_internal.automation_budget_reservations SET settled=($4::jsonb->>metric)::bigint,released=reserved-($4::jsonb->>metric)::bigint WHERE deployment_id=$1 AND tenant_id=$2 AND attempt_id=$3",
         &[&deployment.as_str(),&tenant.as_str(),&attempt,&actual]).await.map_err(|_|unavailable())?;
+    let bound: serde_json::Value = column(&row, "reserved_bound")?;
     for bucket in
         attempt_buckets(tx, deployment, tenant, attempt, column(&row, "charge_at")?).await?
     {
-        bucket.sync(tx).await?;
+        let amount = |value: &serde_json::Value| {
+            value
+                .get(&bucket.metric)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+        };
+        bucket.add(tx, amount(&actual), -amount(&bound)).await?;
     }
     Ok(())
 }
 
-// A later revision may have carried this attempt. Recompute each stored interval from
-// reservation ancestry; future revisions cannot charge older ones.
+// A later revision may have carried this attempt. Every stored interval that counts it follows
+// from reservation ancestry; future revisions cannot charge older ones.
 async fn attempt_buckets(
     tx: &Transaction<'_>,
     deployment: &DeploymentId,
