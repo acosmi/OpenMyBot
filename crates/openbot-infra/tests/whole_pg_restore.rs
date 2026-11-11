@@ -549,6 +549,59 @@ mod ordinary {
         .await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires owned PostgreSQL 17.11 through OPENBOT_TEST_DATABASE_URL"]
+    async fn t046_48_server_legacy_accepts_validated_tool_calls_run_fk() {
+        async fn migrated(p: &DatabasePool, ddl: &str) -> TestResult {
+            let mut c = p.get().await.map_err(text)?;
+            baseline::apply(&c).await.map_err(text)?;
+            native::apply(&mut c).await.map_err(text)?;
+            c.batch_execute(ddl).await.map_err(text)
+        }
+        owned("t046_48", |config, p| async move {
+            migrated(
+                &p,
+                "ALTER TABLE public.tool_calls VALIDATE CONSTRAINT tool_calls_run_id_fkey",
+            )
+            .await?;
+            let site = ServerSite::new();
+            site.configure(&p, Some("legacy_adoption")).await?;
+            let (pool, runtime) = site.start(&config, &kek(KEK)).await.map_err(text)?;
+            pool.close();
+            drop(runtime);
+            let head = site.head().ok_or("no head")?;
+            require(head["phase"] == "OrdinaryActive", "validated FK adopts")?;
+            let (pool, _runtime) = site.start(&config, &kek(KEK)).await.map_err(text)?;
+            pool.close();
+            require(
+                site.head().as_ref() == Some(&head),
+                "restart enrolls the same head",
+            )
+        })
+        .await;
+        owned("t046_48_other", |config, p| async move {
+            migrated(
+                &p,
+                "ALTER TABLE public.tool_calls DROP CONSTRAINT tool_calls_run_id_fkey;
+                 ALTER TABLE public.tool_calls ADD CONSTRAINT tool_calls_run_id_fkey
+                   FOREIGN KEY(run_id) REFERENCES public.runs(run_id) ON DELETE CASCADE NOT VALID",
+            )
+            .await?;
+            let site = ServerSite::new();
+            site.configure(&p, Some("legacy_adoption")).await?;
+            require(
+                refused(site.start(&config, &kek(KEK)).await)?
+                    == RecoveryControlFault::ControlInvalid,
+                "another ON DELETE action",
+            )?;
+            require(
+                site.head().is_none() && site.operations().is_empty(),
+                "no head and no operation",
+            )
+        })
+        .await;
+    }
+
     /// One protected value per KEK-protected column, sealed the way its
     /// consumer writes it, plus enough credential rows to cross one keyset page.
     struct Protected {
