@@ -462,6 +462,83 @@ async fn rejection_order_refusal_counters_and_limits() {
     }).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
+async fn sender_storm_answers_accept_or_rate_limit_without_extra_writes() {
+    let admin = harness::admin_config("automation_ingress_storm");
+    harness::with_temp_database(&admin, "automation_ingress_storm", |database| async move {
+        let f = assembly_fixture::Fixture::with_options(
+            &database,
+            assembly_fixture::Options {
+                automation: true,
+                subscribe: false,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let app = router(&f, f.assembly.automation_delivery.clone());
+        let key = enabled_receiver(&f, "storm", "receiver-storm", json!([])).await;
+        let at = now();
+        // Burst 20, refill 10 per second, taken inside the serialized acceptance transaction.
+        // Requests stay under the definition's 100 pending. Whether any request is limited
+        // depends on how fast this build commits acceptances (the limiter arithmetic is covered
+        // by the infra unit test), so the storm asserts only timing-independent facts: every
+        // answer is an acceptance or a rate limit, and a rate limit writes nothing but its counter.
+        let (mut accepted, mut limited) = (0_i64, 0_u64);
+        for wave in 0..99_usize.div_ceil(8) {
+            let mut tasks = Vec::new();
+            for index in wave * 8..(wave * 8 + 8).min(99) {
+                let (app, key) = (app.clone(), key.clone());
+                let body = event(&format!("storm-{index}"), "push", r#"{"repo":"wrok"}"#, &at);
+                tasks.push(tokio::spawn(async move {
+                    deliver(&app, "receiver-storm", &key, body).await
+                }));
+            }
+            for task in tasks {
+                let (status, headers, body) = task.await.unwrap();
+                match status {
+                    202 => accepted += 1,
+                    429 => {
+                        limited += 1;
+                        assert_eq!(body["code"], "automation_rate_limited");
+                        assert_eq!(headers[http::header::RETRY_AFTER], "1");
+                    }
+                    other => panic!("unexpected storm status {other}: {body}"),
+                }
+            }
+        }
+        assert_eq!(accepted + i64::try_from(limited).unwrap(), 99);
+        assert!(accepted >= 20, "{accepted} accepted, {limited} limited");
+        assert_eq!(
+            count(
+                &f,
+                "SELECT count(*) FROM openbot_internal.automation_deliveries"
+            )
+            .await,
+            accepted
+        );
+        assert_eq!(
+            count(
+                &f,
+                "SELECT count(*) FROM openbot_internal.automation_occurrences"
+            )
+            .await,
+            accepted
+        );
+        let projected = receivers(&f, "storm").await;
+        assert_eq!(
+            refusal(&projected[0], AutomationRefusalReason::RateLimited),
+            limited
+        );
+        assert_eq!(projected[0].refusals.len(), usize::from(limited > 0));
+        drop(app);
+        f.assembly.shutdown().await;
+        f.pool.close();
+        Ok(())
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
 async fn receiver_lifecycle_fresh_origin_cas_and_vault_storage() {

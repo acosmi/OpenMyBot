@@ -43,6 +43,10 @@ impl AutomationDispatchQueue for PostgresAutomations {
                 -i64::try_from(expired).map_err(|_| unavailable())?,
             )
             .await?;
+            if expired > 0 {
+                self.audit(&tx, None, &id, "automation_occurrence_expired")
+                    .await?;
+            }
             if column::<i64>(definition, "active_count")? > 0 {
                 let runs=tx.query("SELECT o.run_id FROM openbot_internal.automation_occurrences o JOIN public.runs r ON r.run_id=o.run_id
                     WHERE o.deployment_id=$1 AND o.tenant_id=$2 AND o.automation_id=$3 AND r.status='running'",

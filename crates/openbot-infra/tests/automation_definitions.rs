@@ -1496,7 +1496,16 @@ async fn capacity_and_recovery_preserve_unknown() {
             Some(AutomationOccurrenceReason::ReconciliationRequired),
         );
         let idle = &receipts[4];
+        let expired_audits = "SELECT count(*),count(*) FILTER (WHERE target_id='capacity-e') FROM public.audit_events
+             WHERE target_type='automation' AND payload::text LIKE '%automation_occurrence_expired%'";
         let client = f.pool.get().await.unwrap();
+        let none_expired = client.query_one(expired_audits, &[]).await.unwrap();
+        drop(client);
+        store.maintain().await.unwrap();
+        let client = f.pool.get().await.unwrap();
+        let after_idle = client.query_one(expired_audits, &[]).await.unwrap();
+        assert_eq!(after_idle.get::<_, i64>(0), none_expired.get::<_, i64>(0));
+        assert_eq!(after_idle.get::<_, i64>(1), 0);
         assert_eq!(client.execute(
             "UPDATE openbot_internal.automation_occurrences
              SET accepted_at=accepted_at-interval '25 hours',expires_at=expires_at-interval '25 hours'
@@ -1504,6 +1513,11 @@ async fn capacity_and_recovery_preserve_unknown() {
         ).await.unwrap(), 1);
         drop(client);
         store.maintain().await.unwrap();
+        let client = f.pool.get().await.unwrap();
+        let after_expiry = client.query_one(expired_audits, &[]).await.unwrap();
+        assert_eq!(after_expiry.get::<_, i64>(0), none_expired.get::<_, i64>(0) + 1);
+        assert_eq!(after_expiry.get::<_, i64>(1), 1);
+        drop(client);
         let replay = trigger(&f, "capacity-e", "first", 2).await;
         assert_eq!(replay.receipt_id, idle.receipt_id);
         assert_eq!(replay.occurrence.unwrap().state, AutomationOccurrenceState::Expired);

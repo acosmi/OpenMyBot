@@ -81,8 +81,8 @@ impl AutomationDeliveries for PostgresAutomations {
         let definition = tx.query_one("SELECT state,current_revision,pending_count FROM openbot_internal.automation_definitions
             WHERE deployment_id=$1 AND tenant_id=$2 AND automation_id=$3 FOR UPDATE",
             &[&scope[0],&scope[1],&id.as_str()]).await.map_err(|_|unavailable())?;
-        // The definition lock serializes every acceptance of this receiver, so a rotation or
-        // revocation committed after authentication is observed here.
+        // Rotation and revocation lock only this receiver row; taking it FOR UPDATE and comparing
+        // the key revision below is what makes a change committed after authentication refuse here.
         let current = tx.query_one("SELECT r.current_key_revision,r.revoked_at IS NULL AS active,r.adapter,r.source_principal,r.event_filter,r.dedup_count,
                 EXISTS(SELECT 1 FROM public.credentials c WHERE c.id=r.vault_record_ref::uuid AND c.revoked_at IS NULL) AS key_active
             FROM openbot_internal.automation_receivers r WHERE r.deployment_id=$1 AND r.tenant_id=$2 AND r.receiver_id=$3 FOR UPDATE",
