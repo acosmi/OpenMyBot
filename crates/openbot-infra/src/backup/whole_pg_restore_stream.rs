@@ -8277,4 +8277,274 @@ INSERT INTO public.tool_attempts(tool_call_id,attempt_seq,attempt_id,capability_
         );
         let _ = native::NATIVE_0055_VERSION;
     }
+
+    /// The original Server assembly on the candidate, with the automation port and
+    /// the delegated entry its dispatcher reuses.
+    async fn automation_assembly(
+        pg: &OwnedCandidate,
+    ) -> (
+        crate::db::pool::DatabasePool,
+        crate::application_assembly::PostgresApplicationAssembly,
+        openbot_contracts::auth::AuthContext,
+    ) {
+        use crate::application_assembly::{
+            ChannelRoutingProviderInput, PostgresApplicationAssemblyInput,
+            assemble_postgres_server_application,
+        };
+        use openbot_application::provider::{
+            RemoteAguiAuthorization, RemoteAguiEventStream, RemoteAguiTransport,
+            RemoteAguiTransportError,
+        };
+        use openbot_contracts::ids::{DeploymentId, TenantId};
+        use openbot_domain::vault::{KeyVersion, SecretBytes, WrappingKey};
+        use std::sync::Arc;
+        struct ClosedRemote;
+        #[async_trait::async_trait]
+        impl RemoteAguiTransport for ClosedRemote {
+            async fn start(
+                &self,
+                _: &str,
+                _: Option<&RemoteAguiAuthorization>,
+                _: Vec<u8>,
+            ) -> Result<Box<dyn RemoteAguiEventStream>, RemoteAguiTransportError> {
+                Err(RemoteAguiTransportError::Unavailable)
+            }
+        }
+        let config = pg.config("openbot");
+        let password = String::from_utf8(config.get_password().unwrap().to_vec()).unwrap();
+        let pool = crate::db::pool::connect_config(
+            config,
+            8,
+            Duration::from_secs(25),
+            "automation candidate",
+        )
+        .await
+        .unwrap();
+        let deployment = DeploymentId::new(DEP);
+        let tenant = TenantId::new(TENANT);
+        let policy = crate::policy::PolicyStore::postgres(pool.clone(), None);
+        policy.load().await.unwrap();
+        let auth = crate::auth::single_user::load_single_user_principal(
+            &pool,
+            deployment.clone(),
+            tenant.clone(),
+        )
+        .await
+        .unwrap()
+        .auth_context()
+        .clone();
+        let assembly = assemble_postgres_server_application(PostgresApplicationAssemblyInput {
+            recovery_gate: crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &deployment,
+                &tenant,
+            ),
+            pool: pool.clone(),
+            listener_database: crate::db::pool::DatabaseConfig {
+                connect_timeout: Duration::from_secs(25),
+                ..crate::db::pool::DatabaseConfig::new(
+                    pg.uds().to_str().unwrap(),
+                    5432,
+                    "desktop_admin",
+                    "openbot",
+                )
+                .with_password(password)
+            }
+            .into(),
+            deployment: deployment.clone(),
+            tenant: tenant.clone(),
+            single_user: true,
+            admin_floor: None,
+            model: "fixture-model".into(),
+            credential_key_id: "fixture-credential".into(),
+            credential_vault: crate::vault::CredentialRecordVault::single_key(
+                tenant.clone(),
+                KeyVersion::new(1),
+                WrappingKey::from_bytes(vec![0x42; 32]).unwrap(),
+            ),
+            audit_key: SecretBytes::new(vec![0x51; 32]),
+            remote_assertions: Arc::new(
+                openbot_domain::remote_callback::RemoteRunAssertionSigner::new(vec![0x52; 32])
+                    .unwrap(),
+            ),
+            mcp_oauth_state_key: SecretBytes::new(vec![0x53; 32]),
+            policy_store: policy,
+            ui_preferences: Arc::new(
+                crate::ui_preferences::PostgresUiPreferenceAdministration::new(
+                    pool.clone(),
+                    deployment,
+                    tenant,
+                    SecretBytes::new(vec![0x51; 32]),
+                )
+                .unwrap(),
+            ),
+            screen_sessions: Arc::new(openbot_application::NoScreenSessionAdministration),
+            artifacts: None,
+            runtime_capabilities: None,
+            remote_agent_probe: Arc::new(ClosedRemote),
+            managed_slot_available: false,
+            channel_routing_provider: ChannelRoutingProviderInput {
+                endpoint: url::Url::parse("http://127.0.0.1:9/v1/chat/completions").unwrap(),
+                environment_api_key: None,
+                egress_allow_cidrs: vec!["127.0.0.1/32".into()],
+                allow_http: true,
+            },
+            stall_timeout: Some(Duration::from_secs(2)),
+            oauth_public_url: None,
+            app_url: None,
+            extra_provider_adapters: Vec::new(),
+            run_event_subscriber: None,
+            delegation_authority: None,
+        })
+        .await
+        .unwrap();
+        (pool, assembly, auth)
+    }
+
+    // The restore operation's auth_generation batch is the only coupling to an
+    // automation delegation: the next dispatch finds the grant's generation stale,
+    // keeps the occurrence pending with authority_unavailable, leaves the definition
+    // enabled and adds no restore fact (spec revision R484 ¶8064).
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
+    async fn retired_generation_keeps_an_enabled_automation_pending_authority_unavailable() {
+        use openbot_application::automation::AutomationDispatcher;
+        use openbot_contracts::automation::{
+            AutomationBudgetsFile, AutomationConfigV1, AutomationGrantConsent,
+            AutomationGrantValidity, CreateAutomationDefinition, TriggerAutomationDefinition,
+            UpdateAutomationDefinition,
+        };
+        use openbot_contracts::command::{AppCommand, AppReply};
+        let pg = OwnedCandidate::start(native::NATIVE_LATEST_VERSION, "").await;
+        {
+            let pool = crate::db::pool::connect_config(
+                pg.config("openbot"),
+                1,
+                Duration::from_secs(25),
+                "automation seed",
+            )
+            .await
+            .unwrap();
+            crate::auth::single_user::initialize_single_user(&pool, true)
+                .await
+                .unwrap();
+            pool.get().await.unwrap().batch_execute("INSERT INTO public.agents(id,name,type,configuration) VALUES('delegated-bot','Delegated Bot','built_in','{\"providerSource\":\"extension:fake_host\",\"systemPrompt\":\"Standing instruction\"}');INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility) VALUES('delegated-bot','dev-local-user','Bot','Fixture role','seed','public');").await.unwrap();
+            pool.close();
+        }
+        let (pool, assembly, auth) = automation_assembly(&pg).await;
+        let config: AutomationConfigV1 = serde_json::from_value(serde_json::json!({"schemaVersion":1,"title":"Manual","botId":"delegated-bot",
+            "promptTemplate":"Inspect the original owner input.","trigger":{"kind":"manual"},"modelPolicy":"bot_current",
+            "permissionCeiling":{"toolIds":[],"dataScopes":[]},"budget":[{"metric":"sampling_calls","totalLimit":"10"}],"runDeadlineSeconds":60})).unwrap();
+        assembly
+            .application
+            .execute(
+                auth.clone(),
+                AppCommand::CreateAutomationDefinition(CreateAutomationDefinition {
+                    automation_id: "joint".to_owned().try_into().unwrap(),
+                    config,
+                }),
+            )
+            .await
+            .unwrap();
+        let budgets: AutomationBudgetsFile = serde_json::from_value(serde_json::json!({"schemaVersion":1,"revision":1,
+            "workspaces":[{"deploymentId":auth.deployment(),"tenantId":auth.tenant(),"budget":[{"metric":"sampling_calls","totalLimit":"20"}]}],
+            "owners":[{"deploymentId":auth.deployment(),"tenantId":auth.tenant(),"ownerId":auth.actor(),"budget":[{"metric":"sampling_calls","totalLimit":"20"}]}]})).unwrap();
+        assembly
+            .automations
+            .as_ref()
+            .unwrap()
+            .install_budgets(Some(
+                &openbot_domain::automation::AutomationBudgets::try_from(budgets).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assembly
+            .application
+            .execute(
+                auth.clone(),
+                AppCommand::UpdateAutomationDefinition {
+                    automation_id: "joint".to_owned().try_into().unwrap(),
+                    input: UpdateAutomationDefinition::Enable {
+                        expected_revision: 1.try_into().unwrap(),
+                        grant_consent: AutomationGrantConsent {
+                            validity: AutomationGrantValidity::UntilRevoked {},
+                        },
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let AppReply::AutomationReceiptAccepted(receipt) = assembly
+            .application
+            .execute(
+                auth.clone(),
+                AppCommand::TriggerAutomationDefinition {
+                    automation_id: "joint".to_owned().try_into().unwrap(),
+                    input: TriggerAutomationDefinition {
+                        operation_id: "joint:run".to_owned().try_into().unwrap(),
+                        expected_revision: 2.try_into().unwrap(),
+                    },
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("one accepted manual occurrence");
+        };
+        assembly.shutdown().await;
+        pool.close();
+        drop(pool);
+
+        let client = pg.client().await;
+        let generation = "SELECT u.auth_generation,d.granted_auth_generation FROM public.users u JOIN openbot_internal.automation_delegations d ON d.owner_id=u.id WHERE u.id=$1";
+        let granted = client
+            .query_one(generation, &[&auth.actor().as_str()])
+            .await
+            .unwrap();
+        assert_eq!(granted.get::<_, i64>(0), granted.get::<_, i64>(1));
+        let mut claimed = upgraded(&pg).await;
+        claimed
+            .session
+            .retire_cohort_before(deadline())
+            .await
+            .unwrap();
+        let retired = client
+            .query_one(generation, &[&auth.actor().as_str()])
+            .await
+            .unwrap();
+        assert_eq!(retired.get::<_, i64>(0), granted.get::<_, i64>(0) + 1);
+        assert_eq!(retired.get::<_, i64>(1), granted.get::<_, i64>(1));
+        let restore_facts = "SELECT (SELECT count(*) FROM openbot_internal.restore_pg_operations),(SELECT count(*) FROM openbot_internal.restore_pg_batches),(SELECT count(*) FROM openbot_internal.restore_reconfirm_requirements),(SELECT count(*) FROM openbot_internal.restore_reconfirm_receipts),(SELECT count(*) FROM openbot_internal.restore_pg_seals)";
+        let facts = |row: tokio_postgres::Row| -> [i64; 5] { std::array::from_fn(|i| row.get(i)) };
+        let before = facts(client.query_one(restore_facts, &[]).await.unwrap());
+        assert!(before[1] > 0);
+
+        let (pool, assembly, _) = automation_assembly(&pg).await;
+        let dispatcher = AutomationDispatcher::new(
+            assembly.automations.as_ref().unwrap().clone(),
+            assembly.delegated_entry.as_ref().unwrap().clone(),
+        );
+        assert_eq!(dispatcher.scan().await.unwrap(), 0);
+        let row = client
+            .query_one(
+                "SELECT o.state,o.reason_code,o.run_id IS NULL,d.state FROM openbot_internal.automation_occurrences o JOIN openbot_internal.automation_definitions d USING(deployment_id,tenant_id,automation_id) WHERE o.occurrence_id=$1",
+                &[&receipt.receipt_id.as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "pending");
+        assert_eq!(
+            row.get::<_, Option<String>>(1).as_deref(),
+            Some("authority_unavailable")
+        );
+        assert!(row.get::<_, bool>(2));
+        assert_eq!(row.get::<_, String>(3), "enabled");
+        assert_eq!(
+            facts(client.query_one(restore_facts, &[]).await.unwrap()),
+            before
+        );
+        assembly.shutdown().await;
+        pool.close();
+        drop(claimed);
+    }
 }
