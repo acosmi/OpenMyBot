@@ -100,7 +100,7 @@ async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
             }
             if prior==51 { writer_check_legacy51(&mut c).await?; }
             if prior<native::NATIVE_LATEST_VERSION {
-                require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"real historical to52 upgrade was not applied")?;
+                require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"real historical upgrade to latest was not applied")?;
             }
             writer_check(&c).await?;
             let rows:i64=c.query_one("SELECT count(*) FROM openbot_internal.channel_history_sources",&[]).await.map_err(|e|e.to_string())?.get(0);
