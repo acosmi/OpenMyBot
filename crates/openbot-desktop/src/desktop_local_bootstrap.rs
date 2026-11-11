@@ -977,6 +977,7 @@ pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecret
     store: &S,
     postgres_service: &crate::postgres_sidecar::ReviewedPostgresKeyStoreService,
     vault_service: &crate::desktop_vault::ReviewedDesktopVaultKeyStoreService,
+    held: Option<crate::postgres_sidecar::KernelStartLock>,
 ) -> Result<
     OpenedRestoredGeneration,
     (
@@ -990,6 +991,7 @@ pub(crate) async fn open_restored_generation<S: crate::os_secret_store::OsSecret
         &site,
         store,
         postgres_service,
+        held,
     )
     .await
     .map_err(|(error, outcome)| {
@@ -1055,6 +1057,7 @@ pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecre
     store: &S,
     postgres_service: &crate::postgres_sidecar::ReviewedPostgresKeyStoreService,
     vault_service: &crate::desktop_vault::ReviewedDesktopVaultKeyStoreService,
+    held: Option<crate::postgres_sidecar::KernelStartLock>,
 ) -> Result<
     (
         DesktopLocalInstallation,
@@ -1078,6 +1081,7 @@ pub(crate) async fn open_current_installation<S: crate::os_secret_store::OsSecre
         store,
         postgres_service,
         vault_service,
+        held,
     )
     .await?;
     let gate = runtime

@@ -10,7 +10,7 @@ const CANDIDATE_NONCE_BYTES: usize = 16;
 const MAX_CREATE_ATTEMPTS: usize = 8;
 
 /// A live exclusive lock on the persistent inode for one installation instance.
-pub(super) struct KernelStartLock {
+pub(crate) struct KernelStartLock {
     root: PathBuf,
     path: PathBuf,
     bytes: Vec<u8>,
@@ -62,6 +62,12 @@ impl KernelStartLock {
 
     pub(super) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The held root directory's metadata, for the generation it locks.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    pub(super) fn root_metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.root_file.metadata()
     }
 
     pub(super) fn is_current(&self) -> bool {

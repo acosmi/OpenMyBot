@@ -21,7 +21,8 @@ mod version_output_tests;
 
 #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
 use helper_journal::{HelperJournal, HelperJournalError, HelperJournalPreparation, HelperKind};
-use kernel_start_lock::{KernelStartLock, path_matches_open_file};
+pub(crate) use kernel_start_lock::KernelStartLock;
+use kernel_start_lock::path_matches_open_file;
 #[cfg(all(feature = "postgres-supervisor", target_os = "macos"))]
 use startup_journal::{StartupJournal, StartupJournalError, StartupJournalPreparation};
 
@@ -477,6 +478,7 @@ impl PostgresStartLock {
             None,
             StartControlInspection::Ordinary,
             PostgresGeneration::Ordinary,
+            None,
         )
     }
 
@@ -494,6 +496,7 @@ impl PostgresStartLock {
             Some(data_dir),
             StartControlInspection::Ordinary,
             PostgresGeneration::Ordinary,
+            None,
         )
     }
 
@@ -504,9 +507,14 @@ impl PostgresStartLock {
         data_dir: Option<&Path>,
         control_inspection: StartControlInspection,
         generation: PostgresGeneration<'_>,
+        held: Option<KernelStartLock>,
     ) -> Result<Self, PostgresSidecarError> {
         let (data_dir_name, scram_account) = generation.names(instance_id);
-        let kernel_guard = KernelStartLock::acquire(app_data_root, instance_id)?;
+        // A guard held since before registration is this same start's lock.
+        let kernel_guard = match held {
+            Some(held) => held,
+            None => KernelStartLock::acquire(app_data_root, instance_id)?,
+        };
         #[cfg(all(
             feature = "desktop-launcher",
             feature = "postgres-maintenance",
@@ -1932,6 +1940,77 @@ impl Drop for RunningPostgresSidecar {
     }
 }
 
+/// Before registration and before any spawn: take the kernel start lock of
+/// the published head's generation, the restored `site` or else this
+/// installation's own data directory, and observe that its data directory
+/// has no opener other than this process. The held lock goes to the start
+/// that spawns PostgreSQL; the observation names the generation root only
+/// when the data directory exists. Any opener, such as the orphaned
+/// postmaster of a killed runtime, refuses the start before it registers.
+/// `None`: no installation exists to observe.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub(crate) fn hold_local_generation(
+    app_data_root: &Path,
+    authority_store: &openbot_infra::auth::single_user::desktop_local::DesktopLocalAuthorityStore,
+    site: Option<&openbot_infra::auth::single_user::desktop_local::RestoredLocalSite>,
+) -> Result<
+    Option<(
+        KernelStartLock,
+        Option<openbot_infra::recovery_control::LocalPostgresQuiescence>,
+    )>,
+    PostgresSidecarError,
+> {
+    use std::os::unix::fs::MetadataExt as _;
+    use wrok_bot_macos_process::{DataDirectoryOpenerObservation, observe_data_directory_openers};
+    let installation;
+    let (generation_root, instance_id, data_dir) = match site {
+        Some(site) => (
+            site.data_dir()
+                .parent()
+                .ok_or(PostgresSidecarError::DataDirectoryInvalid)?,
+            site.installation_id(),
+            site.data_dir(),
+        ),
+        None => {
+            let Ok(existing) = authority_store.load_existing_installation() else {
+                return Ok(None);
+            };
+            installation = existing;
+            (
+                app_data_root,
+                installation.authority().instance_id(),
+                installation.sidecar_data_dir(),
+            )
+        }
+    };
+    let kernel = KernelStartLock::acquire(generation_root, instance_id)?;
+    let data = match fs::symlink_metadata(data_dir) {
+        Ok(data) if data.is_dir() => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Some((kernel, None))),
+        _ => return Err(PostgresSidecarError::DataDirectoryInvalid),
+    };
+    let own = ProcessIdentity::capture(std::process::id())
+        .map_err(|_| PostgresSidecarError::ProcessIdentityInvalid)?;
+    match observe_data_directory_openers(data_dir, data.dev(), data.ino(), &[own]) {
+        Ok(DataDirectoryOpenerObservation::Empty) => {}
+        Ok(DataDirectoryOpenerObservation::Observed) => {
+            return Err(PostgresSidecarError::StartupJournalRecoveryRequired);
+        }
+        Err(_) => return Err(PostgresSidecarError::StartupJournalInvalid),
+    }
+    let root = kernel
+        .root_metadata()
+        .map_err(|_| PostgresSidecarError::StartLockGuardInvalid)?;
+    let observed = openbot_infra::recovery_control::LocalPostgresQuiescence::observed(
+        openbot_infra::recovery_control::RecoveryFileIdentity {
+            device: root.dev(),
+            inode: root.ino(),
+            uid: root.uid(),
+        },
+    );
+    Ok(Some((kernel, Some(observed))))
+}
+
 /// Verified PostgreSQL process lifecycle owner. It ends at SCRAM readiness; schema/package/window
 /// assembly remains a separate step and cannot run before this succeeds.
 #[cfg(feature = "postgres-supervisor")]
@@ -1957,6 +2036,7 @@ impl PostgresSidecarSupervisor {
             StartControlInspection::Ordinary,
             None,
             PostgresGeneration::Ordinary,
+            None,
         )
         .await
         .map_err(|(error, _)| error)
@@ -1974,6 +2054,7 @@ impl PostgresSidecarSupervisor {
         service: &ReviewedPostgresKeyStoreService,
         limits: Option<crate::tauri_background::capture::control::Limits>,
         legacy: Option<&openbot_infra::recovery_control::OrdinaryInitializationSession>,
+        held: Option<KernelStartLock>,
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
         Self::start_inner(
             bundle,
@@ -1986,6 +2067,7 @@ impl PostgresSidecarSupervisor {
             },
             legacy.map(|owner| (owner.effect_deadline(), owner.convergence_deadline())),
             PostgresGeneration::Ordinary,
+            held,
         )
         .await
     }
@@ -2000,6 +2082,7 @@ impl PostgresSidecarSupervisor {
         site: &openbot_infra::auth::single_user::desktop_local::RestoredLocalSite,
         store: &S,
         service: &ReviewedPostgresKeyStoreService,
+        held: Option<KernelStartLock>,
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
         let generation_root = site.data_dir().parent().ok_or((
             PostgresSidecarError::DataDirectoryInvalid,
@@ -2015,10 +2098,12 @@ impl PostgresSidecarSupervisor {
             PostgresGeneration::RestoredCurrent {
                 scram_account: site.postgres_account(),
             },
+            held,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner<S: PostgresSecretStore + ?Sized>(
         bundle: VerifiedPostgresBundle,
         (app_data_root, instance_id, data_dir): (&Path, &str, &Path),
@@ -2027,6 +2112,7 @@ impl PostgresSidecarSupervisor {
         control_inspection: StartControlInspection,
         legacy: Option<(std::time::Instant, std::time::Instant)>,
         generation: PostgresGeneration<'_>,
+        held: Option<KernelStartLock>,
     ) -> Result<RunningPostgresSidecar, (PostgresSidecarError, SidecarOutcome)> {
         if legacy.is_some_and(|(effect, _)| std::time::Instant::now() >= effect) {
             return Err((
@@ -2049,15 +2135,20 @@ impl PostgresSidecarSupervisor {
             Some(data_dir),
             control_inspection,
             generation,
+            held,
         )
         .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(not(all(feature = "postgres-supervisor", target_os = "macos")))]
-        let mut lock = PostgresStartLock::acquire(
-            app_data_root,
-            instance_id,
-            PostgresBundleDigest(bundle.manifest_sha256),
-        )
-        .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
+        let mut lock = {
+            // Only the macOS launcher holds a guard before registration.
+            let _ = held;
+            PostgresStartLock::acquire(
+                app_data_root,
+                instance_id,
+                PostgresBundleDigest(bundle.manifest_sha256),
+            )
+            .map_err(|error| (error, SidecarOutcome::NeverSpawned))?
+        };
         lock.ensure_current()
             .map_err(|error| (error, SidecarOutcome::NeverSpawned))?;
         #[cfg(target_os = "macos")]
@@ -4330,6 +4421,7 @@ mod tests {
                 &service,
                 None,
                 None,
+                None,
             )
             .await,
             Err((
@@ -4391,6 +4483,7 @@ mod tests {
             (&app_root, &instance, &data_dir),
             &store,
             &service,
+            None,
             None,
             None,
         )
@@ -5609,6 +5702,7 @@ mod tests {
                         RuntimeOwner::DesktopAgentRelay,
                         RuntimeOwner::DesktopAgent,
                     ],
+                    |_| Ok(None),
                 )
                 .err()
                 .unwrap()

@@ -1558,6 +1558,238 @@ async fn t046_07_run() {
     fs::remove_dir_all(parent).unwrap();
 }
 
+/// The host limits of t046_65 and its child processes: capacity N = 2.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+fn t046_65_limits() -> TrustedHostRecoveryLimits {
+    TrustedHostRecoveryLimits {
+        max_request_bytes: 65_536,
+        max_activation_bytes: 65_536,
+        max_journal_frame_bytes: 65_536,
+        max_journal_bytes: 1 << 20,
+        max_journal_records: 64,
+        max_runtime_record_bytes: 65_536,
+        max_registered_runtimes: 2,
+        max_retained_operations: 8,
+        max_root_entries: 64,
+        max_temp_entries: 8,
+        max_evidence_refs: 16,
+        max_runtime_resource_facts: 16,
+        max_id_bytes: 128,
+        max_component_bytes: 128,
+        max_relative_path_bytes: 1024,
+        max_path_depth: 16,
+        max_open_files: 64,
+        max_metadata_bytes: 1 << 24,
+        admission_ns: 5_000_000_000,
+    }
+}
+
+/// t046_65's registering Desktop process: the launcher's pre-registration
+/// observation, then registration, then optionally the generation's own
+/// PostgreSQL server, which a kill -9 of this process leaves orphaned. It
+/// waits to be killed. Without the parent's variables it does nothing.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[test]
+fn t046_65_child_registers_and_waits() {
+    use openbot_infra::auth::single_user::desktop_local::DesktopLocalAuthorityStore;
+    use openbot_infra::recovery_control::{RecoveryControl, RecoveryControlConfig, RuntimeOwner};
+    use std::io::Write as _;
+    let Some(app) = std::env::var_os("OPENBOT_T046_65_APP") else {
+        return;
+    };
+    let app = PathBuf::from(app);
+    let actual = CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app).unwrap();
+    let store = DesktopLocalAuthorityStore::new(actual.clone());
+    let control =
+        RecoveryControl::open(RecoveryControlConfig::local(actual, t046_65_limits()).unwrap())
+            .unwrap();
+    let mut held = None;
+    let _runtime = control
+        .open_local_before(
+            &store,
+            [11; 32],
+            [
+                "com.example.product.desktop-vault.t046-local",
+                "com.example.product.postgresql.t046-local",
+            ],
+            serde_json::from_value(
+                json!({ "effectNs": 120_000_000_000u64, "convergenceNs": 30_000_000_000u64 }),
+            )
+            .unwrap(),
+            &[
+                RuntimeOwner::PostgresSidecar,
+                RuntimeOwner::SqlDriver,
+                RuntimeOwner::ApplicationAssembly,
+                RuntimeOwner::DesktopAgentRelay,
+                RuntimeOwner::DesktopAgent,
+            ],
+            |restored| {
+                let (lock, observed) =
+                    crate::postgres_sidecar::hold_local_generation(&app, &store, restored)
+                        .unwrap()
+                        .unwrap();
+                held = Some(lock);
+                Ok(observed)
+            },
+        )
+        .unwrap();
+    if std::env::var_os("OPENBOT_T046_65_POSTGRES").is_some() {
+        let data_dir = store
+            .load_existing_installation()
+            .unwrap()
+            .sidecar_data_dir()
+            .to_owned();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let bin = PathBuf::from(std::env::var_os("OPENBOT_TEST_POSTGRES_BIN_DIR").unwrap());
+        // Never waited on: the kill -9 of this process orphans it on purpose.
+        #[allow(clippy::zombie_processes)]
+        std::process::Command::new(bin.join("postgres"))
+            .arg("-D")
+            .arg(&data_dir)
+            .args(["-p", &port.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    // libtest may print its own progress on the same line first.
+    println!("t046-65-registered");
+    std::io::stdout().flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(600));
+}
+
+/// Spawn t046_65's child under `app`, wait until it registered, then kill -9 it.
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+fn t046_65_kill_registered_child(app: &std::path::Path, postgres: bool) {
+    use std::io::BufRead as _;
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "recovery::tests::t046_65_child_registers_and_waits",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("OPENBOT_T046_65_APP", app)
+        .stdout(std::process::Stdio::piped());
+    if postgres {
+        command.env("OPENBOT_T046_65_POSTGRES", "1");
+    }
+    let mut child = command.spawn().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert!(
+        lines.any(|line| line.unwrap().ends_with("t046-65-registered")),
+        "the child registered"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+#[test]
+#[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
+fn t046_65_killed_local_runtime_settles_only_after_its_postgres_is_gone() {
+    crate::testing::on_large_stack(t046_65_run);
+}
+
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+async fn t046_65_run() {
+    use crate::tauri_background::prepare_desktop_local_runtime;
+    let site = SidecarRelease::new();
+    let parent = crate::postgres_sidecar::fixture_root("t046-65-crash");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let app_root = parent.join("app");
+    let control_root = parent.join("com.acosmi.wrokbot.restore-control");
+    let app = || CurrentOsUserAppDataRoot::from_current_os_user_app_data(&app_root).unwrap();
+    let prepared = prepare_desktop_local_runtime(app(), site.config(t046_65_limits()))
+        .await
+        .unwrap();
+    prepared.shutdown().await.unwrap();
+    // N + 2 runtimes killed before any sidecar starts, at capacity N: each
+    // registration settles the one before it.
+    for round in 0..4 {
+        t046_65_kill_registered_child(&app_root, false);
+        assert_eq!(local_runtimes(&control_root).len(), 1, "round {round}");
+    }
+    // A killed runtime's orphaned postmaster still holds the data directory:
+    // the next start fails before it registers and settles nothing.
+    t046_65_kill_registered_child(&app_root, true);
+    let killed = local_runtimes(&control_root);
+    assert_eq!(killed.len(), 1);
+    let data_dir = fs::read_dir(&app_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("postgresql-17-")
+        })
+        .unwrap();
+    let orphan = fs::read_to_string(data_dir.join("postmaster.pid"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        prepare_desktop_local_runtime(app(), site.config(t046_65_limits()))
+            .await
+            .is_err(),
+        "a live orphan refuses the start"
+    );
+    assert_eq!(
+        local_runtimes(&control_root),
+        killed,
+        "no settlement and no new entry"
+    );
+    assert!(
+        !killed[0].join("receipt-v1").exists(),
+        "the killed runtime left no receipt"
+    );
+    // Once the orphan has exited, the next start settles the killed entry.
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-TERM", &orphan])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let stopping = std::time::Instant::now();
+    while std::process::Command::new("/bin/kill")
+        .args(["-0", &orphan])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+    {
+        assert!(stopping.elapsed() < std::time::Duration::from_secs(30));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let prepared = prepare_desktop_local_runtime(app(), site.config(t046_65_limits()))
+        .await
+        .unwrap();
+    let runtimes = local_runtimes(&control_root);
+    assert_eq!(runtimes.len(), 1, "the killed entry settled");
+    assert!(!killed[0].exists());
+    prepared.shutdown().await.unwrap();
+    assert!(runtimes[0].join("receipt-v1").is_file());
+    fs::remove_dir_all(parent).unwrap();
+}
+
 #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
 #[test]
 #[ignore = "requires dedicated PostgreSQL 17.11 binaries via OPENBOT_TEST_POSTGRES_BIN_DIR"]
@@ -3888,6 +4120,7 @@ async fn t046_35_run() {
                 [VAULT_KEY_STORE_SERVICE, POSTGRES_KEY_STORE_SERVICE],
                 bootstrap.bounds,
                 &owners,
+                |_| Ok(None),
             )
             .expect("the Current head enrolls a runtime")
     };
@@ -4068,6 +4301,7 @@ async fn t046_35_run() {
                 VAULT_KEY_STORE_SERVICE,
             )
             .unwrap(),
+            None,
         )
         .await
         .map_err(|(failure, ..)| failure)

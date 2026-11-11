@@ -607,6 +607,7 @@ impl VerifiedDesktopRelease {
             store,
             &postgres_service,
             &vault_service,
+            None,
         )
         .await;
         let OpenedRestoredGeneration {

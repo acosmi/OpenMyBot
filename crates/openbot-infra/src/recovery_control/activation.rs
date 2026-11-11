@@ -381,6 +381,17 @@ impl ActivationBinding {
             _ => Err(invalid()),
         }
     }
+    /// The generation ID and root a Local binding names; none for Server.
+    pub(super) fn local_generation(&self) -> Option<(&str, RecoveryFileIdentity)> {
+        match &self.site {
+            ActivationSiteBinding::LocalPhysical {
+                generation_id,
+                generation_root,
+                ..
+            } => Some((generation_id, *generation_root)),
+            ActivationSiteBinding::ServerDatabase { .. } => None,
+        }
+    }
     pub(super) fn is_local(&self) -> bool {
         matches!(self.site, ActivationSiteBinding::LocalPhysical { .. })
     }

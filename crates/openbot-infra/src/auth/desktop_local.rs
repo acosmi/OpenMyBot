@@ -731,6 +731,11 @@ struct StoreInner {
 }
 
 impl DesktopLocalAuthorityStore {
+    #[cfg(feature = "desktop-local")]
+    pub(crate) fn app_data_root(&self) -> &CurrentOsUserAppDataRoot {
+        &self.inner.root
+    }
+
     #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
     pub(crate) fn original_app_data_root(&self) -> &Path {
         self.inner.root.as_path()

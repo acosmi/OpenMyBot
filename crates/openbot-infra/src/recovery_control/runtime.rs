@@ -269,6 +269,23 @@ fn enrollment<'a>(
     }
 }
 
+/// A Desktop host's observation, made while it holds the PostgreSQL start
+/// lock of the published head's Local generation and before its own spawn,
+/// that the generation's data directory has no opener. Host DATA: it only
+/// lets registration settle crashed Local enrollments of that generation.
+pub struct LocalPostgresQuiescence {
+    pub(super) generation_root: RecoveryFileIdentity,
+}
+
+impl LocalPostgresQuiescence {
+    /// `generation_root` is the held identity of the directory the start lock
+    /// and the observed data directory live in.
+    #[must_use]
+    pub fn observed(generation_root: RecoveryFileIdentity) -> Self {
+        Self { generation_root }
+    }
+}
+
 /// The actual SH and the original enrollment FD have a single strong owner.
 /// A read gate only holds Weak. There is intentionally no Clone or Drop close.
 pub struct RecoveryRuntimeOwner {
@@ -950,6 +967,7 @@ fn enqueue_enrollment(
 pub(super) fn enter_runtime(
     control: &ControlOwner,
     intent: RuntimeEntry,
+    local: Option<&LocalPostgresQuiescence>,
     deadline: Instant,
 ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
     let mut registration_effect_may_have_started = false;
@@ -1027,7 +1045,7 @@ pub(super) fn enter_runtime(
         {
             files.fill_runtime_nonce(deadline)?;
         }
-        files.verify_registration_capacity(deadline)?;
+        files.verify_registration_capacity(local, deadline)?;
         let root = files.root_identity(deadline)?;
         let original = files
             .pending_startup

@@ -6613,8 +6613,11 @@ impl ControlFiles {
         .map(|_| ())
     }
 
+    /// The registration count under ownerEX: entries whose closure is proven
+    /// retire first, so the limit bounds live and unproven runtimes only.
     pub(super) fn verify_registration_capacity(
         &mut self,
+        local: Option<&super::runtime::LocalPostgresQuiescence>,
         deadline: Instant,
     ) -> Result<(), RecoveryControlError> {
         if self.pending_owner.is_none() {
@@ -6628,6 +6631,7 @@ impl ControlFiles {
             None,
             deadline,
         )?;
+        self.retire_closed_runtimes(local, deadline)?;
         let count = self.inventory_count(
             Directory::Runtimes,
             self.limits.max_registered_runtimes,
@@ -6640,6 +6644,274 @@ impl ControlFiles {
             ));
         }
         Ok(())
+    }
+
+    /// Retire, under the held ownerEX, every runtime entry whose closure is
+    /// proven: an exact close receipt, or an enrollment whose registered
+    /// process is gone while this registration holds runtime EX, with a Local
+    /// entry also needing this host's pre-spawn PostgreSQL observation of the
+    /// same generation. A directory without an enrollment never started any
+    /// business effect and is removed. Every other entry stays and counts.
+    fn retire_closed_runtimes(
+        &mut self,
+        local: Option<&super::runtime::LocalPostgresQuiescence>,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let maximum = usize::try_from(self.limits.max_registered_runtimes)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        let reservation = maximum
+            .checked_mul(2 * std::mem::size_of::<Hex32>())
+            .and_then(|n| n.checked_add(2 * std::mem::size_of::<RestoreRuntimeReadback>()))
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.prepay(reservation as u64, 0)?;
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(maximum)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.restore_runtime_readbacks
+            .try_reserve_exact(1)
+            .map_err(|_| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.inventory_count(
+            Directory::Runtimes,
+            self.limits.max_registered_runtimes,
+            Some(&mut names),
+            deadline,
+        )?;
+        let identities = [
+            self.root_identity(deadline)?,
+            self.held_lock_identity(true, deadline)?,
+            self.held_lock_identity(false, deadline)?,
+        ];
+        let published = &self
+            .pending_startup
+            .as_ref()
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::EntryInvalid))?
+            .published;
+        let control = Hex32::parse(published.control_id())?;
+        let generation = match published.binding().local_generation() {
+            Some((id, root)) => Some((Hex32::parse(id)?, root)),
+            None => None,
+        };
+        // Only this host's observation of the head's own generation can
+        // speak for a Local entry's PostgreSQL children.
+        let local_quiet = local.is_some_and(|observed| {
+            generation.is_some_and(|(_, root)| root == observed.generation_root)
+        });
+        // A nonblocking EX on the held runtime.lock FD proves that no
+        // registered runtime is alive; busy keeps every crashed entry.
+        self.reserve_io(0)?;
+        before(deadline)?;
+        self.raw.unit = Some(
+            rustix::fs::flock(
+                self.pending_runtime.as_ref().ok_or_else(|| {
+                    RecoveryControlError::new(RecoveryControlFault::ControlInvalid)
+                })?,
+                FlockOperation::NonBlockingLockExclusive,
+            )
+            .map_err(io::Error::from),
+        );
+        self.post(deadline)?;
+        let settle = match self.raw.unit.as_ref() {
+            Some(Ok(())) => true,
+            Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.share_runtime_lock(identities[2], deadline)?;
+                false
+            }
+            _ => return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
+        };
+        if self.held_lock_identity(false, deadline)? != identities[2] {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::ControlInvalid,
+            ));
+        }
+        for nonce in names {
+            self.open_runtime_entry(nonce, deadline)?;
+            if !self.runtime_record_present("enrollment-v1", deadline)? {
+                self.remove_runtime_entry(
+                    nonce,
+                    &["receipt-v1", "enrollment-v1.pending"],
+                    deadline,
+                )?;
+                continue;
+            }
+            if self.runtime_record_present("enrollment-v1.pending", deadline)?
+                || self.runtime_record_present("receipt-v1.pending", deadline)?
+            {
+                self.runtime_work = None;
+                continue;
+            }
+            if self.runtime_record_present("receipt-v1", deadline)? {
+                let verified = self.verify_closed_runtime_entry(
+                    nonce,
+                    Some(control.as_str()),
+                    identities,
+                    deadline,
+                );
+                let readback = self.restore_runtime_readbacks.pop();
+                match verified {
+                    Ok(()) => {
+                        self.runtime_work = readback.and_then(|readback| readback.directory);
+                        self.remove_runtime_entry(
+                            nonce,
+                            &["enrollment-v1", "receipt-v1"],
+                            deadline,
+                        )?;
+                    }
+                    Err(error)
+                        if matches!(
+                            error.fault(),
+                            RecoveryControlFault::OwnerBusy | RecoveryControlFault::ControlInvalid
+                        ) =>
+                    {
+                        self.runtime_work = None;
+                    }
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            if !settle {
+                self.runtime_work = None;
+                continue;
+            }
+            let cap = self.limits.max_runtime_record_bytes;
+            let record =
+                self.read_record(Directory::RuntimeWork, "enrollment-v1", cap, deadline)?;
+            let decode = record
+                .bytes
+                .len()
+                .checked_mul(32)
+                .and_then(|n| n.checked_add(std::mem::size_of::<RestoreRuntimeEnrollment>()))
+                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+            self.prepay(decode as u64, 0)?;
+            let decoded = serde_json::from_slice::<RestoreRuntimeEnrollment>(&record.bytes);
+            self.post(deadline)?;
+            let closed = decoded.is_ok_and(|enrollment| {
+                let locks = &enrollment.root_and_lock_identities;
+                enrollment.record_type == "wrokbot-runtime-enrollment"
+                    && enrollment.version == 1
+                    && enrollment.control_id == control
+                    && enrollment.nonce == nonce
+                    && [locks.control_root, locks.admission_lock, locks.runtime_lock] == identities
+                    && match enrollment.resource_model {
+                        super::runtime::ResourceModel::Server => true,
+                        super::runtime::ResourceModel::Local => {
+                            local_quiet
+                                && match (
+                                    enrollment.business_install_binding.local_generation(),
+                                    generation,
+                                ) {
+                                    (Some((id, root)), Some((head, head_root))) => {
+                                        id == head.as_str() && root == head_root
+                                    }
+                                    _ => false,
+                                }
+                        }
+                    }
+            });
+            if closed {
+                self.remove_runtime_entry(nonce, &["enrollment-v1"], deadline)?;
+            } else {
+                self.runtime_work = None;
+            }
+        }
+        if settle {
+            self.share_runtime_lock(identities[2], deadline)?;
+        }
+        Ok(())
+    }
+
+    /// Return the held runtime.lock FD to SH and check it is still the named lock.
+    fn share_runtime_lock(
+        &mut self,
+        runtime: RecoveryFileIdentity,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.reserve_io(0)?;
+        before(deadline)?;
+        self.raw.unit = Some(
+            rustix::fs::flock(
+                self.pending_runtime.as_ref().ok_or_else(|| {
+                    RecoveryControlError::new(RecoveryControlFault::ControlInvalid)
+                })?,
+                FlockOperation::NonBlockingLockShared,
+            )
+            .map_err(io::Error::from),
+        );
+        self.post(deadline)?;
+        if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) {
+            return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
+        }
+        if self.held_lock_identity(false, deadline)? != runtime {
+            return Err(RecoveryControlError::new(
+                RecoveryControlFault::ControlInvalid,
+            ));
+        }
+        Ok(())
+    }
+
+    fn runtime_record_present(
+        &mut self,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<bool, RecoveryControlError> {
+        self.reserve_io(0)?;
+        before(deadline)?;
+        self.raw.named = Some(rustix::fs::statat(
+            self.directory(Directory::RuntimeWork)?,
+            name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        ));
+        self.post(deadline)?;
+        match self.raw.named.as_ref() {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(rustix::io::Errno::NOENT)) => Ok(false),
+            _ => Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
+        }
+    }
+
+    /// Unlink `records` in order (an absent one is already gone), make the
+    /// entry directory durable, then remove it and make `runtimes` durable.
+    fn remove_runtime_entry(
+        &mut self,
+        nonce: Hex32,
+        records: &[&str],
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        for name in records {
+            self.reserve_io(0)?;
+            before(deadline)?;
+            self.raw.unit = Some(
+                rustix::fs::unlinkat(
+                    self.directory(Directory::RuntimeWork)?,
+                    *name,
+                    AtFlags::empty(),
+                )
+                .map_err(io::Error::from),
+            );
+            self.post(deadline)?;
+            match self.raw.unit.as_ref() {
+                Some(Ok(())) => (),
+                Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => (),
+                _ => return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure)),
+            }
+        }
+        self.sync_directory(Directory::RuntimeWork, deadline)?;
+        self.reserve_io(0)?;
+        before(deadline)?;
+        self.raw.unit = Some(
+            rustix::fs::unlinkat(
+                self.directory(Directory::Runtimes)?,
+                nonce.as_str(),
+                AtFlags::REMOVEDIR,
+            )
+            .map_err(io::Error::from),
+        );
+        self.post(deadline)?;
+        if !matches!(self.raw.unit.as_ref(), Some(Ok(()))) {
+            return Err(RecoveryControlError::new(RecoveryControlFault::IoFailure));
+        }
+        self.runtime_work = None;
+        self.sync_directory(Directory::Runtimes, deadline)
     }
 
     fn held_owner_identity(
@@ -6714,149 +6986,175 @@ impl ControlFiles {
             Some(&mut names),
             deadline,
         )?;
-        let root = self.root_identity(deadline)?;
-        let admission = self.held_lock_identity(true, deadline)?;
-        let runtime = self.held_lock_identity(false, deadline)?;
-        let cap = self.limits.max_runtime_record_bytes;
+        let identities = [
+            self.root_identity(deadline)?,
+            self.held_lock_identity(true, deadline)?,
+            self.held_lock_identity(false, deadline)?,
+        ];
         for nonce in names {
-            let index = self.restore_runtime_readbacks.len();
-            self.restore_runtime_readbacks.push(RestoreRuntimeReadback {
-                directory: None,
-                enrollment: None,
-                receipt: None,
-                decoded_enrollment: None,
-                decoded_receipt: None,
-            });
-            // The runtime directory itself, read-only, as `read_journal` opens an operation.
-            self.reserve_io(1)?;
-            self.raw.file = Some(
-                rustix::fs::openat(
-                    self.directory(Directory::Runtimes)?,
-                    nonce.as_str(),
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map(File::from)
-                .map_err(io::Error::from),
-            );
-            self.post(deadline)?;
-            let identity = self.check_opened(true, deadline)?;
-            self.named_matches(Directory::Runtimes, nonce.as_str(), identity, deadline)?;
-            self.runtime_work = Some(self.take_opened()?);
-            self.restore_runtime_readbacks[index].enrollment =
-                Some(self.read_record(Directory::RuntimeWork, "enrollment-v1", cap, deadline)?);
-            self.reserve_io(0)?;
-            before(deadline)?;
-            self.raw.named = Some(rustix::fs::statat(
-                self.directory(Directory::RuntimeWork)?,
-                "receipt-v1",
-                AtFlags::SYMLINK_NOFOLLOW,
-            ));
-            self.post(deadline)?;
-            if matches!(self.raw.named, Some(Err(rustix::io::Errno::NOENT))) {
-                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
-            }
-            self.restore_runtime_readbacks[index].receipt =
-                Some(self.read_record(Directory::RuntimeWork, "receipt-v1", cap, deadline)?);
-            let readback = &self.restore_runtime_readbacks[index];
-            let wire_bytes = readback
-                .enrollment
-                .as_ref()
-                .expect("original enrollment retained")
-                .bytes
-                .len()
-                .checked_add(
-                    readback
-                        .receipt
-                        .as_ref()
-                        .expect("original receipt retained")
-                        .bytes
-                        .len(),
-                )
-                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-            // Closed values have bounded scalar, string and vector headers;
-            // include pinned serde escape scratch before decoding either copy.
-            let decode = wire_bytes
-                .checked_mul(32)
-                .and_then(|n| n.checked_add(std::mem::size_of::<RestoreRuntimeEnrollment>()))
-                .and_then(|n| n.checked_add(std::mem::size_of::<RestoreRuntimeReceipt>() + 1024))
-                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
-            self.prepay(decode as u64, 0)?;
-            let readback = &mut self.restore_runtime_readbacks[index];
-            readback.decoded_enrollment = Some(serde_json::from_slice(
-                &readback
-                    .enrollment
-                    .as_ref()
-                    .expect("retained enrollment")
-                    .bytes,
-            ));
-            readback.decoded_receipt = Some(serde_json::from_slice(
-                &readback.receipt.as_ref().expect("retained receipt").bytes,
-            ));
-            self.post(deadline)?;
-            let readback = &self.restore_runtime_readbacks[index];
-            let enrollment = readback
-                .decoded_enrollment
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
-            let receipt = readback
-                .decoded_receipt
-                .as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
-            let owners = &enrollment.original_owner_set;
-            let observed = receipt.clock_observations[0];
-            enrollment.business_install_binding.validate(&self.limits)?;
-            if enrollment.record_type != "wrokbot-runtime-enrollment"
-                || enrollment.version != 1
-                || Some(enrollment.control_id.as_str()) != control_id
-                || enrollment.nonce != nonce
-                || enrollment.pid == 0
-                || enrollment.process_start.nanos >= 1_000_000_000
-                || enrollment.root_and_lock_identities.control_root != root
-                || enrollment.root_and_lock_identities.admission_lock != admission
-                || enrollment.root_and_lock_identities.runtime_lock != runtime
-                || enrollment.authorization_epoch.as_str()
-                    != enrollment.business_install_binding.authorization_epoch()
-                || owners.is_empty()
-                || owners.len() as u64 > self.limits.max_runtime_resource_facts
-                || owners
-                    .iter()
-                    .enumerate()
-                    .any(|(i, owner)| owners[..i].contains(owner))
-                || receipt.record_type != "wrokbot-runtime-close"
-                || receipt.version != 1
-                || !enrollment.matches(&receipt.same_identity_tuple)
-                || !super::journal::hex_matches(
-                    &Sha256::digest(
-                        &readback
-                            .enrollment
-                            .as_ref()
-                            .expect("retained enrollment")
-                            .bytes,
-                    )
-                    .into(),
-                    receipt.enrollment_digest.as_str(),
-                )
-                || observed == 0
-                || !receipt.retained_unknown_effect_refs.is_empty()
-                || receipt.original_resource_facts.len() != owners.len()
-                || owners.iter().any(|owner| {
-                    receipt
-                        .original_resource_facts
-                        .iter()
-                        .filter(|fact| fact.closed_owner(observed) == Some(*owner))
-                        .count()
-                        != 1
-                })
-            {
-                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
-            }
-            super::id(&enrollment.boot_identity, self.limits.max_id_bytes)?;
-            self.restore_runtime_readbacks[index].directory = self.runtime_work.take();
+            self.open_runtime_entry(nonce, deadline)?;
+            self.verify_closed_runtime_entry(nonce, control_id, identities, deadline)?;
         }
         self.post(deadline)
+    }
+
+    /// The runtime directory itself, read-only, as `read_journal` opens an operation.
+    fn open_runtime_entry(
+        &mut self,
+        nonce: Hex32,
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        self.reserve_io(1)?;
+        self.raw.file = Some(
+            rustix::fs::openat(
+                self.directory(Directory::Runtimes)?,
+                nonce.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(io::Error::from),
+        );
+        self.post(deadline)?;
+        let identity = self.check_opened(true, deadline)?;
+        self.named_matches(Directory::Runtimes, nonce.as_str(), identity, deadline)?;
+        self.runtime_work = Some(self.take_opened()?);
+        Ok(())
+    }
+
+    /// The one check that an open runtime entry's immutable enrollment has its
+    /// exact original close receipt; the restore claim and the registration
+    /// retirement both use it. Absence is Busy, never closure. The readback,
+    /// with the entry directory, stays last in `restore_runtime_readbacks`.
+    fn verify_closed_runtime_entry(
+        &mut self,
+        nonce: Hex32,
+        control_id: Option<&str>,
+        [root, admission, runtime]: [RecoveryFileIdentity; 3],
+        deadline: Instant,
+    ) -> Result<(), RecoveryControlError> {
+        let cap = self.limits.max_runtime_record_bytes;
+        let index = self.restore_runtime_readbacks.len();
+        self.restore_runtime_readbacks.push(RestoreRuntimeReadback {
+            directory: None,
+            enrollment: None,
+            receipt: None,
+            decoded_enrollment: None,
+            decoded_receipt: None,
+        });
+        self.restore_runtime_readbacks[index].enrollment =
+            Some(self.read_record(Directory::RuntimeWork, "enrollment-v1", cap, deadline)?);
+        self.reserve_io(0)?;
+        before(deadline)?;
+        self.raw.named = Some(rustix::fs::statat(
+            self.directory(Directory::RuntimeWork)?,
+            "receipt-v1",
+            AtFlags::SYMLINK_NOFOLLOW,
+        ));
+        self.post(deadline)?;
+        if matches!(self.raw.named, Some(Err(rustix::io::Errno::NOENT))) {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+        }
+        self.restore_runtime_readbacks[index].receipt =
+            Some(self.read_record(Directory::RuntimeWork, "receipt-v1", cap, deadline)?);
+        let readback = &self.restore_runtime_readbacks[index];
+        let wire_bytes = readback
+            .enrollment
+            .as_ref()
+            .expect("original enrollment retained")
+            .bytes
+            .len()
+            .checked_add(
+                readback
+                    .receipt
+                    .as_ref()
+                    .expect("original receipt retained")
+                    .bytes
+                    .len(),
+            )
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        // Closed values have bounded scalar, string and vector headers;
+        // include pinned serde escape scratch before decoding either copy.
+        let decode = wire_bytes
+            .checked_mul(32)
+            .and_then(|n| n.checked_add(std::mem::size_of::<RestoreRuntimeEnrollment>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<RestoreRuntimeReceipt>() + 1024))
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::CapacityExceeded))?;
+        self.prepay(decode as u64, 0)?;
+        let readback = &mut self.restore_runtime_readbacks[index];
+        readback.decoded_enrollment = Some(serde_json::from_slice(
+            &readback
+                .enrollment
+                .as_ref()
+                .expect("retained enrollment")
+                .bytes,
+        ));
+        readback.decoded_receipt = Some(serde_json::from_slice(
+            &readback.receipt.as_ref().expect("retained receipt").bytes,
+        ));
+        self.post(deadline)?;
+        let readback = &self.restore_runtime_readbacks[index];
+        let enrollment = readback
+            .decoded_enrollment
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
+        let receipt = readback
+            .decoded_receipt
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
+        let owners = &enrollment.original_owner_set;
+        let observed = receipt.clock_observations[0];
+        enrollment.business_install_binding.validate(&self.limits)?;
+        if enrollment.record_type != "wrokbot-runtime-enrollment"
+            || enrollment.version != 1
+            || Some(enrollment.control_id.as_str()) != control_id
+            || enrollment.nonce != nonce
+            || enrollment.pid == 0
+            || enrollment.process_start.nanos >= 1_000_000_000
+            || enrollment.root_and_lock_identities.control_root != root
+            || enrollment.root_and_lock_identities.admission_lock != admission
+            || enrollment.root_and_lock_identities.runtime_lock != runtime
+            || enrollment.authorization_epoch.as_str()
+                != enrollment.business_install_binding.authorization_epoch()
+            || owners.is_empty()
+            || owners.len() as u64 > self.limits.max_runtime_resource_facts
+            || owners
+                .iter()
+                .enumerate()
+                .any(|(i, owner)| owners[..i].contains(owner))
+            || receipt.record_type != "wrokbot-runtime-close"
+            || receipt.version != 1
+            || !enrollment.matches(&receipt.same_identity_tuple)
+            || !super::journal::hex_matches(
+                &Sha256::digest(
+                    &readback
+                        .enrollment
+                        .as_ref()
+                        .expect("retained enrollment")
+                        .bytes,
+                )
+                .into(),
+                receipt.enrollment_digest.as_str(),
+            )
+            || observed == 0
+            || !receipt.retained_unknown_effect_refs.is_empty()
+            || receipt.original_resource_facts.len() != owners.len()
+            || owners.iter().any(|owner| {
+                receipt
+                    .original_resource_facts
+                    .iter()
+                    .filter(|fact| fact.closed_owner(observed) == Some(*owner))
+                    .count()
+                    != 1
+            })
+        {
+            return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+        }
+        super::id(&enrollment.boot_identity, self.limits.max_id_bytes)?;
+        self.restore_runtime_readbacks[index].directory = self.runtime_work.take();
+        Ok(())
     }
 
     fn open_restore_selection(
@@ -8073,7 +8371,7 @@ pub(super) fn enter_current_reconfirmation(
         uuid::Uuid::from_bytes(super::hex_array(current.request_id.as_str())),
     );
     let convergence = intent.convergence_deadline();
-    let runtime = super::ordinary::enroll(owner, published, &intent)?;
+    let runtime = super::ordinary::enroll(owner, published, &intent, None)?;
     Ok((runtime, sql, convergence))
 }
 
@@ -8204,8 +8502,8 @@ pub(super) async fn verify_local_binding_before(
     Ok(())
 }
 
-/// Connect the bootstrap Pool for this Server site and keep it, with its first
-/// client, in the control owner for the runtime read gate.
+/// Connect the bootstrap Pool for this Server site and keep it in the control
+/// owner for the runtime read gate.
 #[cfg(feature = "server-runtime")]
 pub(super) async fn connect_server_before(
     owner: &ControlOwner,

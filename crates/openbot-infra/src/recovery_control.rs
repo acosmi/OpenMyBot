@@ -46,8 +46,9 @@ pub use runtime::AuthorizationPurpose;
 pub use runtime::LocalSubjectReconfirmation;
 pub(crate) use runtime::RecoveryWorkerLease;
 pub use runtime::{
-    PassiveObjectKind, RecoveryReadGate, RecoveryRuntimeOwner, RuntimeCloseFact,
-    RuntimeCloseReceipt, RuntimeCloseResources, RuntimeOwner, RuntimePgAck, RuntimeTaskOutcome,
+    LocalPostgresQuiescence, PassiveObjectKind, RecoveryReadGate, RecoveryRuntimeOwner,
+    RuntimeCloseFact, RuntimeCloseReceipt, RuntimeCloseResources, RuntimeOwner, RuntimePgAck,
+    RuntimeTaskOutcome,
 };
 
 /// Redacted closed failure class; original IO stays with its original owner.
@@ -1170,7 +1171,7 @@ impl RecoveryControl {
                     effect,
                 )
                 .await?;
-                let owner = ordinary::enroll(&self.shared, published, &intent)?;
+                let owner = ordinary::enroll(&self.shared, published, &intent, None)?;
                 return Ok((pool, owner));
             }
             Err(error) if error.fault() == RecoveryControlFault::InitializationRequired => {
@@ -1224,6 +1225,14 @@ impl RecoveryControl {
     /// Shared-lock ordinary startup: a published head at the latest native
     /// version enrolls this runtime; otherwise `InitializationRequired`, with
     /// the intent handed back where the exclusive writer is the next step.
+    ///
+    /// Before registration, under the held SH, `observe` receives the head's
+    /// restored generation (`None` for the installation's own data
+    /// directory). The host takes that generation's PostgreSQL start lock and
+    /// observes its data directory before any spawn; its observation lets
+    /// registration settle crashed Local enrollments of the same generation.
+    /// A refusal from `observe` (the host keeps its own failure) releases the
+    /// SH, registers nothing and is `OwnerBusy`.
     #[cfg(feature = "desktop-local")]
     pub fn open_local_before(
         &self,
@@ -1232,6 +1241,9 @@ impl RecoveryControl {
         services: [&str; 2],
         bounds: OrdinaryStartupBounds,
         owners: &[RuntimeOwner],
+        observe: impl FnOnce(
+            Option<&crate::auth::single_user::desktop_local::RestoredLocalSite>,
+        ) -> Result<Option<LocalPostgresQuiescence>, ()>,
     ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
         let result = (|| {
             let intent =
@@ -1239,7 +1251,28 @@ impl RecoveryControl {
             let admission = intent.admission_deadline();
             let (published, intent) =
                 ordinary::shared_local_head(&self.shared, intent, admission, creator)?;
-            ordinary::enroll(&self.shared, published, &intent)
+            let restored = match published.restore_cohort() {
+                Some(_) => {
+                    let mut files = entry::lock(&self.shared)?;
+                    match files.restored_local_site_before(
+                        &published,
+                        creator.app_data_root(),
+                        admission,
+                    ) {
+                        Ok(site) => Some(site),
+                        Err(error) => {
+                            files.latch(error.fault());
+                            return Err(error);
+                        }
+                    }
+                }
+                None => None,
+            };
+            let Ok(local) = observe(restored.as_ref()) else {
+                entry::lock(&self.shared)?.release_registration_attempt();
+                return Err(RecoveryControlError::new(RecoveryControlFault::OwnerBusy));
+            };
+            ordinary::enroll(&self.shared, published, &intent, local.as_ref())
         })();
         result.map_err(|error| error.retain(&self.shared))
     }
@@ -2941,6 +2974,7 @@ pub(crate) mod tests {
                 )
                 .unwrap(),
                 &LOCAL_OWNERS,
+                |_| Ok(None),
             )
         }
 
@@ -3382,6 +3416,338 @@ pub(crate) mod tests {
                 .exists(),
             "no restore operation was claimed"
         );
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn runtime_entries(fixture: &RestoreEntryFixture) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(fixture.control_root().join("runtimes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    /// A Local start whose host observed the head's own generation before spawning.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn open_local_observed(
+        fixture: &RestoreEntryFixture,
+        control: &super::RecoveryControl,
+        generation_root: RecoveryFileIdentity,
+    ) -> Result<super::RecoveryRuntimeOwner, super::RecoveryControlError> {
+        let store = crate::auth::single_user::desktop_local::DesktopLocalAuthorityStore::new(
+            crate::auth::single_user::desktop_local::CurrentOsUserAppDataRoot::from_current_os_user_app_data(
+                fixture.directory.join("old-app"),
+            )
+            .unwrap(),
+        );
+        control.open_local_before(
+            &store,
+            [0x11; 32],
+            ["test.vault", "test.postgres"],
+            serde_json::from_value(
+                json!({"effectNs": 30_000_000_000u64, "convergenceNs": 30_000_000_000u64}),
+            )
+            .unwrap(),
+            &LOCAL_OWNERS,
+            |restored| {
+                assert!(
+                    restored.is_none(),
+                    "an ordinary head names no restored site"
+                );
+                Ok(Some(super::LocalPostgresQuiescence::observed(
+                    generation_root,
+                )))
+            },
+        )
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    async fn t046_60_receipted_runtimes_retire_before_the_capacity_count() {
+        let mut fixture = RestoreEntryFixture::new();
+        fixture.limits.max_registered_runtimes = 2;
+        let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_active(
+            &fixture,
+            &writer,
+            crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+        );
+        drop(writer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // N + 2 starts at capacity N: each registration first retires the
+        // previous runtime's receipted entry.
+        for _ in 0..4 {
+            let control = super::RecoveryControl::open(fixture.config()).unwrap();
+            let mut runtime = fixture.open_local(&control).unwrap();
+            assert_eq!(runtime_entries(&fixture).len(), 1, "only the live entry");
+            runtime
+                .close_before(never_started(), deadline)
+                .await
+                .unwrap();
+            drop(runtime);
+            drop(control);
+            assert_eq!(runtime_records(&fixture, "receipt-v1"), 1);
+        }
+        let (mut control, entry) = fixture.open();
+        control
+            .claim_restore(entry, fixture.profile.clone())
+            .expect("the last receipt still releases the claim");
+        drop(control);
+        assert_eq!(
+            std::fs::read_dir(fixture.control_root().join("operations"))
+                .unwrap()
+                .count(),
+            2,
+            "operations are never retired"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    async fn t046_61_tampered_receipts_stay_and_remnant_directories_are_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = RestoreEntryFixture::new();
+        let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_active(
+            &fixture,
+            &writer,
+            crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+        );
+        drop(writer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut closed = Vec::new();
+        for _ in 0..2 {
+            let control = super::RecoveryControl::open(fixture.config()).unwrap();
+            let mut runtime = fixture.open_local(&control).unwrap();
+            let entry = runtime_entries(&fixture)
+                .into_iter()
+                .find(|entry| !closed.contains(entry))
+                .unwrap();
+            runtime
+                .close_before(never_started(), deadline)
+                .await
+                .unwrap();
+            drop(runtime);
+            drop(control);
+            closed.push(entry);
+            // Keep the first entry from the next registration's retirement.
+            if closed.len() == 1 {
+                let receipt = closed[0].join("receipt-v1");
+                let mut value: Value =
+                    serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+                value["clockObservations"] = json!([0]);
+                std::fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+        }
+        let tampered = closed[0].clone();
+        // An interrupted close leaves its pending receipt beside the enrollment.
+        let interrupted = closed[1].with_file_name("abcdefabcdefabcdefabcdefabcde001");
+        let remnants = [
+            ("abcdefabcdefabcdefabcdefabcde002", None),
+            ("abcdefabcdefabcdefabcdefabcde003", Some("receipt-v1")),
+            (
+                "abcdefabcdefabcdefabcdefabcde004",
+                Some("enrollment-v1.pending"),
+            ),
+        ];
+        for (name, record) in remnants
+            .iter()
+            .map(|(name, record)| (*name, *record))
+            .chain([("abcdefabcdefabcdefabcdefabcde001", Some("enrollment-v1"))])
+        {
+            let directory = closed[1].with_file_name(name);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if let Some(record) = record {
+                std::fs::copy(tampered.join("receipt-v1"), directory.join(record)).unwrap();
+                std::fs::set_permissions(
+                    directory.join(record),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        }
+        std::fs::copy(
+            tampered.join("enrollment-v1"),
+            interrupted.join("receipt-v1.pending"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            interrupted.join("receipt-v1.pending"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let runtime = fixture.open_local(&control).unwrap();
+        assert!(!closed[1].exists(), "the intact receipt retired");
+        for (name, _) in remnants {
+            assert!(!closed[1].with_file_name(name).exists(), "{name} removed");
+        }
+        assert!(
+            tampered.join("receipt-v1").exists(),
+            "tampered receipt kept"
+        );
+        assert!(interrupted.join("receipt-v1.pending").exists());
+        assert_eq!(runtime_entries(&fixture).len(), 3);
+        drop(runtime);
+        drop(control);
+        let (mut control, entry) = fixture.open();
+        assert_eq!(
+            control
+                .claim_restore(entry, fixture.profile.clone())
+                .err()
+                .map(|error| error.fault()),
+            Some(RecoveryControlFault::OwnerBusy)
+        );
+    }
+
+    /// The registering process of t046_62: it enrolls under the parent's
+    /// fixture and stays alive until the parent kills it. Without the
+    /// parent's variables it does nothing.
+    #[test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn t046_62_child_registers_and_waits() {
+        use std::io::Write;
+        let Some(directory) = std::env::var_os("OPENBOT_T046_62_FIXTURE") else {
+            return;
+        };
+        let mut fixture = std::mem::ManuallyDrop::new(RestoreEntryFixture::new());
+        std::fs::remove_dir_all(&fixture.directory).unwrap();
+        fixture.directory = directory.into();
+        fixture.limits.max_registered_runtimes = 3;
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let _runtime = match std::env::var("OPENBOT_T046_62_OBSERVED").unwrap().as_str() {
+            "none" => fixture.open_local(&control).unwrap(),
+            observed => {
+                open_local_observed(&fixture, &control, serde_json::from_str(observed).unwrap())
+                    .unwrap()
+            }
+        };
+        // libtest may print its own progress on the same line first.
+        println!("t046-62-registered");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(600));
+    }
+
+    /// A real runtime process registered under `fixture`; kill -9 is its crash.
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn registered_child(
+        fixture: &RestoreEntryFixture,
+        observed: Option<RecoveryFileIdentity>,
+    ) -> std::process::Child {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "recovery_control::tests::t046_62_child_registers_and_waits",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OPENBOT_T046_62_FIXTURE", &fixture.directory)
+            .env(
+                "OPENBOT_T046_62_OBSERVED",
+                observed.map_or("none".to_owned(), |root| {
+                    serde_json::to_string(&root).unwrap()
+                }),
+            )
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(
+            lines.any(|line| line.unwrap().ends_with("t046-62-registered")),
+            "the child enrolled"
+        );
+        child
+    }
+
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    fn crash(mut child: std::process::Child) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    async fn t046_62_crashed_local_enrollments_settle_only_with_the_same_generation_observed() {
+        let mut fixture = RestoreEntryFixture::new();
+        fixture.limits.max_registered_runtimes = 3;
+        let writer = super::RecoveryControl::open(fixture.config()).unwrap();
+        publish_active(
+            &fixture,
+            &writer,
+            crate::db::native::NATIVE_LATEST_VERSION.unsigned_abs(),
+        );
+        drop(writer);
+        let generation = fixture.site_root();
+        let other = RecoveryFileIdentity {
+            inode: generation.inode + 1,
+            ..generation
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // Three runtimes killed without a close: no observation, then another
+        // generation's observation, settle nothing.
+        crash(registered_child(&fixture, None));
+        crash(registered_child(&fixture, None));
+        crash(registered_child(&fixture, Some(other)));
+        assert_eq!(runtime_entries(&fixture).len(), 3);
+        let (mut claim, entry) = fixture.open();
+        assert_eq!(
+            claim
+                .claim_restore(entry, fixture.profile.clone())
+                .err()
+                .map(|error| error.fault()),
+            Some(RecoveryControlFault::OwnerBusy)
+        );
+        drop(claim);
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        assert_eq!(
+            fixture
+                .open_local(&control)
+                .err()
+                .map(|error| error.fault()),
+            Some(RecoveryControlFault::CapacityExceeded),
+            "unsettled crashes count"
+        );
+        drop(control);
+        // The same generation's observation settles all of them.
+        let first_control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let mut first = open_local_observed(&fixture, &first_control, generation).unwrap();
+        assert_eq!(runtime_entries(&fixture).len(), 1, "every crash settled");
+        // While registered runtimes are alive their SH denies EX: a crashed
+        // entry stays even with the matching observation.
+        let live = registered_child(&fixture, Some(generation));
+        crash(registered_child(&fixture, Some(generation)));
+        assert_eq!(runtime_entries(&fixture).len(), 3);
+        first.close_before(never_started(), deadline).await.unwrap();
+        drop(first);
+        drop(first_control);
+        let second_control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let mut second = open_local_observed(&fixture, &second_control, generation).unwrap();
+        assert_eq!(
+            runtime_entries(&fixture).len(),
+            3,
+            "the receipt retired; the live child keeps the crashed entry"
+        );
+        second
+            .close_before(never_started(), deadline)
+            .await
+            .unwrap();
+        drop(second);
+        drop(second_control);
+        crash(live);
+        let control = super::RecoveryControl::open(fixture.config()).unwrap();
+        let mut runtime = open_local_observed(&fixture, &control, generation).unwrap();
+        assert_eq!(runtime_entries(&fixture).len(), 1);
+        runtime
+            .close_before(never_started(), deadline)
+            .await
+            .unwrap();
+        drop(runtime);
+        drop(control);
+        let (mut control, entry) = fixture.open();
+        control
+            .claim_restore(entry, fixture.profile.clone())
+            .expect("settled and receipted entries release the claim");
     }
 
     #[tokio::test]

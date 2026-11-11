@@ -237,7 +237,7 @@ impl CurrentFixture {
         let control = RecoveryControl::open(RecoveryControlConfig::local(app.clone(), limits).unwrap()).unwrap();
         let mut runtime = control.open_local_before(&DesktopLocalAuthorityStore::new(app.clone()),[0x11;32],["test.vault","test.postgres"],
             serde_json::from_value(json!({"effectNs":120000000000u64,"convergenceNs":30000000000u64})).unwrap(),
-            &[RuntimeOwner::PostgresSidecar,RuntimeOwner::SqlDriver,RuntimeOwner::ApplicationAssembly,RuntimeOwner::DesktopAgentRelay,RuntimeOwner::DesktopAgent]).unwrap();
+            &[RuntimeOwner::PostgresSidecar,RuntimeOwner::SqlDriver,RuntimeOwner::ApplicationAssembly,RuntimeOwner::DesktopAgentRelay,RuntimeOwner::DesktopAgent],|_| Ok(None)).unwrap();
         let site = runtime.restored_local_site(&app).unwrap().unwrap();
         let port = connect_port(port).await;
         let admin = desktop_local::connect_for_attestation(port,SecretBytes::new(password.into_bytes())).await.unwrap();

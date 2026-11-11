@@ -2728,6 +2728,7 @@ pub(crate) async fn execute_local_legacy_adoption(
         &postgres_key_store_service,
         None,
         owner.session.as_ref(),
+        None,
     )
     .await;
     let sidecar = match started {
@@ -2889,6 +2890,10 @@ pub(crate) async fn prepare_desktop_local_runtime(
 ) -> Result<PreparedDesktopLocalRuntime, DesktopLocalRuntimeError> {
     let authority_store = DesktopLocalAuthorityStore::new(app_data_root.clone());
 
+    // The ordinary head's start lock, taken with its pre-spawn observation
+    // before registration and held until the sidecar start.
+    #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+    let mut held_start = None;
     #[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
     let config = {
         use openbot_infra::recovery_control::{
@@ -2906,7 +2911,10 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 app_data_root.clone(),
                 bootstrap.host_limits.clone(),
             )?)?;
-            match control.open_local_before(
+            // An opener of the generation's data directory, such as an
+            // orphaned postmaster, refuses the start before registration.
+            let mut refused = None;
+            let opened = control.open_local_before(
                 &authority_store,
                 bootstrap.release_digest,
                 [
@@ -2921,7 +2929,26 @@ pub(crate) async fn prepare_desktop_local_runtime(
                     RuntimeOwner::DesktopAgentRelay,
                     RuntimeOwner::DesktopAgent,
                 ],
-            ) {
+                |restored| match crate::postgres_sidecar::hold_local_generation(
+                    app_data_root.as_path(),
+                    &authority_store,
+                    restored,
+                ) {
+                    Ok(Some((held, observed))) => {
+                        held_start = Some(held);
+                        Ok(observed)
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => {
+                        refused = Some(error);
+                        Err(())
+                    }
+                },
+            );
+            if let Some(error) = refused {
+                return Err(map_sidecar_error(error));
+            }
+            match opened {
                 Ok(runtime) => config.with_recovery_runtime(runtime),
                 Err(error) if error.fault() == RecoveryControlFault::InitializationRequired => {
                     let intent = error
@@ -3021,6 +3048,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                 secret_store.as_ref(),
                 &postgres_key_store_service,
                 &vault_key_store_service,
+                held_start.take(),
             ))
             .await
             .map_err(|(failure, sidecar, sql)| (Some(failure), sidecar, sql))
@@ -3399,6 +3427,7 @@ pub(crate) async fn prepare_desktop_local_runtime(
                         &postgres_key_store_service,
                         capture_limits,
                         None,
+                        held_start.take(),
                     )
                     .await;
                 }

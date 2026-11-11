@@ -416,9 +416,10 @@ pub(super) fn enroll(
     control: &ControlOwner,
     published: PublishedActivation,
     intent: &VerifiedOrdinaryStartupIntent,
+    local: Option<&runtime::LocalPostgresQuiescence>,
 ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
     let entry = entry::lock(control)?.runtime_entry(published, intent)?;
-    runtime::enter_runtime(control, entry, intent.effect)
+    runtime::enter_runtime(control, entry, local, intent.effect)
 }
 
 /// `RecoveryControl::enter_runtime_before`: the shared head branch, then the
@@ -429,7 +430,7 @@ pub(super) fn enter_runtime(
     deadline: Instant,
 ) -> Result<RecoveryRuntimeOwner, RecoveryControlError> {
     let (published, intent) = shared_head(control, intent, deadline)?;
-    enroll(control, published, &intent)
+    enroll(control, published, &intent, None)
 }
 
 #[cfg(feature = "desktop-local")]
@@ -2014,7 +2015,7 @@ impl OrdinaryInitializationSession {
                 self.intent.expects(published.binding())?;
                 files.runtime_entry(published, &self.intent)?
             };
-            runtime::enter_runtime(&self.control, entry, effect)
+            runtime::enter_runtime(&self.control, entry, None, effect)
         })();
         result.map_err(|mut error: RecoveryControlError| {
             error.retained_ordinary = Some(Box::new(self));
