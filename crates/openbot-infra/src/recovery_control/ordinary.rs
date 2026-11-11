@@ -247,11 +247,12 @@ impl VerifiedOrdinaryStartupIntent {
     /// A published binding matches the sealed site expectation.
     pub(super) fn expects(&self, binding: &ActivationBinding) -> Result<(), RecoveryControlError> {
         match &self.site {
+            // The bound serviceConfig is activation evidence only; an
+            // ordinary start does not compare the configuration file.
             SiteExpectation::Server {
                 dataset,
                 ids,
                 database,
-                service_config,
                 ..
             } => {
                 let actual = binding.ordinary_server()?;
@@ -267,8 +268,7 @@ impl VerifiedOrdinaryStartupIntent {
                     ids[1].as_str(),
                     ids[2].as_str(),
                     ids[3].as_str(),
-                ] || actual.service_config != service_config
-                    || !database.matches(actual.server_database)
+                ] || !database.matches(actual.server_database)
                 {
                     return Err(fault(RecoveryControlFault::EntryInvalid));
                 }
@@ -384,28 +384,21 @@ fn shared_head_inner(
         expected.root = Some(files.select_restored_local_root_before(&published, admission)?);
         expected.component = plan.entry_component.clone();
     }
-    // Server adoption needs the operator's migrated database and its
-    // legacy_adoption intent; that intent edits the
-    // service configuration, which the republished head binds instead.
-    let rebound = match &intent.site {
-        SiteExpectation::Server { service_config, .. }
-            if below
-                && intent.source.map(|(source, _, _)| source)
-                    == Some(OrdinaryInitializationSource::LegacyAdoption {
-                        site: OrdinarySite::ServerDatabase,
-                    }) =>
-        {
-            Some(published.binding().with_service_config(service_config))
-        }
-        _ => None,
-    };
-    if let Err(error) = intent.expects(rebound.as_ref().unwrap_or(published.binding())) {
+    if let Err(error) = intent.expects(published.binding()) {
         files.release_registration_attempt();
         return Err(error);
     }
     if below {
         files.release_registration_attempt();
-        if matches!(intent.site, SiteExpectation::Server { .. }) && rebound.is_none() {
+        // Server upgrade needs the operator's migrated database and its
+        // legacy_adoption intent; the republished head rebinds the
+        // service configuration.
+        if matches!(intent.site, SiteExpectation::Server { .. })
+            && intent.source.map(|(source, _, _)| source)
+                != Some(OrdinaryInitializationSource::LegacyAdoption {
+                    site: OrdinarySite::ServerDatabase,
+                })
+        {
             return Err(initialization_required(None));
         }
         let digest = published.digest().to_owned();

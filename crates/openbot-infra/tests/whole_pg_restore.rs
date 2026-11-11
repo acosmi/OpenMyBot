@@ -462,6 +462,93 @@ mod ordinary {
         .await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires owned PostgreSQL 17.11 through OPENBOT_TEST_DATABASE_URL"]
+    async fn t046_47_server_ordinary_start_ignores_service_config_identity() {
+        owned("t046_47", |config, p| async move {
+            let site = ServerSite::new();
+            site.configure(&p, Some("fresh_init")).await?;
+            let (pool, runtime) = site.start(&config, &kek(KEK)).await.map_err(text)?;
+            pool.close();
+            drop(runtime);
+            let head = site.head().ok_or("no head")?;
+            let operations = site.operations();
+            let path = site.directory.join("config");
+            // Rewrite the configuration through a new file, so it always
+            // lands at a new inode.
+            let rewrite = |edit: &dyn Fn(&mut Value)| -> TestResult {
+                let mut value: Value =
+                    serde_json::from_slice(&std::fs::read(&path).map_err(text)?).map_err(text)?;
+                edit(&mut value);
+                let next = site.directory.join("config.next");
+                ServerSite::write_private(&next, &serde_json::to_vec(&value).map_err(text)?);
+                std::fs::rename(&next, &path).map_err(text)
+            };
+            // The steady state after activation: no startup intent.
+            rewrite(&|value| value["optionalStartupIntent"] = Value::Null)?;
+            let (pool, runtime) = site.start(&config, &kek(KEK)).await.map_err(text)?;
+            pool.close();
+            drop(runtime);
+            require(
+                site.operations() == operations,
+                "null intent: no new operation",
+            )?;
+            require(
+                site.head().as_ref() == Some(&head),
+                "null intent: same head",
+            )?;
+            // Byte-identical configuration at a new inode.
+            let inode = std::fs::metadata(&path).map_err(text)?.ino();
+            rewrite(&|_| {})?;
+            require(
+                std::fs::metadata(&path).map_err(text)?.ino() != inode,
+                "a new inode",
+            )?;
+            let (pool, runtime) = site.start(&config, &kek(KEK)).await.map_err(text)?;
+            pool.close();
+            drop(runtime);
+            require(
+                site.operations() == operations,
+                "new inode: no new operation",
+            )?;
+            require(site.head().as_ref() == Some(&head), "new inode: same head")?;
+            // The site expectations themselves are still compared.
+            let original: Value =
+                serde_json::from_slice(&std::fs::read(&path).map_err(text)?).map_err(text)?;
+            for (field, edit) in [
+                (
+                    "database oid",
+                    &(|value: &mut Value| {
+                        value["expectedServerDatabase"]["databaseOid"] = json!(
+                            value["expectedServerDatabase"]["databaseOid"]
+                                .as_u64()
+                                .unwrap()
+                                + 1
+                        );
+                    }) as &dyn Fn(&mut Value),
+                ),
+                ("target installation", &|value: &mut Value| {
+                    value["expectedInstallationBinding"]["targetInstallationId"] =
+                        json!("another-target");
+                }),
+            ] {
+                rewrite(&|value| {
+                    *value = original.clone();
+                    edit(value);
+                })?;
+                require(
+                    refused(site.start(&config, &kek(KEK)).await)?
+                        == RecoveryControlFault::EntryInvalid,
+                    field,
+                )?;
+                require(site.operations() == operations, "refusal: no new operation")?;
+                require(site.head().as_ref() == Some(&head), "refusal: same head")?;
+            }
+            Ok(())
+        })
+        .await;
+    }
+
     /// One protected value per KEK-protected column, sealed the way its
     /// consumer writes it, plus enough credential rows to cross one keyset page.
     struct Protected {
