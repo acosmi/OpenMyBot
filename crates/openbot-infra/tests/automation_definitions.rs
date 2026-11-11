@@ -1453,7 +1453,7 @@ async fn capacity_and_recovery_preserve_unknown() {
         store.reserve_sampling(&lease, 0).await.unwrap();
         let client = f.pool.get().await.unwrap();
         assert_eq!(client.execute(
-            "UPDATE public.thread_leases SET expires_at=statement_timestamp()-interval '1 second' WHERE thread_id=$1",
+            "UPDATE public.thread_leases SET expires_at=acquired_at+interval '1 microsecond' WHERE thread_id=$1",
             &[&lease.thread_id().as_str()],
         ).await.unwrap(), 1);
         drop(client);
