@@ -49,7 +49,7 @@ fn authority_constructors_remain_at_registered_production_call_sites() {
         (
             "from_verified_source",
             "crates/openbot-server/src/http/automation_ingress.rs",
-            0usize,
+            1usize,
         ),
         (
             "from_verified_grant",
@@ -68,6 +68,7 @@ fn authority_constructors_remain_at_registered_production_call_sites() {
         ),
     ];
     let mut found = BTreeMap::new();
+    let mut accept_calls = BTreeMap::new();
     for entry in fs::read_dir(root.join("crates")).unwrap() {
         let source = entry.unwrap().path().join("src");
         if !source.is_dir() {
@@ -86,6 +87,17 @@ fn authority_constructors_remain_at_registered_production_call_sites() {
                 continue;
             }
             let source = fs::read_to_string(&path).unwrap();
+            let production = production_tokens(&source);
+            // `accept` is a common method name; count it only where the ingress entry is named.
+            if production.contains(&"AutomationDeliveryEntry") {
+                let calls = production
+                    .windows(3)
+                    .filter(|tokens| *tokens == [".", "accept", "("])
+                    .count();
+                if calls > 0 {
+                    accept_calls.insert(relative.clone(), calls);
+                }
+            }
             for constructor in production_references(&source) {
                 assert!(
                     allowed
@@ -99,6 +111,14 @@ fn authority_constructors_remain_at_registered_production_call_sites() {
             }
         }
     }
+    assert_eq!(
+        accept_calls,
+        BTreeMap::from([(
+            "crates/openbot-server/src/http/automation_ingress.rs".to_owned(),
+            1usize
+        )]),
+        "AutomationDeliveryEntry::accept call sites changed"
+    );
     for (name, path, count) in allowed {
         assert_eq!(
             found
@@ -124,6 +144,13 @@ fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn production_references(source: &str) -> Vec<&str> {
+    production_tokens(source)
+        .windows(2)
+        .filter_map(|pair| (pair[0] == "::" && CONSTRUCTORS.contains(&pair[1])).then_some(pair[1]))
+        .collect()
+}
+
+fn production_tokens(source: &str) -> Vec<&str> {
     let tokens = tokens(source);
     let mut production = Vec::new();
     let mut at = 0;
@@ -147,9 +174,6 @@ fn production_references(source: &str) -> Vec<&str> {
         }
     }
     production
-        .windows(2)
-        .filter_map(|pair| (pair[0] == "::" && CONSTRUCTORS.contains(&pair[1])).then_some(pair[1]))
-        .collect()
 }
 fn after_group(tokens: &[&str], start: usize, open: &str, close: &str) -> usize {
     let mut depth = 0;
