@@ -977,7 +977,7 @@ pub(crate) async fn verify_pre_restore(client: &Client, latest: i32) -> Result<(
     let ledger = native::validate_known_prefix(client, latest).await?;
     require(ledger.latest_version() == latest)?;
     compare_registered(&observation_on(client).await?)?;
-    super::thread_history_admission_schema::verify_schema(client).await?;
+    // The admission schema is the writer graph; 0054 replaces its terminal payload body.
     if latest == native::NATIVE_0054_VERSION {
         super::thread_history_writer_schema::verify_schema(client).await
     } else {
