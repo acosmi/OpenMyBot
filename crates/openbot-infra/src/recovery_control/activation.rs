@@ -263,7 +263,6 @@ pub(super) struct OrdinaryServerBinding<'a> {
     pub(super) tenant_id: &'a str,
     pub(super) source_installation_id: &'a str,
     pub(super) target_installation_id: &'a str,
-    pub(super) service_config: &'a ServiceConfigRef,
     pub(super) server_database: &'a ServerDatabaseSite,
     pub(super) master: &'a KeyReference,
     pub(super) postgres: &'a KeyReference,
@@ -366,7 +365,6 @@ impl ActivationBinding {
                 tenant_id,
                 source_installation_id,
                 target_installation_id,
-                service_config,
                 server_database,
                 key_refs,
                 ..
@@ -376,7 +374,6 @@ impl ActivationBinding {
                 tenant_id,
                 source_installation_id,
                 target_installation_id,
-                service_config,
                 server_database,
                 master: &key_refs[0],
                 postgres: &key_refs[1],
