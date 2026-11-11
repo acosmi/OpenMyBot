@@ -1523,7 +1523,7 @@ pub(crate) mod tests {
         json!({"siteKind": "local_physical", "datasetId": "data", "deploymentId": "dep", "tenantId": "ten",
             "sourceInstallationId": "source", "targetInstallationId": "target",
             "generationId": "abcdefabcdefabcdefabcdefabcdef01", "generationRoot": file(11),
-            "pgSystemId": 7_000_000_001u64, "databaseOid": 16384, "pgMajor": 17, "nativeVersion": 54,
+            "pgSystemId": 7_000_000_001u64, "databaseOid": 16384, "pgMajor": 17, "nativeVersion": 55,
             "migrationDigest": ZERO64, "authorizationEpoch": EPOCH,
             "keyRefs": [key("historical_master"), key("postgres_scram")]})
     }
@@ -2675,7 +2675,7 @@ pub(crate) mod tests {
             "OperationIntent",
             json!({
                 "mode": "ordinary_upgrade", "priorActivationDigest": ZERO64,
-                "fromNativeVersion": 53, "toNativeVersion": 54,
+                "fromNativeVersion": 54, "toNativeVersion": 55,
                 "ordinaryStartupBounds": {"effectNs": 5, "convergenceNs": 9},
                 "originalClockRelation": clock(),
             }),

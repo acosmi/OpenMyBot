@@ -1,4 +1,4 @@
-//! Native0051 body writers on current0052, with explicit historical0051 PostgreSQL17.11 checks.
+//! Native0051 body writers on current latest, with explicit historical0051 PostgreSQL17.11 checks.
 //! Internal metadata and permanent IDs; this suite grants no current Host or ACK.
 #![cfg(feature = "server-runtime")]
 mod harness;
@@ -88,7 +88,7 @@ include!("support/thread_history_writer_schema_fixture.rs");
 #[ignore = "requires explicitly owned loopback SCRAM PostgreSQL17.11"]
 async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
     // The delivered function identity is retained; this candidate runs its compatibility
-    // assertions on current52 and explicitly proves the unchanged historical51 branch first.
+    // assertions on current latest and explicitly proves the unchanged historical51 branch first.
     for prior in [50, 51, native::NATIVE_LATEST_VERSION] {
         owned(&format!("writer51graph{prior}"),move|p,_|async move {
             initialize(&p,prior).await?;
@@ -105,7 +105,14 @@ async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
             writer_check(&c).await?;
             let rows:i64=c.query_one("SELECT count(*) FROM openbot_internal.channel_history_sources",&[]).await.map_err(|e|e.to_string())?.get(0);
             require(rows==0,"migration fabricated channel source backfill")?;
+            let terminal_definition: String = c.query_one(
+                "SELECT pg_catalog.pg_get_functiondef('openbot_internal.thread_history_terminal_payload(text,jsonb)'::regprocedure)",
+                &[],
+            ).await.map_err(|e| e.to_string())?.get(0);
+            let changed_terminal = terminal_definition.replace("{1,63}", "{1,64}");
+            require(changed_terminal != terminal_definition, "terminal payload mutation did not change the body")?;
             let faults=[
+                changed_terminal.as_str(),
                 "ALTER TABLE openbot_internal.channel_history_sources ADD COLUMN owned_unregistered text",
                 "ALTER TABLE openbot_internal.channel_history_sources ALTER COLUMN recorded_at SET DEFAULT now()",
                 "ALTER TABLE openbot_internal.channel_history_sources ALTER COLUMN source_schema DROP NOT NULL",
@@ -247,7 +254,14 @@ async fn w04_actual_chunk_remote_projection_tool_pair_admission() {
 async fn w05_closed_finish_and_terminal_replay_read_no_body() {
     owned("writer51finish",|p,config|async move{
         provision(&p).await?;
-        for(index,terminal) in [RunTerminal::Completed,RunTerminal::Failed(RunFailureCode::ProviderGenerationFailed),RunTerminal::Cancelled,RunTerminal::ReconciliationRequired(RunFailureCode::JournalCommitUnknown)].into_iter().enumerate() {
+        for (index, terminal) in [
+            RunTerminal::Completed,
+            RunTerminal::Failed(RunFailureCode::ProviderGenerationFailed),
+            RunTerminal::Cancelled,
+            RunTerminal::Failed(RunFailureCode::DelegationNotCurrent),
+            RunTerminal::Failed(RunFailureCode::AutomationBudgetExceeded),
+            RunTerminal::ReconciliationRequired(RunFailureCode::JournalCommitUnknown),
+        ].into_iter().enumerate() {
             let(req,runtime,lease)=writer_running(&p,&config,360501+index as u64,None).await?;
             runtime.append_semantic_chunk(&lease,1,RunSemanticChannel::Text,"BODY_MUST_NOT_BE_READ_WHEN_CLOSED").await.map_err(|e|e.to_string())?;
             runtime.append_semantic_chunk(&lease,2,RunSemanticChannel::Reasoning,"PRIVATE_OWNED_REASONING").await.map_err(|e|e.to_string())?;
@@ -265,6 +279,24 @@ async fn w05_closed_finish_and_terminal_replay_read_no_body() {
             let before=writer_snapshot(&p).await?;
             require(runtime.finish_run(&lease,3,terminal).await.map_err(|e|e.to_string())?.replayed,"closed exact terminal replay not accepted")?;
             require(writer_snapshot(&p).await?==before,"closed terminal replay rewrote old body or metadata")?;
+            if terminal == RunTerminal::Failed(RunFailureCode::AutomationBudgetExceeded) {
+                let mut c = p.get().await.map_err(|e| e.to_string())?;
+                let tx = c.transaction().await.map_err(|e| e.to_string())?;
+                let changed = tx.execute(
+                    "UPDATE public.runs SET error_code=$2 WHERE run_id=$1",
+                    &[&req.command.run_id.as_str(), &RunFailureCode::DelegationNotCurrent.as_str()],
+                ).await.map_err(|e| e.to_string())?;
+                require(changed == 1, "mismatch fixture did not change the finished run")?;
+                let error = tx.commit().await.err().ok_or("mismatched closed terminal committed")?;
+                require(
+                    error.as_db_error().is_some_and(|db| {
+                        db.code().code() == "55000" && db.message() == "thread_history_writer_binding_invalid"
+                    }),
+                    "closed terminal mismatch missed the deferred binding guard",
+                )?;
+                drop(c);
+                require(writer_snapshot(&p).await? == before, "mismatched terminal changed stored data")?;
+            }
             // Reconciliation remains foreground. Its isolated next case must release that
             // original occupancy without manufacturing a different lease/terminal.
         }

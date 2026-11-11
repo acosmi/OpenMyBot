@@ -1277,7 +1277,7 @@ mod physical_lineage_tests {
             include_str!("../sql/native_0050.sql"),
             include_str!("../sql/native_0051.sql"),
             include_str!("../sql/native_0052.sql"),
-            include_str!("../sql/native_0054.sql"),
+            include_str!("../sql/native_0055.sql"),
         ] {
             for (at, _) in schema.match_indices("CONSTRAINT ") {
                 let (constraint, rest) = schema[at + "CONSTRAINT ".len()..]
@@ -1321,9 +1321,9 @@ mod physical_lineage_tests {
                     .unwrap();
             }
         }
-        // Native 54 also has three unnamed column CHECKs. Recover their original
+        // Native 55 also has three unnamed column CHECKs. Recover their original
         // predicates from the SQL so this physical replacement keeps the catalog oracle.
-        let restore_schema = include_str!("../sql/native_0054.sql");
+        let restore_schema = include_str!("../sql/native_0055.sql");
         for column in ["deployment_id", "tenant_id", "encrypted_canary"] {
             let anchor = format!("    {column} text NOT NULL CHECK (");
             let predicate = restore_schema

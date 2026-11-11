@@ -93,6 +93,9 @@ pub mod approval_preferences;
     any(target_os = "macos", target_os = "linux")
 ))]
 pub mod artifact_administration;
+pub mod automation;
+#[cfg(feature = "server-runtime")]
+pub mod automation_budget;
 #[cfg(feature = "server-runtime")]
 pub(crate) mod delegation;
 #[cfg(feature = "server-runtime")]

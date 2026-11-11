@@ -289,6 +289,7 @@ async fn assembly_rejects_non_single_user_delegated_configuration() {
                 let options = Options {
                     single_user: false,
                     delegated: mode == 1,
+                    automation: false,
                     subscribe: mode == 2,
                     extensions: if mode == 3 {
                         vec![(

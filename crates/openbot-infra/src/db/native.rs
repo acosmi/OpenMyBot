@@ -194,7 +194,7 @@ pub const NATIVE_0030_NAME: &str = "native_0030_personal_model_connections";
 pub const NATIVE_0030_SQL: &str = include_str!("../../sql/native_0030.sql");
 
 /// 当前二进制认识的最新 native schema 版本。
-pub const NATIVE_LATEST_VERSION: i32 = NATIVE_0054_VERSION;
+pub const NATIVE_LATEST_VERSION: i32 = NATIVE_0055_VERSION;
 
 /// Immutable explicit custom-model run binding version.
 pub const NATIVE_0031_VERSION: i32 = 31;
@@ -355,12 +355,19 @@ pub const NATIVE_0053_NAME: &str = "native_0053_thread_pending_inputs";
 /// Exact pending-input table and FIFO index definition.
 pub const NATIVE_0053_SQL: &str = include_str!("../../sql/native_0053_thread_pending_inputs.sql");
 
-/// Append-only restore retirement and current-binding reconfirmation facts.
+/// Automation definitions, durable inputs and cumulative budgets.
 pub const NATIVE_0054_VERSION: i32 = 54;
-/// 0054 stable migration name; schema facts alone grant no restore authority.
-pub const NATIVE_0054_NAME: &str = "native_0054_restore_pg_reconfirmation";
-/// Exact additive 0054 SQL source.
-pub const NATIVE_0054_SQL: &str = include_str!("../../sql/native_0054.sql");
+/// Stable automation migration ledger identity.
+pub const NATIVE_0054_NAME: &str = "native_0054_automation";
+/// Exact automation schema and constraints.
+pub const NATIVE_0054_SQL: &str = include_str!("../../sql/native_0054_automation.sql");
+
+/// Append-only restore retirement and current-binding reconfirmation facts.
+pub const NATIVE_0055_VERSION: i32 = 55;
+/// 0055 stable migration name; schema facts alone grant no restore authority.
+pub const NATIVE_0055_NAME: &str = "native_0055_restore_pg_reconfirmation";
+/// Exact additive 0055 SQL source.
+pub const NATIVE_0055_SQL: &str = include_str!("../../sql/native_0055.sql");
 
 /// 当前二进制钉住的 native migration 数量。
 pub const NATIVE_MIGRATION_COUNT: usize = MIGRATIONS.len();
@@ -586,6 +593,11 @@ const MIGRATIONS: &[MigrationSpec] = &[
         version: NATIVE_0054_VERSION,
         name: NATIVE_0054_NAME,
         sql: NATIVE_0054_SQL,
+    },
+    MigrationSpec {
+        version: NATIVE_0055_VERSION,
+        name: NATIVE_0055_NAME,
+        sql: NATIVE_0055_SQL,
     },
 ];
 
@@ -880,10 +892,16 @@ pub fn native_0053_checksum() -> String {
     Sha256Digest::of(NATIVE_0053_SQL.as_bytes()).to_hex()
 }
 
-/// Checksum of the actual registered 0054 SQL bytes.
+/// Checksum of the exact registered automation migration bytes.
 #[must_use]
 pub fn native_0054_checksum() -> String {
     Sha256Digest::of(NATIVE_0054_SQL.as_bytes()).to_hex()
+}
+
+/// Checksum of the actual registered 0055 SQL bytes.
+#[must_use]
+pub fn native_0055_checksum() -> String {
+    Sha256Digest::of(NATIVE_0055_SQL.as_bytes()).to_hex()
 }
 
 /// SHA-256 of the registered sandbox editing migration.
@@ -1274,6 +1292,9 @@ pub(crate) async fn apply_through_in_transaction(
         validate_custom_model_v2_layout_in_transaction(transaction, NATIVE_0053_VERSION, 41)
             .await?;
     } else if max_version == NATIVE_0054_VERSION {
+        validate_custom_model_v2_layout_in_transaction(transaction, NATIVE_0054_VERSION, 42)
+            .await?;
+    } else if max_version == NATIVE_0055_VERSION {
         validate_custom_model_v2_in_transaction(transaction).await?;
     }
     Ok(if applied == 0 {
@@ -1346,8 +1367,9 @@ pub(crate) async fn validate_custom_model_v2_in_transaction(
 }
 
 /// One ledger walk for every observer: the strict prior layouts (latest 52 with
-/// 40 rows, latest 53 with 41 rows) and the current layout (latest 54, 42 rows).
-/// Only the current layout also carries the additive restore catalog.
+/// 40 rows, latest 53 with 41 rows, latest 54 with 42 rows) and the current layout
+/// (latest 55, 43 rows). Layouts from 54 on carry the automation catalog and its
+/// terminal payload body; only the current layout also carries the additive restore catalog.
 pub(crate) async fn validate_custom_model_v2_layout_in_transaction(
     tx: &tokio_postgres::Transaction<'_>,
     latest: i32,
@@ -1400,13 +1422,18 @@ pub(crate) async fn validate_custom_model_v2_layout_in_transaction(
     super::custom_model_v2_schema::verify_in_transaction(tx).await?;
     super::gateway_authorization_schema::verify_in_transaction(tx).await?;
     super::thread_origin_schema::verify_in_transaction(tx).await?;
-    super::thread_history_writer_schema::verify_in_transaction(tx).await?;
+    if latest >= NATIVE_0054_VERSION {
+        super::thread_history_writer_schema::verify_in_transaction(tx).await?;
+        crate::automation::schema::verify(tx).await?;
+    } else {
+        super::thread_history_writer_schema::verify_legacy0052(tx).await?;
+    }
     if latest == NATIVE_LATEST_VERSION {
         super::restore_reconfirmation_schema::verify_additive_in_transaction(tx).await?;
     }
     Ok(())
 }
-/// Exact current 0013--0054 ledger, journal, origin, writer and additive restore schemas.
+/// Exact current 0013--0055 ledger, journal, origin, writer, automation and additive restore schemas.
 /// This observer never checks out a client or migrates, repairs or closes a transaction.
 #[cfg(feature = "server-runtime")]
 pub(crate) async fn validate_gateway_authorization_journal_in_transaction(
@@ -1425,7 +1452,7 @@ pub(crate) async fn validate_gateway_authorization_journal_in_transaction(
         )
         .await
         .map_err(|source| InfraError::query("核验原事务授权 journal native 前缀", source))?;
-    if NATIVE_MIGRATION_COUNT != 42 || rows.len() != NATIVE_MIGRATION_COUNT {
+    if NATIVE_MIGRATION_COUNT != 43 || rows.len() != NATIVE_MIGRATION_COUNT {
         return Err(invalid());
     }
     for (index, row) in rows.iter().enumerate() {
@@ -1450,12 +1477,13 @@ pub(crate) async fn validate_gateway_authorization_journal_in_transaction(
             return Err(invalid());
         }
     }
-    if MIGRATIONS.last().map(|migration| migration.version) != Some(NATIVE_0054_VERSION) {
+    if MIGRATIONS.last().map(|migration| migration.version) != Some(NATIVE_0055_VERSION) {
         return Err(invalid());
     }
     super::gateway_authorization_schema::verify_in_transaction(tx).await?;
     super::thread_origin_schema::verify_in_transaction(tx).await?;
     super::thread_history_writer_schema::verify_in_transaction(tx).await?;
+    crate::automation::schema::verify(tx).await?;
     super::restore_reconfirmation_schema::verify_additive_in_transaction(tx).await
 }
 
@@ -1645,7 +1673,7 @@ pub(crate) async fn validate_thread_origin_in_transaction(
         )
         .await
         .map_err(|source| InfraError::query("核验原事务历史来源 native 前缀", source))?;
-    if NATIVE_MIGRATION_COUNT != 42 || rows.len() != NATIVE_MIGRATION_COUNT {
+    if NATIVE_MIGRATION_COUNT != 43 || rows.len() != NATIVE_MIGRATION_COUNT {
         return Err(invalid());
     }
     for (index, row) in rows.iter().enumerate() {
@@ -1670,11 +1698,12 @@ pub(crate) async fn validate_thread_origin_in_transaction(
             return Err(invalid());
         }
     }
-    if MIGRATIONS.last().map(|migration| migration.version) != Some(NATIVE_0054_VERSION) {
+    if MIGRATIONS.last().map(|migration| migration.version) != Some(NATIVE_0055_VERSION) {
         return Err(invalid());
     }
     super::thread_origin_schema::verify_in_transaction(tx).await?;
     super::thread_history_writer_schema::verify_in_transaction(tx).await?;
+    crate::automation::schema::verify(tx).await?;
     super::restore_reconfirmation_schema::verify_additive_in_transaction(tx).await
 }
 
@@ -1824,6 +1853,7 @@ mod tests {
             "dd3033fd6fb82953088844a2649c83ab60bbb163318f02dbaac42fc2b25a921b",
         );
         for line in statement_lines(NATIVE_0013_SQL)
+            .chain(statement_lines(NATIVE_0054_SQL))
             .chain(statement_lines(NATIVE_0014_SQL))
             .chain(statement_lines(NATIVE_0015_SQL))
             .chain(statement_lines(NATIVE_0016_SQL))
@@ -2148,7 +2178,7 @@ mod tests {
         assert_ne!(native_0035_checksum(), native_0036_checksum());
         assert_eq!(native_0037_checksum().len(), 64);
         assert_ne!(native_0036_checksum(), native_0037_checksum());
-        assert_eq!(MIGRATIONS.len(), 42);
+        assert_eq!(MIGRATIONS.len(), 43);
         assert_eq!(native_0038_checksum().len(), 64);
         assert_ne!(native_0037_checksum(), native_0038_checksum());
         assert_eq!(native_0039_checksum().len(), 64);
@@ -2194,12 +2224,15 @@ mod tests {
         assert_eq!(MIGRATIONS[40].version, NATIVE_0053_VERSION);
         assert_eq!(native_0054_checksum().len(), 64);
         assert_ne!(native_0053_checksum(), native_0054_checksum());
+        assert_eq!(MIGRATIONS[41].version, NATIVE_0054_VERSION);
+        assert_eq!(native_0055_checksum().len(), 64);
+        assert_ne!(native_0054_checksum(), native_0055_checksum());
         assert_eq!(
-            native_0054_checksum(),
-            "26d8c0afb492881f5617e2a1071d04b2f416ca3e6639662c300471a7a7d99f00",
+            native_0055_checksum(),
+            "c5f2fcc58b50218c087fbf3860ca9dd6e937ddd4439a70ea57e3fb1952b10273",
         );
-        assert_eq!(NATIVE_MIGRATION_COUNT, 42);
-        assert_eq!(MIGRATIONS[41].version, NATIVE_LATEST_VERSION);
+        assert_eq!(NATIVE_MIGRATION_COUNT, 43);
+        assert_eq!(MIGRATIONS[42].version, NATIVE_LATEST_VERSION);
         assert_eq!(NATIVE_0052_SQL.matches("$$").count(), 22);
         assert_eq!(NATIVE_0052_SQL.matches("ALTER TABLE openbot_internal.thread_history_clear_intents\n DROP CONSTRAINT thread_history_clear_intents_kind_check;").count(), 1);
         assert_eq!(NATIVE_0052_SQL.matches("ADD CONSTRAINT thread_history_clear_intents_kind_check CHECK(intent_kind IN('stop_clear','maintenance_clear'));").count(), 1);
@@ -2208,16 +2241,16 @@ mod tests {
     }
 
     #[test]
-    fn t046_21_native_0054_checksum_is_computed_from_sql_bytes() {
+    fn t046_21_native_0055_checksum_is_computed_from_sql_bytes() {
         use sha2::Digest as _;
         let hex = |bytes: &[u8]| format!("{:x}", sha2::Sha256::digest(bytes));
-        assert_eq!(native_0054_checksum(), hex(NATIVE_0054_SQL.as_bytes()));
+        assert_eq!(native_0055_checksum(), hex(NATIVE_0055_SQL.as_bytes()));
         assert_eq!(
-            native_0054_checksum(),
-            "26d8c0afb492881f5617e2a1071d04b2f416ca3e6639662c300471a7a7d99f00"
+            native_0055_checksum(),
+            "c5f2fcc58b50218c087fbf3860ca9dd6e937ddd4439a70ea57e3fb1952b10273"
         );
-        assert_eq!(MIGRATIONS.len(), 42);
-        assert_eq!(MIGRATIONS[41].name, NATIVE_0054_NAME);
+        assert_eq!(MIGRATIONS.len(), 43);
+        assert_eq!(MIGRATIONS[42].name, NATIVE_0055_NAME);
         assert_eq!(NATIVE_0052_SQL.len(), 60390);
         assert_eq!(
             hex(NATIVE_0052_SQL.as_bytes()),

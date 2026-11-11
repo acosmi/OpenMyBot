@@ -695,9 +695,10 @@ pub(crate) async fn verify_pre_upgrade_layout_on(
         super::thread_origin_schema::verify_legacy0051(client).await?;
     } else if ledger.latest_version() == native::NATIVE_0052_VERSION
         || ledger.latest_version() == native::NATIVE_0053_VERSION
+        || ledger.latest_version() == native::NATIVE_0054_VERSION
     {
         super::thread_origin_schema::verify_pre_restore(client, ledger.latest_version()).await?;
-    } else if ledger.latest_version() == native::NATIVE_0054_VERSION {
+    } else if ledger.latest_version() == native::NATIVE_0055_VERSION {
         super::thread_origin_schema::verify(client).await?;
     }
     Ok(ValidatedDesktopVaultLayout {
@@ -751,8 +752,10 @@ fn registered_public_schema(native_version: i32) -> Result<SchemaFacts, InfraErr
         native::NATIVE_0052_VERSION => PUBLIC_0052,
         //0053 adds only the internal pending-input table; public remains0052.
         native::NATIVE_0053_VERSION => PUBLIC_0052,
-        //0054 adds only internal restore facts; its actual additive catalog is checked separately.
+        //0054 adds only internal automation objects; public remains0052.
         native::NATIVE_0054_VERSION => PUBLIC_0052,
+        //0055 adds only internal restore facts; its actual additive catalog is checked separately.
+        native::NATIVE_0055_VERSION => PUBLIC_0052,
         _ => {
             return Err(InfraError::repository_invariant(
                 "desktop_vault_native_schema_unregistered",

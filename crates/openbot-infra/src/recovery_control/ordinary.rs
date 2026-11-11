@@ -1101,7 +1101,7 @@ impl OrdinaryInitializationSession {
         entry::lock(&self.control)?.post(self.intent.effect)
     }
 
-    /// Verify and, only for strict52, migrate the original legacy installation
+    /// Verify and, only for a strict prior layout, migrate the original legacy installation
     /// inside its existing Initializing/ordinary_verify owner.
     #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
     pub async fn verify_local_legacy_before(
@@ -1195,6 +1195,7 @@ impl OrdinaryInitializationSession {
             .native_version();
         if version != native::NATIVE_0052_VERSION
             && version != native::NATIVE_0053_VERSION
+            && version != native::NATIVE_0054_VERSION
             && version != native::NATIVE_LATEST_VERSION
         {
             return Err(invalid());
@@ -1238,6 +1239,7 @@ impl OrdinaryInitializationSession {
                             match version {
                                 native::NATIVE_0052_VERSION => native::validate_custom_model_v2_layout_in_transaction(transaction, native::NATIVE_0052_VERSION, 40).await,
                                 native::NATIVE_0053_VERSION => native::validate_custom_model_v2_layout_in_transaction(transaction, native::NATIVE_0053_VERSION, 41).await,
+                                native::NATIVE_0054_VERSION => native::validate_custom_model_v2_layout_in_transaction(transaction, native::NATIVE_0054_VERSION, 42).await,
                                 _ => native::validate_custom_model_v2_in_transaction(transaction).await,
                             }
                         }).await);
@@ -1251,15 +1253,20 @@ impl OrdinaryInitializationSession {
                             self.local_effect_before()?;
                             if self.local_sql.row.as_ref().and_then(|r| r.as_ref().ok()).and_then(|r| r.as_ref().ok()).ok_or_else(invalid)?.try_get::<_,bool>(0).map_err(|_| invalid())? { return Err(invalid()); }
                         }
-                        // A strict prior layout (52 or 53) upgrades through every registered increment.
+                        // A strict prior layout (52, 53 or 54) upgrades through every registered increment.
                         type PendingMigration = (i32, &'static str, &'static str, fn() -> String);
                         let pending: &[PendingMigration] = match version {
                             native::NATIVE_0052_VERSION => &[
                                 (native::NATIVE_0053_VERSION, native::NATIVE_0053_NAME, native::NATIVE_0053_SQL, native::native_0053_checksum),
                                 (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                                (native::NATIVE_0055_VERSION, native::NATIVE_0055_NAME, native::NATIVE_0055_SQL, native::native_0055_checksum),
                             ],
                             native::NATIVE_0053_VERSION => &[
                                 (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                                (native::NATIVE_0055_VERSION, native::NATIVE_0055_NAME, native::NATIVE_0055_SQL, native::native_0055_checksum),
+                            ],
+                            native::NATIVE_0054_VERSION => &[
+                                (native::NATIVE_0055_VERSION, native::NATIVE_0055_NAME, native::NATIVE_0055_SQL, native::native_0055_checksum),
                             ],
                             _ => &[],
                         };
@@ -1459,7 +1466,7 @@ impl OrdinaryInitializationSession {
         let actual_version: i32 = row.try_get("version").map_err(|_| invalid())?;
         let migration_digest: String = row.try_get("checksum").map_err(|_| invalid())?;
         if actual_version != native::NATIVE_LATEST_VERSION
-            || migration_digest != native::native_0054_checksum()
+            || migration_digest != native::native_0055_checksum()
         {
             return Err(invalid());
         }

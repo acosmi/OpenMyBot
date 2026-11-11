@@ -10,8 +10,8 @@ use openbot_domain::audit::hash::Sha256Digest;
 use serde_json::Value;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
-const ORACLE: &str = include_str!("../../../../fixtures/db/restore-reconfirmation-0054.json");
-const MIGRATION_SQL: &str = include_str!("../../sql/native_0054.sql");
+const ORACLE: &str = include_str!("../../../../fixtures/db/restore-reconfirmation-0055.json");
+const MIGRATION_SQL: &str = include_str!("../../sql/native_0055.sql");
 const MAX_CATALOG_BYTES: usize = 1_048_576;
 
 // This is a fixed catalog query, not a caller-supplied SQL or relation selector.
@@ -28,7 +28,7 @@ original_owner AS (
    OR c.relname='server_kek_canaries') AND c.relkind NOT IN('i','I','S','t')
 ), functions AS (
  SELECT p.* FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
- WHERE n.nspname='openbot_internal' AND pg_catalog.left(p.proname,10)='restore54_'
+ WHERE n.nspname='openbot_internal' AND pg_catalog.left(p.proname,10)='restore55_'
 ), constraints AS (
  SELECT c.* FROM pg_catalog.pg_constraint c WHERE c.conrelid IN(SELECT oid FROM relations)
   OR c.confrelid IN(SELECT oid FROM relations)
@@ -174,7 +174,7 @@ fn parse_expected() -> Result<Value, InfraError> {
     let fields = value.as_object().ok_or_else(invalid)?;
     if fields.len() != 4
         || value["format"] != "restore-reconfirmation-oracle-v1"
-        || value["nativeVersion"] != 54
+        || value["nativeVersion"] != 55
         || value["migrationSha256"] != Sha256Digest::of(MIGRATION_SQL.as_bytes()).to_hex()
         || value["schema"]
             .as_object()

@@ -4635,7 +4635,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         command: Option<Result<Result<u64, tokio_postgres::Error>, Elapsed>>,
         unit: Option<Result<Result<(), tokio_postgres::Error>, Elapsed>>,
         validation: Option<Result<Result<(), InfraError>, Elapsed>>,
-        layout_measure: Option<TimedResult<(i64, [u64; 6]), InfraError>>,
+        layout_measure: Option<TimedResult<(i64, [u64; 7]), InfraError>>,
         catalog: Option<TimedResult<(u64, u64), CaptureSqlFailure>>,
         commit: Option<Result<(), TransactionOwnerError>>,
         rollback: Option<Result<(), TransactionOwnerError>>,
@@ -5272,6 +5272,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             52 => 40_i64,
             53 => 41_i64,
             54 => 42_i64,
+            55 => 43_i64,
             _ => {
                 return Err(RecoveryControlError::new(
                     RecoveryControlFault::InputInvalid,
@@ -5371,6 +5372,11 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                     gateway_authorization_schema::observation_bytes_in_transaction(transaction).await?,
                     thread_origin_schema::observation_bytes_in_transaction(transaction).await?,
                     thread_history_writer_schema::observation_bytes_in_transaction(transaction).await?,
+                    if version as i32 >= native::NATIVE_0054_VERSION {
+                        crate::automation::schema::observation_bytes_in_transaction(transaction).await?
+                    } else {
+                        0
+                    },
                     if version as i32 == native::NATIVE_LATEST_VERSION {
                         restore_reconfirmation_schema::observation_bytes_in_transaction(transaction).await?
                     } else {
@@ -5432,7 +5438,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         }
         let repeated = candidate.sql.schema == StageResult::Acknowledged;
         let version = if repeated {
-            54
+            55
         } else {
             candidate.binding.native_version
         };
@@ -5453,7 +5459,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             .as_mut()
             .and_then(|r| r.as_mut().ok())
             .ok_or_else(|| RecoveryControlError::new(RecoveryControlFault::ControlInvalid))?;
-        let owner = match if version == 54 {
+        let owner = match if version == 55 {
             client.begin_read_committed_read_only().await
         } else {
             client.begin_read_committed().await
@@ -5479,15 +5485,20 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             raw.validation.as_ref().and_then(|r| r.as_ref().ok())
                 .and_then(|r| r.as_ref().ok()).ok_or_else(|| infra_observation_error(raw.validation.as_ref()))?;
             verify_layout(raw, stages, transaction, &candidate.binding, version, deadline).await?;
-            // A strict prior source (52 or 53) upgrades through every registered increment up to
-            // the current layout; a current source only observes.
+            // A strict prior source (52, 53 or 54) upgrades through every registered increment up
+            // to the current layout; a current source only observes.
             let pending: &[PendingMigration] = match version {
                 52 => &[
                     (native::NATIVE_0053_VERSION, native::NATIVE_0053_NAME, native::NATIVE_0053_SQL, native::native_0053_checksum),
                     (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                    (native::NATIVE_0055_VERSION, native::NATIVE_0055_NAME, native::NATIVE_0055_SQL, native::native_0055_checksum),
                 ],
                 53 => &[
                     (native::NATIVE_0054_VERSION, native::NATIVE_0054_NAME, native::NATIVE_0054_SQL, native::native_0054_checksum),
+                    (native::NATIVE_0055_VERSION, native::NATIVE_0055_NAME, native::NATIVE_0055_SQL, native::native_0055_checksum),
+                ],
+                54 => &[
+                    (native::NATIVE_0055_VERSION, native::NATIVE_0055_NAME, native::NATIVE_0055_SQL, native::native_0055_checksum),
                 ],
                 _ => &[],
             };
@@ -6640,10 +6651,10 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
                 ),
             ).await,
             None => {
-                let checksum = native::native_0054_checksum();
+                let checksum = native::native_0055_checksum();
                 tokio::time::timeout_at(tokio::time::Instant::from_std(closing),
                     client.as_client().query(
-                        "SELECT EXISTS(SELECT 1 FROM openbot_internal.schema_migrations WHERE version=54 AND checksum=$1),(SELECT system_identifier::text FROM pg_catalog.pg_control_system())=$2,(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())=$3",
+                        "SELECT EXISTS(SELECT 1 FROM openbot_internal.schema_migrations WHERE version=55 AND checksum=$1),(SELECT system_identifier::text FROM pg_catalog.pg_control_system())=$2,(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())=$3",
                         &[&checksum,&binding.pg_system_identifier,&binding.candidate_database_oid],
                     ),
                 ).await
@@ -7199,7 +7210,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
         let socket_directory = std::fs::File::open(socket_dir).map_err(|_| isolation())?;
         // The source SCRAM secret is the exact 64-byte lowercase-hex password.
         let password = scram_text(scram)?;
-        // The origin, writer and restore oracle trees every schema observation
+        // The origin, writer, automation and restore oracle trees every schema observation
         // borrows are paid once per operation, here (spec revision R484 ¶7984).
         let oracle = crate::thread_history_writer::CurrentWriterSchema::ORACLE_BYTES;
         let oracle_metadata = stages.admit_capacity(Capacity::MetadataBytes, oracle)?;
@@ -7268,7 +7279,7 @@ SELECT CASE WHEN octet_length(request_id)<=512 THEN request_id END AS id,0::bigi
             return Err(isolation());
         }
         binding.native_version = match observed.try_get::<_, Option<i32>>(9).ok().flatten() {
-            Some(version @ 52..=54) => version as u32,
+            Some(version @ 52..=55) => version as u32,
             _ => return Err(invalid_candidate()),
         };
         if !flag(10) {
@@ -7642,12 +7653,12 @@ mod candidate {
 
     #[tokio::test]
     #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
-    async fn t046_21_strict_52_or_53_to_54_single_migration_keeps_prefix_and_fixtures() {
-        let reference = OwnedCandidate::start(53, "").await;
+    async fn t046_21_strict_52_53_or_54_to_55_single_migration_keeps_prefix_and_fixtures() {
+        let reference = OwnedCandidate::start(54, "").await;
         let reference_client = reference.client().await;
-        let public53 = catalog(&reference_client, "public").await;
-        let internal53 = catalog(&reference_client, "openbot_internal").await;
-        for version in [52, 53] {
+        let public54 = catalog(&reference_client, "public").await;
+        let internal54 = catalog(&reference_client, "openbot_internal").await;
+        for version in [52, 53, 54] {
             let pg = OwnedCandidate::start(version, "").await;
             let client = pg.client().await;
             let before = ledger(&client).await;
@@ -7668,14 +7679,14 @@ mod candidate {
             let appended: Vec<_> = after[before.len()..].iter().map(|row| row.0).collect();
             assert_eq!(
                 appended,
-                if version == 52 {
-                    vec![53, 54]
-                } else {
-                    vec![54]
+                match version {
+                    52 => vec![53, 54, 55],
+                    53 => vec![54, 55],
+                    _ => vec![55],
                 }
             );
             assert_eq!(
-                after[after.len() - 2],
+                after[after.len() - 3],
                 (
                     native::NATIVE_0053_VERSION,
                     native::NATIVE_0053_NAME.to_owned(),
@@ -7683,26 +7694,34 @@ mod candidate {
                 )
             );
             assert_eq!(
-                after[after.len() - 1],
+                after[after.len() - 2],
                 (
                     native::NATIVE_0054_VERSION,
                     native::NATIVE_0054_NAME.to_owned(),
                     native::native_0054_checksum()
                 )
             );
-            // Public facts after the upgrade equal the registered 0053 layout:
-            // 0054 adds no public relation, column, constraint or trigger.
-            assert_eq!(catalog(&client, "public").await, public53);
+            assert_eq!(
+                after[after.len() - 1],
+                (
+                    native::NATIVE_0055_VERSION,
+                    native::NATIVE_0055_NAME.to_owned(),
+                    native::native_0055_checksum()
+                )
+            );
+            // Public facts after the upgrade equal the registered 0054 layout:
+            // 0055 adds no public relation, column, constraint or trigger.
+            assert_eq!(catalog(&client, "public").await, public54);
             let internal = catalog(&client, "openbot_internal").await;
             let added: Vec<&str> = internal
                 .lines()
-                .filter(|fact| !internal53.lines().any(|old| old == *fact))
+                .filter(|fact| !internal54.lines().any(|old| old == *fact))
                 .collect();
             assert!(
-                internal53
+                internal54
                     .lines()
                     .all(|fact| internal.lines().any(|new| new == fact)),
-                "0054 keeps every 0053 internal fact"
+                "0055 keeps every 0054 internal fact"
             );
             for table in [
                 "restore_pg_operations",
@@ -7727,10 +7746,10 @@ mod candidate {
 
     #[tokio::test]
     #[ignore = "requires OPENBOT_TEST_PG_BIN with PostgreSQL 17.11"]
-    async fn t046_22_strict_54_source_and_same_operation_reentry_are_read_only() {
+    async fn t046_22_strict_55_source_and_same_operation_reentry_are_read_only() {
         // A current source is only observed, in a read-only transaction, and a
         // same-operation repeat observes again without any new row.
-        let pg = OwnedCandidate::start(native::NATIVE_0054_VERSION, "").await;
+        let pg = OwnedCandidate::start(native::NATIVE_0055_VERSION, "").await;
         let client = pg.client().await;
         let before = (
             ledger(&client).await,
@@ -7892,7 +7911,7 @@ mod candidate {
             assert_eq!(refused(sql).await.0, "23514", "{sql}");
         }
         assert_eq!(refused("INSERT INTO openbot_internal.server_kek_canaries(deployment_id,tenant_id,dataset_id,key_id,encrypted_canary) VALUES('d','t',repeat('a',32),repeat('a',32),'c'),('d','t',repeat('b',32),repeat('b',32),'c')").await.0, "23505");
-        // The actual catalog equals the registered 0054 fixture.
+        // The actual catalog equals the registered 0055 fixture.
         crate::db::restore_reconfirmation_schema::verify_schema(&client)
             .await
             .unwrap();
@@ -8139,7 +8158,7 @@ INSERT INTO public.tool_attempts(tool_call_id,attempt_seq,attempt_id,capability_
         };
         use openbot_contracts::ids::{DeploymentId, TenantId};
         // The ordinary authority observes this binary's full native layout.
-        let pg = OwnedCandidate::start(54, ACTOR_SEED).await;
+        let pg = OwnedCandidate::start(native::NATIVE_LATEST_VERSION, ACTOR_SEED).await;
         let client = pg.client().await;
         let mut threads = Vec::new();
         for _ in 0..2 {
@@ -8256,6 +8275,6 @@ INSERT INTO public.tool_attempts(tool_call_id,attempt_seq,attempt_id,capability_
             client.query_one(rows, &[]).await.unwrap().get::<_, i64>(0),
             before
         );
-        let _ = native::NATIVE_0054_VERSION;
+        let _ = native::NATIVE_0055_VERSION;
     }
 }

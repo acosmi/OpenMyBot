@@ -78,6 +78,7 @@ pub mod approval_admin;
 pub mod approval_preferences;
 mod artifact_save_receipt;
 pub mod artifacts;
+pub mod automation;
 pub mod builtin_tools;
 pub mod chunk;
 pub mod components;

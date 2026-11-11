@@ -46,10 +46,11 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
             + crate::db::restore_reconfirmation_schema::ORACLE_BYTES
             + crate::db::custom_model_catalog_schema::ORACLE_BYTES
             + crate::db::custom_model_v2_schema::ORACLE_BYTES
-            + crate::db::gateway_authorization_schema::ORACLE_BYTES);
+            + crate::db::gateway_authorization_schema::ORACLE_BYTES
+            + crate::automation::schema::ORACLE_BYTES);
 
     /// Bytes [`Self::observe`] allocates on this transaction: the ledger rows
-    /// plus the origin, writer and restore payloads, each observed once, every
+    /// plus the origin, writer, automation and restore payloads, each observed once, every
     /// payload charged for its copies, parsed trees and canonical forms. The
     /// oracle trees are already paid ([`Self::ORACLE_BYTES`]).
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
@@ -66,6 +67,7 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
         let origin = crate::db::thread_origin_schema::observation_bytes_in_transaction(tx).await?;
         let writer =
             crate::db::thread_history_writer_schema::observation_bytes_in_transaction(tx).await?;
+        let automation = crate::automation::schema::observation_bytes_in_transaction(tx).await?;
         let restore =
             crate::db::restore_reconfirmation_schema::observation_bytes_in_transaction(tx).await?;
         u64::try_from(ledger)
@@ -73,6 +75,7 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
             .and_then(|ledger| {
                 origin
                     .checked_add(writer)?
+                    .checked_add(automation)?
                     .checked_add(restore)?
                     .checked_mul(JSON_MEMORY_FACTOR)?
                     .checked_add(ledger)

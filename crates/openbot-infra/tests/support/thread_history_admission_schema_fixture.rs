@@ -188,7 +188,7 @@ async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
         )?;
     } else {
         require(
-            matches!(version, 47..=53),
+            matches!(version, 47..=54),
             "unregistered historical fixture",
         )?;
         baseline::apply(&c).await.map_err(|e| e.to_string())?;

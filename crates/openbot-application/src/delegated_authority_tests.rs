@@ -8,6 +8,11 @@ use openbot_contracts::artifacts::*;
 use openbot_contracts::auth::{
     AuthContextBuilder, AuthGeneration, DelegationSource, Role, VerifiedDelegation,
 };
+use openbot_contracts::automation::{
+    AutomationConfigV1, AutomationId, AutomationOperationId, AutomationPageQuery,
+    AutomationReceiptId, AutomationRevision, CreateAutomationDefinition, ListAutomationDefinitions,
+    TombstoneAutomationDefinition, TriggerAutomationDefinition, UpdateAutomationDefinition,
+};
 use openbot_contracts::budget::RunCostBudgetPreference;
 use openbot_contracts::command::*;
 use openbot_contracts::components::*;
@@ -142,7 +147,7 @@ fn subscriptions() -> [SubscriptionRequest; 4] {
 }
 
 // Fixed independent expected inventory; no wildcard in the typed projection below.
-const EXPECTED_COMMANDS: [&str; 108] = [
+const EXPECTED_COMMANDS: [&str; 117] = [
     "GetRuntimeCapabilities",
     "SaveRunMessageTextArtifact",
     "GetArtifactMetadata",
@@ -251,6 +256,15 @@ const EXPECTED_COMMANDS: [&str; 108] = [
     "GetRunCostBudget",
     "ReplaceRunCostBudget",
     "IssueScreenSession",
+    "ListAutomationDefinitions",
+    "CreateAutomationDefinition",
+    "GetAutomationDefinition",
+    "UpdateAutomationDefinition",
+    "TombstoneAutomationDefinition",
+    "TriggerAutomationDefinition",
+    "ListAutomationOccurrences",
+    "ListAutomationDeliveries",
+    "GetAutomationReceipt",
 ];
 
 fn variant_name(command: &AppCommand) -> &'static str {
@@ -363,10 +377,28 @@ fn variant_name(command: &AppCommand) -> &'static str {
         AppCommand::GetRunCostBudget => "GetRunCostBudget",
         AppCommand::ReplaceRunCostBudget(..) => "ReplaceRunCostBudget",
         AppCommand::IssueScreenSession(..) => "IssueScreenSession",
+        AppCommand::ListAutomationDefinitions(..) => "ListAutomationDefinitions",
+        AppCommand::CreateAutomationDefinition(..) => "CreateAutomationDefinition",
+        AppCommand::GetAutomationDefinition { .. } => "GetAutomationDefinition",
+        AppCommand::UpdateAutomationDefinition { .. } => "UpdateAutomationDefinition",
+        AppCommand::TombstoneAutomationDefinition { .. } => "TombstoneAutomationDefinition",
+        AppCommand::TriggerAutomationDefinition { .. } => "TriggerAutomationDefinition",
+        AppCommand::ListAutomationOccurrences { .. } => "ListAutomationOccurrences",
+        AppCommand::ListAutomationDeliveries { .. } => "ListAutomationDeliveries",
+        AppCommand::GetAutomationReceipt { .. } => "GetAutomationReceipt",
     }
 }
 
 fn commands() -> Vec<AppCommand> {
+    let automation = AutomationId::try_from("automation".to_owned()).unwrap();
+    let revision = AutomationRevision::try_from(1).unwrap();
+    let config: AutomationConfigV1 = serde_json::from_value(json!({
+        "schemaVersion":1,"title":"Manual","botId":"bot","promptTemplate":"Inspect the input",
+        "trigger":{"kind":"manual"},"modelPolicy":"bot_current",
+        "permissionCeiling":{"toolIds":[],"dataScopes":[]},
+        "budget":[{"metric":"sampling_calls","totalLimit":"2"}],"runDeadlineSeconds":60
+    }))
+    .unwrap();
     vec![
         AppCommand::GetRuntimeCapabilities,
         AppCommand::SaveRunMessageTextArtifact(SaveRunMessageTextArtifact {
@@ -806,6 +838,44 @@ fn commands() -> Vec<AppCommand> {
                 origin: String::new(),
             },
         }),
+        AppCommand::ListAutomationDefinitions(ListAutomationDefinitions::default()),
+        AppCommand::CreateAutomationDefinition(CreateAutomationDefinition {
+            automation_id: automation.clone(),
+            config,
+        }),
+        AppCommand::GetAutomationDefinition {
+            automation_id: automation.clone(),
+        },
+        AppCommand::UpdateAutomationDefinition {
+            automation_id: automation.clone(),
+            input: UpdateAutomationDefinition::Pause {
+                expected_revision: revision,
+            },
+        },
+        AppCommand::TombstoneAutomationDefinition {
+            automation_id: automation.clone(),
+            input: TombstoneAutomationDefinition {
+                expected_revision: revision,
+            },
+        },
+        AppCommand::TriggerAutomationDefinition {
+            automation_id: automation.clone(),
+            input: TriggerAutomationDefinition {
+                operation_id: AutomationOperationId::try_from("manual:one".to_owned()).unwrap(),
+                expected_revision: revision,
+            },
+        },
+        AppCommand::ListAutomationOccurrences {
+            automation_id: automation.clone(),
+            query: AutomationPageQuery::default(),
+        },
+        AppCommand::ListAutomationDeliveries {
+            automation_id: automation,
+            query: AutomationPageQuery::default(),
+        },
+        AppCommand::GetAutomationReceipt {
+            receipt_id: AutomationReceiptId::try_from("aocc:one".to_owned()).unwrap(),
+        },
     ]
 }
 
@@ -1137,7 +1207,7 @@ fn assert_untouched(app: &Guarded, poison: &Poison) {
 async fn every_command_variant_refuses_unbound_delegation_before_dispatch() {
     let (app, poison) = guarded();
     let inventory = commands();
-    assert_eq!(inventory.len(), 108);
+    assert_eq!(inventory.len(), 117);
     assert_eq!(
         inventory.iter().map(variant_name).collect::<Vec<_>>(),
         EXPECTED_COMMANDS

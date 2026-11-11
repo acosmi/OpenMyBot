@@ -1103,7 +1103,7 @@ async fn foundation_desktop_current_facts(
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL 17 binaries and independently captured native46 oracles"]
 async fn foundation_original45_desktop_canary_upgrades_and_current_fresh_matches() {
-    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0054_VERSION);
+    assert_eq!(native::NATIVE_LATEST_VERSION, native::NATIVE_0055_VERSION);
     let DesktopFixture {
         database,
         installation,
@@ -1500,6 +1500,11 @@ async fn foundation_original45_desktop_canary_upgrades_and_current_fresh_matches
             native::NATIVE_0054_NAME,
             native::NATIVE_0054_SQL,
         ),
+        (
+            native::NATIVE_0055_VERSION,
+            native::NATIVE_0055_NAME,
+            native::NATIVE_0055_SQL,
+        ),
     ];
     assert_eq!(upgraded_ledger.len(), old_ledger.len() + current_tail.len());
     for (row, (version, name, sql)) in upgraded_ledger[old_ledger.len()..].iter().zip(current_tail)
@@ -1656,9 +1661,9 @@ async fn foundation_original45_desktop_canary_upgrades_and_current_fresh_matches
     let fresh_ledger = foundation_desktop_ledger(&fresh_database).await;
     assert_eq!(
         fresh_ledger.iter().map(|row| row.0).collect::<Vec<_>>(),
-        (13..=native::NATIVE_0054_VERSION).collect::<Vec<_>>()
+        (13..=native::NATIVE_0055_VERSION).collect::<Vec<_>>()
     );
-    assert_eq!(fresh_ledger.last().unwrap().1, native::NATIVE_0054_NAME);
+    assert_eq!(fresh_ledger.last().unwrap().1, native::NATIVE_0055_NAME);
     assert_eq!(fresh_ledger.last().unwrap().2, last.2);
     drop(fresh_canary);
     fresh_database.close();

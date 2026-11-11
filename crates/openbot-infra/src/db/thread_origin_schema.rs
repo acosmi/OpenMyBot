@@ -958,23 +958,33 @@ fn compare_registered(observation: &ThreadOriginSchemaFacts) -> Result<(), Infra
 pub async fn capture(client: &Client) -> Result<ThreadOriginSchemaFacts, InfraError> {
     observation_on(client).await
 }
-/// Require exact current54, the complete old origin/history graph and additive0054 catalog.
+/// Require exact current55, the complete old origin/history graph and additive0055 catalog.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0054_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0054_VERSION)?;
+    let ledger = native::validate_known_prefix(client, native::NATIVE_LATEST_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_LATEST_VERSION)?;
     compare_registered(&observation_on(client).await?)?;
     super::thread_history_admission_schema::verify_schema(client).await?;
     super::restore_reconfirmation_schema::verify_schema(client).await
 }
-/// Explicit strict52/53 pre-restore observation; never qualifies as current54 admission.
+/// Explicit strict52/53/54 pre-restore observation of the origin, admission and that
+/// layout's writer graph; never qualifies as current55 admission.
 pub(crate) async fn verify_pre_restore(client: &Client, latest: i32) -> Result<(), InfraError> {
-    require(latest == native::NATIVE_0052_VERSION || latest == native::NATIVE_0053_VERSION)?;
+    require(
+        latest == native::NATIVE_0052_VERSION
+            || latest == native::NATIVE_0053_VERSION
+            || latest == native::NATIVE_0054_VERSION,
+    )?;
     let ledger = native::validate_known_prefix(client, latest).await?;
     require(ledger.latest_version() == latest)?;
     compare_registered(&observation_on(client).await?)?;
-    super::thread_history_admission_schema::verify_schema(client).await
+    super::thread_history_admission_schema::verify_schema(client).await?;
+    if latest == native::NATIVE_0054_VERSION {
+        super::thread_history_writer_schema::verify_schema(client).await
+    } else {
+        super::thread_history_writer_schema::verify_legacy0052(client).await
+    }
 }
-/// Explicit historical49 pre-upgrade branch; never qualifies as current54 admission.
+/// Explicit historical49 pre-upgrade branch; never qualifies as current55 admission.
 pub(crate) async fn verify_legacy0049(client: &Client) -> Result<(), InfraError> {
     let ledger = native::validate_known_prefix(client, native::NATIVE_0049_VERSION).await?;
     require(ledger.latest_version() == native::NATIVE_0049_VERSION)?;

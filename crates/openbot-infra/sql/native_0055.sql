@@ -1,8 +1,8 @@
--- Native0054: append-only restore retirement and reconfirmation PG facts.
+-- Native0055: append-only restore retirement and reconfirmation PG facts.
 -- A row is not a restore-owner proof, a COMMIT ACK, Current, or Ready.
 -- The original private candidate producer must already hold the external owner,
 -- frozen configuration inventory and its original finite operation budget.
-DO $restore54_owner$
+DO $restore55_owner$
 DECLARE original_owner oid; actual_owner oid;
 BEGIN
  SELECT c.relowner INTO original_owner FROM pg_catalog.pg_class c
@@ -17,7 +17,7 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='restore_pg_schema_invalid';
  END IF;
 END;
-$restore54_owner$;
+$restore55_owner$;
 
 CREATE TABLE openbot_internal.restore_pg_operations (
  operation_id uuid NOT NULL,
@@ -194,17 +194,17 @@ CREATE TABLE openbot_internal.server_kek_canaries (
     PRIMARY KEY (deployment_id, tenant_id)
 );
 
-CREATE FUNCTION openbot_internal.restore54_reject_mutation() RETURNS trigger
+CREATE FUNCTION openbot_internal.restore55_reject_mutation() RETURNS trigger
  LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT PARALLEL UNSAFE SECURITY INVOKER
- COST 100 SET search_path=pg_catalog AS $restore54_immutable$
+ COST 100 SET search_path=pg_catalog AS $restore55_immutable$
 BEGIN
  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='restore_pg_facts_immutable';
 END;
-$restore54_immutable$;
+$restore55_immutable$;
 
-CREATE FUNCTION openbot_internal.restore54_guard_insert() RETURNS trigger
+CREATE FUNCTION openbot_internal.restore55_guard_insert() RETURNS trigger
  LANGUAGE plpgsql VOLATILE CALLED ON NULL INPUT PARALLEL UNSAFE SECURITY INVOKER
- COST 100 SET search_path=pg_catalog AS $restore54_insert$
+ COST 100 SET search_path=pg_catalog AS $restore55_insert$
 DECLARE
  operation openbot_internal.restore_pg_operations%ROWTYPE;
  requirement openbot_internal.restore_reconfirm_requirements%ROWTYPE;
@@ -494,28 +494,28 @@ BEGIN
  END IF;
  RETURN NEW;
 END;
-$restore54_insert$;
+$restore55_insert$;
 
-CREATE TRIGGER restore_pg_operations_insert BEFORE INSERT ON openbot_internal.restore_pg_operations FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_guard_insert();
-CREATE TRIGGER restore_pg_operations_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_pg_operations FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_pg_operations_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_pg_operations FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_pg_batches_insert BEFORE INSERT ON openbot_internal.restore_pg_batches FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_guard_insert();
-CREATE TRIGGER restore_pg_batches_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_pg_batches FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_pg_batches_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_pg_batches FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_reconfirm_requirements_insert BEFORE INSERT ON openbot_internal.restore_reconfirm_requirements FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_guard_insert();
-CREATE TRIGGER restore_reconfirm_requirements_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_reconfirm_requirements FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_reconfirm_requirements_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_reconfirm_requirements FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_reconfirm_receipts_insert BEFORE INSERT ON openbot_internal.restore_reconfirm_receipts FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_guard_insert();
-CREATE TRIGGER restore_reconfirm_receipts_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_reconfirm_receipts FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_reconfirm_receipts_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_reconfirm_receipts FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_pg_seals_insert BEFORE INSERT ON openbot_internal.restore_pg_seals FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_guard_insert();
-CREATE TRIGGER restore_pg_seals_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_pg_seals FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
-CREATE TRIGGER restore_pg_seals_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_pg_seals FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore54_reject_mutation();
+CREATE TRIGGER restore_pg_operations_insert BEFORE INSERT ON openbot_internal.restore_pg_operations FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_guard_insert();
+CREATE TRIGGER restore_pg_operations_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_pg_operations FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_pg_operations_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_pg_operations FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_pg_batches_insert BEFORE INSERT ON openbot_internal.restore_pg_batches FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_guard_insert();
+CREATE TRIGGER restore_pg_batches_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_pg_batches FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_pg_batches_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_pg_batches FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_reconfirm_requirements_insert BEFORE INSERT ON openbot_internal.restore_reconfirm_requirements FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_guard_insert();
+CREATE TRIGGER restore_reconfirm_requirements_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_reconfirm_requirements FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_reconfirm_requirements_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_reconfirm_requirements FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_reconfirm_receipts_insert BEFORE INSERT ON openbot_internal.restore_reconfirm_receipts FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_guard_insert();
+CREATE TRIGGER restore_reconfirm_receipts_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_reconfirm_receipts FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_reconfirm_receipts_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_reconfirm_receipts FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_pg_seals_insert BEFORE INSERT ON openbot_internal.restore_pg_seals FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_guard_insert();
+CREATE TRIGGER restore_pg_seals_immutable BEFORE UPDATE OR DELETE ON openbot_internal.restore_pg_seals FOR EACH ROW EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
+CREATE TRIGGER restore_pg_seals_no_truncate BEFORE TRUNCATE ON openbot_internal.restore_pg_seals FOR EACH STATEMENT EXECUTE FUNCTION openbot_internal.restore55_reject_mutation();
 
 REVOKE ALL ON TABLE openbot_internal.restore_pg_operations,openbot_internal.restore_pg_batches,
  openbot_internal.restore_reconfirm_requirements,openbot_internal.restore_reconfirm_receipts,
  openbot_internal.restore_pg_seals,openbot_internal.server_kek_canaries FROM PUBLIC;
-REVOKE ALL ON FUNCTION openbot_internal.restore54_guard_insert(),openbot_internal.restore54_reject_mutation() FROM PUBLIC;
+REVOKE ALL ON FUNCTION openbot_internal.restore55_guard_insert(),openbot_internal.restore55_reject_mutation() FROM PUBLIC;
 
 -- Dynamic SSO provider ids become the non-nil UUIDs the provider store
 -- requires; only the id changes, never provider_id or configuration bytes.

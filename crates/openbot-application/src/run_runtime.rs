@@ -84,6 +84,8 @@ pub enum RunFailureCode {
     RunCostBudgetCurrencyMismatch,
     /// Durable cost upper bound exceeded the immutable user cap.
     RunCostBudgetExceeded,
+    /// A cumulative automation budget refused a new sampling before provider start.
+    AutomationBudgetExceeded,
     /// Built-in Agent tool sampling step cap reached。
     ToolStepLimit,
     /// G4 tool loop not yet available for this requested call。
@@ -119,6 +121,7 @@ impl RunFailureCode {
             Self::RunCostBudgetUnpriced => "run_cost_budget_unpriced",
             Self::RunCostBudgetCurrencyMismatch => "run_cost_budget_currency_mismatch",
             Self::RunCostBudgetExceeded => "run_cost_budget_exceeded",
+            Self::AutomationBudgetExceeded => "automation_budget_exceeded",
             Self::ToolStepLimit => "tool_step_limit",
             Self::ToolLoopUnavailable => "tool_loop_unavailable",
             Self::ToolDenied => "tool_denied",

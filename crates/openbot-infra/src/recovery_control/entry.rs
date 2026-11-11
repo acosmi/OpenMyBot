@@ -3031,8 +3031,8 @@ impl RestoreControlSession {
         self.retain_failure(result)
     }
 
-    /// Apply the registered increments a 52 or 53 source still needs, or
-    /// observe a 54 source read-only, on the bound candidate.
+    /// Apply the registered increments a 52, 53 or 54 source still needs, or
+    /// observe a 55 source read-only, on the bound candidate.
     pub async fn upgrade_candidate_schema_before(
         &mut self,
         deadline: Instant,

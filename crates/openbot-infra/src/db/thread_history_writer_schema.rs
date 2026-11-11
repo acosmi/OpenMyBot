@@ -7,14 +7,16 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 
 /// Whole portable schema, the actual table ACL state and original raw facts.
 pub type ThreadHistoryWriterSchemaFacts = Value;
-const REGISTERED_SCHEMA: &str =
+const LEGACY0052_SCHEMA: &str =
     include_str!("../../../../fixtures/db/thread-history-writer-0052.json");
 const LEGACY0051_SCHEMA: &str =
     include_str!("../../../../fixtures/db/thread-history-writer-0051.json");
-/// The registered oracle tree, parsed once per process and borrowed by every
-/// observation (spec revision R484 ¶7984); the legacy oracle stays on demand.
+const CURRENT_TERMINAL_PAYLOAD: &str = include_str!("../automation/terminal-payload-0054.json");
+/// The registered 0052 oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶7984); a current observation checks the one
+/// terminal payload body that 0054 replaces separately. The 0051 oracle stays on demand.
 static REGISTERED: std::sync::LazyLock<Option<Value>> =
-    std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
+    std::sync::LazyLock::new(|| serde_json::from_str(LEGACY0052_SCHEMA).ok());
 
 const CAPTURE_SQL: &str = r####"WITH
 wanted_relations(schema_name, relation_name) AS (
@@ -1530,10 +1532,18 @@ async fn observation_on<C: GenericClient + Sync>(
     let raw = serde_json::from_str(&payload).map_err(|_| corrupt("facts"))?;
     normalize_owner_relative(raw, current52)
 }
+#[derive(Clone, Copy)]
+enum WriterOracle {
+    Legacy0051,
+    Legacy0052,
+    Current0054,
+}
+
 fn compare_registered(
     observation: &ThreadHistoryWriterSchemaFacts,
-    current52: bool,
+    oracle: WriterOracle,
 ) -> Result<(), InfraError> {
+    let current52 = !matches!(oracle, WriterOracle::Legacy0051);
     let legacy: Value;
     let expected = if current52 {
         REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?
@@ -1581,30 +1591,70 @@ fn compare_registered(
                 == 1,
         )?;
     }
-    require(
-        expected["schema"]
-            == hot_comparison_clone(&expected["schema"], &observation["schema"], current52)?,
-    )
+    let mut actual = hot_comparison_clone(&expected["schema"], &observation["schema"], current52)?;
+    if matches!(oracle, WriterOracle::Current0054) {
+        // FIX-036-1 replaces exactly this function body; all other registered facts stay exact.
+        let payload: Value = serde_json::from_str(CURRENT_TERMINAL_PAYLOAD)
+            .map_err(|_| corrupt("terminal_payload_oracle"))?;
+        let terminal = |entry: &Value| {
+            same_identity(
+                &entry["identity"],
+                "openbot_internal",
+                "thread_history_terminal_payload",
+            ) && entry["identity"]["arguments"] == "p_type text, p_payload jsonb"
+        };
+        let registered = arr(&expected["schema"]["functions"])?
+            .iter()
+            .find(|entry| terminal(entry))
+            .ok_or_else(|| corrupt("terminal_payload_oracle"))?;
+        let function = actual["functions"]
+            .as_array_mut()
+            .and_then(|functions| functions.iter_mut().find(|entry| terminal(entry)))
+            .ok_or_else(|| corrupt("facts"))?;
+        require(
+            function["source"] == payload["source"]
+                && function["definition"] == payload["definition"],
+        )?;
+        function["source"] = registered["source"].clone();
+        function["definition"] = registered["definition"].clone();
+        sort_top_level_multisets(&mut actual)?;
+    }
+    require(expected["schema"] == actual)
 }
-/// Require exact current54/42, the entire unchanged0052 graph and additive0054 catalog.
+/// Require exact current55/43, the 0052 graph with the 0054 terminal payload body
+/// and the additive0055 catalog.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0054_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0054_VERSION)?;
+    let ledger = native::validate_known_prefix(client, native::NATIVE_LATEST_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_LATEST_VERSION)?;
     verify_schema(client).await?;
     super::restore_reconfirmation_schema::verify_schema(client).await
 }
 /// Schema-only helper after the caller proves its original exact native prefix.
 pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {
-    compare_registered(&observation_on(client, true).await?, true)
+    compare_registered(
+        &observation_on(client, true).await?,
+        WriterOracle::Current0054,
+    )
 }
-/// Whole0052 on the original transaction; never checks out, repairs or closes it.
+/// Verify the current writer schema on the original transaction without changing it.
 pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
-    compare_registered(&observation_on(tx, true).await?, true)
+    compare_registered(&observation_on(tx, true).await?, WriterOracle::Current0054)
+}
+/// Use the original 0052 writer oracle only after an exact 0052/0053 prefix proof.
+pub(crate) async fn verify_legacy0052<C: GenericClient + Sync>(
+    client: &C,
+) -> Result<(), InfraError> {
+    compare_registered(
+        &observation_on(client, true).await?,
+        WriterOracle::Legacy0052,
+    )
 }
 
-/// Registered oracle text length; its tree is charged once per operation.
+/// Registered oracle text lengths (the 0052 graph and the terminal payload body
+/// that replaces one of its functions); the tree is charged once per operation.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
-pub(crate) const ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
+pub(crate) const ORACLE_BYTES: u64 =
+    (LEGACY0052_SCHEMA.len() + CURRENT_TERMINAL_PAYLOAD.len()) as u64;
 
 /// Payload text length one current [`verify_in_transaction`] observes,
 /// measured on the same transaction before it runs.
@@ -1627,13 +1677,16 @@ pub(crate) async fn observation_bytes_in_transaction(
 }
 /// Schema-only historical51 helper after an explicit exact pre-upgrade prefix proof.
 pub(crate) async fn verify_schema_legacy0051(client: &Client) -> Result<(), InfraError> {
-    compare_registered(&observation_on(client, false).await?, false)
+    compare_registered(
+        &observation_on(client, false).await?,
+        WriterOracle::Legacy0051,
+    )
 }
 /// Original whole0051 schema and oracle, only on an explicitly proven 39-item legacy prefix.
 pub(crate) async fn verify_legacy0051_in_transaction(
     tx: &Transaction<'_>,
 ) -> Result<(), InfraError> {
-    compare_registered(&observation_on(tx, false).await?, false)
+    compare_registered(&observation_on(tx, false).await?, WriterOracle::Legacy0051)
 }
 
 // The independent fixture declares the finite builtin scope. Candidate observations

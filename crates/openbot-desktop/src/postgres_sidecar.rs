@@ -5274,7 +5274,7 @@ mod tests {
                 root_uid: String::new(),
             };
             let client = plane.pool().get().await.unwrap();
-            // Native 0054's largest catalog function measures 132464 weighted row bytes
+            // Native 0055's largest catalog function measures 132464 weighted row bytes
             // and 21983 field bytes. This fixture explicitly admits that schema; the old
             // profile remains a rejection case (spec revision R484 ¶6870–6874, ¶7936).
             for (max_row_bytes, max_field_bytes, expected) in [
@@ -5413,7 +5413,7 @@ mod tests {
         let decode = CaptureDecodeBudget::checked(65_536, 4_194_304).unwrap();
         decode.bind_original_clock(Arc::new(UnitClock)).unwrap();
         // pageRows 8 also proves the file-settings read no longer needs one 21-row page.
-        // Native 0054 measures 132464 weighted row bytes and 21983 field bytes at its
+        // Native 0055 measures 132464 weighted row bytes and 21983 field bytes at its
         // largest catalog function. These are explicit fixture bounds, not production
         // defaults (spec revision R484 ¶6870–6874, ¶7936).
         let budget = || {

@@ -215,6 +215,8 @@ pub enum AgentFailure {
     RunCostBudgetCurrencyMismatch,
     /// Durable provider cost upper bound exceeded the frozen user cap.
     RunCostBudgetExceeded,
+    /// A cumulative automation budget refused a new sampling before provider start.
+    AutomationBudgetExceeded,
     /// Tool step cap 8。
     ToolStepLimit,
     /// Tool loop implementation unavailable。

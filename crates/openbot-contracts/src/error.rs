@@ -42,6 +42,40 @@ use crate::ids::{ActorId, ComputerGeneration, DocumentGeneration, PolicyDecision
 pub struct ErrorCode(&'static str);
 
 impl ErrorCode {
+    /// An unaccepted source event is outside its permitted time window.
+    pub const EVENT_OUTSIDE_WINDOW: Self = Self("event_outside_window");
+    /// The requested source adapter is not delivered.
+    pub const EVENT_ADAPTER_UNAVAILABLE: Self = Self("event_adapter_unavailable");
+    /// The unknown-disposition contract is not delivered.
+    pub const UNKNOWN_DISPOSITION_UNAVAILABLE: Self = Self("unknown_disposition_unavailable");
+    /// Source authentication is missing, revoked or no longer current.
+    pub const AUTOMATION_SOURCE_UNAUTHORIZED: Self = Self("automation_source_unauthorized");
+    /// The definition is paused or retired and cannot accept new input.
+    pub const AUTOMATION_NOT_ACCEPTING: Self = Self("automation_not_accepting");
+    /// The authenticated source event does not match the registered filter.
+    pub const EVENT_NOT_ACCEPTED: Self = Self("event_not_accepted");
+    /// The definition revision compare-and-swap failed.
+    pub const AUTOMATION_REVISION_CONFLICT: Self = Self("automation_revision_conflict");
+    /// The receiver key revision compare-and-swap failed.
+    pub const AUTOMATION_KEY_REVISION_CONFLICT: Self = Self("automation_key_revision_conflict");
+    /// A manual operation or creation identity has different original intent.
+    pub const AUTOMATION_OPERATION_CONFLICT: Self = Self("automation_operation_conflict");
+    /// The permanent source event key has a different verified fingerprint.
+    pub const AUTOMATION_EVENT_CONFLICT: Self = Self("automation_event_conflict");
+    /// The explicit definition delegation is no longer current.
+    pub const AUTOMATION_DELEGATION_INVALID: Self = Self("automation_delegation_invalid");
+    /// The required finite cumulative ceilings or attested price are missing.
+    pub const AUTOMATION_BUDGET_UNCONFIGURED: Self = Self("automation_budget_unconfigured");
+    /// The configured trigger consumer has not been delivered.
+    pub const AUTOMATION_TRIGGER_UNAVAILABLE: Self = Self("automation_trigger_unavailable");
+    /// A registered streaming, normalized-data or template byte limit was exceeded.
+    pub const PAYLOAD_TOO_LARGE: Self = Self("payload_too_large");
+    /// The persisted definition or workspace capacity is full.
+    pub const AUTOMATION_CAPACITY_EXCEEDED: Self = Self("automation_capacity_exceeded");
+    /// The permanent receiver deduplication namespace reached its quota.
+    pub const AUTOMATION_RECEIVER_FULL: Self = Self("automation_receiver_full");
+    /// The existing input rate or in-flight budget is exhausted.
+    pub const AUTOMATION_RATE_LIMITED: Self = Self("automation_rate_limited");
     /// 未登录（401）。
     pub const UNAUTHENTICATED: Self = Self("unauthenticated");
     /// 已登录但角色不足（403）。
@@ -301,6 +335,57 @@ impl fmt::Display for SensitiveWriteReason {
 /// audit 类型。这比任何「记得同步更新」的注释都可靠 —— 漏一处就编译不过。
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AppError {
+    /// An unaccepted source event is outside its permitted time window.
+    #[error("event_outside_window")]
+    EventOutsideWindow,
+    /// The requested source adapter is not delivered.
+    #[error("event_adapter_unavailable")]
+    EventAdapterUnavailable,
+    /// The unknown-disposition contract is not delivered.
+    #[error("unknown_disposition_unavailable")]
+    UnknownDispositionUnavailable,
+    /// Source authentication is missing, revoked or no longer current.
+    #[error("automation_source_unauthorized")]
+    AutomationSourceUnauthorized,
+    /// The definition is paused or retired and cannot accept new input.
+    #[error("automation_not_accepting")]
+    AutomationNotAccepting,
+    /// The authenticated source event does not match the registered filter.
+    #[error("event_not_accepted")]
+    EventNotAccepted,
+    /// The definition revision compare-and-swap failed.
+    #[error("automation_revision_conflict")]
+    AutomationRevisionConflict,
+    /// The receiver key revision compare-and-swap failed.
+    #[error("automation_key_revision_conflict")]
+    AutomationKeyRevisionConflict,
+    /// A manual operation or creation identity has different original intent.
+    #[error("automation_operation_conflict")]
+    AutomationOperationConflict,
+    /// The permanent source event key has a different verified fingerprint.
+    #[error("automation_event_conflict")]
+    AutomationEventConflict,
+    /// The explicit definition delegation is no longer current.
+    #[error("automation_delegation_invalid")]
+    AutomationDelegationInvalid,
+    /// The required finite cumulative ceilings or attested price are missing.
+    #[error("automation_budget_unconfigured")]
+    AutomationBudgetUnconfigured,
+    /// The configured trigger consumer has not been delivered.
+    #[error("automation_trigger_unavailable")]
+    AutomationTriggerUnavailable,
+    /// A registered streaming, normalized-data or template byte limit was exceeded.
+    #[error("payload_too_large")]
+    PayloadTooLarge,
+    /// The persisted definition or workspace capacity is full.
+    #[error("automation_capacity_exceeded")]
+    AutomationCapacityExceeded,
+    /// The permanent receiver deduplication namespace reached its quota.
+    #[error("automation_receiver_full")]
+    AutomationReceiverFull,
+    /// The existing input rate or in-flight budget is exhausted.
+    #[error("automation_rate_limited")]
+    AutomationRateLimited,
     /// The visible conversation has an unsupported channel anchor (400).
     #[error("anchor_unsupported")]
     AnchorUnsupported,
@@ -436,6 +521,23 @@ impl AppError {
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
         match self {
+            Self::EventOutsideWindow => ErrorCode::EVENT_OUTSIDE_WINDOW,
+            Self::EventAdapterUnavailable => ErrorCode::EVENT_ADAPTER_UNAVAILABLE,
+            Self::UnknownDispositionUnavailable => ErrorCode::UNKNOWN_DISPOSITION_UNAVAILABLE,
+            Self::AutomationSourceUnauthorized => ErrorCode::AUTOMATION_SOURCE_UNAUTHORIZED,
+            Self::AutomationNotAccepting => ErrorCode::AUTOMATION_NOT_ACCEPTING,
+            Self::EventNotAccepted => ErrorCode::EVENT_NOT_ACCEPTED,
+            Self::AutomationRevisionConflict => ErrorCode::AUTOMATION_REVISION_CONFLICT,
+            Self::AutomationKeyRevisionConflict => ErrorCode::AUTOMATION_KEY_REVISION_CONFLICT,
+            Self::AutomationOperationConflict => ErrorCode::AUTOMATION_OPERATION_CONFLICT,
+            Self::AutomationEventConflict => ErrorCode::AUTOMATION_EVENT_CONFLICT,
+            Self::AutomationDelegationInvalid => ErrorCode::AUTOMATION_DELEGATION_INVALID,
+            Self::AutomationBudgetUnconfigured => ErrorCode::AUTOMATION_BUDGET_UNCONFIGURED,
+            Self::AutomationTriggerUnavailable => ErrorCode::AUTOMATION_TRIGGER_UNAVAILABLE,
+            Self::PayloadTooLarge => ErrorCode::PAYLOAD_TOO_LARGE,
+            Self::AutomationCapacityExceeded => ErrorCode::AUTOMATION_CAPACITY_EXCEEDED,
+            Self::AutomationReceiverFull => ErrorCode::AUTOMATION_RECEIVER_FULL,
+            Self::AutomationRateLimited => ErrorCode::AUTOMATION_RATE_LIMITED,
             Self::Unauthenticated => ErrorCode::UNAUTHENTICATED,
             Self::ForbiddenRole { .. } => ErrorCode::FORBIDDEN_ROLE,
             Self::NotVisible => ErrorCode::NOT_VISIBLE,
@@ -463,6 +565,23 @@ impl AppError {
     #[must_use]
     pub const fn http_status(&self) -> u16 {
         match self {
+            Self::EventOutsideWindow => 400,
+            Self::EventAdapterUnavailable => 400,
+            Self::UnknownDispositionUnavailable => 400,
+            Self::AutomationSourceUnauthorized => 401,
+            Self::AutomationNotAccepting => 403,
+            Self::EventNotAccepted => 403,
+            Self::AutomationRevisionConflict => 409,
+            Self::AutomationKeyRevisionConflict => 409,
+            Self::AutomationOperationConflict => 409,
+            Self::AutomationEventConflict => 409,
+            Self::AutomationDelegationInvalid => 409,
+            Self::AutomationBudgetUnconfigured => 409,
+            Self::AutomationTriggerUnavailable => 409,
+            Self::PayloadTooLarge => 413,
+            Self::AutomationCapacityExceeded => 429,
+            Self::AutomationReceiverFull => 429,
+            Self::AutomationRateLimited => 429,
             Self::Unauthenticated
             | Self::SensitiveWriteRefused {
                 reason: SensitiveWriteReason::SessionNotFresh,
@@ -496,6 +615,23 @@ impl AppError {
     #[must_use]
     pub const fn audit_kind(&self) -> AuditKind {
         match self {
+            Self::EventOutsideWindow => AuditKind::InputRejected,
+            Self::EventAdapterUnavailable => AuditKind::InputRejected,
+            Self::UnknownDispositionUnavailable => AuditKind::InputRejected,
+            Self::AutomationSourceUnauthorized => AuditKind::AuthFailure,
+            Self::AutomationNotAccepting => AuditKind::AuthorizationDenied,
+            Self::EventNotAccepted => AuditKind::AuthorizationDenied,
+            Self::AutomationRevisionConflict => AuditKind::ConcurrencyConflict,
+            Self::AutomationKeyRevisionConflict => AuditKind::ConcurrencyConflict,
+            Self::AutomationOperationConflict => AuditKind::ConcurrencyConflict,
+            Self::AutomationEventConflict => AuditKind::ConcurrencyConflict,
+            Self::AutomationDelegationInvalid => AuditKind::AuthorizationDenied,
+            Self::AutomationBudgetUnconfigured => AuditKind::InputRejected,
+            Self::AutomationTriggerUnavailable => AuditKind::InputRejected,
+            Self::PayloadTooLarge => AuditKind::InputRejected,
+            Self::AutomationCapacityExceeded => AuditKind::InputRejected,
+            Self::AutomationReceiverFull => AuditKind::InputRejected,
+            Self::AutomationRateLimited => AuditKind::InputRejected,
             Self::Unauthenticated => AuditKind::AuthFailure,
             Self::ForbiddenRole { .. } => AuditKind::AuthorizationDenied,
             Self::NotVisible => AuditKind::ResourceNotVisible,
@@ -525,7 +661,8 @@ impl AppError {
 /// §15.3 允许出现的全部 HTTP 状态码（含成功侧的 200：空 thread history 是 200 + 空列表）。
 ///
 /// 任何落在此集合之外的状态码都说明有人在错误映射里发明了新语义。
-pub const HTTP_STATUS_DOMAIN: &[u16] = &[200, 202, 400, 401, 403, 404, 409, 410, 429, 502, 503];
+pub const HTTP_STATUS_DOMAIN: &[u16] =
+    &[200, 202, 400, 401, 403, 404, 409, 410, 413, 429, 502, 503];
 
 impl From<crate::request_binding::ArtifactReadCurrentError> for AppError {
     fn from(error: crate::request_binding::ArtifactReadCurrentError) -> Self {
@@ -542,6 +679,19 @@ impl From<crate::request_binding::ArtifactReadCurrentError> for AppError {
             Error::Unavailable => Self::DependencyUnavailable {
                 dependency: "artifacts",
             },
+        }
+    }
+}
+
+impl From<crate::automation::AutomationContractError> for AppError {
+    fn from(error: crate::automation::AutomationContractError) -> Self {
+        match error {
+            crate::automation::AutomationContractError::MalformedPayload => {
+                Self::MalformedPayload {
+                    field: "automation",
+                }
+            }
+            crate::automation::AutomationContractError::PayloadTooLarge => Self::PayloadTooLarge,
         }
     }
 }
@@ -579,7 +729,7 @@ mod tests {
 
     /// 变体总数。新增变体必须同 PR 改这里 —— 它与 [`variant_index`] 和
     /// [`all_variants_for_test`] 三者互相咬合，见下方三条测试。
-    const VARIANT_COUNT: usize = 18;
+    const VARIANT_COUNT: usize = 35;
 
     /// 无通配 `_` 的穷举 match：**新增变体在这里编译失败**，逼作者同 PR 更新下面的变体台账。
     ///
@@ -588,6 +738,23 @@ mod tests {
     /// 也钉成编译期 + 断言双重约束。
     fn variant_index(error: &AppError) -> usize {
         match error {
+            AppError::EventOutsideWindow => 18,
+            AppError::EventAdapterUnavailable => 19,
+            AppError::UnknownDispositionUnavailable => 20,
+            AppError::AutomationSourceUnauthorized => 21,
+            AppError::AutomationNotAccepting => 22,
+            AppError::EventNotAccepted => 23,
+            AppError::AutomationRevisionConflict => 24,
+            AppError::AutomationKeyRevisionConflict => 25,
+            AppError::AutomationOperationConflict => 26,
+            AppError::AutomationEventConflict => 27,
+            AppError::AutomationDelegationInvalid => 28,
+            AppError::AutomationBudgetUnconfigured => 29,
+            AppError::AutomationTriggerUnavailable => 30,
+            AppError::PayloadTooLarge => 31,
+            AppError::AutomationCapacityExceeded => 32,
+            AppError::AutomationReceiverFull => 33,
+            AppError::AutomationRateLimited => 34,
             AppError::Unauthenticated => 0,
             AppError::ForbiddenRole { .. } => 1,
             AppError::NotVisible => 2,
@@ -619,6 +786,23 @@ mod tests {
     /// 载荷的变体，两个分支都必须被断言覆盖。
     fn all_variants_for_test() -> Vec<AppError> {
         vec![
+            AppError::EventOutsideWindow,
+            AppError::EventAdapterUnavailable,
+            AppError::UnknownDispositionUnavailable,
+            AppError::AutomationSourceUnauthorized,
+            AppError::AutomationNotAccepting,
+            AppError::EventNotAccepted,
+            AppError::AutomationRevisionConflict,
+            AppError::AutomationKeyRevisionConflict,
+            AppError::AutomationOperationConflict,
+            AppError::AutomationEventConflict,
+            AppError::AutomationDelegationInvalid,
+            AppError::AutomationBudgetUnconfigured,
+            AppError::AutomationTriggerUnavailable,
+            AppError::PayloadTooLarge,
+            AppError::AutomationCapacityExceeded,
+            AppError::AutomationReceiverFull,
+            AppError::AutomationRateLimited,
             AppError::AnchorUnsupported,
             AppError::PendingInputLimit,
             AppError::PendingInputState,
@@ -728,6 +912,23 @@ mod tests {
     #[test]
     fn http_status_matches_plan_section_15_3() {
         let cases: Vec<(AppError, u16)> = vec![
+            (AppError::EventOutsideWindow, 400),
+            (AppError::EventAdapterUnavailable, 400),
+            (AppError::UnknownDispositionUnavailable, 400),
+            (AppError::AutomationSourceUnauthorized, 401),
+            (AppError::AutomationNotAccepting, 403),
+            (AppError::EventNotAccepted, 403),
+            (AppError::AutomationRevisionConflict, 409),
+            (AppError::AutomationKeyRevisionConflict, 409),
+            (AppError::AutomationOperationConflict, 409),
+            (AppError::AutomationEventConflict, 409),
+            (AppError::AutomationDelegationInvalid, 409),
+            (AppError::AutomationBudgetUnconfigured, 409),
+            (AppError::AutomationTriggerUnavailable, 409),
+            (AppError::PayloadTooLarge, 413),
+            (AppError::AutomationCapacityExceeded, 429),
+            (AppError::AutomationReceiverFull, 429),
+            (AppError::AutomationRateLimited, 429),
             (AppError::AnchorUnsupported, 400),
             (AppError::PendingInputLimit, 429),
             (AppError::PendingInputState, 409),
