@@ -193,6 +193,87 @@ pub trait AutomationDefinitions: AutomationExecutionBudgets + Send + Sync {
         auth: &AuthContext,
         id: AutomationReceiptId,
     ) -> Result<AutomationReceipt, AppError>;
+    /// Create a sender-key receiver on an event definition without advancing its revision.
+    async fn create_receiver(
+        &self,
+        auth: &AuthContext,
+        id: AutomationId,
+        receiver: AutomationReceiverId,
+        expected_revision: AutomationRevision,
+        filter: AutomationEventFilter,
+    ) -> Result<AutomationReceiverSecret, AppError>;
+    /// Replace the current sender key; the previous key stops authenticating immediately.
+    async fn rotate_receiver_key(
+        &self,
+        auth: &AuthContext,
+        receiver: AutomationReceiverId,
+        expected_key_revision: AutomationRevision,
+    ) -> Result<AutomationReceiverSecret, AppError>;
+    /// Revoke the receiver and its current key, keeping receipts and the key namespace.
+    async fn revoke_receiver(
+        &self,
+        auth: &AuthContext,
+        receiver: AutomationReceiverId,
+        expected_key_revision: AutomationRevision,
+    ) -> Result<AutomationReceiver, AppError>;
+}
+
+/// Same-PG source admission behind the Server ingress boundary; it carries no actor authority.
+#[async_trait]
+pub trait AutomationDeliveries: Send + Sync {
+    /// Open the receiver's current Vault record and compare the presented key in constant time.
+    async fn authenticate(
+        &self,
+        receiver: &AutomationReceiverId,
+        presented: &openbot_domain::vault::SecretBytes,
+    ) -> Result<AutomationRevision, AppError>;
+    /// The acceptance transaction: recheck, replay, filter, window, limits and durable writes.
+    async fn admit(
+        &self,
+        delivery: VerifiedAutomationDelivery,
+    ) -> Result<AutomationIngressOutcome, AppError>;
+    /// Count one content-free refusal for a known receiver; unknown receivers are not recorded.
+    async fn record_refusal(
+        &self,
+        receiver: &AutomationReceiverId,
+        reason: AutomationRefusalReason,
+    ) -> Result<(), AppError>;
+}
+
+/// Third assembly output: Server holds Some, Desktop None. Not an `AppCommand`.
+#[derive(Clone)]
+pub struct AutomationDeliveryEntry {
+    port: std::sync::Arc<dyn AutomationDeliveries>,
+}
+impl AutomationDeliveryEntry {
+    /// Wrap the Server's same-PG admission port.
+    #[must_use]
+    pub fn new(port: std::sync::Arc<dyn AutomationDeliveries>) -> Self {
+        Self { port }
+    }
+    /// Authenticate a sender key before any replay read.
+    pub async fn authenticate(
+        &self,
+        receiver: &AutomationReceiverId,
+        presented: &openbot_domain::vault::SecretBytes,
+    ) -> Result<AutomationRevision, AppError> {
+        self.port.authenticate(receiver, presented).await
+    }
+    /// Durably accept verified source input or return its original receipt.
+    pub async fn accept(
+        &self,
+        delivery: VerifiedAutomationDelivery,
+    ) -> Result<AutomationIngressOutcome, AppError> {
+        self.port.admit(delivery).await
+    }
+    /// Count a refusal for a known receiver.
+    pub async fn record_refusal(
+        &self,
+        receiver: &AutomationReceiverId,
+        reason: AutomationRefusalReason,
+    ) -> Result<(), AppError> {
+        self.port.record_refusal(receiver, reason).await
+    }
 }
 
 /// Same-PG durable queue used only by the application-owned background dispatcher.

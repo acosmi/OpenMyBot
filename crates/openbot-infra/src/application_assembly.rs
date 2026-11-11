@@ -224,6 +224,8 @@ pub struct PostgresApplicationAssembly {
     pub provider_extensions: openbot_application::ProviderExtensions,
     /// Sole delegated Run admission handle, absent without a trusted authority.
     pub delegated_entry: Option<openbot_application::DelegatedRunEntry>,
+    /// Sender-key ingress admission: Some only where Server automation is assembled.
+    pub automation_delivery: Option<openbot_application::automation::AutomationDeliveryEntry>,
     terminal_runtime: Option<Arc<PostgresRunRuntime>>,
     capture_facts_closed: bool,
     #[cfg(all(feature = "server-runtime", target_os = "macos"))]
@@ -257,6 +259,7 @@ impl core::fmt::Debug for PostgresApplicationAssembly {
             .field("mcp_revocation_reconciler", &"running")
             .field("provider_extensions", &self.provider_extensions.len())
             .field("delegated_entry", &self.delegated_entry.is_some())
+            .field("automation_delivery", &self.automation_delivery.is_some())
             .finish()
     }
 }
@@ -659,7 +662,7 @@ async fn assemble_with_automation(
         pool.clone(),
         model,
         credential_key_id,
-        credential_vault,
+        credential_vault.clone(),
         audit_key.to_vec(),
         stall_timeout,
         channel_routing_provider,
@@ -682,11 +685,15 @@ async fn assemble_with_automation(
                 deployment.clone(),
                 tenant.clone(),
                 SecretBytes::new(audit_key.to_vec()),
+                credential_vault,
             )
         })
         .transpose()
         .map_err(|_| fail("automations"))?
         .map(Arc::new);
+    let automation_delivery = automations.as_ref().map(|automations| {
+        openbot_application::automation::AutomationDeliveryEntry::new(automations.clone())
+    });
     let application = OpenBotApplication::new(channels.clone())
         .with_people(people)
         .with_audit(PostgresAuditReader::new(pool.clone()))
@@ -747,6 +754,7 @@ async fn assemble_with_automation(
         run_runtime,
         provider_extensions,
         delegated_entry,
+        automation_delivery,
         remote_interrupts,
         mcp_catalog,
         components,

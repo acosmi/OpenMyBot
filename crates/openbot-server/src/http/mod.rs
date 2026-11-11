@@ -52,6 +52,7 @@ pub mod artifact_save_receipts;
 pub mod artifacts;
 pub mod auth_oidc;
 pub mod auth_sso;
+pub mod automation_ingress;
 pub mod automations;
 pub mod channels;
 pub mod components;
@@ -153,6 +154,7 @@ struct StateInner {
     mcp_oauth_callback: Option<Arc<dyn McpOAuthCallback>>,
     static_app: Option<StaticApp>,
     screen_hub: Option<ScreenHub>,
+    automation_delivery: Option<openbot_application::automation::AutomationDeliveryEntry>,
 }
 
 impl ServerState {
@@ -366,6 +368,7 @@ pub struct ServerBuilder {
     mcp_oauth_callback: Option<Arc<dyn McpOAuthCallback>>,
     static_app: Option<StaticApp>,
     screen_hub: Option<ScreenHub>,
+    automation_delivery: Option<openbot_application::automation::AutomationDeliveryEntry>,
 }
 
 impl ServerBuilder {
@@ -390,6 +393,7 @@ impl ServerBuilder {
             mcp_oauth_callback: None,
             static_app: None,
             screen_hub: None,
+            automation_delivery: None,
         }
     }
 
@@ -510,6 +514,16 @@ impl ServerBuilder {
         self
     }
 
+    /// Attach the Server's sender-key ingress port; its route exists only when present.
+    #[must_use]
+    pub fn with_automation_delivery(
+        mut self,
+        entry: Option<openbot_application::automation::AutomationDeliveryEntry>,
+    ) -> Self {
+        self.automation_delivery = entry;
+        self
+    }
+
     /// 收口成 [`ServerState`]。
     #[must_use]
     pub fn build(self) -> ServerState {
@@ -532,6 +546,7 @@ impl ServerBuilder {
                 mcp_oauth_callback: self.mcp_oauth_callback,
                 static_app: self.static_app,
                 screen_hub: self.screen_hub,
+                automation_delivery: self.automation_delivery,
             }),
         }
     }
@@ -574,6 +589,7 @@ async fn record_http_metrics(request: Request, next: Next) -> Response {
 pub fn router(state: ServerState) -> Router {
     let static_app = state.static_app().cloned();
     let transport_policy = state.inner.transport_policy.clone();
+    let automation_delivery = state.inner.automation_delivery.clone();
     let router = Router::new()
         .route("/health", get(health::health))
         .route("/readiness", get(health::readiness))
@@ -917,14 +933,21 @@ pub fn router(state: ServerState) -> Router {
     // Static routes are mounted before these layers so GUI HTML/assets and their 404/405 paths
     // retain the same request-id, tracing, metrics and bounded-body transport contract as APIs.
     // Axum only applies `Router::layer` to routes already present at the call site.
-    router
+    let router = router
         // Existing routes use the single legacy transport budget. Automation's smaller stream
         // budget is enforced in its own framing handler before typed JSON is admitted.
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT_BYTES))
         // Automation counts its stricter stream budget and returns the registered JSON 413,
         // including bodies that exceed the legacy transport limit. Shared transport guards remain.
-        .merge(automations::routes(state))
+        .merge(automations::routes(state));
+    // Sender-key ingress keeps the transport gate below but no session, cookie or CSRF layer;
+    // it streams its own 256 KiB budget like the automation management routes.
+    let router = match automation_delivery {
+        Some(entry) => router.merge(automation_ingress::routes(entry)),
+        None => router,
+    };
+    router
         .layer(axum::middleware::from_fn_with_state(
             transport_policy,
             transport_gate::enforce,

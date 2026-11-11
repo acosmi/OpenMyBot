@@ -719,6 +719,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_remote_callback_authenticator(remote_callback_auth)
         .with_remote_callback_tools(remote_callback_tools)
         .with_screen_hub(screen_hub)
+        .with_automation_delivery(application_assembly.automation_delivery.clone())
         .with_readiness_probe(Arc::new(db_probe));
     if let Some(dist) = server.app_dist_dir.as_deref() {
         builder = builder.with_static_app(StaticApp::open(dist)?);

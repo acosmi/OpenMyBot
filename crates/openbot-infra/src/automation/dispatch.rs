@@ -66,7 +66,10 @@ impl AutomationBeginAdmission {
         {
             return Err(AppError::AutomationRevisionConflict);
         }
-        if column::<String>(&occurrence, "trigger_kind")? != "manual" {
+        if !matches!(
+            column::<String>(&occurrence, "trigger_kind")?.as_str(),
+            "manual" | "event"
+        ) {
             return Err(AppError::AutomationTriggerUnavailable);
         }
         let replay = column::<String>(&occurrence, "state")? == "run_created";

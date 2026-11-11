@@ -106,6 +106,8 @@ automation_ids! {
     AutomationOperationId,
     /// One cumulative-budget attempt identity.
     AutomationAttemptId,
+    /// One allowlisted sender event type.
+    AutomationEventType,
 }
 
 /// A finite nonnegative budget amount, kept outside JavaScript floating-point numbers.
@@ -940,12 +942,491 @@ pub struct AutomationDeliveryPage {
     pub items: Vec<AutomationReceipt>,
     /// Opaque cursor for the same definition and owner.
     pub next_cursor: Option<String>,
+    /// Every receiver of this definition, including revoked ones, with refusal intervals.
+    pub receivers: Vec<AutomationReceiver>,
+}
+
+closed_strings! {
+    /// Receiver source adapters; only `sender_key` can be created in the first cut.
+    AutomationReceiverAdapter {
+        /// Generic bearer sender key.
+        SenderKey => "sender_key",
+        /// Reserved for its successor revision; creation returns `event_adapter_unavailable`.
+        Github => "github",
+    }
+}
+closed_strings! {
+    /// Content-free refusal reasons counted per known receiver.
+    AutomationRefusalReason {
+        /// Invalid, rotated or revoked sender key for a known receiver.
+        SourceUnauthorized => "automation_source_unauthorized",
+        /// The definition is paused or tombstoned.
+        NotAccepting => "automation_not_accepting",
+        /// Event type or match conditions did not hold.
+        EventNotAccepted => "event_not_accepted",
+        /// A new event lies outside the registered freshness window.
+        EventOutsideWindow => "event_outside_window",
+        /// Closed envelope, duplicate key or value checks failed.
+        MalformedPayload => "malformed_payload",
+        /// A stream or normalized budget was exceeded.
+        PayloadTooLarge => "payload_too_large",
+        /// The per-receiver process rate was exceeded.
+        RateLimited => "automation_rate_limited",
+    }
+}
+
+/// A JSON scalar in a match condition; containers and NUL text are refused at admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
+pub struct AutomationScalar(serde_json::Value);
+
+impl AutomationScalar {
+    /// Compare with ECMAScript number semantics, the same interpretation as the fingerprint.
+    #[must_use]
+    pub fn matches(&self, value: &serde_json::Value) -> bool {
+        match (&self.0, value) {
+            (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
+                left.as_f64() == right.as_f64()
+            }
+            (left, right) => left == right,
+        }
+    }
+}
+
+impl TryFrom<serde_json::Value> for AutomationScalar {
+    type Error = AutomationContractError;
+
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        match &value {
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                Err(AutomationContractError::MalformedPayload)
+            }
+            serde_json::Value::String(text) if text.contains('\0') => {
+                Err(AutomationContractError::MalformedPayload)
+            }
+            _ => Ok(Self(value)),
+        }
+    }
+}
+
+impl From<AutomationScalar> for serde_json::Value {
+    fn from(value: AutomationScalar) -> Self {
+        value.0
+    }
+}
+
+/// One through eight object field names, each at most 128 UTF-8 bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub struct AutomationMatchPath(Vec<String>);
+
+impl TryFrom<Vec<String>> for AutomationMatchPath {
+    type Error = AutomationContractError;
+
+    fn try_from(value: Vec<String>) -> Result<Self, Self::Error> {
+        if !(1..=8).contains(&value.len())
+            || value
+                .iter()
+                .any(|segment| segment.len() > 128 || segment.contains('\0'))
+        {
+            return Err(AutomationContractError::MalformedPayload);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<AutomationMatchPath> for Vec<String> {
+    fn from(value: AutomationMatchPath) -> Self {
+        value.0
+    }
+}
+
+/// One through thirty-two scalars whose JSON encoding is at most 4 KiB.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<AutomationScalar>", into = "Vec<AutomationScalar>")]
+pub struct AutomationScalarSet(Vec<AutomationScalar>);
+
+impl TryFrom<Vec<AutomationScalar>> for AutomationScalarSet {
+    type Error = AutomationContractError;
+
+    fn try_from(value: Vec<AutomationScalar>) -> Result<Self, Self::Error> {
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|_| AutomationContractError::MalformedPayload)?
+            .len();
+        if !(1..=32).contains(&value.len()) || bytes > 4096 {
+            return Err(AutomationContractError::MalformedPayload);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<AutomationScalarSet> for Vec<AutomationScalar> {
+    fn from(value: AutomationScalarSet) -> Self {
+        value.0
+    }
+}
+
+/// Closed object-field condition; no URL, script or regular expression is evaluated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AutomationMatch {
+    /// The field equals one scalar.
+    Eq {
+        /// Object field names from the top of `data`.
+        path: AutomationMatchPath,
+        /// Expected scalar.
+        value: AutomationScalar,
+    },
+    /// The field equals one scalar of a bounded set.
+    In {
+        /// Object field names from the top of `data`.
+        path: AutomationMatchPath,
+        /// Allowed scalars.
+        value: AutomationScalarSet,
+    },
+}
+
+/// Immutable receiver filter: distinct allowlisted event types and closed match conditions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "AutomationEventFilterInput")]
+pub struct AutomationEventFilter {
+    event_types: Vec<AutomationEventType>,
+    matches: Vec<AutomationMatch>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutomationEventFilterInput {
+    event_types: Vec<AutomationEventType>,
+    matches: Vec<AutomationMatch>,
+}
+
+impl TryFrom<AutomationEventFilterInput> for AutomationEventFilter {
+    type Error = AutomationContractError;
+
+    fn try_from(input: AutomationEventFilterInput) -> Result<Self, Self::Error> {
+        let mut distinct = input.event_types.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if !(1..=64).contains(&input.event_types.len())
+            || distinct.len() != input.event_types.len()
+            || input.matches.len() > 32
+        {
+            return Err(AutomationContractError::MalformedPayload);
+        }
+        Ok(Self {
+            event_types: input.event_types,
+            matches: input.matches,
+        })
+    }
+}
+
+impl AutomationEventFilter {
+    /// Whether the type is allowlisted and every condition holds on the normalized data.
+    #[must_use]
+    pub fn accepts(&self, event_type: &AutomationEventType, data: &serde_json::Value) -> bool {
+        self.event_types.contains(event_type)
+            && self.matches.iter().all(|condition| {
+                let (path, expected) = match condition {
+                    AutomationMatch::Eq { path, value } => (path, core::slice::from_ref(value)),
+                    AutomationMatch::In { path, value } => (path, value.0.as_slice()),
+                };
+                path.0
+                    .iter()
+                    .try_fold(data, |current, field| current.as_object()?.get(field))
+                    .is_some_and(|actual| expected.iter().any(|scalar| scalar.matches(actual)))
+            })
+    }
+}
+
+/// Empty placeholder that only routes an unopened adapter to its registered refusal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomationUnavailableSource {}
+
+/// Receiver source; only the generic sender-key adapter is open in the first cut.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "adapter", rename_all = "snake_case")]
+pub enum AutomationReceiverSource {
+    /// Bearer sender key bound to this receiver and its immutable filter.
+    SenderKey(AutomationEventFilter),
+    /// Not open until its successor revision; never stored.
+    Github(AutomationUnavailableSource),
+}
+
+/// Fixed external source identity; it is never a Wrok actor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AutomationSourcePrincipal {
+    /// A generic sender is the receiver itself.
+    SenderKey {
+        /// Owning receiver namespace.
+        #[serde(rename = "receiverId")]
+        receiver_id: AutomationReceiverId,
+    },
+}
+
+/// Owner create request; the definition revision is checked but not advanced.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateAutomationReceiver {
+    /// Permanent receiver namespace chosen by the owner.
+    pub receiver_id: AutomationReceiverId,
+    /// Current definition revision observed by the owner.
+    pub expected_revision: AutomationRevision,
+    /// Immutable source adapter and filter.
+    pub source: AutomationReceiverSource,
+}
+
+/// Replace the sender key without any overlap period.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RotateAutomationReceiverKey {
+    /// Current key revision observed by the owner.
+    pub expected_key_revision: AutomationRevision,
+}
+
+/// Revoke a receiver while retaining its receipts and key namespace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RevokeAutomationReceiver {
+    /// Current key revision observed by the owner.
+    pub expected_key_revision: AutomationRevision,
+}
+
+/// Content-free refusal interval for one reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutomationReceiverRefusal {
+    /// Closed refusal reason.
+    pub reason: AutomationRefusalReason,
+    /// Cumulative count.
+    pub count: u64,
+    /// First PG refusal time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub first_at: OffsetDateTime,
+    /// Latest PG refusal time.
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_at: OffsetDateTime,
+}
+
+/// Owner-visible receiver projection without any secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationReceiver {
+    /// Permanent receiver namespace.
+    pub id: AutomationReceiverId,
+    /// The one definition it feeds.
+    pub automation_id: AutomationId,
+    /// Fixed source adapter.
+    pub adapter: AutomationReceiverAdapter,
+    /// Fixed external source identity.
+    pub source_principal: AutomationSourcePrincipal,
+    /// Immutable filter.
+    pub event_filter: AutomationEventFilter,
+    /// Current key revision.
+    pub key_revision: AutomationRevision,
+    /// Revocation time, if revoked.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub revoked_at: Option<OffsetDateTime>,
+    /// Refusal intervals by reason.
+    pub refusals: Vec<AutomationReceiverRefusal>,
+}
+
+/// A 256-bit sender key as 64 lowercase hex characters; shown only once and never logged.
+pub struct AutomationSenderKey(zeroize::Zeroizing<String>);
+
+impl AutomationSenderKey {
+    /// Take ownership of a freshly minted key.
+    ///
+    /// # Errors
+    /// Returns an error unless the value is exactly 64 lowercase hex characters.
+    pub fn new(value: String) -> Result<Self, AutomationContractError> {
+        let value = zeroize::Zeroizing::new(value);
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(AutomationContractError::MalformedPayload);
+        }
+        Ok(Self(value))
+    }
+
+    /// Expose the key only to response serialization.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for AutomationSenderKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AutomationSenderKey([redacted])")
+    }
+}
+
+impl PartialEq for AutomationSenderKey {
+    fn eq(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq as _;
+        self.0.as_bytes().ct_eq(other.0.as_bytes()).into()
+    }
+}
+
+impl Eq for AutomationSenderKey {}
+
+impl Serialize for AutomationSenderKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.expose())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutomationSenderKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+/// Create/rotate response: the receiver plus its one-time sender key.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationReceiverSecret {
+    /// Secret-free receiver projection.
+    #[serde(flatten)]
+    pub receiver: AutomationReceiver,
+    /// One-time sender key.
+    pub sender_key: AutomationSenderKey,
+}
+
+/// Exact ingress success projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationIngressReceipt {
+    /// Original delivery receipt.
+    pub receipt_id: AutomationReceiptId,
+    /// Terminal delivery status.
+    pub status: AutomationDeliveryStatus,
+}
+
+/// New durable acceptance or an exact replay of the original receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutomationIngressOutcome {
+    /// The acceptance transaction committed in this request.
+    Accepted(AutomationIngressReceipt),
+    /// Same receiver, event and fingerprint as an existing receipt.
+    Replayed(AutomationIngressReceipt),
+}
+
+/// Boundary-verified source input. It is not Serde and has no public fields or wire form.
+pub struct VerifiedAutomationDelivery {
+    receiver_id: AutomationReceiverId,
+    key_revision: AutomationRevision,
+    source_principal: AutomationSourcePrincipal,
+    source_event_key: AutomationOperationId,
+    adapter: AutomationReceiverAdapter,
+    event_type: AutomationEventType,
+    occurred_at: Option<OffsetDateTime>,
+    normalized_data: serde_json::Value,
+    fingerprint: [u8; 32],
+    verified_body_digest: Option<[u8; 32]>,
+}
+
+impl VerifiedAutomationDelivery {
+    /// Wrap facts checked once at the Server source boundary.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_verified_source(
+        receiver_id: AutomationReceiverId,
+        key_revision: AutomationRevision,
+        source_principal: AutomationSourcePrincipal,
+        source_event_key: AutomationOperationId,
+        adapter: AutomationReceiverAdapter,
+        event_type: AutomationEventType,
+        occurred_at: Option<OffsetDateTime>,
+        normalized_data: serde_json::Value,
+        fingerprint: [u8; 32],
+        verified_body_digest: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            receiver_id,
+            key_revision,
+            source_principal,
+            source_event_key,
+            adapter,
+            event_type,
+            occurred_at,
+            normalized_data,
+            fingerprint,
+            verified_body_digest,
+        }
+    }
+
+    /// Authenticated receiver.
+    #[must_use]
+    pub fn receiver_id(&self) -> &AutomationReceiverId {
+        &self.receiver_id
+    }
+    /// Key revision observed by authentication.
+    #[must_use]
+    pub fn key_revision(&self) -> AutomationRevision {
+        self.key_revision
+    }
+    /// Fixed source identity.
+    #[must_use]
+    pub fn source_principal(&self) -> &AutomationSourcePrincipal {
+        &self.source_principal
+    }
+    /// Stable source event key.
+    #[must_use]
+    pub fn source_event_key(&self) -> &AutomationOperationId {
+        &self.source_event_key
+    }
+    /// Source adapter.
+    #[must_use]
+    pub fn adapter(&self) -> AutomationReceiverAdapter {
+        self.adapter
+    }
+    /// Allowlist candidate.
+    #[must_use]
+    pub fn event_type(&self) -> &AutomationEventType {
+        &self.event_type
+    }
+    /// UTC source time, when the adapter has one.
+    #[must_use]
+    pub fn occurred_at(&self) -> Option<OffsetDateTime> {
+        self.occurred_at
+    }
+    /// Normalized `{data,eventType,occurredAt}` with the fingerprint's number interpretation.
+    #[must_use]
+    pub fn normalized_data(&self) -> &serde_json::Value {
+        &self.normalized_data
+    }
+    /// SHA-256 of the RFC 8785 bytes of the normalized payload.
+    #[must_use]
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+    /// Verified raw body digest for adapters that sign the body.
+    #[must_use]
+    pub fn verified_body_digest(&self) -> Option<&[u8; 32]> {
+        self.verified_body_digest.as_ref()
+    }
+}
+
+impl fmt::Debug for VerifiedAutomationDelivery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedAutomationDelivery")
+            .field("receiver_id", &self.receiver_id)
+            .field("source_event_key", &self.source_event_key)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn receipt_projection_matches_the_closed_origin_and_result_contract() {
@@ -988,6 +1469,187 @@ mod tests {
         let mut blocked = value;
         blocked["occurrence"]["runStatus"] = json!("blocked_budget");
         assert!(serde_json::from_value::<AutomationReceipt>(blocked).is_err());
+    }
+
+    #[test]
+    fn receiver_inputs_and_event_filter_are_closed_and_bounded() {
+        let input = json!({"receiverId":"receiver:one","expectedRevision":1,"source":{
+            "adapter":"sender_key","eventTypes":["push","order.created"],
+            "matches":[{"path":["repo","id"],"op":"eq","value":1},
+                       {"path":["kind"],"op":"in","value":["a",2,true,null]}]}});
+        let parsed: CreateAutomationReceiver = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), input);
+        let github: CreateAutomationReceiver = serde_json::from_value(json!({"receiverId":"gh",
+            "expectedRevision":1,"source":{"adapter":"github","repositoryId":1}}))
+        .unwrap();
+        assert!(matches!(github.source, AutomationReceiverSource::Github(_)));
+        let types = |count: usize| (0..count).map(|i| format!("t{i}")).collect::<Vec<_>>();
+        let matches = |count: usize| vec![json!({"path":["a"],"op":"eq","value":1}); count];
+        let source = |event_types: Value, matches: Value| {
+            serde_json::from_value::<AutomationReceiverSource>(
+                json!({"adapter":"sender_key","eventTypes":event_types,"matches":matches}),
+            )
+        };
+        assert!(source(json!(types(64)), json!(matches(32))).is_ok());
+        assert!(source(json!(["x".repeat(128)]), json!(Vec::<Value>::new())).is_ok());
+        assert!(
+            source(
+                json!(["push"]),
+                json!([{"path":vec!["a"; 8],"op":"eq","value":"b".repeat(4096)}])
+            )
+            .is_ok()
+        );
+        assert!(
+            source(
+                json!(["push"]),
+                json!([{"path":["a"],"op":"in","value":vec![json!("x".repeat(128)); 31]}])
+            )
+            .is_ok()
+        );
+        for (event_types, conditions) in [
+            (json!([]), json!([])),
+            (json!(types(65)), json!([])),
+            (json!(["push", "push"]), json!([])),
+            (json!(["x".repeat(129)]), json!([])),
+            (json!(["push/x"]), json!([])),
+            (json!(["push"]), json!(matches(33))),
+            (json!(["push"]), json!([{"path":[],"op":"eq","value":1}])),
+            (
+                json!(["push"]),
+                json!([{"path":vec!["a"; 9],"op":"eq","value":1}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["x".repeat(129)],"op":"eq","value":1}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"eq","value":{"b":1}}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"eq","value":[1]}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"eq","value":"a\u{0}"}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"in","value":[]}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"in","value":vec![1; 33]}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"in","value":["x".repeat(4096)]}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"regex","value":"."}]),
+            ),
+            (
+                json!(["push"]),
+                json!([{"path":["a"],"op":"eq","value":1,"script":"x"}]),
+            ),
+        ] {
+            assert!(
+                source(event_types.clone(), conditions.clone()).is_err(),
+                "{event_types} {conditions}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<AutomationReceiverSource>(
+                json!({"adapter":"sender_key","eventTypes":["push"],"matches":[],"ownerId":"x"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AutomationReceiverSource>(json!({"adapter":"relay"})).is_err()
+        );
+        for closed in [
+            json!({"expectedKeyRevision":1,"senderKey":"x"}),
+            json!({"expectedKeyRevision":0}),
+            json!({}),
+        ] {
+            assert!(serde_json::from_value::<RotateAutomationReceiverKey>(closed.clone()).is_err());
+            assert!(serde_json::from_value::<RevokeAutomationReceiver>(closed).is_err());
+        }
+        let key = AutomationSenderKey::new("ab".repeat(32)).unwrap();
+        assert_eq!(format!("{key:?}"), "AutomationSenderKey([redacted])");
+        for invalid in ["AB".repeat(32), "ab".repeat(31), "zz".repeat(32)] {
+            assert!(AutomationSenderKey::new(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn event_filter_uses_ecmascript_numbers_and_object_fields_only() {
+        let filter: AutomationEventFilter = serde_json::from_value(json!({
+            "eventTypes":["push"],
+            "matches":[{"path":["n"],"op":"eq","value":1.0},
+                       {"path":["a","b"],"op":"in","value":[9007199254740992_u64,"x"]}]
+        }))
+        .unwrap();
+        let push = AutomationEventType::try_from("push".to_owned()).unwrap();
+        let other = AutomationEventType::try_from("pull".to_owned()).unwrap();
+        assert!(filter.accepts(&push, &json!({"n":1,"a":{"b":9007199254740992.0_f64}})));
+        assert!(filter.accepts(&push, &json!({"n":1.0,"a":{"b":"x"}})));
+        assert!(!filter.accepts(&other, &json!({"n":1,"a":{"b":"x"}})));
+        assert!(!filter.accepts(&push, &json!({"n":"1","a":{"b":"x"}})));
+        assert!(!filter.accepts(&push, &json!({"n":1,"a":[{"b":"x"}]})));
+        assert!(!filter.accepts(&push, &json!({"n":1})));
+    }
+
+    #[test]
+    fn verified_delivery_has_no_serde_or_public_fields() {
+        struct Probe<T>(core::marker::PhantomData<T>);
+        trait Fallback {
+            fn implemented(&self) -> bool {
+                false
+            }
+        }
+        impl<T> Fallback for Probe<T> {}
+        impl<T: Serialize> Probe<T> {
+            fn implemented(&self) -> bool {
+                true
+            }
+        }
+        struct DeProbe<T>(core::marker::PhantomData<T>);
+        trait DeFallback {
+            fn implemented(&self) -> bool {
+                false
+            }
+        }
+        impl<T> DeFallback for DeProbe<T> {}
+        impl<T: for<'de> Deserialize<'de>> DeProbe<T> {
+            fn implemented(&self) -> bool {
+                true
+            }
+        }
+        assert!(!Probe::<VerifiedAutomationDelivery>(core::marker::PhantomData).implemented());
+        assert!(!DeProbe::<VerifiedAutomationDelivery>(core::marker::PhantomData).implemented());
+        assert!(!Probe::<AutomationIngressOutcome>(core::marker::PhantomData).implemented());
+        // Positive control: the probe does detect an implementation.
+        assert!(Probe::<AutomationIngressReceipt>(core::marker::PhantomData).implemented());
+        assert!(DeProbe::<AutomationEventFilter>(core::marker::PhantomData).implemented());
+        let receiver = AutomationReceiverId::try_from("receiver".to_owned()).unwrap();
+        let delivery = VerifiedAutomationDelivery::from_verified_source(
+            receiver.clone(),
+            AutomationRevision::try_from(1).unwrap(),
+            AutomationSourcePrincipal::SenderKey {
+                receiver_id: receiver,
+            },
+            AutomationOperationId::try_from("event".to_owned()).unwrap(),
+            AutomationReceiverAdapter::SenderKey,
+            AutomationEventType::try_from("push".to_owned()).unwrap(),
+            None,
+            json!({"data":{"secret-body":"canary"}}),
+            [7; 32],
+            None,
+        );
+        assert!(!format!("{delivery:?}").contains("canary"));
     }
 
     #[test]
