@@ -640,12 +640,14 @@ async fn receiver_lifecycle_fresh_origin_cas_and_vault_storage() {
         let AppReply::Credentials(page) = execute(&f, AppCommand::ListCredentials(Default::default())).await.unwrap() else { panic!() };
         let listed = page.credentials.iter().find(|c| c.key_id == "http-r" && c.revoked_at.is_none()).unwrap();
         assert_eq!(listed.provider, "automation_receiver");
-        let replacement = openbot_contracts::credential_admin::CredentialWrite::new(
-            openbot_contracts::credential_admin::ManualCredentialKind::Connector, "automation_receiver".into(), "http-r".into(), json!({}),
-            zeroize::Zeroizing::new("replacement".into())).unwrap();
-        assert!(execute(&f, AppCommand::RotateCredential { credential_id: listed.id.clone(), input: replacement }).await.is_err());
+        // Credential retirement runs under the request's recovery admission, so both writes
+        // go through the admin routes with a real session binding.
+        let replacement = json!({"kind":"connector","provider":"automation_receiver","keyId":"http-r","metadata":{},"plaintext":"replacement"});
+        let (status, _, _) = send(&app, owner_request("POST", &format!("/api/admin/credentials/{}/rotate", listed.id), ADMIN, Some(ORIGIN)), body(replacement)).await;
+        assert!(!status.is_success(), "a managed row was replaced: {status}");
         assert_eq!(deliver(&app, "http-r", &key2, first.clone()).await.0, 200);
-        execute(&f, AppCommand::RevokeCredential { credential_id: listed.id.clone() }).await.unwrap();
+        let (status, _, _) = send(&app, owner_request("POST", &format!("/api/admin/credentials/{}/revoke", listed.id), ADMIN, Some(ORIGIN)), Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(deliver(&app, "http-r", &key2, first.clone()).await.0, 401);
 
         // Owner rotation restores delivery; revoke is CAS-checked and permanent.
