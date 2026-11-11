@@ -3489,6 +3489,27 @@ async fn t046_40_run() {
         .await
         .unwrap();
     assert!(matches!(started, AppReply::ThreadRunStarted(_)));
+    // The dispatcher holds FOR UPDATE on this run and its Thread until it marks the
+    // run's dispatch delivered; the save below takes FOR SHARE NOWAIT on the same
+    // rows and correctly refuses while that lock is held.
+    let client = running.pool().get().await.unwrap();
+    let dispatched = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM public.outbox WHERE outbox_id=$1 AND status='delivered')",
+            &[&format!("{}:agent_run_dispatch", run_id.as_str())],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0)
+    {
+        assert!(
+            std::time::Instant::now() < dispatched,
+            "run dispatch delivered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(client);
     let saved = running
         .artifact_administration
         .save_run_message_text(
