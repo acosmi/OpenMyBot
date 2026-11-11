@@ -443,7 +443,10 @@ fn http_route_of(command: &AppCommand) -> Option<String> {
         | AppCommand::TriggerAutomationDefinition { .. }
         | AppCommand::ListAutomationOccurrences { .. }
         | AppCommand::ListAutomationDeliveries { .. }
-        | AppCommand::GetAutomationReceipt { .. } => None,
+        | AppCommand::GetAutomationReceipt { .. }
+        | AppCommand::CreateAutomationReceiver { .. }
+        | AppCommand::RotateAutomationReceiverKey { .. }
+        | AppCommand::RevokeAutomationReceiver { .. } => None,
 
         AppCommand::ListVisibleChannels { limit, cursor } => {
             let mut uri = String::from("/api/channels");
@@ -1427,8 +1430,26 @@ async fn automation_commands_are_server_only_and_unassembled_desktop_returns_503
         AppCommand::GetAutomationReceipt {
             receipt_id: AutomationReceiptId::try_from("aocc:one".to_owned()).unwrap(),
         },
+        AppCommand::CreateAutomationReceiver {
+            automation_id: AutomationId::try_from("automation".to_owned()).unwrap(),
+            input: serde_json::from_value(serde_json::json!({"receiverId":"receiver",
+                "expectedRevision":1,"source":{"adapter":"sender_key","eventTypes":["push"],"matches":[]}}))
+            .unwrap(),
+        },
+        AppCommand::RotateAutomationReceiverKey {
+            receiver_id: AutomationReceiverId::try_from("receiver".to_owned()).unwrap(),
+            input: RotateAutomationReceiverKey {
+                expected_key_revision: revision,
+            },
+        },
+        AppCommand::RevokeAutomationReceiver {
+            receiver_id: AutomationReceiverId::try_from("receiver".to_owned()).unwrap(),
+            input: RevokeAutomationReceiver {
+                expected_key_revision: revision,
+            },
+        },
     ];
-    assert_eq!(commands.len(), 9);
+    assert_eq!(commands.len(), 12);
     for command in commands {
         assert_eq!(
             http_route_of(&command),

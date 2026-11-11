@@ -391,6 +391,8 @@ impl AgentToolGateway {
                 | AppReply::AutomationReceipt(_)
                 | AppReply::AutomationOccurrences(_)
                 | AppReply::AutomationDeliveries(_)
+                | AppReply::AutomationReceiverSecret(_)
+                | AppReply::AutomationReceiver(_)
                 | AppReply::ThreadTitleSet(_)
                 | AppReply::ThreadRunStarted(_)
                 | AppReply::ThreadRunCancellation(_)

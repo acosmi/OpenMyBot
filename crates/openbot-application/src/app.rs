@@ -1083,6 +1083,42 @@ where
                     .receipt(auth, receipt_id)
                     .await?,
             )),
+            AppCommand::CreateAutomationReceiver {
+                automation_id,
+                input,
+            } => {
+                let definitions = self.automation_definitions()?;
+                let openbot_contracts::automation::AutomationReceiverSource::SenderKey(filter) =
+                    input.source
+                else {
+                    return Err(AppError::EventAdapterUnavailable);
+                };
+                Ok(AppReply::AutomationReceiverSecret(
+                    definitions
+                        .create_receiver(
+                            auth,
+                            automation_id,
+                            input.receiver_id,
+                            input.expected_revision,
+                            filter,
+                        )
+                        .await?,
+                ))
+            }
+            AppCommand::RotateAutomationReceiverKey { receiver_id, input } => {
+                Ok(AppReply::AutomationReceiverSecret(
+                    self.automation_definitions()?
+                        .rotate_receiver_key(auth, receiver_id, input.expected_key_revision)
+                        .await?,
+                ))
+            }
+            AppCommand::RevokeAutomationReceiver { receiver_id, input } => {
+                Ok(AppReply::AutomationReceiver(
+                    self.automation_definitions()?
+                        .revoke_receiver(auth, receiver_id, input.expected_key_revision)
+                        .await?,
+                ))
+            }
             AppCommand::MintThreadId => Ok(AppReply::ThreadMinted(
                 mint_thread_id(&self.threads, auth).await?,
             )),

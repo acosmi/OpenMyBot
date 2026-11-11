@@ -222,6 +222,8 @@ pub async fn list(
         | AppReply::AutomationReceipt(_)
         | AppReply::AutomationOccurrences(_)
         | AppReply::AutomationDeliveries(_)
+        | AppReply::AutomationReceiverSecret(_)
+        | AppReply::AutomationReceiver(_)
         | AppReply::RemoteInterruptResolved(_) => {
             tracing::error!(
                 "ListVisibleChannels 收到非 Channels 应答 —— ApplicationService 契约破损"
@@ -339,6 +341,8 @@ pub async fn get(
         | AppReply::AutomationReceipt(_)
         | AppReply::AutomationOccurrences(_)
         | AppReply::AutomationDeliveries(_)
+        | AppReply::AutomationReceiverSecret(_)
+        | AppReply::AutomationReceiver(_)
         | AppReply::RemoteInterruptResolved(_) => {
             tracing::error!("GetVisibleChannel received a non-Channel application reply");
             Err(AppError::DependencyUnavailable {
@@ -462,6 +466,8 @@ pub async fn create(
         | AppReply::AutomationReceipt(_)
         | AppReply::AutomationOccurrences(_)
         | AppReply::AutomationDeliveries(_)
+        | AppReply::AutomationReceiverSecret(_)
+        | AppReply::AutomationReceiver(_)
         | AppReply::RemoteInterruptResolved(_) => {
             tracing::error!("CreateChannel received a non-Channel application reply");
             Err(AppError::DependencyUnavailable {
