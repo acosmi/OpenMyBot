@@ -312,6 +312,8 @@ hmac = "0.12.1"
 # Fixed bundled IANA rules for automation draft admission (spec revision R485).
 jiff = { version = "=0.2.35", default-features = false, features = ["std"] }
 jiff-tzdb = "=0.1.8"
+# RFC 8785 sender-key fingerprints, consumed only at the Server ingress boundary (spec revision R485).
+serde_json_canonicalizer = "=0.3.2"
 hkdf = "0.12.4"
 subtle = "2.6.1"
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }

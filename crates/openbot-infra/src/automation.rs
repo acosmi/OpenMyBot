@@ -18,3 +18,6 @@ pub(crate) mod dispatch;
 
 #[cfg(feature = "server-runtime")]
 mod queue;
+
+#[cfg(feature = "server-runtime")]
+mod ingress;

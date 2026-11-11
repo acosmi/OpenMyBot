@@ -65,6 +65,9 @@ serde = { workspace = true }
 # **不给 `ActionPolicy` 派生 `Deserialize`**：那会开一条"自由 JSON 直接铸造领域类型"的路（§5.2
 # 明令禁止的形态）。这里逐字段读、逐字段校验、再显式构造。
 serde_json = { workspace = true }
+# Sender-key ingress: RFC 8785 bytes and their SHA-256 fingerprint (spec revision R485).
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
 url.workspace = true
 
 # 请求 span。
@@ -115,7 +118,6 @@ aes-gcm.workspace = true
 ed25519-dalek.workspace = true
 base64.workspace = true
 hkdf.workspace = true
-sha2.workspace = true
 
 # 注：`serde_json` 已上移到 [dependencies]（G2 起启动期要解析 `AGENT_COMPUTER_POLICY`），
 # 这里不再重复声明。它进生产依赖**不等于**放开"自由 params"：那条禁令针对的是

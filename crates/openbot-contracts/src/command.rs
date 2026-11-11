@@ -173,6 +173,27 @@ pub enum AppCommand {
         /// Prefix locates the receipt; current owner scope still authorizes it.
         receipt_id: crate::automation::AutomationReceiptId,
     },
+    /// Create one sender-key receiver under a fresh owner session.
+    CreateAutomationReceiver {
+        /// Candidate current-owner event definition.
+        automation_id: crate::automation::AutomationId,
+        /// Closed receiver identity, observed revision and source.
+        input: crate::automation::CreateAutomationReceiver,
+    },
+    /// Replace a receiver's sender key with no overlap.
+    RotateAutomationReceiverKey {
+        /// Candidate current-owner receiver.
+        receiver_id: crate::automation::AutomationReceiverId,
+        /// Observed key revision.
+        input: crate::automation::RotateAutomationReceiverKey,
+    },
+    /// Revoke a receiver while keeping its receipts.
+    RevokeAutomationReceiver {
+        /// Candidate current-owner receiver.
+        receiver_id: crate::automation::AutomationReceiverId,
+        /// Observed key revision.
+        input: crate::automation::RevokeAutomationReceiver,
+    },
     /// Read the actual current host's closed capability projection without inputs.
     #[serde(deserialize_with = "deserialize_runtime_capabilities_input")]
     GetRuntimeCapabilities,
@@ -787,6 +808,10 @@ pub enum AppReply {
     AutomationOccurrences(crate::automation::AutomationOccurrencePage),
     /// Real external deliveries only.
     AutomationDeliveries(crate::automation::AutomationDeliveryPage),
+    /// Created or rotated receiver with its one-time sender key.
+    AutomationReceiverSecret(crate::automation::AutomationReceiverSecret),
+    /// Secret-free receiver projection.
+    AutomationReceiver(crate::automation::AutomationReceiver),
     /// Current-authenticated closed runtime capability projection.
     RuntimeCapabilities(crate::runtime_capabilities::RuntimeCapabilitiesResponse),
     /// Content-free positive local registration fact.

@@ -11,7 +11,7 @@ use openbot_contracts::{
     automation::*,
     command::ThreadRunAnchor,
     error::AppError,
-    ids::{DeploymentId, RunId, TenantId, ThreadId},
+    ids::{ActorId, DeploymentId, RunId, TenantId, ThreadId},
 };
 use openbot_domain::{
     audit::{
@@ -19,7 +19,7 @@ use openbot_domain::{
         payload::{AuditFact, AuditIdentifier, AuditLabel, AuditPayload},
     },
     automation::AutomationConfig,
-    vault::SecretBytes,
+    vault::{SecretBytes, SecretKind, SecretPrincipal, ServiceId},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -35,6 +35,11 @@ pub struct PostgresAutomations {
     pub(crate) deployment: DeploymentId,
     pub(crate) tenant: TenantId,
     audit_key: Arc<SecretBytes>,
+    /// Existing Vault holding one credentials row per receiver key revision.
+    pub(crate) vault: crate::vault::CredentialRecordVault,
+    /// Per-receiver process token buckets: 10 per second, burst 20.
+    pub(crate) rate:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, f64)>>>,
 }
 
 impl PostgresAutomations {
@@ -44,6 +49,7 @@ impl PostgresAutomations {
         deployment: DeploymentId,
         tenant: TenantId,
         audit_key: SecretBytes,
+        vault: crate::vault::CredentialRecordVault,
     ) -> Result<Self, AppError> {
         if audit_key.is_empty() {
             return Err(unavailable());
@@ -53,6 +59,8 @@ impl PostgresAutomations {
             deployment,
             tenant,
             audit_key: Arc::new(audit_key),
+            vault,
+            rate: Arc::default(),
         })
     }
 
@@ -168,10 +176,10 @@ impl PostgresAutomations {
         })
     }
 
-    async fn audit(
+    pub(crate) async fn audit(
         &self,
         tx: &Transaction<'_>,
-        auth: &AuthContext,
+        actor: Option<&ActorId>,
         id: &AutomationId,
         action: &'static str,
     ) -> Result<(), AppError> {
@@ -180,7 +188,7 @@ impl PostgresAutomations {
             .map_err(|_| unavailable())?;
         let event = AuditEvent {
             id: event_id,
-            actor: Some(auth.actor().clone()),
+            actor: actor.cloned(),
             event_type: AuditEventType::parse("configuration.changed").ok_or_else(unavailable)?,
             target_kind: AuditLabel::new("automation"),
             target_id: Some(AuditIdentifier::new(id.as_str()).map_err(|_| unavailable())?),
@@ -275,7 +283,8 @@ impl AutomationDefinitions for PostgresAutomations {
             &config.wire().budget,
         )
         .await?;
-        self.audit(&tx, auth, &id, "automation_created").await?;
+        self.audit(&tx, Some(auth.actor()), &id, "automation_created")
+            .await?;
         let row = self.definition_row(&tx, auth, &id, false).await?;
         let result = self.projection(&tx, &row).await?;
         tx.commit().await.map_err(|_| unavailable())?;
@@ -413,7 +422,7 @@ impl AutomationDefinitions for PostgresAutomations {
         tx.query_one("SELECT pg_notify('openbot_automation',$1)", &[&id.as_str()])
             .await
             .map_err(|_| unavailable())?;
-        self.audit(&tx, auth, &id, "automation_manual_accepted")
+        self.audit(&tx, Some(auth.actor()), &id, "automation_manual_accepted")
             .await?;
         let receipt = read_receipt(
             &tx,
@@ -522,9 +531,206 @@ impl AutomationDefinitions for PostgresAutomations {
                 .await?,
             );
         }
+        let mut receivers = Vec::new();
+        for row in tx.query("SELECT receiver_id FROM openbot_internal.automation_receivers WHERE deployment_id=$1 AND tenant_id=$2 AND automation_id=$3 ORDER BY created_at,receiver_id",
+            &[&self.deployment.as_str(),&self.tenant.as_str(),&id.as_str()]).await.map_err(|_|unavailable())? {
+            receivers.push(read_receiver(&tx, &self.deployment, &self.tenant, &column::<String>(&row, "receiver_id")?).await?);
+        }
         tx.rollback().await.map_err(|_| unavailable())?;
-        Ok(AutomationDeliveryPage { items, next_cursor })
+        Ok(AutomationDeliveryPage {
+            items,
+            next_cursor,
+            receivers,
+        })
     }
+
+    async fn create_receiver(
+        &self,
+        auth: &AuthContext,
+        id: AutomationId,
+        receiver: AutomationReceiverId,
+        expected_revision: AutomationRevision,
+        filter: AutomationEventFilter,
+    ) -> Result<AutomationReceiverSecret, AppError> {
+        let mut client = self.pool.get().await.map_err(|_| unavailable())?;
+        let tx = client.transaction().await.map_err(|_| unavailable())?;
+        self.prepare(&tx, auth).await?;
+        let row = self.definition_row(&tx, auth, &id, true).await?;
+        if column::<i64>(&row, "current_revision")? != expected_revision.get() {
+            return Err(AppError::AutomationRevisionConflict);
+        }
+        if column::<String>(&row, "state")? == "tombstoned" {
+            return Err(AppError::AutomationNotAccepting);
+        }
+        let config: AutomationConfigV1 = stored(column(&row, "config_snapshot")?)?;
+        if !matches!(config.trigger, AutomationTrigger::Event {}) {
+            return Err(AppError::MalformedPayload { field: "source" });
+        }
+        let (credential, sender_key) = self.insert_sender_key(&tx, auth.actor(), &receiver).await?;
+        let principal = serde_json::to_value(AutomationSourcePrincipal::SenderKey {
+            receiver_id: receiver.clone(),
+        })
+        .map_err(|_| unavailable())?;
+        let filter = serde_json::to_value(&filter).map_err(|_| unavailable())?;
+        // Receiver namespaces are permanent and never reused, by this or any other owner.
+        let inserted = tx.execute("INSERT INTO openbot_internal.automation_receivers(receiver_id,deployment_id,tenant_id,automation_id,adapter,source_principal,event_filter,current_key_revision,vault_record_ref)
+            VALUES($1,$2,$3,$4,'sender_key',$5,$6,1,$7) ON CONFLICT (receiver_id) DO NOTHING",
+            &[&receiver.as_str(),&self.deployment.as_str(),&self.tenant.as_str(),&id.as_str(),&principal,&filter,&credential.to_string()]).await.map_err(|_|unavailable())?;
+        if inserted != 1 {
+            return Err(AppError::AutomationOperationConflict);
+        }
+        self.audit(&tx, Some(auth.actor()), &id, "automation_receiver_created")
+            .await?;
+        let receiver =
+            read_receiver(&tx, &self.deployment, &self.tenant, receiver.as_str()).await?;
+        tx.commit().await.map_err(|_| unavailable())?;
+        Ok(AutomationReceiverSecret {
+            receiver,
+            sender_key,
+        })
+    }
+
+    async fn rotate_receiver_key(
+        &self,
+        auth: &AuthContext,
+        receiver: AutomationReceiverId,
+        expected_key_revision: AutomationRevision,
+    ) -> Result<AutomationReceiverSecret, AppError> {
+        let mut client = self.pool.get().await.map_err(|_| unavailable())?;
+        let tx = client.transaction().await.map_err(|_| unavailable())?;
+        self.prepare(&tx, auth).await?;
+        let row = self.owned_receiver(&tx, auth, &receiver).await?;
+        if column::<Option<OffsetDateTime>>(&row, "revoked_at")?.is_some()
+            || column::<i64>(&row, "current_key_revision")? != expected_key_revision.get()
+        {
+            return Err(AppError::AutomationKeyRevisionConflict);
+        }
+        let (credential, sender_key) = self.insert_sender_key(&tx, auth.actor(), &receiver).await?;
+        revoke_sender_key(&tx, &column::<String>(&row, "vault_record_ref")?).await?;
+        tx.execute("UPDATE openbot_internal.automation_receivers SET current_key_revision=current_key_revision+1,vault_record_ref=$4 WHERE deployment_id=$1 AND tenant_id=$2 AND receiver_id=$3",
+            &[&self.deployment.as_str(),&self.tenant.as_str(),&receiver.as_str(),&credential.to_string()]).await.map_err(|_|unavailable())?;
+        let id = AutomationId::try_from(column::<String>(&row, "automation_id")?)?;
+        self.audit(&tx, Some(auth.actor()), &id, "automation_receiver_rotated")
+            .await?;
+        let receiver =
+            read_receiver(&tx, &self.deployment, &self.tenant, receiver.as_str()).await?;
+        tx.commit().await.map_err(|_| unavailable())?;
+        Ok(AutomationReceiverSecret {
+            receiver,
+            sender_key,
+        })
+    }
+
+    async fn revoke_receiver(
+        &self,
+        auth: &AuthContext,
+        receiver: AutomationReceiverId,
+        expected_key_revision: AutomationRevision,
+    ) -> Result<AutomationReceiver, AppError> {
+        let mut client = self.pool.get().await.map_err(|_| unavailable())?;
+        let tx = client.transaction().await.map_err(|_| unavailable())?;
+        self.prepare(&tx, auth).await?;
+        let row = self.owned_receiver(&tx, auth, &receiver).await?;
+        if column::<i64>(&row, "current_key_revision")? != expected_key_revision.get() {
+            return Err(AppError::AutomationKeyRevisionConflict);
+        }
+        // An already revoked receiver at the observed revision returns its unchanged projection.
+        if column::<Option<OffsetDateTime>>(&row, "revoked_at")?.is_none() {
+            tx.execute("UPDATE openbot_internal.automation_receivers SET revoked_at=statement_timestamp() WHERE deployment_id=$1 AND tenant_id=$2 AND receiver_id=$3",
+                &[&self.deployment.as_str(),&self.tenant.as_str(),&receiver.as_str()]).await.map_err(|_|unavailable())?;
+            revoke_sender_key(&tx, &column::<String>(&row, "vault_record_ref")?).await?;
+            let id = AutomationId::try_from(column::<String>(&row, "automation_id")?)?;
+            self.audit(&tx, Some(auth.actor()), &id, "automation_receiver_revoked")
+                .await?;
+        }
+        let receiver =
+            read_receiver(&tx, &self.deployment, &self.tenant, receiver.as_str()).await?;
+        tx.commit().await.map_err(|_| unavailable())?;
+        Ok(receiver)
+    }
+}
+
+impl PostgresAutomations {
+    /// Current-owner receiver row, locked; other owners and workspaces see 404.
+    async fn owned_receiver(
+        &self,
+        tx: &Transaction<'_>,
+        auth: &AuthContext,
+        receiver: &AutomationReceiverId,
+    ) -> Result<Row, AppError> {
+        tx.query_opt("SELECT r.automation_id,r.current_key_revision,r.revoked_at,r.vault_record_ref
+            FROM openbot_internal.automation_receivers r JOIN openbot_internal.automation_definitions d
+              ON (d.deployment_id,d.tenant_id,d.automation_id)=(r.deployment_id,r.tenant_id,r.automation_id)
+            WHERE r.deployment_id=$1 AND r.tenant_id=$2 AND r.receiver_id=$3 AND d.owner_id=$4 FOR UPDATE OF r",
+            &[&self.deployment.as_str(),&self.tenant.as_str(),&receiver.as_str(),&auth.actor().as_str()])
+            .await.map_err(|_|unavailable())?.ok_or(AppError::NotVisible)
+    }
+
+    /// Mint a 256-bit key and seal it into one new `public.credentials` row of this transaction.
+    async fn insert_sender_key(
+        &self,
+        tx: &Transaction<'_>,
+        owner: &ActorId,
+        receiver: &AutomationReceiverId,
+    ) -> Result<(Uuid, AutomationSenderKey), AppError> {
+        use std::fmt::Write as _;
+        let mut random = zeroize::Zeroizing::new([0_u8; 32]);
+        getrandom::fill(random.as_mut()).map_err(|_| unavailable())?;
+        let mut hex = zeroize::Zeroizing::new(String::with_capacity(64));
+        for byte in random.iter() {
+            write!(hex, "{byte:02x}").map_err(|_| unavailable())?;
+        }
+        let sender_key =
+            AutomationSenderKey::new(std::mem::take(&mut *hex)).map_err(|_| unavailable())?;
+        let credential = Uuid::now_v7();
+        let sealed = self
+            .vault
+            .seal(
+                &credential,
+                SecretKind::Agent,
+                SecretPrincipal::Actor(owner.clone()),
+                SecretPrincipal::Service(ServiceId::new(format!(
+                    "automation_receiver:{}",
+                    receiver.as_str()
+                ))),
+                &SecretBytes::new(sender_key.expose().as_bytes().to_vec()),
+            )
+            .map_err(|_| unavailable())?;
+        tx.execute("INSERT INTO public.credentials(id,kind,provider,encrypted_value,key_id,metadata,revoked_at,created_at,updated_at)
+            VALUES($1,'agent','automation_receiver',$2,$3,'{}'::jsonb,NULL,clock_timestamp(),clock_timestamp())",
+            &[&credential,&sealed,&receiver.as_str()]).await.map_err(|_|unavailable())?;
+        Ok((credential, sender_key))
+    }
+}
+
+async fn revoke_sender_key(tx: &Transaction<'_>, credential: &str) -> Result<(), AppError> {
+    tx.execute("UPDATE public.credentials SET revoked_at=coalesce(revoked_at,clock_timestamp()),updated_at=clock_timestamp()
+        WHERE id=$1::text::uuid AND kind='agent' AND provider='automation_receiver'",
+        &[&credential]).await.map_err(|_|unavailable())?;
+    Ok(())
+}
+
+/// Secret-free receiver projection with its content-free refusal intervals.
+pub(crate) async fn read_receiver(
+    tx: &Transaction<'_>,
+    deployment: &DeploymentId,
+    tenant: &TenantId,
+    receiver: &str,
+) -> Result<AutomationReceiver, AppError> {
+    let row = tx.query_one("SELECT r.*,(SELECT COALESCE(jsonb_agg(jsonb_build_object('reason',f.reason_code,'count',f.count,'firstAt',f.first_at,'lastAt',f.last_at) ORDER BY f.reason_code),'[]')
+          FROM openbot_internal.automation_receiver_refusals f WHERE (f.deployment_id,f.tenant_id,f.receiver_id)=(r.deployment_id,r.tenant_id,r.receiver_id)) AS refusals
+        FROM openbot_internal.automation_receivers r WHERE r.deployment_id=$1 AND r.tenant_id=$2 AND r.receiver_id=$3",
+        &[&deployment.as_str(),&tenant.as_str(),&receiver]).await.map_err(|_|unavailable())?;
+    Ok(AutomationReceiver {
+        id: column::<String>(&row, "receiver_id")?.try_into()?,
+        automation_id: column::<String>(&row, "automation_id")?.try_into()?,
+        adapter: string_value(column(&row, "adapter")?)?,
+        source_principal: stored(column(&row, "source_principal")?)?,
+        event_filter: stored(column(&row, "event_filter")?)?,
+        key_revision: column::<i64>(&row, "current_key_revision")?.try_into()?,
+        revoked_at: column(&row, "revoked_at")?,
+        refusals: stored(column(&row, "refusals")?)?,
+    })
 }
 
 impl PostgresAutomations {
@@ -612,7 +818,7 @@ impl PostgresAutomations {
                 )
             }
             AutomationUpdate::Enable { grant_consent, .. } => {
-                if !matches!(config.trigger, AutomationTrigger::Manual {}) {
+                if matches!(config.trigger, AutomationTrigger::Cron { .. }) {
                     return Err(AppError::AutomationTriggerUnavailable);
                 }
                 let facts = crate::delegation::owner_snapshot(
@@ -749,7 +955,7 @@ impl PostgresAutomations {
             &config.budget,
         )
         .await?;
-        self.audit(&tx, auth, &id, action).await?;
+        self.audit(&tx, Some(auth.actor()), &id, action).await?;
         let current = self.definition_row(&tx, auth, &id, false).await?;
         let projection = self.projection(&tx, &current).await?;
         tx.commit().await.map_err(|_| unavailable())?;

@@ -1,7 +1,7 @@
 //! Owner-scoped automation HTTP framing; commands retain all persistence and authority decisions.
 
 use crate::{
-    auth::{Authenticated, OriginAuthenticated, SensitiveAuthenticated},
+    auth::{Authenticated, FreshOriginAuthenticated, OriginAuthenticated, SensitiveAuthenticated},
     error::HttpError,
     http::ServerState,
 };
@@ -55,6 +55,15 @@ pub(crate) fn routes(state: ServerState) -> axum::Router {
             "/api/automation-deliveries/{id}",
             on(MethodFilter::GET, receipt).on(MethodFilter::HEAD, head_not_allowed),
         )
+        .route("/api/automations/{id}/receivers", post(create_receiver))
+        .route(
+            "/api/automation-receivers/{id}/rotate-key",
+            post(rotate_receiver_key),
+        )
+        .route(
+            "/api/automation-receivers/{id}",
+            axum::routing::delete(revoke_receiver),
+        )
         .with_state(state)
         .layer(axum::middleware::from_fn(bounded_request))
 }
@@ -63,7 +72,7 @@ async fn head_not_allowed() -> StatusCode {
     StatusCode::METHOD_NOT_ALLOWED
 }
 
-async fn bounded_request(
+pub(super) async fn bounded_request(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -308,6 +317,84 @@ pub async fn receipt(
         .await?
     {
         AppReply::AutomationReceipt(row) => Ok(Json(row)),
+        _ => Err(contract_error()),
+    }
+}
+
+/// Create a sender-key receiver under a fresh same-origin session; its key is shown only here.
+pub async fn create_receiver(
+    State(state): State<ServerState>,
+    FreshOriginAuthenticated(auth): FreshOriginAuthenticated,
+    RawQuery(query): RawQuery,
+    Path(id): Path<String>,
+    request_headers: HeaderMap,
+    body: Body,
+) -> Result<(StatusCode, Json<AutomationReceiverSecret>), HttpError> {
+    reject_query(query)?;
+    let automation_id = AutomationId::try_from(id).map_err(|_| malformed("automation_id"))?;
+    let input = json_input::<CreateAutomationReceiver>(&request_headers, body).await?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::CreateAutomationReceiver {
+                automation_id,
+                input,
+            },
+        )
+        .await?
+    {
+        AppReply::AutomationReceiverSecret(row) => Ok((StatusCode::CREATED, Json(row))),
+        _ => Err(contract_error()),
+    }
+}
+
+/// Rotate the current key with no overlap; a lost response is recovered by rotating again.
+pub async fn rotate_receiver_key(
+    State(state): State<ServerState>,
+    FreshOriginAuthenticated(auth): FreshOriginAuthenticated,
+    RawQuery(query): RawQuery,
+    Path(id): Path<String>,
+    request_headers: HeaderMap,
+    body: Body,
+) -> Result<Json<AutomationReceiverSecret>, HttpError> {
+    reject_query(query)?;
+    let receiver_id = AutomationReceiverId::try_from(id).map_err(|_| malformed("receiver_id"))?;
+    let input = json_input::<RotateAutomationReceiverKey>(&request_headers, body).await?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::RotateAutomationReceiverKey { receiver_id, input },
+        )
+        .await?
+    {
+        AppReply::AutomationReceiverSecret(row) => Ok(Json(row)),
+        _ => Err(contract_error()),
+    }
+}
+
+/// Revoke a receiver; its receipts and key namespace remain.
+pub async fn revoke_receiver(
+    State(state): State<ServerState>,
+    FreshOriginAuthenticated(auth): FreshOriginAuthenticated,
+    RawQuery(query): RawQuery,
+    Path(id): Path<String>,
+    request_headers: HeaderMap,
+    body: Body,
+) -> Result<Json<AutomationReceiver>, HttpError> {
+    reject_query(query)?;
+    let receiver_id = AutomationReceiverId::try_from(id).map_err(|_| malformed("receiver_id"))?;
+    let input = json_input::<RevokeAutomationReceiver>(&request_headers, body).await?;
+    match state
+        .application()
+        .execute(
+            auth,
+            AppCommand::RevokeAutomationReceiver { receiver_id, input },
+        )
+        .await?
+    {
+        AppReply::AutomationReceiver(row) => Ok(Json(row)),
         _ => Err(contract_error()),
     }
 }
