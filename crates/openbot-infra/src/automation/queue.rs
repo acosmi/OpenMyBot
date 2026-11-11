@@ -5,7 +5,9 @@ use super::{
     store::{adjust_pending, column, lock_workspace, unavailable},
 };
 use async_trait::async_trait;
-use openbot_application::{BeginDelegatedThreadRun, automation::AutomationDispatchQueue};
+use openbot_application::{
+    BeginDelegatedThreadRun, DelegatedUntrustedMaterial, automation::AutomationDispatchQueue,
+};
 use openbot_contracts::{
     auth::DelegationSource,
     automation::{AutomationId, AutomationOccurrenceReason},
@@ -73,6 +75,25 @@ impl AutomationDispatchQueue for PostgresAutomations {
                 }
             }
         }
+        // Delivery bodies are cleared seven days after their acceptance transaction; the
+        // permanent key, fingerprint and receipt remain for exact replay and conflict checks.
+        let cleared = tx.query("UPDATE openbot_internal.automation_deliveries SET normalized_data=NULL,data_cleared_at=statement_timestamp()
+            WHERE deployment_id=$1 AND tenant_id=$2 AND normalized_data IS NOT NULL AND terminal_at<=statement_timestamp()-interval '7 days'
+            RETURNING automation_id",
+            &[&self.deployment.as_str(),&self.tenant.as_str()]).await.map_err(|_|unavailable())?;
+        let cleared = cleared
+            .iter()
+            .map(|row| column::<String>(row, "automation_id"))
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        for id in cleared {
+            self.audit(
+                &tx,
+                None,
+                &AutomationId::try_from(id)?,
+                "automation_event_data_cleared",
+            )
+            .await?;
+        }
         tx.execute("UPDATE public.outbox o SET status='delivered',delivered_at=statement_timestamp(),updated_at=statement_timestamp()
             FROM openbot_internal.automation_occurrences a WHERE o.aggregate_id=a.occurrence_id AND o.destination='automation.dispatch' AND o.status='pending'
               AND a.deployment_id=$1 AND a.tenant_id=$2 AND a.state NOT IN ('pending','blocked_budget','blocked_model')",
@@ -82,11 +103,14 @@ impl AutomationDispatchQueue for PostgresAutomations {
     }
     async fn pending(&self) -> Result<Vec<BeginDelegatedThreadRun>, AppError> {
         let client = self.pool.get().await.map_err(|_| unavailable())?;
-        let rows=client.query("SELECT DISTINCT ON (a.automation_id) a.automation_id,a.occurrence_id,a.definition_revision,d.thread_id,d.bot_id
+        let rows=client.query("SELECT DISTINCT ON (a.automation_id) a.automation_id,a.occurrence_id,a.definition_revision,d.thread_id,d.bot_id,
+                a.delivery_receipt_id,v.normalized_data
             FROM openbot_internal.automation_occurrences a JOIN openbot_internal.automation_definitions d
               ON (d.deployment_id,d.tenant_id,d.automation_id)=(a.deployment_id,a.tenant_id,a.automation_id)
+            LEFT JOIN openbot_internal.automation_deliveries v
+              ON (v.deployment_id,v.tenant_id,v.receipt_id)=(a.deployment_id,a.tenant_id,a.delivery_receipt_id)
             WHERE d.deployment_id=$1 AND d.tenant_id=$2 AND d.state='enabled' AND d.current_revision=a.definition_revision
-              AND a.trigger_kind='manual' AND a.state IN ('pending','blocked_budget','blocked_model') AND a.expires_at>statement_timestamp()
+              AND a.trigger_kind IN ('manual','event') AND a.state IN ('pending','blocked_budget','blocked_model') AND a.expires_at>statement_timestamp()
             ORDER BY a.automation_id,a.accepted_at,a.occurrence_id LIMIT 1000",
             &[&self.deployment.as_str(),&self.tenant.as_str()]).await.map_err(|_|unavailable())?;
         rows.iter()
@@ -103,7 +127,18 @@ impl AutomationDispatchQueue for PostgresAutomations {
                     trigger_id: occurrence,
                     thread_id: ThreadId::new(column::<String>(row, "thread_id")?),
                     bot_id: BotId::new(column::<String>(row, "bot_id")?),
-                    untrusted_material: None,
+                    // Event data is a separate untrusted user-role message, never the template.
+                    untrusted_material: column::<Option<String>>(row, "delivery_receipt_id")?
+                        .map(|receipt| {
+                            let data: serde_json::Value =
+                                column::<Option<_>>(row, "normalized_data")?
+                                    .ok_or_else(unavailable)?;
+                            Ok::<_, AppError>(DelegatedUntrustedMaterial {
+                                source_ref: receipt,
+                                text: data.to_string(),
+                            })
+                        })
+                        .transpose()?,
                 })
             })
             .collect()

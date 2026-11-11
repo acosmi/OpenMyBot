@@ -855,6 +855,11 @@ async fn manual_commit_faults_and_lost_notify_converge() {
             f.auth.deployment().clone(),
             f.auth.tenant().clone(),
             openbot_domain::vault::SecretBytes::new(vec![0x51; 32]),
+            openbot_infra::vault::CredentialRecordVault::single_key(
+                f.auth.tenant().clone(),
+                openbot_domain::vault::KeyVersion::new(1),
+                openbot_domain::vault::WrappingKey::from_bytes(vec![0x42; 32]).unwrap(),
+            ),
         )
         .unwrap();
         proxy.drop_next_commit_ack();
