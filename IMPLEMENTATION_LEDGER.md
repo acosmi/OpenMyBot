@@ -278,6 +278,8 @@ Phase 8 completion point: V7-IMPL-047 (#233) is merged together with V7-COMP-026
 | FIX-006-1 | Host request binding rechecks read the raw session generation so a NULL or negative generation is refused (spec revision R484 §4.4) | [#283](https://github.com/acosmi/OpenMyBot/pull/283) | [7e9a767c55](https://github.com/acosmi/OpenMyBot/commit/7e9a767c55f8cccb16ab5c71ecf56986c23e668e) | 2026-11-08 |
 | FIX-008-1 | Artifact current-read negative-generation tests expect the pinned-schema refusal that runs before the generation check | [#283](https://github.com/acosmi/OpenMyBot/pull/283) | [7e9a767c55](https://github.com/acosmi/OpenMyBot/commit/7e9a767c55f8cccb16ab5c71ecf56986c23e668e) | 2026-11-08 |
 | FIX-042-1 | UI fixture test scopes its snapshot guard before the await so server clippy passes on all targets | [#284](https://github.com/acosmi/OpenMyBot/pull/284) | [7cb939a26a](https://github.com/acosmi/OpenMyBot/commit/7cb939a26a31de6812acb641d54cc7a003afa8d0) | 2026-11-08 |
+| V7-IMPL-054 | Durable Server automation definitions, scoped delegation grants, manual trigger receipts and three-scope run budgets (native 0054); closed-terminal payload predicate (FIX-036-1); an active Run continues across a re-grant that does not narrow its authority (spec revision R485 §5.3) | [#286](https://github.com/acosmi/OpenMyBot/pull/286) | [0fc5be3e7a](https://github.com/acosmi/OpenMyBot/commit/0fc5be3e7af3ee19c98d27597f203192a3aeece3) | 2026-11-10 |
+| FIX-054-1 | Automation budget admission reads incrementally kept balances, so reservation cost no longer grows with the attempt history | [#287](https://github.com/acosmi/OpenMyBot/pull/287) | [cb398c42bd](https://github.com/acosmi/OpenMyBot/commit/cb398c42bd4e6a3c43d3a0cd5dd157a6d8da0e71) | 2026-11-11 |
 
 ## Open
 
