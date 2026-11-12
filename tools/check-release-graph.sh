@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Supply-chain, source and secret checks on the actual macOS release feature graph of the desktop
-# launcher and on the built app bundle (spec revision R485, section 16.3 and acceptance A7).
+# launcher and on the built app bundle (supply-chain section and macOS release acceptance).
 #
 # Read-only: it never installs a tool, never fetches advisory or audit data and never edits
 # deny.toml or supply-chain/. A missing tool or an option the installed tool does not support is
@@ -71,9 +71,6 @@ deny_cmd=(cargo deny --log-level warn --manifest-path crates/openbot-desktop/Car
   bans licenses sources advisories)
 if ! command -v cargo-deny > /dev/null; then
   record cargo-deny not_evaluated null '' "${deny_cmd[*]}" '{"reason": "cargo-deny is not installed"}'
-elif grep -q '^all-features' "$deny_cfg"; then
-  record cargo-deny not_evaluated null "$(cargo deny --version)" "${deny_cmd[*]}" \
-    '{"reason": "deny.toml all-features setting changed shape; feature graph cannot be isolated"}'
 else
   rc=0
   "${deny_cmd[@]}" > "$out/cargo-deny.log" 2>&1 || rc=$?
@@ -99,19 +96,24 @@ if ! command -v cargo-audit > /dev/null; then
 else
   rc=0
   "${audit_cmd[@]}" > "$out/cargo-audit.json" 2> "$out/cargo-audit.log" || rc=$?
-  detail='{"scope": "whole lockfile, not the feature subgraph", "log": "cargo-audit.log"}'
-  if jq -e . "$out/cargo-audit.json" > /dev/null 2>&1; then
-    detail="$(jq -c --argjson graph "$graph_json" --argjson base "$detail" '
+  # The database revision makes a pass on a stale advisory database visible.
+  if detail="$(jq -ce --argjson graph "$graph_json" '
       def mark: (.package.name + " v" + .package.version) as $p
         | {id: (.advisory.id // null), package: $p,
            in_release_graph: (if $graph == null then null else any($graph[]; . == $p) end)};
-      $base + {vulnerabilities: [.vulnerabilities.list[] | mark],
-               warnings: [.warnings[]?[] | mark + {kind}]}
+      {scope: "whole lockfile, not the feature subgraph", log: "cargo-audit.log",
+       database: {last_commit: .database["last-commit"], last_updated: .database["last-updated"],
+                  advisory_count: .database["advisory-count"]},
+       vulnerabilities: [.vulnerabilities.list[] | mark],
+       warnings: [.warnings[]?[] | mark + {kind}]}
       | .vulnerability_count = (.vulnerabilities | length)
-      | .warning_count = (.warnings | length)' "$out/cargo-audit.json")"
+      | .warning_count = (.warnings | length)' "$out/cargo-audit.json" 2> /dev/null)"; then
+    record cargo-audit "$([[ $rc -eq 0 ]] && echo pass || echo fail)" "$rc" \
+      "$(cargo audit --version)" "${audit_cmd[*]}" "$detail"
+  else
+    record cargo-audit not_evaluated "$rc" "$(cargo audit --version)" "${audit_cmd[*]}" \
+      '{"reason": "no cargo-audit JSON report of the expected shape", "log": "cargo-audit.log"}'
   fi
-  record cargo-audit "$([[ $rc -eq 0 ]] && echo pass || echo fail)" "$rc" \
-    "$(cargo audit --version)" "${audit_cmd[*]}" "$detail"
 fi
 
 vet_cmd=(cargo vet --locked --output-format json)
@@ -120,52 +122,86 @@ if ! command -v cargo-vet > /dev/null; then
 else
   rc=0
   "${vet_cmd[@]}" > "$out/cargo-vet.json" 2> "$out/cargo-vet.log" || rc=$?
-  detail='{"scope": "whole lockfile, not the feature subgraph", "log": "cargo-vet.log"}'
-  if jq -e . "$out/cargo-vet.json" > /dev/null 2>&1; then
-    detail="$(jq -c --argjson graph "$graph_json" --argjson base "$detail" '
-      $base + {conclusion, unvetted: [.failures[]? | (.name + " v" + .version) as $p
+  if detail="$(jq -ce --argjson graph "$graph_json" '
+      {scope: "whole lockfile, not the feature subgraph", log: "cargo-vet.log", conclusion,
+       unvetted: [.failures[]? | (.name + " v" + .version) as $p
         | {package: $p, missing_criteria,
            in_release_graph: (if $graph == null then null else any($graph[]; . == $p) end)}]}
-      | .unvetted_count = (.unvetted | length)' "$out/cargo-vet.json")"
+      | .unvetted_count = (.unvetted | length)' "$out/cargo-vet.json" 2> /dev/null)"; then
+    record cargo-vet "$([[ $rc -eq 0 ]] && echo pass || echo fail)" "$rc" \
+      "$(cargo vet --version)" "${vet_cmd[*]}" "$detail"
+  else
+    record cargo-vet not_evaluated "$rc" "$(cargo vet --version)" "${vet_cmd[*]}" \
+      '{"reason": "no cargo-vet JSON report of the expected shape", "log": "cargo-vet.log"}'
   fi
-  record cargo-vet "$([[ $rc -eq 0 ]] && echo pass || echo fail)" "$rc" \
-    "$(cargo vet --version)" "${vet_cmd[*]}" "$detail"
 fi
 
-# (d) Secret scan of the built bundle with the repository rules. Inline allow markers and ignore
-# files are disabled, as in the repository guard; the report keeps matched values redacted.
-leaks_cmd=(gitleaks dir "$app" --config .gitleaks.toml --redact=100 --no-banner --no-color
-  --ignore-gitleaks-allow --gitleaks-ignore-path "$out/no-ignored-findings"
-  --report-format json --report-path "$out/gitleaks.json")
-if ! command -v gitleaks > /dev/null; then
-  record gitleaks not_evaluated null '' "${leaks_cmd[*]}" '{"reason": "gitleaks is not installed"}'
-else
-  rc=0
-  "${leaks_cmd[@]}" > "$out/gitleaks.log" 2>&1 || rc=$?
-  findings=null
-  [[ -f "$out/gitleaks.json" ]] && findings="$(jq length "$out/gitleaks.json")"
-  record gitleaks "$([[ $rc -eq 0 ]] && echo pass || echo fail)" "$rc" "$(gitleaks version)" \
-    "${leaks_cmd[*]}" "$(jq -cn --argjson n "$findings" \
-      '{findings: $n, report: "gitleaks.json", log: "gitleaks.log"}')"
-fi
-
-# (e) Release signing posture. An ad-hoc signed PostgreSQL bundle carries the
-# disable-library-validation entitlement, so neither may reach a release. Without --release the
-# findings are informational only.
-manifest="$app/Contents/Resources/postgres/manifest.json"
-pg_identity=null
-[[ -f "$manifest" ]] && pg_identity="$(jq -c '.signing_identity' "$manifest")"
+# (d) Mach-O inventory under Contents/, found by magic bytes. gitleaks skips binary files, so each
+# Mach-O is also dumped with strings -a for the secret scan, and its entitlements are read for (f).
+# strings reads the file from stdin so it sees every byte; given a path, macOS strings parses the
+# Mach-O and skips data outside the architecture slices. The C locale keeps the dump ASCII, because
+# a UTF-8 locale lets raw high bytes through and gitleaks then skips the dump as binary.
+mkdir -p "$out/strings"
+macho_count=0
+macho_bytes=0
+strings_bytes=0
 dlv_files=()
 while IFS= read -r -d '' file; do
   case "$(head -c 4 "$file" | xxd -p)" in
     cffaedfe | cefaedfe | cafebabe | cafebabf) ;;
     *) continue ;;
   esac
-  if codesign -d --entitlements :- "$file" 2> /dev/null | tr -d ' \t\n' \
+  rel="${file#"$app"/}"
+  mkdir -p "$(dirname "$out/strings/$rel")"
+  LC_ALL=C strings -a < "$file" > "$out/strings/$rel.txt"
+  macho_count=$((macho_count + 1))
+  macho_bytes=$((macho_bytes + $(wc -c < "$file")))
+  strings_bytes=$((strings_bytes + $(wc -c < "$out/strings/$rel.txt")))
+  if codesign -d --entitlements - --xml "$file" 2> /dev/null | tr -d ' \t\n' \
     | grep -q '<key>com.apple.security.cs.disable-library-validation</key><true/>'; then
-    dlv_files+=("${file#"$app"/}")
+    dlv_files+=("$rel")
   fi
 done < <(find "$app/Contents" -type f -print0)
+
+# (e) Secret scan with the repository rules of the bundle's text files and of the Mach-O strings.
+# Inline gitleaks:allow markers are disabled and the repository's ignore file is not used, as in the
+# repository guard; a .gitleaksignore inside the scanned tree itself is still honoured by gitleaks.
+# The reports keep matched values redacted.
+for scope in bundle macho-strings; do
+  if [[ $scope == bundle ]]; then
+    src="$app"
+    extra='{}'
+  else
+    src="$out/strings"
+    extra="$(jq -cn --argjson files "$macho_count" --argjson bytes "$macho_bytes" \
+      --argjson strings_bytes "$strings_bytes" '{macho_files: $files, macho_bytes: $bytes,
+        strings_bytes: $strings_bytes,
+        note: "strings -a cannot see secrets inside compressed embedded assets such as the UI bundle"}')"
+  fi
+  leaks_cmd=(gitleaks dir "$src" --config .gitleaks.toml --redact=100 --no-banner --no-color
+    --ignore-gitleaks-allow --gitleaks-ignore-path "$out/no-ignored-findings"
+    --report-format json --report-path "$out/gitleaks-$scope.json")
+  if ! command -v gitleaks > /dev/null; then
+    record "gitleaks-$scope" not_evaluated null '' "${leaks_cmd[*]}" \
+      '{"reason": "gitleaks is not installed"}'
+    continue
+  fi
+  rc=0
+  "${leaks_cmd[@]}" > "$out/gitleaks-$scope.log" 2>&1 || rc=$?
+  findings=null
+  [[ -f "$out/gitleaks-$scope.json" ]] && findings="$(jq length "$out/gitleaks-$scope.json")"
+  record "gitleaks-$scope" "$([[ $rc -eq 0 ]] && echo pass || echo fail)" "$rc" \
+    "$(gitleaks version)" "${leaks_cmd[*]}" "$(jq -cn --argjson n "$findings" --argjson extra "$extra" \
+      --arg scope "$scope" '{findings: $n, report: "gitleaks-\($scope).json",
+        log: "gitleaks-\($scope).log"} + $extra')"
+done
+
+# (f) Release signing posture. An ad-hoc signed PostgreSQL bundle carries the
+# disable-library-validation entitlement, so neither may reach a release. Without --release the
+# findings are informational only.
+manifest="$app/Contents/Resources/postgres/manifest.json"
+pg_identity=null
+[[ -f "$manifest" ]] && pg_identity="$(jq -c '.signing_identity' "$manifest")"
 signing_detail="$(jq -cn --argjson identity "$pg_identity" --argjson release "$release" \
   '$ARGS.positional as $dlv | {release: $release, postgres_manifest: "Contents/Resources/postgres/manifest.json",
     postgres_signing_identity: $identity, disable_library_validation: $dlv,
@@ -181,9 +217,9 @@ else
   signing_status=fail
 fi
 record release-signing "$signing_status" null '' \
-  'codesign -d --entitlements :- <each Mach-O under Contents/>' "$signing_detail"
+  'codesign -d --entitlements - --xml <each Mach-O under Contents/>' "$signing_detail"
 
-# (f) Summary. Every check must pass; not_evaluated is a failure of the gate, never a pass.
+# (g) Summary. Every check must pass; not_evaluated is a failure of the gate, never a pass.
 jq -s --arg app "$app" --arg target "$target" --argjson release "$release" '{
     app: $app, target: $target, release: $release, features: ["desktop-launcher"], package: "openbot-desktop",
     checks: .,
