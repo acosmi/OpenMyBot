@@ -86,6 +86,13 @@ async fn final_http_joint(tag: &str, change: JointChange) {
         let gate = FinalizeGate::new();
         fixture.install_actual(Mode::Sessions, Some(gate.clone())).await?;
         let setup_auth = fixture.auth(COOKIE_A).await?;
+        if matches!(change, JointChange::ConfigurationAndKey) {
+            // A configured policy keeps the late key visible: an unconfigured policy would hide
+            // the provider level and make the stale and fresh results equal.
+            fixture.pool.get().await.map_err(|_| "C7 policy setup acquire")?
+                .batch_execute("INSERT INTO public.action_policy(id,mode,deny,allow) VALUES('current','enforce',ARRAY['true'],'{}')")
+                .await.map_err(|_| "C7 policy setup")?;
+        }
         let mut pending = Some(start_http(fixture.router.clone(), COOKIE_A));
         let result = async {
             gate.entered().await?;
@@ -119,9 +126,9 @@ async fn final_http_joint(tag: &str, change: JointChange) {
             let actual = join_http(&mut pending, Duration::from_secs(3)).await?;
             require(fixture.port.as_ref().ok_or("C7 actual collector missing")?.calls() == (1, 1, 1),
                 "C7 original HTTP bypassed collector/finalizer/tail")?;
-            require(actual.value.get("capabilities").is_none(), "C7 stale whole projection leaked")?;
             match change {
                 JointChange::SessionAndPolicy => {
+                    require(actual.value.get("capabilities").is_none(), "C7 stale whole projection leaked")?;
                     require(actual.status == StatusCode::UNAUTHORIZED,
                         "C7 original A authority deletion must reject the whole HTTP result")?;
                     gate.release();
@@ -135,8 +142,15 @@ async fn final_http_joint(tag: &str, change: JointChange) {
                     require(fixture.auth(COOKIE_B).await?.auth_generation().get() == 0,
                         "C7 original A deletion advanced actor generation")?;
                 }
-                JointChange::ConfigurationAndKey => require(actual.status == StatusCode::SERVICE_UNAVAILABLE,
-                    "C7 late configured/key sources must not reuse an absent-source success")?,
+                JointChange::ConfigurationAndKey => {
+                    require(actual.status == StatusCode::OK, "C7 late configured/key sources refused the query")?;
+                    let dto: RuntimeCapabilitiesResponse = serde_json::from_value(actual.value)
+                        .map_err(|_| "C7 late source exact capability DTO")?;
+                    for id in [RuntimeCapabilityId::AgentTools, RuntimeCapabilityId::ModelCustomV1] {
+                        require(entry(&dto, id).reason_code() == RuntimeCapabilityReasonCode::ProviderUnproven,
+                            "C7 late configured/key sources reused the stale missing-key projection")?;
+                    }
+                }
             }
             require(fixture.fingerprint().await? == expected,
                 "C7 capability HTTP wrote beyond controller-only changes")?;
@@ -159,7 +173,7 @@ async fn actual_c7_http_final_session_policy_joint_preserves_sibling() {
 
 #[tokio::test]
 #[ignore = "requires root-owned isolated PostgreSQL"]
-async fn actual_c7_http_final_configuration_key_joint_refuses_stale_projection() {
+async fn actual_c7_http_final_configuration_key_joint_observes_late_sources() {
     final_http_joint("cap7configkey", JointChange::ConfigurationAndKey).await;
 }
 
