@@ -82,6 +82,9 @@ async fn two_work_journey_preserves_held_inputs_and_other_work() {
                 f.config.clone(),
                 "owned-v2-runtime".into(),
                 time::Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &f.pool, &DeploymentId::new(DEP), &TenantId::new(TENANT),
+                ),
             )
             .unwrap()
             .with_model_dataset_binding(f.binding.clone())

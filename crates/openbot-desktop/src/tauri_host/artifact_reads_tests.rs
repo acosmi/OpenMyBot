@@ -14,6 +14,7 @@ use crate::tauri_background::{
     DesktopLocalApplicationInput, DesktopLocalReleaseInput, DesktopLocalRuntimeConfig,
     PreparedDesktopLocalRuntime, prepare_desktop_local_runtime,
 };
+use crate::testing::on_large_stack;
 use crate::{DesktopAgentBudgets, DesktopOpenAiProviderInput};
 use http::{Method, Request, Response, StatusCode};
 use openbot_application::tenant::package::{
@@ -1136,26 +1137,6 @@ async fn spawned_bridge(
     tokio::spawn(async move { bridge(&protocol, label, request).await }.with_current_subscriber())
         .await
         .expect("spawned public reader request")
-}
-
-/// Runs a Prepared Local case on a 16 MiB thread over a two-worker runtime. The case body and the
-/// Prepared Local setup poll on this thread; unoptimized, they overflow the default 2 MiB test
-/// stack. Requests spawned from the body run on runtime workers with their default stack.
-fn on_large_stack<F: Future<Output = ()> + 'static>(case: fn() -> F) {
-    let polling = std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("test runtime")
-                .block_on(case())
-        })
-        .expect("test polling thread");
-    if let Err(panic) = polling.join() {
-        std::panic::resume_unwind(panic);
-    }
 }
 
 fn no_store(response: &Response<Vec<u8>>) -> Result<(), String> {

@@ -5,7 +5,6 @@
 //! that root with a no-clobber hard-link transaction. The resulting deployment/tenant plus the
 //! single local actor form the identity described by v4 §6.1.
 
-#[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
@@ -108,6 +107,11 @@ impl CurrentOsUserAppDataRoot {
     #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.0
+    }
+
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub(crate) fn retained_path_bytes(&self) -> u64 {
+        self.0.capacity() as u64
     }
 }
 
@@ -317,6 +321,32 @@ pub struct DesktopLocalInstallation {
     sidecar_data_dir: PathBuf,
 }
 
+/// The original app-data directory created by this installation attempt.
+/// Only a successful exclusive leaf creation can produce this non-Clone witness.
+pub struct OriginalFreshRoot {
+    _root: File,
+    _instance_id: Arc<str>,
+}
+
+impl core::fmt::Debug for OriginalFreshRoot {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("OriginalFreshRoot(<original held directory>)")
+    }
+}
+
+impl OriginalFreshRoot {
+    #[cfg(any(all(feature = "desktop-local", feature = "server-runtime"), test))]
+    pub(crate) fn into_root_for(
+        self,
+        authority: &DesktopLocalAuthority,
+    ) -> Result<File, DesktopLocalAuthorityError> {
+        if self._instance_id != authority.instance_id {
+            return Err(DesktopLocalAuthorityError::Corrupt);
+        }
+        Ok(self._root)
+    }
+}
+
 impl core::fmt::Debug for DesktopLocalInstallation {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -462,6 +492,186 @@ impl DesktopLocalInstallation {
     }
 }
 
+/// The selected restored generation a Current Local runtime names, before any
+/// readback: business IDs, its `data` child and both target key references
+/// (spec revision R484 ¶8023, ¶8132). Only that runtime forms it; it carries no
+/// authority, opens no principal and is never an AuthContext source.
+#[cfg(feature = "server-runtime")]
+pub struct RestoredLocalSite {
+    pub(crate) ids: [String; 4],
+    pub(crate) data_dir: PathBuf,
+    pub(crate) master: (String, String),
+    pub(crate) postgres_account: String,
+}
+
+#[cfg(feature = "server-runtime")]
+impl core::fmt::Debug for RestoredLocalSite {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("RestoredLocalSite(<selected generation>)")
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+impl RestoredLocalSite {
+    /// The target installation ID; the sidecar's lock and journal namespace.
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        &self.ids[0]
+    }
+
+    /// The deployment, tenant and dataset IDs the Vault canary must match.
+    #[must_use]
+    pub fn business_ids(&self) -> [&str; 3] {
+        [&self.ids[1], &self.ids[2], &self.ids[3]]
+    }
+
+    /// The generation's PostgreSQL directory.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The master target slot account and the canary key ID it names.
+    #[must_use]
+    pub fn master(&self) -> (&str, &str) {
+        (&self.master.0, &self.master.1)
+    }
+
+    /// The SCRAM target slot account.
+    #[must_use]
+    pub fn postgres_account(&self) -> &str {
+        &self.postgres_account
+    }
+
+    /// The same live attestation an installation makes, against this
+    /// generation's directory; it converts no installation authority.
+    pub async fn attest_postgres_admin(
+        &self,
+        admin: UnattestedDesktopLocalAdmin,
+    ) -> Result<AttestedDesktopLocalAdmin, DesktopLocalBootstrapError> {
+        if let Err(error) = verify_postgres_sidecar(admin.pool(), &self.data_dir).await {
+            admin.close();
+            return Err(error);
+        }
+        Ok(admin.into_attested())
+    }
+}
+
+/// Facts of a restored installation read back on the bound candidate with the
+/// new target-slot key: private IDs, the generation's PostgreSQL directory and
+/// tuple (spec revision R484 ¶8022). It carries no authority and is never an
+/// AuthContext source; it only feeds the same restore owner's publication.
+#[cfg(feature = "server-runtime")]
+pub struct VerifiedRestoreInstallationBinding {
+    instance_id: String,
+    deployment_id: String,
+    tenant_id: String,
+    dataset_id: String,
+    sidecar_data_dir: PathBuf,
+    pg_system_id: u64,
+    database_oid: u32,
+}
+
+#[cfg(feature = "server-runtime")]
+impl core::fmt::Debug for VerifiedRestoreInstallationBinding {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("VerifiedRestoreInstallationBinding(<restored facts>)")
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+impl VerifiedRestoreInstallationBinding {
+    /// Only the restore owner's installation readback forms these facts.
+    pub(crate) fn from_readback(
+        [instance_id, deployment_id, tenant_id, dataset_id]: [String; 4],
+        sidecar_data_dir: PathBuf,
+        pg_system_id: u64,
+        database_oid: u32,
+    ) -> Self {
+        Self {
+            instance_id,
+            deployment_id,
+            tenant_id,
+            dataset_id,
+            sidecar_data_dir,
+            pg_system_id,
+            database_oid,
+        }
+    }
+
+    pub(crate) fn ids(&self) -> [&str; 4] {
+        [
+            &self.instance_id,
+            &self.deployment_id,
+            &self.tenant_id,
+            &self.dataset_id,
+        ]
+    }
+
+    pub(crate) fn postgres(&self) -> (u64, u32) {
+        (self.pg_system_id, self.database_oid)
+    }
+}
+
+/// The same restored facts after the Current descriptor's publication was
+/// observed and read back and the Local subject confirmation gate succeeded
+/// (spec revision R484 ¶8024). Only that startup producer forms it.
+#[cfg(feature = "server-runtime")]
+pub struct VerifiedCurrentRestoreInstallationBinding {
+    restored: VerifiedRestoreInstallationBinding,
+}
+
+#[cfg(feature = "server-runtime")]
+impl VerifiedCurrentRestoreInstallationBinding {
+    /// The startup producer's single constructor, after its own Current and
+    /// subject checks; it does not repeat or replace them. That producer is
+    /// `RecoveryRuntimeOwner::current_restore_installation_before`.
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub(crate) fn after_current_gate(restored: VerifiedRestoreInstallationBinding) -> Self {
+        Self { restored }
+    }
+}
+
+#[cfg(feature = "server-runtime")]
+impl DesktopLocalInstallation {
+    /// The restored installation keeps its business IDs and uses the selected
+    /// generation's PostgreSQL directory; ordinary Fresh/Existing are unchanged
+    /// and no dataset can be overridden here (spec revision R484 ¶8024).
+    pub fn from_verified_current_restore(
+        binding: VerifiedCurrentRestoreInstallationBinding,
+    ) -> Result<Self, DesktopLocalAuthorityError> {
+        let restored = binding.restored;
+        let metadata = fs::symlink_metadata(&restored.sidecar_data_dir)
+            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(DesktopLocalAuthorityError::SidecarPermissionsInsecure);
+            }
+        }
+        let auth = AuthContextBuilder::from_verified_session(
+            DeploymentId::new(restored.deployment_id),
+            TenantId::new(restored.tenant_id),
+            ActorId::new(DESKTOP_LOCAL_ACTOR_ID),
+            AuthGeneration::new(0),
+            true,
+        )
+        .with_roles([Role::Admin, Role::User])
+        .build();
+        Ok(Self {
+            authority: DesktopLocalAuthority {
+                instance_id: Arc::from(restored.instance_id),
+                auth,
+            },
+            sidecar_data_dir: restored.sidecar_data_dir,
+        })
+    }
+}
+
 /// Mechanical result of the pre-window Desktop Local database bootstrap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopLocalBootstrapReport {
@@ -521,6 +731,16 @@ struct StoreInner {
 }
 
 impl DesktopLocalAuthorityStore {
+    #[cfg(feature = "desktop-local")]
+    pub(crate) fn app_data_root(&self) -> &CurrentOsUserAppDataRoot {
+        &self.inner.root
+    }
+
+    #[cfg(all(feature = "desktop-local", feature = "server-runtime"))]
+    pub(crate) fn original_app_data_root(&self) -> &Path {
+        self.inner.root.as_path()
+    }
+
     /// Bind to one host-asserted current-user app-data root.
     #[must_use]
     pub fn new(root: CurrentOsUserAppDataRoot) -> Self {
@@ -539,7 +759,7 @@ impl DesktopLocalAuthorityStore {
             .mutation
             .lock()
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
-        self.load_or_create_locked()
+        self.load_or_create_locked().map(|(authority, _)| authority)
     }
 
     /// Load/elect the authority and reserve its direct private PostgreSQL 17 data directory.
@@ -550,22 +770,69 @@ impl DesktopLocalAuthorityStore {
     pub fn load_or_create_installation(
         &self,
     ) -> Result<DesktopLocalInstallation, DesktopLocalAuthorityError> {
+        self.load_or_create_installation_for_recovery()
+            .map(|(installation, _)| installation)
+    }
+
+    /// Load the same installation and carry the original exclusive root-creation witness.
+    /// A pre-existing directory, including an empty one, never produces Fresh evidence.
+    pub fn load_or_create_installation_for_recovery(
+        &self,
+    ) -> Result<(DesktopLocalInstallation, Option<OriginalFreshRoot>), DesktopLocalAuthorityError>
+    {
         let _guard = self
             .inner
             .mutation
             .lock()
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
-        let authority = self.load_or_create_locked()?;
+        let (authority, root) = self.load_or_create_locked()?;
         let sidecar_data_dir =
             prepare_sidecar_data_dir(self.inner.root.as_path(), authority.instance_id())?;
+        let fresh = root.map(|root| OriginalFreshRoot {
+            _root: root,
+            _instance_id: Arc::clone(&authority.instance_id),
+        });
+        Ok((
+            DesktopLocalInstallation {
+                authority,
+                sidecar_data_dir,
+            },
+            fresh,
+        ))
+    }
+
+    /// Read the existing installation without electing an identity or creating a directory.
+    pub fn load_existing_installation(
+        &self,
+    ) -> Result<DesktopLocalInstallation, DesktopLocalAuthorityError> {
+        let _guard = self
+            .inner
+            .mutation
+            .lock()
+            .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        let root = self.inner.root.as_path();
+        // The recovery owner has already checked the held root; this reader never repairs it.
+        let metadata =
+            fs::symlink_metadata(root).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+        }
+        let instance =
+            read_instance(&root.join(FILE_NAME))?.ok_or(DesktopLocalAuthorityError::Corrupt)?;
+        let authority = authority(instance);
+        let sidecar_data_dir =
+            root.join(format!("{SIDECAR_DATA_PREFIX}{}", authority.instance_id()));
+        validate_existing_sidecar_data_dir(root, &sidecar_data_dir)?;
         Ok(DesktopLocalInstallation {
             authority,
             sidecar_data_dir,
         })
     }
 
-    fn load_or_create_locked(&self) -> Result<DesktopLocalAuthority, DesktopLocalAuthorityError> {
-        prepare_root(self.inner.root.as_path())?;
+    fn load_or_create_locked(
+        &self,
+    ) -> Result<(DesktopLocalAuthority, Option<File>), DesktopLocalAuthorityError> {
+        let original_root = prepare_root(self.inner.root.as_path())?;
         let path = self.inner.root.as_path().join(FILE_NAME);
         let instance = match read_instance(&path)? {
             Some(instance) => {
@@ -574,7 +841,7 @@ impl DesktopLocalAuthorityStore {
             }
             None => elect_instance(self.inner.root.as_path(), &path)?,
         };
-        Ok(authority(instance))
+        Ok((authority(instance), original_root))
     }
 }
 
@@ -591,18 +858,7 @@ fn prepare_sidecar_data_dir(
     }
     let path = root.join(format!("{SIDECAR_DATA_PREFIX}{instance_id}"));
     match fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-                return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(DesktopLocalAuthorityError::SidecarPermissionsInsecure);
-                }
-            }
-        }
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let builder = fs::DirBuilder::new();
             #[cfg(unix)]
@@ -619,14 +875,34 @@ fn prepare_sidecar_data_dir(
         }
         Err(_) => return Err(DesktopLocalAuthorityError::Unavailable),
     }
+    validate_existing_sidecar_data_dir(root, &path)?;
+    Ok(path)
+}
+
+fn validate_existing_sidecar_data_dir(
+    root: &Path,
+    path: &Path,
+) -> Result<(), DesktopLocalAuthorityError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(DesktopLocalAuthorityError::SidecarPermissionsInsecure);
+        }
+    }
     let canonical_root =
         fs::canonicalize(root).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
     let canonical_path =
-        fs::canonicalize(&path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        fs::canonicalize(path).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
     if canonical_path.parent() != Some(canonical_root.as_path()) {
         return Err(DesktopLocalAuthorityError::SidecarPathCorrupt);
     }
-    Ok(path)
+    Ok(())
 }
 
 async fn verify_postgres_sidecar(
@@ -745,25 +1021,90 @@ fn listen_addresses_are_local(value: &str) -> bool {
         .all(|address| matches!(address.trim(), "" | "127.0.0.1" | "::1"))
 }
 
-fn prepare_root(root: &Path) -> Result<(), DesktopLocalAuthorityError> {
-    match fs::symlink_metadata(root) {
+fn prepare_root(root: &Path) -> Result<Option<File>, DesktopLocalAuthorityError> {
+    let created = match fs::symlink_metadata(root) {
         Ok(metadata) => {
             if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
                 return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
             }
+            false
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(root).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+            let parent = root
+                .parent()
+                .ok_or(DesktopLocalAuthorityError::InvalidAppDataRoot)?;
+            fs::create_dir_all(parent).map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            match builder.create(root) {
+                Ok(()) => true,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(root)
+                        .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+                    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                        return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+                    }
+                    false
+                }
+                Err(_) => return Err(DesktopLocalAuthorityError::Unavailable),
+            }
         }
         Err(_) => return Err(DesktopLocalAuthorityError::Unavailable),
-    }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
             .map_err(|_| DesktopLocalAuthorityError::Unavailable)?;
+        if created {
+            use rustix::fs::{Mode, OFlags};
+            use std::os::unix::fs::MetadataExt as _;
+            use std::path::Component;
+            // Retain the same no-symlink walk and actual private-root checks
+            // at the OS-path boundary, including builds without artifact runtime.
+            let mut held =
+                File::open("/").map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?;
+            for component in root.components() {
+                match component {
+                    Component::RootDir => {}
+                    Component::Normal(name) => {
+                        held = File::from(
+                            rustix::fs::openat(
+                                &held,
+                                name,
+                                OFlags::RDONLY
+                                    | OFlags::DIRECTORY
+                                    | OFlags::NOFOLLOW
+                                    | OFlags::CLOEXEC,
+                                Mode::empty(),
+                            )
+                            .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?,
+                        );
+                    }
+                    Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                        return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+                    }
+                }
+            }
+            let metadata = held
+                .metadata()
+                .map_err(|_| DesktopLocalAuthorityError::InvalidAppDataRoot)?;
+            if !metadata.is_dir()
+                || metadata.mode() & 0o7777 != 0o700
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+            {
+                return Err(DesktopLocalAuthorityError::InvalidAppDataRoot);
+            }
+            return Ok(Some(held));
+        }
     }
-    Ok(())
+    #[cfg(not(unix))]
+    let _ = created;
+    Ok(None)
 }
 
 fn read_instance(path: &Path) -> Result<Option<[u8; INSTANCE_BYTES]>, DesktopLocalAuthorityError> {
@@ -992,6 +1333,31 @@ mod tests {
     }
 
     #[test]
+    fn existing_installation_reader_never_elects_or_creates_missing_inputs() {
+        let missing = root("existing-reader-missing");
+        assert!(store(&missing).load_existing_installation().is_err());
+        assert!(!missing.exists());
+        let fixture_name = root("existing-reader-positive");
+        let existing = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(fixture_name.file_name().unwrap());
+        let installation = store(&existing).load_or_create_installation().unwrap();
+        let bytes = fs::read(existing.join(FILE_NAME)).unwrap();
+        let observed = store(&existing).load_existing_installation().unwrap();
+        assert_eq!(observed.authority(), installation.authority());
+        assert_eq!(observed.sidecar_data_dir(), installation.sidecar_data_dir());
+        assert_eq!(fs::read(existing.join(FILE_NAME)).unwrap(), bytes);
+        fs::remove_dir(installation.sidecar_data_dir()).unwrap();
+        assert!(store(&existing).load_existing_installation().is_err());
+        assert!(!installation.sidecar_data_dir().exists());
+        assert_eq!(fs::read(existing.join(FILE_NAME)).unwrap(), bytes);
+        fs::remove_file(existing.join(FILE_NAME)).unwrap();
+        assert!(store(&existing).load_existing_installation().is_err());
+        assert_eq!(fs::read_dir(&existing).unwrap().count(), 0);
+        fs::remove_dir(existing).unwrap();
+    }
+
+    #[test]
     fn first_run_and_restart_produce_the_same_single_user_admin_authority() {
         let root = root("restart");
         let first = store(&root).load_or_create().unwrap();
@@ -1119,6 +1485,60 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_fresh_root_witness_requires_exclusive_leaf_creation() {
+        use std::os::unix::fs::MetadataExt as _;
+        let fresh_path = root("ordinary-fresh-witness");
+        let (installation, fresh) = store(&fresh_path)
+            .load_or_create_installation_for_recovery()
+            .unwrap();
+        let held = fresh
+            .expect("this call created the original leaf")
+            .into_root_for(installation.authority())
+            .unwrap();
+        assert_eq!(
+            held.metadata().unwrap().ino(),
+            fs::metadata(&fresh_path).unwrap().ino()
+        );
+        let (again, reused) = store(&fresh_path)
+            .load_or_create_installation_for_recovery()
+            .unwrap();
+        assert!(reused.is_none());
+        assert_eq!(installation, again);
+        drop(held);
+        fs::remove_dir_all(fresh_path).unwrap();
+
+        let existing_path = root("ordinary-existing-empty");
+        fs::create_dir_all(&existing_path).unwrap();
+        let (_, fresh) = store(&existing_path)
+            .load_or_create_installation_for_recovery()
+            .unwrap();
+        assert!(fresh.is_none(), "an existing empty leaf is not Fresh");
+        fs::remove_dir_all(existing_path).unwrap();
+
+        let raced_path = root("ordinary-raced-leaf");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let path = raced_path.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_root(&path).unwrap()
+            }));
+        }
+        let first_fresh = workers.remove(0).join().unwrap();
+        let second_fresh = workers.remove(0).join().unwrap();
+        assert_eq!(
+            usize::from(first_fresh.is_some()) + usize::from(second_fresh.is_some()),
+            1,
+            "only the exclusive leaf creator receives the witness"
+        );
+        drop((first_fresh, second_fresh));
+        fs::remove_dir_all(raced_path).unwrap();
     }
 
     #[cfg(unix)]

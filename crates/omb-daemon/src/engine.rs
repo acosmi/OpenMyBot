@@ -188,7 +188,13 @@ pub(crate) async fn assemble(
         )
         .map_err(|_| DaemonError::EngineAssemblyFailed)?,
     );
+    let recovery_gate = openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+        &pool,
+        &deployment,
+        &tenant,
+    );
     let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+        recovery_gate: recovery_gate.clone(),
         pool: pool.clone(),
         listener_database: database.into(),
         deployment: deployment.clone(),
@@ -227,13 +233,15 @@ pub(crate) async fn assemble(
     })
     .await
     .map_err(|_| DaemonError::EngineAssemblyFailed)?;
+    let resolver =
+        SingleUserAuthResolver::from_verified_principal(principal, default_session_lifetime());
+    resolver
+        .install_recovery_read_gate(&pool, recovery_gate)
+        .map_err(|_| DaemonError::EngineAssemblyFailed)?;
     Ok(Engine {
         assembly,
         authority,
-        resolver: SingleUserAuthResolver::from_verified_principal(
-            principal,
-            default_session_lifetime(),
-        ),
+        resolver,
         vault,
         pool,
         deployment,

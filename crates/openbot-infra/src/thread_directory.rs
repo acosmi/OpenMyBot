@@ -143,16 +143,21 @@ pub struct PostgresThreadDirectory {
     runtime: Option<RuntimeLease>,
     model_dataset_binding:
         Option<std::sync::Arc<crate::model_dataset::PostgresModelDatasetBinding>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl PostgresThreadDirectory {
     /// 用共享连接池构造只读/mint 目录；`begin_thread_run` 会 fail-closed。
     #[must_use]
-    pub fn new(pool: crate::db::pool::DatabasePool) -> Self {
+    pub fn new(
+        pool: crate::db::pool::DatabasePool,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
+    ) -> Self {
         Self {
             pool,
             runtime: None,
             model_dataset_binding: None,
+            recovery_gate,
         }
     }
 
@@ -166,6 +171,7 @@ impl PostgresThreadDirectory {
         database: impl Into<ThreadListenerDatabase>,
         owner_id: String,
         duration: Duration,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, ThreadDirectoryError> {
         if owner_id.is_empty() || duration <= Duration::ZERO {
             return Err(ThreadDirectoryError::Corrupt {
@@ -181,6 +187,7 @@ impl PostgresThreadDirectory {
                 duration,
             }),
             model_dataset_binding: None,
+            recovery_gate,
         })
     }
 
@@ -198,6 +205,26 @@ impl PostgresThreadDirectory {
         Ok(self)
     }
 
+    /// One worker admission per thread entry that has no bound of its own:
+    /// these SQL transactions are capped by the 5 s lock wait, so the 5 s precedent.
+    async fn admission(
+        &self,
+    ) -> Result<
+        (
+            crate::recovery_control::RecoveryWorkerLease<'_>,
+            std::time::Instant,
+        ),
+        ThreadDirectoryError,
+    > {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
+        Ok((admission, deadline))
+    }
+
     pub(crate) async fn begin_delegated(
         &self,
         delegated: openbot_application::DelegatedBegin,
@@ -208,6 +235,7 @@ impl PostgresThreadDirectory {
                 dependency: "thread_directory",
             },
         )?;
+        let (admission, deadline) = self.admission().await.map_err(|e| e.into_app_error())?;
         let mut client = self.pool.get().await.map_err(|_| {
             openbot_contracts::error::AppError::DependencyUnavailable {
                 dependency: "delegation_store",
@@ -268,14 +296,20 @@ impl PostgresThreadDirectory {
             &[],
             &schema,
             Some(&delegated),
+            &admission,
             automation.as_ref(),
         )
         .await;
         match result {
             Ok(BeginOutcome::Created(receipt)) => {
-                if let Some(admission) = automation.take() {
-                    admission.associate(&tx, &delegated).await?;
+                if let Some(automation) = automation.take() {
+                    automation.associate(&tx, &delegated).await?;
                 }
+                admission.verify_current_before(deadline).map_err(|_| {
+                    openbot_contracts::error::AppError::DependencyUnavailable {
+                        dependency: "thread_directory",
+                    }
+                })?;
                 tx.commit().await.map_err(|_| {
                     if automation_source {
                         crate::automation::store::unavailable()
@@ -312,6 +346,7 @@ impl PostgresThreadDirectory {
             .runtime
             .as_ref()
             .ok_or(ThreadDirectoryError::Unavailable)?;
+        let (admission, deadline) = self.admission().await?;
         let mut client = self.pool.get().await.map_err(|error| {
             tracing::error!(error = %error, "begin thread run 获取数据库连接失败");
             ThreadDirectoryError::Unavailable
@@ -326,7 +361,7 @@ impl PostgresThreadDirectory {
             .batch_execute("SET LOCAL lock_timeout='5s'")
             .await
             .map_err(|error| unavailable("begin thread run 设置锁等待限制失败", error))?;
-        let outcome = apply_begin(&transaction, runtime, &request, &materials).await;
+        let outcome = apply_begin(&transaction, runtime, &request, &materials, &admission).await;
         match outcome {
             Ok(BeginOutcome::Replayed(receipt)) => {
                 if let Err(error) = transaction.rollback().await {
@@ -338,6 +373,9 @@ impl PostgresThreadDirectory {
                 Ok(receipt)
             }
             Ok(BeginOutcome::Created(receipt)) => {
+                admission
+                    .verify_current_before(deadline)
+                    .map_err(|_| ThreadDirectoryError::Unavailable)?;
                 transaction.commit().await.map_err(|error| {
                     tracing::error!(error = %error, "begin thread run commit 结果未知");
                     ThreadDirectoryError::CommitUnknown
@@ -567,6 +605,12 @@ impl PostgresThreadDirectory {
         progress: &V2BeginProgress,
         materials: &[RunInputArtifactMaterial],
     ) -> Result<ThreadRunStarted, ThreadDirectoryError> {
+        // The worker admission is held from the first read to the Run's COMMIT.
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         let binding = self
             .model_dataset_binding
             .as_ref()
@@ -597,7 +641,7 @@ impl PostgresThreadDirectory {
             )
             .await
             .map_err(|_| ThreadDirectoryError::Unavailable)?;
-        let outcome = apply_begin_v2(&transaction, runtime, request, materials).await;
+        let outcome = apply_begin_v2(&transaction, runtime, request, materials, &admission).await;
         match outcome {
             Ok(BeginOutcome::Replayed(receipt)) => {
                 progress
@@ -616,6 +660,9 @@ impl PostgresThreadDirectory {
                 if std::time::Instant::now() >= deadline {
                     return Err(ThreadDirectoryError::Unavailable);
                 }
+                admission
+                    .verify_current_before(deadline)
+                    .map_err(|_| ThreadDirectoryError::Unavailable)?;
                 // This observes entry into the possible COMMIT call, never a wire send or ACK.
                 progress
                     .stage
@@ -696,6 +743,12 @@ impl ThreadDirectory for PostgresThreadDirectory {
             .as_ref()
             .ok_or(ThreadDirectoryError::Unavailable)?;
         let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
+        // Held from the pending row read to its COMMIT, like an ordinary begin.
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         let mut checkout = binding
             .checkout(deadline)
             .await
@@ -823,6 +876,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
                             ) {
                                 Ok(()) => apply_begin_v2_observed(
                                     &original, runtime, &request, &materials, &schema, None,
+                                    &admission,
                                 )
                                 .await
                                 .map(|_| ())
@@ -864,6 +918,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         tx.execute("UPDATE openbot_internal.thread_pending_inputs SET state=$2,held_reason=$3,last_error=$4,
             state_changed_at=CASE WHEN state<>$2 THEN clock_timestamp() ELSE state_changed_at END WHERE run_id=$1",
             &[&run,&state,&held,&last_error]).await.map_err(|_| ThreadDirectoryError::Unavailable)?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         original.commit().await.map_err(map_v2_commit_end_error)
     }
 
@@ -876,6 +933,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         limit: u32,
     ) -> Result<openbot_contracts::command::BotThreadPage, ThreadDirectoryError> {
         use openbot_contracts::command::{BotThreadForeground, BotThreadPage, BotThreadSummary};
+        let (admission, deadline) = self.admission().await?;
         let mut client = self
             .pool
             .get()
@@ -1026,6 +1084,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         } else {
             None
         };
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         tx.commit()
             .await
             .map_err(|_| ThreadDirectoryError::Unavailable)?;
@@ -1041,6 +1102,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         thread_id: &ThreadId,
         title: String,
     ) -> Result<openbot_contracts::command::ThreadTitleSet, ThreadDirectoryError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self
             .pool
             .get()
@@ -1114,6 +1176,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         )
         .await
         .map_err(|error| write_error("rename conversation", error))?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         tx.commit()
             .await
             .map_err(|error| write_error("commit conversation rename", error))?;
@@ -1128,6 +1193,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         auth: &openbot_contracts::auth::AuthContext,
         thread_id: &ThreadId,
     ) -> Result<openbot_contracts::command::PendingInputs, ThreadDirectoryError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self
             .pool
             .get()
@@ -1177,6 +1243,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
                 artifact_refs: decode(&row, "artifact_refs")?,
             });
         }
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         tx.rollback()
             .await
             .map_err(|_| ThreadDirectoryError::Unavailable)?;
@@ -1189,6 +1258,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         thread_id: &ThreadId,
         run_id: Option<&openbot_contracts::ids::RunId>,
     ) -> Result<openbot_contracts::command::ThreadWorkStopped, ThreadDirectoryError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self
             .pool
             .get()
@@ -1248,6 +1318,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         )
         .await
         .map_err(|e| write_error("touch stopped conversation", e))?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         tx.commit()
             .await
             .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
@@ -1265,6 +1338,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         thread_id: &ThreadId,
         run_id: &openbot_contracts::ids::RunId,
     ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self
             .pool
             .get()
@@ -1298,6 +1372,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         )
         .await
         .map_err(|e| write_error("touch released conversation", e))?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         tx.commit()
             .await
             .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
@@ -1312,6 +1389,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         auth: &openbot_contracts::auth::AuthContext,
         thread_id: &ThreadId,
     ) -> Result<openbot_contracts::command::ThreadCompleted, ThreadDirectoryError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self
             .pool
             .get()
@@ -1366,6 +1444,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         )
         .await
         .map_err(|e| write_error("archive conversation", e))?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         tx.commit()
             .await
             .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
@@ -1380,6 +1461,7 @@ impl ThreadDirectory for PostgresThreadDirectory {
         thread_id: &ThreadId,
         run_id: &openbot_contracts::ids::RunId,
     ) -> Result<openbot_contracts::command::PendingInputReceipt, ThreadDirectoryError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self
             .pool
             .get()
@@ -1413,6 +1495,9 @@ impl ThreadDirectory for PostgresThreadDirectory {
         )
         .await
         .map_err(|error| write_error("touch withdrawn conversation", error))?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         tx.commit()
             .await
             .map_err(|_| ThreadDirectoryError::CommitUnknown)?;
@@ -1441,6 +1526,11 @@ impl ThreadDirectory for PostgresThreadDirectory {
             });
         }
         let deadline = std::time::Instant::now() + CUSTOM_MODEL_V2_ACCEPT_TIMEOUT;
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ThreadDirectoryError::Unavailable)?;
         let progress = V2BeginProgress::default();
         let work = async {
             let mut checkout = binding
@@ -1460,11 +1550,19 @@ impl ThreadDirectory for PostgresThreadDirectory {
                 "SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true)",
                 &[&remaining],
             ).await.map_err(|_| ThreadDirectoryError::Unavailable)?;
-            match apply_submit_input(&original, runtime, &request, materials.as_deref()).await {
+            match apply_submit_input(
+                &original,
+                runtime,
+                &request,
+                materials.as_deref(),
+                &admission,
+            )
+            .await
+            {
                 Ok(SubmissionOutcome::Written(outcome)) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(ThreadDirectoryError::Unavailable);
-                    }
+                    admission
+                        .verify_current_before(deadline)
+                        .map_err(|_| ThreadDirectoryError::Unavailable)?;
                     progress
                         .stage
                         .store(V2_COMMIT_ENTERED, std::sync::atomic::Ordering::SeqCst);
@@ -2818,6 +2916,7 @@ async fn apply_submit_input(
     runtime: &RuntimeLease,
     request: &BeginThreadRunV2Request,
     materials: Option<&[RunInputArtifactMaterial]>,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
 ) -> Result<SubmissionOutcome, ThreadDirectoryError> {
     let tx = original.as_transaction();
     let schema = crate::thread_history_writer::CurrentWriterSchema::observe(tx)
@@ -2951,8 +3050,16 @@ async fn apply_submit_input(
         tx.batch_execute("SAVEPOINT pending_input_begin")
             .await
             .map_err(|error| unavailable("save input begin boundary", error))?;
-        match apply_begin_v2_observed(original, runtime, request, materials, &schema, Some(now))
-            .await
+        match apply_begin_v2_observed(
+            original,
+            runtime,
+            request,
+            materials,
+            &schema,
+            Some(now),
+            admission,
+        )
+        .await
         {
             Ok(BeginOutcome::Created(receipt)) => {
                 return Ok(SubmissionOutcome::Written(ThreadInputOutcome::Started(
@@ -3038,6 +3145,7 @@ async fn apply_begin(
     runtime: &RuntimeLease,
     request: &BeginThreadRunRequest,
     materials: &[RunInputArtifactMaterial],
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     // One same-transaction observation of the strict current schema, before any lock;
     // writer admission and the channel source below consume this proof.
@@ -3051,11 +3159,13 @@ async fn apply_begin(
         materials,
         &schema,
         None,
+        admission,
         None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_begin_observed(
     transaction: &Transaction<'_>,
     runtime: &RuntimeLease,
@@ -3063,6 +3173,7 @@ async fn apply_begin_observed(
     materials: &[RunInputArtifactMaterial],
     schema: &crate::thread_history_writer::CurrentWriterSchema<'_, '_>,
     delegated: Option<&openbot_application::DelegatedBegin>,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
     automation: Option<&crate::automation::dispatch::AutomationBeginAdmission>,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     // New artifact inputs must serialize with the original cleanup actor UPDATE
@@ -3218,7 +3329,7 @@ async fn apply_begin_observed(
         return Err(ThreadDirectoryError::NotVisible);
     }
     let skill_snapshots = skills::resolve(transaction, request).await?;
-    let model_snapshot = crate::model_runtime::resolve(transaction, request).await?;
+    let model_snapshot = crate::model_runtime::resolve(transaction, request, admission).await?;
     artifact_refs::verify_current(
         transaction,
         schema,
@@ -3948,6 +4059,7 @@ async fn apply_begin_v2(
     runtime: &RuntimeLease,
     request: &BeginThreadRunV2Request,
     materials: &[RunInputArtifactMaterial],
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     let transaction = model_transaction.as_transaction();
     // One same-transaction observation of the strict current schema, before any lock;
@@ -3969,6 +4081,7 @@ async fn apply_begin_v2(
         materials,
         &schema,
         None,
+        admission,
     )
     .await
 }
@@ -3980,6 +4093,7 @@ async fn apply_begin_v2_observed(
     materials: &[RunInputArtifactMaterial],
     schema: &crate::thread_history_writer::CurrentWriterSchema<'_, '_>,
     accepted_at: Option<OffsetDateTime>,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
 ) -> Result<BeginOutcome, ThreadDirectoryError> {
     let transaction = model_transaction.as_transaction();
     crate::model_runtime::validate_actor_v2(transaction, request).await?;
@@ -4074,7 +4188,7 @@ async fn apply_begin_v2_observed(
     crate::model_runtime::validate_actor_v2(transaction, request).await?;
     crate::model_runtime::validate_target_v2(transaction, request).await?;
     let skill_snapshots = skills::resolve_v2(transaction, request).await?;
-    let model_snapshot = crate::model_runtime::resolve_v2(transaction, request).await?;
+    let model_snapshot = crate::model_runtime::resolve_v2(transaction, request, admission).await?;
     let dataset = model_transaction
         .verify_current_dataset()
         .await
@@ -4601,4 +4715,103 @@ async fn replay_existing_v2(
         event_sequence,
         replayed: true,
     }))
+}
+
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod restore_consumer_tests {
+    use super::*;
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use crate::vault::CredentialRecordVault;
+    use openbot_contracts::auth::AuthGeneration;
+    use openbot_contracts::command::BeginThreadRun;
+    use openbot_contracts::ids::RunId;
+    use openbot_contracts::model_connections::RunModelSelection;
+    use openbot_domain::vault::{KeyVersion, WrappingKey};
+
+    /// T046-32 on a published RestoreCurrent: the begin's worker lease carries
+    /// the restored cohort, so a model selection naming a connection whose
+    /// requirement has no receipt is not visible and writes no run. The
+    /// legacy begin is used: the v2 begin's dataset registry fails its public
+    /// schema check on this restored target (CHECK text rendered in UTC).
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_32_unconfirmed_model_selection_begins_no_run() {
+        let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
+        let (p, dep, ten) = (
+            restored.pool.clone(),
+            DeploymentId::new("dep"),
+            TenantId::new("ten"),
+        );
+        p.get().await.unwrap().batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
+            INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');
+            INSERT INTO public.agents(id,name,type,configuration) VALUES('bot','Restored bot','built_in','{\"systemPrompt\":\"Restored prompt\",\"providerSource\":\"managed\"}');
+            INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility) VALUES('bot','alice','Restored bot','','restored','public');").await.unwrap();
+        let vault = CredentialRecordVault::single_key(
+            ten.clone(),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x76; 32]).unwrap(),
+        );
+        let listener = ThreadListenerDatabase::desktop_local(5432, &[b'a'; 64]).unwrap();
+        let directory = PostgresThreadDirectory::with_runtime(
+            p.clone(),
+            listener,
+            "restored-runtime".into(),
+            Duration::seconds(30),
+            restored.read_gate(),
+        )
+        .unwrap();
+        let model =
+            crate::restore_reconfirmation::tests::model_connection(&restored, &vault, "alice")
+                .await
+                .to_string();
+        let requirement = crate::restore_reconfirmation::tests::bound_requirement(
+            &restored,
+            "model_secret",
+            &model,
+        )
+        .await;
+        let req = BeginThreadRunRequest {
+            deployment: dep.clone(),
+            tenant: ten.clone(),
+            actor: ActorId::new("alice"),
+            auth_generation: AuthGeneration::new(7),
+            command: BeginThreadRun {
+                artifact_refs: Vec::new(),
+                thread_id: ThreadIdentity::new(&dep).mint_from_entropy([7; 16]),
+                run_id: RunId::new("restored-run"),
+                bot_id: BotId::new("bot"),
+                anchor: ThreadRunAnchor::DirectBot,
+                message: "Restored selection words".into(),
+                selected_skill_slugs: vec![],
+                model_selection: Some(RunModelSelection {
+                    connection_id: model.clone(),
+                    expected_revision: 1,
+                }),
+            },
+        };
+        let runs = || async {
+            p.get()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT count(*)::bigint FROM public.runs WHERE run_id='restored-run'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        };
+
+        assert!(matches!(
+            directory.begin_thread_run(req.clone()).await,
+            Err(ThreadDirectoryError::NotVisible)
+        ));
+        assert_eq!(runs().await, 0, "the refused begin wrote a run");
+
+        // Positive control: one receipt for the same requirement admits the same begin.
+        restored.confirm(requirement, "alice", "fresh_actor").await;
+        directory.begin_thread_run(req).await.unwrap();
+        assert_eq!(runs().await, 1);
+        drop(directory);
+    }
 }

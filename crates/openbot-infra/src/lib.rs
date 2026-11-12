@@ -195,11 +195,15 @@ pub mod net;
 pub mod policy;
 #[cfg(feature = "server-runtime")]
 pub mod provider;
+#[cfg(all(unix, feature = "server-runtime"))]
+pub mod recovery_control;
 #[cfg(feature = "server-runtime")]
 pub mod remote_agui;
 #[cfg(feature = "server-runtime")]
 pub mod remote_interrupt;
 pub mod repo;
+#[cfg(feature = "server-runtime")]
+pub mod restore_reconfirmation;
 #[cfg(feature = "server-runtime")]
 pub mod routing;
 pub mod run_cost_budget;
@@ -226,3 +230,7 @@ pub mod tool_approval;
 pub mod ui_preferences;
 #[cfg(any(feature = "server-runtime", feature = "desktop-local-vault"))]
 pub mod vault;
+
+#[cfg(all(test, feature = "server-runtime"))]
+#[path = "../tests/support/recovery_admission.rs"]
+mod recovery_admission;

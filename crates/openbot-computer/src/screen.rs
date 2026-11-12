@@ -182,6 +182,8 @@ struct StreamEntry {
 struct HubState {
     streams: BTreeMap<ScreenStreamKey, StreamEntry>,
     tickets: BTreeMap<[u8; 32], PendingTicket>,
+    source_was_attached: bool,
+    retired: bool,
 }
 
 impl Drop for HubState {
@@ -234,6 +236,16 @@ impl ScreenSessionService {
             } => ScreenViewerBinding::verified_desktop(origin, window_label, window_binding),
         }
         .map_err(|_| ScreenSessionAdministrationError::InvalidInput { field: "binding" })?;
+        // The original request's admission, borrowed (and so verified) right
+        // before the ticket insert and held through it (5 s precedent). The
+        // WebSocket send path holds its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let _admission = auth
+            .request_binding()
+            .ok_or(ScreenSessionAdministrationError::Unavailable)?
+            .borrow_recovery_admission_before(auth, deadline)
+            .await
+            .map_err(|_| ScreenSessionAdministrationError::Unavailable)?;
         let issued = self
             .hub
             .issue_ticket_for_target(
@@ -281,6 +293,27 @@ impl ScreenHub {
         })
     }
 
+    /// Remove the original streams and tickets, preventing any later attachment.
+    /// A passive retirement is proven only when this hub has never owned a source.
+    pub async fn retire_original(&self) -> bool {
+        let original = {
+            let mut state = self.state.lock().await;
+            let source_was_attached = state.source_was_attached;
+            std::mem::replace(
+                &mut *state,
+                HubState {
+                    streams: BTreeMap::new(),
+                    tickets: BTreeMap::new(),
+                    retired: true,
+                    source_was_attached,
+                },
+            )
+        };
+        let passive = !original.source_was_attached;
+        drop(original);
+        passive
+    }
+
     /// Attach the sole source minted by one live EngineProcess session.
     pub async fn attach(
         &self,
@@ -293,9 +326,13 @@ impl ScreenHub {
         let (viewers, demand) = watch::channel(ScreenDemand::default());
         {
             let mut state = self.state.lock().await;
+            if state.retired {
+                return Err(ScreenHubError::SourceClosed);
+            }
             if state.streams.contains_key(&key) {
                 return Err(ScreenHubError::DuplicateStream);
             }
+            state.source_was_attached = true;
             state.streams.insert(
                 key.clone(),
                 StreamEntry {
@@ -1023,6 +1060,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn t046_29_old_tickets_viewers_ws_and_native_sessions_close_before_receipt() {
+        use crate::native::{
+            ActionCapability, BootId, CoordinateTransform, LogicalRect, MouseButton, NativeAction,
+            NativeActionGate, NativeCleanupGate, NativeControlError, NativeDisplayId,
+            NativeInjectionOutcome, NativeKey, NativePlatformError, NativePlatformPort,
+            NativeSessionRegistry, NativeSessionState, NativeTarget, NativeWindowId,
+            ObservationGeneration, OsSessionId,
+        };
+        use openbot_contracts::ids::{CapabilityId, PolicyDecisionId, RunId};
+        use openbot_contracts::screen::ScreenSessionTarget;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hub = ScreenHub::new(3).unwrap();
+        let (original_source, _sender, key) = source("actor", 4);
+        let mut demand = hub.attach(original_source).await.unwrap();
+        let actor = auth("actor", 4);
+        let binding = ScreenViewerBinding::verified_server("https://app.example.test").unwrap();
+        let service = ScreenSessionService::new(hub.clone());
+        assert!(matches!(
+            service
+                .issue_at(
+                    &actor,
+                    ScreenSessionRequest {
+                        target: ScreenSessionTarget {
+                            computer_id: ComputerId::new("computer"),
+                            computer_generation: ComputerGeneration::new(3),
+                            tab_id: TabId::new("tab")
+                        },
+                        binding: ScreenViewerBindingRequest::Server {
+                            origin: "https://app.example.test".to_owned()
+                        },
+                    },
+                    NOW
+                )
+                .await,
+            Err(ScreenSessionAdministrationError::Unavailable)
+        ));
+        let ticket = hub
+            .issue_ticket(&actor, &key, binding.clone(), NOW)
+            .await
+            .unwrap();
+        let mut viewer = hub
+            .consume_ticket(&actor, &binding, &ticket.ticket_protocol(), NOW)
+            .await
+            .unwrap();
+        let unused = hub
+            .issue_ticket(&actor, &key, binding.clone(), NOW)
+            .await
+            .unwrap();
+        assert!(viewer.current().is_ok());
+        assert!(
+            !hub.retire_original().await,
+            "a former source cannot be declared passive"
+        );
+        assert!(demand.changed().await.is_closed());
+        assert!(matches!(
+            viewer.next().await,
+            Err(ScreenHubError::ViewerRevoked)
+        ));
+        assert!(
+            hub.consume_ticket(&actor, &binding, &unused.ticket_protocol(), NOW)
+                .await
+                .is_err()
+        );
+        assert!(hub.issue_ticket(&actor, &key, binding, NOW).await.is_err());
+        let (late_source, _late_sender, _) = source("actor", 4);
+        assert!(matches!(
+            hub.attach(late_source).await,
+            Err(ScreenHubError::SourceClosed)
+        ));
+        let passive = ScreenHub::new(1).unwrap();
+        assert!(passive.retire_original().await);
+        let (late_source, _late_sender, _) = source("actor", 4);
+        assert!(matches!(
+            passive.attach(late_source).await,
+            Err(ScreenHubError::SourceClosed)
+        ));
+
+        struct OriginalPlatform {
+            unknown: bool,
+            releases: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl NativePlatformPort for OriginalPlatform {
+            fn with_current_action(
+                &self,
+                _: &ActionCapability,
+                _: &NativeTarget,
+                _: &NativeAction,
+                effect: &mut dyn FnMut() -> Result<(), NativePlatformError>,
+            ) -> Result<(), NativePlatformError> {
+                effect()
+            }
+            fn with_current_cleanup(
+                &self,
+                _: &NativeTarget,
+                effect: &mut dyn FnMut() -> Result<(), NativePlatformError>,
+            ) -> Result<(), NativePlatformError> {
+                effect()
+            }
+            async fn inject_action(
+                &self,
+                _: &NativeTarget,
+                _: &NativeAction,
+                gate: &NativeActionGate<'_>,
+            ) -> Result<NativeInjectionOutcome, NativePlatformError> {
+                gate.dispatch(|| ())?;
+                Ok(if self.unknown {
+                    NativeInjectionOutcome::Unknown {
+                        reason: "original result unknown".to_owned(),
+                    }
+                } else {
+                    NativeInjectionOutcome::Success
+                })
+            }
+            async fn release_inputs(
+                &self,
+                _: &NativeTarget,
+                keys: &[NativeKey],
+                _: &[MouseButton],
+                gate: &NativeCleanupGate<'_>,
+            ) -> Result<(), NativePlatformError> {
+                assert!(keys.contains(&NativeKey::Return));
+                gate.dispatch(|| {
+                    self.releases.fetch_add(1, Ordering::SeqCst);
+                })?;
+                Ok(())
+            }
+            async fn query_session_state(
+                &self,
+                _: &OsSessionId,
+            ) -> Result<NativeSessionState, NativePlatformError> {
+                Ok(NativeSessionState::Active)
+            }
+        }
+        for unknown in [false, true] {
+            let registry = NativeSessionRegistry::new();
+            let platform = Arc::new(OriginalPlatform {
+                unknown,
+                releases: AtomicUsize::new(0),
+            });
+            let session = OsSessionId::new(format!("t046-29-original-native-{unknown}"));
+            let handle = registry
+                .get_or_create(session.clone(), "original", platform.clone())
+                .await
+                .unwrap();
+            handle.acquire_acting().await.unwrap();
+            let target = NativeTarget::from_trusted_host(
+                "device",
+                "test-os-user",
+                session.clone(),
+                BootId::new("boot"),
+                1234,
+                OffsetDateTime::UNIX_EPOCH + time::Duration::hours(100),
+                NativeWindowId::new("window"),
+                NativeDisplayId::new("display"),
+                CoordinateTransform {
+                    scale_factor: 1.0,
+                    bounds: LogicalRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+                ObservationGeneration::new(1),
+            );
+            let target = handle.register_target(target).await;
+            let action = NativeAction::KeyDown {
+                key: NativeKey::Return,
+            };
+            let capability = ActionCapability::new(
+                CapabilityId::new("original-key"),
+                ActorId::new("actor"),
+                RunId::new("run"),
+                PolicyDecisionId::new("decision"),
+                target,
+                ObservationGeneration::new(1),
+                AuthGeneration::new(1),
+                handle.current_epoch().await,
+            )
+            .with_action(action.clone());
+            let now = OffsetDateTime::now_utc();
+            let _original = handle
+                .perform_action(capability, action, now, now)
+                .await
+                .unwrap();
+            let stopped = handle.stop().await;
+            assert_eq!(handle.pending_actions(), 0);
+            assert_eq!(platform.releases.load(Ordering::SeqCst), 1);
+            if unknown {
+                assert!(matches!(
+                    stopped,
+                    Err(NativeControlError::ReconciliationRequired(_))
+                ));
+                drop(handle);
+                let retained = registry
+                    .get_or_create(session, "later", platform)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    retained.acquire_acting().await,
+                    Err(NativeControlError::ReconciliationRequired(_))
+                ));
+            } else {
+                stopped.unwrap();
+                let still_referenced = registry
+                    .get_or_create(session, "later", platform)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    still_referenced.acquire_acting().await,
+                    Err(NativeControlError::Stopped)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn old_source_completion_cannot_close_or_publish_into_a_replacement() {
         let hub = ScreenHub::new(2).expect("hub");
         let (old, old_feed, key) = source("actor", 4);
@@ -1200,13 +1456,100 @@ mod tests {
         ));
     }
 
+    struct AdmittingGuard;
+    struct AdmittedLease;
+    impl openbot_contracts::recovery::RecoveryAdmissionWitness for AdmittedLease {
+        fn purpose(&self) -> openbot_contracts::recovery::RecoveryAdmissionPurpose {
+            openbot_contracts::recovery::RecoveryAdmissionPurpose::Normal
+        }
+        fn verify_current_before(
+            &self,
+            _: &openbot_contracts::request_binding::VerifiedHostRequestBinding,
+            _: &AuthContext,
+            _: std::time::Instant,
+        ) -> Result<(), openbot_contracts::request_binding::HostRequestBindingError> {
+            Ok(())
+        }
+        fn restore_cohort(&self) -> Option<openbot_contracts::recovery::RestoreCohortRef> {
+            None
+        }
+    }
+    impl openbot_contracts::request_binding::HostRequestBindingGuard for AdmittingGuard {
+        fn verify_current<'a>(
+            &'a self,
+            _: &'a AuthContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            openbot_contracts::request_binding::HostRequestBindingError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn borrow_recovery_admission_before<'a>(
+            &'a self,
+            _: &'a openbot_contracts::request_binding::VerifiedHostRequestBinding,
+            _: &'a AuthContext,
+            _: std::time::Instant,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                            openbot_contracts::request_binding::HostRequestBindingError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Box::new(AdmittedLease) as _) })
+        }
+    }
+
+    // Implements only the required check: admission keeps the closed default.
+    struct DefaultGuard;
+    impl openbot_contracts::request_binding::HostRequestBindingGuard for DefaultGuard {
+        fn verify_current<'a>(
+            &'a self,
+            _: &'a AuthContext,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            (),
+                            openbot_contracts::request_binding::HostRequestBindingError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn application_port_resolves_target_and_never_logs_issued_protocol() {
         let hub = ScreenHub::new(3).expect("hub");
         let (source, _sender, key) = source("actor", 4);
         hub.attach(source).await.expect("attach");
         let service = ScreenSessionService::new(hub);
-        let actor = auth("actor", 4);
+        let unbound = auth("actor", 4);
+        let (_owner, issuer) =
+            openbot_contracts::request_binding::RequestBindingOwnerLease::for_trusted_host(
+                openbot_contracts::request_binding::HostRequestBindingKind::DesktopWindow,
+            );
+        let binding = issuer
+            .bind_desktop_window(&unbound, "main".into(), 1, Arc::new(AdmittingGuard))
+            .expect("binding");
+        let actor = unbound
+            .clone()
+            .with_verified_request_binding(binding)
+            .expect("bound");
         let request = ScreenSessionRequest {
             target: openbot_contracts::screen::ScreenSessionTarget {
                 computer_id: key.computer_id().clone(),
@@ -1227,6 +1570,21 @@ mod tests {
             (NOW + SCREEN_TICKET_TTL).unix_timestamp() * 1000
         );
         assert!(!format!("{ticket:?}").contains(ticket.ticket_protocol()));
+        assert_eq!(
+            service.issue_at(&unbound, request.clone(), NOW).await,
+            Err(ScreenSessionAdministrationError::Unavailable)
+        );
+        let closed = issuer
+            .bind_desktop_window(&unbound, "closed".into(), 2, Arc::new(DefaultGuard))
+            .expect("closed binding");
+        let closed = unbound
+            .clone()
+            .with_verified_request_binding(closed)
+            .expect("bound");
+        assert_eq!(
+            service.issue_at(&closed, request.clone(), NOW).await,
+            Err(ScreenSessionAdministrationError::Unavailable)
+        );
 
         let mut stale = request.clone();
         stale.target.computer_generation = ComputerGeneration::new(4);

@@ -54,6 +54,7 @@ pub struct PostgresToolApprovalCoordinator {
     tenant: openbot_contracts::ids::TenantId,
     checkpoint_key: Arc<SecretBytes>,
     wake: Arc<Notify>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl PostgresToolApprovalCoordinator {
@@ -63,6 +64,7 @@ impl PostgresToolApprovalCoordinator {
         deployment: openbot_contracts::ids::DeploymentId,
         tenant: openbot_contracts::ids::TenantId,
         checkpoint_key: Vec<u8>,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, ToolPortError> {
         if checkpoint_key.is_empty() {
             return Err(ToolPortError::Corrupt {
@@ -75,6 +77,7 @@ impl PostgresToolApprovalCoordinator {
             tenant,
             checkpoint_key: Arc::new(SecretBytes::new(checkpoint_key)),
             wake: Arc::new(Notify::new()),
+            recovery_gate,
         })
     }
 
@@ -127,6 +130,23 @@ impl PostgresToolApprovalCoordinator {
         &self,
         request: &ToolApprovalRequest,
     ) -> Result<StoredApproval, ToolPortError> {
+        // The run's request has no host binding: a worker admission, held through
+        // the INSERT and COMMIT (5 s precedent).
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ToolPortError::Unavailable {
+                dependency: "tool_approval",
+            })?;
+        let current = || {
+            admission
+                .verify_current_before(deadline)
+                .map_err(|_| ToolPortError::Unavailable {
+                    dependency: "tool_approval",
+                })
+        };
         let mut client = self.pool.get().await.map_err(unavailable)?;
         let transaction = client.transaction().await.map_err(query_unavailable)?;
         let now: OffsetDateTime = transaction
@@ -237,6 +257,7 @@ impl PostgresToolApprovalCoordinator {
         }
         let approval_id = Uuid::now_v7().to_string();
         let expires_at = now + APPROVAL_TTL;
+        current()?;
         transaction
             .execute(
                 "INSERT INTO public.tool_approvals(
@@ -283,6 +304,7 @@ impl PostgresToolApprovalCoordinator {
             self.checkpoint_key.expose(),
         )
         .await?;
+        current()?;
         transaction.commit().await.map_err(|error| {
             tracing::error!(error = %error, "tool approval request commit 结果未知");
             ToolPortError::CommitUnknown
@@ -449,8 +471,17 @@ impl PostgresToolApprovalCoordinator {
     ) -> Result<bool, ToolApprovalAdministrationError> {
         ensure_auth_scope(self, auth)?;
         let generation = to_i64_admin(auth.auth_generation().get(), "auth_generation")?;
+        // No step here has its own bound, so the 5 s precedent.
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        let binding = auth
+            .request_binding()
+            .ok_or(ToolApprovalAdministrationError::Unavailable)?;
+        let admission = binding
+            .borrow_recovery_admission_before(auth, deadline)
+            .await
+            .map_err(|_| ToolApprovalAdministrationError::Unavailable)?;
         let client = self.pool.get().await.map_err(admin_unavailable)?;
-        client
+        let current = client
             .query_one(
                 "SELECT EXISTS(
                     SELECT 1 FROM public.users u
@@ -463,7 +494,11 @@ impl PostgresToolApprovalCoordinator {
             .await
             .map_err(admin_query)?
             .try_get(0)
-            .map_err(|_| admin_corrupt("approval_activity_scope"))
+            .map_err(|_| admin_corrupt("approval_activity_scope"))?;
+        admission
+            .verify_current_before(binding, auth, deadline)
+            .map_err(|_| ToolApprovalAdministrationError::Unavailable)?;
+        Ok(current)
     }
 }
 

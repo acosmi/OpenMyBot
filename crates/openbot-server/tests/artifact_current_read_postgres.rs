@@ -316,6 +316,15 @@ impl Fixture {
             )
             .map_err(|error| error.to_string())?,
         );
+        resolver
+            .install_recovery_read_gate(
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &deployment,
+                    &tenant,
+                ),
+            )
+            .map_err(|_| "actual resolver recovery admission refused".to_owned())?;
         let begin = BeginThreadRunRequest {
             deployment: deployment.clone(),
             tenant: tenant.clone(),
@@ -337,6 +346,11 @@ impl Fixture {
             config.clone(),
             "artifact-current-read-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &deployment,
+                &tenant,
+            ),
         )
         .map_err(|error| error.to_string())?
         .begin_thread_run(begin.clone())
@@ -363,6 +377,11 @@ impl Fixture {
                 store,
                 ArtifactQuotaPolicy::default(),
                 SecretBytes::new(vec![0x88; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &deployment,
+                    &tenant,
+                ),
             )
             .map_err(|error| error.to_string())?,
         );
@@ -517,6 +536,40 @@ async fn refused_original_session(tag: &str, sql: &'static str, expected: AppErr
     })
     .await;
 }
+
+async fn negative_generation_and_schema_drift(
+    tag: &str,
+    mutation: &'static str,
+    restore_generation: &'static str,
+) {
+    with_fixture(tag, |fixture| async move {
+        let auth = fixture.auth(COOKIE_A).await?;
+        fixture.sql(mutation).await?;
+        // Recovery admission checks the original session before the artifact schema observer.
+        let refused = fixture.read(auth.clone()).await;
+        if refused != Err(AppError::Unauthenticated) {
+            return Err(format!(
+                "negative generation refusal: {:?}",
+                refused.as_ref().err()
+            ));
+        }
+        // Restore only the row value: the dropped pinned CHECK must still refuse the read.
+        fixture.sql(restore_generation).await?;
+        let refused = fixture.read(auth).await;
+        if refused
+            != Err(AppError::DependencyUnavailable {
+                dependency: "host_request_binding",
+            })
+        {
+            return Err(format!(
+                "pinned schema refusal: {:?}",
+                refused.as_ref().err()
+            ));
+        }
+        Ok(())
+    })
+    .await;
+}
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]
 async fn same_id_token_replacement_does_not_rebind_original_read() {
@@ -542,11 +595,12 @@ async fn raw_null_current_generation_is_not_original_zero() {
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]
-async fn raw_negative_current_generation_is_refused_by_pinned_schema_before_generation_check() {
-    // Storing -1 needs a dropped pinned CHECK. The read path verifies the pinned public schema
-    // before BEGIN and refuses that drift as dependency_unavailable with nothing delivered; the
-    // raw negative-generation check is covered by the binding and capabilities suites.
-    refused_original_session("read-current-negative", "ALTER TABLE public.users DROP CONSTRAINT users_auth_generation_nonnegative; UPDATE public.users SET auth_generation=-1 WHERE id='current-read-owner'", AppError::DependencyUnavailable { dependency: "host_request_binding" }).await;
+async fn raw_negative_current_generation_and_pinned_schema_drift_are_refused() {
+    negative_generation_and_schema_drift(
+        "read-current-negative",
+        "ALTER TABLE public.users DROP CONSTRAINT users_auth_generation_nonnegative; UPDATE public.users SET auth_generation=-1 WHERE id='current-read-owner'",
+        "UPDATE public.users SET auth_generation=0 WHERE id='current-read-owner'",
+    ).await;
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]
@@ -559,9 +613,12 @@ async fn raw_null_issued_generation_is_not_original_zero() {
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]
-async fn raw_negative_issued_generation_is_refused_by_pinned_schema_before_generation_check() {
-    // Same pinned-schema refusal as the current-generation case above.
-    refused_original_session("read-issued-negative", "ALTER TABLE public.sessions DROP CONSTRAINT sessions_auth_generation_nonnegative; UPDATE public.sessions SET auth_generation=-1 WHERE id='actual-read-session-a'", AppError::DependencyUnavailable { dependency: "host_request_binding" }).await;
+async fn raw_negative_issued_generation_and_pinned_schema_drift_are_refused() {
+    negative_generation_and_schema_drift(
+        "read-issued-negative",
+        "ALTER TABLE public.sessions DROP CONSTRAINT sessions_auth_generation_nonnegative; UPDATE public.sessions SET auth_generation=-1 WHERE id='actual-read-session-a'",
+        "UPDATE public.sessions SET auth_generation=0 WHERE id='actual-read-session-a'",
+    ).await;
 }
 #[tokio::test]
 #[ignore = "requires Root-owned isolated PostgreSQL"]

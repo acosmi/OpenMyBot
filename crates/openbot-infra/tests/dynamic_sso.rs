@@ -1,7 +1,7 @@
 //! W-7b 动态 SAML/SSO vault、routing、replay、account cleanup 的 PG17 真库闭环。
 #![cfg(feature = "server-sso")]
 
-mod harness;
+pub(crate) mod harness;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-const NOW: i64 = 1_800_000_000;
+pub(crate) const NOW: i64 = 1_800_000_000;
 const HASH_KEY: &[u8] = b"dynamic-sso-ephemeral-key-at-least-32";
 const SESSION_KEY: &[u8] = b"dynamic-sso-session-key-at-least-32bytes";
 const AUDIT_KEY: &[u8] = b"dynamic-sso-audit-key-at-least-32-bytes";
@@ -50,6 +50,10 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), S
     native::apply(&mut client)
         .await
         .map_err(|error| error.to_string())?;
+    seed(&client).await
+}
+
+async fn seed(client: &tokio_postgres::Client) -> Result<(), String> {
     let now = OffsetDateTime::from_unix_timestamp(NOW).unwrap();
     client
         .execute(
@@ -75,13 +79,13 @@ async fn provision(pool: &openbot_infra::db::pool::DatabasePool) -> Result<(), S
         .map_err(|error| error.to_string())
 }
 
-fn metadata() -> String {
+pub(crate) fn metadata() -> String {
     format!(
         r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" entityID="urn:example:idp:directory"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{TEST_CERT_DER_BASE64}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://idp.example/sso"/></md:IDPSSODescriptor></md:EntityDescriptor>"#
     )
 }
 
-fn registration(provider: &str, domain: &str) -> RegisterIdentityProviderInput {
+pub(crate) fn registration(provider: &str, domain: &str) -> RegisterIdentityProviderInput {
     serde_json::from_value(serde_json::json!({
         "providerId": provider,
         "issuer": "urn:example:idp:directory",
@@ -105,6 +109,22 @@ fn service_with_dialer(
     pool: &openbot_infra::db::pool::DatabasePool,
     dialer: SafeDialer,
 ) -> DynamicSsoService {
+    service_with_gate(
+        pool,
+        dialer,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            pool,
+            &openbot_contracts::ids::DeploymentId::new("dep-1"),
+            &TenantId::new("tenant-1"),
+        ),
+    )
+}
+
+pub(crate) fn service_with_gate(
+    pool: &openbot_infra::db::pool::DatabasePool,
+    dialer: SafeDialer,
+    recovery_gate: openbot_infra::recovery_control::RecoveryReadGate,
+) -> DynamicSsoService {
     DynamicSsoService::new(
         pool.clone(),
         &TenantId::new("tenant-1"),
@@ -122,6 +142,7 @@ fn service_with_dialer(
         ],
         dialer,
         "https://app.example".to_owned(),
+        recovery_gate,
     )
     .unwrap()
 }
@@ -135,7 +156,7 @@ fn response(request_id: &str, assertion_id: &str) -> String {
     BASE64_STANDARD.encode(signed.as_bytes())
 }
 
-async fn start(
+pub(crate) async fn start(
     service: &DynamicSsoService,
     email: &str,
     now: OffsetDateTime,
@@ -319,6 +340,68 @@ async fn dynamic_saml_is_encrypted_replay_safe_and_delete_cleans_account_anchors
 }
 
 #[tokio::test]
+#[ignore = "requires real PostgreSQL and xmlsec1; set OPENBOT_TEST_DATABASE_URL and pass --include-ignored"]
+async fn native_0055_gives_legacy_provider_ids_a_uuid_without_touching_configuration() {
+    let admin =
+        admin_config("native_0055_gives_legacy_provider_ids_a_uuid_without_touching_configuration");
+    with_temp_database(&admin, "dynamic_sso_0055", |config| async move {
+        let pool = pool::connect(&config).await.map_err(|error| error.to_string())?;
+        let outcome = async {
+            let mut client = pool.get().await.map_err(|error| error.to_string())?;
+            baseline::apply(&client)
+                .await
+                .map_err(|error| error.to_string())?;
+            native::apply_through(&mut client, native::NATIVE_0052_VERSION)
+                .await
+                .map_err(|error| error.to_string())?;
+            let legacy = serde_json::json!({
+                "entryPoint": "https://idp.example/sso",
+                "idpMetadata": {"metadata": metadata()},
+                "emailAttribute": "email",
+                "groupAttribute": "groups",
+                "groupNormalization": "trim_lowercase"
+            })
+            .to_string();
+            client
+                .execute(
+                    "INSERT INTO public.sso_providers( \
+                       id,issuer,oidc_config,saml_config,user_id,provider_id,organization_id,domain) \
+                     VALUES('legacy','urn:example:idp:directory',NULL,$1,NULL,'legacy-saml',NULL,'legacy.example')",
+                    &[&legacy],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            native::apply(&mut client)
+                .await
+                .map_err(|error| error.to_string())?;
+            let row = client
+                .query_one(
+                    "SELECT id,saml_config FROM public.sso_providers WHERE provider_id='legacy-saml'",
+                    &[],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let id: String = row.try_get(0).map_err(|error| error.to_string())?;
+            let saml: String = row.try_get(1).map_err(|error| error.to_string())?;
+            let parsed = uuid::Uuid::parse_str(&id).map_err(|error| error.to_string())?;
+            if parsed.is_nil() || parsed.hyphenated().to_string() != id || saml != legacy {
+                return Err(format!("0055 did not give one non-nil UUID id: {id}"));
+            }
+            seed(&client).await?;
+            drop(client);
+            service(&pool)
+                .preflight_all(OffsetDateTime::from_unix_timestamp(NOW).unwrap())
+                .await
+                .map_err(|error| error.to_string())
+        }
+        .await;
+        pool.close();
+        outcome
+    })
+    .await;
+}
+
+#[tokio::test]
 #[ignore = "需要真实 PostgreSQL + xmlsec1：设 OPENBOT_TEST_DATABASE_URL 后加 --include-ignored"]
 async fn legacy_plaintext_saml_config_is_read_verified_and_resealed_as_v2() {
     let admin = admin_config("legacy_plaintext_saml_config_is_read_verified_and_resealed_as_v2");
@@ -339,7 +422,7 @@ async fn legacy_plaintext_saml_config_is_read_verified_and_resealed_as_v2() {
                 .execute(
                     "INSERT INTO public.sso_providers( \
                        id,issuer,oidc_config,saml_config,user_id,provider_id,organization_id,domain) \
-                     VALUES('legacy','urn:example:idp:directory',NULL,$1,'admin','legacy-saml',NULL,' Legacy.Example ')",
+                     VALUES('0190d3a1-7c2e-7a4b-9f3e-5d6c7b8a9e01','urn:example:idp:directory',NULL,$1,'admin','legacy-saml',NULL,' Legacy.Example ')",
                     &[&legacy],
                 )
                 .await
@@ -453,7 +536,7 @@ async fn legacy_plaintext_saml_config_is_read_verified_and_resealed_as_v2() {
 }
 
 #[derive(Clone)]
-struct LocalResolver(SocketAddr);
+pub(crate) struct LocalResolver(pub(crate) SocketAddr);
 
 #[async_trait::async_trait]
 impl DnsResolver for LocalResolver {
@@ -463,9 +546,9 @@ impl DnsResolver for LocalResolver {
 }
 
 #[derive(Clone)]
-struct OidcAuthorizationParams {
-    nonce: String,
-    challenge: String,
+pub(crate) struct OidcAuthorizationParams {
+    pub(crate) nonce: String,
+    pub(crate) challenge: String,
 }
 
 #[tokio::test]
@@ -543,6 +626,10 @@ async fn dynamic_oidc_registration_start_and_cross_replica_callback_share_the_sa
                     now,
                     "203.0.113.7",
                     Some("integration-agent"),
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -565,6 +652,10 @@ async fn dynamic_oidc_registration_start_and_cross_replica_callback_share_the_sa
                     now,
                     "203.0.113.7",
                     None,
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await;
             if replay.is_ok() {
@@ -589,6 +680,21 @@ async fn dynamic_oidc_registration_start_and_cross_replica_callback_share_the_sa
 async fn spawn_oidc_idp(
     auth_params: Arc<Mutex<Option<OidcAuthorizationParams>>>,
     calls: Arc<AtomicUsize>,
+) -> Result<
+    (
+        SocketAddr,
+        CertificateDer<'static>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ),
+    String,
+> {
+    spawn_oidc_idp_requests(auth_params, calls, 5).await
+}
+
+pub(crate) async fn spawn_oidc_idp_requests(
+    auth_params: Arc<Mutex<Option<OidcAuthorizationParams>>>,
+    calls: Arc<AtomicUsize>,
+    requests: usize,
 ) -> Result<
     (
         SocketAddr,
@@ -628,7 +734,7 @@ async fn spawn_oidc_idp(
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     let origin = format!("https://idp.test:{}", address.port());
     let server = tokio::spawn(async move {
-        for _ in 0..5 {
+        for _ in 0..requests {
             let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
             let mut tls = acceptor
                 .accept(stream)

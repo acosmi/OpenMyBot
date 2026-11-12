@@ -1,7 +1,9 @@
-//! Native0051 body writers on current0054, with explicit historical0051 PostgreSQL17.11 checks.
+//! Native0051 body writers on current latest, with explicit historical0051 PostgreSQL17.11 checks.
 //! Internal metadata and permanent IDs; this suite grants no current Host or ACK.
 #![cfg(feature = "server-runtime")]
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 use async_trait::async_trait;
 use openbot_application::model_connections::ModelConnectionAdministration;
 use openbot_application::provider::{
@@ -86,8 +88,8 @@ include!("support/thread_history_writer_schema_fixture.rs");
 #[ignore = "requires explicitly owned loopback SCRAM PostgreSQL17.11"]
 async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
     // The delivered function identity is retained; this candidate runs its compatibility
-    // assertions on current54 and explicitly proves the unchanged historical51 branch first.
-    for prior in [50, 51, 52] {
+    // assertions on current latest and explicitly proves the unchanged historical51 branch first.
+    for prior in [50, 51, native::NATIVE_LATEST_VERSION] {
         owned(&format!("writer51graph{prior}"),move|p,_|async move {
             initialize(&p,prior).await?;
             let mut c=p.get().await.map_err(|e|e.to_string())?;
@@ -97,8 +99,8 @@ async fn w01_fresh51_upgrade50_and_complete_prior_graph() {
                 require(pure["schema"]["relations"]==old["schema"]["relations"],"explicit0050 relations altered before upgrade")?;
             }
             if prior==51 { writer_check_legacy51(&mut c).await?; }
-            if prior<52 {
-                require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"real historical to54 upgrade was not applied")?;
+            if prior<native::NATIVE_LATEST_VERSION {
+                require(native::apply(&mut c).await.map_err(|e|e.to_string())?==native::ApplyOutcome::Applied,"real historical upgrade to latest was not applied")?;
             }
             writer_check(&c).await?;
             let rows:i64=c.query_one("SELECT count(*) FROM openbot_internal.channel_history_sources",&[]).await.map_err(|e|e.to_string())?.get(0);
@@ -770,7 +772,7 @@ async fn w11_unicode_reverse_changes_truncate_and_actual_two_tx() {
 #[tokio::test]
 #[ignore = "requires explicitly owned loopback SCRAM PostgreSQL17.11"]
 async fn w12_current51_explicit50_and_original_host_id_regression() {
-    for version in [47, 48, 49, 50, 51, 52] {
+    for version in [47, 48, 49, 50, 51, 52, 53, native::NATIVE_LATEST_VERSION] {
         owned(&format!("writer51boundary{version}"),move|p,_|async move{
             initialize(&p,version).await?;
             let mut c=p.get().await.map_err(|e|e.to_string())?;
@@ -783,7 +785,7 @@ async fn w12_current51_explicit50_and_original_host_id_regression() {
                 require(admission_schema::verify(&c).await.is_err(),"explicit0050 current consumer bypassed new whole0052")?;
             }
             if version==51 { writer_check_legacy51(&mut c).await?; }
-            if version<52 {native::apply(&mut c).await.map_err(|e|e.to_string())?;}
+            if version<native::NATIVE_LATEST_VERSION {native::apply(&mut c).await.map_err(|e|e.to_string())?;}
             writer_check(&c).await?;
             raw_thread(&c,"writer-original-permanent-id").await?;
             close_writer_head(&c,"writer-original-permanent-id").await?;

@@ -321,6 +321,12 @@ impl Host {
         policy.load().await.map_err(|_| "policy_load")?;
         self.assembly = Some(
             assemble_postgres_application(PostgresApplicationAssemblyInput {
+                recovery_gate:
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &self.pool,
+                        &deployment,
+                        &tenant,
+                    ),
                 pool: self.pool.clone(),
                 listener_database: config.into(),
                 deployment: deployment.clone(),

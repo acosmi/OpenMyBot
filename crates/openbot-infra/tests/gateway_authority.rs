@@ -118,6 +118,11 @@ impl DatabaseFixture {
             SecretBytes::new(AUDIT_KEY.to_vec()),
             tls.dialer_with(false, true),
             &tls.endpoint(),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &DeploymentId::new(DEPLOYMENT),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap();
         Self {

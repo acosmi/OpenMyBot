@@ -538,6 +538,11 @@ async fn provider_delta_flows_through_agent_host_into_replay_history_and_termina
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -546,6 +551,11 @@ async fn provider_delta_flows_through_agent_host_into_replay_history_and_termina
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -723,6 +733,11 @@ async fn parallel_safe_components_share_budget_and_persist_provider_order_on_rea
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -731,6 +746,11 @@ async fn parallel_safe_components_share_budget_and_persist_provider_order_on_rea
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -888,6 +908,11 @@ async fn component_decision_suspends_cross_replica_answer_then_commits_exchange_
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -896,6 +921,11 @@ async fn component_decision_suspends_cross_replica_answer_then_commits_exchange_
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -1111,6 +1141,7 @@ async fn remember_tool_runs_through_policy_capability_memory_audit_and_second_sa
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -1119,6 +1150,7 @@ async fn remember_tool_runs_through_policy_capability_memory_audit_and_second_sa
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -1150,6 +1182,7 @@ async fn remember_tool_runs_through_policy_capability_memory_audit_and_second_sa
                 tenant.clone(),
                 policy.clone(),
                 tool_memory.clone(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             );
             let application: Arc<dyn ApplicationService> = Arc::new(
                 OpenBotApplication::new(ChannelRepo::new(pool.clone()))
@@ -1637,6 +1670,7 @@ async fn remote_agui_row_routes_through_safe_sse_into_durable_text_reasoning_and
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -1645,6 +1679,7 @@ async fn remote_agui_row_routes_through_safe_sse_into_durable_text_reasoning_and
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -2087,6 +2122,7 @@ async fn remote_agui_interrupt_resolves_through_application_and_makes_a_second_s
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -2095,6 +2131,7 @@ async fn remote_agui_interrupt_resolves_through_application_and_makes_a_second_s
                     owner.clone(),
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -2459,6 +2496,7 @@ async fn real_openai_http_stream_uses_fresh_vault_credential_and_durable_reasoni
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -2467,6 +2505,7 @@ async fn real_openai_http_stream_uses_fresh_vault_credential_and_durable_reasoni
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -2686,6 +2725,7 @@ async fn managed_route_runs_anthropic_and_google_without_touching_package_provid
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -2694,6 +2734,7 @@ async fn managed_route_runs_anthropic_and_google_without_touching_package_provid
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -2831,6 +2872,11 @@ async fn cross_replica_durable_cancel_drops_the_active_child_before_cancelled_te
                 config.clone(),
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -2839,6 +2885,11 @@ async fn cross_replica_durable_cancel_drops_the_active_child_before_cancelled_te
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -3001,6 +3052,11 @@ async fn deadline_and_real_stream_stall_append_hash_chain_audits_before_terminal
                 config,
                 owner.clone(),
                 DEFAULT_THREAD_LEASE_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let runtime: Arc<dyn RunRuntime> = Arc::new(
@@ -3009,6 +3065,11 @@ async fn deadline_and_real_stream_stall_append_hash_chain_audits_before_terminal
                     owner,
                     DEFAULT_THREAD_LEASE_DURATION,
                     DEFAULT_DISPATCH_CLAIM_DURATION,
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );

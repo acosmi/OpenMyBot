@@ -72,3 +72,24 @@ pub fn auth_in_tenant(tenant_id: &str, actor: &str, auth_generation: u64) -> Aut
         false,
     )
 }
+
+/// Runs a real-sidecar Desktop case on a 16 MiB thread over a two-worker runtime. The case body
+/// and the Prepared Local setup poll on this thread; unoptimized, they overflow the default 2 MiB
+/// test stack. Requests spawned from the body run on runtime workers with their default stack.
+#[cfg(all(test, feature = "desktop-local-runtime", unix))]
+pub(crate) fn on_large_stack<F: std::future::Future<Output = ()> + 'static>(case: fn() -> F) {
+    let polling = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(case())
+        })
+        .expect("test polling thread");
+    if let Err(panic) = polling.join() {
+        std::panic::resume_unwind(panic);
+    }
+}

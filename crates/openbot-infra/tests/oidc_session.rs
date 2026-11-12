@@ -158,6 +158,11 @@ fn issuer(pool: &openbot_infra::db::pool::DatabasePool) -> PostgresOidcSessionIs
         default_session_lifetime(),
         AdminFloor::from_configured(["admin@example.com"]).unwrap(),
         AUDIT_KEY,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            pool,
+            &openbot_contracts::ids::DeploymentId::new("oidc-session"),
+            &TenantId::new("tenant-1"),
+        ),
     )
     .unwrap()
 }
@@ -720,6 +725,10 @@ async fn real_tls_discovery_pkce_token_jwks_claims_and_session_is_one_replay_saf
                     now + Duration::milliseconds(100),
                     "203.0.113.9",
                     None,
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await;
             if !matches!(
@@ -741,6 +750,10 @@ async fn real_tls_discovery_pkce_token_jwks_claims_and_session_is_one_replay_saf
                     now + Duration::milliseconds(200),
                     "203.0.113.9",
                     None,
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await;
             if !matches!(
@@ -775,6 +788,10 @@ async fn real_tls_discovery_pkce_token_jwks_claims_and_session_is_one_replay_saf
                     now + Duration::seconds(1),
                     "203.0.113.9",
                     Some("integration-agent"),
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -798,6 +815,10 @@ async fn real_tls_discovery_pkce_token_jwks_claims_and_session_is_one_replay_saf
                     now + Duration::seconds(2),
                     "203.0.113.9",
                     None,
+                    openbot_infra::auth::oidc::session_issuer::OriginalLoginRequest::new(
+                        std::time::Instant::now() + openbot_infra::auth::oidc::coordinator::DYNAMIC_SSO_LOGIN_BUDGET,
+                        tokio_util::sync::CancellationToken::new(),
+                    ),
                 )
                 .await;
             if !matches!(

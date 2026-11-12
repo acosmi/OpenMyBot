@@ -257,6 +257,11 @@ impl Fixture {
                     store,
                     policy,
                     SecretBytes::new(vec![0x65; 32]),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &DeploymentId::new(DEP),
+                        &TenantId::new(TENANT),
+                    ),
                 )
                 .map_err(text)?,
             ))
@@ -271,6 +276,12 @@ impl Fixture {
         let policy_store = PolicyStore::postgres(pool.clone(), None);
         policy_store.load().await.map_err(text)?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: pool.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -331,6 +342,15 @@ impl Fixture {
         resolver
             .install_thread_history_authority(&authority)
             .map_err(text)?;
+        resolver
+            .install_recovery_read_gate(
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
+            )
+            .map_err(text)?;
         if let Some(artifacts) = &artifacts {
             resolver
                 .install_artifact_read_authority(&artifacts.read_authority())
@@ -341,6 +361,11 @@ impl Fixture {
             config,
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?;
         let security = SensitiveWriteSecurity::new(
@@ -469,6 +494,11 @@ impl Fixture {
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?;
         let claim = runtime
@@ -548,6 +578,11 @@ impl Fixture {
                 PROCESS.into(),
                 DEFAULT_THREAD_LEASE_DURATION,
                 DEFAULT_DISPATCH_CLAIM_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(text)?,
         );

@@ -25,6 +25,9 @@ pub mod staging;
 /// Original-owner bounded whole-PG carrier transport, separate from legacy archive/staging.
 #[cfg(all(feature = "server-runtime", target_os = "macos"))]
 pub mod whole_pg_capture_stream;
+/// Whole-PG restore input is separate from the legacy archive interfaces.
+#[cfg(all(unix, feature = "server-runtime"))]
+pub mod whole_pg_restore_stream;
 
 #[cfg(test)]
 mod tests;

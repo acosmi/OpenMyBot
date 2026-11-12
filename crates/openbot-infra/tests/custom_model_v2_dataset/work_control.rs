@@ -13,6 +13,11 @@ fn runtime(f: &Fixture) -> PostgresRunRuntime {
         "owned-v2-runtime".into(),
         time::Duration::seconds(30),
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &f.pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .unwrap()
 }
@@ -106,7 +111,7 @@ async fn w04_stop_holds_and_cancels_atomically() {
             assert_eq!(claim.lease().run_id(),&first.command.run_id);
             let lease=rt.acknowledge_dispatch(&claim).await.unwrap();
             // A failure after the hold UPDATE must roll back both halves.
-            let no_runtime = PostgresThreadDirectory::new(f.pool.clone());
+            let no_runtime = PostgresThreadDirectory::new(f.pool.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")));
             assert!(matches!(no_runtime.stop_thread_work(&auth(), &first.command.thread_id, Some(&first.command.run_id)).await, Err(ThreadDirectoryError::Unavailable)));
             let c = f.pool.get().await.unwrap();
             assert_eq!(c.query_one("SELECT state FROM openbot_internal.thread_pending_inputs WHERE run_id=$1", &[&pending.command.run_id.as_str()]).await.unwrap().get::<_,String>(0), "pending");

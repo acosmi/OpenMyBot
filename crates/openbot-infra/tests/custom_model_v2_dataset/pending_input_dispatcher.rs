@@ -18,6 +18,7 @@ async fn w06_generation_change_holds_frozen_input() {
         let runtime = openbot_infra::run_runtime::PostgresRunRuntime::new(
             f.pool.clone(), "owned-v2-runtime".into(), time::Duration::seconds(30),
             openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
         ).unwrap().with_pending_input_dispatcher(dispatcher.clone());
         let claim = runtime.claim_dispatch().await.unwrap().unwrap();
         let lease = runtime.acknowledge_dispatch(&claim).await.unwrap();
@@ -57,6 +58,11 @@ async fn queue_idle(f: &Fixture, index: u64, model: &ModelConnection) -> BeginTh
         "owned-v2-runtime".into(),
         time::Duration::seconds(30),
         openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &f.pool,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .unwrap();
     let claim = runtime.claim_dispatch().await.unwrap().unwrap();
@@ -244,7 +250,7 @@ async fn w03_occupancy_and_clear_intent_block_dispatch() {
     harness::with_temp_database(&harness::admin_config("pending_w03"), "pendingw03", |config| async move {
         let f = Fixture::new(config, 8).await;
         let model = f.model(CustomModelProtocol::OpenaiResponses).await;
-        let runtime = openbot_infra::run_runtime::PostgresRunRuntime::new(f.pool.clone(), "owned-v2-runtime".into(), time::Duration::seconds(30), openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION).unwrap();
+        let runtime = openbot_infra::run_runtime::PostgresRunRuntime::new(f.pool.clone(), "owned-v2-runtime".into(), time::Duration::seconds(30), openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap();
         let mut retained = Vec::new();
         for index in 1..=4 {
             let first = f.request(index, false, &model);

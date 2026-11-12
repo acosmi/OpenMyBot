@@ -60,4 +60,22 @@ fn compatible_and_usage_paths_have_distinct_stable_exit_codes() {
             .trim(),
         r#"{"code":"database_url_missing"}"#
     );
+
+    let migrate_without_database = run(&["migrate-schema"], None);
+    assert_eq!(migrate_without_database.status.code(), Some(69));
+    assert!(migrate_without_database.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(migrate_without_database.stderr)
+            .unwrap()
+            .trim(),
+        r#"{"code":"database_url_missing"}"#
+    );
+
+    let migrate_extra = run(&["migrate-schema", "extra"], None);
+    assert_eq!(migrate_extra.status.code(), Some(64));
+    assert!(migrate_extra.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(migrate_extra.stderr).unwrap().trim(),
+        r#"{"code":"migration_preflight_usage"}"#
+    );
 }

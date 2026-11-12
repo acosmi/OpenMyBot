@@ -486,23 +486,9 @@ async fn exercise(prepared: &PreparedDesktopLocalRuntime) -> TestResult {
 #[test]
 #[ignore = "requires explicitly owned PostgreSQL17.11 binaries via OPENBOT_TEST_PG_BIN"]
 fn artifact_deletion_real_local_window_deletes_and_stale_window_refuses() {
-    // The test body and the Prepared Local setup poll on this larger thread; with them on the
-    // default 2 MiB test stack, unoptimized Prepared Local cases overflow it. Each deletion request
-    // runs on a runtime worker with its default stack, as the Desktop host spawns every request.
-    let polling = std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("test runtime")
-                .block_on(run())
-        })
-        .expect("test polling thread");
-    if let Err(panic) = polling.join() {
-        std::panic::resume_unwind(panic);
-    }
+    // Each deletion request runs on a runtime worker with its default stack, as the Desktop host
+    // spawns every request.
+    crate::testing::on_large_stack(run);
 }
 
 async fn run() {

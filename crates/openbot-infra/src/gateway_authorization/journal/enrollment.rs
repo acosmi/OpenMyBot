@@ -1074,7 +1074,11 @@ pub(super) async fn enroll(
         .map_err(|e| facts.error(Stage::Entry, map_journal(e, false)))?;
     facts.id = Some(owner.reservation.id);
 
-    let (authority, control, end) = enrollment_headers_channel(EnrollmentRequestKind::Metadata);
+    let (authority, control, end) = enrollment_headers_channel(
+        EnrollmentRequestKind::Metadata,
+        accounts.recovery_gate(),
+        current.deadline().ok(),
+    );
     let client = accounts
         .enrollment_client(&current, authority, Arc::clone(&outcomes))
         .map_err(|e| facts.error(Stage::Metadata, map_authority(e)))?;
@@ -1095,7 +1099,11 @@ pub(super) async fn enroll(
     let metadata: GatewayDesktopMetadata =
         merge_reader(metadata, &headers).map_err(|e| facts.error(Stage::Metadata, e))?;
 
-    let (authority, control, end) = enrollment_headers_channel(EnrollmentRequestKind::Profile);
+    let (authority, control, end) = enrollment_headers_channel(
+        EnrollmentRequestKind::Profile,
+        accounts.recovery_gate(),
+        current.deadline().ok(),
+    );
     let client = accounts
         .enrollment_client(&current, authority, outcomes)
         .map_err(|e| facts.error(Stage::Profile, map_authority(e)))?;

@@ -372,6 +372,7 @@ fn invalid_pg_version_preserves_mid_phase_journal_and_all_prior_evidence() {
                 &harness.root,
                 &harness.instance,
                 &harness.data_dir,
+                &format!("postgresql-17-{}", harness.instance),
             );
             assert_eq!(
                 result,
@@ -390,6 +391,7 @@ fn invalid_pg_version_preserves_mid_phase_journal_and_all_prior_evidence() {
                 &harness.root,
                 &harness.instance,
                 &harness.data_dir,
+                &format!("postgresql-17-{}", harness.instance),
             );
             assert!(
                 matches!(

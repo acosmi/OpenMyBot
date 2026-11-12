@@ -8,6 +8,10 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 /// Whole portable schema, the actual table ACL state and original raw facts.
 pub type ThreadOriginSchemaFacts = Value;
 const REGISTERED_SCHEMA: &str = include_str!("../../../../fixtures/db/thread-origins-0049.json");
+/// The registered oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶7984).
+static REGISTERED: std::sync::LazyLock<Option<Value>> =
+    std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 
 const CAPTURE_SQL: &str = r####"WITH
 wanted_relations(schema_name, relation_name) AS (
@@ -928,8 +932,8 @@ async fn observation_on<C: GenericClient + Sync>(
     normalize_owner_relative(raw)
 }
 fn compare_registered(observation: &ThreadOriginSchemaFacts) -> Result<(), InfraError> {
-    let expected: Value = serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("oracle"))?;
-    let keys = obj(&expected)?
+    let expected = REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?;
+    let keys = obj(expected)?
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
@@ -954,19 +958,33 @@ fn compare_registered(observation: &ThreadOriginSchemaFacts) -> Result<(), Infra
 pub async fn capture(client: &Client) -> Result<ThreadOriginSchemaFacts, InfraError> {
     observation_on(client).await
 }
-/// Require the exact current native54 prefix, original origin oracle and history admission schema.
+/// Require exact current55, the complete old origin/history graph and additive0055 catalog.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0054_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0054_VERSION)?;
+    let ledger = native::validate_known_prefix(client, native::NATIVE_LATEST_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_LATEST_VERSION)?;
     compare_registered(&observation_on(client).await?)?;
-    super::thread_history_admission_schema::verify_schema(client).await
+    super::thread_history_admission_schema::verify_schema(client).await?;
+    super::restore_reconfirmation_schema::verify_schema(client).await
 }
-/// Verify the original origin and writer schemas after the caller proves the 0053 prefix.
-pub(crate) async fn verify_legacy0053_schema(client: &Client) -> Result<(), InfraError> {
+/// Explicit strict52/53/54 pre-restore observation of the origin, admission and that
+/// layout's writer graph; never qualifies as current55 admission.
+pub(crate) async fn verify_pre_restore(client: &Client, latest: i32) -> Result<(), InfraError> {
+    require(
+        latest == native::NATIVE_0052_VERSION
+            || latest == native::NATIVE_0053_VERSION
+            || latest == native::NATIVE_0054_VERSION,
+    )?;
+    let ledger = native::validate_known_prefix(client, latest).await?;
+    require(ledger.latest_version() == latest)?;
     compare_registered(&observation_on(client).await?)?;
-    super::thread_history_writer_schema::verify_legacy0052(client).await
+    // The admission schema is the writer graph; 0054 replaces its terminal payload body.
+    if latest == native::NATIVE_0054_VERSION {
+        super::thread_history_writer_schema::verify_schema(client).await
+    } else {
+        super::thread_history_writer_schema::verify_legacy0052(client).await
+    }
 }
-/// Explicit historical49 pre-upgrade branch; never qualifies as current52 admission.
+/// Explicit historical49 pre-upgrade branch; never qualifies as current55 admission.
 pub(crate) async fn verify_legacy0049(client: &Client) -> Result<(), InfraError> {
     let ledger = native::validate_known_prefix(client, native::NATIVE_0049_VERSION).await?;
     require(ledger.latest_version() == native::NATIVE_0049_VERSION)?;
@@ -989,4 +1007,27 @@ pub(crate) async fn verify_legacy0051(client: &Client) -> Result<(), InfraError>
 /// Only observes origin schema after the caller proves the exact native prefix on this original Tx.
 pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
     compare_registered(&observation_on(tx).await?)
+}
+
+/// Registered oracle text length; its tree is charged once per operation.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
+
+/// Payload text length one [`verify_in_transaction`] observes, measured on
+/// the same transaction before it runs.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) async fn observation_bytes_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<u64, InfraError> {
+    let row = tx
+        .query_one(
+            &format!("SELECT coalesce(octet_length(thread_origin_raw),0)::bigint FROM ({CAPTURE_SQL}) observed"),
+            &[],
+        )
+        .await
+        .map_err(|source| InfraError::query("measure thread origin schema observation", source))?;
+    let payload: i64 = row
+        .try_get(0)
+        .map_err(|source| RowDecodeError::column("(thread_origin_schema)", "bytes", source))?;
+    u64::try_from(payload).ok().ok_or_else(|| corrupt("facts"))
 }

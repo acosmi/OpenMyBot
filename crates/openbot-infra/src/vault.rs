@@ -71,6 +71,8 @@ pub struct CredentialRecordVault {
     tenant: TenantId,
     current_version: KeyVersion,
     key: Arc<WrappingKey>,
+    #[cfg(test)]
+    open_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CredentialRecordVault {
@@ -85,7 +87,14 @@ impl CredentialRecordVault {
             tenant,
             current_version,
             key: Arc::new(key),
+            #[cfg(test)]
+            open_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_calls(&self) -> usize {
+        self.open_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 以 v2 record AEAD 封装 credential 明文。
@@ -127,6 +136,9 @@ impl CredentialRecordVault {
         consumer: SecretPrincipal,
         stored: &str,
     ) -> Result<OpenedCredential, CredentialVaultError> {
+        #[cfg(test)]
+        self.open_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match classify_column(stored) {
             ColumnShape::Plaintext => Err(CredentialVaultError::PlaintextRejected),
             ColumnShape::LegacyEnvelope => {
@@ -340,6 +352,7 @@ mod tests {
     #[test]
     fn v2_credential_is_bound_to_tenant_owner_consumer_kind_and_id() {
         let vault = vault();
+        assert_eq!(vault.open_calls(), 0);
         let id = Uuid::new_v4();
         let (owner, consumer) = principals();
         let plaintext = SecretBytes::new(b"refresh-person-1".to_vec());
@@ -363,6 +376,19 @@ mod tests {
             .unwrap();
         assert!(!opened.needs_migration());
         assert!(opened.into_secret().ct_eq(&plaintext));
+        let cloned = vault.clone();
+        let reopened = cloned
+            .open(
+                &id,
+                SecretKind::McpUserToken,
+                owner.clone(),
+                consumer.clone(),
+                &sealed,
+            )
+            .unwrap();
+        assert!(reopened.into_secret().ct_eq(&plaintext));
+        assert_eq!(vault.open_calls(), 2);
+        assert_eq!(cloned.open_calls(), 2);
 
         for (candidate_id, candidate_owner, candidate_consumer, candidate_kind) in [
             (

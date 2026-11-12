@@ -171,19 +171,19 @@ case "$(uname -s)" in
     if [[ "$(uname -m)" == 'arm64' ]]; then
       grep -qF 'native=/opt/homebrew/opt/libxml2/lib' .cargo/config.toml \
         || fail 'Apple Silicon 未锁单一 Homebrew libxml2 链接路径'
-      pc='/opt/homebrew/opt/libxmlsec1/lib/pkgconfig:/opt/homebrew/opt/libxml2/lib/pkgconfig:/opt/homebrew/opt/openssl@3/lib/pkgconfig'
+      pc="${PKG_CONFIG_PATH:-/opt/homebrew/opt/libxmlsec1/lib/pkgconfig:/opt/homebrew/opt/libxml2/lib/pkgconfig:/opt/homebrew/opt/openssl@3/lib/pkgconfig}"
       [[ "$(PKG_CONFIG_PATH="$pc" pkg-config --modversion libxml-2.0)" == '2.15.3' ]] \
-        || fail 'Homebrew libxml2 版本漂移'
+        || fail 'macOS libxml2 version drift'
       [[ "$(PKG_CONFIG_PATH="$pc" pkg-config --modversion openssl)" == '3.6.3' ]] \
-        || fail 'Homebrew OpenSSL 版本漂移'
+        || fail 'macOS OpenSSL version drift'
     elif [[ "$(uname -m)" == 'x86_64' ]]; then
       grep -qF 'native=/usr/local/opt/libxml2/lib' .cargo/config.toml \
         || fail 'Intel macOS 未锁单一 Homebrew libxml2 链接路径'
-      pc='/usr/local/opt/libxmlsec1/lib/pkgconfig:/usr/local/opt/libxml2/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig'
+      pc="${PKG_CONFIG_PATH:-/usr/local/opt/libxmlsec1/lib/pkgconfig:/usr/local/opt/libxml2/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig}"
       [[ "$(PKG_CONFIG_PATH="$pc" pkg-config --modversion libxml-2.0)" == '2.15.3' ]] \
-        || fail 'Intel Homebrew libxml2 版本漂移'
+        || fail 'Intel macOS libxml2 version drift'
       [[ "$(PKG_CONFIG_PATH="$pc" pkg-config --modversion openssl)" == '3.6.3' ]] \
-        || fail 'Intel Homebrew OpenSSL 版本漂移'
+        || fail 'Intel macOS OpenSSL version drift'
     else
       fail "未审计的 macOS 架构：$(uname -m)"
     fi

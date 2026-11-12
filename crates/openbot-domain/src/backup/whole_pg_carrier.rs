@@ -494,6 +494,91 @@ pub struct WholePgManifestClaim {
     pub materials: Vec<WholePgMaterialClaim>,
 }
 
+mod manifest_decode;
+
+/// Restore-side expectations for one carrier, taken from its separate key medium.
+pub struct WholePgManifestExpectation {
+    /// Bundle UUID bytes recorded in the key medium.
+    pub bundle_id: [u8; 16],
+    /// Source capture operation UUID bytes recorded in the key medium.
+    pub source_operation_id: [u8; 16],
+    /// Manifest SHA-256 recorded in the key medium.
+    pub manifest_sha256: [u8; 32],
+}
+
+/// Authenticates the first (manifest) frame in place and returns its frozen manifest.
+///
+/// Order: header magic/version/bundle/digest against `expected`; frame header
+/// kind0/seq0/reserved ordinal/offset0 with the header's manifest length;
+/// AEAD open with the capture stream key; plaintext digest; bounded decode;
+/// [`FrozenWholePgManifest::check`]; claim bundle/operation; exact header
+/// rebuild (a different canonical encoding is `NonCanonical`). Any failure
+/// wipes and clears `buffer`.
+pub fn open_whole_pg_manifest_in_place(
+    key: &SecretBytes,
+    expected: &WholePgManifestExpectation,
+    header: &[u8; 80],
+    frame_header: &[u8; 21],
+    tag: &[u8; 16],
+    buffer: &mut Zeroizing<Vec<u8>>,
+    bounds: CheckedWholePgCarrierBounds,
+) -> Result<FrozenWholePgManifest> {
+    let result = (|| {
+        if &header[..8] != b"WBPGCAP1"
+            || header[8..12] != 1u32.to_be_bytes()
+            || header[12..28] != expected.bundle_id
+            || header[48..80] != expected.manifest_sha256
+        {
+            return Err(WholePgCarrierFault::IntentMismatch);
+        }
+        let mut first = [0u8; 21];
+        first[5..9].copy_from_slice(&RESERVED.to_be_bytes());
+        first[17..21].copy_from_slice(&header[28..32]);
+        let manifest_len = u64::from(u32::from_be_bytes(
+            header[28..32].try_into().expect("four header bytes"),
+        ));
+        if *frame_header != first || buffer.len() as u64 != manifest_len {
+            return Err(WholePgCarrierFault::FrameInvalid);
+        }
+        if manifest_len > bounds.max_manifest_bytes {
+            return Err(WholePgCarrierFault::CapacityExceeded);
+        }
+        let stream = derive_application_key(key, ApplicationKeyPurpose::WholePgCaptureStreamV1)
+            .map_err(|_| WholePgCarrierFault::SecretInvalid)?;
+        whole_pg_open_in_place(
+            &stream,
+            &nonce(0),
+            &aad(header, frame_header),
+            tag,
+            buffer.as_mut_slice(),
+        )
+        .map_err(|_| WholePgCarrierFault::AuthenticationFailed)?;
+        if !bool::from(
+            Sha256::digest(buffer.as_slice())
+                .as_slice()
+                .ct_eq(&expected.manifest_sha256),
+        ) {
+            return Err(WholePgCarrierFault::IntentMismatch);
+        }
+        let claim = manifest_decode::decode(buffer.as_slice(), &bounds)?;
+        let frozen = FrozenWholePgManifest::check(claim, bounds)?;
+        if uuid_bytes(&frozen.claim.bundle_id)? != expected.bundle_id
+            || uuid_bytes(&frozen.claim.operation_id)? != expected.source_operation_id
+        {
+            return Err(WholePgCarrierFault::IntentMismatch);
+        }
+        if frozen.header() != *header {
+            return Err(WholePgCarrierFault::NonCanonical);
+        }
+        Ok(frozen)
+    })();
+    if result.is_err() {
+        buffer.zeroize();
+        buffer.clear();
+    }
+    result
+}
+
 /// Checked manifest retaining a shared claim and immutable frame layout, without source authority.
 pub struct FrozenWholePgManifest {
     claim: Arc<WholePgManifestClaim>,
@@ -1565,6 +1650,101 @@ mod tests {
         assert!(matches!(
             FrozenWholePgManifest::check(c, bounds()),
             Err(WholePgCarrierFault::MaterialMissing)
+        ));
+    }
+    #[test]
+    fn t046_17_first_frame_bounded_decode_is_canonical_and_terminal_checked() {
+        let frozen = FrozenWholePgManifest::check(claim(), bounds()).unwrap();
+        let key = SecretBytes::new(vec![7; 32]);
+        let stream =
+            derive_application_key(&key, ApplicationKeyPurpose::WholePgCaptureStreamV1).unwrap();
+        let header = frozen.header();
+        let mut seal = WholePgSealCodec::new(&key, &frozen).unwrap();
+        let mut frames = Vec::new();
+        let mut buffer = Zeroizing::new(Vec::with_capacity(16384));
+        while let Some(spec) = seal.next_frame() {
+            fill(&frozen, spec, &mut buffer);
+            let parts = seal.seal_next_in_place(&mut buffer).unwrap();
+            frames.push((parts.header, parts.tag, buffer.to_vec()));
+        }
+        let expected = |header: &[u8; 80]| WholePgManifestExpectation {
+            bundle_id: uuid_bytes(&frozen.claim().bundle_id).unwrap(),
+            source_operation_id: uuid_bytes(&frozen.claim().operation_id).unwrap(),
+            manifest_sha256: header[48..80].try_into().unwrap(),
+        };
+        let open = |header: &[u8; 80], frame: &([u8; 21], [u8; 16], Vec<u8>), bounds| {
+            let mut plain = Zeroizing::new(frame.2.clone());
+            let opened = open_whole_pg_manifest_in_place(
+                &key,
+                &expected(header),
+                header,
+                &frame.0,
+                &frame.1,
+                &mut plain,
+                bounds,
+            );
+            (opened, plain)
+        };
+
+        // The manifest frame opens in place and rebuilds the exact header.
+        let (opened, plain) = open(&header, &frames[0], bounds());
+        let opened = opened.unwrap();
+        assert_eq!(opened.header(), header);
+        assert_eq!(Sha256::digest(plain.as_slice()).as_slice(), &header[48..80]);
+
+        // A manifest beyond the metadata bound stops in the bounded decoder.
+        let tight = WholePgCarrierBounds {
+            max_metadata_bytes: 1024,
+            ..raw_bounds()
+        }
+        .check()
+        .unwrap();
+        let (refused, plain) = open(&header, &frames[0], tight);
+        assert!(matches!(
+            refused,
+            Err(WholePgCarrierFault::CapacityExceeded)
+        ));
+        assert!(plain.is_empty());
+
+        // An authenticated but non-canonical encoding of the same claim is refused.
+        let mut canonical = Zeroizing::new(Vec::with_capacity(16384));
+        frozen.encode_manifest_into(&mut canonical).unwrap();
+        let mut spaced = vec![b'{', b' '];
+        spaced.extend_from_slice(&canonical[1..]);
+        let mut odd_header = header;
+        odd_header[28..32].copy_from_slice(&(spaced.len() as u32).to_be_bytes());
+        odd_header[48..80].copy_from_slice(&Sha256::digest(&spaced));
+        let mut odd_frame = frames[0].0;
+        odd_frame[17..21].copy_from_slice(&(spaced.len() as u32).to_be_bytes());
+        let tag = whole_pg_seal_in_place(
+            &stream,
+            &nonce(0),
+            &aad(&odd_header, &odd_frame),
+            &mut spaced,
+        )
+        .unwrap();
+        let (refused, plain) = open(&odd_header, &(odd_frame, tag, spaced), bounds());
+        assert!(matches!(refused, Err(WholePgCarrierFault::NonCanonical)));
+        assert!(plain.is_empty());
+
+        // The remaining frames still require the exact terminal record.
+        let mut reader = WholePgOpenCodec::new(&key, &opened, &header).unwrap();
+        let (terminal, data) = frames.split_last().unwrap();
+        for (frame_header, tag, bytes) in data {
+            let mut bytes = Zeroizing::new(bytes.clone());
+            reader
+                .open_next_in_place(frame_header, tag, &mut bytes)
+                .unwrap();
+        }
+        let seq = u32::from_be_bytes(terminal.0[1..5].try_into().unwrap());
+        let mut wrong = vec![0u8; 84];
+        let tag =
+            whole_pg_seal_in_place(&stream, &nonce(seq), &aad(&header, &terminal.0), &mut wrong)
+                .unwrap();
+        let mut wrong = Zeroizing::new(wrong);
+        assert!(matches!(
+            reader.open_next_in_place(&terminal.0, &tag, &mut wrong),
+            Err(WholePgCarrierFault::TerminalMissing)
         ));
     }
 }

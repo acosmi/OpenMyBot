@@ -66,14 +66,13 @@ pub struct OwnedCaptureStreamInputs {
     // Metadata bytes check_parts charged for these parts; only from_owned_parts sets it.
     parts_metadata: u64,
 }
-#[allow(dead_code)] // Fields hold the original owners until this failure drops.
 pub struct OwnedCaptureStreamFailure {
-    fault: WholePgCarrierFault,
+    _fault: WholePgCarrierFault,
     // Before release, retain the genuine original FD/secret values on every failure.
     // After release, None and the recorded stage preserve that irreversible fact.
-    retained: Option<WholePgOwnedStreamParts>,
-    io: RetainedStreamIo,
-    release_stage: StreamReleaseStage,
+    _retained: Option<WholePgOwnedStreamParts>,
+    _io: RetainedStreamIo,
+    _release_stage: StreamReleaseStage,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum StreamReleaseStage {
@@ -129,10 +128,10 @@ impl OwnedCaptureStreamInputs {
                 parts_metadata,
             }),
             Err(fault) => Err(OwnedCaptureStreamFailure {
-                fault,
-                retained: Some(parts),
-                io: RetainedStreamIo::empty(),
-                release_stage: StreamReleaseStage::Retained,
+                _fault: fault,
+                _retained: Some(parts),
+                _io: RetainedStreamIo::empty(),
+                _release_stage: StreamReleaseStage::Retained,
             }),
         }
     }
@@ -468,10 +467,10 @@ pub fn run_owned_stream(
             published_verified: io.published_verified,
         }),
         Err(fault) => Err(OwnedCaptureStreamFailure {
-            fault,
-            retained,
-            io,
-            release_stage,
+            _fault: fault,
+            _retained: retained,
+            _io: io,
+            _release_stage: release_stage,
         }),
     }
 }
@@ -1658,7 +1657,7 @@ mod tests {
         };
         let receipt = match run_owned_stream(input, Arc::new(Always)) {
             Ok(v) => v,
-            Err(v) => panic!("{}", v.fault),
+            Err(v) => panic!("{}", v._fault),
         };
         assert!(receipt.key_verified && receipt.temporary_verified && receipt.published_verified);
         assert_eq!(receipt.wire_bytes, wire);
@@ -1689,16 +1688,16 @@ mod tests {
             Err(v) => v,
             Ok(_) => panic!("overwrite"),
         };
-        assert_eq!(failed.fault, WholePgCarrierFault::PublishUnknown);
+        assert_eq!(failed._fault, WholePgCarrierFault::PublishUnknown);
         assert_eq!(std::fs::read(&final_path).unwrap(), b"old-backup");
         assert!(
-            failed.io.key.is_some()
-                && failed.io.key_verified
-                && failed.io.temporary_verified
-                && !failed.io.published_verified
+            failed._io.key.is_some()
+                && failed._io.key_verified
+                && failed._io.temporary_verified
+                && !failed._io.published_verified
         );
         assert!(root.join("output").join(TEMP).exists());
-        assert_eq!(failed.retained.as_ref().unwrap().sources.len(), 15);
+        assert_eq!(failed._retained.as_ref().unwrap().sources.len(), 15);
         drop(failed);
         finish(root);
     }
@@ -1717,7 +1716,7 @@ mod tests {
             Ok(_) => panic!("overwrite"),
         };
         assert_eq!(std::fs::read(&key_path).unwrap(), b"old-key");
-        assert!(!failed.io.key_verified && failed.io.key.is_some());
+        assert!(!failed._io.key_verified && failed._io.key.is_some());
         assert!(!root.join("output").join(TEMP).exists());
         drop(failed);
         finish(root);
@@ -1733,11 +1732,11 @@ mod tests {
             Err(v) => v,
             Ok(_) => panic!("expired"),
         };
-        assert_eq!(failed.fault, WholePgCarrierFault::DeadlineExpired);
-        assert_eq!(failed.retained.as_ref().unwrap().sources.len(), 15);
+        assert_eq!(failed._fault, WholePgCarrierFault::DeadlineExpired);
+        assert_eq!(failed._retained.as_ref().unwrap().sources.len(), 15);
         assert_eq!(
             failed
-                .retained
+                ._retained
                 .as_ref()
                 .unwrap()
                 .sources
@@ -1746,7 +1745,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(failed.io.files.is_empty() && failed.io.key.is_none());
+        assert!(failed._io.files.is_empty() && failed._io.key.is_none());
         drop(failed);
         finish(root);
     }
@@ -1766,9 +1765,9 @@ mod tests {
             Err(v) => v,
             Ok(_) => panic!("source"),
         };
-        assert_eq!(failed.fault, WholePgCarrierFault::SourceChanged);
+        assert_eq!(failed._fault, WholePgCarrierFault::SourceChanged);
         assert!(!root.join("key").join(KEY).exists());
-        assert!(failed.io.files.is_empty());
+        assert!(failed._io.files.is_empty());
         drop(failed);
         finish(root);
     }
@@ -1872,7 +1871,7 @@ mod tests {
         };
         let receipt = match run_owned_stream(input, Arc::new(Always)) {
             Ok(v) => v,
-            Err(v) => panic!("{}", v.fault),
+            Err(v) => panic!("{}", v._fault),
         };
         rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
         assert!(receipt.published_verified());
@@ -1893,9 +1892,9 @@ mod tests {
             Err(v) => v,
             Ok(_) => panic!("closing"),
         };
-        assert_eq!(failure.fault, WholePgCarrierFault::ClosingPending);
-        assert_eq!(failure.release_stage, StreamReleaseStage::Retained);
-        assert!(failure.retained.is_some() && failure.io.key.is_some());
+        assert_eq!(failure._fault, WholePgCarrierFault::ClosingPending);
+        assert_eq!(failure._release_stage, StreamReleaseStage::Retained);
+        assert!(failure._retained.is_some() && failure._io.key.is_some());
         assert_eq!(
             rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive),
             Err(rustix::io::Errno::WOULDBLOCK)
@@ -1927,10 +1926,10 @@ mod tests {
             Ok(_) => panic!("late_release"),
         };
         assert_eq!(clock.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(failure.fault, WholePgCarrierFault::ClosingPending);
-        assert_eq!(failure.release_stage, StreamReleaseStage::Released);
-        assert!(failure.retained.is_none());
-        assert!(failure.io.files.is_empty() && failure.io.key.is_none());
+        assert_eq!(failure._fault, WholePgCarrierFault::ClosingPending);
+        assert_eq!(failure._release_stage, StreamReleaseStage::Released);
+        assert!(failure._retained.is_none());
+        assert!(failure._io.files.is_empty() && failure._io.key.is_none());
         rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
         drop(failure);
         drop(probe);
@@ -1947,8 +1946,8 @@ mod tests {
             Err(v) => v,
             Ok(_) => panic!("profile"),
         };
-        assert_eq!(failure.fault, WholePgCarrierFault::ProfileInvalid);
-        assert!(failure.io.key.is_none() && failure.io.files.is_empty());
+        assert_eq!(failure._fault, WholePgCarrierFault::ProfileInvalid);
+        assert!(failure._io.key.is_none() && failure._io.files.is_empty());
         drop(failure);
         finish(root);
     }
@@ -1962,7 +1961,7 @@ mod tests {
             Err(v) => v,
             Ok(_) => panic!("copies"),
         };
-        assert_eq!(failure.fault, WholePgCarrierFault::CapacityExceeded);
+        assert_eq!(failure._fault, WholePgCarrierFault::CapacityExceeded);
         drop(failure);
         finish(root);
         let (root, mut parts) = fixture(64);
@@ -1974,7 +1973,7 @@ mod tests {
             Err(v) => v,
             Ok(_) => panic!("peak"),
         };
-        assert_eq!(failure.fault, WholePgCarrierFault::CapacityExceeded);
+        assert_eq!(failure._fault, WholePgCarrierFault::CapacityExceeded);
         drop(failure);
         finish(root);
     }
@@ -1986,14 +1985,14 @@ mod tests {
         parts.carrier_bounds = carrier.check().unwrap();
         let input = match OwnedCaptureStreamInputs::from_owned_parts(parts) {
             Ok(v) => v,
-            Err(v) => panic!("{}", v.fault),
+            Err(v) => panic!("{}", v._fault),
         };
         let failure = match run_owned_stream(input, Arc::new(Always)) {
             Err(v) => v,
             Ok(_) => panic!("allocation"),
         };
-        assert_eq!(failure.fault, WholePgCarrierFault::CapacityExceeded);
-        assert!(failure.io.files.is_empty() && failure.io.key.is_none());
+        assert_eq!(failure._fault, WholePgCarrierFault::CapacityExceeded);
+        assert!(failure._io.files.is_empty() && failure._io.key.is_none());
         drop(failure);
         finish(root);
     }

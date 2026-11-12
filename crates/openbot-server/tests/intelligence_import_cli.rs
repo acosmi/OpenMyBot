@@ -171,6 +171,60 @@ async fn cli_rejects_public_secret_file_then_imports_empty_signed_bundle() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "requires PostgreSQL: set OPENBOT_TEST_DATABASE_URL and run with --include-ignored"]
+async fn migrate_schema_cli_brings_an_empty_database_to_latest_idempotently() {
+    let admin = admin_config("migrate_schema_cli_brings_an_empty_database_to_latest_idempotently");
+    with_temp_database(&admin, "migrate_schema_cli", |config| async move {
+        let database_url = connection_string(&config)?;
+        for run in ["first", "second"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_openbot-migrate"))
+                .env_clear()
+                .env("DATABASE_URL", &database_url)
+                .arg("migrate-schema")
+                .output()
+                .map_err(|error| error.to_string())?;
+            if output.status.code() != Some(0)
+                || !output.stderr.is_empty()
+                || String::from_utf8_lossy(&output.stdout).trim()
+                    != r#"{"code":"migration_completed"}"#
+            {
+                return Err(format!("{run} migrate-schema run failed: {output:?}"));
+            }
+        }
+        let pool = pool::connect(&config)
+            .await
+            .map_err(|error| error.to_string())?;
+        let client = pool.get().await.map_err(|error| error.to_string())?;
+        let version: i32 = client
+            .query_one(
+                "SELECT max(version) FROM openbot_internal.schema_migrations",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get(0);
+        let validated: bool = client
+            .query_one(
+                "SELECT convalidated FROM pg_constraint
+                 WHERE conrelid='public.tool_calls'::regclass AND conname='tool_calls_run_id_fkey'",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get(0);
+        drop(client);
+        pool.close();
+        if version != openbot_infra::db::native::NATIVE_LATEST_VERSION || validated {
+            return Err(format!(
+                "ledger {version} or tool_calls_run_id_fkey validated={validated}"
+            ));
+        }
+        Ok(())
+    })
+    .await;
+}
+
 fn run_cli(
     database_url: &str,
     bundle: &std::path::Path,

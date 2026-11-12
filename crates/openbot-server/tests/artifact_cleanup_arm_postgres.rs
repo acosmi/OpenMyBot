@@ -413,6 +413,11 @@ impl Fixture {
             direct,
             "cleanup-arm-owned-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &admin,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?
         .begin_thread_run(begin.clone())
@@ -439,6 +444,11 @@ impl Fixture {
                 store.clone(),
                 ArtifactQuotaPolicy::default(),
                 SecretBytes::new(vec![0x18; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &admin,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|e| e.to_string())?,
         );
@@ -1779,12 +1789,12 @@ async fn foreign_current_admin_or_namespace_cannot_arm_original_saved_pair() {
         let new_unenrolled=PostgresSessionAuthResolver::new(f.pool.clone(),SESSION_KEY,default_session_lifetime(),DeploymentId::new(DEPLOYMENT),TenantId::new(TENANT)).map_err(|e|e.to_string())?;
         let unenrolled_auth=resolve(&new_unenrolled,COOKIE_A).await?;
         require(unenrolled_auth==f.auth && !unenrolled_auth.request_binding().unwrap().identity().same_binding(f.auth.request_binding().unwrap().identity()),"foreign issuer fixture did not preserve six facts while changing original Host binding")?;
-        let other_actual=Arc::new(PostgresArtifactAdministration::new(f.registry.clone(),f.store.clone(),ArtifactQuotaPolicy::default(),SecretBytes::new(vec![0x18;32])).map_err(|e|e.to_string())?);
+        let other_actual=Arc::new(PostgresArtifactAdministration::new(f.registry.clone(),f.store.clone(),ArtifactQuotaPolicy::default(),SecretBytes::new(vec![0x18;32]),openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool,&DeploymentId::new(DEPLOYMENT),&TenantId::new(TENANT))).map_err(|e|e.to_string())?);
         let foreign_root=OwnedRoot::new()?;
         let deployment=DeploymentId::new("foreign-cleanup-deployment");let tenant=TenantId::new("foreign-cleanup-tenant");
         let registry=Arc::new(ArtifactDatasetRegistry::from_server(f.pool.clone(),&deployment,&tenant).await.map_err(|e|e.to_string())?);
         let store=Arc::new(DatasetBoundArtifactStore::bind_host_root(std::fs::File::open(&foreign_root.0).map_err(|e|e.to_string())?,registry.clone(),ArtifactQuotaPolicy::default()).await.map_err(|e|e.to_string())?);
-        let foreign=Arc::new(PostgresArtifactAdministration::new(registry,store,ArtifactQuotaPolicy::default(),SecretBytes::new(vec![0x19;32])).map_err(|e|e.to_string())?);
+        let foreign=Arc::new(PostgresArtifactAdministration::new(registry,store,ArtifactQuotaPolicy::default(),SecretBytes::new(vec![0x19;32]),openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool,&deployment,&tenant)).map_err(|e|e.to_string())?);
         let foreign_host=PostgresSessionAuthResolver::new(f.pool.clone(),SESSION_KEY,default_session_lifetime(),deployment,tenant).map_err(|e|e.to_string())?;
         foreign_host.install_artifact_read_authority(&foreign.read_authority()).map_err(|_|"foreign true authority enrollment failed")?;
         let foreign_auth=resolve(&foreign_host,COOKIE_A).await?;
@@ -2891,7 +2901,8 @@ async fn actual_foreign_store_or_preflight_replaced_object_refuses_cleanup_witho
         let foreign_store = Arc::new(DatasetBoundArtifactStore::bind_host_root(
             std::fs::File::open(&foreign_root.0).map_err(|e| e.to_string())?, foreign_registry.clone(), ArtifactQuotaPolicy::default()).await.map_err(|e| e.to_string())?);
         let foreign = Arc::new(PostgresArtifactAdministration::new(foreign_registry.clone(), foreign_store,
-            ArtifactQuotaPolicy::default(), SecretBytes::new(vec![0x18; 32])).map_err(|e| e.to_string())?);
+            ArtifactQuotaPolicy::default(), SecretBytes::new(vec![0x18; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &foreign_deployment, &foreign_tenant)).map_err(|e| e.to_string())?);
         let original = object_fact(&f.path())?;
         let gate = install_physical_gate(f, original.clone(), 0, false)?;
         let before = database_facts(&f.admin).await?;
@@ -4268,6 +4279,11 @@ async fn terminal_g124_alternate_namespace(
             Arc::clone(&store),
             ArtifactQuotaPolicy::default(),
             SecretBytes::new(vec![0x18; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &f.pool,
+                &deployment,
+                &tenant,
+            ),
         )
         .map_err(|e| e.to_string())?,
     );

@@ -12,6 +12,11 @@ const LEGACY0052_SCHEMA: &str =
 const LEGACY0051_SCHEMA: &str =
     include_str!("../../../../fixtures/db/thread-history-writer-0051.json");
 const CURRENT_TERMINAL_PAYLOAD: &str = include_str!("../automation/terminal-payload-0054.json");
+/// The registered 0052 oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶7984); a current observation checks the one
+/// terminal payload body that 0054 replaces separately. The 0051 oracle stays on demand.
+static REGISTERED: std::sync::LazyLock<Option<Value>> =
+    std::sync::LazyLock::new(|| serde_json::from_str(LEGACY0052_SCHEMA).ok());
 
 const CAPTURE_SQL: &str = r####"WITH
 wanted_relations(schema_name, relation_name) AS (
@@ -1494,12 +1499,13 @@ async fn observation_on<C: GenericClient + Sync>(
     client: &C,
     current52: bool,
 ) -> Result<ThreadHistoryWriterSchemaFacts, InfraError> {
-    let registered = if current52 {
-        LEGACY0052_SCHEMA
+    let legacy: Value;
+    let expected = if current52 {
+        REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?
     } else {
-        LEGACY0051_SCHEMA
+        legacy = serde_json::from_str(LEGACY0051_SCHEMA).map_err(|_| corrupt("oracle"))?;
+        &legacy
     };
-    let expected: Value = serde_json::from_str(registered).map_err(|_| corrupt("oracle"))?;
     let contract = &expected["rawContract"];
     check_raw_contract_shape(contract, current52)?;
     let row = client
@@ -1538,32 +1544,14 @@ fn compare_registered(
     oracle: WriterOracle,
 ) -> Result<(), InfraError> {
     let current52 = !matches!(oracle, WriterOracle::Legacy0051);
-    let registered = if current52 {
-        LEGACY0052_SCHEMA
+    let legacy: Value;
+    let expected = if current52 {
+        REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?
     } else {
-        LEGACY0051_SCHEMA
+        legacy = serde_json::from_str(LEGACY0051_SCHEMA).map_err(|_| corrupt("oracle"))?;
+        &legacy
     };
-    let mut expected: Value = serde_json::from_str(registered).map_err(|_| corrupt("oracle"))?;
-    if matches!(oracle, WriterOracle::Current0054) {
-        // FIX-036-1 replaces exactly this function body; all other registered facts stay exact.
-        let payload: Value = serde_json::from_str(CURRENT_TERMINAL_PAYLOAD)
-            .map_err(|_| corrupt("terminal_payload_oracle"))?;
-        let function = expected["schema"]["functions"]
-            .as_array_mut()
-            .and_then(|functions| {
-                functions.iter_mut().find(|entry| {
-                    same_identity(
-                        &entry["identity"],
-                        "openbot_internal",
-                        "thread_history_terminal_payload",
-                    ) && entry["identity"]["arguments"] == "p_type text, p_payload jsonb"
-                })
-            })
-            .ok_or_else(|| corrupt("terminal_payload_oracle"))?;
-        function["source"] = payload["source"].clone();
-        function["definition"] = payload["definition"].clone();
-    }
-    let keys = obj(&expected)?
+    let keys = obj(expected)?
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
@@ -1603,16 +1591,43 @@ fn compare_registered(
                 == 1,
         )?;
     }
-    require(
-        expected["schema"]
-            == hot_comparison_clone(&expected["schema"], &observation["schema"], current52)?,
-    )
+    let mut actual = hot_comparison_clone(&expected["schema"], &observation["schema"], current52)?;
+    if matches!(oracle, WriterOracle::Current0054) {
+        // FIX-036-1 replaces exactly this function body; all other registered facts stay exact.
+        let payload: Value = serde_json::from_str(CURRENT_TERMINAL_PAYLOAD)
+            .map_err(|_| corrupt("terminal_payload_oracle"))?;
+        let terminal = |entry: &Value| {
+            same_identity(
+                &entry["identity"],
+                "openbot_internal",
+                "thread_history_terminal_payload",
+            ) && entry["identity"]["arguments"] == "p_type text, p_payload jsonb"
+        };
+        let registered = arr(&expected["schema"]["functions"])?
+            .iter()
+            .find(|entry| terminal(entry))
+            .ok_or_else(|| corrupt("terminal_payload_oracle"))?;
+        let function = actual["functions"]
+            .as_array_mut()
+            .and_then(|functions| functions.iter_mut().find(|entry| terminal(entry)))
+            .ok_or_else(|| corrupt("facts"))?;
+        require(
+            function["source"] == payload["source"]
+                && function["definition"] == payload["definition"],
+        )?;
+        function["source"] = registered["source"].clone();
+        function["definition"] = registered["definition"].clone();
+        sort_top_level_multisets(&mut actual)?;
+    }
+    require(expected["schema"] == actual)
 }
-/// Require the exact current 0054 prefix and its fixed writer schema on this Client.
+/// Require exact current55/43, the 0052 graph with the 0054 terminal payload body
+/// and the additive0055 catalog.
 pub async fn verify(client: &Client) -> Result<(), InfraError> {
-    let ledger = native::validate_known_prefix(client, native::NATIVE_0054_VERSION).await?;
-    require(ledger.latest_version() == native::NATIVE_0054_VERSION)?;
-    verify_schema(client).await
+    let ledger = native::validate_known_prefix(client, native::NATIVE_LATEST_VERSION).await?;
+    require(ledger.latest_version() == native::NATIVE_LATEST_VERSION)?;
+    verify_schema(client).await?;
+    super::restore_reconfirmation_schema::verify_schema(client).await
 }
 /// Schema-only helper after the caller proves its original exact native prefix.
 pub(crate) async fn verify_schema(client: &Client) -> Result<(), InfraError> {
@@ -1633,6 +1648,32 @@ pub(crate) async fn verify_legacy0052<C: GenericClient + Sync>(
         &observation_on(client, true).await?,
         WriterOracle::Legacy0052,
     )
+}
+
+/// Registered oracle text lengths (the 0052 graph and the terminal payload body
+/// that replaces one of its functions); the tree is charged once per operation.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const ORACLE_BYTES: u64 =
+    (LEGACY0052_SCHEMA.len() + CURRENT_TERMINAL_PAYLOAD.len()) as u64;
+
+/// Payload text length one current [`verify_in_transaction`] observes,
+/// measured on the same transaction before it runs.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) async fn observation_bytes_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<u64, InfraError> {
+    let expected = REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?;
+    let row = tx
+        .query_one(
+            &format!("SELECT coalesce(octet_length(thread_history_raw),0)::bigint FROM ({CAPTURE_SQL}) observed"),
+            &[&expected["rawContract"], &true],
+        )
+        .await
+        .map_err(|source| InfraError::query("measure thread history writer schema observation", source))?;
+    let payload: i64 = row.try_get(0).map_err(|source| {
+        RowDecodeError::column("(thread_history_writer_schema)", "bytes", source)
+    })?;
+    u64::try_from(payload).ok().ok_or_else(|| corrupt("facts"))
 }
 /// Schema-only historical51 helper after an explicit exact pre-upgrade prefix proof.
 pub(crate) async fn verify_schema_legacy0051(client: &Client) -> Result<(), InfraError> {

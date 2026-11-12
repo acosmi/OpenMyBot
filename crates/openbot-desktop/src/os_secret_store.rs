@@ -39,6 +39,21 @@ pub trait OsSecretStore: Send + Sync {
 
     /// Create or replace one exact service/account pair.
     fn write(&self, service: &str, account: &str, secret: &[u8]) -> Result<(), OsSecretStoreError>;
+
+    /// Read one exact pair whose value is at most `max_bytes`; a longer value
+    /// is `Unknown` and is not copied into this process. Adapters that cannot
+    /// see the length before their own copy check it right after.
+    fn read_bounded(
+        &self,
+        service: &str,
+        account: &str,
+        max_bytes: usize,
+    ) -> Result<Option<SecretBytes>, OsSecretStoreError> {
+        match self.read(service, account)? {
+            Some(secret) if secret.expose().len() > max_bytes => Err(OsSecretStoreError::Unknown),
+            read => Ok(read),
+        }
+    }
 }
 
 /// Current-user macOS Keychain generic-password adapter.
@@ -82,6 +97,31 @@ impl OsSecretStore for MacOsKeychainSecretStore {
             .map(|entry| {
                 entry.map(|(password, _item)| SecretBytes::new(password.as_ref().to_vec()))
             })
+        })
+    }
+
+    // Security.framework allocates its own password buffer before returning;
+    // that buffer is outside this boundary. The length is checked on it before
+    // the only copy into Rust-owned memory.
+    fn read_bounded(
+        &self,
+        service: &str,
+        account: &str,
+        max_bytes: usize,
+    ) -> Result<Option<SecretBytes>, OsSecretStoreError> {
+        macos_interaction::non_interactive(|| {
+            match macos_interaction::lookup(
+                self.keychain
+                    .find_generic_password(service, account)
+                    .map_err(|error| error.code()),
+            )? {
+                Some((password, _item)) if password.as_ref().len() > max_bytes => {
+                    Err(OsSecretStoreError::Unknown)
+                }
+                entry => {
+                    Ok(entry.map(|(password, _item)| SecretBytes::new(password.as_ref().to_vec())))
+                }
+            }
         })
     }
 

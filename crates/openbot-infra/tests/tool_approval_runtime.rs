@@ -1,5 +1,7 @@
 //! Durable human proof-of-intent: actor isolation, wait/wake, reuse, denial, expiry and revocation.
 
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 mod harness {
     include!("../../../test-support/postgres_harness.rs");
 }
@@ -34,15 +36,17 @@ const THREAD: &str = "approval-thread";
 const AUDIT_KEY: &[u8] = b"approval-runtime-audit-key-at-least-32";
 
 fn auth(actor: &str, generation: u64) -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new("approval-deployment"),
-        TenantId::new("approval-tenant"),
-        ActorId::new(actor),
-        AuthGeneration::new(generation),
-        false,
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new("approval-deployment"),
+            TenantId::new("approval-tenant"),
+            ActorId::new(actor),
+            AuthGeneration::new(generation),
+            false,
+        )
+        .with_role(Role::User)
+        .build(),
     )
-    .with_role(Role::User)
-    .build()
 }
 
 fn request(call: &str, class: ApprovalClass) -> ToolApprovalRequest {
@@ -205,6 +209,11 @@ async fn durable_wait_grant_reuse_deny_expire_and_generation_cancel_are_real() {
                     DeploymentId::new("approval-deployment"),
                     TenantId::new("approval-tenant"),
                     AUDIT_KEY.to_vec(),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &openbot_contracts::ids::DeploymentId::new("outside"),
+                        &openbot_contracts::ids::TenantId::new("outside"),
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );
@@ -215,6 +224,11 @@ async fn durable_wait_grant_reuse_deny_expire_and_generation_cancel_are_real() {
                 DeploymentId::new("approval-deployment"),
                 TenantId::new("approval-tenant"),
                 AUDIT_KEY.to_vec(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let mut owner_activity = replica

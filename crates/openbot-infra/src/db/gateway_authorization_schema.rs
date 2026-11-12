@@ -9,6 +9,10 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 pub type GatewayAuthorizationSchemaFacts = Value;
 const REGISTERED_SCHEMA: &str =
     include_str!("../../../../fixtures/db/gateway-authorization-attempts-0048.json");
+/// The registered oracle tree, parsed once per process and borrowed by every
+/// observation (spec revision R484 ¶7984).
+static REGISTERED: std::sync::LazyLock<Option<Value>> =
+    std::sync::LazyLock::new(|| serde_json::from_str(REGISTERED_SCHEMA).ok());
 
 const CAPTURE_SQL: &str = r####"WITH
 wanted_relations(schema_name, relation_name) AS (
@@ -1259,8 +1263,8 @@ async fn observation_on<C: GenericClient + Sync>(
 }
 
 fn compare_registered(observation: &GatewayAuthorizationSchemaFacts) -> Result<(), InfraError> {
-    let expected: Value = serde_json::from_str(REGISTERED_SCHEMA).map_err(|_| corrupt("oracle"))?;
-    let expected_keys = obj(&expected)?
+    let expected = REGISTERED.as_ref().ok_or_else(|| corrupt("oracle"))?;
+    let expected_keys = obj(expected)?
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
@@ -1302,6 +1306,31 @@ pub async fn verify(client: &Client) -> Result<(), InfraError> {
 /// It does not acquire another client or transaction, migrate, repair or finish the transaction.
 pub(crate) async fn verify_in_transaction(tx: &Transaction<'_>) -> Result<(), InfraError> {
     compare_registered(&observation_on(tx).await?)
+}
+
+/// Registered oracle text length; its tree is charged once per operation.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const ORACLE_BYTES: u64 = REGISTERED_SCHEMA.len() as u64;
+
+/// Payload text length one [`verify_in_transaction`] observes, measured on
+/// the same transaction before it runs.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) async fn observation_bytes_in_transaction(
+    tx: &Transaction<'_>,
+) -> Result<u64, InfraError> {
+    let row = tx
+        .query_one(
+            &format!("SELECT coalesce(octet_length(gateway_authorization_raw),0)::bigint FROM ({CAPTURE_SQL}) observed"),
+            &[],
+        )
+        .await
+        .map_err(|source| InfraError::query("measure gateway authorization schema observation", source))?;
+    let payload: i64 = row.try_get(0).map_err(|source| {
+        super::RowDecodeError::column("(gateway_authorization_schema)", "bytes", source)
+    })?;
+    u64::try_from(payload).map_err(|_| {
+        InfraError::repository_invariant("gateway_authorization_schema_observation_bytes")
+    })
 }
 
 #[cfg(test)]

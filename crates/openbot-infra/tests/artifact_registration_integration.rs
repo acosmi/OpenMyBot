@@ -233,6 +233,11 @@ impl Fixture {
             config.clone(),
             "artifact-registration-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?;
         directory
@@ -295,6 +300,11 @@ impl Fixture {
             store,
             policy,
             SecretBytes::new(vec![0x81; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map(Arc::new)
         .map_err(|error| error.to_string())
@@ -361,6 +371,11 @@ impl Fixture {
             "artifact-registration-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?;
         let claim = runtime
@@ -1158,6 +1173,11 @@ async fn equal_database_identity_does_not_combine_foreign_pool_and_store_owner()
             store,
             ArtifactQuotaPolicy::default(),
             SecretBytes::new(vec![0x81; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &foreign,
+                &DeploymentId::new(DEPLOYMENT),
+                &TenantId::new(TENANT),
+            ),
         );
         require(
             administration.is_err(),

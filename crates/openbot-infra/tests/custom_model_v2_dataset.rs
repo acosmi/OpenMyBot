@@ -7,6 +7,8 @@ mod harness;
 mod pending_input_dispatcher;
 #[path = "custom_model_v2_dataset/pending_inputs.rs"]
 mod pending_inputs;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 #[path = "custom_model_v2_dataset/work_control.rs"]
 mod work_control;
 #[path = "custom_model_v2_dataset/work_journey.rs"]
@@ -67,15 +69,18 @@ impl RemoteAguiTransport for ClosedProbe {
     }
 }
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    // This owned database is outside every recovery domain (spec revision R484 S12).
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct W02ArtifactRoot(std::path::PathBuf);
 impl W02ArtifactRoot {
@@ -159,6 +164,11 @@ impl Fixture {
                     store,
                     policy,
                     SecretBytes::new(vec![0x65; 32]),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &p,
+                        &DeploymentId::new(DEP),
+                        &TenantId::new(TENANT),
+                    ),
                 )
                 .unwrap(),
             ))
@@ -168,6 +178,12 @@ impl Fixture {
         let policy_store = PolicyStore::postgres(p.clone(), None);
         policy_store.load().await.unwrap();
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &p,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: p.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -211,6 +227,11 @@ impl Fixture {
             config.clone(),
             "owned-v2-runtime".into(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &p,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(binding.clone())
@@ -590,7 +611,12 @@ async fn original_pool_scope_once_enrollment_and_owner_lifetime_are_closed() {
                 other.clone(),
                 f.config.clone(),
                 "other".into(),
-                time::Duration::seconds(30)
+                time::Duration::seconds(30),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &other,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside")
+                )
             )
             .unwrap()
             .with_model_dataset_binding(f.binding.clone())
@@ -912,6 +938,7 @@ async fn server_original_six_tuple_checks_reject_reachable_drift_and_database_sc
 async fn server_namespace_schema_native_prefix_and_snapshot_shape_drift_never_accept_or_repair() {
     let admin = harness::admin_config("v2_server_physical_faults");
     harness::with_temp_database(&admin,"v2serverphysicalfaults",|config|async move {
+        let unknown_version:i32=openbot_infra::db::native::NATIVE_LATEST_VERSION+1;
         let f=Fixture::new(config,6).await;
         let model=f.model(CustomModelProtocol::OpenaiChatCompletions).await;
         let c=f.pool.get().await.unwrap();
@@ -933,7 +960,7 @@ async fn server_namespace_schema_native_prefix_and_snapshot_shape_drift_never_ac
                 2=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=repeat('0',64) WHERE version=47",&[]).await.unwrap();},
                 3=>{c.execute("UPDATE openbot_internal.schema_migrations SET name='owned_wrong_native_name' WHERE version=47",&[]).await.unwrap();},
                 4=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=46",&[]).await.unwrap();},
-                5=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(52,'owned_unknown_native_version',repeat('0',64))",&[]).await.unwrap();},
+                5=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES($1,'owned_unknown_native_version',repeat('0',64))",&[&unknown_version]).await.unwrap();},
                 _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT run_model_selection_v2_snapshots_protocol_check TO owned_v2_fault_snapshot_protocol").await.unwrap();},
             }
             if mode==6 {assert!(openbot_infra::db::custom_model_v2_schema::verify(&c).await.is_err());}
@@ -950,7 +977,7 @@ async fn server_namespace_schema_native_prefix_and_snapshot_shape_drift_never_ac
                 2=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=$1 WHERE version=47",&[&latest_checksum]).await.unwrap();},
                 3=>{c.execute("UPDATE openbot_internal.schema_migrations SET name=$1 WHERE version=47",&[&latest_name]).await.unwrap();},
                 4=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum,applied_at) VALUES(46,$1,$2,$3)",&[&gap_name,&gap_checksum,&gap_applied]).await.unwrap();},
-                5=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=52",&[]).await.unwrap();},
+                5=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=$1",&[&unknown_version]).await.unwrap();},
                 _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT owned_v2_fault_snapshot_protocol TO run_model_selection_v2_snapshots_protocol_check").await.unwrap();},
             }
             let restored_ledger:Value=c.query_one("SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM openbot_internal.schema_migrations m",&[]).await.unwrap().get(0);

@@ -5,6 +5,8 @@
 //! private controls in a newly created test database, never application extension points.
 
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -66,15 +68,17 @@ fn require(condition: bool, message: &'static str) -> TestResult {
 }
 
 fn actor(user: &str) -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEPLOYMENT),
-        TenantId::new(TENANT),
-        ActorId::new(user),
-        AuthGeneration::new(7),
-        false,
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEPLOYMENT),
+            TenantId::new(TENANT),
+            ActorId::new(user),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 
 fn create_input() -> CreateModelConnection {

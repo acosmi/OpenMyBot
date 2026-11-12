@@ -15,6 +15,7 @@ async fn w02_terminal_commit_dispatches_frozen_fifo() {
         let runtime = openbot_infra::run_runtime::PostgresRunRuntime::new(
             f.pool.clone(), "owned-v2-runtime".into(), time::Duration::seconds(30),
             openbot_infra::run_runtime::DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
         ).unwrap().with_pending_input_dispatcher(dispatcher.clone());
         let c = f.pool.get().await.unwrap();
         c.batch_execute("INSERT INTO public.skills(id,slug,title,summary,instructions,origin,owner_user_id)
