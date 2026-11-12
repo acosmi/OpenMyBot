@@ -12,7 +12,7 @@ use openbot_contracts::components::{
     SHOW_PROGRESS_COMPONENT_NAME, SHOW_QUOTE_COMPONENT_NAME, SHOW_RECORD_COMPONENT_NAME,
 };
 
-use crate::i18n::{t, use_i18n};
+use crate::i18n::{t, t_string, use_i18n};
 
 use super::{
     AreaChartCard, BarChartCard, ChartPoint, ChartSeries, ChecklistCard, ChecklistItem,
@@ -57,13 +57,13 @@ pub fn ComponentPreview(name: String) -> AnyView {
             <HumanDecisionCard
                 name=ASK_APPROVAL_COMPONENT_NAME.to_owned()
                 arguments=serde_json::json!({
-                    "title":"Refund this order?",
-                    "summary":"The customer was charged twice for the same order.",
+                    "title": t_string!(i18n, gallery.sample_refund_title),
+                    "summary": t_string!(i18n, gallery.sample_refund_summary),
                     "details":[
-                        {"label":"Amount","value":"$128.40"},
-                        {"label":"Order","value":"2043"}
+                        {"label": t_string!(i18n, gallery.sample_amount), "value":"$128.40"},
+                        {"label": t_string!(i18n, gallery.sample_order), "value":"2043"}
                     ],
-                    "approveLabel":"Refund"
+                    "approveLabel": t_string!(i18n, gallery.sample_refund)
                 })
                 answer=Signal::derive(|| Some(ComponentHumanDecisionAnswer::Approval(
                     ComponentApprovalAnswer {
@@ -75,27 +75,30 @@ pub fn ComponentPreview(name: String) -> AnyView {
                 error=Signal::derive(|| false)
             />
         }.into_any(),
-        ASK_CHOICE_COMPONENT_NAME => view! {
-            <HumanDecisionCard
-                name=ASK_CHOICE_COMPONENT_NAME.to_owned()
-                arguments=serde_json::json!({
-                    "title":"Where should this go?",
-                    "summary":"Choose the destination environment.",
-                    "options":[
-                        {"id":"staging","label":"Staging"},
-                        {"id":"production","label":"Production","description":"Live customers"}
-                    ]
-                })
-                answer=Signal::derive(|| Some(ComponentHumanDecisionAnswer::Choice(
-                    ComponentChoiceAnswer {
-                        choice: "staging".to_owned(),
-                        label: "Staging".to_owned(),
-                    }
-                )))
-                submitting=Signal::derive(|| false)
-                error=Signal::derive(|| false)
-            />
-        }.into_any(),
+        ASK_CHOICE_COMPONENT_NAME => {
+            let staging = t_string!(i18n, gallery.sample_staging).to_owned();
+            view! {
+                <HumanDecisionCard
+                    name=ASK_CHOICE_COMPONENT_NAME.to_owned()
+                    arguments=serde_json::json!({
+                        "title": t_string!(i18n, gallery.sample_destination_title),
+                        "summary": t_string!(i18n, gallery.sample_destination_summary),
+                        "options":[
+                            {"id":"staging","label": staging},
+                            {"id":"production","label": t_string!(i18n, gallery.sample_production),"description": t_string!(i18n, gallery.sample_live_customers)}
+                        ]
+                    })
+                    answer=Signal::derive(move || Some(ComponentHumanDecisionAnswer::Choice(
+                        ComponentChoiceAnswer {
+                            choice: "staging".to_owned(),
+                            label: staging.clone(),
+                        }
+                    )))
+                    submitting=Signal::derive(|| false)
+                    error=Signal::derive(|| false)
+                />
+            }.into_any()
+        }
         SHOW_ACTIVITY_REPORT_COMPONENT_NAME => view! {
             <p class="ob-gallery-preview-unavailable">
                 {move || t!(i18n, gallery.preview_unavailable)}
@@ -104,103 +107,112 @@ pub fn ComponentPreview(name: String) -> AnyView {
         .into_any(),
         SHOW_AREA_CHART_COMPONENT_NAME => view! {
             <AreaChartCard
-                title="Storage used".to_owned()
-                caption=Some("Growing steadily since the migration.".to_owned())
-                labels=vec!["Jan".to_owned(), "Feb".to_owned(), "Mar".to_owned(), "Apr".to_owned(), "May".to_owned()]
+                title=t_string!(i18n, gallery.sample_storage_title).to_owned()
+                caption=Some(t_string!(i18n, gallery.sample_storage_caption).to_owned())
+                labels=vec![
+                    t_string!(i18n, gallery.sample_jan).to_owned(),
+                    t_string!(i18n, gallery.sample_feb).to_owned(),
+                    t_string!(i18n, gallery.sample_mar).to_owned(),
+                    t_string!(i18n, gallery.sample_apr).to_owned(),
+                    t_string!(i18n, gallery.sample_may).to_owned(),
+                ]
                 series=vec![ChartSeries { name: "TB".to_owned(), values: vec![12.0, 19.0, 26.0, 31.0, 44.0] }]
             />
         }.into_any(),
         SHOW_BAR_CHART_COMPONENT_NAME => view! {
             <BarChartCard
-                title="Revenue by team".to_owned()
-                caption=Some("Sales leads, and Engineering is closing the gap.".to_owned())
+                title=t_string!(i18n, gallery.sample_revenue_title).to_owned()
+                caption=Some(t_string!(i18n, gallery.sample_revenue_caption).to_owned())
                 points=vec![
-                    ChartPoint { label: "Sales".to_owned(), value: 120.0 },
-                    ChartPoint { label: "Engineering".to_owned(), value: 80.0 },
-                    ChartPoint { label: "Support".to_owned(), value: 45.0 },
+                    ChartPoint { label: t_string!(i18n, gallery.sample_sales).to_owned(), value: 120.0 },
+                    ChartPoint { label: t_string!(i18n, gallery.sample_engineering).to_owned(), value: 80.0 },
+                    ChartPoint { label: t_string!(i18n, gallery.sample_support).to_owned(), value: 45.0 },
                 ]
             />
         }.into_any(),
         SHOW_CHECKLIST_COMPONENT_NAME => view! {
             <ChecklistCard
-                title="Before the release".to_owned()
+                title=t_string!(i18n, gallery.sample_release_title).to_owned()
                 caption=None
                 items=vec![
-                    ChecklistItem { text: "Migrations applied".to_owned(), done: true, note: None },
-                    ChecklistItem { text: "Changelog written".to_owned(), done: true, note: None },
-                    ChecklistItem { text: "Load test".to_owned(), done: false, note: Some("Waiting on staging".to_owned()) },
+                    ChecklistItem { text: t_string!(i18n, gallery.sample_migrations).to_owned(), done: true, note: None },
+                    ChecklistItem { text: t_string!(i18n, gallery.sample_changelog).to_owned(), done: true, note: None },
+                    ChecklistItem { text: t_string!(i18n, gallery.sample_load_test).to_owned(), done: false, note: Some(t_string!(i18n, gallery.sample_waiting_staging).to_owned()) },
                 ]
             />
         }
         .into_any(),
         SHOW_LINE_CHART_COMPONENT_NAME => view! {
             <LineChartCard
-                title="Signups".to_owned()
-                caption=Some("Six weeks, one release.".to_owned())
-                labels=vec!["W1".to_owned(), "W2".to_owned(), "W3".to_owned(), "W4".to_owned(), "W5".to_owned(), "W6".to_owned()]
-                series=vec![ChartSeries { name: "Signups".to_owned(), values: vec![120.0, 180.0, 160.0, 240.0, 300.0, 420.0] }]
+                title=t_string!(i18n, gallery.sample_signups).to_owned()
+                caption=Some(t_string!(i18n, gallery.sample_signups_caption).to_owned())
+                labels=(1..=6).map(|week| t_string!(i18n, gallery.sample_week, week = week).to_owned()).collect::<Vec<_>>()
+                series=vec![ChartSeries { name: t_string!(i18n, gallery.sample_signups).to_owned(), values: vec![120.0, 180.0, 160.0, 240.0, 300.0, 420.0] }]
             />
         }.into_any(),
         SHOW_METRICS_COMPONENT_NAME => view! {
             <MetricsCard
-                title="This month".to_owned()
+                title=t_string!(i18n, gallery.sample_this_month).to_owned()
                 caption=None
                 metrics=vec![
-                    HeadlineMetric { label: "Revenue".to_owned(), value: "$412k".to_owned(), change: Some("+12% on last month".to_owned()), change_tone: GalleryTone::Positive },
-                    HeadlineMetric { label: "Open deals".to_owned(), value: "38".to_owned(), change: None, change_tone: GalleryTone::Neutral },
-                    HeadlineMetric { label: "Churn".to_owned(), value: "1.4%".to_owned(), change: Some("+0.3pt".to_owned()), change_tone: GalleryTone::Caution },
+                    HeadlineMetric { label: t_string!(i18n, gallery.sample_revenue).to_owned(), value: "$412k".to_owned(), change: Some(t_string!(i18n, gallery.sample_revenue_change).to_owned()), change_tone: GalleryTone::Positive },
+                    HeadlineMetric { label: t_string!(i18n, gallery.sample_open_deals).to_owned(), value: "38".to_owned(), change: None, change_tone: GalleryTone::Neutral },
+                    HeadlineMetric { label: t_string!(i18n, gallery.sample_churn).to_owned(), value: "1.4%".to_owned(), change: Some("+0.3pt".to_owned()), change_tone: GalleryTone::Caution },
                 ]
             />
         }
         .into_any(),
         SHOW_NOTICE_COMPONENT_NAME => view! {
             <NoticeCard
-                title="Certificate expires in 30 days".to_owned()
-                body="The checkout certificate has an owner now, and this is the first of the new alerts.".to_owned()
+                title=t_string!(i18n, gallery.sample_certificate_title).to_owned()
+                body=t_string!(i18n, gallery.sample_certificate_body).to_owned()
                 tone=GalleryTone::Caution
-                points=vec!["Owner: Platform".to_owned(), "Renews automatically once approved".to_owned()]
+                points=vec![
+                    t_string!(i18n, gallery.sample_certificate_owner).to_owned(),
+                    t_string!(i18n, gallery.sample_certificate_renews).to_owned(),
+                ]
             />
         }
         .into_any(),
         SHOW_PIE_CHART_COMPONENT_NAME => view! {
             <PieChartCard
-                title="Where the month went".to_owned()
+                title=t_string!(i18n, gallery.sample_month_title).to_owned()
                 caption=None
                 points=vec![
-                    ChartPoint { label: "Build".to_owned(), value: 48.0 },
-                    ChartPoint { label: "Support".to_owned(), value: 26.0 },
-                    ChartPoint { label: "Meetings".to_owned(), value: 26.0 },
+                    ChartPoint { label: t_string!(i18n, gallery.sample_build).to_owned(), value: 48.0 },
+                    ChartPoint { label: t_string!(i18n, gallery.sample_support).to_owned(), value: 26.0 },
+                    ChartPoint { label: t_string!(i18n, gallery.sample_meetings).to_owned(), value: 26.0 },
                 ]
             />
         }.into_any(),
         SHOW_PROGRESS_COMPONENT_NAME => view! {
             <ProgressChartCard
-                title="Migration to the new runtime".to_owned()
-                caption=Some("Two services left.".to_owned())
+                title=t_string!(i18n, gallery.sample_runtime_title).to_owned()
+                caption=Some(t_string!(i18n, gallery.sample_runtime_caption).to_owned())
                 points=vec![
-                    ProgressPoint { label: "Services moved".to_owned(), value: 18.0, target: 20.0 },
-                    ProgressPoint { label: "Tests ported".to_owned(), value: 240.0, target: 240.0 },
+                    ProgressPoint { label: t_string!(i18n, gallery.sample_services_moved).to_owned(), value: 18.0, target: 20.0 },
+                    ProgressPoint { label: t_string!(i18n, gallery.sample_tests_ported).to_owned(), value: 240.0, target: 240.0 },
                 ]
             />
         }.into_any(),
         SHOW_QUOTE_COMPONENT_NAME => view! {
             <QuoteCard
-                quote="Meals under $75 need no receipt. Anything above needs one, and anything above $500 needs your manager before you spend it.".to_owned()
-                attribution="the expense policy".to_owned()
-                context="Last changed in March.".to_owned()
+                quote=t_string!(i18n, gallery.sample_quote).to_owned()
+                attribution=t_string!(i18n, gallery.sample_quote_attribution).to_owned()
+                context=t_string!(i18n, gallery.sample_quote_context).to_owned()
             />
         }
         .into_any(),
         SHOW_RECORD_COMPONENT_NAME => view! {
             <RecordCard
-                title="Invoice 2043".to_owned()
+                title=t_string!(i18n, gallery.sample_invoice_title).to_owned()
                 subtitle=Some("Northwind Traders".to_owned())
-                status=Some("Approved".to_owned())
+                status=Some(t_string!(i18n, gallery.decision_approved).to_owned())
                 status_tone=GalleryTone::Neutral
                 fields=vec![
-                    RecordField { label: "Amount".to_owned(), value: "$4,280.00".to_owned() },
-                    RecordField { label: "Raised".to_owned(), value: "12 March".to_owned() },
-                    RecordField { label: "Owner".to_owned(), value: "Priya Raman".to_owned() },
+                    RecordField { label: t_string!(i18n, gallery.sample_amount).to_owned(), value: "$4,280.00".to_owned() },
+                    RecordField { label: t_string!(i18n, gallery.sample_raised).to_owned(), value: t_string!(i18n, gallery.sample_raised_date).to_owned() },
+                    RecordField { label: t_string!(i18n, gallery.sample_owner).to_owned(), value: "Priya Raman".to_owned() },
                 ]
             />
         }

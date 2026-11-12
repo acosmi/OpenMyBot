@@ -77,7 +77,7 @@ use crate::primitives::{
     Avatar, AvatarSize, Badge, BadgeTone, Bubble, BubbleKind, Button, ButtonSize, ButtonVariant,
     Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageHeader,
     MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem,
-    MessageScrollerViewport, Notice, NoticeTone, TechnicalDetails, Textarea,
+    MessageScrollerViewport, Notice, NoticeTone, TechnicalDetails, Textarea, use_sidebar,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -1981,6 +1981,10 @@ fn ConversationSurface(
         allow_missing_snapshot.set(false);
         reload_generation.update(|value| *value = value.saturating_add(1));
     });
+    let show_channels = {
+        let sidebar = use_sidebar();
+        UnsyncCallback::new(move |_| sidebar.show_history())
+    };
     let composer_model = if direct {
         ComposerModel::Direct(direct_model)
     } else {
@@ -2015,6 +2019,7 @@ fn ConversationSurface(
             i18n,
             send_notice.get(),
             model_composer.selection_status(),
+            show_channels,
         ));
         if begin_unknown.get() && !direct {
             notices.push(SlotNotice::new(
@@ -2285,11 +2290,27 @@ fn ConversationSurface(
                                 let queue_id = message.id.clone();
                                 let text = message.intent.message.clone();
                                 let visible_text = text.clone();
-                                let assistant = message.intent.agent_id.as_str().to_owned();
+                                let assistant = use_agent_directory().agents.with_untracked(|agents| {
+                                    agents
+                                        .iter()
+                                        .find(|agent| agent.id == message.intent.agent_id)
+                                        .map(|agent| agent.name.clone())
+                                });
+                                let assistant = assistant.unwrap_or_else(|| t_string!(i18n, channels.unlisted_assistant).to_owned());
                                 let model = message.intent.model_selection.as_ref().map_or_else(
                                     || t_string!(i18n, models.use_agent_default).to_owned(),
-                                    |selection| t_string!(i18n, channels.queued_model_snapshot, connection=selection.connection_id.clone(), revision=selection.expected_revision).to_owned(),
+                                    |_| t_string!(i18n, bot_work.pending_model_snapshot).to_owned(),
                                 );
+                                let model_details = message.intent.model_selection.as_ref().map(|selection| {
+                                    let connection = selection.connection_id.clone();
+                                    let revision = selection.expected_revision;
+                                    view! {
+                                        <TechnicalDetails copy=connection.clone()>
+                                            <code>{connection}</code>
+                                            <span>{move || t_string!(i18n, bot_work.pending_model_revision, revision = revision).to_owned()}</span>
+                                        </TechnicalDetails>
+                                    }
+                                });
                                 let intent_summary = t_string!(i18n, channels.queued_intent_snapshot, assistant=assistant, model=model).to_owned();
                                 let remove_label = t_string!(
                                     i18n,
@@ -2314,6 +2335,7 @@ fn ConversationSurface(
                                                     <MessageFooter>
                                                         <span role="status">{move || t!(i18n, channels.queued_status)}</span>
                                                         <span class="ob-queue-snapshot">{intent_summary}</span>
+                                                        {model_details}
                                                         <Button
                                                             variant=ButtonVariant::Ghost
                                                             size=ButtonSize::Small

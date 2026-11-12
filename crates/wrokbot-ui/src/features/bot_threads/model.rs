@@ -220,7 +220,16 @@ pub fn ModelPickerV2(state: ModelComposerV2, disabled: Signal<bool>) -> impl Int
                             t_string!(i18n, common.loading).to_owned()
                         }
                         CatalogStatus::Ready if state.selected.get().is_some() => {
-                            t_string!(i18n, models.custom_source).to_owned()
+                            let key = picker_value.get();
+                            state
+                                .choices
+                                .get()
+                                .into_iter()
+                                .find(|choice| choice.selection.as_ref().map(selection_key) == key)
+                                .map_or_else(
+                                    || t_string!(i18n, models.custom_source).to_owned(),
+                                    |choice| choice.name,
+                                )
                         }
                         CatalogStatus::Ready if state.repick.get() => {
                             t_string!(i18n, bot_work.model_repick).to_owned()

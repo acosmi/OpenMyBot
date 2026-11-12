@@ -422,6 +422,7 @@ pub fn HomePage() -> impl IntoView {
             i18n,
             notice.get(),
             model_composer.selection_status(),
+            show_channels,
         ));
         if load_error.get() {
             notices.push(

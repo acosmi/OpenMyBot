@@ -57,7 +57,7 @@ pub fn AppLayout(children: Children) -> impl IntoView {
         <SidebarProvider
             id="app-sidebar".to_owned()
             collapsed
-            aria_label=move || t_string!(i18n, shell.nav_channels).to_owned()
+            aria_label=move || t_string!(i18n, shell.sidebar_mobile_title).to_owned()
             mobile_title=move || t_string!(i18n, shell.sidebar_mobile_title).to_owned()
             mobile_description=move || t_string!(i18n, shell.sidebar_mobile_description).to_owned()
         >
@@ -90,7 +90,7 @@ fn IconRail() -> impl IntoView {
     let toggle = sidebar.clone();
     let history = sidebar.clone();
     view! {
-        <nav class="ob-icon-rail" aria-label=move || t_string!(i18n, shell.tier_daily_work).to_owned()>
+        <nav class="ob-icon-rail" aria-label=move || t_string!(i18n, shell.rail_label).to_owned()>
             <a class="ob-rail-brand" href="/" aria-label=move || t_string!(i18n, common.app_name).to_owned()>
                 <crate::primitives::BrandMark />
             </a>

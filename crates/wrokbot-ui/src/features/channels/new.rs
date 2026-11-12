@@ -72,6 +72,7 @@ pub(crate) fn submission_slot_notice(
     i18n: leptos_i18n::I18nContext<crate::i18n::Locale>,
     notice: Option<SubmissionNotice>,
     model_status: ModelSelectionStatus,
+    show_channels: UnsyncCallback<()>,
 ) -> Option<SlotNotice> {
     let text = match notice? {
         SubmissionNotice::ModelAgentConflict
@@ -89,7 +90,15 @@ pub(crate) fn submission_slot_notice(
         }
         SubmissionNotice::Conflict => t_string!(i18n, channels.submit_conflict),
         SubmissionNotice::Rejected => t_string!(i18n, channels.submit_rejected),
-        SubmissionNotice::NavigationFailed => t_string!(i18n, channels.navigation_failed),
+        SubmissionNotice::NavigationFailed => {
+            return Some(
+                SlotNotice::new(
+                    NoticeTone::Error,
+                    t_string!(i18n, channels.navigation_failed),
+                )
+                .with_button(t_string!(i18n, channels.show_list), show_channels),
+            );
+        }
         SubmissionNotice::RoutingFailed => t_string!(i18n, home.routing_failed),
     };
     Some(SlotNotice::new(NoticeTone::Error, text))
@@ -670,6 +679,7 @@ pub fn ChannelNewPage() -> impl IntoView {
             i18n,
             notice.get(),
             model_composer.selection_status(),
+            show_channels,
         ));
         if load_error.get() || recipient_restore_missing.get() {
             notices.push(SlotNotice::new(

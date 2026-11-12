@@ -169,7 +169,7 @@ fn BotActivityView(
                 disabled=ask_disabled
                 on_activate=move |_| {
                     if let Some(bot) = busiest.get_value() {
-                        on_ask.run(busiest_follow_up(&bot));
+                        on_ask.run(t_string!(i18n, gallery.activity_busiest_follow_up, bot = bot).to_owned());
                     }
                 }
             >{t!(i18n, gallery.activity_ask_busiest)}</Button>
@@ -233,7 +233,7 @@ fn RecentRefusalsView(
                 variant=ButtonVariant::Chip
                 size=ButtonSize::Small
                 disabled=ask_disabled
-                on_activate=move |_| on_ask.run(REFUSAL_FOLLOW_UP.to_owned())
+                on_activate=move |_| on_ask.run(t_string!(i18n, gallery.activity_refusal_follow_up).to_owned())
             >{t!(i18n, gallery.activity_explain_latest)}</Button>
         </Show>
     }
@@ -330,12 +330,6 @@ fn activity_width(actions: u64, most: u64) -> f64 {
     }
 }
 
-fn busiest_follow_up(bot: &str) -> String {
-    format!("What has {bot} actually been doing? Look at the audit trail and summarise it.")
-}
-
-const REFUSAL_FOLLOW_UP: &str = "Explain the most recent refusal in that list, and what would have to change for it to be allowed.";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,14 +348,6 @@ mod tests {
         );
         assert_eq!(activity_width(5, 10), 50.0);
         assert_eq!(activity_width(0, 0), 0.0);
-        assert_eq!(
-            busiest_follow_up("bot-finance"),
-            "What has bot-finance actually been doing? Look at the audit trail and summarise it."
-        );
-        assert_eq!(
-            REFUSAL_FOLLOW_UP,
-            "Explain the most recent refusal in that list, and what would have to change for it to be allowed."
-        );
         assert!(matches!(
             project_result(
                 ActivityReportKind::Refusals,

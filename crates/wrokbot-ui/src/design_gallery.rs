@@ -1116,19 +1116,19 @@ pub fn DesignGallery() -> impl IntoView {
                             }.into_any()
                         >
                             <div class="ob-design-row">
-                                <GalleryBadge tone=GalleryTone::Neutral>"Neutral"</GalleryBadge>
-                                <GalleryBadge tone=GalleryTone::Caution>"Caution"</GalleryBadge>
-                                <GalleryBadge tone=GalleryTone::Negative>"Negative"</GalleryBadge>
+                                <GalleryBadge tone=GalleryTone::Neutral>{move || t!(i18n, gallery.tone_neutral)}</GalleryBadge>
+                                <GalleryBadge tone=GalleryTone::Caution>{move || t!(i18n, gallery.tone_caution)}</GalleryBadge>
+                                <GalleryBadge tone=GalleryTone::Negative>{move || t!(i18n, gallery.tone_negative)}</GalleryBadge>
                             </div>
                         </GalleryFrame>
                         <QuoteCard
-                            quote="The exact words remain attached to their source.".to_owned()
-                            attribution="the fixture".to_owned()
-                            context="Compiled Rust renderer".to_owned()
+                            quote=t_string!(i18n, gallery.sample_quote).to_owned()
+                            attribution=t_string!(i18n, gallery.sample_quote_attribution).to_owned()
+                            context=t_string!(i18n, gallery.sample_quote_context).to_owned()
                         />
                         <RefusedCard
-                            title="Quotation".to_owned()
-                            reason="This component is not available to this coworker.".to_owned()
+                            title=t_string!(i18n, gallery.quotation).to_owned()
+                            reason=t_string!(i18n, gallery.activity_refused_component).to_owned()
                         />
                     </div>
                 </section>

@@ -272,7 +272,8 @@ mod tests {
 #[component]
 pub(crate) fn MarkdownPreview() -> impl IntoView {
     let source = RwSignal::new("## 工作计划 · Plan\n\n这是 **重点**、*说明*、~~旧项~~和 `inline code`。\n\n3. 核对来源\n4. 交付结果\n\n- [x] 已完成\n- [ ] 待复核\n\n> 引用保持层级。\n\n| 模块 | 状态 |\n|:---|---:|\n| 技能 | 已接通 |\n| Screen | 待接通 |\n\n```rust\n// Evidence first\nfn main() {\n    let text = \"你好，Wrok Bot\";\n    println!(\"{}\", text);\n}\n```\n\n[参考来源](https://example.test/reference)\n\n![remote pixel](https://example.test/pixel.png)\n\n<script>alert('inert')</script>\n".to_owned());
-    view! { <section class="ob-page" id="markdown-preview"><h1 class="ob-page-title">"Markdown preview"</h1><crate::primitives::Textarea value=source id="markdown-preview-source" aria_label="Markdown source"/>
+    let i18n = use_i18n();
+    view! { <section class="ob-page" id="markdown-preview"><h1 class="ob-page-title">{move || t!(i18n, design_gallery.markdown_preview)}</h1><crate::primitives::Textarea value=source id="markdown-preview-source" aria_label=t_string!(i18n, design_gallery.markdown_source).to_owned()/>
         <StreamingMarkdownBody content=Signal::derive(move || source.get())/>
     </section> }
 }
