@@ -26,7 +26,8 @@ use crate::features::layout::{PageHeader, PageShell, PageTopbar, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, EmptyState, IconSize, IconView,
+    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, EmptyState, IconSize, IconView, Notice,
+    NoticePresentation, NoticeTone, TechnicalDetails, Timestamp,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -308,10 +309,9 @@ pub fn ApprovalPage() -> impl IntoView {
             <super::attention::DecisionAttention/>
 
             <Show when=move || load_error.get().is_some()>
-                <div class="ob-alert" role="alert">
-                    <IconView icon=Icon::TriangleAlert size=IconSize::Inline />
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, admin.approval_load_error)}</span>
-                </div>
+                </Notice>
             </Show>
 
             {move || {
@@ -449,7 +449,14 @@ fn ApprovalCard(card: ApprovalCardView, actions: ToolApprovalActions) -> impl In
                 </Badge>
             </header>
 
-            <p class="ob-approval-source"><code>{card.bot_id.as_str().to_owned()}</code><span>" · "</span><code>{card.run_id.as_str().to_owned()}</code> " · " <code>{card.call_id.as_str().to_owned()}</code> " · " <time>{card.requested_at.format(&Rfc3339).unwrap_or_default()}</time></p>
+            <div class="ob-approval-source">
+                <Timestamp at=card.requested_at />
+                <TechnicalDetails copy=format!("{}\n{}\n{}", card.bot_id.as_str(), card.run_id.as_str(), card.call_id.as_str())>
+                    <code>{card.bot_id.as_str().to_owned()}</code>
+                    <code>{card.run_id.as_str().to_owned()}</code>
+                    <code>{card.call_id.as_str().to_owned()}</code>
+                </TechnicalDetails>
+            </div>
             <Show when=move || observation.get().is_some()>
                 <p class="ob-approval-observation" role="status">{move || match observation.get() {
                     Some(DecisionObservation { phase: DecisionPhase::Submitting, .. }) => t_string!(i18n, common.loading).to_owned(),
@@ -460,7 +467,7 @@ fn ApprovalCard(card: ApprovalCardView, actions: ToolApprovalActions) -> impl In
                 }}</p>
             </Show>
             <Show when=move || observation.get().is_some_and(|value| value.phase == DecisionPhase::Unknown && value.dismissed_binding != Some(current_binding))>
-                <div class="ob-alert" role="alert" data-approval-notice="decision-unknown">
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                     <span>{move || t!(i18n, admin.approval_decision_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -469,7 +476,7 @@ fn ApprovalCard(card: ApprovalCardView, actions: ToolApprovalActions) -> impl In
                     >
                         {move || t!(i18n, common.close)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
 
             {current_details.then(|| view! {

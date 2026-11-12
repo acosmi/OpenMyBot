@@ -7,8 +7,6 @@ use leptos_router::hooks::{use_params_map, use_query_map};
 #[cfg(target_arch = "wasm32")]
 use openbot_contracts::mcp::McpVendorRevocationStatus;
 use openbot_contracts::mcp::{McpConnection, McpConnections};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 #[cfg(target_arch = "wasm32")]
 use crate::api::{begin_mcp_connection, disconnect_mcp_connection, load_mcp_connections};
@@ -21,6 +19,7 @@ use crate::icons::Icon;
 use crate::primitives::{
     Badge, BadgeTone, Button, ButtonSize, ButtonVariant, IconSize, IconView, Item, ItemAction,
     ItemActions, ItemDescription, ItemMedia, ItemTitle, Menu, MenuContent, MenuItem, MenuTrigger,
+    Notice, NoticeTone, Timestamp,
 };
 
 const GOOGLE_DRIVE_SERVER_ID: &str = "google-drive";
@@ -89,24 +88,24 @@ pub fn ConnectedAccountsPage() -> impl IntoView {
                 description=move || t_string!(i18n, settings.connected_accounts_description).to_owned()
             />
             <Show when=move || callback_notice.get() == Some(CallbackNotice::Failed)>
-                <p class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     {move || t!(i18n, settings.connect_failed)}
-                </p>
+                </Notice>
             </Show>
             <Show when=move || callback_notice.get() == Some(CallbackNotice::Connected)>
-                <p class="ob-status" role="status">
+                <Notice tone=NoticeTone::Status>
                     {move || t_string!(
                         i18n,
                         settings.connect_success,
                         account = t_string!(i18n, settings.google_drive_title),
                     ).to_owned()}
-                </p>
+                </Notice>
             </Show>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, settings.connected_accounts_load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -115,7 +114,7 @@ pub fn ConnectedAccountsPage() -> impl IntoView {
                     >
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || !loading.get() && !load_error.get()>
                 <PageSection
@@ -245,7 +244,7 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, settings.connected_accounts_load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -254,7 +253,7 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                     >
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || !loading.get() && !load_error.get() && account.get().is_none()>
                 <PageHeader
@@ -270,12 +269,12 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                     description=move || t_string!(i18n, settings.google_drive_description).to_owned()
                 />
                 <Show when=move || action_error.get()>
-                    <p class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         {move || t!(i18n, settings.connection_action_error)}
-                    </p>
+                    </Notice>
                 </Show>
                 <Show when=move || disconnect_notice.get().is_some()>
-                    <p class="ob-status" role="status">
+                    <Notice tone=NoticeTone::Status>
                         {move || match disconnect_notice.get() {
                             Some(DisconnectNotice::Revoked) => {
                                 t_string!(i18n, settings.disconnect_revoked).to_owned()
@@ -285,7 +284,7 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                             }
                             None => String::new(),
                         }}
-                    </p>
+                    </Notice>
                 </Show>
                 <PageSection
                     heading_id="connected-account-access"
@@ -323,8 +322,7 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                             }
                         >
                             {move || account.get().and_then(|account| account.connection).map(|connection| {
-                                let connected_at = format_connected_at(connection.connected_at);
-                                let connected_at_label = connected_at.clone();
+                                let connected_at = connection.connected_at;
                                 let scope = connection.scope;
                                 view! {
                                     <div class="ob-connected-account-card-header">
@@ -358,15 +356,7 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                                         </div>
                                         <div>
                                             <dt>{move || t!(i18n, settings.connection_time)}</dt>
-                                            <dd>
-                                                <time datetime=connected_at.clone()>
-                                                    {move || t_string!(
-                                                        i18n,
-                                                        settings.connected_at,
-                                                        when = connected_at_label.as_str(),
-                                                    ).to_owned()}
-                                                </time>
-                                            </dd>
+                                            <dd><Timestamp at=connected_at /></dd>
                                         </div>
                                     </dl>
                                 }
@@ -582,15 +572,10 @@ fn connected_account_href(server_id: &str) -> Option<String> {
         .then(|| format!("/settings/connected-accounts/{server_id}"))
 }
 
-fn format_connected_at(value: OffsetDateTime) -> String {
-    value
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| value.unix_timestamp().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::OffsetDateTime;
 
     fn page() -> McpConnections {
         McpConnections {
@@ -642,10 +627,6 @@ mod tests {
         assert_eq!(
             resolve_callback_notice(Some("unreviewed-custom"), &accounts),
             None
-        );
-        assert_eq!(
-            format_connected_at(OffsetDateTime::UNIX_EPOCH),
-            "1970-01-01T00:00:00Z"
         );
     }
 }

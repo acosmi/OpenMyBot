@@ -2,7 +2,10 @@
 use crate::api::ApiError;
 use crate::features::gallery::HumanDecisionCard;
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonSize, ButtonVariant, Textarea};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, Notice, NoticePresentation, NoticeTone, TechnicalDetails,
+    Textarea, Timestamp,
+};
 use leptos::prelude::*;
 use openbot_contracts::components::{
     ComponentHumanDecisionAnswer, ComponentHumanDecisionResolved, PendingComponentHumanDecision,
@@ -395,7 +398,7 @@ pub(crate) fn DecisionAttention(
     let remote = expect_context::<RemoteInterruptActions>();
     view! {
         <section class="ob-attention-family" data-attention-family="component">
-            <Show when=move || component.error.get().is_some()><p class="ob-alert" role="status">{move || t!(i18n, gallery.decision_load_error)}</p></Show>
+            <Show when=move || component.error.get().is_some()><Notice tone=NoticeTone::Caution>{move || t!(i18n, gallery.decision_load_error)}</Notice></Show>
             <For each=move || if inaccessible(component.error.get()) || (inline && run.get().is_none()) { Vec::new() } else { component.pending.get().into_iter().filter(|card| matches_run(run.get(), card.run_id.as_str())).collect() }
                 key=|card| (card.decision_id.clone(), binding(card))
                 children=move |card| view! { <ComponentAttentionCard card actions=component/> }/>
@@ -403,7 +406,7 @@ pub(crate) fn DecisionAttention(
                 key=|row| row.source.id.clone() children=move |row| { let id = row.source.id.clone(); view! { <DecisionReference source=row.source phase=Signal::derive(move || component.observations.get().get(&id).map(|row| row.phase))/> } }/>
         </section>
         <section class="ob-attention-family" data-attention-family="remote">
-            <Show when=move || remote.error.get().is_some()><p class="ob-alert" role="status">{move || t!(i18n, channels.remote_interrupt_load_error)}</p></Show>
+            <Show when=move || remote.error.get().is_some()><Notice tone=NoticeTone::Caution>{move || t!(i18n, channels.remote_interrupt_load_error)}</Notice></Show>
             <For each=move || if inaccessible(remote.error.get()) || (inline && run.get().is_none()) { Vec::new() } else { remote.pending.get().into_iter().filter(|card| matches_run(run.get(), &card.run_id)).collect() }
                 key=|card| (card.request_id.clone(), binding(card))
                 children=move |card| view! { <RemoteAttentionCard card actions=remote/> }/>
@@ -448,7 +451,7 @@ fn ComponentAttentionCard(
     });
     let callback_card = card.clone();
     view! { <article class="ob-review-card" data-component-decision=id>
-        <p class="ob-approval-source"><code>{card.agent_id.as_str().to_owned()}</code> " · " <code>{card.run_id.as_str().to_owned()}</code> " · " <code>{card.provider_call_id.clone()}</code></p>
+        <div class="ob-approval-source"><TechnicalDetails copy=format!("{}\n{}\n{}", card.agent_id.as_str(), card.run_id.as_str(), card.provider_call_id)><code>{card.agent_id.as_str().to_owned()}</code><code>{card.run_id.as_str().to_owned()}</code><code>{card.provider_call_id.clone()}</code></TechnicalDetails></div>
         <DecisionExpiry requested=milliseconds(card.requested_at) expires now=actions.now/>
         <DecisionStatus phase/>
         <HumanDecisionCard name=card.component_name arguments=card.arguments answer blocked
@@ -488,13 +491,13 @@ fn RemoteAttentionCard(
     let resolve_card = card.clone();
     let cancel_card = card.clone();
     view! { <article class="ob-review-card" data-remote-interrupt=id>
-        <p class="ob-approval-source"><code>{card.agent_id}</code> " · " <code>{card.run_id}</code></p>
+        <div class="ob-approval-source"><TechnicalDetails copy=format!("{}\n{}", card.agent_id, card.run_id)><code>{card.agent_id}</code><code>{card.run_id}</code></TechnicalDetails></div>
         <DecisionExpiry requested=card.requested_at_ms expires now=actions.now/>
         <DecisionStatus phase/>
         <div data-untrusted-remote-content=""><h3>{card.untrusted_reason}</h3><p>{card.untrusted_message.unwrap_or_default()}</p>
             <p class="ob-page-intro">{move || t!(i18n, channels.remote_interrupt_caption)}</p></div>
         <Textarea value=payload aria_label=move || t_string!(i18n, channels.remote_interrupt_payload_label).to_owned() disabled=blocked invalid/>
-        <Show when=move || invalid.get()><p role="alert">{move || t!(i18n, channels.remote_interrupt_payload_invalid)}</p></Show>
+        <Show when=move || invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, channels.remote_interrupt_payload_invalid)}</Notice></Show>
         <footer class="ob-approval-actions">
             <Button variant=ButtonVariant::Primary size=ButtonSize::Small disabled=blocked on_activate=move |_| {
                 if blocked.get_untracked() { return; }
@@ -512,7 +515,7 @@ fn RemoteAttentionCard(
 #[component]
 fn DecisionReference(source: SourceReference, phase: Signal<Option<Phase>>) -> impl IntoView {
     view! { <article class="ob-review-card" data-decision-reference=source.id>
-        <p class="ob-approval-source"><code>{source.bot}</code> " · " <code>{source.run}</code> {source.call.map(|call| view! { <code>{call}</code> })}</p>
+        <div class="ob-approval-source"><TechnicalDetails copy=[Some(source.bot.as_str()), Some(source.run.as_str()), source.call.as_deref()].into_iter().flatten().collect::<Vec<_>>().join("\n")><code>{source.bot}</code><code>{source.run}</code>{source.call.map(|call| view! { <code>{call}</code> })}</TechnicalDetails></div>
         <DecisionStatus phase/>
     </article> }
 }
@@ -530,19 +533,10 @@ fn DecisionStatus(phase: Signal<Option<Phase>>) -> impl IntoView {
 #[component]
 fn DecisionExpiry(requested: i64, expires: i64, now: RwSignal<i64>) -> impl IntoView {
     let i18n = use_i18n();
-    view! { <p class="ob-page-intro"><time>{format_time(requested)}</time> " · " <time>{format_time(expires)}</time> " · " {move || if now.get() >= expires { t_string!(i18n, admin.approval_expired).to_owned() } else { t_string!(i18n, admin.approval_expires, seconds=(expires.saturating_sub(now.get())/1000)).to_owned() }}</p> }
+    view! { <p class="ob-page-intro">{time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(requested) * 1_000_000).ok().map(|at| view! { <Timestamp at /> " · " })}{move || if now.get() >= expires { t_string!(i18n, admin.approval_expired).to_owned() } else { t_string!(i18n, admin.approval_expires, seconds=(expires.saturating_sub(now.get())/1000)).to_owned() }}</p> }
 }
 fn milliseconds(time: time::OffsetDateTime) -> i64 {
     i64::try_from(time.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
-}
-fn format_time(ms: i64) -> String {
-    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
-        .ok()
-        .and_then(|time| {
-            time.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
-        .unwrap_or_else(|| ms.to_string())
 }
 fn now_ms() -> i64 {
     #[cfg(target_arch = "wasm32")]

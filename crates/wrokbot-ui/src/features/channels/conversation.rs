@@ -73,7 +73,8 @@ use crate::primitives::{
     Avatar, AvatarSize, Badge, BadgeTone, Bubble, BubbleKind, Button, ButtonSize, ButtonVariant,
     IconSize, IconView, Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter,
     MessageHeader, MessageScroller, MessageScrollerButton, MessageScrollerContent,
-    MessageScrollerItem, MessageScrollerViewport, Textarea,
+    MessageScrollerItem, MessageScrollerViewport, Notice, NoticePresentation, NoticeTone,
+    TechnicalDetails, Textarea,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -1987,20 +1988,20 @@ fn ConversationSurface(
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || snapshot_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, channels.conversation_load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
                         size=ButtonSize::Small
                         on_activate=retry_snapshot
                     >{move || t!(i18n, common.retry)}</Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || stream_error.get() && !snapshot_error.get()>
-                <div class="ob-alert" role="status">
+                <Notice tone=NoticeTone::Caution>
                     <span>{move || t!(i18n, channels.conversation_stream_error)}</span>
                     <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry_snapshot>{move || t!(i18n, channels.reread)}</Button>
-                </div>
+                </Notice>
             </Show>
             <MessageScroller
                 id="channel-transcript"
@@ -2104,7 +2105,7 @@ fn ConversationSurface(
                             </p>
                         </Show>
                         <Show when=move || state.get().terminal_notice.is_some()>
-                            <p class="ob-alert" role="status">{move || state.get().terminal_notice.map(|notice| terminal_text(i18n.get_locale(), notice, direct))}</p>
+                            <Notice tone=NoticeTone::Status>{move || state.get().terminal_notice.map(|notice| terminal_text(i18n.get_locale(), notice, direct))}</Notice>
                         </Show>
                         <Show when=move || !queued.get().is_empty()><h2 class="ob-queue-heading">{move || t!(i18n, channels.queued_status)}</h2></Show>
                         <For
@@ -2198,7 +2199,7 @@ fn ConversationSurface(
                         />
                     </Show>
                     <Show when=move || matches!(accepted_input.get(), Some(AcceptedInput::Queued { .. }))>
-                        <p class="ob-alert" role="status">
+                        <Notice tone=NoticeTone::Status>
                             {move || {
                                 let accepted = t_string!(i18n, bot_work.pending_accepted).to_owned();
                                 match accepted_input.get() {
@@ -2209,7 +2210,7 @@ fn ConversationSurface(
                                     _ => accepted,
                                 }
                             }}
-                        </p>
+                        </Notice>
                     </Show>
                     {direct_work.get_value().map(|work| view! {
                         <PendingInputsPanel
@@ -2253,7 +2254,7 @@ fn ConversationSurface(
                 <Show when=move || !skill_composer.selected.get().is_empty() && trim_ecmascript(&draft.get()).is_empty()>
                     <p class="ob-page-empty">{move || t!(i18n, skills.task_required)}</p>
                 </Show>
-                <Show when=move || queue_skills_invalid.get()><p class="ob-alert" role="alert">{move || t!(i18n, skills.selection_limit)}</p></Show>
+                <Show when=move || queue_skills_invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, skills.selection_limit)}</Notice></Show>
                 </div>
                 <div class="ob-chat-controls">
                 <Show
@@ -2327,37 +2328,37 @@ fn ConversationSurface(
                 </div>
             </Show>
             <Show when=move || stop_receipt.get().is_some()>
-                <p class="ob-alert" role="status">{move || stop_receipt.get().map(|receipt| stop_receipt_text(i18n.get_locale(), receipt))}</p>
+                <Notice tone=NoticeTone::Status>{move || stop_receipt.get().map(|receipt| stop_receipt_text(i18n.get_locale(), receipt))}</Notice>
             </Show>
             <Show when=move || direct_notice.get().is_some()>
-                <p class="ob-alert" role="alert">{move || direct_notice.get().map(|notice| direct_notice_text(i18n.get_locale(), notice))}</p>
+                <Notice tone=NoticeTone::Error>{move || direct_notice.get().map(|notice| direct_notice_text(i18n.get_locale(), notice))}</Notice>
             </Show>
             // The direct entry's one alert for an unknown receipt carries its exact retry.
             <Show when=move || direct_retry.get().is_some()>
-                <p class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, channels.begin_unknown)}</span>
                     <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry_direct>
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </p>
+                </Notice>
             </Show>
             <Show when=move || direct && matches!(state.get().active_run_state, Some(ThreadForegroundRunState::ReconciliationRequired))>
-                <p class="ob-alert" role="status">{move || t!(i18n, bot_work.reconciliation_pending_hold)}</p>
+                <Notice tone=NoticeTone::Caution>{move || t!(i18n, bot_work.reconciliation_pending_hold)}</Notice>
             </Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_agent_conflict)}</p></Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_selection_unavailable)}</p></Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::Conflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_conflict)}</p></Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::Rejected)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_rejected)}</p></Show>
+            <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_agent_conflict)}</Notice></Show>
+            <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_selection_unavailable)}</Notice></Show>
+            <Show when=move || send_notice.get()==Some(SubmissionNotice::Conflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_conflict)}</Notice></Show>
+            <Show when=move || send_notice.get()==Some(SubmissionNotice::Rejected)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_rejected)}</Notice></Show>
             <Show when=move || begin_unknown.get() && !direct>
-                <p class="ob-alert" role="alert">{move || t!(i18n, channels.begin_unknown)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.begin_unknown)}</Notice>
             </Show>
             <Show when=move || submission_blocked.get()>
-                <a class="ob-alert" role="alert" href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
+                <Notice tone=NoticeTone::Error><a href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
                     {move || t!(i18n, channels.submission_blocked)}
-                </a>
+                </a></Notice>
             </Show>
             <Show when=move || cancel_error.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, channels.cancel_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.cancel_error)}</Notice>
             </Show>
             <Show when=move || !channel_active>
                 <p class="ob-page-empty">{move || t!(i18n, channels.detail_inactive)}</p>
@@ -2379,13 +2380,20 @@ fn ToolTranscriptCard(tool: TranscriptTool) -> impl IntoView {
     let computer = tool.name.starts_with("computer_");
     let unnamed = tool.name.is_empty();
     let label = display.label;
+    let technical = [
+        tool.call_id,
+        tool.agent_id.map(|id| id.as_str().to_owned()),
+        error,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     view! { <article class="ob-tool-card" data-tool-call=data_call data-tool-state=if failed { "review" } else if recorded { "recorded" } else { "waiting" }>
         <header><strong>{move || if unnamed { t_string!(i18n, channels.tool_unrecognized).to_owned() } else { label.clone() }}</strong>{display.detail.map(|detail| view! { <span>{detail}</span> })}
             <span class="ob-tool-state">{move || if failed { t_string!(i18n, channels.tool_record_error).to_owned() } else if recorded { t_string!(i18n, channels.tool_result_recorded).to_owned() } else { t_string!(i18n, channels.tool_waiting_result).to_owned() }}</span>
             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| controls.show(if computer { WorkspaceTab::Computer } else { WorkspaceTab::Results })>{move || t!(i18n, gallery.details)}</Button>
         </header>
-        <p class="ob-tool-source">{tool.call_id.map(|id| view! { <code>{id}</code> })} " · " {tool.agent_id.map(|id| view! { <code>{id.as_str().to_owned()}</code> })}</p>
-        {error.map(|code| view! { <p class="ob-tool-error" role="status"><code>{code}</code></p> })}
+        {(!technical.is_empty()).then(|| view! { <div class="ob-tool-source"><TechnicalDetails copy=technical.join("\n")>{technical.into_iter().map(|value| view! { <code>{value}</code> }).collect_view()}</TechnicalDetails></div> })}
         {tool.result.map(|result| view! { <details><summary>{move || t!(i18n, channels.tool_result_label)}</summary><pre>{result}</pre></details> })}
     </article> }
 }

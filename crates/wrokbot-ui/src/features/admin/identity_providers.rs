@@ -18,8 +18,9 @@ use crate::features::layout::{
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input, InputType, SecretInput,
-    SecretInputController, SecretInputPolicy, SecretInputStatus, Textarea,
+    Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input, InputType, Notice,
+    NoticePresentation, NoticeTone, SecretInput, SecretInputController, SecretInputPolicy,
+    SecretInputStatus, Textarea,
 };
 
 #[derive(Clone, Copy)]
@@ -199,9 +200,9 @@ pub fn AdminIdentityProvidersPage() -> impl IntoView {
                 description=move || t_string!(i18n, admin.identity_providers_environment_note).to_owned()
             >
                 <Show when=move || removal_error.get()>
-                    <p class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         {move || t!(i18n, admin.identity_providers_remove_error)}
-                    </p>
+                    </Notice>
                 </Show>
                 <Show when=move || loading.get()>
                     <div class="ob-loading" role="status">
@@ -210,7 +211,7 @@ pub fn AdminIdentityProvidersPage() -> impl IntoView {
                     </div>
                 </Show>
                 <Show when=move || load_error.get()>
-                    <div class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         <span>{move || t!(i18n, admin.identity_providers_load_error)}</span>
                         <Button
                             variant=ButtonVariant::Ghost
@@ -219,7 +220,7 @@ pub fn AdminIdentityProvidersPage() -> impl IntoView {
                         >
                             {move || t!(i18n, common.retry)}
                         </Button>
-                    </div>
+                    </Notice>
                 </Show>
                 <Show when=move || {
                     !loading.get() && !load_error.get() && providers.get().is_empty()
@@ -434,14 +435,14 @@ pub fn AdminIdentityProvidersPage() -> impl IntoView {
                     <Show when=move || {
                         submit_attempted.get() && !draft_valid(draft)
                     }>
-                        <p class="ob-alert" role="alert">
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                             {move || t!(i18n, admin.identity_providers_form_error)}
-                        </p>
+                        </Notice>
                     </Show>
                     <Show when=move || registration_error.get()>
-                        <p class="ob-alert" role="alert">
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                             {move || t!(i18n, admin.identity_providers_register_error)}
-                        </p>
+                        </Notice>
                     </Show>
                 </div>
                 <div class="ob-library-form-actions">

@@ -26,7 +26,9 @@ use crate::features::channels::conversation::DirectBotConversation;
 use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonSize, ButtonVariant, IconSize, IconView};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone,
+};
 
 /// Authenticated direct-Bot chat with URL-owned Agent selection.
 #[component]
@@ -72,12 +74,12 @@ pub fn BotChatPage() -> impl IntoView {
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, bot_chat.agent_load_error)}</span>
                     <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || !loading.get() && !load_error.get() && selected_profile.get().is_none()>
                 <p class="ob-page-empty">{move || t!(i18n, bot_chat.no_agents)}</p>
@@ -198,18 +200,18 @@ fn BotThreadPane(agent: AgentProfile) -> impl IntoView {
             </Button>
         </div>
         <Show when=move || history_unavailable.get()>
-            <p class="ob-alert" role="alert">{move || t!(i18n, bot_chat.history_unavailable)}</p>
+            <Notice tone=NoticeTone::Error>{move || t!(i18n, bot_chat.history_unavailable)}</Notice>
         </Show>
         <Show when=move || thread_error.get()>
-            <div class="ob-alert" role="alert">
+            <Notice tone=NoticeTone::Error>
                 <span>{move || t!(i18n, bot_chat.thread_error)}</span>
                 <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>
                     {move || t!(i18n, common.retry)}
                 </Button>
-            </div>
+            </Notice>
         </Show>
         <Show when=move || new_error.get()>
-            <p class="ob-alert" role="alert">{move || t!(i18n, bot_chat.new_chat_error)}</p>
+            <Notice tone=NoticeTone::Error>{move || t!(i18n, bot_chat.new_chat_error)}</Notice>
         </Show>
         <Show when=move || loading.get()>
             <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>

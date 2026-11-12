@@ -10,12 +10,13 @@ use openbot_contracts::components::{
     ComponentFunctionData, RECENT_REFUSALS_FUNCTION_NAME, RecentRefusalsReport,
 };
 use openbot_contracts::ids::BotId;
-use time::format_description::well_known::Rfc3339;
 
 #[cfg(target_arch = "wasm32")]
 use crate::api::call_component_function;
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonSize, ButtonVariant};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, Notice, NoticePresentation, NoticeTone, Timestamp,
+};
 
 use super::GalleryFrame;
 
@@ -109,7 +110,7 @@ pub fn ActivityReportCard(
             }.into_any(),
             ActivityState::Failed => view! {
                 <GalleryFrame title=runtime_title(i18n, title.get_value(), report)>
-                    <p class="ob-gallery-activity-error" role="status">{t!(i18n, gallery.activity_read_failed)}</p>
+                    <Notice tone=NoticeTone::Caution presentation=NoticePresentation::Inline>{t!(i18n, gallery.activity_read_failed)}</Notice>
                 </GalleryFrame>
             }.into_any(),
             ActivityState::Activity(data) => view! {
@@ -255,7 +256,7 @@ fn RecentRefusalsView(
                         each=move || rows.get().into_iter().enumerate()
                         key=|(index, _)| *index
                         children=move |(_, row)| {
-                            let when = row.at.format(&Rfc3339).unwrap_or_default();
+                            let when = row.at;
                             let has_bot = row.bot.is_some();
                             let bot = StoredValue::new(row.bot.unwrap_or_default());
                             let has_reason = row.reason.is_some();
@@ -267,7 +268,7 @@ fn RecentRefusalsView(
                                         <Show when=move || has_bot>
                                             <span>{move || bot.get_value()}</span>
                                         </Show>
-                                        <time datetime=when.clone()>{when.clone()}</time>
+                                        <Timestamp at=when />
                                     </div>
                                     <Show when=move || has_reason>
                                         <p>{move || reason.get_value()}</p>

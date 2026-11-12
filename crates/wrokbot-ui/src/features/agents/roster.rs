@@ -11,7 +11,7 @@ use crate::features::layout::{
     PageWidth, StaggerItem,
 };
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonSize, ButtonVariant};
+use crate::primitives::{Button, ButtonSize, ButtonVariant, Notice, NoticeTone};
 
 use super::{AgentCard, AgentEditor, AgentProfilePanel};
 
@@ -120,7 +120,7 @@ pub fn AgentsPage() -> impl IntoView {
                                 </div>
                             </Show>
                             <Show when=move || load_error.get()>
-                                <div class="ob-alert" role="alert">
+                                <Notice tone=NoticeTone::Error>
                                     <span>{move || t!(i18n, agents.load_error)}</span>
                                     <Button
                                         variant=ButtonVariant::Ghost
@@ -129,7 +129,7 @@ pub fn AgentsPage() -> impl IntoView {
                                     >
                                         {move || t!(i18n, common.retry)}
                                     </Button>
-                                </div>
+                                </Notice>
                             </Show>
                             <Show when=move || !loading.get() && !load_error.get()>
                                 <PageSection

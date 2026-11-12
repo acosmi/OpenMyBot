@@ -30,8 +30,8 @@ use crate::icons::Icon;
 use crate::preferences::PreferenceSaveStatus;
 use crate::primitives::{
     Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, IconSize, IconView, Input, InputType,
-    LocaleSwitch, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupLabel, SidebarHeader,
-    SidebarNavLink, SidebarNavList, ThemeToggle,
+    LocaleSwitch, Notice, NoticePresentation, NoticeTone, SidebarContent, SidebarFooter,
+    SidebarGroup, SidebarGroupLabel, SidebarHeader, SidebarNavLink, SidebarNavList, ThemeToggle,
 };
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -192,10 +192,10 @@ pub fn AppSidebar() -> impl IntoView {
                     <div class="ob-sidebar-loading" role="status">{move || t!(i18n, common.loading)}</div>
                 </Show>
                 <Show when=move || load_error.get()>
-                    <div class="ob-sidebar-alert" role="alert">
+                    <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                         <span>{move || t!(i18n, channels.load_error)}</span>
                         <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>{move || t!(i18n, common.retry)}</Button>
-                    </div>
+                    </Notice>
                 </Show>
                 <Show when=move || !search.get().trim().is_empty() && !loading.get() && visible_channels.get().is_empty()>
                     <p class="ob-sidebar-search-empty" role="status">{move || t!(i18n, channels.no_match_title)}</p>
@@ -263,8 +263,8 @@ pub fn AppSidebar() -> impl IntoView {
                     </Show>
                 </div>
             </details>
-            <Show when=move || sign_out_error.get()><p class="ob-sidebar-alert" role="alert">{move || t!(i18n, auth.sign_out_error)}</p></Show>
-            <Show when=move || account_error.get()><p class="ob-sidebar-alert" role="alert">{move || t!(i18n, account.load_failed)}</p></Show>
+            <Show when=move || sign_out_error.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, auth.sign_out_error)}</Notice></Show>
+            <Show when=move || account_error.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, account.load_failed)}</Notice></Show>
         </SidebarFooter>
     }
 }
@@ -318,10 +318,10 @@ fn SidebarAgents() -> impl IntoView {
         <SidebarGroupLabel>{move || t!(i18n, shell.nav_agents)}</SidebarGroupLabel>
         <Show when=move || loading.get()><p class="ob-sidebar-loading" role="status">{move || t!(i18n, common.loading)}</p></Show>
         <Show when=move || failed.get()>
-            <div class="ob-sidebar-alert" role="alert">
+            <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                 <span>{move || t!(i18n, agents.load_error)}</span>
                 <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>{move || t!(i18n, common.retry)}</Button>
-            </div>
+            </Notice>
         </Show>
         <Show when=move || !loading.get() && !failed.get() && agents.get().is_empty()>
             <p class="ob-sidebar-search-empty">{move || t!(i18n, agents.empty_title)}</p>

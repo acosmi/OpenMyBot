@@ -12,7 +12,10 @@ use serde_json::{Map, Value};
 
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonSize, ButtonVariant, IconSize, IconView, Input};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, IconSize, IconView, Input, Notice, NoticePresentation,
+    NoticeTone,
+};
 
 use super::{GalleryBadge, GalleryFrame, GalleryTone, RefusedCard};
 
@@ -170,14 +173,14 @@ fn approval_card(
                         invalid=note_too_long
                     />
                     <Show when=move || note_too_long.get()>
-                        <p class="ob-gallery-decision-error" role="alert">
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                             {move || t!(i18n, gallery.decision_note_too_long)}
-                        </p>
+                        </Notice>
                     </Show>
                     <Show when=move || error.get()>
-                        <p class="ob-gallery-decision-error" role="alert">
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                             {move || t!(i18n, gallery.decision_answer_error)}
-                        </p>
+                        </Notice>
                     </Show>
                     <div class="ob-gallery-decision-actions">
                         <Button
@@ -365,9 +368,9 @@ fn choice_card(
                 />
             </ul>
             <Show when=move || error.get()>
-                <p class="ob-gallery-decision-error" role="alert">
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                     {move || t!(i18n, gallery.decision_answer_error)}
-                </p>
+                </Notice>
             </Show>
         </GalleryFrame>
     }

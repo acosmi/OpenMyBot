@@ -10,7 +10,7 @@ use crate::{
         editor_location::EditorLocation,
     },
     i18n::{t, t_string, use_i18n},
-    primitives::{Button, ButtonVariant},
+    primitives::{Button, ButtonVariant, Notice, NoticeTone},
 };
 use form::{EditTarget, ModelDeleteDialog, ModelEditor};
 use leptos::prelude::*;
@@ -106,10 +106,10 @@ fn CustomConnections(editor: EditorLocation) -> impl IntoView {
         <p class="ob-page-intro">{move ||t!(i18n, models.saved_boundary)}</p>
         <Show when=move || actions.status.get()==Status::Pending><p role="status">{move ||t!(i18n, models.saving)}</p></Show>
         <Show when=move || actions.status.get()==Status::Saved><p role="status">{move ||t!(i18n, models.saved)}</p></Show>
-        <Show when=move || matches!(actions.status.get(),Status::Failed(WriteError::Unknown))><p class="ob-alert" role="alert">{move ||t!(i18n, models.unknown)}</p></Show>
+        <Show when=move || matches!(actions.status.get(),Status::Failed(WriteError::Unknown))><Notice tone=NoticeTone::Error>{move ||t!(i18n, models.unknown)}</Notice></Show>
         <Button disabled=Signal::derive(move || reading.get() || actions.status.get()==Status::Pending) on_activate=move |_|directory.reload()>{move ||t!(i18n, models.refresh)}</Button>
         <Show when=move ||reading.get()><p role="status">{move ||t!(i18n, common.loading)}</p></Show>
-        <Show when=move ||directory.status.get()==DirectoryStatus::Failed><p class="ob-alert" role="alert">{move ||t!(i18n, models.load_failed)}</p></Show>
+        <Show when=move ||directory.status.get()==DirectoryStatus::Failed><Notice tone=NoticeTone::Error>{move ||t!(i18n, models.load_failed)}</Notice></Show>
         <Show when=move ||directory.status.get()==DirectoryStatus::Ready || !directory.rows.get().is_empty()>
             <Show when=move ||directory.status.get()==DirectoryStatus::Ready>
                 <Button id="model-create" disabled=locked on_activate=move |_|open.run(EditTarget::Create)>{move ||t!(i18n, models.custom_add)}</Button>

@@ -21,7 +21,6 @@ use openbot_contracts::memory::{
     MemorySensitivity, MemoryStatus,
 };
 use sha2::{Digest, Sha256};
-use time::format_description::well_known::Rfc3339;
 
 #[cfg(target_arch = "wasm32")]
 use crate::api::{
@@ -32,7 +31,8 @@ use crate::features::layout::{PageEmpty, PageHeader, PageRows, PageSection, Page
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
     Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Dialog, DialogBody, DialogClose,
-    DialogContent, DialogFooter, Field, Input, InputType, Switch, Textarea,
+    DialogContent, DialogFooter, Field, Input, InputType, Notice, NoticeTone, Switch, Textarea,
+    Timestamp,
 };
 
 /// Native memory list and control destination required by v3 §3.1 item 7.
@@ -312,12 +312,12 @@ pub fn MemoryPage() -> impl IntoView {
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
                 </Show>
                 <Show when=move || load_error.get() != MemoryReadIssue::None>
-                    <div class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         <span>{move || if load_error.get() == MemoryReadIssue::ReconciliationRequired { t_string!(i18n, memory.reconciliation_required).to_owned() } else { t_string!(i18n, memory.load_error).to_owned() }}</span>
                         <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>
                             {move || t!(i18n, models.refresh)}
                         </Button>
-                    </div>
+                    </Notice>
                 </Show>
                 <Show when=move || !loading.get() && load_error.get() == MemoryReadIssue::None>
                     <PageSection
@@ -338,7 +338,7 @@ pub fn MemoryPage() -> impl IntoView {
                             </Field>
                         </div>
                         <Show when=move || control_error.get()>
-                            <p class="ob-alert" role="alert">{move || t!(i18n, memory.control_error)}</p>
+                            <Notice tone=NoticeTone::Error>{move || t!(i18n, memory.control_error)}</Notice>
                         </Show>
                     </PageSection>
                     <PageSection
@@ -379,7 +379,7 @@ pub fn MemoryPage() -> impl IntoView {
                         </Show>
                     </PageSection>
                     <Show when=move || action_error.get()>
-                        <p class="ob-alert" role="alert">{move || t!(i18n, memory.action_error)}</p>
+                        <Notice tone=NoticeTone::Error>{move || t!(i18n, memory.action_error)}</Notice>
                     </Show>
                 </Show>
             </div>
@@ -516,7 +516,7 @@ fn MemorySearch(
                 </Button>
             </div>
             <Show when=move || failed.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, memory.load_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, memory.load_error)}</Notice>
             </Show>
             <Show when=move || results.get().is_some_and(|records| records.is_empty())>
                 <PageEmpty>{move || t!(i18n, common.no_results)}</PageEmpty>
@@ -580,7 +580,7 @@ fn MemoryRow(
     let scope = record.scope.clone();
     let tags = StoredValue::new(record.tags.clone());
     let source = StoredValue::new(record.source.clone());
-    let created_at = format_timestamp(record.created_at);
+    let created_at = record.created_at;
     let status = record.status;
     let kind = record.memory_kind;
     let sensitivity = record.sensitivity;
@@ -604,7 +604,7 @@ fn MemoryRow(
             </p>
             <p class="ob-memory-scope">{move || scope_label(i18n, &scope)}</p>
             <div class="ob-memory-provenance">
-                <span>{move || t_string!(i18n, memory.created_at, when = created_at.as_str()).to_owned()}</span>
+                <span>{move || t!(i18n, memory.created)} " " <Timestamp at=created_at /></span>
                 <span>{move || t_string!(i18n, memory.origin, value = origin_label(i18n, origin)).to_owned()}</span>
                 <Show when=move || source.get_value().is_some()>
                     {move || source.get_value().map(|source| t_string!(
@@ -737,12 +737,6 @@ fn memory_excerpt(raw: &str) -> String {
 
 fn correct_trigger_id(memory_id: &str) -> String {
     format!("{}-correct", memory_dom_id(memory_id))
-}
-
-fn format_timestamp(timestamp: time::OffsetDateTime) -> String {
-    timestamp
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
 }
 
 fn dismiss_correction(
@@ -928,10 +922,6 @@ mod tests {
         let long = "x".repeat(90);
         assert_eq!(memory_excerpt(&long).chars().count(), 81);
         assert_eq!(correct_trigger_id("memory-1").len(), 31);
-        assert_eq!(
-            format_timestamp(OffsetDateTime::UNIX_EPOCH),
-            "1970-01-01T00:00:00Z"
-        );
         assert_eq!(status_name(MemoryStatus::Forbidden), "forbidden");
         assert_eq!(status_tone(MemoryStatus::Deleted), BadgeTone::Danger);
     }

@@ -7,7 +7,9 @@ use crate::api::channel_new_href;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{delete_agent, duplicate_agent, load_agent_with_abort_signal, set_agent_hidden};
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Avatar, AvatarSize, Badge, Button, ButtonSize, ButtonVariant};
+use crate::primitives::{
+    Avatar, AvatarSize, Badge, Button, ButtonSize, ButtonVariant, Notice, NoticeTone,
+};
 
 use super::{AgentEditor, CallbackTokenPanel};
 
@@ -116,7 +118,7 @@ pub fn AgentProfilePanel(
             <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
         </Show>
         <Show when=move || load_error.get()>
-            <p class="ob-agent-profile-error" role="alert">
+            <Notice tone=NoticeTone::Error>
                 <span>{move || t!(i18n, agents.detail_load_error)}</span>
                 <Button
                     variant=ButtonVariant::Ghost
@@ -130,7 +132,7 @@ pub fn AgentProfilePanel(
                         reload_generation.update(|generation| *generation = generation.saturating_add(1));
                     }
                 >{move || t!(i18n, common.retry)}</Button>
-            </p>
+            </Notice>
         </Show>
         {move || profile.get().map(|current| {
             if editing.get() {
@@ -209,7 +211,7 @@ pub fn AgentProfilePanel(
                         />
                     </Show>
                     <Show when=move || action_error.get()>
-                        <p class="ob-alert" role="alert">{move || t!(i18n, agents.action_error)}</p>
+                        <Notice tone=NoticeTone::Error>{move || t!(i18n, agents.action_error)}</Notice>
                     </Show>
                     <div class="ob-agent-profile-actions">
                         <a

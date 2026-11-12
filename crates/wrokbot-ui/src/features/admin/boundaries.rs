@@ -12,7 +12,10 @@ use crate::api::{load_action_policy, save_action_policy};
 use crate::features::layout::{PageEmpty, PageHeader, PageSection, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonSize, ButtonVariant, IconSize, IconView, Input, InputType};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, IconSize, IconView, Input, InputType, Notice,
+    NoticePresentation, NoticeTone,
+};
 
 const ALLOW_EVERYTHING_RULE: &str = "true";
 const NEVER_SUBMIT_RULE: &str = "(intent == \"activate\" && contains(element.name, \"submit\")) || ((tool.name == \"computer_key\" || tool.name == \"computer_type\") && key == \"Enter\")";
@@ -159,7 +162,7 @@ pub fn AdminBoundariesPage() -> impl IntoView {
                 </div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, boundaries.load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -168,13 +171,13 @@ pub fn AdminBoundariesPage() -> impl IntoView {
                     >
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || save_error.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, boundaries.save_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, boundaries.save_error)}</Notice>
             </Show>
             <Show when=move || saved.get()>
-                <p class="ob-status" role="status">{move || t!(i18n, boundaries.saved)}</p>
+                <Notice tone=NoticeTone::Status>{move || t!(i18n, boundaries.saved)}</Notice>
             </Show>
             <Show when=move || {
                 !loading.get() && !load_error.get() && policy.get().is_none()
@@ -307,9 +310,9 @@ pub fn AdminBoundariesPage() -> impl IntoView {
                         </Button>
                     </form>
                     <Show when=move || draft_error.get().is_some()>
-                        <p class="ob-boundary-draft-error" role="alert">
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                             {move || draft_error_text(i18n, draft_error.get())}
-                        </p>
+                        </Notice>
                     </Show>
 
                     <ul class="ob-boundary-presets">

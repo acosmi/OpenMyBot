@@ -7,7 +7,7 @@ mod syntax;
 
 use crate::{
     i18n::{t, t_string, use_i18n},
-    primitives::{Button, ButtonSize, ButtonVariant},
+    primitives::CopyButton,
 };
 use leptos::prelude::*;
 use parser::{MarkdownBlock, MarkdownInline, TableAlignment};
@@ -143,41 +143,16 @@ fn link_view(url: SafeUrl, title: Option<String>, content: AnyView) -> AnyView {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CopyStatus {
-    Ready,
-    Pending,
-    Copied,
-    Failed,
-}
 #[component]
 fn CodeBlock(lang: String, code: String) -> impl IntoView {
-    let i18n = use_i18n();
-    let status = RwSignal::new(CopyStatus::Ready);
     let spans = syntax::highlight_code(&code, &lang)
         .into_iter()
         .flatten()
         .map(highlighted_span_view)
         .collect_view();
-    let source = StoredValue::new(code);
-    let copy = move |_| {
-        if status.get_untracked() == CopyStatus::Pending {
-            return;
-        }
-        status.set(CopyStatus::Pending);
-        leptos::task::spawn_local_scoped_with_cancellation(async move {
-            let result = syntax::copy_code_to_clipboard(&source.get_value()).await;
-            status.try_set(if result.is_ok() {
-                CopyStatus::Copied
-            } else {
-                CopyStatus::Failed
-            });
-        });
-    };
     view! { <div class="ob-markdown-code"><div class="ob-skill-chips"><code>{if lang.is_empty() { "text".to_owned() } else { lang }}</code>
-        <Button variant=ButtonVariant::Ghost size=ButtonSize::Small disabled=Signal::derive(move || status.get() == CopyStatus::Pending) on_activate=copy>{move || if status.get() == CopyStatus::Copied { t_string!(i18n, channels.md_copied).to_owned() } else { t_string!(i18n, channels.md_copy).to_owned() }}</Button>
-    </div><pre><code>{spans}</code></pre>
-    <Show when=move || status.get() == CopyStatus::Failed><p role="status">{move || t!(i18n, channels.md_copy_error)}</p></Show></div> }
+        <CopyButton text=code/>
+    </div><pre><code>{spans}</code></pre></div> }
 }
 
 #[cfg(test)]

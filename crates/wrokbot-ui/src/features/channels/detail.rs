@@ -8,6 +8,7 @@ use openbot_contracts::command::ChannelDetail;
 use crate::api::load_channel;
 use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, use_i18n};
+use crate::primitives::{Notice, NoticeTone};
 
 use super::ChannelConversation;
 
@@ -29,7 +30,7 @@ pub fn ChannelDetailPage() -> impl IntoView {
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || failed.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, channels.load_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.load_error)}</Notice>
             </Show>
             <Show when=move || channel.get().is_some()>
                 {move || channel.get().map(|detail| view! {

@@ -12,9 +12,10 @@
 #          @media (prefers-color-scheme: dark) {
 #            :root:not(.light) { … }                          跟随系统（同 [color.dark]）
 #          }
-#        非颜色 token（[size] [z_index] [motion] [opacity]）只进 :root 一块，
-#        它们不随主题变化；随主题变化的非颜色量（阴影强度）已经做成 color 段的
-#        shadow_popover / shadow_dialog（GUI 方案 §4.1 禁 `dark:` 变体的前提）。
+#        Non-color tokens ([size] [z_index] [motion] [opacity]) go into the :root block only;
+#        they do not change with the theme. The one non-color quantity that does (shadow
+#        strength) is already the color tokens shadow_popover / shadow_dialog (the premise for
+#        GUI plan §4.1 forbidding `dark:` variants).
 #     ② src/tokens.rs（生成，不入库）—— compiled component 与对比度单测 token_contrast_wcag_aa 共用。
 #
 # 命名约定：本文件的 key 用 snake_case（TOML 惯例 + Rust 常量直接派生）；
@@ -38,8 +39,9 @@ system_dark_selector = ":root:not(.light)"
 #   * 颜色是唯一既进 tokens.css 又被 @theme inline 引用的段——它必须随主题切三块，而
 #     @theme inline 只能声明一次。tokens.css 用 `--bg` 这类无前缀名，@theme 那边写
 #     `--color-bg: var(--bg)`，两个名字不同，不自引用。
-#   * Tailwind 没有 namespace 的量（z-index 阶、控件高度 / 固定尺寸、动效时长与级联参数、
-#     状态不透明度、CJK 排版覆盖）只进 tokens.css。
+#   * Quantities without a Tailwind namespace (z-index steps, control heights / fixed sizes,
+#     motion durations and cascade parameters, state opacity, CJK type overrides) go into
+#     tokens.css only.
 #   * 其余（字体栈、字号阶、圆角阶、缓动、断点）只进 tokens.rs，值在 app.css 手写一份。
 css_emit_sections = ["color", "z_index", "size", "motion", "opacity", "typography_cjk"]
 rust_emit_sections = ["color", "typography", "spacing", "radius", "border", "focus", "size", "breakpoint", "z_index", "shadow", "motion", "opacity"]
@@ -235,7 +237,7 @@ shadow_library = "0 2px 3px #00000020"
 shadow_library_hover = "0 5px 15px #00000040"
 
 # ---------------------------------------------------------------------------
-# §4.4 字体与排版
+# §4.4 Typography
 # ---------------------------------------------------------------------------
 [typography]
 css_prefix = ""
@@ -250,19 +252,21 @@ font_weights = [400, 500, 550, 600, 630, 700]
 
 # 数字一律 tabular-nums（时间、计数、表格）
 font_variant_numeric = "tabular-nums"
-# 中英混排：text-wrap: pretty 仅标题；body 只用 break-word 兜底（不缩小 min-content，
-# 控件与表格单元格不在词中断开），消息 / Markdown 正文容器自己声明 anywhere 防长 ID/URL 撑破列。
+# Mixed CJK/Latin text: text-wrap: pretty on headings only. body falls back to break-word
+# (min-content is not reduced, so controls and table cells never break inside a word); message
+# and Markdown body containers declare anywhere themselves so long ids/URLs cannot widen a column.
 heading_text_wrap = "pretty"
 body_overflow_wrap = "break-word"
 
-# UI spec v5.2 §2.4 E04 CJK 排版。这一小段进 tokens.css（css_emit_sections 里的
-# "typography_cjk"），生成 `:lang(zh) { … }` 一条规则；Tailwind 没有对应 namespace。
-# 规则只覆盖 scale_steps 各级的 `--text-*--line-height`（= size × line_height），不直接写
-# line-height：辅助/错误小字、正文控件随变量变宽松，阅读容器（1.75/1.95）的继承值不被压掉。
+# UI spec v5.2 §2.4 E04 CJK typography. This block goes into tokens.css ("typography_cjk" in
+# css_emit_sections) as one `:lang(zh) { … }` rule; Tailwind has no matching namespace.
+# The rule only overrides `--text-*--line-height` for the scale_steps (= size × line_height) and
+# never sets line-height directly: helper/error text and body controls loosen through the
+# variables, while reading containers (1.75/1.95) keep their inherited value.
 # 中英文之间不自动加空格（由文案维护），所以这里没有对应 token。
 [typography.cjk]
 selector = ":lang(zh)"
-line_height = "1.6"                 # 英文 12/16、13/18、14/20 ≈ 1.33–1.43 在中文偏挤
+line_height = "1.6"                 # Latin 12/16, 13/18, 14/20 ≈ 1.33–1.43 is cramped for CJK
 scale_steps = ["xs", "sm", "base"]
 hanging_punctuation = "first"       # 支持的引擎生效，不支持无害
 
@@ -409,7 +413,8 @@ library_card_gap = 20
 library_mark_width = 38
 library_mark_height = 42
 
-# 断点（UI spec v5.2 §5.5：700/701 与 1100/1101；上游其它断点不构成契约，本表是唯一真源）。
+# Breakpoints (UI spec v5.2 §5.5: 700/701 and 1100/1101; other upstream breakpoints are not a
+# contract; this table is the only source).
 [breakpoint]
 md = "701px"
 lg = "1101px"
@@ -427,8 +432,8 @@ dialog = 100
 tooltip = 60
 toast = 100
 
-# 控件状态不透明度。disabled 取 UI spec v5.2 §2.6 review card 的 .55，全站唯一值；
-# loading 不降透明度（只换 cursor: progress）。
+# Control state opacity. disabled takes the .55 of the UI spec v5.2 §2.6 review card, the one
+# value used everywhere; loading keeps full opacity (only cursor: progress changes).
 [opacity]
 css_prefix = "opacity"
 disabled = "0.55"

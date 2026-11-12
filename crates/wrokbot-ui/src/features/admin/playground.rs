@@ -26,7 +26,7 @@ use crate::features::layout::{PageHeader, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
     Button, ButtonSize, ButtonVariant, Dialog, DialogBody, DialogContent, DialogFooter, Field,
-    Input, Textarea,
+    Input, Notice, NoticeTone, Textarea,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::revision_editor::{Apply, Phase};
@@ -795,19 +795,19 @@ pub fn SandboxPlaygroundPage() -> impl IntoView {
                 </div>
             </Show>
             <Show when=move || action_error.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, admin.playground_action_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, admin.playground_action_error)}</Notice>
             </Show>
             <Show when=move || editing.read_error.get().is_some()>
-                <p class="ob-alert" role="alert">{move || if editing.read_error.get() == Some(ApiError::Forbidden) {
+                <Notice tone=NoticeTone::Error>{move || if editing.read_error.get() == Some(ApiError::Forbidden) {
                     t_string!(i18n, admin.playground_forbidden).to_owned()
-                } else { t_string!(i18n, admin.playground_load_error).to_owned() }}</p>
+                } else { t_string!(i18n, admin.playground_load_error).to_owned() }}</Notice>
             </Show>
             <Show when=move || load_error.get().is_some()>
-                <p class="ob-alert" role="alert">{move || if load_error.get() == Some(ApiError::Forbidden) {
+                <Notice tone=NoticeTone::Error>{move || if load_error.get() == Some(ApiError::Forbidden) {
                     t_string!(i18n, admin.playground_forbidden).to_owned()
                 } else {
                     t_string!(i18n, admin.playground_load_error).to_owned()
-                }}</p>
+                }}</Notice>
             </Show>
             <div class="ob-playground-grid">
                 <section class="ob-playground-editor" aria-labelledby="sandbox-editor-title">
@@ -856,9 +856,9 @@ pub fn SandboxPlaygroundPage() -> impl IntoView {
                 <section class="ob-playground-preview" aria-labelledby="sandbox-preview-title">
                     <h2 id="sandbox-preview-title">{move || t!(i18n, admin.playground_preview)}</h2>
                     <Show when=move || sample.get().is_none()>
-                        <p class="ob-alert" role="alert">
+                        <Notice tone=NoticeTone::Error>
                             {move || t!(i18n, admin.playground_sample_invalid)}
-                        </p>
+                        </Notice>
                     </Show>
                     <For
                         each=move || preview.get()

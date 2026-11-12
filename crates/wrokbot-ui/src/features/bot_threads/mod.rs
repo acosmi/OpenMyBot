@@ -18,7 +18,8 @@ use crate::api::{ApiError, complete_thread, list_bot_threads, set_thread_title};
 use crate::i18n::{Locale, t, t_string, td_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input,
+    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input, Notice,
+    NoticeTone, Timestamp,
 };
 
 use self::attention::AttentionIndex;
@@ -147,7 +148,7 @@ pub fn BotWorkList(
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || failed.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, bot_work.list_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, bot_work.list_error)}</Notice>
             </Show>
             <Show when=move || !loading.get() && !failed.get() && rows.get().is_empty()>
                 <p class="ob-page-empty">{move || t!(i18n, bot_work.list_empty)}</p>
@@ -260,11 +261,7 @@ fn BotWorkRow(
         Signal::derive(move || attention.with(|index| index.count_for(foreground_run.as_ref())));
     let row_title = row.title;
     let pending_inputs = row.pending_inputs;
-    let updated_at = row
-        .updated_at
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-    let updated_label = updated_at.clone();
+    let updated_at = row.updated_at;
     let control_id = format!("bot-work-title-{}", row.thread_id.as_str());
 
     view! {
@@ -299,7 +296,7 @@ fn BotWorkRow(
                             {move || t_string!(i18n, bot_work.attention_count, count = attention_count.get()).to_owned()}
                         </Badge>
                     </Show>
-                    <time class="ob-bot-work-updated" datetime=updated_at>{updated_label}</time>
+                    <span class="ob-bot-work-updated"><Timestamp at=updated_at /></span>
                 </span>
             </button>
             <div class="ob-bot-work-actions">
@@ -324,9 +321,9 @@ fn BotWorkRow(
                 })}
             </div>
             <Show when=move || notice.get().is_some()>
-                <p class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     {move || notice.get().map(|notice| work_notice_text(i18n.get_locale(), notice))}
-                </p>
+                </Notice>
             </Show>
             <Show when=move || renaming.get()>
                 <div class="ob-bot-work-rename">

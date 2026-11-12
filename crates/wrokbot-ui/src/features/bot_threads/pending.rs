@@ -13,7 +13,10 @@ use crate::api::ApiError;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{release_pending_input, withdraw_pending_input};
 use crate::i18n::{Locale, t, t_string, td_string, use_i18n};
-use crate::primitives::{Badge, BadgeTone, Button, ButtonSize, ButtonVariant};
+use crate::primitives::{
+    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Notice, NoticeTone, TechnicalDetails,
+    Timestamp,
+};
 
 /// The two actions a retained input offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,15 +101,15 @@ pub fn PendingInputsPanel(
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || failed.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, bot_work.pending_load_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, bot_work.pending_load_error)}</Notice>
             </Show>
             <Show when=move || !loading.get() && !failed.get() && items.get().is_empty()>
                 <p class="ob-page-empty">{move || t!(i18n, bot_work.pending_empty)}</p>
             </Show>
             <Show when=move || notice.get().is_some()>
-                <p class="ob-alert" role="status">
+                <Notice tone=NoticeTone::Status>
                     {move || notice.get().map(|notice| pending_notice_text(i18n.get_locale(), &notice))}
-                </p>
+                </Notice>
             </Show>
             <ul class="ob-bot-pending-rows">
                 <For
@@ -138,11 +141,7 @@ pub fn PendingInputsPanel(
                             .map(|slug| format!("/{slug}"))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        let submitted_at = item
-                            .submitted_at
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_default();
-                        let submitted_label = submitted_at.clone();
+                        let submitted_at = item.submitted_at;
                         view! {
                             <li class="ob-bot-pending-row">
                                 <div class="ob-bot-pending-head">
@@ -153,9 +152,7 @@ pub fn PendingInputsPanel(
                                 <p class="ob-bot-pending-message">{item.message}</p>
                                 <p class="ob-bot-pending-meta">
                                     <span class="ob-bot-pending-assistant">{assistant.clone()}</span>
-                                    <span>
-                                        {move || t_string!(i18n, bot_work.pending_model_snapshot, connection = connection.as_str(), revision = revision).to_owned()}
-                                    </span>
+                                    <span>{move || t!(i18n, bot_work.pending_model_snapshot)}</span>
                                     {(!skills.is_empty()).then(|| view! {
                                         <span class="ob-bot-pending-skills">{skills}</span>
                                     })}
@@ -164,8 +161,12 @@ pub fn PendingInputsPanel(
                                             {move || t_string!(i18n, bot_work.pending_position, position = position).to_owned()}
                                         </span>
                                     })}
-                                    <time datetime=submitted_at>{submitted_label}</time>
+                                    <Timestamp at=submitted_at />
                                 </p>
+                                <TechnicalDetails copy=connection.clone()>
+                                    <code>{connection.clone()}</code>
+                                    <span>{move || t_string!(i18n, bot_work.pending_model_revision, revision = revision).to_owned()}</span>
+                                </TechnicalDetails>
                                 <div class="ob-bot-pending-actions">
                                     <Button
                                         variant=ButtonVariant::Ghost

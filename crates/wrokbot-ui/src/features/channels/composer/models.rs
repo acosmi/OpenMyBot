@@ -11,7 +11,9 @@ use crate::api::ApiError;
 use crate::api::model_connections;
 use crate::features::settings::models::ModelActions;
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Select, SelectContent, SelectItem, SelectTrigger};
+use crate::primitives::{
+    Notice, NoticePresentation, NoticeTone, Select, SelectContent, SelectItem, SelectTrigger,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DirectoryStatus {
@@ -359,10 +361,10 @@ pub(crate) fn ModelPicker(state: ModelComposer, disabled: Signal<bool>) -> impl 
                         };
                         let value = selection_key(Some(&selection)).expect("selection key");
                         let option_id = format!("run-model-{}-{}", row.id, row.revision);
-                        let presentation = StoredValue::new((row.source, row.model, row.id, row.name.clone()));
+                        let presentation = StoredValue::new((row.source, row.model, row.name.clone()));
                         let enabled = row.enabled;
                         let has_credential = row.has_credential;
-                        let summary = move || presentation.with_value(|(source, model, id, _)| {
+                        let summary = move || presentation.with_value(|(source, model, _)| {
                             let source_label = match source {
                                 ModelConnectionSource::Custom => t_string!(i18n, models.custom_source).to_owned(),
                             };
@@ -373,11 +375,11 @@ pub(crate) fn ModelPicker(state: ModelComposer, disabled: Signal<bool>) -> impl 
                             } else {
                                 t_string!(i18n, models.key_stored).to_owned()
                             };
-                            format!("{model} · {source_label} · {id} · {availability}")
+                            format!("{model} · {source_label} · {availability}")
                         });
                         let label = move || {
                             let summary = summary();
-                            presentation.with_value(|(_, _, _, name)| format!("{name} · {summary}"))
+                            presentation.with_value(|(_, _, name)| format!("{name} · {summary}"))
                         };
                         view! {
                             <SelectItem
@@ -396,7 +398,7 @@ pub(crate) fn ModelPicker(state: ModelComposer, disabled: Signal<bool>) -> impl 
                         }
                     }/>
                     <Show when=move || state.directory.status.get()==DirectoryStatus::Loading><p role="status">{move || t!(i18n, common.loading)}</p></Show>
-                    <Show when=move || state.directory.status.get()==DirectoryStatus::Failed><p class="ob-alert" role="alert">{move || t!(i18n, models.load_failed)}</p></Show>
+                    <Show when=move || state.directory.status.get()==DirectoryStatus::Failed><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, models.load_failed)}</Notice></Show>
                     <Show when=move || state.directory.status.get()==DirectoryStatus::Ready && rows.get().is_empty()><p>{move || t!(i18n, models.none_available)}</p></Show>
                 </SelectContent>
             </Select>
@@ -404,13 +406,13 @@ pub(crate) fn ModelPicker(state: ModelComposer, disabled: Signal<bool>) -> impl 
                 <span class="ob-page-empty" role="status">{move || t!(i18n, common.loading)}</span>
             </Show>
             <Show when=move || selection_status.get()==ModelSelectionStatus::DirectoryFailed>
-                <span class="ob-alert" role="alert">{move || t!(i18n, models.load_failed)}</span>
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, models.load_failed)}</Notice>
             </Show>
             <Show when=move || selection_status.get()==ModelSelectionStatus::Unavailable>
-                <span class="ob-alert" role="alert">{move || if disabled.get() {t_string!(i18n, models.selection_unavailable_locked).to_owned()} else {t_string!(i18n, models.selection_unavailable).to_owned()}}</span>
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || if disabled.get() {t_string!(i18n, models.selection_unavailable_locked).to_owned()} else {t_string!(i18n, models.selection_unavailable).to_owned()}}</Notice>
             </Show>
             <Show when=move || selection_status.get()==ModelSelectionStatus::AgentConflict>
-                <span class="ob-alert" role="alert">{move || if disabled.get() {t_string!(i18n, models.selection_unavailable_locked).to_owned()} else {t_string!(i18n, models.selection_agent_conflict).to_owned()}}</span>
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || if disabled.get() {t_string!(i18n, models.selection_unavailable_locked).to_owned()} else {t_string!(i18n, models.selection_agent_conflict).to_owned()}}</Notice>
             </Show>
             <Show when=move || !state.supports_explicit.get() && selection_status.get()==ModelSelectionStatus::AgentDefault>
                 <span class="ob-page-empty">{move || t!(i18n, models.managed_by_agent)}</span>

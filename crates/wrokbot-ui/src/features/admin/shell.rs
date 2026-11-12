@@ -10,7 +10,7 @@ use crate::api::ApiError;
 use crate::api::require_admin_status;
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{IconSize, IconView};
+use crate::primitives::{IconSize, IconView, Notice, NoticeTone};
 
 const ADMIN_HOME_PATH: &str = "/admin";
 const ADMIN_AUDIT_PATH: &str = "/admin/audit";
@@ -222,10 +222,9 @@ fn admin_gate_fallback(
         }
         .into_any(),
         AdminGateState::Failed | AdminGateState::Authorized => view! {
-            <div class="ob-alert" role="alert">
-                <IconView icon=Icon::TriangleAlert size=IconSize::Inline />
+            <Notice tone=NoticeTone::Error>
                 <span>{move || t!(i18n, admin.gate_error)}</span>
-            </div>
+            </Notice>
         }
         .into_any(),
     }

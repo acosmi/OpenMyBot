@@ -14,7 +14,9 @@ use openbot_contracts::versioned_model_selection::{
 #[cfg(target_arch = "wasm32")]
 use crate::api::list_custom_model_catalog;
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Select, SelectContent, SelectItem, SelectTrigger};
+use crate::primitives::{
+    Notice, NoticePresentation, NoticeTone, Select, SelectContent, SelectItem, SelectTrigger,
+};
 
 /// Closed status of the catalog the picker reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,7 +262,7 @@ pub fn ModelPickerV2(state: ModelComposerV2, disabled: Signal<bool>) -> impl Int
                         <p role="status">{move || t!(i18n, common.loading)}</p>
                     </Show>
                     <Show when=move || state.status.get()==CatalogStatus::Failed>
-                        <p class="ob-alert" role="alert">{move || t!(i18n, models.load_failed)}</p>
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, models.load_failed)}</Notice>
                     </Show>
                     <Show when=move || state.status.get()==CatalogStatus::Ready && state.choices.get().is_empty()>
                         <p>{move || t!(i18n, models.none_available)}</p>

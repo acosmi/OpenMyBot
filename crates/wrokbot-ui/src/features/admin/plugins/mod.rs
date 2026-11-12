@@ -17,7 +17,7 @@ use crate::features::layout::{
 };
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonVariant, IconSize, IconView, Switch};
+use crate::primitives::{Button, ButtonVariant, IconSize, IconView, Notice, NoticeTone, Switch};
 use forms::{PluginDialog, PluginDialogs};
 pub(crate) use state::PluginActions;
 use state::{PluginData, PluginPageState};
@@ -104,16 +104,16 @@ pub fn AdminPluginsPage() -> impl IntoView {
                 }
             }}
             <Show when=move || actions.busy.get() && !actions.unknown.get()><p class="ob-loading" role="status">{move || t!(i18n, plugins.saving)}</p></Show>
-            <Show when=move || actions.unknown.get()><p class="ob-alert" role="alert">{move || t!(i18n, plugins.write_unknown)}</p></Show>
+            <Show when=move || actions.unknown.get()><Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.write_unknown)}</Notice></Show>
             <Show when=move || actions.failed.get() && !actions.unknown.get() && scope.get().0.is_none_or(|id| actions.target.get().as_deref() == Some(&id))>
-                <p class="ob-alert" role="alert">{move || t!(i18n, plugins.write_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.write_error)}</Notice>
             </Show>
             <Show when=move || state.loading.get()><p class="ob-loading" role="status">{move || t!(i18n, common.loading)}</p></Show>
             <Show when=move || state.error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, plugins.load_error)}</span>
                     <Button variant=ButtonVariant::Ghost on_activate=move |_| state.reload()>{move || t!(i18n, common.retry)}</Button>
-                </div>
+                </Notice>
             </Show>
             {move || state.data.get().map(|data| {
                 let (server, tool) = scope.get();
@@ -260,9 +260,9 @@ fn PluginDetail(data: PluginData, server_id: String, editor: EditorLocation) -> 
                             <a class="ob-button" data-size="md" data-variant="secondary" href=api::account_href(&key.get_value()).expect("validated server")>{move || t!(i18n, plugins.personal_manage)}</a>
                         </div>
                     </Show>
-                    <Show when=move || connect_error.get()><p class="ob-alert" role="alert">{move || t!(i18n, plugins.connect_error)}</p></Show>
+                    <Show when=move || connect_error.get()><Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.connect_error)}</Notice></Show>
                 </Show>
-                <Show when=move || !callback_available><p class="ob-alert">{move || t!(i18n, plugins.callback_unavailable)}</p></Show>
+                <Show when=move || !callback_available><Notice tone=NoticeTone::Caution>{move || t!(i18n, plugins.callback_unavailable)}</Notice></Show>
                 {callback.get_value().map(|uri| view! { <div class="ob-plugin-value"><span>{move || t!(i18n, plugins.redirect_uri)}</span><code>{uri}</code></div> })}
             </PageSection>
             {server.get_value().map(|server| view! { <ServerFacts server /> })}
@@ -286,7 +286,7 @@ fn ServerFacts(server: McpAdminServer) -> impl IntoView {
     view! {
         <div class="ob-plugin-value"><span>{move || t!(i18n, plugins.endpoint)}</span><code>{server.url}</code></div>
         <div class="ob-plugin-value"><span>{move || t!(i18n, plugins.private_egress)}</span><code>{if server.egress_allow_cidrs.is_empty() { "—".to_owned() } else { server.egress_allow_cidrs.join(", ") }}</code></div>
-        {server.last_error.map(|_| view! { <p class="ob-alert" role="alert">{move || t!(i18n, plugins.catalog_error)}</p> })}
+        {server.last_error.map(|_| view! { <Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.catalog_error)}</Notice> })}
     }
 }
 

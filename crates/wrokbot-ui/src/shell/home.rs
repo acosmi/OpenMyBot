@@ -28,8 +28,8 @@ use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, IconSize, IconView, Select,
-    SelectContent, SelectItem, SelectTrigger, Textarea,
+    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone,
+    Select, SelectContent, SelectItem, SelectTrigger, Textarea,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -411,7 +411,7 @@ pub fn HomePage() -> impl IntoView {
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
                 </Show>
                 <Show when=move || load_error.get()>
-                    <div class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         <span>{move || t!(i18n, home.agents_load_error)}</span>
                         <Button
                             size=ButtonSize::Small
@@ -420,7 +420,7 @@ pub fn HomePage() -> impl IntoView {
                         >
                             {move || t!(i18n, common.retry)}
                         </Button>
-                    </div>
+                    </Notice>
                 </Show>
                 <div class="ob-home-footer">
                 <ComposerFrame busy=Signal::derive(move || submitting.get())>
@@ -529,25 +529,25 @@ pub fn HomePage() -> impl IntoView {
                         <a href="/agents">{move || t!(i18n, home.no_agents)}</a>
                     </p>
                 </Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_agent_conflict)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_selection_unavailable)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Conflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_conflict)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Rejected)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_rejected)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::NavigationFailed)><p class="ob-alert" role="alert">{move || t!(i18n, channels.navigation_failed)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::RoutingFailed)><p class="ob-alert" role="alert">{move || t!(i18n, home.routing_failed)}</p></Show>
+                <Show when=move || notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_agent_conflict)}</Notice></Show>
+                <Show when=move || notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_selection_unavailable)}</Notice></Show>
+                <Show when=move || notice.get()==Some(SubmissionNotice::Conflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_conflict)}</Notice></Show>
+                <Show when=move || notice.get()==Some(SubmissionNotice::Rejected)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_rejected)}</Notice></Show>
+                <Show when=move || notice.get()==Some(SubmissionNotice::NavigationFailed)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.navigation_failed)}</Notice></Show>
+                <Show when=move || notice.get()==Some(SubmissionNotice::RoutingFailed)><Notice tone=NoticeTone::Error>{move || t!(i18n, home.routing_failed)}</Notice></Show>
                 <Show when=move || uncertain_create.get()>
-                    <div class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         <p>{move || t!(i18n, channels.create_uncertain)}</p>
                         <a href="/">{move || t!(i18n, home.title)}</a>
-                    </div>
+                    </Notice>
                 </Show>
                 <Show when=move || begin_unknown.get()>
-                    <p class="ob-alert" role="alert">{move || t!(i18n, channels.begin_unknown)}</p>
+                    <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.begin_unknown)}</Notice>
                 </Show>
                 <Show when=move || submission_blocked.get()>
-                    <a class="ob-alert" role="alert" href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
+                    <Notice tone=NoticeTone::Error><a href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
                         {move || t!(i18n, channels.submission_blocked)}
-                    </a>
+                    </a></Notice>
                 </Show>
 
                 </div>

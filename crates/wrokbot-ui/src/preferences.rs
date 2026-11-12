@@ -1,5 +1,6 @@
 //! Authenticated preference editing. Immediate appearance is separate from revision persistence.
 
+use crate::primitives::{Notice, NoticePresentation, NoticeTone};
 use crate::{
     api::preference_cas::{self as api, CasError},
     editor_notice::EditorNotice,
@@ -498,7 +499,7 @@ pub fn PreferenceSaveStatus(
     let phase = Signal::derive(move || preferences.writes.get().core.phase());
     let busy = Signal::derive(move || preferences.reading.get());
     view! {
-        <Show when=move ||preferences.read_failed.get()><p class="ob-preference-error" role="alert">{move ||t!(i18n,revision_editor.read_failed)}</p></Show>
+        <Show when=move ||preferences.read_failed.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n,revision_editor.read_failed)}</Notice></Show>
         <Show when=move ||preferences.writes.get().known.is_some() fallback=move ||view! {
             <Show when=move ||preferences.read_failed.get() fallback=move ||view! {<p role="status">{move ||t!(i18n,common.loading)}</p>}>
                 <crate::primitives::Button id=format!("{id_prefix}-retry-read") disabled=busy on_activate=move |_|preferences.read(i18n,ReadChoice::Compare)>{move ||t!(i18n,common.retry)}</crate::primitives::Button>

@@ -15,7 +15,9 @@ use crate::api::{
     start_environment_sign_in,
 };
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonSize, ButtonVariant, Field, Input, InputType};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, Field, Input, InputType, Notice, NoticeTone,
+};
 
 #[cfg(any(target_arch = "wasm32", test))]
 const SIGN_PATH: &str = "/sign";
@@ -308,9 +310,9 @@ fn SignInPage() -> impl IntoView {
                     </Show>
 
                     <Show when=move || start_error.get().is_some()>
-                        <p class="ob-sign-error" role="alert">
+                        <Notice tone=NoticeTone::Error>
                             {move || sign_in_error(i18n, start_error.get())}
-                        </p>
+                        </Notice>
                     </Show>
                 </section>
             </main>

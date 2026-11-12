@@ -4,7 +4,6 @@ use leptos::prelude::*;
 use openbot_contracts::audit::AuditEventView;
 #[cfg(any(target_arch = "wasm32", test))]
 use openbot_contracts::audit::AuditPage;
-use time::format_description::well_known::Rfc3339;
 
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::api::ApiError;
@@ -13,7 +12,9 @@ use crate::api::load_audit_page;
 use crate::features::layout::{PageHeader, PageShell, PageTopbar, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonSize, ButtonVariant, IconSize, IconView};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone, Timestamp,
+};
 
 /// Time-ordered, paginated administrator audit page.
 #[component]
@@ -53,13 +54,12 @@ pub fn AdminAuditPage() -> impl IntoView {
                 description=move || t_string!(i18n, admin.audit_intro).to_owned()
             />
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
-                    <IconView icon=Icon::TriangleAlert size=IconSize::Inline />
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, admin.audit_load_error)}</span>
                     <Button disabled=loading on_activate=load_more>
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || loading.get() && events.with(Vec::is_empty)>
                 <div class="ob-loading" role="status">
@@ -150,17 +150,12 @@ fn AuditRow(event: AuditEventView) -> impl IntoView {
         || event.target_type.clone(),
         |target| format!("{} / {target}", event.target_type),
     );
-    let timestamp = event
-        .created_at
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| event.created_at.unix_timestamp().to_string());
-    let datetime = timestamp.clone();
     let payload = serde_json::to_string_pretty(&event.payload).unwrap_or_else(|_| "{}".to_owned());
     view! {
         <li class="ob-audit-row">
             <div class="ob-audit-row-header">
                 <strong>{event.event_type}</strong>
-                <time datetime=datetime>{timestamp}</time>
+                <Timestamp at=event.created_at />
             </div>
             <dl class="ob-audit-facts">
                 <div><dt>{move || t!(i18n, admin.audit_actor)}</dt><dd>{move || actor.clone().unwrap_or_else(|| t_string!(i18n, admin.audit_system).to_owned())}</dd></div>

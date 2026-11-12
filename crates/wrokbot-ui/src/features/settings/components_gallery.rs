@@ -15,7 +15,9 @@ use crate::features::layout::{
 };
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonSize, ButtonVariant, IconSize, IconView};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone,
+};
 
 /// Published compiled components this deployment can currently offer.
 #[component]
@@ -48,7 +50,7 @@ pub fn ComponentsGalleryPage() -> impl IntoView {
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, gallery.components_load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -57,7 +59,7 @@ pub fn ComponentsGalleryPage() -> impl IntoView {
                     >
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || !loading.get() && !load_error.get()>
                 <Show
@@ -137,7 +139,7 @@ pub fn ComponentGalleryDetailPage() -> impl IntoView {
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, gallery.components_load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -146,7 +148,7 @@ pub fn ComponentGalleryDetailPage() -> impl IntoView {
                     >
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || !loading.get() && !load_error.get() && component.get().is_none()>
                 <PageHeader

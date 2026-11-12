@@ -7,7 +7,9 @@ use openbot_contracts::ids::BotId;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{issue_agent_callback_token, revoke_agent_callback_token};
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonSize, ButtonVariant};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, Notice, NoticePresentation, NoticeTone,
+};
 
 /// Generate/rotate/revoke one remote Agent callback token. Cleartext lives only in this component.
 #[component]
@@ -142,7 +144,7 @@ pub fn CallbackTokenPanel(
                 </div>
             </Show>
             <Show when=move || operation_error.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, agents.callback_error)}</p>
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, agents.callback_error)}</Notice>
             </Show>
         </section>
     }

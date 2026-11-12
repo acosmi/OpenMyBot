@@ -22,11 +22,12 @@ use crate::primitives::{
     Menu, MenuContent, MenuItem, MenuSeparator, MenuSub, MenuSubTrigger, MenuTrigger, Message,
     MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageGroup, MessageHeader,
     MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem,
-    MessageScrollerViewport, Select, SelectContent, SelectGroup, SelectItem, SelectTrigger,
-    Separator, SeparatorOrientation, Sheet, SheetSide, Sidebar, SidebarContent, SidebarFooter,
-    SidebarGroup, SidebarGroupLabel, SidebarHeader, SidebarNavLink, SidebarNavList,
-    SidebarProvider, SidebarTrigger, Skeleton, SkeletonShape, Switch, Textarea,
-    TextareaPreviewState, Toast, ToastPreviewState, Tooltip, TooltipTrigger, TooltipTriggerAction,
+    MessageScrollerViewport, Notice, NoticePresentation, NoticeTone, Select, SelectContent,
+    SelectGroup, SelectItem, SelectTrigger, Separator, SeparatorOrientation, Sheet, SheetSide,
+    Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupLabel, SidebarHeader,
+    SidebarNavLink, SidebarNavList, SidebarProvider, SidebarTrigger, Skeleton, SkeletonShape,
+    Switch, TechnicalDetails, Textarea, TextareaPreviewState, Timestamp, Toast, ToastPreviewState,
+    Tooltip, TooltipTrigger, TooltipTriggerAction,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +83,7 @@ pub fn DesignGallery() -> impl IntoView {
     let scroller_next_id = RwSignal::new(11_i32);
     let scroller_previous_id = RwSignal::new(-1_i32);
     let scroller_expanded_id = RwSignal::new(None::<i32>);
+    let sample_time = time::macros::datetime!(2026-11-12 09:41 UTC);
 
     view! {
         <section class="ob-page ob-design-gallery" aria-labelledby="design-gallery-title">
@@ -673,6 +675,34 @@ pub fn DesignGallery() -> impl IntoView {
                                 {move || scroller_items.with(Vec::len)}
                             </output>
                         </div>
+                    </div>
+                </section>
+
+                <section class="ob-design-section" aria-labelledby="design-notices-title">
+                    <h2 id="design-notices-title">{move || t!(i18n, design_gallery.notices)}</h2>
+                    <div class="ob-design-stack" id="design-notices">
+                        <Notice tone=NoticeTone::Error>
+                            <span>{move || t!(i18n, design_gallery.notice_error)}</span>
+                            <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| button_count.update(|count| *count += 1)>
+                                {move || t!(i18n, common.retry)}
+                            </Button>
+                        </Notice>
+                        <Notice tone=NoticeTone::Caution>{move || t!(i18n, design_gallery.notice_caution)}</Notice>
+                        <Notice tone=NoticeTone::Status>{move || t!(i18n, design_gallery.notice_status)}</Notice>
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
+                            <span>{move || t!(i18n, design_gallery.notice_error)}</span>
+                            <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| button_count.update(|count| *count += 1)>
+                                {move || t!(i18n, common.retry)}
+                            </Button>
+                        </Notice>
+                        <Notice tone=NoticeTone::Caution presentation=NoticePresentation::Inline>{move || t!(i18n, design_gallery.notice_caution)}</Notice>
+                        <Notice tone=NoticeTone::Status presentation=NoticePresentation::Inline>{move || t!(i18n, design_gallery.notice_status)}</Notice>
+                        <Separator decorative=true />
+                        <Timestamp at=sample_time />
+                        <TechnicalDetails copy="run_01JC0000000000000000000000\ncall_7f3a">
+                            <code>"run_01JC0000000000000000000000"</code>
+                            <code>"call_7f3a"</code>
+                        </TechnicalDetails>
                     </div>
                 </section>
 

@@ -11,9 +11,9 @@ use openbot_contracts::agent::{
 use crate::api::{create_agent, test_agent_connection, update_agent};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
-    Button, ButtonSize, ButtonVariant, Field, Input, InputType, SecretInput, SecretInputController,
-    SecretInputPolicy, SecretInputStatus, Select, SelectContent, SelectItem, SelectTrigger,
-    Textarea,
+    Button, ButtonSize, ButtonVariant, Field, Input, InputType, Notice, NoticePresentation,
+    NoticeTone, SecretInput, SecretInputController, SecretInputPolicy, SecretInputStatus, Select,
+    SelectContent, SelectItem, SelectTrigger, Textarea,
 };
 
 /// Create or edit one coworker. Password bytes stay in the DOM until an explicit request and are
@@ -366,10 +366,10 @@ pub fn AgentEditor(
                 </div>
             </div>
             <Show when=move || form_invalid.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, agents.form_error)}</p>
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, agents.form_error)}</Notice>
             </Show>
             <Show when=move || save_error.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, agents.save_error)}</p>
+                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, agents.save_error)}</Notice>
             </Show>
             <div class="ob-agent-editor-actions">
                 <Button
