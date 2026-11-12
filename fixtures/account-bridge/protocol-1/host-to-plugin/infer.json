@@ -1,0 +1,12 @@
+{
+  "type": "infer",
+  "requestId": "req-0001",
+  "connectionId": "00000000-0000-4000-8000-00000000c001",
+  "credentialGeneration": 3,
+  "body": {
+    "model": "fixture-model",
+    "max_tokens": 64,
+    "stream": true,
+    "messages": [{ "role": "user", "content": "Hello" }]
+  }
+}

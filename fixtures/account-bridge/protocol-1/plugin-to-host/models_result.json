@@ -1,0 +1,8 @@
+{
+  "type": "models_result",
+  "requestId": "req-0001",
+  "models": [
+    { "id": "fixture-model", "displayName": "Fixture Model" },
+    { "id": "fixture-model-small", "displayName": "Fixture Model Small" }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "type": "infer_end",
+  "requestId": "req-0001",
+  "outcome": {
+    "status": "failed",
+    "code": "credential_expired"
+  }
+}

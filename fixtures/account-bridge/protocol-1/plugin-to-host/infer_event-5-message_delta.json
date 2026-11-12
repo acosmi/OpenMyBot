@@ -1,0 +1,9 @@
+{
+  "type": "infer_event",
+  "requestId": "req-0001",
+  "event": {
+    "type": "message_delta",
+    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+    "usage": { "output_tokens": 2 }
+  }
+}

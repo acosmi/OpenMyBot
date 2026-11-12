@@ -1,0 +1,10 @@
+{
+  "type": "hello",
+  "protocol": "wrokbot-account-bridge/2",
+  "pluginVersion": "0.0.0-fixture.1",
+  "connectors": ["openai"],
+  "egressProxy": {
+    "url": "http://127.0.0.1:43129",
+    "credential": "fixture-proxy-password"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "type": "infer_event",
+  "requestId": "req-0001",
+  "event": {
+    "type": "message_start",
+    "message": {
+      "id": "msg_fixture_0001",
+      "type": "message",
+      "role": "assistant",
+      "model": "fixture-model",
+      "content": [],
+      "stop_reason": null,
+      "stop_sequence": null,
+      "usage": { "input_tokens": 9, "output_tokens": 1 }
+    }
+  }
+}

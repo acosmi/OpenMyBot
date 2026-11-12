@@ -1,0 +1,11 @@
+{
+  "type": "login_result",
+  "requestId": "req-0001",
+  "attemptId": "00000000-0000-4000-8000-00000000a001",
+  "accountId": "fixture-account-1",
+  "tokenSet": {
+    "accessToken": "fixture-access-token",
+    "refreshToken": "fixture-refresh-token"
+  },
+  "expiresAt": 4102444800
+}

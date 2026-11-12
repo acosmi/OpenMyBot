@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "requestId": "req-0001",
+  "code": "connector_unavailable",
+  "message": "connector is not enabled"
+}
