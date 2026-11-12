@@ -146,7 +146,7 @@ pub fn ComponentPreview(name: String) -> AnyView {
             <LineChartCard
                 title=t_string!(i18n, gallery.sample_signups).to_owned()
                 caption=Some(t_string!(i18n, gallery.sample_signups_caption).to_owned())
-                labels=(1..=6).map(|week| t_string!(i18n, gallery.sample_week, week = week).to_owned()).collect::<Vec<_>>()
+                labels={(1..=6).map(|week| t_string!(i18n, gallery.sample_week, week = week).to_owned()).collect::<Vec<String>>()}
                 series=vec![ChartSeries { name: t_string!(i18n, gallery.sample_signups).to_owned(), values: vec![120.0, 180.0, 160.0, 240.0, 300.0, 420.0] }]
             />
         }.into_any(),
