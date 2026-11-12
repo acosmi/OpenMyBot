@@ -1,4 +1,4 @@
-# Wrok Bot UI v5.1 — frozen visual token roles
+# Wrok Bot UI spec v5.2 — frozen visual token roles
 #
 # 真源文档：repository contract
 # 本文件投影冻结视觉值；如有冲突，以已授权的现行视觉规范为准，
@@ -12,9 +12,9 @@
 #          @media (prefers-color-scheme: dark) {
 #            :root:not(.light) { … }                          跟随系统（同 [color.dark]）
 #          }
-#        非颜色 token（[radius] [size] [z_index] [typography] [motion]）只进 :root 一块，
-#        它们不随主题变化；随主题变化的非颜色量（阴影强度、图片压暗）已经做成 color 段的
-#        shadow_popover / shadow_dialog / image_dim（GUI 方案 §4.1 禁 `dark:` 变体的前提）。
+#        非颜色 token（[size] [z_index] [motion] [opacity]）只进 :root 一块，
+#        它们不随主题变化；随主题变化的非颜色量（阴影强度）已经做成 color 段的
+#        shadow_popover / shadow_dialog（GUI 方案 §4.1 禁 `dark:` 变体的前提）。
 #     ② src/tokens.rs（生成，不入库）—— compiled component 与对比度单测 token_contrast_wcag_aa 共用。
 #
 # 命名约定：本文件的 key 用 snake_case（TOML 惯例 + Rust 常量直接派生）；
@@ -39,10 +39,10 @@ system_dark_selector = ":root:not(.light)"
 #     @theme inline 只能声明一次。tokens.css 用 `--bg` 这类无前缀名，@theme 那边写
 #     `--color-bg: var(--bg)`，两个名字不同，不自引用。
 #   * Tailwind 没有 namespace 的量（z-index 阶、控件高度 / 固定尺寸、动效时长与级联参数、
-#     CJK 排版覆盖）只进 tokens.css。
+#     状态不透明度、CJK 排版覆盖）只进 tokens.css。
 #   * 其余（字体栈、字号阶、圆角阶、缓动、断点）只进 tokens.rs，值在 app.css 手写一份。
-css_emit_sections = ["color", "z_index", "size", "motion", "typography_cjk"]
-rust_emit_sections = ["color", "typography", "spacing", "radius", "border", "focus", "size", "breakpoint", "z_index", "shadow", "motion"]
+css_emit_sections = ["color", "z_index", "size", "motion", "opacity", "typography_cjk"]
+rust_emit_sections = ["color", "typography", "spacing", "radius", "border", "focus", "size", "breakpoint", "z_index", "shadow", "motion", "opacity"]
 
 # 重复来源的漂移闸门（status = done）：
 # app.css 的 `@theme inline` 手写了 typography.font_sans / font_mono / typography.scale /
@@ -112,7 +112,6 @@ chart_4 = "#AE3EC9"
 chart_5 = "#868E96"
 shadow_popover = "0 8px 25px #2B382318"
 shadow_dialog = "0 20px 80px #30344419"
-image_dim = "1"             # 暗色下内容图片 filter: brightness()
 modal_overlay = "#34394D30"
 avatar_0 = "#E8E8EA"
 avatar_1 = "#E8ECEB"
@@ -135,6 +134,7 @@ input_border = "#DEDEDE"
 menu_border = "#E1E5DC"
 modal_border = "#EEECE8"
 bg_agent_selected = "#ECEFF7"
+bg_row_hover = "#EDEDED"    # navigation row hover; distinct from bg_agent_selected in both themes
 bg_user_bubble = "#3D7E75"
 fg_user_bubble = "#FFFFFF"
 bg_review_positive = "#496D61"
@@ -185,7 +185,6 @@ chart_4 = "#DA77F2"
 chart_5 = "#ADB5BD"
 shadow_popover = "0 4px 16px rgb(0 0 0 / .45)"
 shadow_dialog = "0 12px 40px rgb(0 0 0 / .60)"
-image_dim = ".88"
 modal_overlay = "rgb(0 0 0 / .35)"
 avatar_0 = "#2A2A2E"
 avatar_1 = "#26302E"
@@ -195,10 +194,6 @@ avatar_4 = "#30282E"
 avatar_5 = "#282C34"
 avatar_6 = "#302F28"
 avatar_7 = "#263132"
-
-# ---------------------------------------------------------------------------
-# §4.3 字体与排版
-# ---------------------------------------------------------------------------
 bg_rail = "#0F0F10"
 bg_pane = "#1C1C1F"
 bg_input = "#1C1C1F"
@@ -212,6 +207,7 @@ input_border = "#2E2E33"
 menu_border = "#2E2E33"
 modal_border = "#2E2E33"
 bg_agent_selected = "#27272B"
+bg_row_hover = "#1F1F22"
 bg_user_bubble = "#3D7E75"
 fg_user_bubble = "#FFFFFF"
 bg_review_positive = "#496D61"
@@ -238,6 +234,9 @@ library_border_hover = "#66666F"
 shadow_library = "0 2px 3px #00000020"
 shadow_library_hover = "0 5px 15px #00000040"
 
+# ---------------------------------------------------------------------------
+# §4.4 字体与排版
+# ---------------------------------------------------------------------------
 [typography]
 css_prefix = ""
 
@@ -251,16 +250,20 @@ font_weights = [400, 500, 550, 600, 630, 700]
 
 # 数字一律 tabular-nums（时间、计数、表格）
 font_variant_numeric = "tabular-nums"
-# 中英混排：text-wrap: pretty 仅标题，正文 overflow-wrap: anywhere 防长 token 撑破列
+# 中英混排：text-wrap: pretty 仅标题；body 只用 break-word 兜底（不缩小 min-content，
+# 控件与表格单元格不在词中断开），消息 / Markdown 正文容器自己声明 anywhere 防长 ID/URL 撑破列。
 heading_text_wrap = "pretty"
-body_overflow_wrap = "anywhere"
+body_overflow_wrap = "break-word"
 
-# §8.6 CJK 排版。这一小段进 tokens.css（css_emit_sections 里的 "typography_cjk"），
-# 生成 `:lang(zh) { … }` 一条规则；Tailwind 没有对应 namespace。
+# UI spec v5.2 §2.4 E04 CJK 排版。这一小段进 tokens.css（css_emit_sections 里的
+# "typography_cjk"），生成 `:lang(zh) { … }` 一条规则；Tailwind 没有对应 namespace。
+# 规则只覆盖 scale_steps 各级的 `--text-*--line-height`（= size × line_height），不直接写
+# line-height：辅助/错误小字、正文控件随变量变宽松，阅读容器（1.75/1.95）的继承值不被压掉。
 # 中英文之间不自动加空格（由文案维护），所以这里没有对应 token。
 [typography.cjk]
 selector = ":lang(zh)"
-line_height = "1.6"                 # 英文 14/20 = 1.43 在中文偏挤
+line_height = "1.6"                 # 英文 12/16、13/18、14/20 ≈ 1.33–1.43 在中文偏挤
+scale_steps = ["xs", "sm", "base"]
 hanging_punctuation = "first"       # 支持的引擎生效，不支持无害
 
 # 字号阶（Tailwind @theme 覆盖默认值）。size / line_height 单位均为 px。
@@ -342,20 +345,9 @@ outline_offset = "2px"
 # 控件高度与固定尺寸（单位 px）。
 [size]
 css_prefix = "size"
-sidebar_min = 220
-sidebar_max = 220
-home_top_min = 72
-home_top_max = 200
-home_pad_min = 24
-home_pad_max = 56
-agent_picker_max = 280
-account_panel_min = 240
-account_panel_max = 520
 brand_mark = 30
 brand_mark_small = 19
 brand_sign = 64
-home_title = 24
-composer_height = 132
 composer_radius = 22
 control_sm = 32
 control_md = 36          # 默认
@@ -373,7 +365,6 @@ message_scroller_preview = 320
 listbox_min = 180
 listbox_max = 288
 sidebar_preview = 360
-table_row = 36
 sidebar_item = 42
 topbar = 64
 native_toolbar = 56    # macOS unified title/toolbar; host-authored overlay mode only
@@ -384,10 +375,7 @@ content_max_table = 1200 # 表格类页面
 content_max_chat = 850
 icon_inline = 16         # §4.6.1 行内 / 文字旁
 icon_nav = 20            # §4.6.1 导航 / 按钮
-min_viewport_w = 1024    # §5.3 最小支持视口
-min_viewport_h = 640
-
-# 断点（§5.3；上游 24 处断点用法不构成契约，本表是唯一真源）。
+detail_panel = 600       # UI spec v5.2 §5.5 overlay sheet max width
 home_content_max = 800
 rail_button = 36
 rail_icon = 18
@@ -420,6 +408,8 @@ library_card_padding = 22
 library_card_gap = 20
 library_mark_width = 38
 library_mark_height = 42
+
+# 断点（UI spec v5.2 §5.5：700/701 与 1100/1101；上游其它断点不构成契约，本表是唯一真源）。
 [breakpoint]
 md = "701px"
 lg = "1101px"
@@ -427,17 +417,21 @@ lg = "1101px"
 # z-index 阶。禁止其它值。
 [z_index]
 css_prefix = "z"
-base = 0
 sticky = 10
 sidebar = 30
 detail_panel = 15
-popover = 35
 menu = 35
 combobox = 35
 sheet = 25
 dialog = 100
 tooltip = 60
 toast = 100
+
+# 控件状态不透明度。disabled 取 UI spec v5.2 §2.6 review card 的 .55，全站唯一值；
+# loading 不降透明度（只换 cursor: progress）。
+[opacity]
+css_prefix = "opacity"
+disabled = "0.55"
 
 # 菜单、模态和 Composer 分别使用明确的语义阴影。
 [shadow]
@@ -458,9 +452,7 @@ ease_exit = "cubic-bezier(0.4, 0, 1, 1)"
 
 duration_hover = "150ms"
 duration_overlay_enter = "180ms"    # popover / menu / sheet 进入
-duration_overlay_exit = "120ms"     # 同上退出
 duration_dialog_enter = "240ms"     # dialog 进入
-duration_dialog_exit = "160ms"      # 同上退出
 agent_presence_cycle = "1200ms"     # thinking/speaking 状态环周期（§6.7）
 agent_presence_error = "160ms"      # error 单次横向位移（§6.7）
 

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use toml::Value;
 
 use crate::icons::Icon;
@@ -42,6 +44,13 @@ fn compact_visual_roles_keep_aa_on_their_declared_surfaces() {
             ("fg_nav_group", "bg_sidebar"),
             ("fg_agent_row", "bg_sidebar"),
             ("fg_agent_row", "bg_agent_selected"),
+            ("fg_agent_row", "bg_row_hover"),
+            ("fg", "bg_row_hover"),
+            ("fg_secondary", "bg_row_hover"),
+            ("fg_muted", "bg_row_hover"),
+            ("fg", "bg_agent_selected"),
+            ("fg_secondary", "bg_agent_selected"),
+            ("fg_muted", "bg_agent_selected"),
             ("fg_breadcrumb", "bg"),
             ("fg_user_bubble", "bg_user_bubble"),
             ("fg_review_positive", "bg_review_positive"),
@@ -121,6 +130,78 @@ fn root_and_app_layout_css_keep_one_viewport_with_inner_scroll_ownership() {
         .0;
     assert!(main.contains("min-height: 0"));
     assert!(main.contains("overflow: auto"));
+
+    // The document itself never adds a second scroll container below the app shell.
+    for selector in ["\nhtml {", "\nbody {"] {
+        let rule = css
+            .split_once(selector)
+            .unwrap_or_else(|| panic!("{selector} rule"))
+            .1
+            .split_once('}')
+            .expect("root rule")
+            .0;
+        assert!(
+            !rule.contains("min-height"),
+            "{selector} must not set min-height"
+        );
+    }
+    // UI spec v5.2 §5.5: width breakpoints are 700/701 and 1100/1101 only.
+    for line in css
+        .lines()
+        .filter(|line| line.starts_with("@media") && line.contains("width"))
+    {
+        for value in line
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            assert!(
+                matches!(value, "700px" | "701px" | "1100px"),
+                "stray breakpoint {value} in `{line}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn app_css_references_only_defined_custom_properties() {
+    let app = include_str!("../design/app.css");
+    let generated = include_str!("../design/tokens.css");
+    let mut declared = BTreeSet::from(["spacing"]); // Tailwind's own spacing theme variable.
+    for css in [app, generated] {
+        for (index, _) in css.match_indices("--") {
+            let name = custom_property_name(&css[index + 2..]);
+            if css[index + 2 + name.len()..].trim_start().starts_with(':') {
+                declared.insert(name);
+            }
+        }
+    }
+    let undefined = app
+        .match_indices("var(--")
+        .map(|(index, _)| custom_property_name(&app[index + 6..]))
+        .filter(|name| !declared.contains(name))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        undefined.is_empty(),
+        "app.css reads undefined custom properties: {undefined:?}"
+    );
+}
+
+#[test]
+fn cjk_rule_overrides_scale_line_heights_without_setting_line_height() {
+    let generated = include_str!("../design/tokens.css");
+    let rule = generated
+        .split_once(":lang(zh) {")
+        .expect("generated CJK rule")
+        .1
+        .split_once('}')
+        .expect("CJK rule terminator")
+        .0;
+    assert!(!rule.contains("\n  line-height:"));
+    for (step, size) in [("xs", 12), ("sm", 13), ("base", 14)] {
+        assert!(rule.contains(&format!(
+            "--text-{step}--line-height: calc({size}px * 1.6);"
+        )));
+    }
 }
 
 #[test]
@@ -192,6 +273,13 @@ fn all_avatar_palettes_keep_initials_wcag_aa_in_both_themes() {
             assert_contrast(colors, "fg", &format!("avatar_{index}"), 4.5, theme);
         }
     }
+}
+
+fn custom_property_name(rest: &str) -> &str {
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    &rest[..end]
 }
 
 fn tokens() -> Value {
