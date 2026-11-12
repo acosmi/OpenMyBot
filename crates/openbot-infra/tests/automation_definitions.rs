@@ -791,8 +791,38 @@ async fn three_scope_reservations_race_and_settle_once() {
             let before=image(&f).await;
             assert!(store.install_budgets(Some(&budget_file(&f,2,call_rules("10"),call_rules("1")))).await.is_err());assert_eq!(image(&f).await,before);
             assert!(store.install_budgets(Some(&budget_file(&f,3,call_rules("20"),call_rules("10")))).await.is_err());assert_eq!(image(&f).await,before,"same policy revision is immutable");
-            let swapped=json!([{"metric":"tool_calls","totalLimit":"10"}]);
+            let swapped=json!([{"metric":"sampling_calls","totalLimit":"10"},{"metric":"tool_calls","totalLimit":"10"}]);
             assert!(store.install_budgets(Some(&budget_file(&f,3,swapped,call_rules("10")))).await.is_err());assert_eq!(image(&f).await,before,"same revision cannot drop or add a metric");
+            Ok(())
+        }.await;
+        f.assembly.shutdown().await;f.pool.close();result
+    }).await;
+}
+
+#[cfg(feature = "server-runtime")]
+#[tokio::test]
+#[ignore = "requires explicitly owned PostgreSQL 17; selected include-ignored only"]
+async fn layer_without_current_sampling_rule_is_unconfigured() {
+    let admin = harness::admin_config("automation_budget_sampling_rule");
+    harness::with_temp_database(&admin,"automation_budget_sampling_rule",|database|async move{
+        let f=assembly_fixture::Fixture::with_options(&database,assembly_fixture::Options{automation:true,..Default::default()}).await?;
+        let result:Result<(),String>=async{
+            create(&f,"rule").await;install_budgets(&f,"20").await;enable(&f,"rule",1).await;trigger(&f,"rule","first",2).await;
+            let request=f.assembly.automations.as_ref().unwrap().pending().await.unwrap().remove(0);
+            let entry=f.assembly.delegated_entry.as_ref().unwrap();
+            let client=f.pool.get().await.unwrap();
+            for kind in ["owner","workspace","automation"]{
+                // Spec revision R485: a layer whose current rules lack sampling_calls blocks reservation.
+                assert_eq!(client.execute("WITH old AS (UPDATE openbot_internal.automation_budget_policies SET current=false WHERE scope_kind=$1 AND current AND metric='sampling_calls' RETURNING *)
+                    INSERT INTO openbot_internal.automation_budget_policies(deployment_id,tenant_id,scope_kind,scope_id,revision,metric,window_origin,window_seconds,window_limit,total_limit,current)
+                    SELECT deployment_id,tenant_id,scope_kind,scope_id,revision,'tool_calls',window_origin,window_seconds,window_limit,total_limit,true FROM old",&[&kind]).await.unwrap(),1);
+                assert!(budget_refusal(&entry.begin(request.clone()).await.unwrap_err()),"{kind}");
+                assert_eq!(client.query_one("SELECT count(*) FROM public.runs",&[]).await.unwrap().get::<_,i64>(0),0,"{kind}");
+                assert_eq!(client.execute("WITH extra AS (DELETE FROM openbot_internal.automation_budget_policies WHERE scope_kind=$1 AND current AND metric='tool_calls' RETURNING scope_id,revision)
+                    UPDATE openbot_internal.automation_budget_policies p SET current=true FROM extra WHERE p.scope_kind=$1 AND p.scope_id=extra.scope_id AND p.revision=extra.revision AND p.metric='sampling_calls'",&[&kind]).await.unwrap(),1);
+            }
+            drop(client);
+            entry.begin(request).await.unwrap();
             Ok(())
         }.await;
         f.assembly.shutdown().await;f.pool.close();result

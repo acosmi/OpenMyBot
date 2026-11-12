@@ -400,10 +400,11 @@ impl AutomationBudgetPlan {
     ) -> Result<Self, AppError> {
         let policies = policies(tx, deployment, tenant, owner, automation).await?;
         for kind in ["owner", "workspace", "automation"] {
-            if !policies
-                .iter()
-                .any(|r| r.get::<_, String>("scope_kind") == kind)
-            {
+            // A layer without a current sampling_calls rule is unconfigured (spec revision R485).
+            if !policies.iter().any(|r| {
+                r.get::<_, String>("scope_kind") == kind
+                    && r.get::<_, String>("metric") == "sampling_calls"
+            }) {
                 return Err(budget_blocked());
             }
         }

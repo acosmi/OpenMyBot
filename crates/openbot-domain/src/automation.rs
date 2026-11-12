@@ -127,6 +127,10 @@ fn validate_budget(rules: &mut [AutomationBudgetRule]) -> Result<(), AutomationC
             window.origin = window.origin.to_offset(UtcOffset::UTC);
         }
     }
+    // Spec revision R485: every budget layer carries a finite sampling_calls rule.
+    if !metrics.contains(&AutomationBudgetMetric::SamplingCalls) {
+        return Err(AutomationContractError::MalformedPayload);
+    }
     Ok(())
 }
 
@@ -230,7 +234,7 @@ mod tests {
     fn configured_budget_scopes_are_exact_and_finite() {
         let value = json!({"schemaVersion":1,"revision":1,
             "workspaces":[{"deploymentId":"dep","tenantId":"tenant","budget":[{"metric":"sampling_calls","totalLimit":"9"}]}],
-            "owners":[{"deploymentId":"dep","tenantId":"tenant","ownerId":"owner","budget":[{"metric":"tool_calls","totalLimit":"4"}]}]
+            "owners":[{"deploymentId":"dep","tenantId":"tenant","ownerId":"owner","budget":[{"metric":"sampling_calls","totalLimit":"3"},{"metric":"tool_calls","totalLimit":"4"}]}]
         });
         let wire: AutomationBudgetsFile = serde_json::from_value(value).unwrap();
         assert!(AutomationBudgets::try_from(wire.clone()).is_ok());
@@ -243,6 +247,9 @@ mod tests {
         let mut unbounded = wire.clone();
         unbounded.owners[0].budget[0].total_limit = None;
         assert!(AutomationBudgets::try_from(unbounded).is_err());
+        let mut without_sampling = wire.clone();
+        without_sampling.owners[0].budget.remove(0);
+        assert!(AutomationBudgets::try_from(without_sampling).is_err());
         let mut duplicate_metric = wire;
         let repeated = duplicate_metric.workspaces[0].budget[0].clone();
         duplicate_metric.workspaces[0].budget.push(repeated);
@@ -261,9 +268,16 @@ mod tests {
         wire.budget[0].currency = Some("USD".to_owned());
         assert!(AutomationConfig::try_from(wire).is_err());
         let mut wire = input();
-        wire.budget[0].metric = AutomationBudgetMetric::MoneyMicrounits;
+        wire.budget[0].metric = AutomationBudgetMetric::ToolCalls;
+        assert_eq!(
+            AutomationConfig::try_from(wire),
+            Err(AutomationContractError::MalformedPayload)
+        );
+        let mut wire = input();
+        wire.budget.push(wire.budget[0].clone());
+        wire.budget[1].metric = AutomationBudgetMetric::MoneyMicrounits;
         assert!(AutomationConfig::try_from(wire.clone()).is_err());
-        wire.budget[0].currency = Some("USD".to_owned());
+        wire.budget[1].currency = Some("USD".to_owned());
         assert!(AutomationConfig::try_from(wire).is_ok());
     }
 }
