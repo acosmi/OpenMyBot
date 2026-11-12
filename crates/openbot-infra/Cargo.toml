@@ -14,7 +14,7 @@ workspace = true
 # Server keeps the complete network + OIDC + SAML surface by default. Desktop Local consumes only
 # database/bootstrap adapters; it must not compile the Server TLS or xmlsec/OpenSSL graphs.
 default = ["server-sso"]
-desktop-local = []
+desktop-local = ["dep:wrok-bot-macos-local-auth"]
 desktop-local-vault = ["desktop-local"]
 server-runtime = [
     "dep:acosmi-sdk",
@@ -57,6 +57,7 @@ openbot-application.workspace = true
 openbot-contracts.workspace = true
 # G2 起 infra 要把领域类型（规范化 email、凭据信封、审计链…）映射到行与列上。
 openbot-domain.workspace = true
+wrok-bot-macos-process.workspace = true
 
 # OIDC 协议实现（v3 §6.2）。传输由本 crate 自己的 safe dialer 注入，见根 Cargo.toml 的
 # 依赖注释：`default-features = false` 关掉了它自带的 reqwest + rustls。
@@ -137,6 +138,10 @@ axum.workspace = true
 [target.'cfg(unix)'.dependencies]
 # Existing locked safe syscall wrapper; descriptor-relative backup IO, no application unsafe.
 rustix.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The pre-window Current receipt consumes the actual native confirmation and cleanup owners.
+wrok-bot-macos-local-auth = { workspace = true, optional = true }
 
 # Integration targets that exercise runtime-gated adapters. Shared Desktop runtime
 # assertions remain in these targets when the runtime feature is enabled.

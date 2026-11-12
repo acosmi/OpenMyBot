@@ -91,6 +91,11 @@ impl Fixture {
             config.clone(),
             "effect-owner".into(),
             time::Duration::minutes(10),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         directory
@@ -102,6 +107,11 @@ impl Fixture {
             "effect-owner".into(),
             time::Duration::minutes(10),
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         let claim = runtime
@@ -315,7 +325,7 @@ async fn effect_survives_later_outcome_failure_reconnect_erasure_and_duplicate_w
         assert_eq!(effects(&f.pool).await?,before);assert_eq!(lifecycle(&f.pool).await?,original_lifecycle);
         // Unknown keeps its occupancy after a fresh connection/process adapter.
         let reconnected=pool::connect(&f.config).await.map_err(|e|e.to_string())?;
-        let directory=PostgresThreadDirectory::with_runtime(reconnected.clone(),f.config.clone(),"readback-only".into(),time::Duration::minutes(10)).map_err(|e|e.to_string())?;
+        let directory=PostgresThreadDirectory::with_runtime(reconnected.clone(),f.config.clone(),"readback-only".into(),time::Duration::minutes(10), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&reconnected, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e|e.to_string())?;
         assert_eq!(directory.run_effect_receipts(f.query()).await.map_err(|e|e.to_string())?.receipts,snapshot.receipts);
         let replacement=store(&f.pool).correct(openbot_application::CorrectMemoryRequest { deployment: openbot_contracts::ids::DeploymentId::new("dep-a"),
             tenant:f.begin.tenant.clone(),actor:f.begin.actor.clone(),auth_generation:AuthGeneration::new(0),memory_id:historical.memory_id.clone(),

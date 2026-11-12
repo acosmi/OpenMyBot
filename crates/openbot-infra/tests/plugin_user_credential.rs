@@ -84,10 +84,10 @@ where
             );
             let fixture = Fixture {
                 pool: pool.clone(),
-                store: PluginUserCredentialStore::new(pool.clone(), vault.clone())
+                store: PluginUserCredentialStore::new(pool.clone(), vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                     .with_rotation_audit_key(AUDIT_KEY.to_vec())
                     .map_err(|error| error.to_string())?,
-                retirer: PostgresOwnedCredentialRetirer::new(pool.clone(), AUDIT_KEY.to_vec())
+                retirer: PostgresOwnedCredentialRetirer::new(pool.clone(), AUDIT_KEY.to_vec(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                     .map_err(|error| error.to_string())?,
                 vault,
             };

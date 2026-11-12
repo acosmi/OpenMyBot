@@ -350,4 +350,4 @@ const fn unavailable() -> AppError {
 
 #[cfg(all(test, unix))]
 #[path = "artifact_reads_tests.rs"]
-mod tests;
+pub(super) mod tests;

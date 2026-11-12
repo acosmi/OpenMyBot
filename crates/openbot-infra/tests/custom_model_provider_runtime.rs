@@ -1,5 +1,7 @@
 //! Owned PG + TLS integration for actual personal provider starts, without vendor accounts.
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 #[path = "custom_model_provider_runtime/target_identity.rs"]
 mod target_identity;
 use async_trait::async_trait;
@@ -58,15 +60,18 @@ const TENANT: &str = "custom-runtime-tenant";
 const OWNER: &str = "custom-runtime";
 const KEY: &str = "OWNED_CUSTOM_MODEL_CANARY";
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    // This owned database is outside every recovery domain (spec revision R484 S12).
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct Fixture {
     pool: openbot_infra::db::pool::DatabasePool,
@@ -101,6 +106,11 @@ impl Fixture {
             config.clone(),
             OWNER.into(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap();
         Self {
@@ -129,6 +139,11 @@ impl Fixture {
             dialer,
             SafeHttpBudget::new(64 * 1024 * 1024, timeout).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap()
     }
@@ -978,6 +993,11 @@ async fn lost_rollback_ack_after_headers_is_unknown_without_http_replay() {
             tls.dialer(),
             SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(3)).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap();
         assert!(matches!(
@@ -1025,6 +1045,11 @@ impl RunningAgent {
                 OWNER.into(),
                 time::Duration::seconds(30),
                 DEFAULT_DISPATCH_CLAIM_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &f.pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .unwrap(),
         );
@@ -1276,7 +1301,7 @@ async fn deployment_tenant_owner_current_reference_and_valid_legacy_cipher_are_n
         let legacy_vault=CredentialRecordVault::single_key(TenantId::new(TENANT),KeyVersion::new(1),WrappingKey::from_bytes((0_u8..32).collect()).unwrap());
         assert!(legacy_vault.open(&secret,SecretKind::Model,SecretPrincipal::Actor(ActorId::new("alice")),SecretPrincipal::Service(ServiceId::new(&model.id)),LEGACY).unwrap().needs_migration());
         c.execute("UPDATE public.model_connection_secrets SET encrypted_value=$1 WHERE id=$2",&[&LEGACY,&secret]).await.unwrap();
-        let adapter=PostgresCustomModelProvider::new(f.pool.clone(),legacy_vault,DeploymentId::new(DEP),TenantId::new(TENANT),tls.dialer(),SafeHttpBudget::new(64*1024*1024,Duration::from_secs(3)).unwrap(),Some(Duration::from_secs(2))).unwrap();
+        let adapter=PostgresCustomModelProvider::new(f.pool.clone(),legacy_vault,DeploymentId::new(DEP),TenantId::new(TENANT),tls.dialer(),SafeHttpBudget::new(64*1024*1024,Duration::from_secs(3)).unwrap(),Some(Duration::from_secs(2)), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &DeploymentId::new(DEP), &TenantId::new(TENANT))).unwrap();
         closed(adapter.start(request).await);assert_eq!(tls.count(),0);
         drop(c);tls.stop().await;f.pool.close();Ok(())
     }).await;

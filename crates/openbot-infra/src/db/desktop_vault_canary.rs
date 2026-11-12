@@ -643,58 +643,70 @@ pub async fn verify_pre_upgrade_layout(
 ) -> Result<ValidatedDesktopVaultLayout, DesktopVaultCanaryError> {
     bounded(async {
         let client = client(pool).await?;
-        let ledger = native::validate_known_prefix(&client, native::NATIVE_0032_VERSION).await?;
-        verify_internal_shape(&client).await?;
-        let expected = registered_public_schema(ledger.latest_version())?;
-        if schema_facts::fetch(&client).await? != expected {
-            return Err(InfraError::repository_invariant(
-                "desktop_vault_public_schema_invalid",
-            ));
-        }
-        let unknown_views: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('v','m','p','f'))",
-                &[],
-            )
-            .await
-            .map_err(|source| InfraError::query("只读核验 public 未知关系", source))?
-            .try_get(0)
-            .map_err(|source| RowDecodeError::column("(pg_class)", "exists", source))?;
-        if unknown_views {
-            return Err(InfraError::repository_invariant(
-                "desktop_vault_public_relation_unknown",
-            ));
-        }
-        if ledger.latest_version() >= native::NATIVE_0046_VERSION {
-            super::custom_model_catalog_schema::verify(&client)
-                .await
-                .map_err(|_| {
-                    InfraError::repository_invariant("custom_model_catalog_schema_invalid")
-                })?;
-        }
-        if ledger.latest_version() >= native::NATIVE_0047_VERSION {
-            super::custom_model_v2_schema::verify(&client).await?;
-        }
-        if ledger.latest_version() >= native::NATIVE_0048_VERSION {
-            super::gateway_authorization_schema::verify(&client).await?;
-        }
-        if ledger.latest_version() == native::NATIVE_0049_VERSION {
-            super::thread_origin_schema::verify_legacy0049(&client).await?;
-        }
-        if ledger.latest_version()==native::NATIVE_0050_VERSION {
-            super::thread_origin_schema::verify_legacy0050(&client).await?;
-        } else if ledger.latest_version()==native::NATIVE_0051_VERSION {
-            super::thread_origin_schema::verify_legacy0051(&client).await?;
-        } else if ledger.latest_version()==native::NATIVE_0053_VERSION {
-            super::thread_origin_schema::verify_legacy0053_schema(&client).await?;
-        } else if ledger.latest_version()>=native::NATIVE_0052_VERSION {
-            super::thread_origin_schema::verify(&client).await?;
-        }
-        Ok(ValidatedDesktopVaultLayout {
-            native_version: ledger.latest_version(),
-        })
+        verify_pre_upgrade_layout_on(&client).await
     })
     .await
+}
+
+/// Same original authenticated readonly client. The original startup owner
+/// retains the complete result and supplies its unchanged admission deadline.
+pub(crate) async fn verify_pre_upgrade_layout_on(
+    client: &tokio_postgres::Client,
+) -> Result<ValidatedDesktopVaultLayout, InfraError> {
+    let ledger = native::validate_known_prefix(client, native::NATIVE_0032_VERSION).await?;
+    verify_internal_shape(client).await?;
+    let expected = registered_public_schema(ledger.latest_version())?;
+    if !schema_facts::fetch(client)
+        .await?
+        .matches_registered(&expected)
+    {
+        return Err(InfraError::repository_invariant(
+            "desktop_vault_public_schema_invalid",
+        ));
+    }
+    let unknown_views: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('v','m','p','f'))",
+            &[],
+        )
+        .await
+        .map_err(|source| InfraError::query("read-only public relation check", source))?
+        .try_get(0)
+        .map_err(|source| RowDecodeError::column("(pg_class)", "exists", source))?;
+    if unknown_views {
+        return Err(InfraError::repository_invariant(
+            "desktop_vault_public_relation_unknown",
+        ));
+    }
+    if ledger.latest_version() >= native::NATIVE_0046_VERSION {
+        super::custom_model_catalog_schema::verify(client)
+            .await
+            .map_err(|_| InfraError::repository_invariant("custom_model_catalog_schema_invalid"))?;
+    }
+    if ledger.latest_version() >= native::NATIVE_0047_VERSION {
+        super::custom_model_v2_schema::verify(client).await?;
+    }
+    if ledger.latest_version() >= native::NATIVE_0048_VERSION {
+        super::gateway_authorization_schema::verify(client).await?;
+    }
+    if ledger.latest_version() == native::NATIVE_0049_VERSION {
+        super::thread_origin_schema::verify_legacy0049(client).await?;
+    }
+    if ledger.latest_version() == native::NATIVE_0050_VERSION {
+        super::thread_origin_schema::verify_legacy0050(client).await?;
+    } else if ledger.latest_version() == native::NATIVE_0051_VERSION {
+        super::thread_origin_schema::verify_legacy0051(client).await?;
+    } else if ledger.latest_version() == native::NATIVE_0052_VERSION
+        || ledger.latest_version() == native::NATIVE_0053_VERSION
+        || ledger.latest_version() == native::NATIVE_0054_VERSION
+    {
+        super::thread_origin_schema::verify_pre_restore(client, ledger.latest_version()).await?;
+    } else if ledger.latest_version() == native::NATIVE_0055_VERSION {
+        super::thread_origin_schema::verify(client).await?;
+    }
+    Ok(ValidatedDesktopVaultLayout {
+        native_version: ledger.latest_version(),
+    })
 }
 
 /// Require the exact latest layout known to this binary. Ordinary current-schema callers retain
@@ -745,6 +757,8 @@ fn registered_public_schema(native_version: i32) -> Result<SchemaFacts, InfraErr
         native::NATIVE_0053_VERSION => PUBLIC_0052,
         //0054 adds only internal automation objects; public remains0052.
         native::NATIVE_0054_VERSION => PUBLIC_0052,
+        //0055 adds only internal restore facts; its actual additive catalog is checked separately.
+        native::NATIVE_0055_VERSION => PUBLIC_0052,
         _ => {
             return Err(InfraError::repository_invariant(
                 "desktop_vault_native_schema_unregistered",

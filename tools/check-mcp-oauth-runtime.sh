@@ -89,8 +89,12 @@ import re
 store = Path('crates/openbot-infra/src/store/plugin_user_credential.rs').read_text()
 operation = Path('crates/openbot-infra/src/store/plugin_user_credential/refresh_operation.rs').read_text()
 broker = Path('crates/openbot-infra/src/mcp_credentials.rs').read_text()
-fresh = store.split('pub async fn fresh_user_access_token', 1)[1].split('pub async fn connections_for', 1)[0]
-anchors = ['.claim_refresh(&prepared)', 'OperationSendFence::new',
+public_fresh = store.split('pub async fn fresh_user_access_token<', 1)[1].split('pub(crate) async fn fresh_user_access_token_admitted<', 1)[0]
+assert public_fresh.index('.admission(') < public_fresh.index('.fresh_user_access_token_admitted('), 'public refresh must acquire admission before forwarding'
+assert public_fresh.count('.fresh_user_access_token_admitted(') == 1, 'public refresh must forward once'
+fresh = store.split('pub(crate) async fn fresh_user_access_token_admitted<', 1)[1].split('pub async fn connections_for', 1)[0]
+anchors = ['.prepare_admitted(server_id, actor, admission)', 'current(admission)',
+           '.claim_refresh(&prepared, admission)', 'OperationSendFence::new',
            'prepared.exchange_rotating(exchanger, &fence)', 'fence.admitted()',
            '.finish_refresh(', 'Ok(VendorAccessToken(grant.access_token))']
 positions = [fresh.index(anchor) for anchor in anchors]
@@ -103,7 +107,7 @@ for start, end in [('pub(super) async fn claim_refresh', 'async fn admit_refresh
     assert commit is not None and body.index('lock_binding(') < commit.start(), start
 assert 'pub async fn exchange<' not in store, 'legacy prepared exchange can bypass durable ownership'
 refresh = broker.split('async fn refresh_actor_bearer', 1)[1].split('impl core::fmt::Debug', 1)[0]
-assert refresh.count('.fresh_user_access_token(') == 1, 'broker must invoke exactly one owned refresh'
+assert refresh.count('.fresh_user_access_token_admitted(') == 1, 'broker must invoke exactly one owned refresh under its held admission'
 assert 'for attempt' not in refresh and 'continue;' not in refresh and 'loop {' not in refresh, 'broker retry can duplicate refresh sends'
 mcp_source = Path('crates/openbot-infra/src/mcp_oauth.rs').read_text()
 drive_source = Path('crates/openbot-infra/src/google_drive_oauth.rs').read_text()
@@ -163,7 +167,7 @@ grep -qF 'removed_server_client_material' crates/openbot-infra/src/mcp_connectio
 grep -qF 'let (refresh, material) = if removed_server || admin_retirement {' \
   crates/openbot-infra/src/mcp_connections.rs \
   || fail 'server removal and admin retirement no longer use their retained credential context'
-grep -qF '.removed_server_client_material(&claim, admin_retirement)' \
+rg -Uq '\.removed_server_client_material\(\s*&claim,\s*admin_retirement,\s*admission\.restore_cohort\(\),\s*deadline,\s*\)' \
   crates/openbot-infra/src/mcp_connections.rs \
   || fail 'removed-server claim no longer routes through its retained context'
 if grep -qF 'let material = if removed_server' crates/openbot-infra/src/mcp_connections.rs; then

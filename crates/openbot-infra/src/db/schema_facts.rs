@@ -40,6 +40,33 @@ impl SchemaFacts {
     pub fn enum_type(&self, name: &str) -> Option<&EnumFacts> {
         self.enums.iter().find(|e| e.name == name)
     }
+
+    /// Compare these observed facts with a registered layout. The registered
+    /// finalizer may already have validated `tool_calls_run_id_fkey`: an
+    /// observed definition equal to the registered one without its trailing
+    /// ` NOT VALID` counts as the registered value. Nothing else is relaxed.
+    pub fn matches_registered(mut self, registered: &SchemaFacts) -> bool {
+        if let Some(registered_def) = registered
+            .table("tool_calls")
+            .and_then(|table| {
+                table
+                    .constraints
+                    .iter()
+                    .find(|constraint| constraint.name == "tool_calls_run_id_fkey")
+            })
+            .map(|constraint| &constraint.def)
+            && let Some(observed) = self
+                .tables
+                .iter_mut()
+                .filter(|table| table.name == "tool_calls")
+                .flat_map(|table| table.constraints.iter_mut())
+                .find(|constraint| constraint.name == "tool_calls_run_id_fkey")
+            && registered_def.strip_suffix(" NOT VALID") == Some(observed.def.as_str())
+        {
+            observed.def.clone_from(registered_def);
+        }
+        self == *registered
+    }
 }
 
 /// 一张表的事实。
@@ -134,15 +161,30 @@ pub struct FunctionFacts {
 /// 在给定连接上跑 [`SCHEMA_FACTS_SQL`] 并解析结果。
 ///
 /// 只读：整条语句都是对 `pg_catalog` 的 `SELECT`。
+///
+/// The observation is rendered in UTC like the other catalog captures:
+/// `pg_get_constraintdef` and `pg_get_expr` print timestamptz literals in the
+/// session TimeZone, which a cluster inherits from its host at initdb.
 pub async fn fetch(client: &tokio_postgres::Client) -> Result<SchemaFacts, InfraError> {
-    let row = client
-        .query_one(SCHEMA_FACTS_SQL, &[])
+    // One simple-query message runs as one implicit transaction: the SET LOCAL
+    // ends with it, and neither a failed statement nor a dropped future leaves
+    // a transaction open on a pooled client.
+    let messages = client
+        .simple_query(&format!("SET LOCAL timezone='UTC';\n{SCHEMA_FACTS_SQL}"))
         .await
         .map_err(|source| InfraError::query("提取 schema 事实", source))?;
-    let payload: String = row
-        .try_get(0)
-        .map_err(|source| RowDecodeError::column(SCHEMA_FACTS_LABEL, "jsonb_pretty", source))?;
-    serde_json::from_str(&payload)
+    // The observation always yields one non-NULL row; anything else is not
+    // a schema to decode.
+    let payload = messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row.try_get(0)),
+            _ => None,
+        })
+        .ok_or(InfraError::repository_invariant("schema_facts_missing"))?
+        .map_err(|source| RowDecodeError::column(SCHEMA_FACTS_LABEL, "jsonb_pretty", source))?
+        .ok_or(InfraError::repository_invariant("schema_facts_missing"))?;
+    serde_json::from_str(payload)
         .map_err(|source| RowDecodeError::json(SCHEMA_FACTS_LABEL, "jsonb_pretty", source).into())
 }
 

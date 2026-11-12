@@ -109,6 +109,7 @@ pub(crate) async fn validate_thread(
 pub(crate) async fn resolve(
     tx: &Transaction<'_>,
     request: &BeginThreadRunRequest,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
 ) -> Result<Option<SelectionSnapshot>, Error> {
     let Some(selection) = &request.command.model_selection else {
         return Ok(None);
@@ -158,6 +159,7 @@ pub(crate) async fn resolve(
     .await
     .map_err(|_| Error::Unavailable)?
     .ok_or_else(corrupt)?;
+    require_model_confirmed(tx, &id, admission).await?;
     let protocol = match value::<String>(&row, "protocol")?.as_str() {
         "openai_chat_completions" => CustomModelProtocol::OpenaiChatCompletions,
         "openai_responses" => CustomModelProtocol::OpenaiResponses,
@@ -184,6 +186,34 @@ pub(crate) async fn resolve(
         endpoint,
         model: normalized.model,
     }))
+}
+
+/// The restored logical connection, not its rotating secret row, is the source.
+/// Shared by the legacy and v2 acceptance; the lease is rechecked after the read.
+async fn require_model_confirmed(
+    tx: &Transaction<'_>,
+    connection: &Uuid,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
+) -> Result<(), Error> {
+    crate::restore_reconfirmation::require_confirmed_before(
+        tx,
+        crate::restore_reconfirmation::RequirementSource {
+            cohort: admission.restore_cohort(),
+            kind: crate::restore_reconfirmation::RequirementKind::ModelSecret,
+            source_ref: &connection.to_string(),
+        },
+        admission.deadline(),
+    )
+    .await
+    .map_err(|error| match error {
+        crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+            Error::NotVisible
+        }
+        _ => Error::Unavailable,
+    })?;
+    admission
+        .verify_current_before(admission.deadline())
+        .map_err(|_| Error::Unavailable)
 }
 
 pub(crate) async fn insert(
@@ -793,6 +823,7 @@ pub(crate) struct SelectionSnapshotV2 {
 pub(crate) async fn resolve_v2(
     tx: &Transaction<'_>,
     request: &openbot_application::BeginThreadRunV2Request,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
 ) -> Result<SelectionSnapshotV2, Error> {
     let selection = &request.command.model_selection;
     let id = Uuid::parse_str(selection.connection_id()).map_err(|_| Error::InvalidInput {
@@ -844,6 +875,7 @@ pub(crate) async fn resolve_v2(
         AND s.deployment_id=$3 AND s.tenant_id=$4 AND s.owner_user_id=$5 AND s.retired_at IS NULL FOR SHARE OF s",
         &[&secret_id,&id,&request.deployment.as_str(),&request.tenant.as_str(),&request.actor.as_str()])
         .await.map_err(|_|Error::Unavailable)?.ok_or_else(corrupt)?;
+    require_model_confirmed(tx, &id, admission).await?;
     let normalized = normalize_model_configuration(
         &value::<String>(&row, "name")?,
         protocol,

@@ -320,6 +320,11 @@ impl Fixture {
             config.clone(),
             "artifact-current-read-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?
         .begin_thread_run(begin.clone())
@@ -356,6 +361,11 @@ impl Fixture {
                 store.clone(),
                 ArtifactQuotaPolicy::default(),
                 SecretBytes::new(vec![0x88; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|error| error.to_string())?,
         );
@@ -578,6 +588,11 @@ fn shared_public_peer(
             fixture.store.clone(),
             ArtifactQuotaPolicy::default(),
             SecretBytes::new(vec![0x88; 32]),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &fixture.pool,
+                &DeploymentId::new("outside"),
+                &TenantId::new("outside"),
+            ),
         )
         .map_err(|error| error.to_string())?,
     );
@@ -644,7 +659,8 @@ async fn shared_read_barrier_closes_all_administrations_and_keeps_other_artifact
             ).await.map_err(|error| error.to_string())?);
             let foreign_weak = Arc::downgrade(&foreign_store);
             let foreign = Arc::new(PostgresArtifactAdministration::new(foreign_registry.clone(), foreign_store.clone(),
-                ArtifactQuotaPolicy::default(), SecretBytes::new(vec![0x88; 32])).map_err(|error| error.to_string())?);
+                ArtifactQuotaPolicy::default(), SecretBytes::new(vec![0x88; 32]),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&fixture.pool, &DeploymentId::new("outside"), &TenantId::new("outside"))).map_err(|error| error.to_string())?);
             require(foreign.close_observed_artifact_reads(&record).is_err(), "actual foreign Store closed an original snapshot by string identity")?;
             drop(foreign); drop(foreign_store); drop(foreign_registry);
             require(foreign_weak.upgrade().is_none(), "extra foreign test Store Arc remained live")?;
@@ -1020,6 +1036,17 @@ impl ActualSingleUserRead {
         resolver
             .install_artifact_read_authority(&fixture.actual.read_authority())
             .map_err(|_| "canonical same-Pool read enrollment failed")?;
+        // This owned database is outside every recovery domain (spec revision R484 S12).
+        resolver
+            .install_recovery_read_gate(
+                &fixture.pool,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &fixture.pool,
+                    &deployment,
+                    &tenant,
+                ),
+            )
+            .map_err(|_| "canonical same-Pool recovery admission failed")?;
         let auth = resolver
             .resolve(&parts(COOKIE_A)?)
             .await
@@ -1045,6 +1072,11 @@ impl ActualSingleUserRead {
             config,
             "single-user-read-fixture".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &fixture.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?
         .begin_thread_run(begin.clone())
@@ -1962,4 +1994,71 @@ async fn actual_server_session_public_reader_cached_first_cleanup_fence_recheck_
         let cleaned = fixture.finish().await;
         outcome.and(cleaned)
     }).await;
+}
+
+/// Card section 5.2 R4: the SingleUser host with the typed outside-domain gate
+/// admits its consumers; reconfirmation never borrows from it, and a host
+/// without any installed gate stays closed.
+pub(in crate::http) async fn outside_recovery_domain_single_user_case() {
+    let tag = "outside_domain_single_user";
+    harness::with_temp_database(&harness::admin_config(tag), tag, |config| async move {
+        let fixture = Fixture::new(config.clone(), 4096).await?;
+        let single = ActualSingleUserRead::new(&fixture, config).await?;
+        let outcome = async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let auth = single
+                .resolver
+                .resolve(&parts(COOKIE_A)?)
+                .await
+                .map_err(|e| e.to_string())?;
+            fixture
+                .actual
+                .observe_run_input_metadata_current(&auth, &single.receipt.artifact_id, deadline)
+                .await
+                .map_err(|e| format!("gated SingleUser consumer refused: {e:?}"))?;
+            let binding = auth.request_binding().ok_or("SingleUser binding missing")?;
+            require(
+                matches!(
+                    binding
+                        .borrow_restore_reconfirmation_before(&auth, deadline)
+                        .await,
+                    Err(openbot_contracts::request_binding::HostRequestBindingError::Unavailable)
+                ),
+                "outside-domain gate lent a reconfirmation admission",
+            )?;
+            let ungated = crate::SingleUserAuthResolver::from_verified_principal(
+                openbot_infra::auth::single_user::load_single_user_principal(
+                    &fixture.pool,
+                    DeploymentId::new(DEPLOYMENT),
+                    TenantId::new(TENANT),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+                default_session_lifetime(),
+            );
+            let closed = ungated
+                .resolve(&parts(COOKIE_A)?)
+                .await
+                .map_err(|e| e.to_string())?;
+            let closed_binding = closed
+                .request_binding()
+                .ok_or("SingleUser binding missing")?;
+            let refused = closed_binding
+                .borrow_recovery_admission_before(&closed, deadline)
+                .await;
+            ungated.close_request_bindings();
+            require(
+                matches!(
+                    refused,
+                    Err(openbot_contracts::request_binding::HostRequestBindingError::Unavailable)
+                ),
+                "SingleUser host without a gate lent an admission",
+            )
+        }
+        .await;
+        single.resolver.close_request_bindings();
+        let cleaned = fixture.finish().await;
+        outcome.and(cleaned)
+    })
+    .await;
 }

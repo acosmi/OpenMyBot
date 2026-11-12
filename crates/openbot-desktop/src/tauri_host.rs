@@ -478,6 +478,8 @@ fn component_governance_route(path: &str) -> Option<ComponentGovernanceRoute<'_>
 struct WindowBindingRegistry {
     next_window_binding_id: HostAtomicU64,
     windows: Arc<RwLock<BTreeMap<String, WindowAuthority>>>,
+    #[cfg(all(feature = "desktop-local-runtime", unix))]
+    recovery_read_gate: OnceLock<openbot_infra::recovery_control::RecoveryReadGate>,
     #[cfg(all(feature = "desktop-local-runtime", target_os = "macos"))]
     local_confirmation_slot: Arc<OnceLock<Weak<LocalConfirmationService>>>,
     #[cfg(all(feature = "desktop-local-runtime", target_os = "macos"))]
@@ -494,6 +496,8 @@ struct WindowRequestBindingGuard {
     expected: AuthContext,
     source: Option<Arc<dyn HostRequestBindingGuard>>,
     upstream: Option<VerifiedHostRequestBinding>,
+    #[cfg(all(feature = "desktop-local-runtime", unix))]
+    recovery_read_gate: Option<openbot_infra::recovery_control::RecoveryReadGate>,
 }
 impl WindowRequestBindingGuard {
     fn repository_tail_source(&self) -> Self {
@@ -506,6 +510,8 @@ impl WindowRequestBindingGuard {
             expected: self.expected.clone(),
             source: None,
             upstream: None,
+            #[cfg(all(feature = "desktop-local-runtime", unix))]
+            recovery_read_gate: self.recovery_read_gate.clone(),
         }
     }
 
@@ -540,6 +546,33 @@ impl WindowRequestBindingGuard {
     }
 }
 impl HostRequestBindingGuard for WindowRequestBindingGuard {
+    #[cfg(all(feature = "desktop-local-runtime", unix))]
+    fn borrow_recovery_admission_before<'a>(
+        &'a self,
+        binding: &'a VerifiedHostRequestBinding,
+        auth: &'a AuthContext,
+        deadline: Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        openbot_contracts::recovery::RecoveryAdmissionLease<'a>,
+                        HostRequestBindingError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.check_window(auth)?;
+            let gate = self
+                .recovery_read_gate
+                .as_ref()
+                .ok_or(HostRequestBindingError::Unavailable)?;
+            gate.borrow_before(binding, auth, deadline).await
+        })
+    }
+
     fn borrow_artifact_cleanup_host_before<'a>(
         &'a self,
         auth: &'a AuthContext,
@@ -779,6 +812,8 @@ impl HostRequestBindingGuard for WindowRequestBindingGuard {
                     expected: self.expected.clone(),
                     source: None,
                     upstream: None,
+                    #[cfg(all(feature = "desktop-local-runtime", unix))]
+                    recovery_read_gate: self.recovery_read_gate.clone(),
                 },
                 original: binding.identity().clone(),
                 inner,
@@ -840,6 +875,8 @@ impl HostRequestBindingGuard for WindowRequestBindingGuard {
                     expected: self.expected.clone(),
                     source: None,
                     upstream: None,
+                    #[cfg(all(feature = "desktop-local-runtime", unix))]
+                    recovery_read_gate: self.recovery_read_gate.clone(),
                 },
                 original: binding.identity().clone(),
                 inner,
@@ -908,6 +945,8 @@ impl HostRequestBindingGuard for WindowRequestBindingGuard {
                     expected: self.expected.clone(),
                     source: None,
                     upstream: None,
+                    #[cfg(all(feature = "desktop-local-runtime", unix))]
+                    recovery_read_gate: self.recovery_read_gate.clone(),
                 },
                 original: binding.identity().clone(),
                 inner,
@@ -1410,6 +1449,8 @@ impl DesktopTauriProtocol {
             window_registry: Arc::new(WindowBindingRegistry {
                 next_window_binding_id: HostAtomicU64::new(1),
                 windows: Arc::clone(&windows),
+                #[cfg(all(feature = "desktop-local-runtime", unix))]
+                recovery_read_gate: OnceLock::new(),
                 #[cfg(all(feature = "desktop-local-runtime", target_os = "macos"))]
                 local_confirmation_slot: Arc::new(OnceLock::new()),
                 #[cfg(all(feature = "desktop-local-runtime", target_os = "macos"))]
@@ -1526,6 +1567,30 @@ impl DesktopTauriProtocol {
     }
 
     /// Bind one host-created webview label to verified local session authority.
+    #[cfg(all(feature = "desktop-local-runtime", unix))]
+    pub(crate) fn with_recovery_read_gate(
+        self,
+        gate: openbot_infra::recovery_control::RecoveryReadGate,
+        pool: &openbot_infra::db::pool::DatabasePool,
+        auth: &AuthContext,
+    ) -> Result<Self, TauriHostError> {
+        if !gate.matches_server_scope(pool, auth.deployment().as_str(), auth.tenant().as_str())
+            || !self
+                .windows
+                .read()
+                .map_err(|_| TauriHostError::AuthorityUnavailable)?
+                .is_empty()
+        {
+            return Err(TauriHostError::AuthorityUnavailable);
+        }
+        self.window_registry
+            .recovery_read_gate
+            .set(gate)
+            .map_err(|_| TauriHostError::AuthorityUnavailable)?;
+        Ok(self)
+    }
+
+    /// Bind one host-created webview label to verified local session authority.
     pub fn bind_window(
         &self,
         label: impl Into<String>,
@@ -1595,6 +1660,8 @@ impl DesktopTauriProtocol {
             expected: auth.clone(),
             source: self.current_identity_source.clone(),
             upstream,
+            #[cfg(all(feature = "desktop-local-runtime", unix))]
+            recovery_read_gate: self.window_registry.recovery_read_gate.get().cloned(),
         });
         let binding = self
             .request_binding_issuer
@@ -2058,6 +2125,15 @@ impl DesktopTauriProtocol {
             return index_response(&self.index, values.0, values.1, self.os_locale);
         }
         self.asset(&path)
+    }
+
+    #[cfg(all(test, feature = "desktop-local-runtime", unix))]
+    pub(crate) fn bound_auth_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Option<AuthContext>, TauriHostError> {
+        self.authority(label)
+            .map(|authority| authority.map(|authority| authority.auth))
     }
 
     fn authority(&self, label: &str) -> Result<Option<WindowAuthority>, TauriHostError> {

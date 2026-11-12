@@ -505,6 +505,11 @@ impl Fixture {
             config.clone(),
             OWNER.into(),
             duration,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         directory
@@ -516,6 +521,11 @@ impl Fixture {
             OWNER.into(),
             duration,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         let claim = runtime
@@ -679,6 +689,11 @@ impl Fixture {
                 self.begin.deployment.clone(),
                 self.begin.tenant.clone(),
                 KEY.to_vec(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|e| e.to_string())?,
             request: Mutex::new(None),
@@ -1102,7 +1117,7 @@ async fn remember_positive_commit_survives_outcome_commit_rejection_and_original
             });
             let control = Arc::new(ForwardBuiltIn {
                 inner:PostgresBuiltInToolControlPlane::new(f.pool.clone(),
-                    f.begin.deployment.clone(), f.begin.tenant.clone(), policy, memory.clone()),
+                    f.begin.deployment.clone(), f.begin.tenant.clone(), policy, memory.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))),
                 executions:AtomicUsize::new(0)
             });
             f.launch(control.clone());

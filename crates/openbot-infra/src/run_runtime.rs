@@ -267,6 +267,7 @@ pub struct PostgresRunRuntime {
     claim_duration: Duration,
     delegation_runtime: Option<std::sync::Weak<openbot_application::DelegationRuntime>>,
     terminal_delivery: Option<Arc<crate::run_terminal_delivery::TerminalDelivery>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
     pending_inputs: Option<Arc<dyn openbot_application::PendingInputWake>>,
 }
 
@@ -286,6 +287,7 @@ impl PostgresRunRuntime {
         owner_id: String,
         lease_duration: Duration,
         claim_duration: Duration,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, RunRuntimeError> {
         if owner_id.is_empty()
             || owner_id.as_bytes().contains(&0)
@@ -304,6 +306,7 @@ impl PostgresRunRuntime {
             claim_duration,
             delegation_runtime: None,
             terminal_delivery: None,
+            recovery_gate,
             pending_inputs: None,
         })
     }
@@ -400,13 +403,21 @@ impl PostgresRunRuntime {
         {
             delivery.enqueue(notice);
         }
-        if let Some(dispatcher) = &self.pending_inputs
-            && let Err(error) = dispatcher.wake(lease.thread_id()).await
-        {
-            tracing::warn!(
-                code = error.code().as_str(),
-                "pending input terminal wake unavailable"
-            );
+        // The same host guard as any thread entry; a closed gate skips the wake.
+        // The borrow verifies and is dropped at once: each dispatch holds its own lease.
+        if let Some(dispatcher) = &self.pending_inputs {
+            match self.admission().await {
+                Ok(admission) => {
+                    drop(admission);
+                    if let Err(error) = dispatcher.wake(lease.thread_id()).await {
+                        tracing::warn!(
+                            code = error.code().as_str(),
+                            "pending input terminal wake unavailable"
+                        );
+                    }
+                }
+                Err(_) => tracing::warn!("pending input terminal wake refused by recovery gate"),
+            }
         }
     }
     pub(crate) async fn fail_confirmed_delegated_callback(
@@ -478,6 +489,26 @@ impl PostgresRunRuntime {
         Ok(receipt)
     }
 
+    /// One worker admission per claim, renewal or terminal write: these SQL
+    /// writes have no per-step bound, so the 5 s precedent.
+    async fn admission(
+        &self,
+    ) -> Result<
+        (
+            crate::recovery_control::RecoveryWorkerLease<'_>,
+            std::time::Instant,
+        ),
+        RunRuntimeError,
+    > {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| RunRuntimeError::Unavailable)?;
+        Ok((admission, deadline))
+    }
+
     async fn client(&self) -> Result<crate::db::pool::PooledClient, RunRuntimeError> {
         self.pool.get().await.map_err(|error| {
             tracing::error!(error = %error, "run runtime 获取数据库连接失败");
@@ -490,6 +521,9 @@ impl PostgresRunRuntime {
 impl RunRuntime for PostgresRunRuntime {
     async fn scan_pending_inputs_at_startup(&self) -> Result<(), RunRuntimeError> {
         if let Some(dispatcher) = &self.pending_inputs {
+            // A closed gate refuses the whole scan; the relay logs it and dispatches nothing.
+            // The borrow verifies and is dropped at once: each dispatch holds its own lease.
+            drop(self.admission().await?);
             dispatcher
                 .scan_startup()
                 .await
@@ -551,6 +585,7 @@ impl RunRuntime for PostgresRunRuntime {
     }
 
     async fn claim_dispatch(&self) -> Result<Option<ClaimedRunDispatch>, RunRuntimeError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self.client().await?;
         let transaction = client
             .transaction()
@@ -562,7 +597,13 @@ impl RunRuntime for PostgresRunRuntime {
             self.lease_duration,
             self.claim_duration,
         )
-        .await;
+        .await
+        .and_then(|claim| {
+            admission
+                .verify_current_before(deadline)
+                .map(|()| claim)
+                .map_err(|_| RunRuntimeError::Unavailable)
+        });
         let claim = finish_transaction(transaction, result).await?;
         claim
             .map(|c| {
@@ -621,9 +662,13 @@ impl RunRuntime for PostgresRunRuntime {
     }
 
     async fn renew_lease(&self, lease: &RunExecutionLease) -> Result<(), RunRuntimeError> {
+        let (admission, deadline) = self.admission().await?;
         let client = self.client().await?;
         let now = database_now_client(&client).await?;
         let expires_at = checked_add(now, self.lease_duration, "lease_expiry")?;
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| RunRuntimeError::Unavailable)?;
         let updated = client
             .execute(
                 "UPDATE public.thread_leases l SET expires_at=$6,updated_at=$5 \
@@ -754,6 +799,7 @@ impl RunRuntime for PostgresRunRuntime {
         expected_sequence: u64,
         terminal: RunTerminal,
     ) -> Result<RunWriteReceipt, RunRuntimeError> {
+        let (admission, deadline) = self.admission().await?;
         let mut client = self.client().await?;
         let transaction = client
             .transaction()
@@ -761,7 +807,8 @@ impl RunRuntime for PostgresRunRuntime {
             .map_err(|error| unavailable("开始 run terminal 事务", error))?;
         let result = async {
             let schema = observe_writer_schema(&transaction).await?;
-            finish_run_in_transaction(
+            // Includes the terminal SQL retirement of remote interrupts.
+            let receipt = finish_run_in_transaction(
                 &transaction,
                 &schema,
                 &self.owner_id,
@@ -770,7 +817,11 @@ impl RunRuntime for PostgresRunRuntime {
                 terminal,
                 LeaseCheck::Active,
             )
-            .await
+            .await?;
+            admission
+                .verify_current_before(deadline)
+                .map_err(|_| RunRuntimeError::Unavailable)?;
+            Ok(receipt)
         }
         .await;
         let receipt = finish_transaction(transaction, result).await?;

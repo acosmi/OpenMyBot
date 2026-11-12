@@ -195,11 +195,7 @@ impl HelperJournalPreparation {
                 bytes,
                 record,
             } => {
-                let validated = validate_record(
-                    record,
-                    &owner.instance_id,
-                    data_dir_name(&owner.instance_id).as_str(),
-                )?;
+                let validated = validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
                 if record.phase != HelperJournalPhase::HelpersComplete {
                     return Err(HelperJournalError::ReconciliationRequired);
                 }
@@ -248,7 +244,7 @@ impl HelperJournalPreparation {
             schema: JOURNAL_SCHEMA.to_owned(),
             schema_version: JOURNAL_SCHEMA_VERSION,
             instance_id: owner.instance_id.to_string(),
-            data_dir_name: data_dir_name(&owner.instance_id),
+            data_dir_name: owner.data_dir_name.to_string(),
             data_dir_device: self.data_dir_device,
             data_dir_inode: self.data_dir_inode,
             attempt_id: random_id()?,
@@ -308,11 +304,7 @@ impl HelperJournal {
         {
             return Err(HelperJournalError::ReconciliationRequired);
         }
-        validate_record(
-            &self.record,
-            &owner.instance_id,
-            data_dir_name(&owner.instance_id).as_str(),
-        )?;
+        validate_record(&self.record, &owner.instance_id, &owner.data_dir_name)?;
         Ok(())
     }
 
@@ -472,11 +464,7 @@ fn publish_absent(
     record: &HelperJournalRecord,
     bytes: Vec<u8>,
 ) -> Result<(File, Vec<u8>), HelperJournalError> {
-    validate_record(
-        record,
-        &owner.instance_id,
-        data_dir_name(&owner.instance_id).as_str(),
-    )?;
+    validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
         .write_all(&bytes)
@@ -550,11 +538,7 @@ fn replace_exact(
     record: &HelperJournalRecord,
     bytes: Vec<u8>,
 ) -> Result<(File, Vec<u8>), HelperJournalError> {
-    validate_record(
-        record,
-        &owner.instance_id,
-        data_dir_name(&owner.instance_id).as_str(),
-    )?;
+    validate_record(record, &owner.instance_id, &owner.data_dir_name)?;
     let (candidate_path, mut candidate) = create_candidate(&preparation.root, &owner.instance_id)?;
     if candidate
         .write_all(&bytes)
@@ -617,7 +601,7 @@ fn journal_identity<'a>(
     data_dir: &Path,
 ) -> Result<(&'a Path, PathBuf, String), HelperJournalError> {
     let root = owner.path.parent().ok_or(HelperJournalError::Invalid)?;
-    let expected_name = data_dir_name(&owner.instance_id);
+    let expected_name = owner.data_dir_name.to_string();
     if !root.is_absolute() || data_dir != root.join(&expected_name) {
         return Err(HelperJournalError::Invalid);
     }
@@ -626,10 +610,6 @@ fn journal_identity<'a>(
         owner.instance_id
     ));
     Ok((root, path, expected_name))
-}
-
-fn data_dir_name(instance_id: &str) -> String {
-    format!("postgresql-17-{instance_id}")
 }
 
 struct DirectoryBinding {
@@ -698,7 +678,7 @@ fn validate_owner_and_directory(
     } = directory;
     if owner.path.parent() != Some(root)
         || !owner.ownership_is_current()
-        || data_dir_path != root.join(data_dir_name(&owner.instance_id))
+        || data_dir_path != root.join(&*owner.data_dir_name)
     {
         return Err(HelperJournalError::Invalid);
     }
@@ -773,7 +753,7 @@ fn ensure_journal_absent(
     path: &Path,
 ) -> Result<(), HelperJournalError> {
     let root = owner.path.parent().ok_or(HelperJournalError::Invalid)?;
-    let data_dir = root.join(data_dir_name(&owner.instance_id));
+    let data_dir = root.join(&*owner.data_dir_name);
     ensure_journal_absent_parts(
         owner,
         &data_dir,
@@ -827,7 +807,7 @@ fn ensure_retired_bound(
     bytes: &[u8],
 ) -> Result<(), HelperJournalError> {
     let root = owner.path.parent().ok_or(HelperJournalError::Invalid)?;
-    let data_dir = root.join(data_dir_name(&owner.instance_id));
+    let data_dir = root.join(&*owner.data_dir_name);
     if !directory_binding_is_current(owner, root, &data_dir, directory)
         || !path_matches_open_file(path, file, bytes, directory.root_uid, Some(1))
     {
@@ -1140,6 +1120,7 @@ pub(super) fn recover_mid_phase(
     app_data_root: &Path,
     instance_id: &str,
     data_dir: &Path,
+    data_dir_name: &str,
 ) -> Result<(), HelperJournalError> {
     if !owner.is_current() || owner.root() != app_data_root {
         return Err(HelperJournalError::Invalid);
@@ -1147,8 +1128,7 @@ pub(super) fn recover_mid_phase(
     if !app_data_root.is_absolute() || data_dir.parent() != Some(app_data_root) {
         return Err(HelperJournalError::Invalid);
     }
-    let data_dir_name = data_dir_name(instance_id);
-    if data_dir.file_name().and_then(|n| n.to_str()) != Some(data_dir_name.as_str()) {
+    if data_dir.file_name().and_then(|n| n.to_str()) != Some(data_dir_name) {
         return Err(HelperJournalError::Invalid);
     }
     let root_meta = fs::symlink_metadata(app_data_root).map_err(|_| HelperJournalError::Invalid)?;
@@ -1182,7 +1162,7 @@ pub(super) fn recover_mid_phase(
             let bytes = read_bounded_file(&path, &file, root_uid)?;
             let record: HelperJournalRecord =
                 serde_json::from_slice(&bytes).map_err(|_| HelperJournalError::Invalid)?;
-            let _ = validate_record(&record, instance_id, &data_dir_name)?;
+            let _ = validate_record(&record, instance_id, data_dir_name)?;
             if record.data_dir_device != device || record.data_dir_inode != inode {
                 return Err(HelperJournalError::Invalid);
             }
@@ -1436,7 +1416,7 @@ fn replace_exact_mid_phase(
         bytes: old_bytes,
         root_uid,
     } = previous;
-    validate_record(record, instance_id, data_dir_name(instance_id).as_str())?;
+    validate_record(record, instance_id, &record.data_dir_name)?;
     if !owner.is_current() {
         return Err(HelperJournalError::Invalid);
     }
@@ -1471,13 +1451,13 @@ pub(super) fn allows_quiescent_cleanup(
     app_data_root: &Path,
     instance_id: &str,
     data_dir: &Path,
+    data_dir_name: &str,
 ) -> Result<(), HelperJournalError> {
     if !app_data_root.is_absolute() || data_dir.parent() != Some(app_data_root) {
         return Err(HelperJournalError::Invalid);
     }
     let path = app_data_root.join(format!(".postgresql-17-{instance_id}.helper-v1.json"));
-    let data_dir_name = format!("postgresql-17-{instance_id}");
-    if data_dir.file_name().and_then(|n| n.to_str()) != Some(data_dir_name.as_str()) {
+    if data_dir.file_name().and_then(|n| n.to_str()) != Some(data_dir_name) {
         return Err(HelperJournalError::Invalid);
     }
     match fs::symlink_metadata(&path) {
@@ -1491,7 +1471,7 @@ pub(super) fn allows_quiescent_cleanup(
             let bytes = read_bounded_file(&path, &file, root_meta.uid())?;
             let record: HelperJournalRecord =
                 serde_json::from_slice(&bytes).map_err(|_| HelperJournalError::Invalid)?;
-            let _ = validate_record(&record, instance_id, &data_dir_name)?;
+            let _ = validate_record(&record, instance_id, data_dir_name)?;
             if record.phase != HelperJournalPhase::HelpersComplete {
                 return Err(HelperJournalError::RecoveryRequired);
             }

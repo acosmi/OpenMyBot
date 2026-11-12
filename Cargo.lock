@@ -4875,6 +4875,8 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots",
+ "wrok-bot-macos-local-auth",
+ "wrok-bot-macos-process",
  "zeroize",
 ]
 
@@ -4910,6 +4912,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-tungstenite",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",

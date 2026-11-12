@@ -9,6 +9,11 @@ use tokio_postgres::{Transaction, error::SqlState};
 
 use crate::db::{InfraError, RowDecodeError, native};
 
+/// 32 times the JSON length, the factor capture_materials applies to catalog
+/// JSON: the row copy, parsed trees and canonical copies of each observed text.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) const JSON_MEMORY_FACTOR: u64 = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OpenOrClosed {
     Open,
@@ -29,6 +34,53 @@ impl<'t, 'c> CurrentWriterSchema<'t, 'c> {
     pub(crate) async fn observe(tx: &'t Transaction<'c>) -> Result<Self, InfraError> {
         verify_current_in_transaction(tx).await?;
         Ok(Self { tx })
+    }
+
+    /// Every registered schema oracle tree a candidate observation borrows,
+    /// each parsed once per process. A restore operation pays them once, when
+    /// its candidate is bound.
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    pub(crate) const ORACLE_BYTES: u64 = JSON_MEMORY_FACTOR
+        * (crate::db::thread_origin_schema::ORACLE_BYTES
+            + crate::db::thread_history_writer_schema::ORACLE_BYTES
+            + crate::db::restore_reconfirmation_schema::ORACLE_BYTES
+            + crate::db::custom_model_catalog_schema::ORACLE_BYTES
+            + crate::db::custom_model_v2_schema::ORACLE_BYTES
+            + crate::db::gateway_authorization_schema::ORACLE_BYTES
+            + crate::automation::schema::ORACLE_BYTES);
+
+    /// Bytes [`Self::observe`] allocates on this transaction: the ledger rows
+    /// plus the origin, writer, automation and restore payloads, each observed once, every
+    /// payload charged for its copies, parsed trees and canonical forms. The
+    /// oracle trees are already paid ([`Self::ORACLE_BYTES`]).
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    pub(crate) async fn observation_bytes(tx: &'t Transaction<'c>) -> Result<u64, InfraError> {
+        let ledger: i64 = tx
+            .query_one(
+                "SELECT coalesce(sum(octet_length(name)+octet_length(checksum)),0)::bigint FROM openbot_internal.schema_migrations",
+                &[],
+            )
+            .await
+            .map_err(|source| InfraError::query("measure native ledger observation", source))?
+            .try_get(0)
+            .map_err(|source| RowDecodeError::column("(schema_migrations)", "bytes", source))?;
+        let origin = crate::db::thread_origin_schema::observation_bytes_in_transaction(tx).await?;
+        let writer =
+            crate::db::thread_history_writer_schema::observation_bytes_in_transaction(tx).await?;
+        let automation = crate::automation::schema::observation_bytes_in_transaction(tx).await?;
+        let restore =
+            crate::db::restore_reconfirmation_schema::observation_bytes_in_transaction(tx).await?;
+        u64::try_from(ledger)
+            .ok()
+            .and_then(|ledger| {
+                origin
+                    .checked_add(writer)?
+                    .checked_add(automation)?
+                    .checked_add(restore)?
+                    .checked_mul(JSON_MEMORY_FACTOR)?
+                    .checked_add(ledger)
+            })
+            .ok_or_else(|| InfraError::repository_invariant("thread_history_writer_schema_bytes"))
     }
 
     /// The original transaction this proof was observed on.

@@ -3,6 +3,8 @@
 #![cfg(feature = "server-runtime")]
 
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 
 use async_trait::async_trait;
 use openbot_application::AgentContextSource;
@@ -649,6 +651,11 @@ fn directory(
         config.clone(),
         PROCESS.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(|e| e.to_string())
 }
@@ -764,6 +771,11 @@ async fn settle(p: &pool::DatabasePool, run: &str) -> TestResult {
         PROCESS.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(|e| e.to_string())?;
     let claim = runtime
@@ -1106,7 +1118,7 @@ async fn o04_v2_origin_preserves_original_dataset_consumer() {
                 let snapshot_count:i64=c.query_one("SELECT count(*) FROM openbot_internal.run_model_selection_v2_snapshots WHERE run_id=$1",&[&req.command.run_id.as_str()]).await.map_err(|e|e.to_string())?.try_get(0).map_err(|e|e.to_string())?;
                 require(snapshot_count==1,"actual original V2 snapshot absent")?;
             }
-            let runtime=PostgresRunRuntime::new(p.clone(),PROCESS.into(),DEFAULT_THREAD_LEASE_DURATION,DEFAULT_DISPATCH_CLAIM_DURATION).map_err(|e|e.to_string())?;
+            let runtime=PostgresRunRuntime::new(p.clone(),PROCESS.into(),DEFAULT_THREAD_LEASE_DURATION,DEFAULT_DISPATCH_CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e|e.to_string())?;
             let claim=runtime.claim_dispatch().await.map_err(|e|e.to_string())?.ok_or("actual V2 dispatch absent")?;
             let lease=runtime.acknowledge_dispatch(&claim).await.map_err(|e|e.to_string())?;
             require(lease.run_id().as_str()==req.command.run_id.as_str(),"V2 claim/ack reached another Run")?;
@@ -1118,7 +1130,7 @@ async fn o04_v2_origin_preserves_original_dataset_consumer() {
             runtime.finish_run(&lease,lease.next_event_sequence(),RunTerminal::Completed).await.map_err(|e|e.to_string())?;
             let before=counts(&f.pool).await?;
             let other_pool=pool::connect(&f.config).await.map_err(|e|e.to_string())?;
-            let mismatch=PostgresThreadDirectory::with_runtime(other_pool.clone(),config.clone(),PROCESS.into(),DEFAULT_THREAD_LEASE_DURATION).map_err(|e|e.to_string())?.with_model_dataset_binding(f.binding.clone());
+            let mismatch=PostgresThreadDirectory::with_runtime(other_pool.clone(),config.clone(),PROCESS.into(),DEFAULT_THREAD_LEASE_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&other_pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(|e|e.to_string())?.with_model_dataset_binding(f.binding.clone());
             require(mismatch.is_err(),"different original Pool accepted original binding")?;
             close_pool(other_pool).await?;
             require(counts(&p).await?==before,"pool mismatch added business/origin")?;
@@ -1153,7 +1165,7 @@ async fn o06_later_member_and_v1_to_v2_keep_original_creator() {
             f.directory.begin_thread_run(later.clone()).await.map_err(|e|e.to_string())?;
             settle(&p,later.command.run_id.as_str()).await?;
             let b_auth=current_owned_auth(&p,"origin-b").await?;
-            let model=f.models.create(&b_auth,&CreateModelConnection{name:"Owned later B".into(),protocol:CustomModelProtocol::OpenaiChatCompletions,endpoint:"https://owned-origin.example.test/v1".into(),model:"owned-later-model".into(),enabled:true,api_key:ModelApiKey::new(Zeroizing::new("OWNED_ORIGIN_LATER_B_KEY".into())).map_err(|e|e.to_string())?}).await.map_err(|e|e.to_string())?;
+            let model=f.models.create(&recovery_admission::outside_domain(b_auth.clone()),&CreateModelConnection{name:"Owned later B".into(),protocol:CustomModelProtocol::OpenaiChatCompletions,endpoint:"https://owned-origin.example.test/v1".into(),model:"owned-later-model".into(),enabled:true,api_key:ModelApiKey::new(Zeroizing::new("OWNED_ORIGIN_LATER_B_KEY".into())).map_err(|e|e.to_string())?}).await.map_err(|e|e.to_string())?;
             let mut v2=f.request(603,false,&model);v2.actor=ActorId::new("origin-b");v2.command.thread_id=first.command.thread_id.clone();
             f.directory.begin_thread_run_v2(v2.clone()).await.map_err(|e|e.to_string())?;
             require(f.directory.begin_thread_run_v2(v2.clone()).await.map_err(|e|e.to_string())?.replayed,"exact later B V2 did not replay")?;
@@ -1218,6 +1230,12 @@ impl ModelFixture {
         let policy_store = PolicyStore::postgres(p.clone(), None);
         policy_store.load().await.unwrap();
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &p,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: p.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -1259,6 +1277,11 @@ impl ModelFixture {
             config.clone(),
             PROCESS.into(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &p,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(binding.clone())
@@ -1284,7 +1307,8 @@ impl ModelFixture {
     async fn model(&self, protocol: CustomModelProtocol) -> ModelConnection {
         self.models
             .create(
-                &auth(),
+                // Creation needs a request binding outside every recovery domain.
+                &recovery_admission::outside_domain(auth()),
                 &CreateModelConnection {
                     name: "Owned choice".into(),
                     protocol,

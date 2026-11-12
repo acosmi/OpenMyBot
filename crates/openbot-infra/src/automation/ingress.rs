@@ -18,6 +18,13 @@ impl AutomationDeliveries for PostgresAutomations {
         receiver: &AutomationReceiverId,
         presented: &SecretBytes,
     ) -> Result<AutomationRevision, AppError> {
+        // The 5 s SQL precedent of the other standalone credential resolutions.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| unavailable())?;
         let client = self.pool.get().await.map_err(|_| unavailable())?;
         // Revoked receivers, revoked key rows (including an administrator revocation) and
         // unknown receivers are indistinguishable to the sender.
@@ -29,10 +36,33 @@ impl AutomationDeliveries for PostgresAutomations {
             WHERE r.deployment_id=$1 AND r.tenant_id=$2 AND r.receiver_id=$3 AND r.revoked_at IS NULL",
             &[&self.deployment.as_str(),&self.tenant.as_str(),&receiver.as_str()]).await.map_err(|_|unavailable())?
             .ok_or(AppError::AutomationSourceUnauthorized)?;
+        let credential = column::<Uuid>(&row, "credential")?;
+        // A restored key stays closed until its credential requirement has a receipt
+        // (spec revision R485 ¶1467): the sender sees the same refusal as a revoked key.
+        crate::restore_reconfirmation::require_confirmed_before(
+            &**client,
+            crate::restore_reconfirmation::RequirementSource {
+                cohort: admission.restore_cohort(),
+                kind: crate::restore_reconfirmation::RequirementKind::Credential,
+                source_ref: &credential.to_string(),
+            },
+            deadline,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+                AppError::AutomationSourceUnauthorized
+            }
+            _ => unavailable(),
+        })?;
+        drop(client);
+        admission
+            .verify_current_before(deadline)
+            .map_err(|_| unavailable())?;
         let stored_key = self
             .vault
             .open(
-                &column::<Uuid>(&row, "credential")?,
+                &credential,
                 SecretKind::Agent,
                 SecretPrincipal::Actor(ActorId::new(column::<String>(&row, "owner_id")?)),
                 SecretPrincipal::Service(ServiceId::new(format!(
@@ -243,5 +273,90 @@ mod tests {
                 .count(),
             20
         );
+    }
+}
+
+/// A restored receiver key is a `credential` requirement of the cohort: before
+/// its receipt the sender is refused as unauthorized without a Vault-open;
+/// after one receipt the same key opens once and authenticates.
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod restore_gate {
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use openbot_application::automation::AutomationDeliveries as _;
+    use openbot_contracts::{
+        automation::AutomationReceiverId,
+        error::AppError,
+        ids::{ActorId, DeploymentId, TenantId},
+    };
+    use openbot_domain::vault::{
+        KeyVersion, SecretBytes, SecretKind, SecretPrincipal, ServiceId, WrappingKey,
+    };
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_32_unconfirmed_receiver_key_opens_no_vault() {
+        let vault = crate::vault::CredentialRecordVault::single_key(
+            TenantId::new("ten"),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x56; 32]).unwrap(),
+        );
+        let credential = uuid::Uuid::now_v7();
+        let sealed = vault
+            .seal(
+                &credential,
+                SecretKind::Agent,
+                SecretPrincipal::Actor(ActorId::new("owner")),
+                SecretPrincipal::Service(ServiceId::new("automation_receiver:receiver-r")),
+                &SecretBytes::new(b"restored-sender-key".to_vec()),
+            )
+            .unwrap();
+        let seed = format!(
+            "INSERT INTO public.users(id,email,auth_generation) VALUES('owner','owner@restored.example.test',0);
+             INSERT INTO public.threads(thread_id,tenant_id,deployment_id,created_by,anchor_kind,anchor_id,status) VALUES('automation-thread','ten','dep','owner','direct_bot','bot-1','active');
+             INSERT INTO openbot_internal.automation_definitions(automation_id,deployment_id,tenant_id,owner_id,bot_id,thread_id,current_revision,state)
+               VALUES('automation-r','dep','ten','owner','bot-1','automation-thread',1,'enabled');
+             INSERT INTO openbot_internal.automation_definition_revisions(deployment_id,tenant_id,automation_id,revision,config_snapshot)
+               VALUES('dep','ten','automation-r',1,'{{}}');
+             INSERT INTO public.credentials(id,kind,provider,encrypted_value,key_id,metadata) VALUES('{credential}','agent','automation_receiver','{sealed}','receiver-r','{{}}');
+             INSERT INTO openbot_internal.automation_receivers(receiver_id,deployment_id,tenant_id,automation_id,adapter,source_principal,event_filter,current_key_revision,vault_record_ref)
+               VALUES('receiver-r','dep','ten','automation-r','sender_key','{{\"kind\":\"sender_key\",\"receiverId\":\"receiver-r\"}}','{{\"eventTypes\":[\"push\"],\"matches\":[]}}',1,'{credential}');"
+        );
+        let restored = RestoreCurrentFixture::publish(&seed, async |_| {}).await;
+        let automations = super::PostgresAutomations::new(
+            restored.pool.clone(),
+            DeploymentId::new("dep"),
+            TenantId::new("ten"),
+            SecretBytes::new(vec![0x51; 32]),
+            vault.clone(),
+            restored.read_gate(),
+        )
+        .unwrap();
+        let receiver = AutomationReceiverId::try_from("receiver-r".to_owned()).unwrap();
+        let key = SecretBytes::new(b"restored-sender-key".to_vec());
+
+        let opens = vault.open_calls();
+        assert_eq!(
+            automations.authenticate(&receiver, &key).await.err(),
+            Some(AppError::AutomationSourceUnauthorized)
+        );
+        assert_eq!(vault.open_calls(), opens, "an unconfirmed key was opened");
+
+        let row = restored.pool.get().await.unwrap().query_one(
+            "SELECT requirement_id,owner_id FROM openbot_internal.restore_reconfirm_requirements
+             WHERE source_kind='credential' AND source_ref=$1 AND owner_kind='service'",
+            &[&credential.to_string()],
+        ).await.unwrap();
+        restored
+            .confirm(row.get(0), row.get(1), "fresh_service_operator")
+            .await;
+        assert_eq!(
+            automations
+                .authenticate(&receiver, &key)
+                .await
+                .unwrap()
+                .get(),
+            1
+        );
+        assert_eq!(vault.open_calls(), opens + 1);
     }
 }

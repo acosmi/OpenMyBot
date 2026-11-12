@@ -293,9 +293,15 @@ impl ModelDatasetFacts {
 
 // A controlled physical replacement is a refusal fault, never a restore capability.
 // The tests keep the real original Desktop owner, registry and manager across the fault.
+// The integration tests' outside-domain request binding: model writes
+// borrow a Normal admission with no restore cohort.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+use crate::recovery_admission;
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod physical_lineage_tests {
     use super::PostgresModelDatasetBinding;
+    use super::recovery_admission;
     use crate::artifact_registry::{
         ArtifactDatasetRegistry, ArtifactRegistryError, verify_artifact_registry_schema,
     };
@@ -804,7 +810,7 @@ mod physical_lineage_tests {
             .unwrap();
             let model = models
                 .create(
-                    &auth,
+                    &recovery_admission::outside_domain(auth.clone()),
                     &CreateModelConnection {
                         name: "Owned physical lineage choice".into(),
                         protocol: CustomModelProtocol::OpenaiChatCompletions,
@@ -825,6 +831,11 @@ mod physical_lineage_tests {
                 cluster.config(APP_DATABASE),
                 "owned-original-lineage-runtime".into(),
                 time::Duration::seconds(30),
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &database.clone_pool(),
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .unwrap()
             .with_model_dataset_binding(binding.clone())
@@ -1252,6 +1263,81 @@ mod physical_lineage_tests {
                      DROP CONSTRAINT {constraint}; \
                      ALTER TABLE openbot_internal.run_model_selection_v2_snapshots \
                      ADD CONSTRAINT {constraint} CHECK ({predicate});"
+                ))
+                .await
+                .unwrap();
+        }
+        // Replay the original named BETWEEN CHECKs from the migration text.
+        // The memory authorization CHECK also needs its original implicit numeric
+        // cast: pg_dump emits an explicit cast, changing the writer oracle's AST.
+        for schema in [
+            include_str!("../sql/native_0037.sql"),
+            include_str!("../sql/native_0048.sql"),
+            include_str!("../sql/native_0049.sql"),
+            include_str!("../sql/native_0050.sql"),
+            include_str!("../sql/native_0051.sql"),
+            include_str!("../sql/native_0052.sql"),
+            include_str!("../sql/native_0055.sql"),
+        ] {
+            for (at, _) in schema.match_indices("CONSTRAINT ") {
+                let (constraint, rest) = schema[at + "CONSTRAINT ".len()..]
+                    .split_once(char::is_whitespace)
+                    .unwrap();
+                let Some(rest) = rest.trim_start().strip_prefix("CHECK") else {
+                    continue;
+                };
+                let rest = rest.trim_start().strip_prefix('(').unwrap();
+                let (mut depth, mut quoted, mut end) = (1, false, 0);
+                for (index, byte) in rest.bytes().enumerate() {
+                    match byte {
+                        b'\'' => quoted = !quoted,
+                        b'(' if !quoted => depth += 1,
+                        b')' if !quoted => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        end = index;
+                        break;
+                    }
+                }
+                let predicate = &rest[..end];
+                if !predicate.contains("BETWEEN")
+                    && constraint != "memories_source_authorization_shape"
+                {
+                    continue;
+                }
+                let head = &schema[..at];
+                let statement = head
+                    .rfind("CREATE TABLE ")
+                    .max(head.rfind("ALTER TABLE "))
+                    .unwrap();
+                let table = head[statement..].split_whitespace().nth(2).unwrap();
+                transaction
+                    .batch_execute(&format!(
+                        "ALTER TABLE {table} DROP CONSTRAINT {constraint}; \
+                         ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({predicate});"
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        // Native 55 also has three unnamed column CHECKs. Recover their original
+        // predicates from the SQL so this physical replacement keeps the catalog oracle.
+        let restore_schema = include_str!("../sql/native_0055.sql");
+        for column in ["deployment_id", "tenant_id", "encrypted_canary"] {
+            let anchor = format!("    {column} text NOT NULL CHECK (");
+            let predicate = restore_schema
+                .split_once(anchor.as_str())
+                .unwrap()
+                .1
+                .split_once("),")
+                .unwrap()
+                .0;
+            let constraint = format!("server_kek_canaries_{column}_check");
+            transaction
+                .batch_execute(&format!(
+                    "ALTER TABLE openbot_internal.server_kek_canaries DROP CONSTRAINT {constraint}; \
+                     ALTER TABLE openbot_internal.server_kek_canaries ADD CONSTRAINT {constraint} CHECK ({predicate});"
                 ))
                 .await
                 .unwrap();

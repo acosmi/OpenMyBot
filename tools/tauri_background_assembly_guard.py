@@ -302,6 +302,22 @@ def _simple_aliases(
                         aliases[tokens[inner]] = aliases[outer]
                     else:
                         aliases.pop(tokens[inner], None)
+        if token == "match" and tokens[index + 2:index + 3] == ["{"]:
+            outer = tokens[index + 1]
+            if outer not in aliases:
+                continue
+            close = _paired(tokens, index + 2, "{", "}")
+            for some_at in _find_all(tokens[index + 3:close], ("Some", "(")):
+                some_at += index + 3
+                pattern_close = _paired(tokens, some_at + 1, "(", ")")
+                pattern = tokens[some_at + 2:pattern_close]
+                if pattern[:1] == ["mut"]:
+                    pattern = pattern[1:]
+                if (
+                    len(pattern) == 1 and pattern[0].isidentifier()
+                    and tokens[pattern_close + 1:pattern_close + 2] == ["=>"]
+                ):
+                    aliases[pattern[0]] = aliases[outer]
     return aliases
 
 
@@ -416,10 +432,6 @@ def _check_database_arms(arm_tokens: list[str]) -> None:
                 ")",
                 ".",
                 "await",
-                ".",
-                "is_ok",
-                "(",
-                ")",
             ]
             if expression != expected:
                 raise GuardError("database Some branch no longer returns its shutdown result")
@@ -427,7 +439,11 @@ def _check_database_arms(arm_tokens: list[str]) -> None:
             if none_seen:
                 raise GuardError("database owner match duplicated its None branch")
             none_seen = True
-            if expression != ["false"]:
+            if expression != _tokens("""Err((
+                DesktopLocalCompositionError::SidecarShutdown,
+                Err(crate::postgres_sidecar::SidecarOutcome::Unknown),
+                crate::desktop_local_bootstrap::SqlDriverOutcome::Unknown,
+            ))"""):
                 raise GuardError("database None branch must remain a failed shutdown stage")
         else:
             raise GuardError("database owner match pattern drift")
@@ -445,12 +461,25 @@ class HelperShape:
 def _check_helper(tokens: list[str]) -> HelperShape:
     function_at = _unique(
         tokens,
-        ("async", "fn", "finish_shutdown_stages", "("),
+        ("async", "fn", "finish_shutdown_stages", "<"),
         "finish_shutdown_stages helper",
     )
-    parameters_open = function_at + 3
+    parameters_open = tokens.index("(", function_at + 3)
+    if tokens[function_at + 3:parameters_open] != ["<", "N", ",", "D", ",", "E", ">"]:
+        raise GuardError("finish_shutdown_stages original-result type parameters drift")
     parameters_close = _paired(tokens, parameters_open, "(", ")")
-    parameters = _split_arguments(tokens[parameters_open + 1:parameters_close])
+    parameters = []
+    start, depth = parameters_open + 1, 0
+    for index in range(start, parameters_close):
+        if tokens[index] == "<":
+            depth += 1
+        elif tokens[index] == ">":
+            depth -= 1
+        elif tokens[index] == "," and depth == 0:
+            parameters.append(tokens[start:index])
+            start = index + 1
+    if start < parameters_close:
+        parameters.append(tokens[start:parameters_close])
     if len(parameters) != 3:
         raise GuardError("finish_shutdown_stages must retain three bounded stage parameters")
     names = []
@@ -458,6 +487,13 @@ def _check_helper(tokens: list[str]) -> HelperShape:
         if ":" not in parameter:
             raise GuardError("finish_shutdown_stages parameter shape drift")
         names.append(parameter[0])
+    expected_types = [
+        _tokens("impl Future<Output = (bool, N)>"),
+        _tokens("impl Future<Output = Result<D, E>>"),
+        ["Duration"],
+    ]
+    if [parameter[2:] for parameter in parameters] != expected_types:
+        raise GuardError("finish_shutdown_stages must preserve the original stage outputs")
     shape = HelperShape(*names)
     try:
         body_open = tokens.index("{", parameters_close + 1)
@@ -494,20 +530,37 @@ def _check_helper(tokens: list[str]) -> HelperShape:
         raise GuardError("non-database timeout must retain its closed result match")
     match_close = _paired(body, match_open, "{", "}")
     arms = _match_arms(body[match_open + 1:match_close])
-    expected_arms = {
-        ("Ok", "(", "true", ")"): "true",
-        ("Ok", "(", "false", ")"): "false",
-        ("Err", "(", "_", ")"): "false",
-    }
-    observed_arms: dict[tuple[str, ...], str] = {}
+    observed_arms = set()
     for pattern, arm_body in arms:
         if not arm_body:
             raise GuardError("non-database timeout match arm shape drift")
-        terminal = arm_body[-1]
-        if pattern in observed_arms:
+        terminal_at = max((i + 1 for i, token in enumerate(arm_body) if token == ";"), default=0)
+        terminal = _split_arguments(_strip_parentheses(arm_body[terminal_at:]))
+        if (
+            len(pattern) == 8
+            and pattern[:3] == ("Ok", "(", "(")
+            and pattern[4] == ","
+            and pattern[6:] == (")", ")")
+            and pattern[3].isidentifier()
+            and pattern[5].isidentifier()
+        ):
+            succeeded, original = pattern[3], pattern[5]
+            if terminal != [[succeeded], ["Some", "(", original, ")"]] or any(
+                _origin(arm_body, name, terminal_at) != (name, None)
+                for name in (succeeded, original)
+            ):
+                raise GuardError("non-database timeout no longer preserves its result and observation")
+            kind = "Ok"
+        elif pattern == ("Err", "(", "_", ")"):
+            if terminal != [["false"], ["None"]]:
+                raise GuardError("non-database timeout error was projected as success or an observation")
+            kind = "Err"
+        else:
+            raise GuardError("non-database timeout match arm shape drift")
+        if kind in observed_arms:
             raise GuardError("duplicate non-database timeout match arm")
-        observed_arms[pattern] = terminal
-    if observed_arms != expected_arms:
+        observed_arms.add(kind)
+    if observed_arms != {"Ok", "Err"}:
         raise GuardError("non-database timeout success/failure projection drift")
 
     database_awaits = [
@@ -530,20 +583,25 @@ def _check_helper(tokens: list[str]) -> HelperShape:
     ):
         raise GuardError("an early exit can skip the independent database shutdown stage")
 
-    non_database_result = None
-    for index in range(timeout_at - 1, -1, -1):
-        if body[index] == "let" and index + 3 < timeout_at and body[index + 1].isidentifier():
-            if "=" in body[index + 2:timeout_at]:
-                non_database_result = body[index + 1]
-                break
-    database_result = None
-    for index in range(database_await - 1, -1, -1):
-        if body[index] == "let" and index + 3 <= database_await and body[index + 1].isidentifier():
-            if "=" in body[index + 2:database_await]:
-                database_result = body[index + 1]
-                break
-    if non_database_result is None or database_result is None:
+    binding_at = max(index for index in range(timeout_at) if body[index] == "let")
+    if body[binding_at + 1] != "(":
+        raise GuardError("non-database result and original observation tuple is missing")
+    binding_close = _paired(body, binding_at + 1, "(", ")")
+    bindings = _split_arguments(body[binding_at + 2:binding_close])
+    if len(bindings) != 2 or any(len(part) != 1 or not part[0].isidentifier() for part in bindings):
+        raise GuardError("non-database result and original observation tuple drift")
+    non_database_result, original_result = (part[0] for part in bindings)
+    database_value = _binding(body, database_await)
+    if database_value is None:
         raise GuardError("shutdown stage result bindings are missing")
+    database_projection = _unique(
+        body, (database_value[0], ".", "is_ok", "(", ")"), "database result projection"
+    )
+    if _origin(body, database_value[0], database_projection) != database_value:
+        raise GuardError("database result was replaced before its success projection")
+    database_result = _binding(body, database_projection)
+    if database_result is None:
+        raise GuardError("database success result binding is missing")
 
     final_if = None
     depths = _brace_depths(body)
@@ -562,10 +620,10 @@ def _check_helper(tokens: list[str]) -> HelperShape:
     condition = body[final_if + 1:condition_open]
     condition = _strip_parentheses(condition)
     result_aliases = _value_aliases(
-        body[database_await + 2:final_if],
+        body[body.index(";", database_projection) + 1:final_if],
         {
             non_database_result: "non_database_result",
-            database_result: "database_result",
+            database_result[0]: "database_result",
         },
     )
     normalized_condition = [
@@ -595,13 +653,23 @@ def _check_helper(tokens: list[str]) -> HelperShape:
         ")",
     ]:
         raise GuardError("stage failure no longer returns DesktopLocalRuntimeError::Shutdown")
-    if failure_close != len(body) - 1:
-        raise GuardError("combined shutdown result is not the helper's final return expression")
+    outcome = _binding(body, final_if)
+    returned_at = failure_close + 2
+    returned = _split_arguments(_strip_parentheses(body[returned_at:]))
+    if (
+        outcome is None
+        or body[failure_close + 1:returned_at] != [";"]
+        or len(returned) != 3
+        or any(len(value) != 1 for value in returned)
+        or [_origin(body, value[0], returned_at) for value in returned]
+        != [outcome, (original_result, None), database_value]
+    ):
+        raise GuardError("helper must return its outcome and both original stage observations")
     return shape
 
 
 def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) -> None:
-    """Four concurrent stops; the stage result is the transport deadline result."""
+    """Four concurrent stops retain transport success and both original writer results."""
 
     join_at = _unique(
         non_database,
@@ -626,14 +694,14 @@ def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) 
 
     expected = {
         ("transport", "shutdown"),
-        ("agent_host", "stop"),
-        ("assembly", "shutdown"),
+        ("agent_host", "stop_for_capture"),
+        ("assembly", "stop_for_capture"),
         ("lifecycle", "wait_local_confirmation_stopped"),
     }
     observed: set[tuple[str, str]] = set()
     resource_arms: dict[tuple[str, str], int] = {}
     for arm_index, argument in enumerate(join_arguments):
-        for method in {"shutdown", "stop", "wait_local_confirmation_stopped"}:
+        for method in {"shutdown", "stop_for_capture", "wait_local_confirmation_stopped"}:
             for call_at, resource in _method_calls(argument, method, aliases, "owner"):
                 pair = (resource or "", method)
                 if pair in expected:
@@ -662,6 +730,28 @@ def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) 
                         raise GuardError(
                             f"concurrent stop future is not polled: {pair[0]}.{pair[1]}"
                         )
+                    if method == "stop_for_capture":
+                        result = _binding(argument, call_at)
+                        observed_at = _unique(
+                            argument, ("close_observed_ns", "(", ")"), "original stop observation"
+                        )
+                        observed_result = _binding(argument, observed_at)
+                        drop_at = _unique(
+                            argument, ("drop", "(", argument[call_at - 2], ")", ";"),
+                            "original stopped owner drop",
+                        )
+                        returned_at = _unique(argument, ("Some", "(", "("), "original stop results")
+                        returned_close = _paired(argument, returned_at + 2, "(", ")")
+                        returned = _split_arguments(argument[returned_at + 3:returned_close])
+                        if (
+                            result is None or observed_result is None
+                            or not call_close < observed_at < drop_at < returned_at
+                            or len(returned) != (3 if resource == "agent_host" else 2)
+                            or any(len(value) != 1 for value in returned[-2:])
+                            or [_origin(argument, value[0], returned_at) for value in returned[-2:]]
+                            != [result, observed_result]
+                        ):
+                            raise GuardError("stop results must retain the original observation after owner drop")
                     observed.add(pair)
                     resource_arms[pair] = arm_index
     if observed != expected:
@@ -697,7 +787,17 @@ def _check_non_database_stage(non_database: list[str], aliases: dict[str, str]) 
         default=0,
     )
     transport_value = [transport_result, ".", "within_deadline"]
-    final = _strip_parentheses(after_join[final_start:])
+    returned = _split_arguments(_strip_parentheses(after_join[final_start:]))
+    if len(returned) != 3:
+        raise GuardError("non-database stage must return transport and both original writer results")
+    for value, resource in zip(returned[1:], ("agent_host", "assembly")):
+        pattern = result_patterns[resource_arms[(resource, "stop_for_capture")]]
+        if (
+            len(pattern) != 1 or not pattern[0].isidentifier() or len(value) != 1
+            or _origin(after_join, value[0], final_start) != (pattern[0], None)
+        ):
+            raise GuardError("the original writer stop result was discarded or replaced")
+    final = _strip_parentheses(returned[0])
     used_at = final_start
     if len(final) == 1:
         origin, let_at = _origin(after_join, final[0], final_start)
@@ -740,6 +840,15 @@ def _without_capture_branch(run: list[str]) -> list[str]:
     )
     if len(_find_all(branch, entry)) != 1 or branch[-2:] != ["return", ";"]:
         raise GuardError("armed capture branch no longer owns the job through one capture entry")
+    receipt_at = _unique(branch, ("close_local_recovery", "("), "capture recovery receipt")
+    receipt_close = _paired(branch, receipt_at + 1, "(", ")")
+    finish_at = _unique(branch, ("job", ".", "completion", ".", "finish", "("), "capture completion")
+    if (
+        not _find_all(branch, entry)[0] < receipt_at < finish_at
+        or _brace_depths(branch)[receipt_at] != 0
+        or branch[receipt_close + 1:receipt_close + 3] != [".", "await"]
+    ):
+        raise GuardError("capture receipt must follow completed capture and precede completion")
     return run[close + 1:]
 
 
@@ -907,7 +1016,7 @@ def _check_owner_closing(tokens: list[str]) -> None:
     if run[let_at + 1] != "(" or not run[let_at + 2].isidentifier() or run[let_at + 3] != ",":
         raise GuardError("non-database timeout result is not retained")
     timeout_result = run[let_at + 2]
-    match_at = _unique(run, ("match", timeout_result, "{"), "non-database timeout match")
+    match_at = _unique(run, ("match", "&", timeout_result, "{"), "non-database timeout match")
     if depths[match_at] != 0:
         raise GuardError("non-database timeout projection left the top-level scope")
     if any(
@@ -916,15 +1025,15 @@ def _check_owner_closing(tokens: list[str]) -> None:
         for index in range(let_at + 1, match_at)
     ):
         raise GuardError("non-database timeout result is rebound before its projection")
-    match_close = _paired(run, match_at + 2, "{", "}")
+    match_close = _paired(run, match_at + 3, "{", "}")
     observed_arms: dict[tuple[str, ...], str] = {}
-    for pattern, arm_body in _match_arms(run[match_at + 3:match_close]):
+    for pattern, arm_body in _match_arms(run[match_at + 4:match_close]):
         if not arm_body or pattern in observed_arms:
             raise GuardError("non-database timeout match arm shape drift")
         observed_arms[pattern] = arm_body[-1]
     if observed_arms != {
-        ("Ok", "(", "true", ")"): "true",
-        ("Ok", "(", "false", ")"): "false",
+        ("Ok", "(", "(", "true", ",", "..", ")", ")"): "true",
+        ("Ok", "(", "(", "false", ",", "..", ")", ")"): "false",
         ("Err", "(", "_", ")"): "false",
     }:
         raise GuardError("non-database timeout success/failure projection drift")
@@ -955,9 +1064,52 @@ def _check_owner_closing(tokens: list[str]) -> None:
     database_open = run.index("{", database_at + 1)
     database_close = _paired(run, database_open, "{", "}")
     _check_database_arms(run[database_open + 1:database_close])
-    database_ok = _binding(run, database_at)
+    database_result = _binding(run, database_at)
+    if database_result is None:
+        raise GuardError("the original database shutdown result is not retained")
+    database_projection = _unique(
+        run, (database_result[0], ".", "is_ok", "(", ")"), "database success projection"
+    )
+    if (
+        depths[database_projection] != 0
+        or _origin(run, database_result[0], database_projection) != database_result
+    ):
+        raise GuardError("database success no longer comes from its original shutdown result")
+    database_ok = _binding(run, database_projection)
 
     finish_at = _unique(run, ("completion", ".", "finish", "("), "shutdown completion")
+    receipt_scope = _unique(
+        run, (*_tokens('#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]'), "{"),
+        "ordinary recovery receipt scope",
+    )
+    receipt_open = run.index("{", receipt_scope)
+    receipt_end = _paired(run, receipt_open, "{", "}")
+    receipt_at = _unique(run, ("close_local_recovery", "("), "ordinary recovery receipt")
+    receipt_close = _paired(run, receipt_at + 1, "(", ")")
+    receipt_arguments = _split_arguments(run[receipt_at + 2:receipt_close])
+    if (
+        not database_close < receipt_open < receipt_at < receipt_end < finish_at
+        or depths[receipt_at] != 1
+        or run[receipt_close + 1:receipt_close + 3] != [".", "await"]
+        or len(receipt_arguments) != 5
+        or receipt_arguments[0] != ["&", "mut", "owner", ".", "recovery_runtime"]
+        or len(receipt_arguments[4]) != 1
+        or _origin(run, receipt_arguments[4][0], receipt_at) != ("deadline", None)
+    ):
+        raise GuardError("recovery receipt must follow database shutdown before completion on the original deadline")
+    original_at = _unique(
+        run[receipt_open:receipt_end], ("match", database_result[0], "{"),
+        "original database result for recovery receipt",
+    ) + receipt_open
+    if _origin(run, database_result[0], original_at) != database_result:
+        raise GuardError("recovery receipt no longer consumes the original database shutdown result")
+    receipt_helper = _block_after(
+        tokens, ("async", "fn", "close_local_recovery", "("), "Local recovery receipt helper"
+    )
+    close_at = _unique(receipt_helper, ("close_before", "("), "runtime close_before")
+    close_end = _paired(receipt_helper, close_at + 1, "(", ")")
+    if receipt_helper[close_end + 1:close_end + 3] != [".", "await"]:
+        raise GuardError("the runtime close receipt must be awaited")
     finish = _call_arguments(run, ("completion", ".", "finish", "("), "shutdown completion")
     terms = _conjunction(finish[0]) if len(finish) == 1 else None
     if terms is None or not {("startup_ok", None), non_database_ok, database_ok} <= {

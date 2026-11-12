@@ -240,8 +240,8 @@ async fn matrix(protocol: Protocol) {
             ).await.map_err(text)?;
             drop(db);
             seed_session(&pool,"writer-session","writer",WRITER_TOKEN).await?;
-            let directory = PostgresThreadDirectory::with_runtime(pool.clone(), config.clone().with_application_name("audit-realtime-listener"), "realtime-writer".into(), DEFAULT_THREAD_LEASE_DURATION).map_err(text)?;
-            let runtime = PostgresRunRuntime::new(pool.clone(), "realtime-writer".into(), DEFAULT_THREAD_LEASE_DURATION, DEFAULT_DISPATCH_CLAIM_DURATION).map_err(text)?;
+            let directory = PostgresThreadDirectory::with_runtime(pool.clone(), config.clone().with_application_name("audit-realtime-listener"), "realtime-writer".into(), DEFAULT_THREAD_LEASE_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(text)?;
+            let runtime = PostgresRunRuntime::new(pool.clone(), "realtime-writer".into(), DEFAULT_THREAD_LEASE_DURATION, DEFAULT_DISPATCH_CLAIM_DURATION, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).map_err(text)?;
             let resolver = Arc::new(PostgresSessionAuthResolver::new(pool.clone(),KEY,default_session_lifetime(),DeploymentId::new("dep"),TenantId::new("tenant")).map_err(text)?);
             let people = PostgresPeopleAdministration::new(pool.clone(),None,b"realtime-audit-key".to_vec()).map_err(text)?;
             let app = Arc::new(OpenBotApplication::new(ChannelRepo::new(pool.clone())).with_threads(directory.clone()));

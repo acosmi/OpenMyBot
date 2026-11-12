@@ -14,7 +14,7 @@ grep -Fq 'security-framework-sys = "=2.17.0"' Cargo.toml || fail "security-frame
 grep -Fq '"Win32_Security_Credentials"' Cargo.toml || fail "Credential Manager windows-sys feature missing"
 grep -Fq 'openbot-infra = { path = "crates/openbot-infra", default-features = false }' Cargo.toml || fail "workspace infra defaults must stay disabled"
 grep -Fq 'default = ["server-sso"]' crates/openbot-infra/Cargo.toml || fail "infra Server SSO default drift"
-grep -Fq 'desktop-local = []' crates/openbot-infra/Cargo.toml || fail "infra Desktop Local feature missing"
+grep -Fq 'desktop-local = ["dep:wrok-bot-macos-local-auth"]' crates/openbot-infra/Cargo.toml || fail "infra Desktop Local feature drift"
 grep -Fq 'desktop-local-vault = ["desktop-local"]' crates/openbot-infra/Cargo.toml || fail "infra Desktop Vault feature missing"
 grep -Fq 'server-runtime = [' crates/openbot-infra/Cargo.toml || fail "infra Server runtime feature missing"
 grep -Fq '    "dep:rustls",' crates/openbot-infra/Cargo.toml || fail "infra Server TLS feature missing rustls"

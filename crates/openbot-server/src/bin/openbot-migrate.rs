@@ -65,6 +65,16 @@ async fn main() -> ExitCode {
             Err(failure) => fail(failure.code, failure.exit),
         };
     }
+    if arguments.len() == 1 && arguments[0] == "migrate-schema" {
+        return match connect_migration_database().await {
+            Ok(pool) => {
+                pool.close();
+                println!(r#"{{"code":"migration_completed"}}"#);
+                ExitCode::SUCCESS
+            }
+            Err(failure) => fail(failure.code, failure.exit),
+        };
+    }
     if arguments.len() == 1 && arguments[0] == "preflight-audit-retention" {
         return run_audit_preflight();
     }

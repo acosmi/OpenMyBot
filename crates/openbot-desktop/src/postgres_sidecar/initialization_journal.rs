@@ -284,7 +284,7 @@ fn journal_identity<'a>(
         .path
         .parent()
         .ok_or(ScramJournalError::DispositionInvalid)?;
-    let expected_data_dir = root.join(format!("postgresql-17-{}", owner.instance_id));
+    let expected_data_dir = root.join(&*owner.data_dir_name);
     if disposition.data_dir() != expected_data_dir {
         return Err(ScramJournalError::DispositionInvalid);
     }

@@ -211,6 +211,7 @@ pub(crate) struct DesktopAgentHostInput {
     pub(crate) provider: DesktopOpenAiProviderInput,
     pub(crate) remote_transport: Arc<SafeRemoteAguiTransport>,
     pub(crate) budgets: DesktopAgentBudgets,
+    pub(crate) recovery_gate: openbot_infra::recovery_control::RecoveryReadGate,
 }
 
 pub(crate) struct DesktopAgentHost {
@@ -225,8 +226,9 @@ pub(crate) enum DesktopAgentStopFailure {
 }
 
 impl DesktopAgentHost {
-    pub(crate) async fn stop(mut self) {
-        let _ = self.stop_for_capture().await;
+    /// Whether this host actually constructed an agent worker.
+    pub(crate) fn agent_started(&self) -> bool {
+        self.agent.is_some()
     }
 
     /// Both original stop futures are polled. The outer capture owner retains this host and
@@ -266,6 +268,7 @@ pub(crate) fn start_desktop_agent_host(
         provider,
         remote_transport,
         budgets,
+        recovery_gate,
     } = input;
     let required = package.package.agents.iter().any(|agent| {
         matches!(
@@ -343,6 +346,7 @@ pub(crate) fn start_desktop_agent_host(
                 SafeHttpBudget::new(PROVIDER_RESPONSE_MAX_BYTES, PROVIDER_CONNECT_TIMEOUT)
                     .map_err(|_| DesktopAgentRuntimeError::Configuration)?,
                 budgets.stall_timeout,
+                recovery_gate,
             )
             .map_err(|_| DesktopAgentRuntimeError::Assembly)?
             .with_model_dataset_binding(Arc::clone(&model_dataset_binding))

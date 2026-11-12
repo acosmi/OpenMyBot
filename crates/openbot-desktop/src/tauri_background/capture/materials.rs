@@ -126,7 +126,7 @@ pub(crate) struct NormalCaptureMaterials {
     snapshot_joined: Option<OriginalSnapshotJoin>,
     snapshot_parts: Option<OriginalSnapshotParts>,
     transport: Option<crate::transport::RetainedTransportClosing>,
-    writer_facts: Option<StoppedNormalWriters>,
+    pub(super) writer_facts: Option<StoppedNormalWriters>,
     files: Vec<CaptureOwnedMaterialFile>,
     // Obtained originals stay in this same source owner before every fallible postcheck.
     opened: Vec<File>,
@@ -177,6 +177,15 @@ pub(crate) struct StoppedNormalWriters {
     original_agent: bool,
     original_assembly: bool,
     original_transport: bool,
+    pub(in crate::tauri_background) agent_result: Option<(
+        bool,
+        Result<(), crate::desktop_agent_runtime::DesktopAgentStopFailure>,
+        Option<u64>,
+    )>,
+    pub(in crate::tauri_background) assembly_result: (
+        Result<(), openbot_infra::application_assembly::CaptureAssemblyStopFailure>,
+        Option<u64>,
+    ),
 }
 #[derive(serde::Serialize)]
 struct HostEntry {
@@ -463,16 +472,21 @@ pub(crate) async fn stop_normal_writers(
     .map_err(|_| Fault::ClosingPending)?
     .map_err(|_| Fault::ClosingPending)?;
     op.require_normal_closing()?;
-    if let Some(agent) = normal.background.agent_host.as_mut() {
+    let agent_result = if let Some(agent) = normal.background.agent_host.as_mut() {
+        let agent_started = agent.agent_started();
         let remaining = op.normal_closing_remaining_ns()?;
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             std::time::Duration::from_nanos(remaining),
             agent.stop_for_capture(),
         )
         .await
-        .map_err(|_| Fault::ClosingPending)?
         .map_err(|_| Fault::ClosingPending)?;
-    }
+        let observed_ns = super::super::close_observed_ns();
+        result.map_err(|_| Fault::ClosingPending)?;
+        Some((agent_started, result, observed_ns))
+    } else {
+        None
+    };
     op.require_normal_closing()?;
     let assembly = normal
         .background
@@ -480,13 +494,14 @@ pub(crate) async fn stop_normal_writers(
         .as_mut()
         .ok_or(Fault::MaterialMissing)?;
     let remaining = op.normal_closing_remaining_ns()?;
-    tokio::time::timeout(
+    let assembly_result = tokio::time::timeout(
         std::time::Duration::from_nanos(remaining),
         assembly.stop_for_capture(),
     )
     .await
-    .map_err(|_| Fault::ClosingPending)?
     .map_err(|_| Fault::ClosingPending)?;
+    let assembly_observed_ns = super::super::close_observed_ns();
+    assembly_result.map_err(|_| Fault::ClosingPending)?;
     op.require_normal_closing()?;
     // The real gate, active operations, original async and blocking workers all close here.
     state.artifact_hold = Some(
@@ -501,6 +516,8 @@ pub(crate) async fn stop_normal_writers(
         original_agent: true,
         original_assembly: true,
         original_transport: true,
+        agent_result,
+        assembly_result: (assembly_result, assembly_observed_ns),
     });
     Ok(())
 }

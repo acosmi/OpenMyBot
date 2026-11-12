@@ -1,6 +1,8 @@
 //! Real current-dataset v2 provider starts against owned PG, original Vault and loopback TLS.
 #![cfg(feature = "server-runtime")]
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use openbot_application::model_connections::ModelConnectionAdministration;
@@ -83,6 +85,11 @@ async fn assemble(
     let policy_store = openbot_infra::policy::PolicyStore::postgres(p.clone(), None);
     policy_store.load().await.unwrap();
     assemble_postgres_application(PostgresApplicationAssemblyInput {
+        recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
         pool: p.clone(),
         listener_database: config.clone().into(),
         deployment: DeploymentId::new(DEP),
@@ -126,15 +133,18 @@ const TENANT: &str = "custom-runtime-tenant";
 const OWNER: &str = "custom-runtime";
 const KEY: &str = "OWNED_CUSTOM_MODEL_CANARY";
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    // This owned database is outside every recovery domain (spec revision R484 S12).
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct Fixture {
     pool: openbot_infra::db::pool::DatabasePool,
@@ -186,6 +196,11 @@ impl Fixture {
             config.clone(),
             OWNER.into(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(binding.clone())
@@ -220,6 +235,11 @@ impl Fixture {
             dialer,
             SafeHttpBudget::new(64 * 1024 * 1024, timeout).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(self.binding.clone())
@@ -1174,6 +1194,11 @@ async fn unconfigured_constructor_closes_v2_and_keeps_actual_legacy_v1_route() {
             tls.dialer(),
             SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).unwrap(),
             Some(Duration::from_secs(2)),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &f.pool,
+                &DeploymentId::new(DEP),
+                &TenantId::new(TENANT),
+            ),
         )
         .unwrap();
         refused(old_provider.start(request).await);

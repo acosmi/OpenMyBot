@@ -472,6 +472,18 @@ impl PostgresRuntimeCapabilityFacts {
         }) {
             return Err(Error::MissingHostSource);
         }
+        // The original request's admission is held through the facts transaction
+        // and its Vault-opens; the returned tail stays synchronous and holds none.
+        let binding = auth.request_binding().ok_or(Error::Unavailable)?;
+        let admission = binding
+            .borrow_recovery_admission_before(auth, deadline.deadline())
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        let current = || {
+            admission
+                .verify_current_before(binding, auth, deadline.deadline())
+                .map_err(|_| Error::Unavailable)
+        };
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline.deadline()), async {
             let mut client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
             let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).read_only(true).start().await.map_err(|_| Error::Unavailable)?;
@@ -484,7 +496,9 @@ impl PostgresRuntimeCapabilityFacts {
                 let session = check_authority(&row, auth, &authority)?;
                 let tail=Arc::new(JointTail { scope:scope.clone(),session,monotonic:std::time::Instant::now(),wall:std::time::SystemTime::now() });
                 deadline.check()?;
-                let mut facts = self.parse_snapshot(row, sso.cloned(), scope.host_mode()==HostMode::Server, deadline).await?;
+                let unconfirmed = unconfirmed_sources(&*tx, &row, admission.restore_cohort(), deadline).await?;
+                current()?;
+                let mut facts = self.parse_snapshot(row, sso.cloned(), scope.host_mode()==HostMode::Server, deadline, unconfirmed).await?;
                 if !auth.has_role(Role::User) && !auth.has_role(Role::Admin) {
                     facts.product_permissions = [PermissionFact::Denied;13];
                 }
@@ -494,6 +508,7 @@ impl PostgresRuntimeCapabilityFacts {
             tx.rollback().await.map_err(|_| Error::Unavailable)?;
             deadline.check()?;
             if !self.is_current() { return Err(Error::NotCurrent); }
+            current()?;
             observed
         }).await.map_err(|_| Error::Unavailable)?
     }
@@ -504,6 +519,7 @@ impl PostgresRuntimeCapabilityFacts {
         sso: Option<ReadOnlySsoCapabilitySource>,
         server_sso: bool,
         deadline: CapabilityDeadline,
+        unconfirmed: UnconfirmedSources,
     ) -> Result<RuntimeCapabilityFacts, Error> {
         let policy: Value = row.try_get("policy").map_err(|_| Error::Unavailable)?;
         let custom: Value = row
@@ -525,8 +541,13 @@ impl PostgresRuntimeCapabilityFacts {
                 deadline.check()?;
                 let acting_policy = observe_policy(&policy, fallback.as_ref(), deadline)?;
                 deadline.check()?;
-                let model_key = observe_default_key(&credentials, &vault, environment.as_deref());
-                let (custom_model_config, custom_key) = observe_custom(&custom, &vault, &actor);
+                let model_key = if unconfirmed.default_key {
+                    ModelKeyFact::Unknown
+                } else {
+                    observe_default_key(&credentials, &vault, environment.as_deref())
+                };
+                let (custom_model_config, custom_key) =
+                    observe_custom(&custom, &vault, &actor, &unconfirmed.connections);
                 let sso_config = sso.as_ref().map_or(
                     if server_sso {
                         ConfigFact::Unknown
@@ -551,6 +572,72 @@ impl PostgresRuntimeCapabilityFacts {
         });
         receiver.await.map_err(|_| Error::Unavailable)?
     }
+}
+
+/// Restored credential sources not yet reconfirmed: their Vault-opens are skipped.
+struct UnconfirmedSources {
+    default_key: bool,
+    connections: std::collections::BTreeSet<String>,
+}
+
+/// Read inside the facts transaction, before parsing and any Vault-open.
+async fn unconfirmed_sources<C: tokio_postgres::GenericClient + Sync>(
+    tx: &C,
+    row: &Row,
+    cohort: Option<openbot_contracts::recovery::RestoreCohortRef>,
+    deadline: CapabilityDeadline,
+) -> Result<UnconfirmedSources, Error> {
+    use crate::restore_reconfirmation::{
+        RequirementKind, RequirementSource, RestoreReconfirmationError, require_confirmed_before,
+    };
+    let mut sources = UnconfirmedSources {
+        default_key: false,
+        connections: std::collections::BTreeSet::new(),
+    };
+    if cohort.is_none() {
+        return Ok(sources);
+    }
+    let unconfirmed = |result: Result<(), RestoreReconfirmationError>| match result {
+        Ok(()) => Ok(false),
+        Err(RestoreReconfirmationError::NotConfirmed) => Ok(true),
+        Err(_) => Err(Error::Unavailable),
+    };
+    let credentials: Value = row
+        .try_get("default_credentials")
+        .map_err(|_| Error::Unavailable)?;
+    if let Some(id) = credentials
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("id"))
+        .and_then(Value::as_str)
+    {
+        let source = RequirementSource {
+            cohort,
+            kind: RequirementKind::Credential,
+            source_ref: id,
+        };
+        sources.default_key =
+            unconfirmed(require_confirmed_before(tx, source, deadline.deadline()).await)?;
+    }
+    let custom: Value = row
+        .try_get("custom_models")
+        .map_err(|_| Error::Unavailable)?;
+    for id in custom
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+    {
+        let source = RequirementSource {
+            cohort,
+            kind: RequirementKind::ModelSecret,
+            source_ref: id,
+        };
+        if unconfirmed(require_confirmed_before(tx, source, deadline.deadline()).await)? {
+            sources.connections.insert(id.to_owned());
+        }
+    }
+    Ok(sources)
 }
 
 fn auth_actor_from_row(row: &Row) -> Result<ActorId, Error> {
@@ -798,6 +885,7 @@ fn observe_custom(
     value: &Value,
     vault: &CredentialRecordVault,
     actor: &ActorId,
+    unconfirmed: &std::collections::BTreeSet<String>,
 ) -> (ConfigFact, ModelKeyFact) {
     let Some(rows) = value.as_array() else {
         return (ConfigFact::Unknown, ModelKeyFact::Unknown);
@@ -847,6 +935,10 @@ fn observe_custom(
             unknown = true;
             continue;
         };
+        if unconfirmed.contains(id) {
+            unknown = true;
+            continue;
+        }
         let Ok(opened) = vault.open(
             &secret_id,
             SecretKind::Model,
@@ -1177,5 +1269,270 @@ mod worker_admission_tests {
             .expect("poisoned gate still drains real work")
             .expect("drain task");
         assert_eq!(workers.active.load(Ordering::Acquire), 0);
+    }
+}
+
+/// T046-30 on a published RestoreCurrent (spec revision R484 ¶8056): no
+/// supported device issuer or registry exists, so the actual assembled facts
+/// keep remote device pairing refused through the real projection while the
+/// same observation projects a live capability as Ready.
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod consumers {
+    use super::*;
+    use crate::auth::single_user::desktop_local::DESKTOP_LOCAL_ACTOR_ID;
+    use crate::recovery_control::RecoveryReadGate;
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use openbot_application::runtime_capabilities::{
+        RuntimeCapabilitiesFuture, RuntimeCapabilityObservationResult, get_runtime_capabilities,
+    };
+    use openbot_contracts::recovery::RecoveryAdmissionLease;
+    use openbot_contracts::request_binding::{
+        HostRequestBindingError, HostRequestBindingGuard, HostRequestBindingKind,
+        RequestBindingOwnerLease, VerifiedHostRequestBinding,
+    };
+    use openbot_contracts::runtime_capabilities::{
+        RuntimeCapabilityId, RuntimeCapabilityReasonCode, RuntimeCapabilityState,
+    };
+    use openbot_domain::vault::{KeyVersion, WrappingKey};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Instant;
+
+    /// The window's admission is the restored runtime's own request lease.
+    struct RestoredWindow {
+        gate: RecoveryReadGate,
+        _owner: RequestBindingOwnerLease,
+    }
+
+    impl HostRequestBindingGuard for RestoredWindow {
+        fn verify_current<'a>(
+            &'a self,
+            _auth: &'a AuthContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), HostRequestBindingError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn verify_current_before<'a>(
+            &'a self,
+            _auth: &'a AuthContext,
+            _deadline: Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<(), HostRequestBindingError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn borrow_recovery_admission_before<'a>(
+            &'a self,
+            binding: &'a VerifiedHostRequestBinding,
+            auth: &'a AuthContext,
+            deadline: Instant,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<RecoveryAdmissionLease<'a>, HostRequestBindingError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(self.gate.borrow_before(binding, auth, deadline))
+        }
+    }
+
+    struct LocalCollector {
+        facts: PostgresRuntimeCapabilityFacts,
+        scope: RuntimeCapabilityHostScope,
+        revision: RuntimeCapabilityRevisionOwner,
+    }
+
+    impl RuntimeCapabilitiesCollector for LocalCollector {
+        fn observe<'a>(
+            &'a self,
+            auth: &'a AuthContext,
+            deadline: CapabilityDeadline,
+        ) -> RuntimeCapabilitiesFuture<'a> {
+            Box::pin(async move {
+                self.facts
+                    .observe(
+                        auth,
+                        Authority::Canonical(DESKTOP_LOCAL_EMAIL),
+                        &self.scope,
+                        None,
+                        deadline,
+                    )
+                    .await?
+                    .into_observation(self.scope.clone(), &self.revision.next()?)
+            })
+        }
+
+        fn finalize<'a>(
+            &'a self,
+            auth: &'a AuthContext,
+            observed: RuntimeCapabilityObservationResult,
+            deadline: CapabilityDeadline,
+        ) -> RuntimeCapabilitiesFuture<'a> {
+            Box::pin(async move {
+                let snapshot = self
+                    .facts
+                    .observe(
+                        auth,
+                        Authority::Canonical(DESKTOP_LOCAL_EMAIL),
+                        &self.scope,
+                        None,
+                        deadline,
+                    )
+                    .await?;
+                Ok(snapshot.apply(observed?))
+            })
+        }
+
+        fn tail_current(
+            &self,
+            _auth: &AuthContext,
+            finalized: RuntimeCapabilityObservationResult,
+            _deadline: CapabilityDeadline,
+        ) -> RuntimeCapabilityObservationResult {
+            finalized
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_30_remote_device_capability_stays_disabled() {
+        let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
+        let (pool, dep, ten) = (
+            restored.pool.clone(),
+            DeploymentId::new("dep"),
+            TenantId::new("ten"),
+        );
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "INSERT INTO public.users(id,email,auth_generation) VALUES('{DESKTOP_LOCAL_ACTOR_ID}','{DESKTOP_LOCAL_EMAIL}',0);
+                 INSERT INTO public.user_roles(user_id,role) VALUES('{DESKTOP_LOCAL_ACTOR_ID}','admin');"
+            ))
+            .await
+            .unwrap();
+        let gate = restored.read_gate();
+        let vault = CredentialRecordVault::single_key(
+            ten.clone(),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x30; 32]).unwrap(),
+        );
+        let policy = PolicyStore::postgres(pool.clone(), None);
+        let memory = Arc::new(crate::memory_admin::PostgresMemoryAdministration::new(
+            pool.clone(),
+        ));
+        let listener =
+            crate::thread_listener::ThreadListenerDatabase::desktop_local(5432, &[b'a'; 64])
+                .unwrap();
+        let facts =
+            PostgresRuntimeCapabilityFacts::from_assembly(RuntimeCapabilityAssemblyFactsInput {
+                pool: pool.clone(),
+                deployment: dep.clone(),
+                tenant: ten.clone(),
+                policy: policy.clone(),
+                vault: vault.clone(),
+                default_key_id: "openai-default".to_owned(),
+                environment_key: None,
+                channels: ChannelRepo::new(pool.clone()),
+                people: PostgresPeopleAdministration::new(pool.clone(), None, vec![0x30; 32])
+                    .unwrap(),
+                threads: PostgresThreadDirectory::with_runtime(
+                    pool.clone(),
+                    listener,
+                    "restored-runtime".into(),
+                    time::Duration::seconds(30),
+                    gate.clone(),
+                )
+                .unwrap(),
+                tools: crate::agent_tools::PostgresBuiltInToolControlPlane::new(
+                    pool.clone(),
+                    dep.clone(),
+                    ten.clone(),
+                    policy,
+                    memory,
+                    gate.clone(),
+                ),
+                models: Arc::new(
+                    crate::model_connections::PostgresModelConnections::new(
+                        pool.clone(),
+                        vault,
+                        dep.clone(),
+                        ten.clone(),
+                        SecretBytes::new(vec![0x30; 32]),
+                    )
+                    .unwrap(),
+                ),
+            })
+            .unwrap();
+        let auth = AuthContextBuilder::from_verified_session(
+            dep,
+            ten,
+            ActorId::new(DESKTOP_LOCAL_ACTOR_ID),
+            AuthGeneration::new(0),
+            true,
+        )
+        .with_role(Role::Admin)
+        .build();
+        let (owner, issuer) =
+            RequestBindingOwnerLease::for_trusted_host(HostRequestBindingKind::DesktopWindow);
+        let binding = issuer
+            .bind_desktop_window(
+                &auth,
+                "main".to_owned(),
+                30,
+                Arc::new(RestoredWindow {
+                    gate,
+                    _owner: owner,
+                }),
+            )
+            .unwrap();
+        let auth = auth.with_verified_request_binding(binding).unwrap();
+        let revision = RuntimeCapabilityRevisionOwner::new().unwrap();
+        let scope = RuntimeCapabilityHostScope::for_desktop_local(
+            &issuer,
+            &auth,
+            revision.runtime_epoch(),
+            WindowBindingClaim::declare("main", 30).unwrap(),
+        )
+        .unwrap();
+        let collector = LocalCollector {
+            facts,
+            scope,
+            revision,
+        };
+
+        let reply = get_runtime_capabilities(Some(&collector), &auth)
+            .await
+            .unwrap();
+        let entry = |id| {
+            *reply
+                .capabilities()
+                .iter()
+                .find(|entry| entry.id() == id)
+                .unwrap()
+        };
+        let pairing = entry(RuntimeCapabilityId::DevicePairing);
+        assert_eq!(
+            (pairing.state(), pairing.reason_code()),
+            (
+                RuntimeCapabilityState::Unsupported,
+                RuntimeCapabilityReasonCode::IndependentApiMissing
+            )
+        );
+        let workspace = entry(RuntimeCapabilityId::Workspace);
+        assert_eq!(
+            workspace.state(),
+            RuntimeCapabilityState::Ready,
+            "the restored observation is live"
+        );
+        // Without the runtime the same request projects nothing at all.
+        drop(restored.runtime);
+        assert!(
+            get_runtime_capabilities(Some(&collector), &auth)
+                .await
+                .is_err()
+        );
     }
 }

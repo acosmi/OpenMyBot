@@ -113,7 +113,7 @@ async fn canary_accepts_0053_before_upgrade_and_requires_0054_for_current() {
         let after = desktop_vault_canary::verify_pre_upgrade_layout(&pool)
             .await
             .unwrap();
-        assert_eq!(after.native_version(), native::NATIVE_0054_VERSION);
+        assert_eq!(after.native_version(), native::NATIVE_LATEST_VERSION);
         desktop_vault_canary::verify_current_layout(&pool)
             .await
             .unwrap();
@@ -604,6 +604,11 @@ async fn core_reference_counterexamples(
         database.clone(),
         "automation-core-counterexample".to_owned(),
         time::Duration::minutes(10),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &f.pool,
+            f.auth.deployment(),
+            f.auth.tenant(),
+        ),
     )
     .unwrap();
     for scenario in ["scope", "owner", "bot", "thread"] {
@@ -889,6 +894,11 @@ async fn manual_commit_faults_and_lost_notify_converge() {
                 f.auth.tenant().clone(),
                 openbot_domain::vault::KeyVersion::new(1),
                 openbot_domain::vault::WrappingKey::from_bytes(vec![0x42; 32]).unwrap(),
+            ),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &proxy_pool,
+                f.auth.deployment(),
+                f.auth.tenant(),
             ),
         )
         .unwrap();

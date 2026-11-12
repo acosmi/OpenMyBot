@@ -8,12 +8,18 @@ use std::process::ExitCode;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    #[cfg_attr(not(feature = "testkit"), allow(unused_mut))]
-    let mut endpoint = TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()));
+    let endpoint = TelegramEndpoint::production(SafeDialer::new(EgressPolicy::default()));
+    #[cfg(feature = "testkit")]
+    let mut endpoint = endpoint;
     let mut args = std::env::args().skip(1);
+    #[cfg(not(feature = "testkit"))]
+    if args.next().is_some() {
+        eprintln!("usage: openmybot-channel-telegram");
+        return ExitCode::from(2);
+    }
+    #[cfg(feature = "testkit")]
     while let Some(flag) = args.next() {
         match (flag.as_str(), args.next()) {
-            #[cfg(feature = "testkit")]
             ("--api-base", Some(base)) => {
                 let Some(port) = url::Url::parse(&base).ok().and_then(|url| url.port()) else {
                     eprintln!("usage: openmybot-channel-telegram [--api-base <loopback url>]");

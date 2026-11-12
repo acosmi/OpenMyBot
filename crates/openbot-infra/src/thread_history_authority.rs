@@ -490,6 +490,29 @@ impl PostgresThreadHistoryAuthority {
     }
 }
 
+/// Precommit outcome only. The candidate's original transaction still owns its ACK.
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) enum RestoredHistoryBatch {
+    Batch { more: bool },
+    Complete { operation_id: String },
+    ExistingComplete { operation_id: String },
+    AwaitingDrain,
+    AwaitingReaders,
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(crate) async fn clear_restored_history_batch_before(
+    source: &mut crate::backup::whole_pg_restore_stream::candidate_sql::PendingHistoryClearSource<
+        '_,
+        '_,
+    >,
+    thread: &ThreadId,
+    deadline: std::time::Instant,
+) -> Result<RestoredHistoryBatch, ThreadHistoryStopClearError> {
+    clear::clear_restored_original(source, thread, deadline).await
+}
+
 /// Only this authority's actual guarded checkout can construct this original transaction.
 struct ThreadHistoryTransaction<'a> {
     authority: &'a PostgresThreadHistoryAuthority,

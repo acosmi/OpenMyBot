@@ -460,10 +460,21 @@ impl Fixture {
                 )
                 .await
                 .map_err(|_| "actual typed canonical principal failed".to_owned())?;
-                Arc::new(SingleUserAuthResolver::from_verified_principal(
+                let resolver = SingleUserAuthResolver::from_verified_principal(
                     principal,
                     default_session_lifetime(),
-                ))
+                );
+                resolver
+                    .install_recovery_read_gate(
+                        &pool,
+                        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                            &pool,
+                            &DeploymentId::new(DEPLOYMENT),
+                            &TenantId::new(TENANT),
+                        ),
+                    )
+                    .map_err(|_| "actual recovery gate install failed".to_owned())?;
+                Arc::new(resolver)
             }
             Mode::Sessions => {
                 let c = pool
@@ -479,16 +490,24 @@ impl Fixture {
                         .await.map_err(|_| "owned session epoch seed failed".to_owned())?;
                 }
                 drop(c);
-                Arc::new(
-                    PostgresSessionAuthResolver::new(
-                        pool.clone(),
-                        SESSION_KEY,
-                        default_session_lifetime(),
-                        DeploymentId::new(DEPLOYMENT),
-                        TenantId::new(TENANT),
-                    )
-                    .map_err(|_| "actual session resolver failed".to_owned())?,
+                let resolver = PostgresSessionAuthResolver::new(
+                    pool.clone(),
+                    SESSION_KEY,
+                    default_session_lifetime(),
+                    DeploymentId::new(DEPLOYMENT),
+                    TenantId::new(TENANT),
                 )
+                .map_err(|_| "actual session resolver failed".to_owned())?;
+                resolver
+                    .install_recovery_read_gate(
+                        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                            &pool,
+                            &DeploymentId::new(DEPLOYMENT),
+                            &TenantId::new(TENANT),
+                        ),
+                    )
+                    .map_err(|_| "actual recovery gate install failed".to_owned())?;
+                Arc::new(resolver)
             }
         };
         // A truthful missing capability dependency, used only by the framing/missing-source cases.
@@ -561,6 +580,11 @@ impl Fixture {
             std::iter::empty::<String>(),
             SafeDialer::new(EgressPolicy::default()),
             "https://capabilities.example.test".to_owned(),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &DeploymentId::new(DEPLOYMENT),
+                &tenant,
+            ),
         )
         .map_err(|_| "actual read-only SSO service source unavailable".to_owned())?;
         let factory = Arc::new(CountActualFactory {
@@ -577,6 +601,12 @@ impl Fixture {
             .await
             .map_err(|_| "actual PolicyStore setup failed".to_owned())?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    &DeploymentId::new(DEPLOYMENT),
+                    &tenant,
+                ),
             pool: self.pool.clone(),
             listener_database: self.config.clone().into(),
             deployment: DeploymentId::new(DEPLOYMENT),

@@ -1,5 +1,7 @@
 //! Isolated real PostgreSQL/Vault personal model-connection transactions.
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 
 use openbot_application::model_connections::{
     ModelConnectionAdministration, ModelConnectionError as Error,
@@ -24,15 +26,18 @@ const DEP: &str = "model-deployment";
 const TENANT: &str = "model-tenant";
 const AUDIT: &[u8] = b"model-connection-test-audit-key-32-bytes";
 fn auth(actor: &str, generation: u64, role: Role) -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new(actor),
-        AuthGeneration::new(generation),
-        false,
+    // This owned database is outside every recovery domain.
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new(actor),
+            AuthGeneration::new(generation),
+            false,
+        )
+        .with_roles([role])
+        .build(),
     )
-    .with_roles([role])
-    .build()
 }
 fn owner() -> AuthContext {
     auth("alice", 7, Role::User)

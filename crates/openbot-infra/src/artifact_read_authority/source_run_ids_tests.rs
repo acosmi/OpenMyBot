@@ -139,6 +139,11 @@ impl Fixture {
             config,
             "source-ids-fixture-owner".to_owned(),
             DEFAULT_THREAD_LEASE_DURATION,
+            crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(|e| e.to_string())?;
         directory
@@ -162,6 +167,11 @@ impl Fixture {
                 Arc::clone(&store),
                 policy,
                 SecretBytes::new(vec![0x83; 32]),
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .map_err(|e| e.to_string())?,
         );

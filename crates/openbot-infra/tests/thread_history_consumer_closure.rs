@@ -10,6 +10,8 @@
 ))]
 
 mod harness;
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -295,6 +297,11 @@ fn directory(
         config.clone(),
         PROCESS.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(text)
 }
@@ -774,6 +781,12 @@ impl V2 {
         let policy_store = PolicyStore::postgres(p.clone(), None);
         policy_store.load().await.map_err(text)?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    p,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: p.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -815,6 +828,11 @@ impl V2 {
             config.clone(),
             PROCESS.to_owned(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                p,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?
         .with_model_dataset_binding(binding.clone())
@@ -849,7 +867,8 @@ impl V2 {
     ) -> TestResult<ModelConnection> {
         self.models
             .create(
-                &auth(),
+                // Creation needs a request binding outside every recovery domain.
+                &recovery_admission::outside_domain(auth()),
                 &CreateModelConnection {
                     name: "Owned choice".into(),
                     protocol,
@@ -1154,6 +1173,7 @@ async fn consumer_closure_closed_context_run_ends_without_provider_start() {
                 PROCESS.to_owned(),
                 DEFAULT_THREAD_LEASE_DURATION,
                 DEFAULT_DISPATCH_CLAIM_DURATION,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(text)?,
         );
@@ -1554,6 +1574,11 @@ async fn consumer_closure_custom_start_refuses_closed_history_before_send() {
                     tls.dialer(),
                     budget,
                     Some(Duration::from_secs(2)),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &p,
+                        &DeploymentId::new(DEP),
+                        &TenantId::new(TENANT),
+                    ),
                 )
                 .unwrap()
                 .with_model_dataset_binding(v2.binding.clone())
@@ -2011,6 +2036,11 @@ async fn capture_remember(
         TenantId::new(TENANT),
         policy,
         memory.clone(),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     );
     let journal = KeepExecuting {
         inner: PostgresToolJournal::new(p.clone(), AUDIT_KEY.to_vec()).map_err(text)?,
@@ -2047,7 +2077,7 @@ async fn consumer_closure_remember_effect_refuses_new_and_replays_existing() {
     owned("closure_remember", |p, config| async move {
         let lease_for = time::Duration::minutes(10);
         let begin = begin_v1(51, false, None);
-        PostgresThreadDirectory::with_runtime(p.clone(), config.clone(), PROCESS.to_owned(), lease_for)
+        PostgresThreadDirectory::with_runtime(p.clone(), config.clone(), PROCESS.to_owned(), lease_for, openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
             .map_err(text)?
             .begin_thread_run(begin.clone())
             .await
@@ -2057,6 +2087,7 @@ async fn consumer_closure_remember_effect_refuses_new_and_replays_existing() {
             PROCESS.to_owned(),
             lease_for,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
         )
         .map_err(text)?;
         let claim = runtime
@@ -2363,6 +2394,7 @@ async fn hold_operation(
 
 /// Builds the save adapter over `registry` and a fresh private root.
 async fn artifact_admin(
+    pool: &pool::DatabasePool,
     registry: Arc<ArtifactDatasetRegistry>,
 ) -> TestResult<(PostgresArtifactAdministration, OwnedRoot)> {
     let root = OwnedRoot::new()?;
@@ -2379,6 +2411,11 @@ async fn artifact_admin(
         Arc::new(store),
         policy,
         SecretBytes::new(vec![0x81; 32]),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            pool,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?;
     Ok((administration, root))
@@ -2424,7 +2461,7 @@ async fn save_case(
         .await
         .map_err(text)?,
     );
-    let (administration, root) = artifact_admin(registry).await?;
+    let (administration, root) = artifact_admin(p, registry).await?;
     let administration = Arc::new(administration);
     let dir = directory(p, proxied)?;
     let [refused, before_io, after_io, replayed, ordered] =
@@ -2897,6 +2934,11 @@ async fn not_closed_case(
         config.clone(),
         PROCESS.to_owned(),
         time::Duration::minutes(10),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(text)?;
     let lease_for = time::Duration::minutes(10);
@@ -2927,6 +2969,11 @@ async fn not_closed_case(
         PROCESS.to_owned(),
         lease_for,
         DEFAULT_DISPATCH_CLAIM_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(text)?;
     // The remember effect needs its own Run leased; the others do not.
@@ -2953,6 +3000,11 @@ async fn not_closed_case(
         tls.dialer(),
         budget,
         Some(Duration::from_secs(2)),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?
     .with_model_dataset_binding(v2.binding.clone())
@@ -2969,7 +3021,7 @@ async fn not_closed_case(
         .await
         .map_err(text)?;
     let registry = v2.registry.clone().ok_or("the dataset registry is gone")?;
-    let (administration, _root) = artifact_admin(registry).await?;
+    let (administration, _root) = artifact_admin(p, registry).await?;
     let owner = auth();
     let save_asked = save_request(&save);
 
@@ -3154,6 +3206,11 @@ async fn legacy_start_query_failure(
         tls.dialer(),
         budget,
         Some(Duration::from_secs(2)),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &starter_pool,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?;
     let sends = tls.requests();
@@ -3233,6 +3290,11 @@ async fn v2_start_early_dataset_query_failure(
         tls.dialer(),
         SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(20)).map_err(text)?,
         Some(Duration::from_secs(2)),
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            &starter_pool,
+            &DeploymentId::new(DEP),
+            &TenantId::new(TENANT),
+        ),
     )
     .map_err(text)?
     .with_model_dataset_binding(original.binding.clone())

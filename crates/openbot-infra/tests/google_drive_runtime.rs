@@ -1,5 +1,7 @@
 //! Real loopback-wire conformance for the Google Drive v3 REST transport.
 
+#[path = "support/recovery_admission.rs"]
+mod recovery_admission;
 mod harness {
     include!("../../../test-support/postgres_harness.rs");
 }
@@ -814,10 +816,11 @@ async fn drive_oauth_catalog_grant_agent_retry_disconnect_and_revoke_are_one_rea
                 Some(&origin),
                 Some("http://app.example.test"),
                 SchemePolicy::HttpOrHttps,
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|error| error.to_string())?
             .with_google_drive_oauth(google_oauth.clone());
-            let auth = AuthContextBuilder::from_verified_session(
+            let auth = recovery_admission::outside_domain(AuthContextBuilder::from_verified_session(
                 DeploymentId::new("drive-deployment"),
                 TenantId::new("drive-tenant"),
                 ActorId::new(DRIVE_ACTOR),
@@ -825,7 +828,7 @@ async fn drive_oauth_catalog_grant_agent_retry_disconnect_and_revoke_are_one_rea
                 false,
             )
             .with_roles([Role::User, Role::Admin])
-            .build();
+            .build());
 
             let unavailable = connections
                 .list_connections(&auth)
@@ -974,7 +977,7 @@ async fn drive_oauth_catalog_grant_agent_retry_disconnect_and_revoke_are_one_rea
             drop(pg);
 
             let broker = Arc::new(
-                PostgresMcpCredentialBroker::new(pool.clone(), vault.clone())
+                PostgresMcpCredentialBroker::new(pool.clone(), vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")))
                     .with_user_oauth(
                         SafeDialer::new(EgressPolicy::new(
                             CidrAllowlist::parse_exact(["127.0.0.1/32"]).unwrap(),
@@ -1030,6 +1033,7 @@ async fn drive_oauth_catalog_grant_agent_retry_disconnect_and_revoke_are_one_rea
                 TenantId::new("drive-tenant"),
                 policy.clone(),
                 Arc::new(memory.clone()),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .with_mcp(catalog.clone(), rmcp)
             .with_google_drive(drive_transport)

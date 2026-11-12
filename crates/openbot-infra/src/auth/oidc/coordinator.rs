@@ -15,8 +15,10 @@ use openidconnect::{AuthorizationCode, ClientSecret};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
 use url::Url;
+#[cfg(feature = "server-sso")]
+use uuid::Uuid;
 
-use super::attempt::CallbackLoginAttempt;
+use super::attempt::{CallbackLoginAttempt, ProviderIncarnationBinding};
 use super::attempt_postgres::{PostgresAttemptError, PostgresLoginAttemptStore};
 use super::authorize::{DEFAULT_SCOPES, authorization_url};
 use super::claims::{
@@ -26,12 +28,15 @@ use super::claims::{
 use super::discovery::{FetchBudget, discover_with_expected_issuer};
 use super::error::OidcError;
 use super::jwks::{JwksCache, JwksRefreshPolicy};
-use super::provider::{OidcProviderConfig, ProviderId, ProviderKind};
+use super::provider::{OidcProviderConfig, ProviderId, ProviderKind, ProviderOrigin};
 use super::ratelimit::RateLimitPolicy;
 use super::ratelimit_postgres::{
     OidcRateLimitBucket, PostgresOidcRateLimiter, PostgresRateLimitError,
 };
-use super::session_issuer::{IssuedSession, PostgresOidcSessionIssuer, SessionIssueError};
+use super::session_issuer::{
+    IssuedSession, OriginalLoginRequest, PostgresOidcSessionIssuer, SessionIssueError,
+    VerifiedCurrentFederatedLogin,
+};
 use super::token::{exchange_authorization_code, untrusted_key_id};
 use super::token_transport::SafeOauthHttpClient;
 use crate::net::safe_http::{SafeDialer, SafeHttpBudget, SafeHttpRequest, SchemePolicy};
@@ -41,6 +46,10 @@ pub const DEFAULT_JWKS_COOLDOWN: Duration = Duration::minutes(1);
 pub const DEFAULT_METADATA_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TOKEN_MAX_BYTES: usize = 64 * 1024;
 pub const DEFAULT_IDP_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+/// One dynamic SSO login flow's single absolute deadline: the sum of
+/// its three steps, discovery or JWKS, token exchange, and DB plus session
+/// issuance. Each step's own budget is unchanged; expiry is closed.
+pub const DYNAMIC_SSO_LOGIN_BUDGET: core::time::Duration = DEFAULT_IDP_TIMEOUT.saturating_mul(3);
 const MAX_AUTHORIZATION_CODE_BYTES: usize = 8 * 1024;
 const LOGIN_START_RATE: RateLimitPolicy = RateLimitPolicy::new(20, Duration::minutes(1));
 const CALLBACK_RATE: RateLimitPolicy = RateLimitPolicy::new(60, Duration::minutes(1));
@@ -110,6 +119,7 @@ impl OidcLoginError {
 /// 一家已完成 discovery 预验证的运行时 provider。
 pub struct OidcProviderRuntime {
     config: OidcProviderConfig,
+    incarnation: ProviderIncarnationBinding,
     client_secret: Option<SecretBytes>,
     metadata: CoreProviderMetadata,
     jwks: Mutex<JwksCache>,
@@ -125,9 +135,91 @@ impl OidcProviderRuntime {
         dialer: &SafeDialer,
         budget: FetchBudget,
     ) -> Result<Self, OidcError> {
-        if group_mapping
-            .as_ref()
-            .is_some_and(|mapping| mapping.provider().as_str() != config.id().as_str())
+        if config.origin() != ProviderOrigin::EnvironmentConfigured {
+            return Err(OidcError::ProviderUnknown);
+        }
+        Self::discover_with_binding(
+            config,
+            client_secret,
+            group_mapping,
+            ProviderIncarnationBinding::Configured {},
+            dialer,
+            budget,
+        )
+        .await
+    }
+
+    /// The row incarnation is configuration DATA, not a Current provider admission.
+    #[cfg(feature = "server-sso")]
+    pub(crate) async fn discover_bound(
+        config: OidcProviderConfig,
+        client_secret: Option<SecretBytes>,
+        group_mapping: Option<IdpGroupMapping>,
+        provider_internal_id: Uuid,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<Self, OidcError> {
+        if config.origin() != ProviderOrigin::DynamicallyRegistered || provider_internal_id.is_nil()
+        {
+            return Err(OidcError::ProviderUnknown);
+        }
+        Self::discover_with_binding(
+            config,
+            client_secret,
+            group_mapping,
+            ProviderIncarnationBinding::Dynamic {
+                provider_internal_id,
+            },
+            dialer,
+            budget,
+        )
+        .await
+    }
+
+    /// Registration has no stored row incarnation yet; validate metadata without minting a runtime.
+    #[cfg(feature = "server-sso")]
+    pub(crate) async fn validate_registration(
+        config: &OidcProviderConfig,
+        group_mapping: Option<IdpGroupMapping>,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<(), OidcError> {
+        if config.origin() != ProviderOrigin::DynamicallyRegistered {
+            return Err(OidcError::ProviderUnknown);
+        }
+        Self::discover_metadata(config, group_mapping.as_ref(), dialer, budget)
+            .await
+            .map(|_| ())
+    }
+
+    async fn discover_with_binding(
+        config: OidcProviderConfig,
+        client_secret: Option<SecretBytes>,
+        group_mapping: Option<IdpGroupMapping>,
+        incarnation: ProviderIncarnationBinding,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<Self, OidcError> {
+        let metadata =
+            Self::discover_metadata(&config, group_mapping.as_ref(), dialer, budget).await?;
+        let jwks = JwksCache::from_metadata(&metadata);
+        Ok(Self {
+            config,
+            incarnation,
+            client_secret,
+            metadata,
+            jwks: Mutex::new(jwks),
+            group_mapping,
+        })
+    }
+
+    async fn discover_metadata(
+        config: &OidcProviderConfig,
+        group_mapping: Option<&IdpGroupMapping>,
+        dialer: &SafeDialer,
+        budget: FetchBudget,
+    ) -> Result<CoreProviderMetadata, OidcError> {
+        if group_mapping.is_some_and(|mapping| mapping.provider().as_str() != config.id().as_str())
         {
             return Err(OidcError::GroupMappingMismatch);
         }
@@ -139,14 +231,7 @@ impl OidcProviderRuntime {
         )
         .await?;
         validate_metadata_endpoints(&metadata, budget)?;
-        let jwks = JwksCache::from_metadata(&metadata);
-        Ok(Self {
-            config,
-            client_secret,
-            metadata,
-            jwks: Mutex::new(jwks),
-            group_mapping,
-        })
+        Ok(metadata)
     }
 
     #[must_use]
@@ -234,11 +319,12 @@ impl OidcLoginCoordinator {
             .providers
             .get(provider_id)
             .ok_or(OidcError::ProviderUnknown)?;
-        let attempt = super::attempt::LoginAttempt::begin(
+        let attempt = super::attempt::LoginAttempt::begin_bound(
             provider_id.clone(),
             runtime.config.redirect_uri().clone(),
             now,
             self.attempt_ttl,
+            runtime.incarnation,
         );
         let url = authorization_url(&runtime.metadata, &runtime.config, &attempt, DEFAULT_SCOPES)?;
         self.attempts.insert(attempt, now).await?;
@@ -255,10 +341,18 @@ impl OidcLoginCoordinator {
         now: OffsetDateTime,
         peer_ip: &str,
         user_agent: Option<&str>,
+        request: OriginalLoginRequest,
     ) -> Result<IssuedSession, OidcLoginError> {
-        let attempt = self
-            .begin_callback(provider_id, state, now, peer_ip)
-            .await?;
+        request.check()?;
+        let deadline = tokio::time::Instant::from_std(request.deadline());
+        let cancel = request.cancellation();
+        let attempt = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(SessionIssueError::DependencyUnavailable.into()),
+            result = tokio::time::timeout_at(deadline, self.begin_callback(provider_id, state, now, peer_ip)) => {
+                result.map_err(|_| SessionIssueError::DependencyUnavailable)??
+            }
+        };
         let runtime = self
             .providers
             .get(provider_id)
@@ -271,6 +365,9 @@ impl OidcLoginCoordinator {
             now,
             peer_ip,
             user_agent,
+            request,
+            None,
+            std::future::ready(Ok(())),
         )
         .await
     }
@@ -299,6 +396,8 @@ impl OidcLoginCoordinator {
     }
 
     /// 已烧 state 后完成 redirect/code/token/JWKS/claims/session；动态 IdP 复用这一半。
+    /// `before_issue` is a lazy future awaited after every network response and
+    /// before the session: the dynamic caller re-checks its current id (spec 8.4).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_callback(
         &self,
@@ -309,79 +408,104 @@ impl OidcLoginCoordinator {
         now: OffsetDateTime,
         peer_ip: &str,
         user_agent: Option<&str>,
+        request: OriginalLoginRequest,
+        admission: Option<&crate::recovery_control::RecoveryWorkerLease<'_>>,
+        before_issue: impl Future<Output = Result<(), OidcLoginError>> + Send,
     ) -> Result<IssuedSession, OidcLoginError> {
-        attempt
-            .redirect_uri()
-            .assert_exact_match(received_redirect_uri)?;
-        runtime
-            .config
-            .redirect_uri()
-            .assert_exact_match(received_redirect_uri)?;
-        if code.is_empty() || code.len() > MAX_AUTHORIZATION_CODE_BYTES || !code.is_ascii() {
-            return Err(OidcError::TokenExchangeRejected.into());
-        }
-        let (nonce, verifier) = attempt.into_nonce_and_verifier();
-        let token_endpoint = runtime
-            .metadata
-            .token_endpoint()
-            .ok_or(OidcError::TokenEndpointMissing)?;
-        let http = SafeOauthHttpClient::new(self.dialer.clone(), token_endpoint, self.token_budget)
-            .map_err(|_| OidcError::MetadataEndpointRejected)?;
-        // 长寿命 runtime 只持有会 zeroize 且不可 Clone 的 SecretBytes；协议库要求的
-        // ClientSecret 仅在这一次 callback 栈帧内临时物化。
-        let client_secret = materialize_client_secret(runtime.client_secret.as_ref())?;
-        let raw_id_token = exchange_authorization_code(
-            &runtime.metadata,
-            &runtime.config,
-            client_secret.as_ref(),
-            AuthorizationCode::new(code.to_owned()),
-            verifier,
-            &http,
-        )
-        .await?;
-        let kid = untrusted_key_id(&raw_id_token)?;
-        let (keys, key_issuer) = {
-            let mut cache = runtime.jwks.lock().await;
-            let keys = cache
-                .key_set_for(
-                    kid.as_ref(),
-                    &self.dialer,
-                    self.fetch_budget,
-                    self.jwks_policy,
-                    now,
-                )
-                .await?
-                .clone();
-            let key_issuer = kid
-                .as_ref()
-                .and_then(|kid| cache.key_issuer(kid))
-                .map(str::to_owned);
-            (keys, key_issuer)
-        };
-        let verified_provider =
-            bind_entra_token_issuer(&runtime.config, &raw_id_token, key_issuer.as_deref())?;
-        let verifier = build_verifier_at(
-            &verified_provider,
-            client_secret.as_ref(),
-            keys,
-            DEFAULT_ID_TOKEN_SIGNING_ALGS,
-            now,
-        )?;
-        let identity = verify_with_group_mapping(
-            &raw_id_token,
-            &verifier,
-            &verified_provider,
-            &nonce,
-            runtime.group_mapping.as_ref(),
-        )?;
-        self.sessions
-            .issue(
-                &identity,
+        request.check()?;
+        let deadline = tokio::time::Instant::from_std(request.deadline());
+        let cancel = request.cancellation();
+        let verify = async {
+            if attempt.provider() != runtime.config.id()
+                || attempt.incarnation() != runtime.incarnation
+            {
+                return Err(PostgresAttemptError::ProviderMismatch.into());
+            }
+            attempt
+                .redirect_uri()
+                .assert_exact_match(received_redirect_uri)?;
+            runtime
+                .config
+                .redirect_uri()
+                .assert_exact_match(received_redirect_uri)?;
+            if code.is_empty() || code.len() > MAX_AUTHORIZATION_CODE_BYTES || !code.is_ascii() {
+                return Err(OidcError::TokenExchangeRejected.into());
+            }
+            let (nonce, verifier) = attempt.into_nonce_and_verifier();
+            let token_endpoint = runtime
+                .metadata
+                .token_endpoint()
+                .ok_or(OidcError::TokenEndpointMissing)?;
+            let http =
+                SafeOauthHttpClient::new(self.dialer.clone(), token_endpoint, self.token_budget)
+                    .map_err(|_| OidcError::MetadataEndpointRejected)?;
+            // The long-lived runtime retains only zeroizing, non-Clone SecretBytes.
+            // Materialize the protocol library's ClientSecret only in this callback frame.
+            let client_secret = materialize_client_secret(runtime.client_secret.as_ref())?;
+            let raw_id_token = exchange_authorization_code(
+                &runtime.metadata,
+                &runtime.config,
+                client_secret.as_ref(),
+                AuthorizationCode::new(code.to_owned()),
+                verifier,
+                &http,
+            )
+            .await?;
+            let kid = untrusted_key_id(&raw_id_token)?;
+            let (keys, key_issuer) = {
+                let mut cache = runtime.jwks.lock().await;
+                let keys = cache
+                    .key_set_for(
+                        kid.as_ref(),
+                        &self.dialer,
+                        self.fetch_budget,
+                        self.jwks_policy,
+                        now,
+                    )
+                    .await?
+                    .clone();
+                let key_issuer = kid
+                    .as_ref()
+                    .and_then(|kid| cache.key_issuer(kid))
+                    .map(str::to_owned);
+                (keys, key_issuer)
+            };
+            let verified_provider =
+                bind_entra_token_issuer(&runtime.config, &raw_id_token, key_issuer.as_deref())?;
+            let verifier = build_verifier_at(
+                &verified_provider,
+                client_secret.as_ref(),
+                keys,
+                DEFAULT_ID_TOKEN_SIGNING_ALGS,
+                now,
+            )?;
+            let identity = verify_with_group_mapping(
+                &raw_id_token,
+                &verifier,
+                &verified_provider,
+                &nonce,
+                runtime.group_mapping.as_ref(),
+            )?;
+            before_issue.await?;
+            request.check()?;
+            Ok::<_, OidcLoginError>(VerifiedCurrentFederatedLogin::from_oidc_callback(
+                identity,
                 &verified_provider,
                 now,
                 Some(peer_ip),
                 user_agent,
-            )
+                admission,
+            ))
+        };
+        let login = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(SessionIssueError::DependencyUnavailable.into()),
+            result = tokio::time::timeout_at(deadline, verify) => {
+                result.map_err(|_| SessionIssueError::DependencyUnavailable)??
+            }
+        };
+        self.sessions
+            .issue_current_login(login, request)
             .await
             .map_err(Into::into)
     }

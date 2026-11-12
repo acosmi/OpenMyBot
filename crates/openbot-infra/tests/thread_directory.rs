@@ -48,7 +48,14 @@ async fn native_thread_status_is_scope_aware_and_never_uses_identity_as_visibili
                 .map_err(|error| error.to_string())?;
             drop(client);
 
-            let directory = PostgresThreadDirectory::new(pool.clone());
+            let directory = PostgresThreadDirectory::new(
+                pool.clone(),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
+            );
             let deployment = DeploymentId::new("dep-a");
             let tenant = TenantId::new("tenant-a");
             let actor = ActorId::new("actor-a");

@@ -80,6 +80,7 @@ async fn shared_postgres_application_assembly_executes_real_command() {
                 WrappingKey::from_bytes(vec![0x42; 32]).map_err(|error| error.to_string())?,
             );
             let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+                recovery_gate: openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &deployment, &tenant),
                 pool: pool.clone(),
                 listener_database: config.clone().into(),
                 deployment: deployment.clone(),

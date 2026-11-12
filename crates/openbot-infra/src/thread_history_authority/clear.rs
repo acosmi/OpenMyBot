@@ -1,6 +1,7 @@
 //! Trusted, bounded clearing of an already closed history. No Auth or Host grant is consumed.
 //! Each batch keeps its original transaction owner; completion and its typed audit are atomic.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -391,17 +392,196 @@ impl PostgresThreadHistoryAuthority {
         thread: &ThreadId,
         deadline: Instant,
     ) -> Result<Decision, Error> {
+        ClearAuthority::Ordinary(self)
+            .clear_original(tx, thread, deadline)
+            .await
+    }
+
+    async fn clear_binding(
+        &self,
+        tx: &Transaction<'_>,
+        thread: &ThreadId,
+        deadline: Instant,
+    ) -> Result<Binding, Error> {
+        ClearAuthority::Ordinary(self)
+            .clear_binding(tx, thread, deadline)
+            .await
+    }
+}
+
+// The Pending source borrows the actual candidate and its original transaction.
+enum ClearAuthority<'a> {
+    Ordinary(&'a PostgresThreadHistoryAuthority),
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    Pending {
+        deployment: &'a str,
+        tenant: &'a str,
+        audit_key: &'a [u8],
+        stages: &'a mut crate::recovery_control::RestoreStages,
+        control:
+            &'a mut Option<Result<Result<Row, tokio_postgres::Error>, tokio::time::error::Elapsed>>,
+        key_result:
+            &'a mut Option<Result<Result<(), tokio_postgres::Error>, tokio::time::error::Elapsed>>,
+    },
+}
+impl ClearAuthority<'_> {
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    fn retain_key_failure(
+        &mut self,
+        failure: Result<tokio_postgres::Error, tokio::time::error::Elapsed>,
+    ) -> Error {
+        let Self::Pending { key_result, .. } = self else {
+            return corrupt("clear_source");
+        };
+        **key_result = Some(match failure {
+            Ok(error) => Ok(Err(error)),
+            Err(elapsed) => Err(elapsed),
+        });
+        match key_result.as_ref() {
+            Some(Ok(Err(error))) => statement_error_ref(error),
+            _ => Error::Unavailable,
+        }
+    }
+    fn reserve_memory(
+        &mut self,
+        bytes: usize,
+    ) -> Result<Option<[crate::recovery_control::RestoreCapacityReservation; 2]>, Error> {
+        match self {
+            Self::Ordinary(_) => Ok(None),
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { stages, .. } => {
+                use crate::recovery_control::RestoreCapacityResource as Resource;
+                let bytes = u64::try_from(bytes).map_err(|_| Error::Unavailable)?;
+                let metadata = stages
+                    .admit_capacity(Resource::MetadataBytes, bytes)
+                    .map_err(|error| {
+                        stages.failure(error.fault());
+                        Error::Unavailable
+                    })?;
+                let allocation = stages
+                    .admit_capacity(Resource::TotalAllocationBytes, bytes)
+                    .map_err(|error| {
+                        stages.failure(error.fault());
+                        Error::Unavailable
+                    })?;
+                Ok(Some([metadata, allocation]))
+            }
+        }
+    }
+    fn settle_memory(
+        &mut self,
+        reservation: Option<[crate::recovery_control::RestoreCapacityReservation; 2]>,
+        bytes: usize,
+    ) -> Result<(), Error> {
+        #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+        if let (Self::Pending { stages, .. }, Some(reservations)) = (self, reservation) {
+            let bytes = u64::try_from(bytes).map_err(|_| Error::Unavailable)?;
+            for reserved in reservations {
+                stages.settle_capacity(reserved, bytes).map_err(|error| {
+                    stages.failure(error.fault());
+                    Error::Unavailable
+                })?;
+            }
+        }
+        #[cfg(not(all(feature = "server-runtime", target_os = "macos")))]
+        let _ordinary = (reservation, bytes);
+        Ok(())
+    }
+    /// A restore candidate pays the binding row's measured text bytes (driver
+    /// row and owned copies) before [`Self::clear_binding`] allocates them.
+    async fn reserve_binding(
+        &mut self,
+        tx: &Transaction<'_>,
+        thread: &ThreadId,
+        deadline: Instant,
+    ) -> Result<
+        (
+            Option<[crate::recovery_control::RestoreCapacityReservation; 2]>,
+            usize,
+        ),
+        Error,
+    > {
+        if matches!(self, Self::Ordinary(_)) {
+            return Ok((None, 0));
+        }
+        let measured = one(
+            tx,
+            deadline,
+            &format!("SELECT coalesce(sum(octet_length(operation_id)+octet_length(actor_id)+octet_length(intent_kind)),0)::bigint AS bytes FROM ({BINDING}) binding"),
+            &[&self.deployment(), &self.tenant(), &thread.as_str()],
+        )
+        .await?;
+        let bytes = usize::try_from(column::<i64>(&measured, "bytes")?)
+            .ok()
+            .and_then(|bytes| {
+                bytes
+                    .checked_mul(2)?
+                    .checked_add(std::mem::size_of::<Binding>())
+            })
+            .ok_or(Error::Unavailable)?;
+        Ok((self.reserve_memory(bytes)?, bytes))
+    }
+    fn batch_bound(&self) -> usize {
+        match self {
+            Self::Ordinary(_) => ROW_LIMIT,
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { .. } => 64,
+        }
+    }
+    fn deployment(&self) -> &str {
+        match self {
+            Self::Ordinary(authority) => authority.deployment.as_str(),
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { deployment, .. } => deployment,
+        }
+    }
+    fn tenant(&self) -> &str {
+        match self {
+            Self::Ordinary(authority) => authority.tenant.as_str(),
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { tenant, .. } => tenant,
+        }
+    }
+    fn audit_key(&self) -> Result<&[u8], Error> {
+        match self {
+            Self::Ordinary(authority) => authority.clear_checkpoint_key(),
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { audit_key, .. } => Ok(audit_key),
+        }
+    }
+    async fn clear_original(
+        &mut self,
+        tx: &Transaction<'_>,
+        thread: &ThreadId,
+        deadline: Instant,
+    ) -> Result<Decision, Error> {
         set_timeouts(tx, deadline).await?;
         // Complete current prefix/origin/writer observation, once and before any row lock.
+        // A restore candidate pays the observation's measured bytes before it
+        // allocates; the oracle trees were paid once when the candidate was bound.
+        let measured = match self {
+            Self::Ordinary(_) => 0,
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { .. } => usize::try_from(
+                bounded(deadline, CurrentWriterSchema::observation_bytes(tx))
+                    .await?
+                    .map_err(schema_error)?,
+            )
+            .map_err(|_| Error::Unavailable)?,
+        };
+        let schema_memory = self.reserve_memory(measured)?;
         let schema = bounded(deadline, CurrentWriterSchema::observe(tx))
             .await?
             .map_err(schema_error)?;
+        self.settle_memory(schema_memory, measured)?;
+        let (binding_memory, binding_bytes) = self.reserve_binding(tx, thread, deadline).await?;
         let binding = self.clear_binding(tx, thread, deadline).await?;
+        self.settle_memory(binding_memory, binding_bytes)?;
         // Q is immutable metadata, but its NOWAIT row lock serializes this operation's batch
         // sequence/count preselection with other batches and completion, without a new wait edge.
         let locked = rows(tx, deadline,
             "SELECT q.operation_id FROM openbot_internal.thread_history_clear_intents q JOIN openbot_internal.thread_history_heads h ON h.closure_operation_id=q.operation_id WHERE q.deployment_id=$1 AND q.tenant_id=$2 AND q.thread_id=$3 AND q.operation_id=$4 AND h.deployment_id=q.deployment_id AND h.tenant_id=q.tenant_id AND h.thread_id=q.thread_id AND h.phase='closed' FOR UPDATE OF q NOWAIT",
-            &[&self.deployment.as_str(),&self.tenant.as_str(),&thread.as_str(),&binding.operation_id]).await?;
+            &[&self.deployment(),&self.tenant(),&thread.as_str(),&binding.operation_id]).await?;
         if locked.len() != 1 {
             return Err(corrupt("history_binding"));
         }
@@ -424,7 +604,7 @@ impl PostgresThreadHistoryAuthority {
                 .clear_completion(tx, &schema, thread, binding, deadline)
                 .await;
         }
-        let selection = select_batch(tx, thread, self.tenant.as_str(), deadline).await?;
+        let selection = select_batch(tx, thread, self, deadline).await?;
         if selection.counts.total() == 0 && !erased {
             return Err(corrupt("clear_body_remaining"));
         }
@@ -463,7 +643,7 @@ impl PostgresThreadHistoryAuthority {
         // proof on this original transaction, checking the complete physical closed joint.
         require_closed(&schema, tx, thread, deadline).await?;
         for selected in selection.tables {
-            apply_table(tx, thread, &binding.actor, selected, deadline).await?;
+            apply_table(tx, thread, &binding.actor, selected, self, deadline).await?;
         }
         settle(tx, deadline).await?;
         Ok(Decision::Batch {
@@ -481,11 +661,7 @@ impl PostgresThreadHistoryAuthority {
             tx,
             deadline,
             BINDING,
-            &[
-                &self.deployment.as_str(),
-                &self.tenant.as_str(),
-                &thread.as_str(),
-            ],
+            &[&self.deployment(), &self.tenant(), &thread.as_str()],
         )
         .await?;
         let [row] = found.as_slice() else {
@@ -528,7 +704,7 @@ impl PostgresThreadHistoryAuthority {
     }
 
     async fn clear_completion(
-        &self,
+        &mut self,
         tx: &Transaction<'_>,
         schema: &CurrentWriterSchema<'_, '_>,
         thread: &ThreadId,
@@ -538,13 +714,15 @@ impl PostgresThreadHistoryAuthority {
         // Exclusive H NOWAIT prevents a later batch passing our completion snapshot.
         let locked = rows(tx, deadline,
             "SELECT thread_id FROM openbot_internal.thread_history_heads WHERE deployment_id=$1 AND tenant_id=$2 AND thread_id=$3 AND phase='closed' AND closure_operation_id=$4 FOR UPDATE NOWAIT",
-            &[&self.deployment.as_str(),&self.tenant.as_str(),&thread.as_str(),&binding.operation_id]).await?;
+            &[&self.deployment(),&self.tenant(),&thread.as_str(),&binding.operation_id]).await?;
         if locked.len() != 1 {
             return Err(corrupt("history_binding"));
         }
         require_closed(schema, tx, thread, deadline).await?;
         // Separate RC statements after the possible pre-lock race, not a stale pre-lock answer.
+        let (binding_memory, binding_bytes) = self.reserve_binding(tx, thread, deadline).await?;
         let fresh = self.clear_binding(tx, thread, deadline).await?;
+        self.settle_memory(binding_memory, binding_bytes)?;
         if fresh.operation_id != binding.operation_id {
             return Err(corrupt("history_binding"));
         }
@@ -574,8 +752,8 @@ impl PostgresThreadHistoryAuthority {
             INSERT_COMPLETION,
             &[
                 &binding.operation_id,
-                &self.deployment.as_str(),
-                &self.tenant.as_str(),
+                &self.deployment(),
+                &self.tenant(),
                 &thread.as_str(),
                 &binding.source.as_str(),
             ],
@@ -586,6 +764,28 @@ impl PostgresThreadHistoryAuthority {
         if batches.get() == 0 || column::<i64>(&completion, "run_output_expired")? != 0 {
             return Err(corrupt("clear_completion_count"));
         }
+        // A restore candidate pays the completion audit as the retirement audit
+        // does: its text six times plus the event and stored row, before building it.
+        let audit_bytes = match self {
+            Self::Ordinary(_) => 0,
+            #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+            Self::Pending { .. } => binding
+                .actor
+                .len()
+                .checked_add(thread.as_str().len())
+                .and_then(|n| n.checked_add(binding.operation_id.len()))
+                .and_then(|n| n.checked_mul(6))
+                .and_then(|n| {
+                    n.checked_add(
+                        2 * std::mem::size_of::<AuditEvent>()
+                            + 2 * std::mem::size_of::<openbot_domain::audit::chain::StoredAuditRow>(
+                            )
+                            + 1024,
+                    )
+                })
+                .ok_or(Error::Unavailable)?,
+        };
+        let audit_memory = self.reserve_memory(audit_bytes)?;
         let payload = counts.audit(&binding, batches)?;
         // Try the original audit lock and tail NOWAIT before the existing chain helpers. Their
         // advisory acquisition and tail lock are reentrant on our already-held original locks.
@@ -619,10 +819,11 @@ impl PostgresThreadHistoryAuthority {
         };
         bounded(
             deadline,
-            append_event_in_transaction(tx, &event, self.clear_checkpoint_key()?),
+            append_event_in_transaction(tx, &event, self.audit_key()?),
         )
         .await?
         .map_err(schema_error)?;
+        self.settle_memory(audit_memory, audit_bytes)?;
         // Force all completion and original writer deferred checks before COMMIT. A database
         // rejection here is known; the guarded COMMIT still owns any later unknown ACK.
         match bounded(deadline, tx.batch_execute("SET CONSTRAINTS ALL IMMEDIATE")).await? {
@@ -635,6 +836,40 @@ impl PostgresThreadHistoryAuthority {
             }
         }
         Ok(Decision::Complete(binding.operation_id))
+    }
+}
+
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+pub(super) async fn clear_restored_original(
+    source: &mut crate::backup::whole_pg_restore_stream::candidate_sql::PendingHistoryClearSource<
+        '_,
+        '_,
+    >,
+    thread: &ThreadId,
+    deadline: Instant,
+) -> Result<super::RestoredHistoryBatch, Error> {
+    let (transaction, deployment, tenant, audit_key, stages, control, key_result) = source.parts();
+    let mut authority = ClearAuthority::Pending {
+        deployment,
+        tenant,
+        audit_key,
+        stages,
+        control,
+        key_result,
+    };
+    match authority
+        .clear_original(transaction, thread, deadline)
+        .await?
+    {
+        Decision::Batch { more } => Ok(super::RestoredHistoryBatch::Batch { more }),
+        Decision::Complete(operation_id) => {
+            Ok(super::RestoredHistoryBatch::Complete { operation_id })
+        }
+        Decision::ExistingComplete(operation_id) => {
+            Ok(super::RestoredHistoryBatch::ExistingComplete { operation_id })
+        }
+        Decision::AwaitingDrain => Ok(super::RestoredHistoryBatch::AwaitingDrain),
+        Decision::AwaitingReaders => Ok(super::RestoredHistoryBatch::AwaitingReaders),
     }
 }
 
@@ -869,44 +1104,88 @@ impl ClearCounts {
 async fn select_batch(
     tx: &Transaction<'_>,
     thread: &ThreadId,
-    tenant: &str,
+    authority: &mut ClearAuthority<'_>,
     deadline: Instant,
 ) -> Result<Selection, Error> {
-    let foreign = one(tx,deadline,"SELECT EXISTS(SELECT 1 FROM public.memories WHERE scope_kind='thread' AND scope_id=$1 AND tenant_id IS DISTINCT FROM $2) AS foreign_memory",&[&thread.as_str(),&tenant]).await?;
+    let foreign = one(tx,deadline,"SELECT EXISTS(SELECT 1 FROM public.memories WHERE scope_kind='thread' AND scope_id=$1 AND tenant_id IS DISTINCT FROM $2) AS foreign_memory",&[&thread.as_str(),&authority.tenant()]).await?;
     if column::<bool>(&foreign, "foreign_memory")? {
         return Err(corrupt("memory_scope"));
     }
+    let table_memory = authority.reserve_memory(
+        ClearTable::ALL
+            .len()
+            .checked_mul(std::mem::size_of::<SelectedTable>())
+            .ok_or(Error::Unavailable)?,
+    )?;
     let mut tables = Vec::with_capacity(ClearTable::ALL.len());
+    authority.settle_memory(
+        table_memory,
+        tables
+            .capacity()
+            .checked_mul(std::mem::size_of::<SelectedTable>())
+            .ok_or(Error::Unavailable)?,
+    )?;
     let mut counts = ClearCounts::default();
     for kind in ClearTable::ALL {
         // Identifiers and fragments below are compiled closed vocabulary; runtime input is bound.
-        let sql = format!(
-            "SELECT {} AS key FROM {} e{} WHERE {} AND {} ORDER BY {} LIMIT 128",
+        let sql_length = "SELECT  AS key FROM  e WHERE  AND  ORDER BY  LIMIT "
+            .len()
+            .checked_add(kind.key().len())
+            .and_then(|n| n.checked_add(kind.table().len()))
+            .and_then(|n| n.checked_add(kind.joins().len()))
+            .and_then(|n| n.checked_add(kind.scope().len()))
+            .and_then(|n| n.checked_add(kind.pending().len()))
+            .and_then(|n| n.checked_add(kind.order().len()))
+            .and_then(|n| n.checked_add(authority.batch_bound().ilog10() as usize + 1))
+            .ok_or(Error::Unavailable)?;
+        let sql_memory = authority.reserve_memory(sql_length)?;
+        let mut sql = String::with_capacity(sql_length);
+        write!(
+            &mut sql,
+            "SELECT {} AS key FROM {} e{} WHERE {} AND {} ORDER BY {} LIMIT {}",
             kind.key(),
             kind.table(),
             kind.joins(),
             kind.scope(),
             kind.pending(),
-            kind.order()
-        );
-        let selected = rows(tx, deadline, &sql, &[&thread.as_str()]).await?;
-        if selected.len() > ROW_LIMIT {
-            return Err(corrupt("clear_batch_bound"));
-        }
-        let keys = if matches!(kind, ClearTable::RunEvents) {
-            Keys::Event(
-                selected
-                    .iter()
-                    .map(|row| column(row, "key"))
-                    .collect::<Result<Vec<i64>, _>>()?,
+            kind.order(),
+            authority.batch_bound()
+        )
+        .map_err(|_| Error::Unavailable)?;
+        authority.settle_memory(sql_memory, sql.capacity())?;
+        #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+        let pending_keys = if matches!(authority, ClearAuthority::Pending { .. }) {
+            Some(
+                select_pending_keys(tx, &[&thread.as_str()], kind, &sql, authority, deadline)
+                    .await?,
             )
         } else {
-            Keys::Text(
-                selected
-                    .iter()
-                    .map(|row| column(row, "key"))
-                    .collect::<Result<Vec<String>, _>>()?,
-            )
+            None
+        };
+        #[cfg(not(all(feature = "server-runtime", target_os = "macos")))]
+        let pending_keys: Option<Keys> = None;
+        let keys = if let Some(keys) = pending_keys {
+            keys
+        } else {
+            let selected = rows(tx, deadline, &sql, &[&thread.as_str()]).await?;
+            if selected.len() > authority.batch_bound() {
+                return Err(corrupt("clear_batch_bound"));
+            }
+            if matches!(kind, ClearTable::RunEvents) {
+                Keys::Event(
+                    selected
+                        .iter()
+                        .map(|row| column(row, "key"))
+                        .collect::<Result<Vec<i64>, _>>()?,
+                )
+            } else {
+                Keys::Text(
+                    selected
+                        .iter()
+                        .map(|row| column(row, "key"))
+                        .collect::<Result<Vec<String>, _>>()?,
+                )
+            }
         };
         counts.set(
             kind,
@@ -917,11 +1196,227 @@ async fn select_batch(
     Ok(Selection { tables, counts })
 }
 
+#[cfg(all(feature = "server-runtime", target_os = "macos"))]
+async fn select_pending_keys(
+    tx: &Transaction<'_>,
+    parameters: &[&(dyn ToSql + Sync)],
+    kind: ClearTable,
+    sql: &str,
+    authority: &mut ClearAuthority<'_>,
+    deadline: Instant,
+) -> Result<Keys, Error> {
+    use crate::recovery_control::RestoreCapacityResource as Resource;
+    use futures_util::TryStreamExt;
+    let field_bytes = if matches!(kind, ClearTable::RunEvents) {
+        "8"
+    } else {
+        "octet_length(key)"
+    };
+    let measure_length = "SELECT count(*)::bigint,coalesce(sum(),0)::bigint,coalesce(max(),0)::bigint FROM () measured".len()
+        .checked_add(2 * field_bytes.len()).and_then(|n| n.checked_add(sql.len())).ok_or(Error::Unavailable)?;
+    let measured_sql_memory = authority.reserve_memory(measure_length)?;
+    let mut measure = String::with_capacity(measure_length);
+    write!(&mut measure, "SELECT count(*)::bigint,coalesce(sum({field_bytes}),0)::bigint,coalesce(max({field_bytes}),0)::bigint FROM ({sql}) measured").map_err(|_| Error::Unavailable)?;
+    authority.settle_memory(measured_sql_memory, measure.capacity())?;
+    // The locked tokio-postgres Row owns one range slot per field; DataRowBody
+    // excludes the field-count header and retains each int32 length plus payload.
+    let control_bytes = std::mem::size_of::<Row>()
+        + 3 * (std::mem::size_of::<Option<std::ops::Range<usize>>>() + 4 + 8);
+    let control_memory = authority.reserve_memory(control_bytes)?;
+    let (count, bytes, maximum) = {
+        let ClearAuthority::Pending {
+            stages, control, ..
+        } = authority
+        else {
+            return Err(corrupt("clear_source"));
+        };
+        let rows = stages
+            .admit_capacity(Resource::PgRows, 1)
+            .map_err(|_| Error::Unavailable)?;
+        **control = Some(
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                tx.query_one(&measure, parameters),
+            )
+            .await,
+        );
+        stages
+            .effect_before(deadline)
+            .map_err(|_| Error::Unavailable)?;
+        let row = control
+            .as_ref()
+            .and_then(|v| v.as_ref().ok())
+            .and_then(|v| v.as_ref().ok())
+            .ok_or(Error::Unavailable)?;
+        let count = usize::try_from(
+            row.try_get::<_, i64>(0)
+                .map_err(|_| corrupt("clear_key_measure"))?,
+        )
+        .map_err(|_| corrupt("clear_key_measure"))?;
+        let bytes = usize::try_from(
+            row.try_get::<_, i64>(1)
+                .map_err(|_| corrupt("clear_key_measure"))?,
+        )
+        .map_err(|_| corrupt("clear_key_measure"))?;
+        let maximum = usize::try_from(
+            row.try_get::<_, i64>(2)
+                .map_err(|_| corrupt("clear_key_measure"))?,
+        )
+        .map_err(|_| corrupt("clear_key_measure"))?;
+        stages
+            .settle_capacity(rows, 1)
+            .map_err(|_| Error::Unavailable)?;
+        (count, bytes, maximum)
+    };
+    authority.settle_memory(control_memory, control_bytes)?;
+    if count > authority.batch_bound() {
+        return Err(corrupt("clear_batch_bound"));
+    }
+    let element = if matches!(kind, ClearTable::RunEvents) {
+        std::mem::size_of::<i64>()
+    } else {
+        std::mem::size_of::<String>()
+    };
+    let key_memory = count
+        .checked_mul(element)
+        .and_then(|n| {
+            n.checked_add(if matches!(kind, ClearTable::RunEvents) {
+                0
+            } else {
+                bytes
+            })
+        })
+        // query_raw yields one owned Row at a time; there is no Vec<Row> growth.
+        .and_then(|n| {
+            n.checked_add(
+                std::mem::size_of::<Row>()
+                    + std::mem::size_of::<Option<std::ops::Range<usize>>>()
+                    + 4,
+            )
+        })
+        .and_then(|n| n.checked_add(maximum))
+        .ok_or(Error::Unavailable)?;
+    let keys_reserved = authority.reserve_memory(key_memory)?;
+    let mut keys = if matches!(kind, ClearTable::RunEvents) {
+        Keys::Event(Vec::with_capacity(count))
+    } else {
+        Keys::Text(Vec::with_capacity(count))
+    };
+    // This retains every selected row. A changed value becomes NULL and refuses,
+    // rather than being filtered out or silently called cleared.
+    let bounded_length =
+        "SELECT CASE WHEN octet_length(key)<=$::bigint THEN key END AS key FROM () measured"
+            .len()
+            .checked_add(sql.len())
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::Unavailable)?;
+    let bounded_memory = authority.reserve_memory(bounded_length)?;
+    let mut bounded_sql = String::with_capacity(bounded_length);
+    if matches!(kind, ClearTable::RunEvents) {
+        bounded_sql.push_str(sql);
+    } else {
+        write!(&mut bounded_sql, "SELECT CASE WHEN octet_length(key)<=${}::bigint THEN key END AS key FROM ({sql}) measured", parameters.len() + 1).map_err(|_| Error::Unavailable)?;
+    }
+    authority.settle_memory(bounded_memory, bounded_sql.capacity())?;
+    let row_reservation = match authority {
+        ClearAuthority::Pending { stages, .. } => stages
+            .admit_capacity(Resource::PgRows, count as u64)
+            .map_err(|_| Error::Unavailable)?,
+        _ => return Err(corrupt("clear_source")),
+    };
+    let maximum_parameter = i64::try_from(maximum).map_err(|_| Error::Unavailable)?;
+    // The original two call sites bind thread or thread+selected PKs.
+    let mut params: [&(dyn ToSql + Sync); 3] = [&maximum_parameter; 3];
+    params[..parameters.len()].copy_from_slice(parameters);
+    let parameter_count = parameters.len() + usize::from(!matches!(kind, ClearTable::RunEvents));
+    let stream = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        tx.query_raw(&bounded_sql, params[..parameter_count].iter().copied()),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => return Err(authority.retain_key_failure(Ok(error))),
+        Err(elapsed) => return Err(authority.retain_key_failure(Err(elapsed))),
+    };
+    tokio::pin!(stream);
+    let mut actual = 0usize;
+    let mut greatest_row = 0usize;
+    loop {
+        let next = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            stream.try_next(),
+        )
+        .await
+        {
+            Ok(Ok(row)) => row,
+            Ok(Err(error)) => return Err(authority.retain_key_failure(Ok(error))),
+            Err(elapsed) => return Err(authority.retain_key_failure(Err(elapsed))),
+        };
+        let Some(row) = next else {
+            break;
+        };
+        if actual == count {
+            return Err(corrupt("clear_key_measure"));
+        }
+        let raw_bytes = match &mut keys {
+            Keys::Event(values) => {
+                values.push(column::<i64>(&row, "key")?);
+                8
+            }
+            Keys::Text(values) => {
+                let value: &str = row.try_get("key").map_err(|_| corrupt("row_decode"))?;
+                if value.len() > maximum {
+                    return Err(corrupt("clear_key_measure"));
+                }
+                values.push(value.to_owned());
+                value.len()
+            }
+        };
+        greatest_row = greatest_row.max(
+            std::mem::size_of::<Row>()
+                + std::mem::size_of::<Option<std::ops::Range<usize>>>()
+                + 4
+                + raw_bytes,
+        );
+        actual += 1;
+    }
+    if actual != count {
+        return Err(corrupt("clear_key_measure"));
+    }
+    if let ClearAuthority::Pending { key_result, .. } = authority {
+        **key_result = Some(Ok(Ok(())));
+    }
+    let actual_memory = match &keys {
+        Keys::Event(values) => values.capacity().checked_mul(std::mem::size_of::<i64>()),
+        Keys::Text(values) => values
+            .iter()
+            .try_fold(
+                values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<String>())
+                    .ok_or(Error::Unavailable)?,
+                |n, value| n.checked_add(value.capacity()).ok_or(Error::Unavailable),
+            )
+            .ok(),
+    }
+    .and_then(|n| n.checked_add(greatest_row))
+    .ok_or(Error::Unavailable)?;
+    authority.settle_memory(keys_reserved, actual_memory)?;
+    if let ClearAuthority::Pending { stages, .. } = authority {
+        stages
+            .settle_capacity(row_reservation, actual as u64)
+            .map_err(|_| Error::Unavailable)?;
+    }
+    Ok(keys)
+}
+
 async fn apply_table(
     tx: &Transaction<'_>,
     thread: &ThreadId,
     actor: &str,
     selected: SelectedTable,
+    authority: &mut ClearAuthority<'_>,
     deadline: Instant,
 ) -> Result<(), Error> {
     let kind = selected.kind;
@@ -929,7 +1424,19 @@ async fn apply_table(
     if expected == 0 {
         return Ok(());
     }
-    let sql = format!(
+    let sql_length =
+        "SELECT  AS key FROM  e WHERE  AND =ANY($2) AND  ORDER BY  FOR UPDATE OF e NOWAIT"
+            .len()
+            .checked_add(kind.key().len() * 2)
+            .and_then(|n| n.checked_add(kind.table().len()))
+            .and_then(|n| n.checked_add(kind.joins().len()))
+            .and_then(|n| n.checked_add(kind.scope().len()))
+            .and_then(|n| n.checked_add(kind.pending().len()))
+            .and_then(|n| n.checked_add(kind.order().len()))
+            .ok_or(Error::Unavailable)?;
+    let sql_memory = authority.reserve_memory(sql_length)?;
+    let mut sql = String::with_capacity(sql_length);
+    write!(&mut sql,
         "SELECT {} AS key FROM {} e{} WHERE {} AND {}=ANY($2) AND {} ORDER BY {} FOR UPDATE OF e NOWAIT",
         kind.key(),
         kind.table(),
@@ -938,9 +1445,26 @@ async fn apply_table(
         kind.key(),
         kind.pending(),
         kind.order()
-    );
+    ).map_err(|_| Error::Unavailable)?;
+    authority.settle_memory(sql_memory, sql.capacity())?;
     let params: &[&(dyn ToSql + Sync)] = &[&thread.as_str(), selected.keys.param()];
-    if rows(tx, deadline, &sql, params).await?.len() != expected {
+    #[cfg(all(feature = "server-runtime", target_os = "macos"))]
+    let pending_count = if matches!(authority, ClearAuthority::Pending { .. }) {
+        Some(
+            select_pending_keys(tx, params, kind, &sql, authority, deadline)
+                .await?
+                .len(),
+        )
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "server-runtime", target_os = "macos")))]
+    let pending_count: Option<usize> = None;
+    let actual = match pending_count {
+        Some(count) => count,
+        None => rows(tx, deadline, &sql, params).await?.len(),
+    };
+    if actual != expected {
         return Err(Error::Unavailable);
     }
     let changed=match kind {
@@ -1120,6 +1644,9 @@ const fn corrupt(field: &'static str) -> Error {
     Error::Corrupt { field }
 }
 fn statement_error(error: tokio_postgres::Error) -> Error {
+    statement_error_ref(&error)
+}
+fn statement_error_ref(error: &tokio_postgres::Error) -> Error {
     if let Some(db) = error.as_db_error()
         && db.code().code() == "55000"
     {

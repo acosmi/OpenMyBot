@@ -29,7 +29,7 @@ use tokio_postgres::{Row, Transaction, types::FromSql};
 use uuid::Uuid;
 
 /// The original scoped Pool is the sole source of definitions, grants and accepted work.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PostgresAutomations {
     pub(crate) pool: crate::db::pool::DatabasePool,
     pub(crate) deployment: DeploymentId,
@@ -37,6 +37,8 @@ pub struct PostgresAutomations {
     audit_key: Arc<SecretBytes>,
     /// Existing Vault holding one credentials row per receiver key revision.
     pub(crate) vault: crate::vault::CredentialRecordVault,
+    /// Recovery admission whose cohort gates every receiver key Vault-open.
+    pub(crate) recovery_gate: crate::recovery_control::RecoveryReadGate,
     /// Per-receiver process token buckets: 10 per second, burst 20.
     pub(crate) rate:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, f64)>>>,
@@ -50,6 +52,7 @@ impl PostgresAutomations {
         tenant: TenantId,
         audit_key: SecretBytes,
         vault: crate::vault::CredentialRecordVault,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, AppError> {
         if audit_key.is_empty() {
             return Err(unavailable());
@@ -60,6 +63,7 @@ impl PostgresAutomations {
             tenant,
             audit_key: Arc::new(audit_key),
             vault,
+            recovery_gate,
             rate: Arc::default(),
         })
     }

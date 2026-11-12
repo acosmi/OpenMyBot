@@ -254,6 +254,7 @@ pub struct PostgresBuiltInToolControlPlane<M> {
     drive: Option<GoogleDriveRestTransport>,
     approvals: Option<Arc<PostgresToolApprovalCoordinator>>,
     cancellations: Option<Arc<ToolCancellationRegistry>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 #[derive(Clone)]
@@ -277,6 +278,7 @@ impl<M> PostgresBuiltInToolControlPlane<M> {
         tenant: TenantId,
         policy: PolicyStore,
         memory: Arc<M>,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Self {
         Self {
             pool,
@@ -288,6 +290,7 @@ impl<M> PostgresBuiltInToolControlPlane<M> {
             drive: None,
             approvals: None,
             cancellations: None,
+            recovery_gate,
         }
     }
 
@@ -717,6 +720,23 @@ where
         let started = Instant::now();
         let (call, redeemed) = call.redeem();
         if call.metadata().name.as_str() != REMEMBER_TOOL_NAME {
+            // One worker admission for this call chain: SQL steps
+            // (5 s precedent), then up to two bearer resolutions (one OAuth round each)
+            // and two vendor calls (MCP_CALL_TIMEOUT, above the 30 s Drive bound).
+            let deadline = Instant::now()
+                + std::time::Duration::from_secs(5)
+                + (crate::mcp_oauth::MCP_OAUTH_ROUND_BUDGET + MCP_CALL_TIMEOUT) * 2;
+            let Ok(admission) = self.recovery_gate.borrow_worker_before(deadline).await else {
+                let (message, code) = mcp_credential_failure(McpCredentialError::Unavailable);
+                return ToolExecutionReport::new(
+                    redeemed,
+                    message.to_owned(),
+                    CommitState::NotCommitted,
+                    started.elapsed(),
+                    Some(code),
+                );
+            };
+            let current = || admission.verify_current_before(deadline).is_ok();
             let Some(runtime) = &self.mcp else {
                 return ToolExecutionReport::new(
                     redeemed,
@@ -798,21 +818,32 @@ where
                     Some("mcp_cancelled_before_call"),
                 );
             }
-            let bearer = match resolve_mcp_bearer(runtime, &tool, call.actor().actor()).await {
-                Ok(bearer) => bearer,
-                Err(error) => {
-                    let (message, code) = mcp_credential_failure(error);
-                    return ToolExecutionReport::new(
-                        redeemed,
-                        message.to_owned(),
-                        CommitState::NotCommitted,
-                        started.elapsed(),
-                        Some(code),
-                    );
-                }
-            };
+            let bearer =
+                match resolve_mcp_bearer(runtime, &tool, call.actor().actor(), &admission).await {
+                    Ok(bearer) => bearer,
+                    Err(error) => {
+                        let (message, code) = mcp_credential_failure(error);
+                        return ToolExecutionReport::new(
+                            redeemed,
+                            message.to_owned(),
+                            CommitState::NotCommitted,
+                            started.elapsed(),
+                            Some(code),
+                        );
+                    }
+                };
             let user_oauth =
                 tool.authentication == crate::mcp_catalog::McpAuthentication::UserOAuth;
+            if !current() {
+                let (message, code) = mcp_credential_failure(McpCredentialError::Unavailable);
+                return ToolExecutionReport::new(
+                    redeemed,
+                    message.to_owned(),
+                    CommitState::NotCommitted,
+                    started.elapsed(),
+                    Some(code),
+                );
+            }
             let mut outcome = call_vendor_tool(
                 runtime,
                 self.drive.as_ref(),
@@ -826,29 +857,45 @@ where
             // rotates again and the original call is retried once; no loop and no retry exists for
             // insufficient scope, transport errors, or deployment bearer credentials.
             if user_oauth && outcome == Err(McpClientError::AuthRequired) {
-                let retry_bearer =
-                    match resolve_mcp_bearer(runtime, &tool, call.actor().actor()).await {
-                        Ok(Some(bearer)) => bearer,
-                        Ok(None) => {
-                            return ToolExecutionReport::new(
-                                redeemed,
-                                "This connector requires authentication again.".to_owned(),
-                                CommitState::NotCommitted,
-                                started.elapsed(),
-                                Some("mcp_auth_required"),
-                            );
-                        }
-                        Err(error) => {
-                            let (message, code) = mcp_credential_failure(error);
-                            return ToolExecutionReport::new(
-                                redeemed,
-                                message.to_owned(),
-                                CommitState::NotCommitted,
-                                started.elapsed(),
-                                Some(code),
-                            );
-                        }
-                    };
+                let retry_bearer = match resolve_mcp_bearer(
+                    runtime,
+                    &tool,
+                    call.actor().actor(),
+                    &admission,
+                )
+                .await
+                {
+                    Ok(Some(bearer)) => bearer,
+                    Ok(None) => {
+                        return ToolExecutionReport::new(
+                            redeemed,
+                            "This connector requires authentication again.".to_owned(),
+                            CommitState::NotCommitted,
+                            started.elapsed(),
+                            Some("mcp_auth_required"),
+                        );
+                    }
+                    Err(error) => {
+                        let (message, code) = mcp_credential_failure(error);
+                        return ToolExecutionReport::new(
+                            redeemed,
+                            message.to_owned(),
+                            CommitState::NotCommitted,
+                            started.elapsed(),
+                            Some(code),
+                        );
+                    }
+                };
+                if !current() {
+                    let (message, code) = mcp_credential_failure(McpCredentialError::Unavailable);
+                    return ToolExecutionReport::new(
+                        redeemed,
+                        message.to_owned(),
+                        CommitState::NotCommitted,
+                        started.elapsed(),
+                        Some(code),
+                    );
+                }
                 outcome = call_vendor_tool(
                     runtime,
                     self.drive.as_ref(),
@@ -1025,6 +1072,7 @@ async fn resolve_mcp_bearer(
     runtime: &McpToolRuntime,
     tool: &GrantedMcpTool,
     actor: &ActorId,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
 ) -> Result<Option<crate::mcp::McpBearerToken>, McpCredentialError> {
     if tool.authentication == crate::mcp_catalog::McpAuthentication::None {
         return Ok(None);
@@ -1034,7 +1082,7 @@ async fn resolve_mcp_bearer(
         .as_ref()
         .ok_or(McpCredentialError::AuthRequired)?;
     credentials
-        .bearer_for(&tool.server_id, actor)
+        .bearer_for_admitted(&tool.server_id, actor, admission)
         .await?
         .map(Some)
         .ok_or(McpCredentialError::Corrupt {

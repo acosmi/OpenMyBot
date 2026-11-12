@@ -94,6 +94,7 @@ async fn actual_postgres_restart_preserves_unknown_occupancy_and_positive_effect
                 config,
                 "restarted-runtime".into(),
                 time::Duration::minutes(10),
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&restarted, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside")),
             )
             .map_err(|e| e.to_string())?;
             let conversation = directory

@@ -227,6 +227,12 @@ impl Fixture {
         let policy_store = PolicyStore::postgres(pool.clone(), None);
         policy_store.load().await.map_err(text)?;
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: pool.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -285,11 +291,25 @@ impl Fixture {
         resolver
             .install_thread_history_authority(&authority)
             .map_err(text)?;
+        resolver
+            .install_recovery_read_gate(
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &pool,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
+            )
+            .map_err(text)?;
         let directory = PostgresThreadDirectory::with_runtime(
             pool.clone(),
             config.clone(),
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?
         .with_model_dataset_binding(Arc::clone(&assembly.model_dataset_binding))
@@ -404,6 +424,11 @@ impl Fixture {
             PROCESS.into(),
             DEFAULT_THREAD_LEASE_DURATION,
             DEFAULT_DISPATCH_CLAIM_DURATION,
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &self.pool,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .map_err(text)?;
         let claim = runtime

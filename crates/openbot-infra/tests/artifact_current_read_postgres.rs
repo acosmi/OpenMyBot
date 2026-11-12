@@ -88,6 +88,11 @@ async fn actual_owned_pool_enrollment_rejects_foreign_manager_and_scope() {
                     store,
                     policy,
                     SecretBytes::new(vec![0x81; 32]),
+                    openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                        &pool,
+                        &deployment,
+                        &tenant,
+                    ),
                 )
                 .map_err(|error| error.to_string())?,
             );

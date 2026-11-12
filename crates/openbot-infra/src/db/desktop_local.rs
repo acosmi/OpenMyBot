@@ -62,6 +62,7 @@ pub struct DesktopLocalDatabase {
     pool: DatabasePool,
     origin: DesktopLocalDatabaseOrigin,
     owner: Arc<()>,
+    admin_observations: Option<Vec<super::pool::ConnectionObservation>>,
     #[cfg(all(
         feature = "desktop-local-vault",
         feature = "server-runtime",
@@ -162,6 +163,19 @@ impl AttestedDesktopLocalAdmin {
             ))
         })?;
         drop(client);
+        // Every admin driver created since before the first probe stays registered
+        // with its supervisor until it is destroyed. When every registered owner
+        // is still live and no owner ever left the registry, these observations
+        // are that complete original set. A destroyed connect future on a driving
+        // owner is the successful hand-over to its Connection, not a destruction.
+        let ended = self.pool.ownership_snapshot();
+        let admin = self.pool.connection_observations();
+        let admin_observations = (!admin.is_empty()
+            && ended.active_resources == admin.len()
+            && ended.destroyed_connections == 0
+            && ended.destroyed_before_start == 0
+            && ended.destroyed_connecting_futures == ended.driving)
+            .then_some(admin);
         self.pool.close();
         let origin = origin?;
 
@@ -215,6 +229,7 @@ impl AttestedDesktopLocalAdmin {
             pool,
             origin,
             owner: Arc::new(()),
+            admin_observations,
             #[cfg(all(
                 feature = "desktop-local-vault",
                 feature = "server-runtime",
@@ -242,6 +257,13 @@ impl DesktopLocalDatabase {
     #[must_use]
     pub fn clone_pool(&self) -> DatabasePool {
         self.pool.clone()
+    }
+
+    /// The closed admin pool's original driver observations, when they are the
+    /// complete set observed from before its first probe; None otherwise.
+    #[must_use]
+    pub fn admin_observations(&self) -> Option<&[super::pool::ConnectionObservation]> {
+        self.admin_observations.as_deref()
     }
 
     /// Mechanical fixed-database origin for startup evidence.

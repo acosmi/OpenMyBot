@@ -19,6 +19,7 @@ pub(super) struct OperationSendFence<'a> {
     store: &'a PluginUserCredentialStore,
     prepared: &'a PreparedUserOAuthCredential,
     operation: &'a RefreshOperation,
+    admission: &'a RecoveryWorkerLease<'a>,
     // 0=new, 1=claim in progress, 2=durably admitted, 3=refused/uncertain. Never reset.
     state: AtomicU8,
 }
@@ -28,11 +29,13 @@ impl<'a> OperationSendFence<'a> {
         store: &'a PluginUserCredentialStore,
         prepared: &'a PreparedUserOAuthCredential,
         operation: &'a RefreshOperation,
+        admission: &'a RecoveryWorkerLease<'a>,
     ) -> Self {
         Self {
             store,
             prepared,
             operation,
+            admission,
             state: AtomicU8::new(0),
         }
     }
@@ -48,10 +51,16 @@ impl RefreshSendFence for OperationSendFence<'_> {
         self.state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| OAuthTokenExchangeError::Unavailable)?;
-        let result = self
-            .store
-            .admit_refresh(self.prepared, self.operation)
-            .await;
+        // The held admission is rechecked at the durable send admission, which
+        // the adapter reaches immediately before its token POST.
+        let result = match current(self.admission) {
+            Ok(()) => {
+                self.store
+                    .admit_refresh(self.prepared, self.operation, self.admission)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         self.state
             .store(if result.is_ok() { 2 } else { 3 }, Ordering::Release);
         result.map_err(|_| OAuthTokenExchangeError::Unavailable)
@@ -59,9 +68,11 @@ impl RefreshSendFence for OperationSendFence<'_> {
 }
 
 impl PluginUserCredentialStore {
+    /// Claims under the caller's held worker admission, rechecked before COMMIT.
     pub(super) async fn claim_refresh(
         &self,
         prepared: &PreparedUserOAuthCredential,
+        admission: &RecoveryWorkerLease<'_>,
     ) -> Result<RefreshOperation, UserCredentialSelectionError> {
         if self.rotation_checkpoint_key.is_none() {
             return Err(UserCredentialSelectionError::Corrupt {
@@ -109,16 +120,20 @@ impl PluginUserCredentialStore {
             "INSERT INTO public.oauth_refresh_operations(operation_id,credential_id,generation,actor_id,auth_generation,server_id,client_credential_id,server_generation,server_updated_at,client_updated_at,resource,transport,egress_allow_cidrs,granted_scope,state,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',clock_timestamp())",
             &[&operation.id,&prepared.user_credential_id,&operation.generation,&prepared.actor.as_str(),&prepared.auth_generation,&prepared.server_id,&prepared.deployment_credential_id,&prepared.server_generation,&prepared.server_updated_at,&prepared.client_updated_at,&prepared.endpoint,&prepared.transport,&prepared.egress_allow_cidrs,&prepared.scope],
         ).await.map_err(|_| UserCredentialSelectionError::Unavailable)?;
+        current(admission)?;
         tx.commit()
             .await
             .map_err(|_| UserCredentialSelectionError::CommitUnknown)?;
         Ok(operation)
     }
 
+    /// The durable send admission: the same worker admission is rechecked
+    /// before its COMMIT, the last step before the token POST.
     async fn admit_refresh(
         &self,
         prepared: &PreparedUserOAuthCredential,
         operation: &RefreshOperation,
+        admission: &RecoveryWorkerLease<'_>,
     ) -> Result<(), UserCredentialSelectionError> {
         let mut client = self
             .pool
@@ -143,6 +158,7 @@ impl PluginUserCredentialStore {
         if changed != 1 {
             return Err(UserCredentialSelectionError::RotationPending);
         }
+        current(admission)?;
         tx.commit()
             .await
             .map_err(|_| UserCredentialSelectionError::CommitUnknown)
@@ -357,4 +373,146 @@ async fn lock_binding(
         .map_err(|_| UserCredentialSelectionError::Unavailable)?;
     row.map(|_| ())
         .ok_or(UserCredentialSelectionError::Conflict)
+}
+
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod tests {
+    use super::{PluginUserCredentialStore, UserCredentialSelectionError};
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use crate::vault::CredentialRecordVault;
+    use openbot_contracts::ids::{ActorId, TenantId};
+    use openbot_domain::vault::{
+        KeyVersion, SecretBytes, SecretKind, SecretPrincipal, ServiceId, WrappingKey,
+    };
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    const SERVER: &str = "restored-drive";
+
+    /// T046-32 on a published RestoreCurrent: a worker lease borrowed while
+    /// the runtime owner lived is rechecked before each durable claim and send
+    /// admission, so neither commits once that owner is dropped.
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_32_dropped_runtime_owner_closes_refresh_claim_and_admit() {
+        let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
+        let vault = CredentialRecordVault::single_key(
+            TenantId::new("ten"),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x42; 32]).unwrap(),
+        );
+        let client = restored.pool.get().await.unwrap();
+        client.batch_execute("INSERT INTO public.mcp_servers(id,title,vendor,url,provenance)
+            VALUES('restored-drive','Restored Drive','Google','https://www.googleapis.com/drive/v3','first-party');").await.unwrap();
+        let oauth_client = Uuid::now_v7();
+        let sealed = vault
+            .seal(
+                &oauth_client,
+                SecretKind::McpOauthClient,
+                SecretPrincipal::Deployment,
+                SecretPrincipal::Service(ServiceId::new(SERVER)),
+                &SecretBytes::new(
+                    br#"{"clientId":"client-id","clientSecret":"client-secret"}"#.to_vec(),
+                ),
+            )
+            .unwrap();
+        client.execute("INSERT INTO public.credentials(id,kind,provider,encrypted_value,key_id,metadata) VALUES($1,'mcp_oauth_client',$2,$3,'oauth-client','{}')",
+            &[&oauth_client, &SERVER, &sealed]).await.unwrap();
+        client
+            .execute(
+                "UPDATE public.mcp_servers SET credential_id=$2 WHERE id=$1",
+                &[&SERVER, &oauth_client],
+            )
+            .await
+            .unwrap();
+        let mut tokens = Vec::new();
+        for actor in ["alice", "bob", "carol"] {
+            client.execute("INSERT INTO public.users(id,email,auth_generation) VALUES($1,$1||'@restored.example.test',0)", &[&actor]).await.unwrap();
+            client
+                .execute(
+                    "INSERT INTO public.user_roles(user_id,role) VALUES($1,'user')",
+                    &[&actor],
+                )
+                .await
+                .unwrap();
+            let token = Uuid::now_v7();
+            let sealed = vault
+                .seal(
+                    &token,
+                    SecretKind::McpUserToken,
+                    SecretPrincipal::Actor(ActorId::new(actor)),
+                    SecretPrincipal::Service(ServiceId::new(SERVER)),
+                    &SecretBytes::new(format!("refresh-token-for-{actor}").into_bytes()),
+                )
+                .unwrap();
+            client.execute("INSERT INTO public.credentials(id,kind,provider,encrypted_value,key_id,metadata) VALUES($1,'mcp_user_token',$2,$3,$4,'{}')",
+                &[&token, &SERVER, &sealed, &actor]).await.unwrap();
+            client.execute("INSERT INTO public.mcp_user_credentials(server_id,user_id,credential_id,scope) VALUES($1,$2,$3,'https://www.googleapis.com/auth/drive.readonly')",
+                &[&SERVER, &actor, &token]).await.unwrap();
+            tokens.push(token);
+        }
+        let store =
+            PluginUserCredentialStore::new(restored.pool.clone(), vault, restored.read_gate())
+                .with_rotation_audit_key(vec![0x5a; 32])
+                .unwrap();
+        let gate = restored.read_gate();
+        let lease = gate
+            .borrow_worker_before(Instant::now() + Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(lease.restore_cohort(), Some(restored.cohort));
+        let mut prepared = Vec::new();
+        for actor in ["alice", "bob", "carol"] {
+            prepared.push(
+                store
+                    .prepare_admitted(SERVER, &ActorId::new(actor), &lease)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Positive control under the live owner: claim and send admission commit.
+        let alice = store.claim_refresh(&prepared[0], &lease).await.unwrap();
+        store
+            .admit_refresh(&prepared[0], &alice, &lease)
+            .await
+            .unwrap();
+        let bob = store.claim_refresh(&prepared[1], &lease).await.unwrap();
+
+        drop(restored.runtime);
+        assert!(matches!(
+            store.admit_refresh(&prepared[1], &bob, &lease).await,
+            Err(UserCredentialSelectionError::Unavailable)
+        ));
+        assert!(matches!(
+            store.claim_refresh(&prepared[2], &lease).await,
+            Err(UserCredentialSelectionError::Unavailable)
+        ));
+        let rows = |credential: Uuid| {
+            let client = &client;
+            async move {
+                client.query_one("SELECT count(*)::bigint,count(admitted_at)::bigint FROM public.oauth_refresh_operations WHERE credential_id=$1", &[&credential])
+                    .await.unwrap()
+            }
+        };
+        let (alice_rows, bob_rows, carol_rows) = (
+            rows(tokens[0]).await,
+            rows(tokens[1]).await,
+            rows(tokens[2]).await,
+        );
+        assert_eq!(
+            (alice_rows.get::<_, i64>(0), alice_rows.get::<_, i64>(1)),
+            (1, 1)
+        );
+        assert_eq!(
+            (bob_rows.get::<_, i64>(0), bob_rows.get::<_, i64>(1)),
+            (1, 0),
+            "send admitted after the owner dropped"
+        );
+        assert_eq!(
+            carol_rows.get::<_, i64>(0),
+            0,
+            "claim committed after the owner dropped"
+        );
+    }
 }

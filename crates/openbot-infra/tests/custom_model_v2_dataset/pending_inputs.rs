@@ -146,7 +146,7 @@ async fn w01_held_rows_do_not_block_direct_start() {
         let mut held=first.clone();held.command.run_id=RunId::new("held-only-input");
         assert!(matches!(accepted(f.directory.submit_thread_input(held.clone(),None).await),ThreadInputOutcome::Queued {position:1,..}));
         assert_eq!(f.directory.stop_thread_work(&auth(),&first.command.thread_id,None).await.unwrap().held,1);
-        let runtime=PostgresRunRuntime::new(f.pool.clone(),"owned-v2-runtime".into(),time::Duration::seconds(30),DEFAULT_DISPATCH_CLAIM_DURATION).unwrap();
+        let runtime=PostgresRunRuntime::new(f.pool.clone(),"owned-v2-runtime".into(),time::Duration::seconds(30),DEFAULT_DISPATCH_CLAIM_DURATION,openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap();
         let claim=runtime.claim_dispatch().await.unwrap().unwrap();
         assert_eq!(claim.lease().run_id(),&first.command.run_id);
         let lease=runtime.acknowledge_dispatch(&claim).await.unwrap();
@@ -192,7 +192,7 @@ async fn pending_input_migration_and_visibility() {
         let model=f.model(CustomModelProtocol::AnthropicMessages).await;
         let first=f.request(1,false,&model);
         accepted(f.directory.submit_thread_input(first.clone(),None).await);
-        let runtime=PostgresRunRuntime::new(f.pool.clone(),"owned-v2-runtime".into(),time::Duration::seconds(30),DEFAULT_DISPATCH_CLAIM_DURATION).unwrap();
+        let runtime=PostgresRunRuntime::new(f.pool.clone(),"owned-v2-runtime".into(),time::Duration::seconds(30),DEFAULT_DISPATCH_CLAIM_DURATION,openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&f.pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap();
         let claim=runtime.claim_dispatch().await.unwrap().unwrap();
         let lease=runtime.acknowledge_dispatch(&claim).await.unwrap();
         runtime.finish_run(&lease,1,openbot_application::RunTerminal::Failed(openbot_application::RunFailureCode::ProviderUnavailable)).await.unwrap();

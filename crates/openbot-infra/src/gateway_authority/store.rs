@@ -527,6 +527,26 @@ pub(super) fn open_tokens(
     scope: &Scope,
     generation: i64,
 ) -> Result<SensitiveTokens, GatewayAuthorityError> {
+    open_tokens_at_auth_generation(
+        vault,
+        secret_id,
+        encrypted,
+        scope,
+        generation,
+        scope.auth_generation,
+    )
+}
+
+// Normal readers always supply the current generation. The confirmation transaction
+// also authenticates the locked historical generation as data before resealing it.
+fn open_tokens_at_auth_generation(
+    vault: &CredentialRecordVault,
+    secret_id: Uuid,
+    encrypted: &str,
+    scope: &Scope,
+    generation: i64,
+    expected_auth_generation: i64,
+) -> Result<SensitiveTokens, GatewayAuthorityError> {
     let opened = vault
         .open(
             &secret_id,
@@ -548,7 +568,7 @@ pub(super) fn open_tokens(
     if stored.schema_version != 1
         || stored.connection_id.0.as_str() != scope.connection_id.to_string()
         || stored.credential_generation != generation
-        || stored.auth_generation != scope.auth_generation
+        || stored.auth_generation != expected_auth_generation
         || stored.issuer.0.as_str() != scope.issuer
         || stored.account_id.0.as_str() != scope.account_id
         || stored
@@ -659,9 +679,142 @@ pub(super) async fn load_secret(
         .map_err(|_| GatewayAuthorityError::Corrupt)
 }
 
+pub(crate) async fn reconfirm_ready_binding(
+    tx: &tokio_postgres::Transaction<'_>,
+    confirmation: &crate::restore_reconfirmation::CurrentRestoredBindingConfirmation<'_>,
+    requirement: &crate::restore_reconfirmation::LockedRestoreRequirement,
+    vault: &CredentialRecordVault,
+    audit_key: &[u8],
+    cancel: &CancellationToken,
+    deadline: std::time::Instant,
+) -> Result<(), GatewayAuthorityError> {
+    confirmation
+        .check_before(deadline)
+        .map_err(|_| GatewayAuthorityError::Unavailable)?;
+    let auth = confirmation.auth();
+    let connection_id =
+        Uuid::parse_str(&requirement.source_ref).map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let expected_birth = requirement
+        .source_created_at
+        .ok_or(GatewayAuthorityError::Conflict)?;
+    let expected_revision = requirement
+        .source_revision
+        .ok_or(GatewayAuthorityError::Conflict)?;
+    let generation =
+        i64::try_from(auth.auth_generation().get()).map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let row = tx.query_opt(
+        "SELECT c.created_at,c.revision,c.issuer,c.client_id,c.account_id,c.organization_id, \
+         c.auth_generation,c.current_secret_id,c.credential_generation,s.encrypted_value \
+         FROM public.sdk_gateway_connections c JOIN public.sdk_gateway_secrets s \
+           ON s.id=c.current_secret_id AND s.connection_id=c.id AND s.deployment_id=c.deployment_id \
+           AND s.tenant_id=c.tenant_id AND s.owner_user_id=c.owner_user_id AND s.credential_generation=c.credential_generation \
+         WHERE c.id=$1 AND c.deployment_id=$2 AND c.tenant_id=$3 AND c.owner_user_id=$4 \
+           AND c.enabled AND c.deleted_at IS NULL AND c.state='ready' AND c.pending_operation_id IS NULL \
+           AND s.retired_at IS NULL FOR UPDATE OF c,s",
+        &[&connection_id,&auth.deployment().as_str(),&auth.tenant().as_str(),&auth.actor().as_str()],
+    ).await.map_err(|_| GatewayAuthorityError::Unavailable)?.ok_or(GatewayAuthorityError::Conflict)?;
+    let birth: OffsetDateTime = row
+        .try_get("created_at")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let revision: i64 = row
+        .try_get("revision")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    if birth != expected_birth || revision != expected_revision {
+        return Err(GatewayAuthorityError::Conflict);
+    }
+    let issuer: String = row
+        .try_get("issuer")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let client_id: String = row
+        .try_get("client_id")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let account_id: String = row
+        .try_get("account_id")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let organization_id: Option<String> = row
+        .try_get("organization_id")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let original_auth_generation: i64 = row
+        .try_get("auth_generation")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let secret_id: Uuid = row
+        .try_get("current_secret_id")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let secret_generation: i64 = row
+        .try_get("credential_generation")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let encrypted: String = row
+        .try_get("encrypted_value")
+        .map_err(|_| GatewayAuthorityError::Corrupt)?;
+    let scope = Scope {
+        auth: auth.clone(),
+        deployment: auth.deployment().clone(),
+        tenant: auth.tenant().clone(),
+        connection_id,
+        expected_revision: revision,
+        auth_generation: generation,
+        issuer,
+        client_id,
+        account_id,
+        organization_id,
+        cancel: cancel.clone(),
+        deadline: Instant::from_std(deadline),
+    };
+    confirmation
+        .check_before(deadline)
+        .map_err(|_| GatewayAuthorityError::Unavailable)?;
+    if cancel.is_cancelled() {
+        return Err(GatewayAuthorityError::Cancelled);
+    }
+    let tokens = open_tokens_at_auth_generation(
+        vault,
+        secret_id,
+        &encrypted,
+        &scope,
+        secret_generation,
+        original_auth_generation,
+    )?;
+    let rebound = seal_tokens(vault, secret_id, &scope, secret_generation, &tokens)?;
+    drop(tokens);
+    confirmation
+        .check_before(deadline)
+        .map_err(|_| GatewayAuthorityError::Unavailable)?;
+    let secret_changed = tx.execute(
+        "UPDATE public.sdk_gateway_secrets SET encrypted_value=$2 \
+         WHERE id=$1 AND connection_id=$3 AND deployment_id=$4 AND tenant_id=$5 AND owner_user_id=$6 \
+           AND credential_generation=$7 AND retired_at IS NULL",
+        &[&secret_id,&rebound,&connection_id,&auth.deployment().as_str(),&auth.tenant().as_str(),
+          &auth.actor().as_str(),&secret_generation],
+    ).await.map_err(|_| GatewayAuthorityError::Unavailable)?;
+    if secret_changed != 1 {
+        return Err(GatewayAuthorityError::Conflict);
+    }
+    let changed = tx.execute(
+        "UPDATE public.sdk_gateway_connections SET auth_generation=$2 \
+         WHERE id=$1 AND created_at=$3 AND revision=$4 AND deployment_id=$5 AND tenant_id=$6 AND owner_user_id=$7 \
+           AND issuer=$8 AND client_id=$9 AND account_id=$10 AND organization_id IS NOT DISTINCT FROM $11 \
+           AND current_secret_id=$12 AND credential_generation=$13 AND auth_generation=$14 \
+           AND enabled AND deleted_at IS NULL AND state='ready' AND pending_operation_id IS NULL",
+        &[&connection_id,&generation,&birth,&revision,&auth.deployment().as_str(),&auth.tenant().as_str(),&auth.actor().as_str(),
+          &scope.issuer,&scope.client_id,&scope.account_id,&scope.organization_id,&secret_id,&secret_generation,&original_auth_generation],
+    ).await.map_err(|_| GatewayAuthorityError::Unavailable)?;
+    if changed != 1 {
+        return Err(GatewayAuthorityError::Conflict);
+    }
+    append_audit(
+        tx,
+        auth,
+        connection_id,
+        audit_key,
+        "restore_binding_reconfirmed",
+    )
+    .await
+}
+
 async fn append_audit(
     tx: &tokio_postgres::Transaction<'_>,
-    scope: &Scope,
+    auth: &AuthContext,
+    connection_id: Uuid,
     audit_key: &[u8],
     change: &'static str,
 ) -> Result<(), GatewayAuthorityError> {
@@ -670,12 +823,12 @@ async fn append_audit(
         .map_err(|_| GatewayAuthorityError::Unavailable)?;
     let event = AuditEvent {
         id,
-        actor: Some(scope.auth.actor().clone()),
+        actor: Some(auth.actor().clone()),
         event_type: AuditEventType::parse("configuration.changed")
             .ok_or(GatewayAuthorityError::Corrupt)?,
         target_kind: AuditLabel::new("sdk_gateway_connection"),
         target_id: Some(
-            AuditIdentifier::new(scope.connection_id.to_string())
+            AuditIdentifier::new(connection_id.to_string())
                 .map_err(|_| GatewayAuthorityError::Corrupt)?,
         ),
         payload: AuditPayload::from_facts(vec![AuditFact::ConfigurationChange(AuditLabel::new(
@@ -758,7 +911,14 @@ async fn insert_enrollment_inner(
     if !token_bytes_equal(&verified, tokens) {
         return Err(GatewayAuthorityError::Corrupt);
     }
-    append_audit(&tx, scope, audit_key, "gateway_connection_enrolled").await?;
+    append_audit(
+        &tx,
+        &scope.auth,
+        scope.connection_id,
+        audit_key,
+        "gateway_connection_enrolled",
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|_| GatewayAuthorityError::CommitUnknown)?;
@@ -821,7 +981,14 @@ async fn begin_rotation_inner(
     if affected != 1 {
         return Err(GatewayAuthorityError::Conflict);
     }
-    append_audit(&tx, scope, audit_key, "gateway_rotation_begun").await?;
+    append_audit(
+        &tx,
+        &scope.auth,
+        scope.connection_id,
+        audit_key,
+        "gateway_rotation_begun",
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|_| GatewayAuthorityError::CommitUnknown)?;
@@ -883,7 +1050,14 @@ async fn admit_token_send_inner(
     if affected != 1 {
         return Err(GatewayAuthorityError::ReconciliationRequired);
     }
-    append_audit(&tx, scope, audit_key, "gateway_rotation_send_admitted").await?;
+    append_audit(
+        &tx,
+        &scope.auth,
+        scope.connection_id,
+        audit_key,
+        "gateway_rotation_send_admitted",
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|_| GatewayAuthorityError::CommitUnknown)
@@ -966,7 +1140,14 @@ async fn stage_rotation_inner(
     if affected != 1 {
         return Err(GatewayAuthorityError::ReconciliationRequired);
     }
-    append_audit(&tx, scope, audit_key, "gateway_rotation_staged").await?;
+    append_audit(
+        &tx,
+        &scope.auth,
+        scope.connection_id,
+        audit_key,
+        "gateway_rotation_staged",
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|_| GatewayAuthorityError::CommitUnknown)?;
@@ -1092,7 +1273,14 @@ async fn finalize_rotation_inner(
     if affected != 1 {
         return Err(GatewayAuthorityError::Corrupt);
     }
-    append_audit(&tx, scope, audit_key, "gateway_rotation_committed").await?;
+    append_audit(
+        &tx,
+        &scope.auth,
+        scope.connection_id,
+        audit_key,
+        "gateway_rotation_committed",
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|_| GatewayAuthorityError::CommitUnknown)
@@ -1145,7 +1333,14 @@ async fn clear_credentials_inner(
     if affected != 1 {
         return Err(GatewayAuthorityError::Conflict);
     }
-    append_audit(&tx, scope, audit_key, "gateway_credentials_cleared").await?;
+    append_audit(
+        &tx,
+        &scope.auth,
+        scope.connection_id,
+        audit_key,
+        "gateway_credentials_cleared",
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|_| GatewayAuthorityError::CommitUnknown)
@@ -1480,4 +1675,206 @@ pub(super) async fn read_enrollment_in_transaction(
         return Err(GatewayAuthorityError::Corrupt);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openbot_contracts::auth::{AuthContextBuilder, AuthGeneration};
+    use openbot_contracts::ids::{ActorId, DeploymentId, TenantId};
+    use openbot_domain::vault::{KeyVersion, WrappingKey};
+
+    fn scope(generation: u64) -> Scope {
+        let deployment = DeploymentId::new("envelope-deployment");
+        let tenant = TenantId::new("envelope-tenant");
+        Scope {
+            auth: AuthContextBuilder::from_verified_session(
+                deployment.clone(),
+                tenant.clone(),
+                ActorId::new("alice"),
+                AuthGeneration::new(generation),
+                false,
+            )
+            .with_role(Role::User)
+            .build(),
+            deployment,
+            tenant,
+            connection_id: Uuid::from_u128(46),
+            expected_revision: 1,
+            auth_generation: i64::try_from(generation).unwrap(),
+            issuer: "https://owned.example.test".into(),
+            client_id: "owned-client".into(),
+            account_id: "owned-account".into(),
+            organization_id: Some("owned-organization".into()),
+            cancel: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
+    fn vault(tenant: &str) -> CredentialRecordVault {
+        CredentialRecordVault::single_key(
+            TenantId::new(tenant),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x46; 32]).unwrap(),
+        )
+    }
+
+    fn tokens() -> acosmi::TokenSet {
+        acosmi::TokenSet {
+            access_token: "owned-access-token".into(),
+            refresh_token: "owned-refresh-token".into(),
+            expires_at: "2035-01-01T00:00:00Z".into(),
+            scope: "ai account".into(),
+            client_id: "owned-client".into(),
+            server_url: "https://owned.example.test".into(),
+        }
+    }
+
+    // These are authenticated-data tests; no Current or confirmation authority is constructed.
+    #[test]
+    fn strict_envelope_opens_after_current_generation_reseal_and_preserves_tokens() {
+        let vault = vault("envelope-tenant");
+        let historical = scope(7);
+        let current = scope(8);
+        let secret = Uuid::new_v4();
+        let original = tokens();
+        let sealed = seal_tokens(&vault, secret, &historical, 3, &original).unwrap();
+        assert_eq!(vault.open_calls(), 0);
+        assert!(matches!(
+            open_tokens(&vault, secret, &sealed, &current, 3),
+            Err(GatewayAuthorityError::Corrupt)
+        ));
+
+        let opened =
+            open_tokens_at_auth_generation(&vault, secret, &sealed, &current, 3, 7).unwrap();
+        assert!(token_bytes_equal(&opened, &original));
+        let rebound = seal_tokens(&vault, secret, &current, 3, &opened).unwrap();
+        drop(opened);
+
+        let clone = vault.clone();
+        let reopened = open_tokens(&clone, secret, &rebound, &current, 3).unwrap();
+        assert!(token_bytes_equal(&reopened, &original));
+        assert!(matches!(
+            open_tokens(&vault, secret, &rebound, &historical, 3),
+            Err(GatewayAuthorityError::Corrupt)
+        ));
+        assert_eq!(vault.open_calls(), 4);
+        assert_eq!(clone.open_calls(), 4);
+    }
+
+    #[test]
+    fn historical_envelope_requires_exact_generations_identity_and_aad() {
+        let vault = vault("envelope-tenant");
+        let historical = scope(7);
+        let current = scope(8);
+        let secret = Uuid::new_v4();
+        let sealed = seal_tokens(&vault, secret, &historical, 3, &tokens()).unwrap();
+        for (secret_id, credential_generation, stored_auth_generation) in
+            [(Uuid::new_v4(), 3, 7), (secret, 4, 7), (secret, 3, 6)]
+        {
+            assert!(matches!(
+                open_tokens_at_auth_generation(
+                    &vault,
+                    secret_id,
+                    &sealed,
+                    &current,
+                    credential_generation,
+                    stored_auth_generation,
+                ),
+                Err(GatewayAuthorityError::Corrupt)
+            ));
+        }
+
+        let mut other_owner = current.clone();
+        other_owner.auth = AuthContextBuilder::from_verified_session(
+            current.deployment.clone(),
+            current.tenant.clone(),
+            ActorId::new("bob"),
+            AuthGeneration::new(8),
+            false,
+        )
+        .with_role(Role::User)
+        .build();
+        let mut other_connection = current.clone();
+        other_connection.connection_id = Uuid::new_v4();
+        let mut other_issuer = current.clone();
+        other_issuer.issuer = "https://other.example.test".into();
+        let mut other_client = current.clone();
+        other_client.client_id = "another-client".into();
+        let mut other_account = current.clone();
+        other_account.account_id = "another-account".into();
+        let mut other_organization = current.clone();
+        other_organization.organization_id = None;
+        for mismatched in [
+            other_owner,
+            other_connection,
+            other_issuer,
+            other_client,
+            other_account,
+            other_organization,
+        ] {
+            assert!(matches!(
+                open_tokens_at_auth_generation(&vault, secret, &sealed, &mismatched, 3, 7),
+                Err(GatewayAuthorityError::Corrupt)
+            ));
+        }
+        let other_tenant = CredentialRecordVault::single_key(
+            TenantId::new("another-tenant"),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x46; 32]).unwrap(),
+        );
+        assert!(matches!(
+            open_tokens_at_auth_generation(&other_tenant, secret, &sealed, &current, 3, 7),
+            Err(GatewayAuthorityError::Corrupt)
+        ));
+        assert_eq!(other_tenant.open_calls(), 1);
+        assert!(open_tokens_at_auth_generation(&vault, secret, &sealed, &current, 3, 7).is_ok());
+    }
+
+    #[test]
+    fn authenticated_envelope_plaintext_limit_accepts_65536_and_rejects_65537_bytes() {
+        let vault = vault("envelope-tenant");
+        let scope = scope(7);
+        let secret = Uuid::new_v4();
+        let original = tokens();
+        let sealed = seal_tokens(&vault, secret, &scope, 3, &original).unwrap();
+        let plaintext = vault
+            .open(
+                &secret,
+                SecretKind::Model,
+                SecretPrincipal::Actor(scope.auth.actor().clone()),
+                principal(scope.connection_id),
+                &sealed,
+            )
+            .unwrap()
+            .into_secret();
+        let mut padded = Zeroizing::new(plaintext.expose().to_vec());
+        assert!(padded.len() < 65_536);
+        padded.resize(65_536, b' ');
+        let at_limit = vault
+            .seal(
+                &secret,
+                SecretKind::Model,
+                SecretPrincipal::Actor(scope.auth.actor().clone()),
+                principal(scope.connection_id),
+                &SecretBytes::new(padded.to_vec()),
+            )
+            .unwrap();
+        let opened = open_tokens(&vault, secret, &at_limit, &scope, 3).unwrap();
+        assert!(token_bytes_equal(&opened, &original));
+        padded.push(b' ');
+        let over_limit = vault
+            .seal(
+                &secret,
+                SecretKind::Model,
+                SecretPrincipal::Actor(scope.auth.actor().clone()),
+                principal(scope.connection_id),
+                &SecretBytes::new(padded.to_vec()),
+            )
+            .unwrap();
+        assert!(matches!(
+            open_tokens(&vault, secret, &over_limit, &scope, 3),
+            Err(GatewayAuthorityError::Corrupt)
+        ));
+    }
 }

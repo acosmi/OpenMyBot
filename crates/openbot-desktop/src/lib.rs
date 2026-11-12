@@ -150,6 +150,8 @@ pub mod postgres_maintenance;
 #[cfg(feature = "postgres-sidecar")]
 pub mod postgres_sidecar;
 pub mod preferences;
+#[cfg(all(feature = "desktop-launcher", target_os = "macos"))]
+pub mod recovery;
 pub mod session;
 pub mod transport;
 pub mod window;

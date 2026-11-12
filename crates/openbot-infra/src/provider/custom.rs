@@ -39,6 +39,7 @@ pub struct PostgresCustomModelProvider {
     connect_budget: SafeHttpBudget,
     stall_timeout: Option<Duration>,
     model_dataset_binding: Option<Arc<crate::model_dataset::PostgresModelDatasetBinding>>,
+    recovery_gate: crate::recovery_control::RecoveryReadGate,
     #[cfg(test)]
     v2_vault_opens: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -46,6 +47,8 @@ pub struct PostgresCustomModelProvider {
 }
 impl PostgresCustomModelProvider {
     /// Bind only trusted host infrastructure. URL/model/key are never accepted by this factory.
+    /// The recovery gate is required, so a host cannot assemble an ungated model consumer.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: crate::db::pool::DatabasePool,
         vault: CredentialRecordVault,
@@ -54,6 +57,7 @@ impl PostgresCustomModelProvider {
         dialer: SafeDialer,
         connect_budget: SafeHttpBudget,
         stall_timeout: Option<Duration>,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Result<Self, ProviderPortError> {
         if deployment.as_str().is_empty()
             || tenant.as_str().is_empty()
@@ -72,6 +76,7 @@ impl PostgresCustomModelProvider {
             connect_budget,
             stall_timeout,
             model_dataset_binding: None,
+            recovery_gate,
             #[cfg(test)]
             v2_vault_opens: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -97,6 +102,7 @@ impl PostgresCustomModelProvider {
         &self,
         request: ProviderRequest,
         deadline: std::time::Instant,
+        admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
     ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
         let binding = self
             .model_dataset_binding
@@ -132,6 +138,7 @@ impl PostgresCustomModelProvider {
                 if loaded.binding!=*expected{return Err(invalid("custom_model_binding"));}
                 if loaded.has_cost_cap{return Err(invalid("custom_model_unpriced"));}
                 let secret_id=Uuid::parse_str(loaded.binding.secret_id()).map_err(|_|invalid("custom_model_credential"))?;
+                require_model_confirmed(transaction.as_transaction(),loaded.binding.connection_id(),admission).await?;
                 // An outer timeout cannot preempt this synchronous continuation when a
                 // Ready SQL future consumes the last budget in the same poll.
                 if std::time::Instant::now()>=deadline{return Err(ProviderPortError::Unavailable);}
@@ -166,6 +173,7 @@ impl PostgresCustomModelProvider {
                 // Synchronous Vault/configuration work also shares the original budget.
                 // Refuse before declaring any possible adapter/network effect.
                 if std::time::Instant::now()>=deadline{return Err(ProviderPortError::Unavailable);}
+                admission.verify_current_before(deadline).map_err(|_|ProviderPortError::Unavailable)?;
                 // This is a conservative may-have-effect fence, not a remote-send or ACK.
                 progress.network_started.store(true,Ordering::SeqCst);
                 adapter.start(request).await
@@ -209,6 +217,7 @@ impl PostgresCustomModelProvider {
         client: &mut crate::db::pool::PooledClient,
         request: ProviderRequest,
         progress: &StartProgress,
+        admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
     ) -> Attempt {
         let tx = match client.transaction().await {
             Ok(tx) => tx,
@@ -250,6 +259,7 @@ impl PostgresCustomModelProvider {
             }
             let secret_id = Uuid::parse_str(loaded.binding.secret_id())
                 .map_err(|_| invalid("custom_model_credential"))?;
+            require_model_confirmed(&tx, loaded.binding.connection_id(), admission).await?;
             let opened = self
                 .vault
                 .open(
@@ -308,6 +318,9 @@ impl PostgresCustomModelProvider {
                     Box::new(AnthropicProvider::new(config, self.dialer.clone()))
                 }
             };
+            admission
+                .verify_current_before(admission.deadline())
+                .map_err(|_| ProviderPortError::Unavailable)?;
             progress.network_started.store(true, Ordering::SeqCst);
             // Existing transport errors do not identify the redirect hop. A 303/307 POST may
             // already have happened before a later DNS/connect error, so never retry that error.
@@ -342,7 +355,8 @@ impl ProviderAdapter for PostgresCustomModelProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<Box<dyn ProviderSession>, ProviderPortError> {
-        let v2_deadline = std::time::Instant::now() + self.connect_budget.timeout();
+        // One entry clock for the admission, both starts and their final recheck.
+        let deadline = std::time::Instant::now() + self.connect_budget.timeout();
         super::common::validate_request(&request)?;
         let ProviderRoute::CustomModel(binding) = &request.route else {
             return Err(invalid("custom_model_route"));
@@ -353,10 +367,15 @@ impl ProviderAdapter for PostgresCustomModelProvider {
         if request.rate_card.is_some() || request.cost_cap.is_some() {
             return Err(invalid("custom_model_unpriced"));
         }
+        let admission = self
+            .recovery_gate
+            .borrow_worker_before(deadline)
+            .await
+            .map_err(|_| ProviderPortError::Unavailable)?;
         if binding.v2_snapshot().is_some() {
-            return self.start_v2(request, v2_deadline).await;
+            return self.start_v2(request, deadline, &admission).await;
         }
-        let deadline = tokio::time::Instant::now() + self.connect_budget.timeout();
+        let deadline = tokio::time::Instant::from_std(deadline);
         let client = tokio::time::timeout_at(deadline, self.pool.get())
             .await
             .map_err(|_| ProviderPortError::Unavailable)?
@@ -373,6 +392,7 @@ impl ProviderAdapter for PostgresCustomModelProvider {
                 connection.client.as_mut().expect("owned start connection"),
                 request,
                 &progress,
+                &admission,
             ),
         )
         .await;
@@ -395,6 +415,33 @@ impl ProviderAdapter for PostgresCustomModelProvider {
                 })),
         }
     }
+}
+
+/// Both starts: no Vault-open of a restored connection before its receipt.
+async fn require_model_confirmed(
+    tx: &tokio_postgres::Transaction<'_>,
+    connection: &str,
+    admission: &crate::recovery_control::RecoveryWorkerLease<'_>,
+) -> Result<(), ProviderPortError> {
+    crate::restore_reconfirmation::require_confirmed_before(
+        tx,
+        crate::restore_reconfirmation::RequirementSource {
+            cohort: admission.restore_cohort(),
+            kind: crate::restore_reconfirmation::RequirementKind::ModelSecret,
+            source_ref: connection,
+        },
+        admission.deadline(),
+    )
+    .await
+    .map_err(|error| match error {
+        crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+            invalid("custom_model_credential")
+        }
+        _ => ProviderPortError::Unavailable,
+    })?;
+    admission
+        .verify_current_before(admission.deadline())
+        .map_err(|_| ProviderPortError::Unavailable)
 }
 
 fn invalid(field: &'static str) -> ProviderPortError {
@@ -495,6 +542,11 @@ mod v2_test_harness {
     include!("../../../../test-support/postgres_harness.rs");
 }
 
+// The integration tests' outside-domain request binding: model writes
+// borrow a Normal admission with no restore cohort.
+#[cfg(test)]
+use crate::recovery_admission;
+
 #[cfg(test)]
 mod v2_vault_tests {
     use super::*;
@@ -589,12 +641,12 @@ mod v2_vault_tests {
             let registry=Arc::new(ArtifactDatasetRegistry::from_server(p.clone(),&DeploymentId::new(DEP),&TenantId::new(TENANT)).await.unwrap());
             let binding=Arc::new(PostgresModelDatasetBinding::unbound(p.clone(),DeploymentId::new(DEP),TenantId::new(TENANT)).unwrap());
             binding.enroll_original_registry(&registry).unwrap();
-            let directory=PostgresThreadDirectory::with_runtime(p.clone(),config.clone(),"owned-vault-runtime".into(),time::Duration::seconds(30)).unwrap()
+            let directory=PostgresThreadDirectory::with_runtime(p.clone(),config.clone(),"owned-vault-runtime".into(),time::Duration::seconds(30), crate::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).unwrap()
                 .with_model_dataset_binding(binding.clone()).unwrap();
             let context=PostgresAgentContextSource::new(p.clone(),DeploymentId::new(DEP),TenantId::new(TENANT),Some(32)).unwrap()
                 .with_model_dataset_binding(binding.clone()).unwrap();
-            let auth=AuthContextBuilder::from_verified_session(DeploymentId::new(DEP),TenantId::new(TENANT),ActorId::new("alice"),AuthGeneration::new(7),false)
-                .with_roles([Role::User]).build();
+            let auth=recovery_admission::outside_domain(AuthContextBuilder::from_verified_session(DeploymentId::new(DEP),TenantId::new(TENANT),ActorId::new("alice"),AuthGeneration::new(7),false)
+                .with_roles([Role::User]).build());
             let original_dataset:String=p.get().await.unwrap().query_one("SELECT dataset_id FROM openbot_internal.artifact_dataset_bindings WHERE deployment_id=$1 AND tenant_id=$2",&[&DEP,&TENANT]).await.unwrap().get(0);
             for mode in 0..12u64 {
                 let model=models.create(&auth,&CreateModelConnection{name:"Owned no-effect choice".into(),protocol:CustomModelProtocol::OpenaiChatCompletions,
@@ -611,7 +663,7 @@ mod v2_vault_tests {
                 let dns=Arc::new(CountedDns(AtomicUsize::new(0)));
                 let dialer=SafeDialer::with_resolver(crate::net::safe_http::EgressPolicy::default(),dns.clone());
                 let adapter=PostgresCustomModelProvider::new(p.clone(),vault.clone(),DeploymentId::new(DEP),TenantId::new(TENANT),dialer,
-                    SafeHttpBudget::new(64*1024*1024,Duration::from_secs(5)).unwrap(),Some(Duration::from_secs(2))).unwrap()
+                    SafeHttpBudget::new(64*1024*1024,Duration::from_secs(5)).unwrap(),Some(Duration::from_secs(2)), crate::recovery_control::RecoveryReadGate::outside_recovery_domain(&p, &DeploymentId::new(DEP), &TenantId::new(TENANT))).unwrap()
                     .with_model_dataset_binding(binding.clone()).unwrap();
                 assert_eq!(adapter.v2_vault_opens.load(Ordering::SeqCst),0);
                 let c=p.get().await.unwrap();let id=Uuid::parse_str(&model.id).unwrap();let run=req.command.run_id.as_str();
@@ -723,6 +775,11 @@ mod v2_vault_tests {
                 config,
                 "owned-concurrent-runtime".into(),
                 time::Duration::seconds(30),
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &p,
+                    &openbot_contracts::ids::DeploymentId::new("outside"),
+                    &openbot_contracts::ids::TenantId::new("outside"),
+                ),
             )
             .unwrap()
             .with_model_dataset_binding(binding.clone())
@@ -736,15 +793,17 @@ mod v2_vault_tests {
             .unwrap()
             .with_model_dataset_binding(binding.clone())
             .unwrap();
-            let auth = AuthContextBuilder::from_verified_session(
-                DeploymentId::new(DEP),
-                TenantId::new(TENANT),
-                ActorId::new("alice"),
-                AuthGeneration::new(7),
-                false,
-            )
-            .with_roles([Role::User])
-            .build();
+            let auth = recovery_admission::outside_domain(
+                AuthContextBuilder::from_verified_session(
+                    DeploymentId::new(DEP),
+                    TenantId::new(TENANT),
+                    ActorId::new("alice"),
+                    AuthGeneration::new(7),
+                    false,
+                )
+                .with_roles([Role::User])
+                .build(),
+            );
             Self {
                 pool: p,
                 vault,
@@ -839,6 +898,11 @@ mod v2_vault_tests {
                 dialer,
                 SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).unwrap(),
                 Some(Duration::from_secs(2)),
+                crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &self.pool,
+                    self.auth.deployment(),
+                    self.auth.tenant(),
+                ),
             )
             .unwrap()
             .with_model_dataset_binding(self.binding.clone())
@@ -998,6 +1062,11 @@ mod v2_vault_tests {
                             ),
                             SafeHttpBudget::new(64 * 1024 * 1024, timeout).unwrap(),
                             Some(Duration::from_secs(2)),
+                            crate::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                                &f.pool,
+                                f.auth.deployment(),
+                                f.auth.tenant(),
+                            ),
                         )
                         .unwrap()
                         .with_model_dataset_binding(f.binding.clone())
@@ -1147,7 +1216,7 @@ mod v2_vault_tests {
                     3=>{owned_dataset_statement(&c,"UPDATE openbot_internal.artifact_dataset_bindings SET initial_origin='desktop_canary' WHERE deployment_id=$1 AND tenant_id=$2",&[&deployment,&tenant]).await.unwrap();},
                     4=>{owned_dataset_statement(&c,"UPDATE openbot_internal.artifact_dataset_bindings SET created_at=created_at+interval '1 second' WHERE deployment_id=$1 AND tenant_id=$2",&[&deployment,&tenant]).await.unwrap();},
                     5=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=repeat('0',64) WHERE version=47",&[]).await.unwrap();},
-                    6=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES(48,'owned_unknown_native_version',repeat('0',64))",&[]).await.unwrap();},
+                    6=>{c.execute("INSERT INTO openbot_internal.schema_migrations(version,name,checksum) VALUES($1,'owned_unknown_native_version',repeat('0',64))",&[&(crate::db::native::NATIVE_LATEST_VERSION+1)]).await.unwrap();},
                     7=>{c.batch_execute("ALTER TABLE openbot_internal.artifact_dataset_bindings RENAME TO owned_v2_fault_namespace").await.unwrap();},
                     8=>{c.batch_execute("ALTER TABLE openbot_internal.artifact_dataset_bindings RENAME CONSTRAINT artifact_dataset_bindings_schema_known TO owned_v2_fault_constraint").await.unwrap();},
                     _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT run_model_selection_v2_snapshots_protocol_check TO owned_v2_fault_snapshot_protocol").await.unwrap();},
@@ -1166,7 +1235,7 @@ mod v2_vault_tests {
                             &[&current_deployment,&current_tenant,&deployment,&tenant,&dataset,&schema,&origin,&created]).await.unwrap();
                     },
                     5=>{c.execute("UPDATE openbot_internal.schema_migrations SET checksum=$1 WHERE version=47",&[&original_checksum]).await.unwrap();},
-                    6=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=48",&[]).await.unwrap();},
+                    6=>{c.execute("DELETE FROM openbot_internal.schema_migrations WHERE version=$1",&[&(crate::db::native::NATIVE_LATEST_VERSION+1)]).await.unwrap();},
                     7=>{c.batch_execute("ALTER TABLE openbot_internal.owned_v2_fault_namespace RENAME TO artifact_dataset_bindings").await.unwrap();},
                     8=>{c.batch_execute("ALTER TABLE openbot_internal.artifact_dataset_bindings RENAME CONSTRAINT owned_v2_fault_constraint TO artifact_dataset_bindings_schema_known").await.unwrap();},
                     _=>{c.batch_execute("ALTER TABLE openbot_internal.run_model_selection_v2_snapshots RENAME CONSTRAINT owned_v2_fault_snapshot_protocol TO run_model_selection_v2_snapshots_protocol_check").await.unwrap();},
@@ -1191,9 +1260,11 @@ mod v2_vault_tests {
     }
 
     // The selector identifies the actual last-authority statement from the frozen
-    // source. It is not an authority oracle, result replacement or a second query.
+    // source: the closed-history head read that follows the v2 load and is the
+    // last SQL before the start's synchronous continuation. It is not an
+    // authority oracle, result replacement or a second query.
     const LAST_AUTHORITY_SQL_SHA256: &str =
-        "83f8da58bb0c955b5e185584e6b292c4b1e50593062bcc700921c1c6cc88ccc0";
+        "4004ac47376f3992dab936335edf6c4abc507a5af306b60f9292cf04868e0c88";
 
     #[derive(Default)]
     struct LastReadyRelayCounts {
@@ -1390,7 +1461,7 @@ mod v2_vault_tests {
         {
             return Err("D1 original binary result format required");
         }
-        if parameters != 22 {
+        if parameters != 3 {
             return Err("D1 original last-authority parameter count");
         }
         Ok(parameters)
@@ -1553,10 +1624,10 @@ mod v2_vault_tests {
                     continue;
                 }
                 if executed.load(Ordering::SeqCst) && tag == b'D' {
-                    // Original binary bool true; these are actual server bytes,
-                    // retained without constructing an ACK or substituting a Row.
-                    if bytes != [0, 1, 0, 0, 0, 1, 1] {
-                        return Err("D1 last current row must be actual true");
+                    // Original binary bool false (the history is open); these are actual
+                    // server bytes, retained without constructing an ACK or substituting a Row.
+                    if bytes != [0, 1, 0, 0, 0, 1, 0] {
+                        return Err("D1 last current row must be actual false");
                     }
                     let mut held = last_ready_wire_frame(tag, &bytes);
                     let (command, command_bytes) = last_ready_frame(&mut up_read)
@@ -1723,8 +1794,8 @@ mod v2_vault_tests {
                     }
                 }
             }).await.expect("original start reached actual last SQL within its original budget");
-            assert_eq!(metadata.backend_pid,backend);assert_eq!(metadata.query_bytes,2936);
-            assert_eq!(metadata.parameter_count,22);assert_eq!(metadata.held_bytes,32);
+            assert_eq!(metadata.backend_pid,backend);assert_eq!(metadata.query_bytes,162);
+            assert_eq!(metadata.parameter_count,3);assert_eq!(metadata.held_bytes,32);
             assert_eq!(adapter.v2_expired_last_authority_ready.load(Ordering::SeqCst),0);
             assert_eq!(adapter.v2_vault_opens.load(Ordering::SeqCst),0);assert_eq!(dns.0.load(Ordering::SeqCst),0);
             assert!(!original.snapshot().retirement_requested && !original.snapshot().connection_destroyed);
@@ -1765,7 +1836,7 @@ mod v2_vault_tests {
             tokio::time::timeout(Duration::from_secs(2),changes.changed()).await.unwrap().unwrap();
             eprintln!("CUSTOM_V2_D1_TRACE wake_after_release={} elapsed_us={}",wake.generation.load(Ordering::SeqCst),first_poll_before.elapsed().as_micros());
             // A wake/socket write supplies scheduling only. This ONE resumed poll
-            // must itself reach the actual load Ok continuation and observe expiry.
+            // must itself reach the actual head-read Ok continuation and observe expiry.
             original_polls+=1;
             let result=match Future::poll(started.as_mut(),&mut cx) {
                 Poll::Ready(result)=>Some(result),
@@ -1810,7 +1881,7 @@ mod v2_vault_tests {
                 // used to make observer0 appear accepted.
                 drop(adapter);f.finish().await;relay.stop().await;return Err(error.to_owned());
             }
-            eprintln!("CUSTOM_V2_D1_LAST_READY query_sha256={LAST_AUTHORITY_SQL_SHA256} original_backend={backend} successor_backend={successor_pid} parsed=1 bound=1 executed=1 actual_binary_true_rows=1 command=SELECT_1 ready=T held_bytes=32 released=1 resumed_polls=1 actual_expired_load_ready=1 vault=0 dns=0 original_retirement_before_pool_close=true original_backend_ended_before_pool_close=true");
+            eprintln!("CUSTOM_V2_D1_LAST_READY query_sha256={LAST_AUTHORITY_SQL_SHA256} original_backend={backend} successor_backend={successor_pid} parsed=1 bound=1 executed=1 actual_binary_false_rows=1 command=SELECT_1 ready=T held_bytes=32 released=1 resumed_polls=1 actual_expired_load_ready=1 vault=0 dns=0 original_retirement_before_pool_close=true original_backend_ended_before_pool_close=true");
             // A separate fresh original start supplies the counter's positive
             // control. The prior original deadline/future is never retried internally.
             assert!(matches!(adapter.start(request).await,Err(ProviderPortError::CommitUnknown)));
@@ -1819,5 +1890,135 @@ mod v2_vault_tests {
             eprintln!("CUSTOM_V2_D1_FRESH_POSITIVE original_manager=true new_start=true vault=1 dns=1 result=CommitUnknown expired_load_ready_total=1");drop(adapter);
             f.finish().await;relay.stop().await;Ok(())
         }).await;
+    }
+
+    /// T046-32 on a published RestoreCurrent: the live gate's lease carries
+    /// the restored cohort, so a requirement for the model connection without
+    /// its receipt closes the start before the Vault-open and any DNS. The
+    /// legacy route is used: the v2 route's dataset registry fails its public
+    /// schema check on this restored target (CHECK text rendered in UTC).
+    #[cfg(all(feature = "desktop-local", target_os = "macos"))]
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_32_unconfirmed_model_secret_start_opens_no_vault_and_no_dns() {
+        let restored =
+            crate::recovery_control::tests::restore_current::RestoreCurrentFixture::publish(
+                "",
+                async |_| {},
+            )
+            .await;
+        let (p, dep, ten) = (
+            restored.pool.clone(),
+            DeploymentId::new("dep"),
+            TenantId::new("ten"),
+        );
+        p.get().await.unwrap().batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
+            INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');
+            INSERT INTO public.agents(id,name,type,configuration) VALUES('bot','Restored bot','built_in','{\"systemPrompt\":\"Restored prompt\",\"providerSource\":\"managed\"}');
+            INSERT INTO public.agent_profiles(agent_id,owner_user_id,title,role_description,avatar_seed,visibility) VALUES('bot','alice','Restored bot','','restored','public');").await.unwrap();
+        let vault = CredentialRecordVault::single_key(
+            ten.clone(),
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x76; 32]).unwrap(),
+        );
+        let listener =
+            crate::thread_listener::ThreadListenerDatabase::desktop_local(5432, &[b'a'; 64])
+                .unwrap();
+        let directory = PostgresThreadDirectory::with_runtime(
+            p.clone(),
+            listener,
+            "restored-runtime".into(),
+            time::Duration::seconds(30),
+            restored.read_gate(),
+        )
+        .unwrap();
+        let context =
+            PostgresAgentContextSource::new(p.clone(), dep.clone(), ten.clone(), Some(32)).unwrap();
+        let model =
+            crate::restore_reconfirmation::tests::model_connection(&restored, &vault, "alice")
+                .await
+                .to_string();
+        let req = openbot_application::BeginThreadRunRequest {
+            deployment: dep.clone(),
+            tenant: ten.clone(),
+            actor: ActorId::new("alice"),
+            auth_generation: AuthGeneration::new(7),
+            command: openbot_contracts::command::BeginThreadRun {
+                artifact_refs: Vec::new(),
+                thread_id: ThreadIdentity::new(&dep).mint_from_entropy([7; 16]),
+                run_id: RunId::new("restored-run"),
+                bot_id: BotId::new("bot"),
+                anchor: ThreadRunAnchor::DirectBot,
+                message: "Restored start words".into(),
+                selected_skill_slugs: vec![],
+                model_selection: Some(openbot_contracts::model_connections::RunModelSelection {
+                    connection_id: model.clone(),
+                    expected_revision: 1,
+                }),
+            },
+        };
+        // Begun before the requirement exists: a source absent from the cohort passes.
+        directory.begin_thread_run(req.clone()).await.unwrap();
+        let lease = RunExecutionLease::new(
+            req.command.run_id.clone(),
+            req.command.thread_id.clone(),
+            req.command.bot_id.clone(),
+            req.actor.clone(),
+            FencingToken::new(1).unwrap(),
+            0,
+        )
+        .unwrap();
+        let request = context.load(&lease).await.unwrap();
+        let requirement = crate::restore_reconfirmation::tests::bound_requirement(
+            &restored,
+            "model_secret",
+            &model,
+        )
+        .await;
+        let adapter = |dns: &Arc<CountedDns>| {
+            PostgresCustomModelProvider::new(
+                p.clone(),
+                vault.clone(),
+                dep.clone(),
+                ten.clone(),
+                SafeDialer::with_resolver(
+                    crate::net::safe_http::EgressPolicy::default(),
+                    dns.clone(),
+                ),
+                SafeHttpBudget::new(64 * 1024 * 1024, Duration::from_secs(5)).unwrap(),
+                Some(Duration::from_secs(2)),
+                restored.read_gate(),
+            )
+            .unwrap()
+        };
+
+        let (dns, opens) = (
+            Arc::new(CountedDns(AtomicUsize::new(0))),
+            vault.open_calls(),
+        );
+        let result = adapter(&dns).start(request.clone()).await;
+        assert!(
+            matches!(
+                result,
+                Err(ProviderPortError::InvalidRequest {
+                    field: "custom_model_credential"
+                })
+            ),
+            "unconfirmed model secret"
+        );
+        assert_eq!(vault.open_calls(), opens, "Vault-open before the receipt");
+        assert_eq!(dns.0.load(Ordering::SeqCst), 0, "DNS before the receipt");
+
+        // Positive control: one receipt for the same requirement and the same
+        // request reaches the original Vault call and the counted resolver.
+        restored.confirm(requirement, "alice", "fresh_actor").await;
+        let dns = Arc::new(CountedDns(AtomicUsize::new(0)));
+        assert!(matches!(
+            adapter(&dns).start(request).await,
+            Err(ProviderPortError::CommitUnknown)
+        ));
+        assert_eq!(vault.open_calls(), opens + 1);
+        assert_eq!(dns.0.load(Ordering::SeqCst), 1);
+        drop((context, directory));
     }
 }

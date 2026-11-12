@@ -830,12 +830,19 @@ fn decode_digest(s: &str) -> Option<[u8; 32]> {
 }
 
 // The supported build is thin 64-bit Mach-O. Fat, unexpected architecture, external prefixes,
-// environment search paths and imports outside the closed lib tree are rejected.
-fn verify_loader(
+// environment search paths and imports outside the closed lib tree are rejected. The accepted
+// dynamic linker and system imports are returned as the program's actual loader inventory.
+/// The most [`verify_loader`] allocates: its load-command buffer (at most
+/// 4 MiB), the strings it copies out of that buffer, and its four vectors.
+#[cfg(target_os = "macos")]
+pub(crate) const VERIFY_LOADER_MEMORY_BYTES: u64 =
+    2 * 4 * 1024 * 1024 + 4 * std::mem::size_of::<Vec<String>>() as u64;
+
+pub(crate) fn verify_loader(
     root: &File,
     path: &str,
     declared: &BTreeSet<String>,
-) -> Result<(), MaintenanceError> {
+) -> Result<Vec<String>, MaintenanceError> {
     let mut f = open_relative(root, path)?;
     let mut head = [0; 32];
     f.read_exact(&mut head)?;
@@ -868,6 +875,7 @@ fn verify_loader(
     let mut imports = Vec::new();
     let mut rpaths = Vec::new();
     let mut identity_seen = false;
+    let mut system = Vec::new();
     for _ in 0..commands {
         let prefix = data
             .get(
@@ -916,6 +924,7 @@ fn verify_loader(
                 if s != "/usr/lib/dyld" {
                     return Err(MaintenanceError::LibraryClosureInvalid);
                 }
+                system.push(s.to_owned());
             } else if cmd == 0xd {
                 let own = path
                     .strip_prefix("lib/")
@@ -966,6 +975,7 @@ fn verify_loader(
             if import.split('/').any(|p| p == "..") {
                 return Err(MaintenanceError::LibraryClosureInvalid);
             }
+            system.push(import);
             continue;
         }
         let local = if let Some(tail) = import.strip_prefix("@rpath/") {
@@ -992,7 +1002,7 @@ fn verify_loader(
     }
     // Keep an actual original file owner through the full command parse.
     f.seek(SeekFrom::Start(0))?;
-    Ok(())
+    Ok(system)
 }
 fn normalize_bundle(base: &Path, tail: &str) -> Result<String, MaintenanceError> {
     let mut parts = base

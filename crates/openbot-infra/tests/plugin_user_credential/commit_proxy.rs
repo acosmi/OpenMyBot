@@ -124,7 +124,7 @@ async fn actual_commit_ack_loss_reads_receipt_without_a_second_exchange() {
         config.host = "127.0.0.1".to_owned();
         config.port = proxy.port;
         let pool = pool::connect(&config).await.map_err(|e| e.to_string())?;
-        let store = PluginUserCredentialStore::new(pool.clone(), fixture.vault.clone()).with_rotation_audit_key(AUDIT_KEY.to_vec()).unwrap();
+        let store = PluginUserCredentialStore::new(pool.clone(), fixture.vault.clone(), openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(&pool, &openbot_contracts::ids::DeploymentId::new("outside"), &openbot_contracts::ids::TenantId::new("outside"))).with_rotation_audit_key(AUDIT_KEY.to_vec()).unwrap();
         for rotate in [false, true] {
             connect(&fixture, DRIVE, ASKER, ASKER_REFRESH).await?;
             let exchanger = ArmCommitLoss { arm: proxy.drop_next.clone(), calls: AtomicUsize::new(0), rotate };

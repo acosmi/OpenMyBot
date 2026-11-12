@@ -36,6 +36,7 @@ pub(super) struct AuthorityInner {
     active: Mutex<Option<ActiveState>>,
     transport: OnceLock<Weak<dyn HttpTransport>>,
     self_ref: OnceLock<Weak<AuthorityInner>>,
+    pub(super) recovery_gate: crate::recovery_control::RecoveryReadGate,
 }
 
 impl AuthorityInner {
@@ -44,6 +45,7 @@ impl AuthorityInner {
         vault: crate::vault::CredentialRecordVault,
         audit_key: SecretBytes,
         scope: Scope,
+        recovery_gate: crate::recovery_control::RecoveryReadGate,
     ) -> Arc<Self> {
         let inner = Arc::new(Self {
             pool,
@@ -54,6 +56,7 @@ impl AuthorityInner {
             active: Mutex::new(None),
             transport: OnceLock::new(),
             self_ref: OnceLock::new(),
+            recovery_gate,
         });
         let _ = inner.self_ref.set(Arc::downgrade(&inner));
         inner
@@ -129,6 +132,17 @@ impl AuthorityInner {
         Ok(())
     }
 
+    /// One worker admission under this operation's original deadline, held by
+    /// the caller through its Vault-open or write (the borrow verifies it once).
+    pub(super) async fn admission(
+        &self,
+    ) -> Result<crate::recovery_control::RecoveryWorkerLease<'static>, GatewayAuthorityError> {
+        self.recovery_gate
+            .borrow_worker_before(self.scope.deadline.into_std())
+            .await
+            .map_err(|_| GatewayAuthorityError::Unavailable)
+    }
+
     async fn load_inner(&self) -> Result<AuthorityState, GatewayAuthorityError> {
         enum LoadedState {
             Ready(store::SensitiveTokens),
@@ -136,6 +150,7 @@ impl AuthorityInner {
         }
 
         let active = self.active()?;
+        let admission = self.admission().await?;
         active
             .session
             .begin(&self.scope.cancel, self.scope.deadline)
@@ -150,6 +165,34 @@ impl AuthorityInner {
                     if connection.pending_operation_id.is_some() {
                         return Err(GatewayAuthorityError::Corrupt);
                     }
+                    {
+                        let client = active
+                            .session
+                            .lock_client(&self.scope.cancel, self.scope.deadline)
+                            .await?;
+                        let client = client.as_ref().ok_or(GatewayAuthorityError::Unavailable)?;
+                        let source_ref = self.scope.connection_id.to_string();
+                        tokio::select! {
+                            biased;
+                            () = self.scope.cancel.cancelled() => {
+                                return Err(GatewayAuthorityError::Cancelled);
+                            }
+                            result = crate::restore_reconfirmation::require_confirmed_before(
+                                &**client,
+                                crate::restore_reconfirmation::RequirementSource {
+                                    cohort: admission.restore_cohort(),
+                                    kind: crate::restore_reconfirmation::RequirementKind::SdkSecret,
+                                    source_ref: &source_ref,
+                                },
+                                self.scope.deadline.into_std(),
+                            ) => result.map_err(|error| match error {
+                                crate::restore_reconfirmation::RestoreReconfirmationError::NotConfirmed => {
+                                    GatewayAuthorityError::ReconciliationRequired
+                                }
+                                _ => GatewayAuthorityError::Unavailable,
+                            })?,
+                        }
+                    }
                     let encrypted = store::load_secret(
                         &active.session,
                         &self.scope,
@@ -157,6 +200,9 @@ impl AuthorityInner {
                         connection.credential_generation,
                     )
                     .await?;
+                    admission
+                        .verify_current_before(self.scope.deadline.into_std())
+                        .map_err(|_| GatewayAuthorityError::Unavailable)?;
                     let tokens = store::open_tokens(
                         &self.vault,
                         secret_id,
@@ -401,6 +447,7 @@ impl StrictTokenAuthority for AuthorityInner {
         if active.operation_id.is_some() {
             return Err(TokenAuthorityError::RotationPending);
         }
+        let _admission = self.admission().await.map_err(map)?;
         let operation =
             store::begin_rotation(&active.session, &self.scope, self.audit_key.expose())
                 .await
@@ -409,13 +456,116 @@ impl StrictTokenAuthority for AuthorityInner {
     }
 
     async fn commit_rotation(&self, tokens: &acosmi::TokenSet) -> AuthorityResult<()> {
+        let _admission = self.admission().await.map_err(map)?;
         self.commit_inner(tokens).await.map_err(map)
     }
 
     async fn clear(&self) -> AuthorityResult<()> {
         let active = self.active().map_err(map)?;
+        let _admission = self.admission().await.map_err(map)?;
         store::clear_credentials(&active.session, &self.scope, self.audit_key.expose())
             .await
             .map_err(map)
+    }
+}
+
+#[cfg(all(test, feature = "desktop-local", target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::recovery_control::tests::restore_current::RestoreCurrentFixture;
+    use openbot_contracts::auth::{AuthContextBuilder, AuthGeneration, Role};
+    use openbot_contracts::ids::{ActorId, DeploymentId, TenantId};
+    use openbot_domain::vault::{KeyVersion, WrappingKey};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// T046-32 on a published RestoreCurrent: the strict authority's worker
+    /// lease carries the restored cohort, so a READY connection whose
+    /// `sdk_secret` requirement has no receipt is not loaded or opened.
+    #[tokio::test]
+    #[ignore = "requires OPENBOT_TEST_PG_BIN PostgreSQL 17.11 for an owned candidate"]
+    async fn t046_32_unconfirmed_sdk_secret_is_not_loaded() {
+        let restored = RestoreCurrentFixture::publish("", async |_| {}).await;
+        let (dep, ten) = (DeploymentId::new("dep"), TenantId::new("ten"));
+        let scope = Scope {
+            auth: AuthContextBuilder::from_verified_session(
+                dep.clone(),
+                ten.clone(),
+                ActorId::new("alice"),
+                AuthGeneration::new(7),
+                false,
+            )
+            .with_role(Role::User)
+            .build(),
+            deployment: dep,
+            tenant: ten.clone(),
+            connection_id: Uuid::now_v7(),
+            expected_revision: 1,
+            auth_generation: 7,
+            issuer: "https://restored.example.test".into(),
+            client_id: "restored-client".into(),
+            account_id: "restored-account".into(),
+            organization_id: None,
+            cancel: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let vault = crate::vault::CredentialRecordVault::single_key(
+            ten,
+            KeyVersion::new(1),
+            WrappingKey::from_bytes(vec![0x46; 32]).unwrap(),
+        );
+        let secret = Uuid::now_v7();
+        let tokens = acosmi::TokenSet {
+            access_token: "restored-access-token".into(),
+            refresh_token: "restored-refresh-token".into(),
+            expires_at: "2035-01-01T00:00:00Z".into(),
+            scope: "ai account".into(),
+            client_id: "restored-client".into(),
+            server_url: "https://restored.example.test".into(),
+        };
+        let sealed = super::super::store::seal_tokens(&vault, secret, &scope, 1, &tokens).unwrap();
+        let mut client = restored.pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES('alice','restored-alice@example.test',7);
+            INSERT INTO public.user_roles(user_id,role) VALUES('alice','user');").await.unwrap();
+        tx.execute("INSERT INTO public.sdk_gateway_connections(id,deployment_id,tenant_id,owner_user_id,name,issuer,client_id,account_id,organization_id,
+              auth_contract_version,error_contract_version,enabled,revision,credential_generation,auth_generation,state,current_secret_id,pending_operation_id,created_at,updated_at)
+            VALUES($1,'dep','ten','alice','Restored SDK',$2,$3,$4,NULL,2,1,true,1,1,7,'ready',$5,NULL,clock_timestamp(),clock_timestamp())",
+            &[&scope.connection_id, &scope.issuer, &scope.client_id, &scope.account_id, &secret]).await.unwrap();
+        tx.execute("INSERT INTO public.sdk_gateway_secrets(id,connection_id,deployment_id,tenant_id,owner_user_id,credential_generation,encrypted_value,created_at)
+            VALUES($1,$2,'dep','ten','alice',1,$3,clock_timestamp())", &[&secret, &scope.connection_id, &sealed]).await.unwrap();
+        tx.commit().await.unwrap();
+        drop(client);
+        let requirement = crate::restore_reconfirmation::tests::bound_requirement(
+            &restored,
+            "sdk_secret",
+            &scope.connection_id.to_string(),
+        )
+        .await;
+        let inner = AuthorityInner::new(
+            restored.pool.clone(),
+            vault.clone(),
+            SecretBytes::new(vec![0x55; 32]),
+            scope,
+            restored.read_gate(),
+        );
+        let _guard = inner.lock().await.unwrap();
+
+        assert!(
+            matches!(
+                inner.load_inner().await,
+                Err(GatewayAuthorityError::ReconciliationRequired)
+            ),
+            "unconfirmed sdk secret"
+        );
+        assert_eq!(vault.open_calls(), 0, "Vault-open before the receipt");
+
+        // Positive control: one receipt for the same requirement loads READY.
+        restored.confirm(requirement, "alice", "fresh_actor").await;
+        assert!(matches!(
+            inner.load_inner().await,
+            Ok(AuthorityState::Ready(_))
+        ));
+        assert_eq!(vault.open_calls(), 1);
     }
 }

@@ -180,15 +180,15 @@ where
 }
 async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     let mut c = p.get().await.map_err(|e| e.to_string())?;
-    if version == 52 {
+    if version == native::NATIVE_LATEST_VERSION {
         require(
             fresh::apply(&mut c).await.map_err(|e| e.to_string())?
                 == fresh::FreshApplyOutcome::Applied(native::ApplyOutcome::Applied),
-            "fresh52 not applied",
+            "fresh latest not applied",
         )?;
     } else {
         require(
-            matches!(version, 47..=51),
+            matches!(version, 47..=54),
             "unregistered historical fixture",
         )?;
         baseline::apply(&c).await.map_err(|e| e.to_string())?;
@@ -203,7 +203,7 @@ async fn initialize(p: &pool::DatabasePool, version: i32) -> TestResult {
     Ok(())
 }
 async fn provision(p: &pool::DatabasePool) -> TestResult {
-    initialize(p, 52).await?;
+    initialize(p, native::NATIVE_LATEST_VERSION).await?;
     let c = p.get().await.map_err(|e| e.to_string())?;
     c.batch_execute("INSERT INTO public.users(id,email,auth_generation) VALUES
         ('origin-a','origin-a@example.test',7),('origin-b','origin-b@example.test',7),
@@ -246,6 +246,11 @@ fn directory(
         config.clone(),
         PROCESS.to_owned(),
         DEFAULT_THREAD_LEASE_DURATION,
+        openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+            p,
+            &openbot_contracts::ids::DeploymentId::new("outside"),
+            &openbot_contracts::ids::TenantId::new("outside"),
+        ),
     )
     .map_err(|e| e.to_string())
 }
@@ -300,15 +305,17 @@ impl RemoteAguiTransport for ClosedProbe {
 }
 
 fn auth() -> AuthContext {
-    AuthContextBuilder::from_verified_session(
-        DeploymentId::new(DEP),
-        TenantId::new(TENANT),
-        ActorId::new("alice"),
-        AuthGeneration::new(7),
-        false,
+    recovery_admission::outside_domain(
+        AuthContextBuilder::from_verified_session(
+            DeploymentId::new(DEP),
+            TenantId::new(TENANT),
+            ActorId::new("alice"),
+            AuthGeneration::new(7),
+            false,
+        )
+        .with_roles([Role::User])
+        .build(),
     )
-    .with_roles([Role::User])
-    .build()
 }
 struct ModelFixture {
     assembly: PostgresApplicationAssembly,
@@ -345,6 +352,12 @@ impl ModelFixture {
         let policy_store = PolicyStore::postgres(p.clone(), None);
         policy_store.load().await.unwrap();
         let assembly = assemble_postgres_application(PostgresApplicationAssemblyInput {
+            recovery_gate:
+                openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                    &p,
+                    &DeploymentId::new(DEP),
+                    &TenantId::new(TENANT),
+                ),
             pool: p.clone(),
             listener_database: config.clone().into(),
             deployment: DeploymentId::new(DEP),
@@ -386,6 +399,11 @@ impl ModelFixture {
             config.clone(),
             PROCESS.into(),
             time::Duration::seconds(30),
+            openbot_infra::recovery_control::RecoveryReadGate::outside_recovery_domain(
+                &p,
+                &openbot_contracts::ids::DeploymentId::new("outside"),
+                &openbot_contracts::ids::TenantId::new("outside"),
+            ),
         )
         .unwrap()
         .with_model_dataset_binding(binding.clone())
