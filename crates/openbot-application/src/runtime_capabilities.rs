@@ -674,7 +674,8 @@ mod tests {
         tail_error: Option<RuntimeCapabilitiesCollectionError>,
         witness_error: Option<RuntimeCapabilitiesCollectionError>,
         omit_witness: bool,
-        mixed: bool,
+        // Implements agent tools with an unconfigured acting policy and this default model key.
+        acting_model_key: Option<ModelKeyFact>,
     }
     impl RuntimeCapabilitiesCollector for RecordingCollector {
         fn observe<'a>(
@@ -694,13 +695,13 @@ mod tests {
                     NonZeroU64::new(1).unwrap(),
                 )?;
                 let mut facts = facts();
-                if self.mixed {
+                if let Some(model_key) = self.acting_model_key {
                     facts.implementations.agent_tools = Presence::Present {
                         independent_api: Evidence::Present,
                         release_dependency: Evidence::Present,
                     };
                     facts.acting_policy = PolicyFact::Unconfigured;
-                    facts.model_key = ModelKeyFact::Present;
+                    facts.model_key = model_key;
                 }
                 let observation = RuntimeCapabilityObservation::from_trusted_facts(
                     scope,
@@ -785,7 +786,7 @@ mod tests {
                 tail_error: None,
                 witness_error: None,
                 omit_witness: false,
-                mixed: false,
+                acting_model_key: None,
             },
         )
     }
@@ -922,9 +923,25 @@ mod tests {
         assert_eq!(collector.steps.lock().unwrap().last(), Some(&"witness"));
     }
     #[tokio::test]
-    async fn supported_mixed_blockers_refuse_entire_reply() {
+    async fn policy_level_blocker_hides_unknown_provider_and_reply_succeeds() {
         let (_lease, auth, mut collector) = fixture(Role::User);
-        collector.mixed = true;
+        collector.acting_model_key = Some(ModelKeyFact::Present);
+        let reply = get_runtime_capabilities(Some(&collector), &auth)
+            .await
+            .unwrap();
+        assert_order(&collector);
+        let agent_tools = reply.capabilities()[1];
+        assert_eq!(agent_tools.id(), RuntimeCapabilityId::AgentTools);
+        assert_eq!(agent_tools.state(), RuntimeCapabilityState::Unconfigured);
+        assert_eq!(
+            agent_tools.reason_code(),
+            RuntimeCapabilityReasonCode::PolicyUnconfigured
+        );
+    }
+    #[tokio::test]
+    async fn two_states_inside_one_level_refuse_entire_reply() {
+        let (_lease, auth, mut collector) = fixture(Role::User);
+        collector.acting_model_key = Some(ModelKeyFact::Unknown);
         assert_eq!(
             get_runtime_capabilities(Some(&collector), &auth).await,
             Err(AppError::DependencyUnavailable {

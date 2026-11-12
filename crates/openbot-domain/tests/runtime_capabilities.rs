@@ -733,20 +733,141 @@ fn projection_does_not_grant_action_capability() {
 }
 
 #[test]
-fn conflicting_blockers_are_rejected_instead_of_dropping_one_to_ready() {
+fn configuration_blocker_hides_a_later_os_permission_blocker() {
     let mut facts = facts_all_ready();
     facts.acting_policy = PolicyFact::Unconfigured;
     facts.os_accessibility = PermissionFact::Denied;
-    let err = project_current(&facts).unwrap_err();
-    match err {
+    let status = project_current(&facts)
+        .expect("different levels do not conflict")
+        .status(CapabilityId::NativeControl);
+    assert_eq!(status.state(), CapabilityState::Unconfigured);
+    assert_eq!(status.reason_code(), ReasonCode::PolicyUnconfigured);
+}
+
+#[test]
+fn each_adjacent_level_boundary_reports_only_the_earlier_level() {
+    // Level 1 release dependency over level 2 product permission.
+    let mut facts = facts_all_ready();
+    facts.implementations.backup_restore = Presence::Present {
+        independent_api: Evidence::Present,
+        release_dependency: Evidence::Missing,
+    };
+    facts.product_permissions[10] = PermissionFact::Denied;
+    let status = project_current(&facts)
+        .expect("level 1 over level 2")
+        .status(CapabilityId::BackupRestore);
+    assert_eq!(status.state(), CapabilityState::Unavailable);
+    assert_eq!(status.reason_code(), ReasonCode::ReleaseDependencyMissing);
+
+    // Level 2 product permission over level 3 acting policy.
+    let mut facts = facts_all_ready();
+    facts.product_permissions[6] = PermissionFact::Denied;
+    facts.acting_policy = PolicyFact::Unconfigured;
+    let status = project_current(&facts)
+        .expect("level 2 over level 3")
+        .status(CapabilityId::BrowserControl);
+    assert_eq!(status.state(), CapabilityState::PermissionRequired);
+    assert_eq!(status.reason_code(), ReasonCode::ProductPermissionRequired);
+
+    // Level 3 acting policy over level 4 computer source.
+    let mut facts = facts_all_ready();
+    facts.acting_policy = PolicyFact::Unconfigured;
+    facts.computer_source = SourceFact::Absent;
+    let status = project_current(&facts)
+        .expect("level 3 over level 4")
+        .status(CapabilityId::BrowserControl);
+    assert_eq!(status.state(), CapabilityState::Unconfigured);
+    assert_eq!(status.reason_code(), ReasonCode::PolicyUnconfigured);
+
+    // Level 4 native source over level 5 OS permission.
+    let mut facts = facts_all_ready();
+    facts.native_source = SourceFact::Absent;
+    facts.os_accessibility = PermissionFact::Denied;
+    let status = project_current(&facts)
+        .expect("level 4 over level 5")
+        .status(CapabilityId::NativeControl);
+    assert_eq!(status.state(), CapabilityState::Unavailable);
+    assert_eq!(status.reason_code(), ReasonCode::NativeSourceMissing);
+}
+
+#[test]
+fn two_states_inside_one_level_still_refuse_the_whole_projection() {
+    let mut facts = facts_all_ready();
+    facts.acting_policy = PolicyFact::Unconfigured;
+    facts.model_key = ModelKeyFact::Unknown;
+    match project_current(&facts).unwrap_err() {
         ProjectionFault::UnresolvedBlockers(conflict) => {
-            assert_eq!(conflict.capability(), CapabilityId::NativeControl);
+            assert_eq!(conflict.capability(), CapabilityId::AgentTools);
             assert!(conflict.unconfigured());
-            assert!(conflict.permission_required());
-            assert!(!conflict.unavailable());
+            assert!(!conflict.permission_required());
+            assert!(conflict.unavailable());
         }
         other => panic!("expected unresolved blockers, got {other:?}"),
     }
+}
+
+#[test]
+fn permission_and_unavailable_inside_the_os_level_refuse_the_whole_projection() {
+    let mut facts = facts_all_ready();
+    facts.os_accessibility = PermissionFact::Denied;
+    facts.os_input = PermissionFact::Unknown;
+    match project_current(&facts).unwrap_err() {
+        ProjectionFault::UnresolvedBlockers(conflict) => {
+            assert_eq!(conflict.capability(), CapabilityId::NativeControl);
+            assert!(!conflict.unconfigured());
+            assert!(conflict.permission_required());
+            assert!(conflict.unavailable());
+        }
+        other => panic!("expected unresolved blockers, got {other:?}"),
+    }
+}
+
+#[test]
+fn one_state_inside_one_level_reports_the_first_collected_reason() {
+    let mut facts = facts_all_ready();
+    facts.os_accessibility = PermissionFact::Denied;
+    facts.os_input = PermissionFact::Denied;
+    let status = project_current(&facts)
+        .expect("same state")
+        .status(CapabilityId::NativeControl);
+    assert_eq!(status.state(), CapabilityState::PermissionRequired);
+    assert_eq!(
+        status.reason_code(),
+        ReasonCode::OsPermissionAccessibilityRequired
+    );
+}
+
+#[test]
+fn pixel_model_key_is_a_configuration_blocker_ahead_of_the_screen_source() {
+    let mut facts = facts_all_ready();
+    facts.model_key = ModelKeyFact::Absent;
+    facts.screen_source = SourceFact::Absent;
+    let status = project_current(&facts)
+        .expect("level 3 over level 4")
+        .status(CapabilityId::PixelEgress);
+    assert_eq!(status.state(), CapabilityState::Unconfigured);
+    assert_eq!(status.reason_code(), ReasonCode::ModelKeyMissing);
+}
+
+#[test]
+fn local_confirmation_is_evaluated_directly_after_product_permission() {
+    let mut facts = facts_all_ready();
+    facts.acting_policy = PolicyFact::Unconfigured;
+    facts.local_confirmation = LocalConfirmationFact::Pending;
+    let status = project_current(&facts)
+        .expect("policy does not apply")
+        .status(CapabilityId::LocalConfirmation);
+    assert_eq!(status.state(), CapabilityState::PermissionRequired);
+    assert_eq!(status.reason_code(), ReasonCode::LocalConfirmationPending);
+
+    let mut facts = facts_all_ready();
+    facts.product_permissions[9] = PermissionFact::Denied;
+    facts.local_confirmation = LocalConfirmationFact::Unavailable;
+    let status = project_current(&facts)
+        .expect("level 2 over level 5")
+        .status(CapabilityId::LocalConfirmation);
+    assert_eq!(status.state(), CapabilityState::PermissionRequired);
+    assert_eq!(status.reason_code(), ReasonCode::ProductPermissionRequired);
 }
 
 #[test]
@@ -961,12 +1082,13 @@ fn missing_sso_configuration_does_not_add_an_unrelated_provider_blocker() {
     assert_eq!(status.reason_code(), ReasonCode::ConfigurationMissing);
 }
 #[test]
-fn present_sso_with_permission_and_provider_blockers_still_refuses_projection() {
+fn present_sso_product_permission_hides_the_provider_blocker() {
     let mut facts = facts_all_ready();
     facts.sso_provider = ProviderFact::Unknown;
     facts.product_permissions[11] = PermissionFact::Denied;
-    assert!(matches!(
-        project_current(&facts),
-        Err(ProjectionFault::UnresolvedBlockers(_))
-    ));
+    let status = project_current(&facts)
+        .expect("different levels do not conflict")
+        .status(CapabilityId::DynamicSso);
+    assert_eq!(status.state(), CapabilityState::PermissionRequired);
+    assert_eq!(status.reason_code(), ReasonCode::ProductPermissionRequired);
 }
