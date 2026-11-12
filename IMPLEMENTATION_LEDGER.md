@@ -290,6 +290,7 @@ Phase 8 completion point: V7-IMPL-047 (#233) is merged together with V7-COMP-026
 | FIX-046-7 | The automation catalog oracle is observed in UTC, so the exact catalog check passes on clusters initialised in any time zone | [#226](https://github.com/acosmi/OpenMyBot/pull/226) | [ad58d2bb8d](https://github.com/acosmi/OpenMyBot/commit/ad58d2bb8d21dbca61e2a4b712c4e523797f61ed) | 2026-11-12 |
 | FIX-046-8 | `wrok-bot-server` treats SIGTERM like SIGINT and no longer holds an unused pool connection, so a graceful stop writes its close receipt within a second | [#226](https://github.com/acosmi/OpenMyBot/pull/226) | [ad58d2bb8d](https://github.com/acosmi/OpenMyBot/commit/ad58d2bb8d21dbca61e2a4b712c4e523797f61ed) | 2026-11-12 |
 | FIX-046-9 | Every registered public-schema check accepts the validated `tool_calls_run_id_fkey`, so a migrated Server database starts | [#226](https://github.com/acosmi/OpenMyBot/pull/226) | [ad58d2bb8d](https://github.com/acosmi/OpenMyBot/commit/ad58d2bb8d21dbca61e2a4b712c4e523797f61ed) | 2026-11-12 |
+| FIX-054-2 | Every automation budget layer requires a finite `sampling_calls` rule: a definition or budgets-file scope without it is rejected, and a layer whose current policies lack it blocks reservation (spec revision R485; no migration) | [#292](https://github.com/acosmi/OpenMyBot/pull/292) | [055a31074c](https://github.com/acosmi/OpenMyBot/commit/055a31074c5373c45dbd9928eeb04e3f1af03e6b) | 2026-11-12 |
 
 ## Open
 
