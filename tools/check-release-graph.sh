@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$app" ]] || usage
-[[ -d "$app" ]] || { printf 'app bundle is not a directory: %s\n' "$app" >&2; exit 2; }
+[[ -d "$app/Contents" ]] || { printf 'not an app bundle (no Contents/ directory): %s\n' "$app" >&2; exit 2; }
 app="$(cd "$app" && pwd)"
 [[ -n "$out" ]] || out="$(mktemp -d)"
 mkdir -p "$out"
@@ -195,6 +195,8 @@ for scope in bundle macho-strings; do
       --arg scope "$scope" '{findings: $n, report: "gitleaks-\($scope).json",
         log: "gitleaks-\($scope).log"} + $extra')"
 done
+# The dumps hold any secret in plain text; only the redacted reports and the summary stay.
+rm -rf "$out/strings"
 
 # (f) Release signing posture. An ad-hoc signed PostgreSQL bundle carries the
 # disable-library-validation entitlement, so neither may reach a release. Without --release the
