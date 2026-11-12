@@ -656,29 +656,10 @@ pub(crate) async fn verify_pre_upgrade_layout_on(
     let ledger = native::validate_known_prefix(client, native::NATIVE_0032_VERSION).await?;
     verify_internal_shape(client).await?;
     let expected = registered_public_schema(ledger.latest_version())?;
-    let mut observed = schema_facts::fetch(client).await?;
-    // The registered finalizer may already have validated this foreign key;
-    // that end state counts as the registered NOT VALID definition.
-    if let Some(registered) = expected
-        .table("tool_calls")
-        .and_then(|table| {
-            table
-                .constraints
-                .iter()
-                .find(|constraint| constraint.name == "tool_calls_run_id_fkey")
-        })
-        .map(|constraint| constraint.def.clone())
-        && let Some(actual) = observed
-            .tables
-            .iter_mut()
-            .filter(|table| table.name == "tool_calls")
-            .flat_map(|table| table.constraints.iter_mut())
-            .find(|constraint| constraint.name == "tool_calls_run_id_fkey")
-        && registered.strip_suffix(" NOT VALID") == Some(actual.def.as_str())
+    if !schema_facts::fetch(client)
+        .await?
+        .matches_registered(&expected)
     {
-        actual.def = registered;
-    }
-    if observed != expected {
         return Err(InfraError::repository_invariant(
             "desktop_vault_public_schema_invalid",
         ));

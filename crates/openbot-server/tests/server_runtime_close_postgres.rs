@@ -26,6 +26,10 @@ struct Site {
     directory: PathBuf,
     database: DatabaseConfig,
     kek: String,
+    capacity: u64,
+    /// The expected server database: system identifier and database OID.
+    server_database: (u64, u32),
+    dataset: String,
 }
 
 impl Drop for Site {
@@ -35,7 +39,11 @@ impl Drop for Site {
 }
 
 impl Site {
-    async fn new(database: DatabaseConfig, capacity: u64) -> Result<Self, String> {
+    async fn new(
+        database: DatabaseConfig,
+        capacity: u64,
+        mode: Option<&str>,
+    ) -> Result<Self, String> {
         use base64::Engine as _;
         // A private task-owned root below the real checkout avoids the
         // intentionally world-writable system temporary ancestor.
@@ -65,45 +73,7 @@ impl Site {
             .map_err(|error| error.to_string())?;
         probe.close();
         let system: String = row.get("system");
-        let oid: u32 = row.get("oid");
-        let config = directory.join("config");
-        let intent = directory.join("intent");
-        let bytes = serde_json::to_vec(&json!({
-            "version": 1,
-            "controlRoot": directory.join("control"),
-            "hostLimits": {
-                "maxRequestBytes": 65536, "maxActivationBytes": 65536, "maxJournalFrameBytes": 65536,
-                "maxJournalBytes": 1 << 20, "maxJournalRecords": 64, "maxRuntimeRecordBytes": 65536,
-                "maxRegisteredRuntimes": capacity, "maxRetainedOperations": 8, "maxRootEntries": 64,
-                "maxTempEntries": 8, "maxEvidenceRefs": 16, "maxRuntimeResourceFacts": 16,
-                "maxIdBytes": 128, "maxComponentBytes": 128, "maxRelativePathBytes": 8192,
-                "maxPathDepth": 128, "maxOpenFiles": 4096, "maxMetadataBytes": 1 << 24,
-                "admissionNs": 30_000_000_000u64
-            },
-            "ordinaryStartupBounds": {"effectNs": 60_000_000_000u64, "convergenceNs": 30_000_000_000u64},
-            "expectedServiceOwner": {"uid": std::fs::metadata(&directory).unwrap().uid(), "service": "openbot-test"},
-            "expectedInstallationBinding": {"deploymentId": TENANT, "tenantId": TENANT,
-                "datasetId": uuid::Uuid::new_v4().simple().to_string(),
-                "sourceInstallationId": "server-source", "targetInstallationId": "server-target"},
-            "expectedServerDatabase": {"pgSystemId": system.parse::<u64>().unwrap(), "databaseOid": oid, "pgMajor": 17},
-            "optionalStartupIntent": {"mode": "fresh_init", "intentFile": intent},
-        }))
-        .unwrap();
-        std::fs::write(&config, &bytes).unwrap();
-        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let meta = std::fs::metadata(&config).unwrap();
-        let intent_bytes = serde_json::to_vec(&json!({
-            "formatVersion": 1,
-            "requestId": uuid::Uuid::new_v4().simple().to_string(),
-            "mode": "fresh_init",
-            "serviceConfig": {"file": {"device": meta.dev(), "inode": meta.ino(), "uid": meta.uid()},
-                "length": meta.len(),
-                "digest": format!("{:x}", Sha256::digest(&bytes))},
-        }))
-        .unwrap();
-        std::fs::write(&intent, intent_bytes).unwrap();
-        std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o600)).unwrap();
-        Ok(Self {
+        let site = Self {
             directory,
             database,
             kek: base64::engine::general_purpose::STANDARD.encode(
@@ -114,7 +84,93 @@ impl Site {
                     .copied()
                     .collect::<Vec<u8>>(),
             ),
-        })
+            capacity,
+            server_database: (system.parse().unwrap(), row.get("oid")),
+            dataset: uuid::Uuid::new_v4().simple().to_string(),
+        };
+        site.configure(mode);
+        Ok(site)
+    }
+
+    /// Replace the configuration (a new inode) and, with a mode, its intent.
+    fn configure(&self, mode: Option<&str>) {
+        let config = self.directory.join("config");
+        let intent = self.directory.join("intent");
+        let _ = std::fs::remove_file(&config);
+        let _ = std::fs::remove_file(&intent);
+        let bytes = serde_json::to_vec(&json!({
+            "version": 1,
+            "controlRoot": self.directory.join("control"),
+            "hostLimits": {
+                "maxRequestBytes": 65536, "maxActivationBytes": 65536, "maxJournalFrameBytes": 65536,
+                "maxJournalBytes": 1 << 20, "maxJournalRecords": 64, "maxRuntimeRecordBytes": 65536,
+                "maxRegisteredRuntimes": self.capacity, "maxRetainedOperations": 8, "maxRootEntries": 64,
+                "maxTempEntries": 8, "maxEvidenceRefs": 16, "maxRuntimeResourceFacts": 16,
+                "maxIdBytes": 128, "maxComponentBytes": 128, "maxRelativePathBytes": 8192,
+                "maxPathDepth": 128, "maxOpenFiles": 4096, "maxMetadataBytes": 1 << 24,
+                "admissionNs": 30_000_000_000u64
+            },
+            "ordinaryStartupBounds": {"effectNs": 60_000_000_000u64, "convergenceNs": 30_000_000_000u64},
+            "expectedServiceOwner": {"uid": std::fs::metadata(&self.directory).unwrap().uid(), "service": "openbot-test"},
+            "expectedInstallationBinding": {"deploymentId": TENANT, "tenantId": TENANT,
+                "datasetId": self.dataset,
+                "sourceInstallationId": "server-source", "targetInstallationId": "server-target"},
+            "expectedServerDatabase": {"pgSystemId": self.server_database.0, "databaseOid": self.server_database.1, "pgMajor": 17},
+            "optionalStartupIntent": mode.map(|mode| json!({"mode": mode, "intentFile": intent})),
+        }))
+        .unwrap();
+        std::fs::write(&config, &bytes).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let Some(mode) = mode else {
+            return;
+        };
+        let meta = std::fs::metadata(&config).unwrap();
+        let intent_bytes = serde_json::to_vec(&json!({
+            "formatVersion": 1,
+            "requestId": uuid::Uuid::new_v4().simple().to_string(),
+            "mode": mode,
+            "serviceConfig": {"file": {"device": meta.dev(), "inode": meta.ino(), "uid": meta.uid()},
+                "length": meta.len(),
+                "digest": format!("{:x}", Sha256::digest(&bytes))},
+        }))
+        .unwrap();
+        std::fs::write(&intent, intent_bytes).unwrap();
+        std::fs::set_permissions(&intent, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// The database in keyword form; it is never printed.
+    fn database_url(&self) -> String {
+        let database = &self.database;
+        format!(
+            "host={} port={} user={} password={} dbname={}",
+            database.host,
+            database.port,
+            database.user,
+            database.password.as_deref().unwrap_or_default(),
+            database.dbname
+        )
+    }
+
+    /// Run `openbot-migrate <command>`, which reads the unprefixed `DATABASE_URL`.
+    fn migrate(&self, command: &str) -> Result<(), String> {
+        let output = Command::new(env!("CARGO_BIN_EXE_openbot-migrate"))
+            .arg(command)
+            .current_dir(&self.directory)
+            .env_clear()
+            .env("HOME", std::env::var_os("HOME").unwrap())
+            .env("PATH", "/usr/bin:/bin")
+            .env("DATABASE_URL", self.database_url())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "openbot-migrate {command}: {} {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            ));
+        }
+        Ok(())
     }
 
     fn runtimes(&self) -> Vec<PathBuf> {
@@ -130,22 +186,13 @@ impl Site {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let database = &self.database;
-        let url = format!(
-            "host={} port={} user={} password={} dbname={}",
-            database.host,
-            database.port,
-            database.user,
-            database.password.as_deref().unwrap_or_default(),
-            database.dbname
-        );
         let child = Command::new(env!("CARGO_BIN_EXE_wrok-bot-server"))
             .arg("--local")
             .current_dir(&self.directory)
             .env_clear()
             .env("HOME", std::env::var_os("HOME").unwrap())
             .env("PATH", "/usr/bin:/bin")
-            .env("WROK_BOT_DATABASE_URL", url)
+            .env("WROK_BOT_DATABASE_URL", self.database_url())
             .env("WROK_BOT_KEY_ENCRYPTION_KEY", &self.kek)
             .env("WROK_BOT_RECOVERY_CONFIG", self.directory.join("config"))
             .env(
@@ -231,7 +278,7 @@ where
 async fn t046_63_graceful_exit_writes_its_receipt_and_the_next_start_retires_it() {
     owned("t046_63", async |database| {
         let capacity = 2;
-        let site = Site::new(database, capacity).await?;
+        let site = Site::new(database, capacity, Some("fresh_init")).await?;
         // N + 2 starts at capacity N, stopped by SIGINT and SIGTERM in turn.
         for (round, signal) in ["-INT", "-TERM", "-INT", "-TERM"].into_iter().enumerate() {
             let running = site.start()?;
@@ -259,7 +306,7 @@ async fn t046_63_graceful_exit_writes_its_receipt_and_the_next_start_retires_it(
 async fn t046_64_killed_server_enrollments_settle_unless_a_registered_server_lives() {
     owned("t046_64", async |database| {
         let capacity = 3;
-        let site = Site::new(database, capacity).await?;
+        let site = Site::new(database, capacity, Some("fresh_init")).await?;
         // N + 2 kill -9 crashes at capacity N: each start settles the last one.
         for round in 0..5 {
             let running = site.start()?;
@@ -299,6 +346,64 @@ async fn t046_64_killed_server_enrollments_settle_unless_a_registered_server_liv
             ));
         }
         Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL 17.11 through OPENBOT_TEST_DATABASE_URL"]
+async fn fix_046_9_validated_tool_run_fk_starts_and_a_changed_one_is_refused() {
+    owned("fix_046_9", async |database| {
+        let admin = pool::connect(&database)
+            .await
+            .map_err(|error| error.to_string())?;
+        let site = Site::new(database, 2, None).await?;
+        site.migrate("migrate-schema")?;
+        site.migrate("intelligence-validate-tool-run-fk")?;
+        let validated: bool = admin
+            .get()
+            .await
+            .map_err(|error| error.to_string())?
+            .query_one(
+                "SELECT convalidated FROM pg_constraint WHERE conname='tool_calls_run_id_fkey'",
+                &[],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if !validated {
+            return Err("the finalizer left the foreign key NOT VALID".to_owned());
+        }
+        // The validated end state counts as the registered layout, for the
+        // legacy adoption start and for a later start without an intent.
+        site.configure(Some("legacy_adoption"));
+        for round in ["legacy_adoption", "null intent"] {
+            let (status, _) = site.start()?.signal("-INT");
+            if status.code() != Some(0) {
+                return Err(format!("{round}: {status}"));
+            }
+            site.configure(None);
+        }
+        // Any other definition under the same name is still refused.
+        admin
+            .get()
+            .await
+            .map_err(|error| error.to_string())?
+            .batch_execute(
+                "ALTER TABLE public.tool_calls DROP CONSTRAINT tool_calls_run_id_fkey;
+                 ALTER TABLE public.tool_calls ADD CONSTRAINT tool_calls_run_id_fkey
+                   FOREIGN KEY (run_id) REFERENCES public.runs(run_id) ON DELETE CASCADE",
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        admin.close();
+        match site.start() {
+            Err(_) => Ok(()),
+            Ok(running) => {
+                running.signal("-INT");
+                Err("a cascading foreign key reached readiness".to_owned())
+            }
+        }
     })
     .await;
 }

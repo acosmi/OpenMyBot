@@ -40,6 +40,33 @@ impl SchemaFacts {
     pub fn enum_type(&self, name: &str) -> Option<&EnumFacts> {
         self.enums.iter().find(|e| e.name == name)
     }
+
+    /// Compare these observed facts with a registered layout. The registered
+    /// finalizer may already have validated `tool_calls_run_id_fkey`: an
+    /// observed definition equal to the registered one without its trailing
+    /// ` NOT VALID` counts as the registered value. Nothing else is relaxed.
+    pub fn matches_registered(mut self, registered: &SchemaFacts) -> bool {
+        if let Some(registered_def) = registered
+            .table("tool_calls")
+            .and_then(|table| {
+                table
+                    .constraints
+                    .iter()
+                    .find(|constraint| constraint.name == "tool_calls_run_id_fkey")
+            })
+            .map(|constraint| &constraint.def)
+            && let Some(observed) = self
+                .tables
+                .iter_mut()
+                .filter(|table| table.name == "tool_calls")
+                .flat_map(|table| table.constraints.iter_mut())
+                .find(|constraint| constraint.name == "tool_calls_run_id_fkey")
+            && registered_def.strip_suffix(" NOT VALID") == Some(observed.def.as_str())
+        {
+            observed.def.clone_from(registered_def);
+        }
+        self == *registered
+    }
 }
 
 /// 一张表的事实。

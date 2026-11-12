@@ -522,7 +522,7 @@ impl ArtifactDatasetRegistry {
             .ok_or_else(|| corrupt("public_schema"))?;
         let actual: schema_facts::SchemaFacts =
             serde_json::from_str(payload).map_err(|_| corrupt("public_schema"))?;
-        if actual != public {
+        if !actual.matches_registered(&public) {
             return Err(corrupt("public_schema"));
         }
         let expected: ArtifactRegistrySchemaFacts =
@@ -628,10 +628,10 @@ pub(crate) async fn verify_artifact_registry_schema_on(
         })?;
     let public: schema_facts::SchemaFacts = serde_json::from_str(REGISTERED_PUBLIC_SCHEMA)
         .map_err(|_| corrupt("public_schema_oracle"))?;
-    if schema_facts::fetch(client)
+    if !schema_facts::fetch(client)
         .await
         .map_err(|_| ArtifactRegistryError::Unavailable)?
-        != public
+        .matches_registered(&public)
     {
         return Err(corrupt("public_schema"));
     }
