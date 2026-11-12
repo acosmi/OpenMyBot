@@ -21,18 +21,17 @@ use crate::api::{
 use crate::features::agents::{AgentDirectory, use_agent_directory};
 use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
-use crate::icons::Icon;
-use crate::primitives::{
-    Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone, Textarea,
-};
+use crate::primitives::{NoticeTone, Textarea, use_sidebar};
 
 use super::RecipientField;
+use super::composer::controls::{ComposerAction, ComposerControls, ComposerModel, choice_notices};
 #[cfg(target_arch = "wasm32")]
 use super::composer::model_intents::{CreateIntent, RunIntent, RunRecovery, is_definite_rejection};
 use super::composer::model_intents::{RunSubmissionActions, SubmissionSource};
-use super::composer::models::{ModelComposer, ModelPicker, ModelSelectionStatus};
+use super::composer::models::{ModelComposer, ModelSelectionStatus};
 use super::composer::presentation::{AssistantIdentity, ComposerFrame, DraftSuggestions};
-use super::composer::skills::{SkillComposer, SkillPicker};
+use super::composer::skills::SkillComposer;
+use super::composer::status::{SlotNotice, StatusSlot};
 use crate::shell::layout::set_shell_title;
 
 /// One recipient/message/run identity retained across a recoverable first-message retry.
@@ -65,6 +64,48 @@ pub(crate) const fn model_notice(status: ModelSelectionStatus) -> Option<Submiss
         | ModelSelectionStatus::DirectoryFailed
         | ModelSelectionStatus::Unavailable => Some(SubmissionNotice::ModelSelectionUnavailable),
     }
+}
+
+/// The status-slot notice of the last refused submission. A model refusal shows only while the
+/// model choice still has that problem.
+pub(crate) fn submission_slot_notice(
+    i18n: leptos_i18n::I18nContext<crate::i18n::Locale>,
+    notice: Option<SubmissionNotice>,
+    model_status: ModelSelectionStatus,
+) -> Option<SlotNotice> {
+    let text = match notice? {
+        SubmissionNotice::ModelAgentConflict
+            if model_notice(model_status) == Some(SubmissionNotice::ModelAgentConflict) =>
+        {
+            t_string!(i18n, channels.model_agent_conflict)
+        }
+        SubmissionNotice::ModelSelectionUnavailable
+            if model_notice(model_status) == Some(SubmissionNotice::ModelSelectionUnavailable) =>
+        {
+            t_string!(i18n, channels.model_selection_unavailable)
+        }
+        SubmissionNotice::ModelAgentConflict | SubmissionNotice::ModelSelectionUnavailable => {
+            return None;
+        }
+        SubmissionNotice::Conflict => t_string!(i18n, channels.submit_conflict),
+        SubmissionNotice::Rejected => t_string!(i18n, channels.submit_rejected),
+        SubmissionNotice::NavigationFailed => t_string!(i18n, channels.navigation_failed),
+        SubmissionNotice::RoutingFailed => t_string!(i18n, home.routing_failed),
+    };
+    Some(SlotNotice::new(NoticeTone::Error, text))
+}
+
+/// The status-slot notice of a channel creation whose reply was lost; its action opens the
+/// sidebar's channel list, where the channel appears if it was created (UI spec v5.2 §7.4).
+pub(crate) fn create_uncertain_notice(
+    i18n: leptos_i18n::I18nContext<crate::i18n::Locale>,
+    show_channels: UnsyncCallback<()>,
+) -> SlotNotice {
+    SlotNotice::new(
+        NoticeTone::Error,
+        t_string!(i18n, channels.create_uncertain),
+    )
+    .with_button(t_string!(i18n, channels.show_list), show_channels)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -595,6 +636,68 @@ pub fn ChannelNewPage() -> impl IntoView {
         }
     });
 
+    let show_channels = {
+        let sidebar = use_sidebar();
+        UnsyncCallback::new(move |_| sidebar.show_history())
+    };
+    let model = ComposerModel::Run(model_composer);
+    let notices = Signal::derive(move || {
+        let mut notices = Vec::new();
+        if uncertain_create.get() {
+            notices.push(create_uncertain_notice(i18n, show_channels));
+        }
+        if begin_unknown.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, channels.begin_unknown),
+            ));
+        }
+        if submission_blocked.get() {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Error,
+                    t_string!(i18n, channels.submission_blocked),
+                )
+                .linked(
+                    submissions
+                        .barrier()
+                        .and_then(|barrier| barrier.href())
+                        .unwrap_or_else(|| "/".to_owned()),
+                ),
+            );
+        }
+        notices.extend(submission_slot_notice(
+            i18n,
+            notice.get(),
+            model_composer.selection_status(),
+        ));
+        if load_error.get() || recipient_restore_missing.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, channels.recipient_load_error),
+            ));
+        }
+        notices.extend(choice_notices(
+            i18n,
+            model,
+            skill_composer,
+            inputs_locked.get(),
+        ));
+        notices
+    });
+    let send_action = ComposerAction {
+        disabled: send_disabled,
+        loading: submitting.into(),
+        label: Signal::derive(move || {
+            if begin_unknown.get() {
+                t_string!(i18n, channels.retry_original).to_owned()
+            } else {
+                t_string!(i18n, channels.composer_send).to_owned()
+            }
+        }),
+        run: send,
+    };
+
     view! {
         <PageShell width=PageWidth::Chat>
             <div class="ob-channel-new">
@@ -602,10 +705,8 @@ pub fn ChannelNewPage() -> impl IntoView {
                 <Show when=move || loading.get()>
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
                 </Show>
-                <Show when=move || load_error.get() || recipient_restore_missing.get()>
-                    <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.recipient_load_error)}</Notice>
-                </Show>
                 <div class="ob-home-footer">
+                <StatusSlot notices/>
                 <ComposerFrame busy=Signal::derive(move || submitting.get())>
                     <Textarea
                         value=draft
@@ -619,78 +720,41 @@ pub fn ChannelNewPage() -> impl IntoView {
                         on_keydown=UnsyncCallback::new(move |event| skill_composer.keyboard(event))
                         on_submit=send
                     />
-                <div class="ob-chat-controls">
-                <div class="ob-channel-new-recipient">
-                    <RecipientField
-                        agents=Signal::derive(move || {
-                            let restoring = resumable.get().is_some() || uncertain_create.get();
-                            if restoring && (loading.get() || load_error.get() || recipient_restore_missing.get()) {
-                                Vec::new()
-                            } else {
-                                agents.get()
-                            }
-                        })
-                        selected
-                        aria_label=move || t_string!(i18n, channels.recipient_label).to_owned()
-                        placeholder=move || t_string!(i18n, channels.recipient_placeholder).to_owned()
-                        empty_label=move || t_string!(i18n, channels.recipient_empty).to_owned()
-                        disabled=inputs_locked
-                        on_select=select
-                    />
-                    <Show when=move || resumable.get().is_some() || uncertain_create.get()>
-                        <p class="ob-page-empty" role="note">
-                            <strong>{move || t!(i18n, channels.recipient_label)}</strong>
-                            {move || {
-                                if loading.get() {
-                                    return t_string!(i18n, common.loading).to_owned();
-                                }
-                                let frozen_agent = resumable.get().map(|attempt| attempt.agent_id).or_else(|| submissions.create_unknown(SubmissionSource::ChannelNew).map(|intent| intent.agent_id));
-                                frozen_agent.and_then(|id| agents.get().into_iter().find(|profile| profile.id == id).map(|profile| profile.name)).unwrap_or_else(|| t_string!(i18n, common.unknown).to_owned())
-                            }}
-                        </p>
-                    </Show>
-                </div>
-                    <ModelPicker state=model_composer disabled=inputs_locked/>
-                    <SkillPicker state=skill_composer disabled=inputs_locked/>
-                    <span class="ob-chat-send">
-                        <Button
-                            variant=ButtonVariant::Primary
-                            size=ButtonSize::Medium
-                            disabled=send_disabled
-                            loading=submitting
-                            on_activate=move |_| send.run(())
-                        >
-                            <IconView icon=Icon::ArrowUp size=IconSize::Navigation />
-                            <span class="ob-visually-hidden">{move || if begin_unknown.get() {
-                                t_string!(i18n, channels.retry_original).to_owned()
-                            } else {
-                                t_string!(i18n, channels.composer_send).to_owned()
-                            }}</span>
-                        </Button>
-                    </span>
-                </div>
+                    <ComposerControls model skills=skill_composer disabled=inputs_locked send=send_action>
+                        <div class="ob-channel-new-recipient">
+                            <RecipientField
+                                agents=Signal::derive(move || {
+                                    let restoring = resumable.get().is_some() || uncertain_create.get();
+                                    if restoring && (loading.get() || load_error.get() || recipient_restore_missing.get()) {
+                                        Vec::new()
+                                    } else {
+                                        agents.get()
+                                    }
+                                })
+                                selected
+                                aria_label=move || t_string!(i18n, channels.recipient_label).to_owned()
+                                placeholder=move || t_string!(i18n, channels.recipient_placeholder).to_owned()
+                                empty_label=move || t_string!(i18n, channels.recipient_empty).to_owned()
+                                disabled=inputs_locked
+                                on_select=select
+                            />
+                            <Show when=move || resumable.get().is_some() || uncertain_create.get()>
+                                <p class="ob-chat-note" role="note">
+                                    <strong>{move || t!(i18n, channels.recipient_label)}</strong>
+                                    {move || {
+                                        if loading.get() {
+                                            return t_string!(i18n, common.loading).to_owned();
+                                        }
+                                        let frozen_agent = resumable.get().map(|attempt| attempt.agent_id).or_else(|| submissions.create_unknown(SubmissionSource::ChannelNew).map(|intent| intent.agent_id));
+                                        frozen_agent.and_then(|id| agents.get().into_iter().find(|profile| profile.id == id).map(|profile| profile.name)).unwrap_or_else(|| t_string!(i18n, common.unknown).to_owned())
+                                    }}
+                                </p>
+                            </Show>
+                        </div>
+                    </ComposerControls>
                 </ComposerFrame>
                 <DraftSuggestions on_choose=UnsyncCallback::new(move |text| { if !inputs_locked.get_untracked() { draft.set(text); } }) disabled=inputs_locked/>
                 </div>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_agent_conflict)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_selection_unavailable)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Conflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_conflict)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Rejected)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_rejected)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::NavigationFailed)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.navigation_failed)}</Notice></Show>
-                <Show when=move || uncertain_create.get()>
-                    <Notice tone=NoticeTone::Error>
-                        <p>{move || t!(i18n, channels.create_uncertain)}</p>
-                        <a href="/">{move || t!(i18n, home.title)}</a>
-                    </Notice>
-                </Show>
-                <Show when=move || begin_unknown.get()>
-                    <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.begin_unknown)}</Notice>
-                </Show>
-                <Show when=move || submission_blocked.get()>
-                    <Notice tone=NoticeTone::Error><a href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
-                        {move || t!(i18n, channels.submission_blocked)}
-                    </a></Notice>
-                </Show>
             </div>
         </PageShell>
     }

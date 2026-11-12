@@ -2467,14 +2467,6 @@ summary:focus-visible,
   font-size: var(--text-xs);
 }
 
-.ob-home-routing-hint,
-.ob-home-model-preset-note {
-  margin: calc(var(--spacing) * 2) 0 0;
-  color: var(--fg-muted);
-  font-size: var(--text-xs);
-  text-align: center;
-}
-
 .ob-recipient-option-avatar {
   display: inline-flex;
   flex: 0 0 auto;
@@ -3522,11 +3514,6 @@ summary::-webkit-details-marker {
   display: none;
 }
 
-.ob-home-routing-hint a {
-  color: var(--fg-secondary);
-  text-underline-offset: 3px;
-}
-
 .ob-agent-roster-toolbar .ob-page-header {
   margin-block-end: 0;
 }
@@ -3806,6 +3793,8 @@ html[data-window-chrome="macos-overlay"] .ob-shell-topbar > .ob-sidebar-trigger 
 .ob-chat-composer .ob-textarea:focus-visible { outline: none; box-shadow: none; }
 .ob-chat-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; margin-top: 8px; }
 .ob-chat-controls > :is(.ob-skill-picker, .ob-channel-new-recipient) { min-width: 0; max-width: 100%; }
+/* The small control buttons size to their label, not to the 180px listbox default (UI spec v5.2 §7.3). */
+.ob-chat-controls .ob-listbox-root:not([data-kind="editable"]) { width: auto; }
 .ob-chat-controls :is(.ob-select-trigger, .ob-skill-picker > .ob-button) {
   min-height: 28px; max-width: 220px; padding: 3px 7px; border: 0;
   border-radius: 7px; background: transparent; color: var(--fg-secondary); font-size: 12px;
@@ -3827,15 +3816,16 @@ html[data-window-chrome="macos-overlay"] .ob-shell-topbar > .ob-sidebar-trigger 
 .ob-chat-controls .ob-recipient-field .ob-listbox-option { flex-direction: row; align-items: center; }
 .ob-chat-controls .ob-recipient-field .ob-listbox-option-content { display: flex; align-items: center; gap: 8px; }
 .ob-chat-controls .ob-recipient-option-copy > :is(span, small) { white-space: normal; overflow-wrap: anywhere; }
-.ob-chat-controls .ob-skill-picker, .ob-chat-draft { position: relative; }
+.ob-chat-controls .ob-skill-picker { position: relative; }
 .ob-chat-composer .ob-home-mention-results {
   position: absolute; inset-block-start: auto; inset-block-end: calc(100% + 4px);
   z-index: var(--z-combobox); width: var(--size-menu-min); max-width: calc(100vw - 32px);
   max-height: min(var(--size-listbox-max), calc(100dvh - 180px));
 }
 .ob-chat-controls .ob-home-mention-results { inset-inline-end: 0; }
-.ob-chat-send { flex: 0 0 auto; margin-left: auto; }
-.ob-chat-send .ob-button, #home-send {
+.ob-chat-send, .ob-chat-takeover { flex: 0 0 auto; margin-left: auto; }
+.ob-chat-takeover + .ob-chat-send { margin-left: 0; }
+.ob-chat-send .ob-button {
   width: var(--size-control-sm); height: var(--size-control-sm); min-height: var(--size-control-sm); padding: 0;
   justify-content: center; border-radius: 50%;
 }
@@ -3853,10 +3843,9 @@ html[data-window-chrome="macos-overlay"] .ob-shell-topbar > .ob-sidebar-trigger 
 .ob-chat-composer[data-kind="active"] { min-height: 0; border-width: 1px 0 0; padding: 13px 3px 5px; }
 .ob-chat-composer[data-kind="active"] .ob-textarea { min-height: 43px; max-height: 120px; padding: 10px 3px; }
 .ob-chat-composer[data-kind="active"] .ob-chat-send .ob-button { width: 30px; height: 30px; min-height: 30px; }
-.ob-model-setup { flex-basis: 100%; order: 4; display: grid; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-subtle); font-size: 13px; line-height: 1.5; }
-.ob-assistant-identity-copy, .ob-chat-draft { min-width: 0; }
-.ob-home-agent-manage-link { display: block; padding: 7px; color: var(--fg-secondary); font-size: 12px; }
-.ob-model-setup a { color: var(--fg-secondary); font-size: 12px; text-decoration: underline; }
+.ob-assistant-identity-copy { min-width: 0; }
+.ob-composer-menu-link { display: block; padding: 7px; color: var(--fg-secondary); font-size: 12px; }
+.ob-chat-note { margin: 0; color: var(--fg-muted); font-size: 12px; }
 .ob-queue-heading { margin: 16px 0 8px; color: var(--fg-muted); font-size: 12px; font-weight: 550; }
 .ob-queue-snapshot { overflow-wrap: anywhere; font-size: 11px; color: var(--fg-muted); }
 
@@ -3893,7 +3882,6 @@ html[data-window-chrome="macos-overlay"] .ob-shell-topbar > .ob-sidebar-trigger 
 .ob-bot-pending { display: flex; flex-direction: column; gap: calc(var(--spacing) * 2); margin-block-end: calc(var(--spacing) * 4); }
 .ob-bot-pending-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: calc(var(--spacing) * 2); }
 .ob-bot-pending-rows { display: flex; flex-direction: column; gap: calc(var(--spacing) * 2); margin: 0; padding: 0; list-style: none; }
-.ob-bot-work-actions { display: flex; flex-wrap: wrap; gap: calc(var(--spacing) * 2); }
 .ob-bot-work-rename { display: flex; flex-wrap: wrap; align-items: flex-end; gap: calc(var(--spacing) * 2); }
 .ob-bot-work-rename-actions { display: flex; gap: calc(var(--spacing) * 2); }
 .ob-bot-attention { display: flex; margin-block-end: calc(var(--spacing) * 2); }

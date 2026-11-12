@@ -5,6 +5,7 @@ pub mod composer;
 pub mod conversation;
 pub mod detail;
 pub(crate) mod markdown;
+pub(crate) mod message_actions;
 pub mod new;
 pub mod recipient_field;
 pub(crate) mod run_observation;

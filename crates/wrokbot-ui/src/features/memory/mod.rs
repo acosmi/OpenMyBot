@@ -294,6 +294,33 @@ pub fn MemoryPage() -> impl IntoView {
         }
     });
 
+    // Deleting erases the content, so it is confirmed first; forbidding is not.
+    let delete_open = RwSignal::new(false);
+    let delete_target = RwSignal::new(None::<String>);
+    let delete_excerpt = RwSignal::new(None::<String>);
+    let request_mutation =
+        UnsyncCallback::new(move |(memory_id, mutation): (String, MemoryMutation)| {
+            if matches!(mutation, MemoryMutation::Delete) {
+                delete_excerpt.set(memories.with_untracked(|rows| {
+                    rows.iter()
+                        .find(|row| row.memory_id == memory_id)
+                        .and_then(|row| row.content.as_deref().map(memory_excerpt))
+                }));
+                delete_target.set(Some(memory_id));
+                delete_open.set(true);
+            } else {
+                mutate.run((memory_id, mutation));
+            }
+        });
+    let close_delete = UnsyncCallback::new(move |_| delete_target.set(None));
+    let confirm_delete = move |_| {
+        if let Some(memory_id) = delete_target.get_untracked() {
+            mutate.run((memory_id, MemoryMutation::Delete));
+        }
+        delete_target.set(None);
+        delete_open.set(false);
+    };
+
     view! {
         <PageShell width=PageWidth::Content>
             <div class="ob-memory-page">
@@ -306,7 +333,7 @@ pub fn MemoryPage() -> impl IntoView {
                     reload_generation
                     pending_ids
                     on_correct=open_correction
-                    on_mutate=mutate
+                    on_mutate=request_mutation
                 />
                 <Show when=move || loading.get()>
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
@@ -361,7 +388,7 @@ pub fn MemoryPage() -> impl IntoView {
                                             writes_enabled=Signal::derive(move || writes_enabled.get())
                                             pending_ids
                                             on_correct=open_correction
-                                            on_mutate=mutate
+                                            on_mutate=request_mutation
                                         />
                                     }
                                 />
@@ -384,6 +411,31 @@ pub fn MemoryPage() -> impl IntoView {
                 </Show>
             </div>
         </PageShell>
+        <Dialog id="memory-delete-dialog" open=delete_open on_close=close_delete>
+            <DialogContent
+                title=move || t_string!(i18n, memory.delete_title).to_owned()
+                description=move || t_string!(i18n, memory.delete_description).to_owned()
+            >
+                <Show when=move || delete_excerpt.with(Option::is_some)>
+                    <DialogBody>
+                        <p class="ob-memory-content">{move || delete_excerpt.get()}</p>
+                    </DialogBody>
+                </Show>
+                <DialogFooter>
+                    <DialogClose id="memory-delete-cancel">
+                        {move || t!(i18n, common.cancel)}
+                    </DialogClose>
+                    <Button
+                        id="memory-delete-confirm"
+                        variant=ButtonVariant::DangerText
+                        size=ButtonSize::Medium
+                        on_activate=confirm_delete
+                    >
+                        {move || t!(i18n, memory.delete_entry)}
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
         <Dialog id="memory-correct-dialog" open=correct_open on_close=close_correction>
             <DialogContent
                 title=move || t_string!(i18n, memory.correct_title).to_owned()

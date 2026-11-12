@@ -877,6 +877,12 @@ impl ArtifactSourceObserver {
             && self.anchor.try_get_value().as_ref() == Some(&source.anchor)
     }
 
+    /// Whether this message offers "save as artifact": it is the one message that can be saved, or
+    /// it has a save whose outcome the user can still follow.
+    pub(crate) fn offers_save(self, message: &str) -> bool {
+        self.selection(message).is_some() || self.actions.visible_operation(self, message).is_some()
+    }
+
     fn selection(self, message: &str) -> Option<UserSource> {
         self.actions.state.with(|_| ());
         self.state.with(|state| {
@@ -2140,9 +2146,6 @@ pub(crate) fn ArtifactMessageActions(
             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small disabled=disabled on_activate=save>
                 {move || t!(i18n, artifacts.save)}
             </Button>
-            <Show when=move || eligible.get().is_none() && operation.get().is_none()>
-                <span class="ob-tool-source">{move || t!(i18n, artifacts.source_unavailable)}</span>
-            </Show>
             <Show when=move || phase.get() == Some(SavePhase::Saving)>
                 <span role="status">{move || t!(i18n, artifacts.saving)}</span>
             </Show>

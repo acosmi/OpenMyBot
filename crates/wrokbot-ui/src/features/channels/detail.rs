@@ -25,9 +25,12 @@ pub fn ChannelDetailPage() -> impl IntoView {
     install_detail_loader(params, channel, loading, failed);
     let directory = use_agent_directory();
     // The conversation signs replies with the assistant's name from the directory, so it waits
-    // for the first directory read; a later refresh keeps it mounted.
-    let directory_settled = Memo::new(move |_| {
-        !directory.loading.get() || directory.agents.with(|agents| !agents.is_empty())
+    // for the first directory read to finish. A failed read also mounts it, with the generic
+    // assistant name, and once mounted no later read or retry unmounts it.
+    let directory_settled = Memo::new(move |settled: Option<&bool>| {
+        settled.copied().unwrap_or(false)
+            || !directory.loading.get()
+            || directory.agents.with(|agents| !agents.is_empty())
     });
     set_shell_title(move || {
         channel

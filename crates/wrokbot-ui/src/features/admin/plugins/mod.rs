@@ -290,14 +290,16 @@ fn ServerFacts(server: McpAdminServer) -> impl IntoView {
 #[component]
 fn PluginTool(data: PluginData, server_id: String, tool_name: String) -> impl IntoView {
     let i18n = use_i18n();
-    let tool = data
+    let server = data
         .page
         .servers
         .iter()
-        .find(|server| server.id == server_id)
+        .find(|server| server.id == server_id);
+    let server_title = server.map(|server| server.title.clone());
+    let tool = server
         .and_then(|server| server.tools.iter().find(|tool| tool.name == tool_name))
         .cloned();
-    let Some(tool) = tool else {
+    let (Some(tool), Some(server_title)) = (tool, server_title) else {
         return view! { <PageEmpty>{move || t!(i18n, plugins.tool_missing)}</PageEmpty> }
             .into_any();
     };
@@ -306,6 +308,8 @@ fn PluginTool(data: PluginData, server_id: String, tool_name: String) -> impl In
     view! {
         <PageSection heading_id="plugin-tool-effect" title=move || t_string!(i18n, plugins.effect).to_owned()>
             <p>{description}</p><p class="text-fg-secondary">{move || effect_label(i18n, effect)}</p>
+            // The tool's own server, reached from the page body (UI spec v5.2 §6.1).
+            <p class="text-fg-secondary">{move || t!(i18n, plugins.tool_server)} " " <a href=api::plugin_href(&server_id).expect("validated id")>{server_title}</a></p>
         </PageSection>
         <PageSection heading_id="plugin-tool-agents" title=move || t_string!(i18n, plugins.agents).to_owned()
             description=move || t_string!(i18n, plugins.grants_intro).to_owned()>

@@ -6,11 +6,12 @@ use openbot_contracts::model_connections::{
     ModelConnection, ModelConnectionSource, RunModelSelection,
 };
 
+use super::status::SlotNotice;
 use crate::api::ApiError;
 #[cfg(target_arch = "wasm32")]
 use crate::api::model_connections;
 use crate::features::settings::models::ModelActions;
-use crate::i18n::{t, t_string, use_i18n};
+use crate::i18n::{Locale, t, t_string, use_i18n};
 use crate::primitives::{
     Notice, NoticePresentation, NoticeTone, Select, SelectContent, SelectItem, SelectTrigger,
 };
@@ -253,6 +254,59 @@ impl ModelComposer {
     pub(crate) fn directory_reload(self) {
         self.directory.reload();
     }
+
+    /// What the composer's status slot says about the model choice (UI spec v5.2 §7.1, §7.3).
+    pub(crate) fn status_notices(
+        self,
+        i18n: leptos_i18n::I18nContext<Locale>,
+        locked: bool,
+    ) -> Vec<SlotNotice> {
+        let locked_text = || t_string!(i18n, models.selection_unavailable_locked);
+        let mut notices = Vec::new();
+        match self.selection_status() {
+            ModelSelectionStatus::DirectoryFailed => notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, models.load_failed),
+            )),
+            ModelSelectionStatus::Unavailable => notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                if locked {
+                    locked_text()
+                } else {
+                    t_string!(i18n, models.selection_unavailable)
+                },
+            )),
+            ModelSelectionStatus::AgentConflict => notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                if locked {
+                    locked_text()
+                } else {
+                    t_string!(i18n, models.selection_agent_conflict)
+                },
+            )),
+            ModelSelectionStatus::AgentDefault
+            | ModelSelectionStatus::Ready
+            | ModelSelectionStatus::Loading => {}
+        }
+        if self.directory.status.get() == DirectoryStatus::Ready
+            && !self
+                .directory
+                .rows
+                .with(|rows| rows.iter().any(|row| row.enabled && row.has_credential))
+        {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Status,
+                    t_string!(i18n, models.custom_setup_note),
+                )
+                .with_link(
+                    "/settings/models",
+                    t_string!(i18n, models.custom_setup_action),
+                ),
+            );
+        }
+        notices
+    }
 }
 
 #[component]
@@ -402,28 +456,7 @@ pub(crate) fn ModelPicker(state: ModelComposer, disabled: Signal<bool>) -> impl 
                     <Show when=move || state.directory.status.get()==DirectoryStatus::Ready && rows.get().is_empty()><p>{move || t!(i18n, models.none_available)}</p></Show>
                 </SelectContent>
             </Select>
-            <Show when=move || selection_status.get()==ModelSelectionStatus::Loading>
-                <span class="ob-page-empty" role="status">{move || t!(i18n, common.loading)}</span>
-            </Show>
-            <Show when=move || selection_status.get()==ModelSelectionStatus::DirectoryFailed>
-                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, models.load_failed)}</Notice>
-            </Show>
-            <Show when=move || selection_status.get()==ModelSelectionStatus::Unavailable>
-                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || if disabled.get() {t_string!(i18n, models.selection_unavailable_locked).to_owned()} else {t_string!(i18n, models.selection_unavailable).to_owned()}}</Notice>
-            </Show>
-            <Show when=move || selection_status.get()==ModelSelectionStatus::AgentConflict>
-                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || if disabled.get() {t_string!(i18n, models.selection_unavailable_locked).to_owned()} else {t_string!(i18n, models.selection_agent_conflict).to_owned()}}</Notice>
-            </Show>
-            <Show when=move || !state.supports_explicit.get() && selection_status.get()==ModelSelectionStatus::AgentDefault>
-                <span class="ob-page-empty">{move || t!(i18n, models.managed_by_agent)}</span>
-            </Show>
         </div>
-        <Show when=move || state.directory.status.get()==DirectoryStatus::Ready && !state.directory.rows.get().iter().any(|row| row.enabled && row.has_credential)>
-            <aside class="ob-model-setup" role="note">
-                <span>{move || t!(i18n, models.custom_setup_note)}</span>
-                <a href="/settings/models">{move || t!(i18n, models.custom_setup_action)}</a>
-            </aside>
-        </Show>
     }
 }
 

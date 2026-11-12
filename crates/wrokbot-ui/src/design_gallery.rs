@@ -4,6 +4,14 @@
 use leptos::prelude::*;
 
 use crate::features::agents::{AgentPresence, AgentPresenceState};
+use crate::features::channels::composer::controls::{
+    ComposerAction, ComposerControls, ComposerModel,
+};
+use crate::features::channels::composer::models::ModelComposer;
+use crate::features::channels::composer::presentation::ComposerFrame;
+use crate::features::channels::composer::skills::SkillComposer;
+use crate::features::channels::composer::status::{SlotNotice, StatusSlot};
+use crate::features::channels::message_actions::MessageActions;
 use crate::features::computer::ComputerPlaceholder;
 use crate::features::gallery::{GalleryBadge, GalleryFrame, GalleryTone, QuoteCard, RefusedCard};
 use crate::features::layout::{
@@ -87,6 +95,65 @@ pub fn DesignGallery() -> impl IntoView {
     let scroller_previous_id = RwSignal::new(-1_i32);
     let scroller_expanded_id = RwSignal::new(None::<i32>);
     let sample_time = time::macros::datetime!(2026-11-12 09:41 UTC);
+    let composer_draft = RwSignal::new(String::new());
+    let composer_skills = SkillComposer::new(
+        composer_draft,
+        Signal::derive(|| None),
+        "design-composer-message",
+    );
+    let composer_model = ComposerModel::Run(ModelComposer::new(
+        Signal::derive(|| true),
+        Signal::derive(|| None),
+    ));
+    let gallery_action = |label: Signal<String>| ComposerAction {
+        disabled: Signal::derive(|| false),
+        loading: Signal::derive(|| false),
+        label,
+        run: UnsyncCallback::new(move |_| button_count.update(|count| *count += 1)),
+    };
+    let retry = UnsyncCallback::new(move |_| button_count.update(|count| *count += 1));
+    let error_wins = Signal::derive(move || {
+        vec![
+            SlotNotice::new(
+                NoticeTone::Status,
+                t_string!(i18n, design_gallery.notice_status),
+            ),
+            SlotNotice::new(
+                NoticeTone::Caution,
+                t_string!(i18n, design_gallery.notice_caution),
+            ),
+            SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, design_gallery.notice_error),
+            )
+            .with_button(t_string!(i18n, common.retry), retry),
+        ]
+    });
+    let blocking_caution_wins = Signal::derive(move || {
+        vec![
+            SlotNotice::new(
+                NoticeTone::Success,
+                t_string!(i18n, design_gallery.notice_success),
+            ),
+            SlotNotice::new(
+                NoticeTone::Caution,
+                t_string!(i18n, design_gallery.notice_caution),
+            )
+            .blocking(),
+        ]
+    });
+    let status_only = Signal::derive(move || {
+        vec![
+            SlotNotice::new(
+                NoticeTone::Status,
+                t_string!(i18n, design_gallery.notice_status),
+            )
+            .with_link(
+                "/settings/models",
+                t_string!(i18n, models.custom_setup_action),
+            ),
+        ]
+    });
 
     view! {
         <section class="ob-page ob-design-gallery" aria-labelledby="design-gallery-title">
@@ -713,6 +780,40 @@ pub fn DesignGallery() -> impl IntoView {
                             <code>"run_01JC0000000000000000000000"</code>
                             <code>"call_7f3a"</code>
                         </TechnicalDetails>
+                    </div>
+                </section>
+
+                <section class="ob-design-section" aria-labelledby="design-composer-title">
+                    <h2 id="design-composer-title">{move || t!(i18n, design_gallery.composer)}</h2>
+                    <div class="ob-design-stack" id="design-composer">
+                        <StatusSlot notices=error_wins/>
+                        <StatusSlot notices=blocking_caution_wins/>
+                        <StatusSlot notices=status_only/>
+                        <ComposerFrame busy=Signal::derive(|| false)>
+                            <Textarea
+                                value=composer_draft
+                                id="design-composer-message"
+                                aria_label=move || t_string!(i18n, channels.composer_placeholder).to_owned()
+                            />
+                            <ComposerControls
+                                model=composer_model
+                                skills=composer_skills
+                                disabled=Signal::derive(|| false)
+                                send=gallery_action(Signal::derive(move || t_string!(i18n, channels.composer_send).to_owned()))
+                                take_over=(Signal::derive(|| true), gallery_action(Signal::derive(move || t_string!(i18n, bot_work.stop_and_take_over).to_owned())))
+                            />
+                        </ComposerFrame>
+                        <Message
+                            align=MessageAlign::End
+                            aria_label=move || t_string!(i18n, design_gallery.composer_label).to_owned()
+                        >
+                            <MessageContent>
+                                <Bubble kind=BubbleKind::User>
+                                    {move || t!(i18n, design_gallery.user_message)}
+                                </Bubble>
+                                <MessageActions on_remember=Some(retry)/>
+                            </MessageContent>
+                        </Message>
                     </div>
                 </section>
 

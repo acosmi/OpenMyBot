@@ -267,14 +267,13 @@ pub(crate) fn SkillPicker(state: SkillComposer, disabled: Signal<bool>) -> impl 
                             <span>{format!("/{}", skill.slug)}</span><span><strong>{skill.title}</strong><small>{skill.summary}</small></span>
                         </button> }
                     }/>
+                    <Show when=move || state.loading.get()><p role="status">{move || t!(i18n, common.loading)}</p></Show>
+                    <Show when=move || state.error.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, skills.choices_error)}</Notice></Show>
+                    <Show when=move || state.agent.get().is_some() && !state.loading.get() && !state.error.get() && state.matches.get().is_empty()><p>{move || t!(i18n, skills.choices_empty)}</p></Show>
+                    <Show when=move || state.agent.get().is_none()><p>{move || t!(i18n, skills.choose_agent_first)}</p></Show>
+                    <a class="ob-composer-menu-link" href="/skills">{move || t!(i18n, skills.manage)}</a>
                 </div>
-                <Show when=move || state.loading.get()><p class="ob-page-empty" role="status">{move || t!(i18n, common.loading)}</p></Show>
-                <Show when=move || state.error.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, skills.choices_error)}</Notice></Show>
-                <Show when=move || state.agent.get().is_some() && !state.loading.get() && !state.error.get() && state.matches.get().is_empty()><p class="ob-page-empty">{move || t!(i18n, skills.choices_empty)}</p></Show>
-                <Show when=move || state.agent.get().is_none()><p class="ob-page-empty">{move || t!(i18n, skills.choose_agent_first)}</p></Show>
-                <a class="ob-plugin-link" href="/skills">{move || t!(i18n, skills.manage)}</a>
             </Show>
-            <Show when=move || state.invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, skills.selection_invalid)}</Notice></Show>
         </div>
     }
 }

@@ -269,11 +269,6 @@ pub fn ModelPickerV2(state: ModelComposerV2, disabled: Signal<bool>) -> impl Int
                     </Show>
                 </SelectContent>
             </Select>
-            <Show when=move || !state.supports_explicit.get()>
-                <span class="ob-page-empty" role="status">
-                    {move || t!(i18n, bot_work.remote_assistant_unsupported)}
-                </span>
-            </Show>
         </div>
     }
 }

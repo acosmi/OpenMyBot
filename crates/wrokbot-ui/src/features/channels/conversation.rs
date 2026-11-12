@@ -25,7 +25,8 @@ use openbot_contracts::sandboxed::is_sandboxed_component_name;
 use openbot_contracts::text::trim_ecmascript;
 use sha2::{Digest, Sha256};
 
-use super::artifacts::{ArtifactMessageActions, ArtifactSourceObserver};
+use super::artifacts::ArtifactSourceObserver;
+use super::message_actions::MessageActions;
 use super::run_observation::{ObservedRunDirectory, OutputPhase, RunObservation};
 #[cfg(target_arch = "wasm32")]
 use crate::api::desktop_transport::{
@@ -41,13 +42,16 @@ use crate::api::{
 use crate::features::agents::{AgentPresence, AgentPresenceState, use_agent_directory};
 #[cfg(target_arch = "wasm32")]
 use crate::features::bot_threads::attention::read_attention_index;
-use crate::features::bot_threads::model::{ModelComposerV2, ModelPickerV2};
+use crate::features::bot_threads::model::ModelComposerV2;
 use crate::features::bot_threads::pending::PendingInputsPanel;
 #[cfg(target_arch = "wasm32")]
 use crate::features::bot_threads::pending::pending_position;
 use crate::features::bot_threads::submit::{AcceptedInput, v2_body};
 #[cfg(target_arch = "wasm32")]
 use crate::features::bot_threads::submit::{DirectSubmissionOutcome, submit_direct_input};
+use crate::features::channels::composer::controls::{
+    ComposerAction, ComposerControls, ComposerModel, choice_notices,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::features::channels::composer::model_intents::SubmissionSource;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -55,11 +59,12 @@ use crate::features::channels::composer::model_intents::is_definite_rejection;
 use crate::features::channels::composer::model_intents::{
     RunIntent, RunRecovery, RunSubmissionActions,
 };
-use crate::features::channels::composer::models::{ModelComposer, ModelPicker};
+use crate::features::channels::composer::models::ModelComposer;
 use crate::features::channels::composer::queue::{QueueAction, QueuedMessage, reduce_queue};
-use crate::features::channels::composer::skills::{SkillComposer, SkillPicker};
+use crate::features::channels::composer::skills::SkillComposer;
+use crate::features::channels::composer::status::{SlotNotice, StatusSlot};
 use crate::features::channels::markdown::{MarkdownBody, StreamingMarkdownBody};
-use crate::features::channels::new::{SubmissionNotice, model_notice};
+use crate::features::channels::new::{SubmissionNotice, model_notice, submission_slot_notice};
 use crate::features::computer::workspace::{
     ComputerWorkspace, ConversationWorkspace, WorkspaceActivity, WorkspaceControls, WorkspaceTab,
 };
@@ -68,13 +73,11 @@ use crate::features::memory::remember::{RememberDialog, RememberReview, Remember
 use crate::features::threads::tool_name::read_tool_name;
 use crate::features::threads::tool_result::for_display;
 use crate::i18n::{Locale, t, t_string, td_string, use_i18n};
-use crate::icons::Icon;
 use crate::primitives::{
     Avatar, AvatarSize, Badge, BadgeTone, Bubble, BubbleKind, Button, ButtonSize, ButtonVariant,
-    IconSize, IconView, Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter,
-    MessageHeader, MessageScroller, MessageScrollerButton, MessageScrollerContent,
-    MessageScrollerItem, MessageScrollerViewport, Notice, NoticePresentation, NoticeTone,
-    TechnicalDetails, Textarea,
+    Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageHeader,
+    MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem,
+    MessageScrollerViewport, Notice, NoticeTone, TechnicalDetails, Textarea,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -1973,10 +1976,182 @@ fn ConversationSurface(
             }
         }
     });
-    let retry_snapshot = move |_| {
+    let retry_snapshot = UnsyncCallback::new(move |_| {
         // An explicit read must also recover a fresh thread whose first Begin ACK was lost.
         allow_missing_snapshot.set(false);
         reload_generation.update(|value| *value = value.saturating_add(1));
+    });
+    let composer_model = if direct {
+        ComposerModel::Direct(direct_model)
+    } else {
+        ComposerModel::Run(model_composer)
+    };
+    let notices = Signal::derive(move || {
+        let locale = i18n.get_locale();
+        let mut notices = Vec::new();
+        if snapshot_error.get() {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Error,
+                    t_string!(i18n, channels.conversation_load_error),
+                )
+                .with_button(t_string!(i18n, common.retry), retry_snapshot),
+            );
+        }
+        // The direct entry's one notice for an unknown receipt carries its exact retry.
+        if direct_retry.get().is_some() {
+            notices.push(
+                SlotNotice::new(NoticeTone::Error, t_string!(i18n, channels.begin_unknown))
+                    .with_button(t_string!(i18n, common.retry), retry_direct),
+            );
+        }
+        if let Some(notice) = direct_notice.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                direct_notice_text(locale, notice),
+            ));
+        }
+        notices.extend(submission_slot_notice(
+            i18n,
+            send_notice.get(),
+            model_composer.selection_status(),
+        ));
+        if begin_unknown.get() && !direct {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, channels.begin_unknown),
+            ));
+        }
+        if submission_blocked.get() {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Error,
+                    t_string!(i18n, channels.submission_blocked),
+                )
+                .linked(
+                    submissions
+                        .barrier()
+                        .and_then(|barrier| barrier.href())
+                        .unwrap_or_else(|| "/".to_owned()),
+                ),
+            );
+        }
+        if cancel_error.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, channels.cancel_error),
+            ));
+        }
+        if queue_skills_invalid.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, skills.selection_limit),
+            ));
+        }
+        notices.extend(choice_notices(
+            i18n,
+            composer_model,
+            skill_composer,
+            textarea_disabled.get(),
+        ));
+        if !channel_active {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Caution,
+                    t_string!(i18n, channels.detail_inactive),
+                )
+                .blocking(),
+            );
+        }
+        if !skill_composer.selected.with(Vec::is_empty)
+            && draft.with(|text| trim_ecmascript(text).is_empty())
+        {
+            notices.push(
+                SlotNotice::new(NoticeTone::Caution, t_string!(i18n, skills.task_required))
+                    .blocking(),
+            );
+        }
+        if stream_error.get() && !snapshot_error.get() {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Caution,
+                    t_string!(i18n, channels.conversation_stream_error),
+                )
+                .with_button(t_string!(i18n, channels.reread), retry_snapshot),
+            );
+        }
+        if direct
+            && state.with(|state| {
+                matches!(
+                    state.active_run_state,
+                    Some(ThreadForegroundRunState::ReconciliationRequired)
+                )
+            })
+        {
+            notices.push(SlotNotice::new(
+                NoticeTone::Caution,
+                t_string!(i18n, bot_work.reconciliation_pending_hold),
+            ));
+        }
+        if let Some(receipt) = stop_receipt.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Status,
+                stop_receipt_text(locale, receipt),
+            ));
+        }
+        notices
+    });
+    let cancelling = Signal::derive(move || {
+        cancelling_request.get()
+            || state.with(|state| {
+                matches!(
+                    state.active_run_state,
+                    Some(ThreadForegroundRunState::Cancelling)
+                )
+            })
+    });
+    let send_action = ComposerAction {
+        disabled: send_disabled,
+        loading: submitting.into(),
+        label: Signal::derive(move || {
+            if begin_unknown.get() {
+                t_string!(i18n, common.retry).to_owned()
+            } else if busy.get() {
+                t_string!(i18n, channels.composer_queue).to_owned()
+            } else {
+                t_string!(i18n, channels.composer_send).to_owned()
+            }
+        }),
+        run: submit,
+    };
+    let stop_action = ComposerAction {
+        disabled: stop_disabled,
+        loading: cancelling_request.into(),
+        label: Signal::derive(move || {
+            if cancelling.get() {
+                t_string!(i18n, channels.cancelling).to_owned()
+            } else {
+                t_string!(i18n, channels.composer_stop).to_owned()
+            }
+        }),
+        run: stop,
+    };
+    let take_over_visible = Signal::derive(move || {
+        direct
+            && (can_stop_work.get()
+                || work_stopping.get()
+                || state.with(|state| {
+                    matches!(
+                        state.active_run_state,
+                        Some(ThreadForegroundRunState::Cancelling)
+                    )
+                }))
+    });
+    let take_over_action = ComposerAction {
+        disabled: Signal::derive(move || !can_stop_work.get()),
+        loading: work_stopping.into(),
+        label: Signal::derive(move || t_string!(i18n, bot_work.stop_and_take_over).to_owned()),
+        run: stop_work,
     };
 
     view! {
@@ -1986,7 +2161,7 @@ fn ConversationSurface(
                 profile=Signal::derive(move || identity_profile.get())
                 title=agent_name.clone()
                 compact=Signal::derive(move || !state.get().messages.is_empty() || !state.get().streaming_text.is_empty())
-                description=move || if busy.get() { t_string!(i18n, channels.tool_running).to_owned() } else { t_string!(i18n, home.model_preset_note).to_owned() }
+                description=move || if busy.get() { t_string!(i18n, channels.tool_running).to_owned() } else { identity_profile.get().map(|profile| profile.role_description).unwrap_or_default() }
             />
             <Show when=move || direct && attention_count.get() != 0>
                 <div class="ob-bot-attention">
@@ -1997,22 +2172,6 @@ fn ConversationSurface(
             </Show>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
-            </Show>
-            <Show when=move || snapshot_error.get()>
-                <Notice tone=NoticeTone::Error>
-                    <span>{move || t!(i18n, channels.conversation_load_error)}</span>
-                    <Button
-                        variant=ButtonVariant::Ghost
-                        size=ButtonSize::Small
-                        on_activate=retry_snapshot
-                    >{move || t!(i18n, common.retry)}</Button>
-                </Notice>
-            </Show>
-            <Show when=move || stream_error.get() && !snapshot_error.get()>
-                <Notice tone=NoticeTone::Caution>
-                    <span>{move || t!(i18n, channels.conversation_stream_error)}</span>
-                    <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry_snapshot>{move || t!(i18n, channels.reread)}</Button>
-                </Notice>
             </Show>
             <MessageScroller
                 id="channel-transcript"
@@ -2248,8 +2407,8 @@ fn ConversationSurface(
             }) observation=Signal::derive(move || state.get().observed_run) thread=thread_id.into()/>
             <RememberDialog review=remember_review/>
             <div class="ob-conversation-input">
+                <StatusSlot notices/>
                 <super::composer::presentation::ComposerFrame active=true busy=Signal::derive(move || submitting.get())>
-                <div class="ob-chat-draft">
                 <Textarea
                     value=draft
                     id="channel-message"
@@ -2262,118 +2421,19 @@ fn ConversationSurface(
                     active_descendant=skill_composer.active_descendant
                     on_keydown=UnsyncCallback::new(move |event| skill_composer.keyboard(event))
                 />
-                <Show when=move || !skill_composer.selected.get().is_empty() && trim_ecmascript(&draft.get()).is_empty()>
-                    <p class="ob-page-empty">{move || t!(i18n, skills.task_required)}</p>
-                </Show>
-                <Show when=move || queue_skills_invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, skills.selection_limit)}</Notice></Show>
-                </div>
-                <div class="ob-chat-controls">
-                <Show
-                    when=move || direct
-                    fallback=move || view! { <ModelPicker state=model_composer disabled=textarea_disabled/> }
-                >
-                    <ModelPickerV2 state=direct_model disabled=textarea_disabled/>
-                </Show>
-                <SkillPicker state=skill_composer disabled=textarea_disabled/>
-                <span class="ob-chat-send">
-                <Show
-                    when=move || show_stop.get()
-                    fallback=move || view! {
-                        <Button
-                            variant=ButtonVariant::Primary
-                            size=ButtonSize::Medium
-                            disabled=send_disabled
-                            loading=submitting
-                            on_activate=submit
-                        >
-                            <IconView icon=Icon::ArrowUp size=IconSize::Navigation />
-                            <span class="ob-visually-hidden">{move || if begin_unknown.get() {
-                                t_string!(i18n, common.retry).to_owned()
-                            } else if busy.get() {
-                                t_string!(i18n, channels.composer_queue).to_owned()
-                            } else {
-                                t_string!(i18n, channels.composer_send).to_owned()
-                            }}</span>
-                        </Button>
-                    }
-                >
-                    <Button
-                        variant=ButtonVariant::Ghost
-                        size=ButtonSize::Medium
-                        disabled=stop_disabled
-                        loading=cancelling_request
-                        aria_label=move || t_string!(i18n, channels.composer_stop).to_owned()
-                        on_activate=stop
-                    >
-                        <IconView icon=Icon::CircleStop size=IconSize::Inline />
-                        <span class="ob-visually-hidden">{move || if cancelling_request.get()
-                            || matches!(
-                                state.get().active_run_state,
-                                Some(ThreadForegroundRunState::Cancelling)
-                            ) {
-                                t_string!(i18n, channels.cancelling).to_owned()
-                            } else {
-                                t_string!(i18n, channels.composer_stop).to_owned()
-                            }}</span>
-                    </Button>
-                </Show>
-                </span>
-                </div>
+                <ComposerControls
+                    model=composer_model
+                    skills=skill_composer
+                    disabled=textarea_disabled
+                    send=send_action
+                    stop=(show_stop, stop_action)
+                    take_over=(take_over_visible, take_over_action)
+                />
                 </super::composer::presentation::ComposerFrame>
                 <Show when=move || !loading.get() && state.get().messages.is_empty()>
                     <super::composer::presentation::DraftSuggestions disabled=textarea_disabled on_choose=UnsyncCallback::new(move |text| { if !textarea_disabled.get_untracked() { draft.set(text); } })/>
                 </Show>
             </div>
-            <Show when=move || direct && (can_stop_work.get() || work_stopping.get() || matches!(state.get().active_run_state, Some(ThreadForegroundRunState::Cancelling)))>
-                <div class="ob-bot-work-actions">
-                    <Button
-                        variant=ButtonVariant::Ghost
-                        size=ButtonSize::Small
-                        disabled=Signal::derive(move || !can_stop_work.get())
-                        loading=work_stopping
-                        on_activate=stop_work
-                    >
-                        <IconView icon=Icon::CircleStop size=IconSize::Inline />
-                        <span>{move || t!(i18n, bot_work.stop_and_take_over)}</span>
-                    </Button>
-                </div>
-            </Show>
-            <Show when=move || stop_receipt.get().is_some()>
-                <Notice tone=NoticeTone::Status>{move || stop_receipt.get().map(|receipt| stop_receipt_text(i18n.get_locale(), receipt))}</Notice>
-            </Show>
-            <Show when=move || direct_notice.get().is_some()>
-                <Notice tone=NoticeTone::Error>{move || direct_notice.get().map(|notice| direct_notice_text(i18n.get_locale(), notice))}</Notice>
-            </Show>
-            // The direct entry's one alert for an unknown receipt carries its exact retry.
-            <Show when=move || direct_retry.get().is_some()>
-                <Notice tone=NoticeTone::Error>
-                    <span>{move || t!(i18n, channels.begin_unknown)}</span>
-                    <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry_direct>
-                        {move || t!(i18n, common.retry)}
-                    </Button>
-                </Notice>
-            </Show>
-            <Show when=move || direct && matches!(state.get().active_run_state, Some(ThreadForegroundRunState::ReconciliationRequired))>
-                <Notice tone=NoticeTone::Caution>{move || t!(i18n, bot_work.reconciliation_pending_hold)}</Notice>
-            </Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_agent_conflict)}</Notice></Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_selection_unavailable)}</Notice></Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::Conflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_conflict)}</Notice></Show>
-            <Show when=move || send_notice.get()==Some(SubmissionNotice::Rejected)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_rejected)}</Notice></Show>
-            <Show when=move || begin_unknown.get() && !direct>
-                <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.begin_unknown)}</Notice>
-            </Show>
-            <Show when=move || submission_blocked.get()>
-                <Notice tone=NoticeTone::Error><a href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
-                    {move || t!(i18n, channels.submission_blocked)}
-                </a></Notice>
-            </Show>
-            <Show when=move || cancel_error.get()>
-                <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.cancel_error)}</Notice>
-            </Show>
-            <Show when=move || !channel_active>
-                <p class="ob-page-empty">{move || t!(i18n, channels.detail_inactive)}</p>
-            </Show>
         </div>
         </ConversationWorkspace>
     }
@@ -2422,13 +2482,15 @@ fn TranscriptMessage(
 ) -> impl IntoView {
     let i18n = use_i18n();
     let artifact_message_id = message.id.clone();
-    let remember_source = (message.id.clone(), message.content.clone());
+    let remember_source = StoredValue::new((message.id.clone(), message.content.clone()));
     let can_remember = memory_available
         && matches!(
             message.kind,
             TranscriptKind::User | TranscriptKind::Assistant
         )
         && !message.content.trim().is_empty();
+    let remember = can_remember
+        .then(|| UnsyncCallback::new(move |_| on_remember.run(remember_source.get_value())));
     let user = message.kind == TranscriptKind::User;
     let kind = message.kind;
     let content = message.content;
@@ -2495,8 +2557,10 @@ fn TranscriptMessage(
                         avatar_name.get_value()
                     }}</MessageHeader>
                     {body}
-                    {can_remember.then(|| view! { <MessageFooter><Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| on_remember.run(remember_source.clone())>{move || t!(i18n, memory.remember_action)}</Button></MessageFooter> })}
-                    {user.then(|| view! { <MessageFooter><ArtifactMessageActions message_id=artifact_message_id source=artifact_source/></MessageFooter> })}
+                    <MessageActions
+                        on_remember=remember
+                        artifact=user.then_some((artifact_message_id, artifact_source))
+                    />
                 </MessageContent>
             </Message>
         </MessageScrollerItem>

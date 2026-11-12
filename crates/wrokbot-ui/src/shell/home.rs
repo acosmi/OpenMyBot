@@ -14,23 +14,28 @@ use crate::api::channel_new_href;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{channel_route_href, mint_run_id, route_channel_message};
 use crate::features::agents::{AgentDirectory, use_agent_directory};
+use crate::features::channels::composer::controls::{
+    ComposerAction, ComposerControls, ComposerModel, choice_notices,
+};
 use crate::features::channels::composer::model_intents::{RunSubmissionActions, SubmissionSource};
-use crate::features::channels::composer::models::{ModelComposer, ModelPicker};
+use crate::features::channels::composer::models::ModelComposer;
 use crate::features::channels::composer::presentation::{
     AssistantIdentity, ComposerFrame, DraftSuggestions,
 };
-use crate::features::channels::composer::skills::{SkillComposer, SkillPicker};
-use crate::features::channels::new::{StartAttempt, SubmissionNotice, model_notice};
+use crate::features::channels::composer::skills::SkillComposer;
+use crate::features::channels::composer::status::{SlotNotice, StatusSlot};
+use crate::features::channels::new::{
+    StartAttempt, SubmissionNotice, create_uncertain_notice, model_notice, submission_slot_notice,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::features::channels::new::{
     StartFailure, StartFailureKind, definite_notice, execute_start_attempt,
 };
 use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
-use crate::icons::Icon;
 use crate::primitives::{
-    Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone,
-    Select, SelectContent, SelectItem, SelectTrigger, Textarea,
+    Avatar, AvatarSize, NoticeTone, Select, SelectContent, SelectItem, SelectTrigger, Textarea,
+    use_sidebar,
 };
 use crate::shell::layout::set_shell_title;
 
@@ -382,7 +387,63 @@ pub fn HomePage() -> impl IntoView {
         }
         send.run(());
     });
-    let retry_agents = move |_| directory.refresh();
+    let retry_agents = UnsyncCallback::new(move |_| directory.refresh());
+    let show_channels = {
+        let sidebar = use_sidebar();
+        UnsyncCallback::new(move |_| sidebar.show_history())
+    };
+    let model = ComposerModel::Run(model_composer);
+    let notices = Signal::derive(move || {
+        let mut notices = Vec::new();
+        if uncertain_create.get() {
+            notices.push(create_uncertain_notice(i18n, show_channels));
+        }
+        if begin_unknown.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, channels.begin_unknown),
+            ));
+        }
+        if submission_blocked.get() {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Error,
+                    t_string!(i18n, channels.submission_blocked),
+                )
+                .linked(
+                    submissions
+                        .barrier()
+                        .and_then(|barrier| barrier.href())
+                        .unwrap_or_else(|| "/".to_owned()),
+                ),
+            );
+        }
+        notices.extend(submission_slot_notice(
+            i18n,
+            notice.get(),
+            model_composer.selection_status(),
+        ));
+        if load_error.get() {
+            notices.push(
+                SlotNotice::new(NoticeTone::Error, t_string!(i18n, home.agents_load_error))
+                    .with_button(t_string!(i18n, common.retry), retry_agents),
+            );
+        }
+        notices.extend(choice_notices(
+            i18n,
+            model,
+            skill_composer,
+            inputs_locked.get(),
+        ));
+        if !loading.get() && !load_error.get() && !has_agents.get() {
+            notices.push(
+                SlotNotice::new(NoticeTone::Caution, t_string!(i18n, home.no_agents))
+                    .blocking()
+                    .linked("/agents".to_owned()),
+            );
+        }
+        notices
+    });
 
     let identity = Signal::derive(move || {
         let selected = frozen_model_agent
@@ -400,6 +461,18 @@ pub fn HomePage() -> impl IntoView {
             draft.set(format!("{prefix}{text}"));
         }
     });
+    let send_action = ComposerAction {
+        disabled: send_disabled,
+        loading: submitting.into(),
+        label: Signal::derive(move || {
+            if begin_unknown.get() {
+                t_string!(i18n, channels.retry_original).to_owned()
+            } else {
+                t_string!(i18n, channels.composer_send).to_owned()
+            }
+        }),
+        run: send,
+    };
 
     view! {
         <PageShell width=PageWidth::Chat>
@@ -408,19 +481,8 @@ pub fn HomePage() -> impl IntoView {
                 <Show when=move || loading.get()>
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
                 </Show>
-                <Show when=move || load_error.get()>
-                    <Notice tone=NoticeTone::Error>
-                        <span>{move || t!(i18n, home.agents_load_error)}</span>
-                        <Button
-                            size=ButtonSize::Small
-                            variant=ButtonVariant::Ghost
-                            on_activate=retry_agents
-                        >
-                            {move || t!(i18n, common.retry)}
-                        </Button>
-                    </Notice>
-                </Show>
                 <div class="ob-home-footer">
+                <StatusSlot notices/>
                 <ComposerFrame busy=Signal::derive(move || submitting.get())>
                     <Textarea
                         value=draft
@@ -484,7 +546,7 @@ pub fn HomePage() -> impl IntoView {
                             </Show>
                         </div>
                     </Show>
-                    <div class="ob-chat-controls">
+                    <ComposerControls model skills=skill_composer disabled=inputs_locked send=send_action>
                         <Select id="home-agent-picker" open=agent_picker_open value=assistant_picker_value disabled=inputs_locked on_value_change=choose_assistant>
                             <SelectTrigger aria_label=move || t_string!(i18n, home.choose_agent).to_owned() placeholder=move || t_string!(i18n, home.auto_assistant).to_owned()/>
                             <SelectContent>
@@ -496,58 +558,12 @@ pub fn HomePage() -> impl IntoView {
                                         {agent.endpoint.is_some().then(|| view! { <small>{move || t!(i18n, shell.remote_agent)}</small> })}
                                     </SelectItem> }
                                 }/>
-                                <a class="ob-home-agent-manage-link" href="/agents">{move || t!(i18n, home.explore_agents)}</a>
+                                <a class="ob-composer-menu-link" href="/agents">{move || t!(i18n, home.explore_agents)}</a>
                             </SelectContent>
                         </Select>
-                        <ModelPicker state=model_composer disabled=inputs_locked/>
-                        <SkillPicker state=skill_composer disabled=inputs_locked/>
-                        <span class="ob-chat-send">
-                        <Button
-                            id="home-send"
-                            variant=ButtonVariant::Primary
-                            size=ButtonSize::Medium
-                            disabled=send_disabled
-                            loading=submitting
-                            on_activate=move |_| send.run(())
-                        >
-                            <IconView icon=Icon::ArrowUp size=IconSize::Navigation />
-                            <span class="ob-visually-hidden">{move || if begin_unknown.get() {
-                                t_string!(i18n, channels.retry_original).to_owned()
-                            } else {
-                                t_string!(i18n, channels.composer_send).to_owned()
-                            }}</span>
-                        </Button>
-                        </span>
-                    </div>
+                    </ComposerControls>
                 </ComposerFrame>
                 <DraftSuggestions on_choose=suggest disabled=inputs_locked/>
-                <p class="ob-home-model-preset-note" role="note">{move || t!(i18n, home.model_preset_note)}</p>
-                <Show when=move || !loading.get() && !load_error.get() && !has_agents.get()>
-                    <p class="ob-home-routing-hint" role="status">
-                        <a href="/agents">{move || t!(i18n, home.no_agents)}</a>
-                    </p>
-                </Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_agent_conflict)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.model_selection_unavailable)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Conflict)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_conflict)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Rejected)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.submit_rejected)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::NavigationFailed)><Notice tone=NoticeTone::Error>{move || t!(i18n, channels.navigation_failed)}</Notice></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::RoutingFailed)><Notice tone=NoticeTone::Error>{move || t!(i18n, home.routing_failed)}</Notice></Show>
-                <Show when=move || uncertain_create.get()>
-                    <Notice tone=NoticeTone::Error>
-                        <p>{move || t!(i18n, channels.create_uncertain)}</p>
-                        <a href="/">{move || t!(i18n, home.title)}</a>
-                    </Notice>
-                </Show>
-                <Show when=move || begin_unknown.get()>
-                    <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.begin_unknown)}</Notice>
-                </Show>
-                <Show when=move || submission_blocked.get()>
-                    <Notice tone=NoticeTone::Error><a href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
-                        {move || t!(i18n, channels.submission_blocked)}
-                    </a></Notice>
-                </Show>
-
                 </div>
             </div>
         </PageShell>
