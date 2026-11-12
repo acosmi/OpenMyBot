@@ -1,0 +1,9 @@
+{
+  "type": "login_progress",
+  "requestId": "req-0001",
+  "attemptId": "00000000-0000-4000-8000-00000000a001",
+  "challenge": {
+    "method": "browser",
+    "authorizationUrl": "https://auth.example.invalid/authorize?state=fixture-state"
+  }
+}

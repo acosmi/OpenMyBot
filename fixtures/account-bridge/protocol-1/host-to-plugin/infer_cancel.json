@@ -1,0 +1,5 @@
+{
+  "type": "infer_cancel",
+  "requestId": "req-0002",
+  "targetRequestId": "req-0001"
+}

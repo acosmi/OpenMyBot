@@ -1,0 +1,10 @@
+{
+  "type": "revoke",
+  "requestId": "req-0001",
+  "connectionId": "00000000-0000-4000-8000-00000000c001",
+  "connector": "openai",
+  "tokenSet": {
+    "accessToken": "fixture-access-token",
+    "refreshToken": "fixture-refresh-token"
+  }
+}
