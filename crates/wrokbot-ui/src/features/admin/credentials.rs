@@ -123,7 +123,7 @@ pub fn AdminCredentialsPage() -> impl IntoView {
                 on_activate=move|_|dialog.set(Some(CredentialDialog::Create(state.page.get_untracked().and_then(|p|p.model_reference))))>{move||t!(i18n,credentials.add)}</Button></div>
             <Show when=move||actions.busy.get()&&!actions.unknown.get()><p role="status" class="ob-loading">{move||t!(i18n,plugins.saving)}</p></Show>
             <Show when=move||actions.failed.get()&&!actions.unknown.get()&&actions.target.get().is_some_and(|id|id.starts_with("credential:"))><Notice tone=NoticeTone::Error>{move||t!(i18n,plugins.write_error)}</Notice></Show>
-            {move||saved.get().map(|id|view!{<Notice tone=NoticeTone::Status><span>{move||t!(i18n,credentials.saved)}</span><TechnicalDetails copy=id.clone()><code>{id}</code></TechnicalDetails></Notice>})}
+            {move||saved.get().map(|id|view!{<Notice tone=NoticeTone::Success><span>{move||t!(i18n,credentials.saved)}</span><TechnicalDetails copy=id.clone()><code>{id}</code></TechnicalDetails></Notice>})}
             <Show when=move||state.loading.get()><p class="ob-loading" role="status">{move||t!(i18n,common.loading)}</p></Show>
             <Show when=move||state.failed.get()><Notice tone=NoticeTone::Error><span>{move||t!(i18n,credentials.load_error)}</span><Button on_activate=move|_|state.load()>{move||t!(i18n,common.retry)}</Button></Notice></Show>
             <PageSection heading_id="credentials-configured" title=move||t_string!(i18n,credentials.configured).to_owned()>

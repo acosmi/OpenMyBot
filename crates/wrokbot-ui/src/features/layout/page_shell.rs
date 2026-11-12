@@ -39,33 +39,10 @@ pub fn PageShell(
     }
 }
 
-/// In-content breadcrumb/action row below the single application toolbar.
+/// Row of page-level actions (refresh, load more) above the page content.
 #[component]
-pub fn PageTopbar(children: Children) -> impl IntoView {
+pub fn PageActions(children: Children) -> impl IntoView {
     view! { <div class="ob-page-actions">{children()}</div> }
-}
-
-/// Same-origin back navigation used inside a PageTopbar.
-#[component]
-pub fn PageBackLink(
-    /// Bounded same-origin destination.
-    #[prop(into)]
-    href: String,
-    /// Visible localized link label.
-    #[prop(into)]
-    label: TextProp,
-) -> impl IntoView {
-    assert_same_origin_href(&href);
-    assert!(
-        !label.get().trim().is_empty(),
-        "back label must be nonempty"
-    );
-    view! {
-        <a class="ob-page-back" href=href>
-            <span aria-hidden="true">"‹"</span>
-            <span>{move || label.get()}</span>
-        </a>
-    }
 }
 
 /// The page's unique h1 and optional explanatory sentence.
@@ -158,34 +135,15 @@ fn assert_dom_id(id: &str) {
     );
 }
 
-fn assert_same_origin_href(href: &str) {
-    assert!(
-        href.starts_with('/')
-            && !href.starts_with("//")
-            && href.len() <= 2048
-            && !href
-                .bytes()
-                .any(|byte| byte.is_ascii_control() || byte == b'\\'),
-        "PageBackLink href must be one bounded same-origin absolute path"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn widths_ids_and_back_links_are_closed() {
+    fn widths_and_ids_are_closed() {
         assert_eq!(PageWidth::Content.as_str(), "content");
         assert_eq!(PageWidth::Table.as_str(), "table");
         assert_eq!(PageWidth::Chat.as_str(), "chat");
         assert_dom_id("settings-connected-accounts");
-        assert_same_origin_href("/settings?tab=general#theme");
-    }
-
-    #[test]
-    #[should_panic(expected = "same-origin")]
-    fn page_back_rejects_external_destinations() {
-        assert_same_origin_href("https://attacker.example/settings");
     }
 }

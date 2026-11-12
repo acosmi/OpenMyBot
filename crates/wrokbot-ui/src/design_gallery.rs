@@ -7,8 +7,8 @@ use crate::features::agents::{AgentPresence, AgentPresenceState};
 use crate::features::computer::ComputerPlaceholder;
 use crate::features::gallery::{GalleryBadge, GalleryFrame, GalleryTone, QuoteCard, RefusedCard};
 use crate::features::layout::{
-    DetailPanel, DetailPanelLayout, DetailPanelMain, PageEmpty, PageRows, PageSection, PageShell,
-    PageTopbar, PageWidth, RowMark, StaggerItem,
+    DetailPanel, DetailPanelLayout, DetailPanelMain, PageActions, PageEmpty, PageRows, PageSection,
+    PageShell, PageWidth, RowMark, SectionTab, SectionTabs, StaggerItem,
 };
 use crate::features::settings::ComputerPlaceholderArt;
 use crate::i18n::{t, t_string, use_i18n};
@@ -25,9 +25,9 @@ use crate::primitives::{
     MessageScrollerViewport, Notice, NoticePresentation, NoticeTone, Select, SelectContent,
     SelectGroup, SelectItem, SelectTrigger, Separator, SeparatorOrientation, Sheet, SheetSide,
     Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupLabel, SidebarHeader,
-    SidebarNavLink, SidebarNavList, SidebarProvider, SidebarTrigger, Skeleton, SkeletonShape,
-    Switch, TechnicalDetails, Textarea, TextareaPreviewState, Timestamp, Toast, ToastPreviewState,
-    Tooltip, TooltipTrigger, TooltipTriggerAction,
+    SidebarNavList, SidebarProvider, SidebarRow, SidebarTrigger, Skeleton, SkeletonShape, Switch,
+    TechnicalDetails, Textarea, TextareaPreviewState, Timestamp, Toast, ToastPreviewState, Tooltip,
+    TooltipTrigger, TooltipTriggerAction,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +40,9 @@ struct ScrollerGalleryItem {
 #[component]
 pub fn DesignGallery() -> impl IntoView {
     let i18n = use_i18n();
+    crate::shell::layout::set_shell_title(move || {
+        vec![t_string!(i18n, design_gallery.title).to_owned()]
+    });
     let button_count = RwSignal::new(0_u32);
     let item_count = RwSignal::new(0_u32);
     let name = RwSignal::new(String::new());
@@ -381,7 +384,7 @@ pub fn DesignGallery() -> impl IntoView {
                             <Sidebar>
                                 <SidebarHeader>
                                     <IconView icon=Icon::Bot size=IconSize::Navigation />
-                                    <span class="ob-sidebar-link-label">{move || t!(i18n, common.app_name)}</span>
+                                    <span class="ob-account-name">{move || t!(i18n, common.app_name)}</span>
                                 </SidebarHeader>
                                 <SidebarContent>
                                     <SidebarGroup>
@@ -389,28 +392,34 @@ pub fn DesignGallery() -> impl IntoView {
                                             {move || t!(i18n, design_gallery.sidebar_group)}
                                         </SidebarGroupLabel>
                                         <SidebarNavList>
-                                            <SidebarNavLink
+                                            <SidebarRow
                                                 href="/approvals"
                                                 icon=Icon::ListChecks
                                                 label=move || t_string!(i18n, admin.nav_approvals).to_owned()
+                                                badge="2"
                                                 current=true
                                             />
-                                            <SidebarNavLink
+                                            <SidebarRow
                                                 href="/agents"
-                                                icon=Icon::Users
-                                                label=move || t_string!(i18n, shell.nav_agents).to_owned()
+                                                avatar="design-sidebar-assistant"
+                                                label=move || t_string!(i18n, design_gallery.avatar_ada).to_owned()
+                                                secondary=Signal::derive(move || t_string!(i18n, design_gallery.sidebar_row_secondary).to_owned())
+                                                time=Some(sample_time)
                                             />
-                                            <SidebarNavLink
-                                                href="/settings"
+                                            <SidebarRow
+                                                on_activate=UnsyncCallback::new(move |_| item_count.update(|count| *count += 1))
                                                 icon=Icon::Settings
                                                 label=move || t_string!(i18n, shell.nav_settings).to_owned()
+                                                actions=move || view! {
+                                                    <span class="ob-sidebar-row-marker"><IconView icon=Icon::Globe size=IconSize::Inline /></span>
+                                                }
                                             />
                                         </SidebarNavList>
                                     </SidebarGroup>
                                 </SidebarContent>
                                 <SidebarFooter>
                                     <IconView icon=Icon::User size=IconSize::Navigation />
-                                    <span class="ob-sidebar-link-label">
+                                    <span class="ob-account-name">
                                         {move || t!(i18n, design_gallery.sidebar_user)}
                                     </span>
                                 </SidebarFooter>
@@ -689,6 +698,7 @@ pub fn DesignGallery() -> impl IntoView {
                         </Notice>
                         <Notice tone=NoticeTone::Caution>{move || t!(i18n, design_gallery.notice_caution)}</Notice>
                         <Notice tone=NoticeTone::Status>{move || t!(i18n, design_gallery.notice_status)}</Notice>
+                        <Notice tone=NoticeTone::Success>{move || t!(i18n, design_gallery.notice_success)}</Notice>
                         <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                             <span>{move || t!(i18n, design_gallery.notice_error)}</span>
                             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| button_count.update(|count| *count += 1)>
@@ -888,8 +898,14 @@ pub fn DesignGallery() -> impl IntoView {
                     <div class="ob-design-layout-preview" id="design-layout-example">
                         <DetailPanelLayout open=detail_open>
                             <DetailPanelMain>
+                                <SectionTabs label=move || t_string!(i18n, design_gallery.section_tabs).to_owned()>
+                                    <SectionTab href="/_design" icon=Icon::LayoutGrid
+                                        label=move || t_string!(i18n, design_gallery.title).to_owned() />
+                                    <SectionTab href="/settings" icon=Icon::Settings nested=true
+                                        label=move || t_string!(i18n, shell.nav_settings).to_owned() />
+                                </SectionTabs>
                                 <PageShell width=PageWidth::Content>
-                                    <PageTopbar>
+                                    <PageActions>
                                         <span>{move || t!(i18n, design_gallery.layout_topbar)}</span>
                                         <div class="ob-design-row">
                                             <Button
@@ -903,7 +919,7 @@ pub fn DesignGallery() -> impl IntoView {
                                                 {detail_close_count}
                                             </output>
                                         </div>
-                                    </PageTopbar>
+                                    </PageActions>
                                     <PageSection
                                         heading_id="design-layout-section"
                                         title=move || t_string!(i18n, design_gallery.layout_section).to_owned()

@@ -12,8 +12,8 @@ use openbot_contracts::mcp::{
 
 use crate::api::plugins as api;
 use crate::features::layout::{
-    DetailPanelLayout, DetailPanelMain, PageBackLink, PageEmpty, PageHeader, PageRows, PageSection,
-    PageShell, PageTopbar, editor_location::EditorLocation,
+    DetailPanelLayout, DetailPanelMain, PageEmpty, PageHeader, PageRows, PageSection, PageShell,
+    editor_location::EditorLocation,
 };
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
@@ -97,9 +97,6 @@ pub fn AdminPluginsPage() -> impl IntoView {
                             .or_else(|| data.page.catalogue.iter().find(|row| &row.key == key).map(|row| row.title.clone()))))
                 }).unwrap_or_else(|| t_string!(i18n, plugins.title).to_owned());
                 view! {
-                    <Show when=move || server.is_some()>
-                        <PageTopbar><PageBackLink href="/admin/plugins" label=move || t_string!(i18n, plugins.title).to_owned() /></PageTopbar>
-                    </Show>
                     <PageHeader heading_id="plugins-title" title=heading description=move || t_string!(i18n, plugins.intro).to_owned() />
                 }
             }}
@@ -307,7 +304,6 @@ fn PluginTool(data: PluginData, server_id: String, tool_name: String) -> impl In
     let effect = tool.effect;
     let description = tool.description.clone();
     view! {
-        <PageTopbar><PageBackLink href=api::plugin_href(&server_id).expect("validated id") label=server_id /></PageTopbar>
         <PageSection heading_id="plugin-tool-effect" title=move || t_string!(i18n, plugins.effect).to_owned()>
             <p>{description}</p><p class="text-fg-secondary">{move || effect_label(i18n, effect)}</p>
         </PageSection>

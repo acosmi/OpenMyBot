@@ -6,7 +6,6 @@
 //! context. This layout therefore owns only their common full-height placement.
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_location;
 
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
@@ -17,6 +16,18 @@ use crate::shell::AppSidebar;
 
 #[derive(Clone, Copy)]
 pub(crate) struct WorkspaceToolbarMount(pub NodeRef<leptos::html::Div>);
+
+/// The mounted page's title for the top bar, as segments read left to right
+/// (for example the assistant, then the conversation).
+#[derive(Clone, Copy)]
+pub(crate) struct ShellTitle(RwSignal<Vec<String>>);
+
+/// Declare the mounted page's top-bar title. Every route sets one, so the next page's title
+/// replaces this one without a cleanup step.
+pub(crate) fn set_shell_title(segments: impl Fn() -> Vec<String> + 'static) {
+    let title = expect_context::<ShellTitle>().0;
+    Effect::new(move |_| title.set(segments()));
+}
 
 /// Root layout shared by sign-in and every authenticated route.
 #[component]
@@ -33,9 +44,9 @@ pub fn RootLayout(children: Children) -> impl IntoView {
 pub fn AppLayout(children: Children) -> impl IntoView {
     let i18n = use_i18n();
     provide_ui_preferences(i18n);
-    provide_context(crate::features::agents::AgentDirectoryGeneration(
-        RwSignal::new(0),
-    ));
+    crate::features::agents::AgentDirectory::provide();
+    crate::features::bot_threads::BotWork::provide();
+    provide_context(ShellTitle(RwSignal::new(Vec::new())));
     let collapsed = RwSignal::new(false);
     let workspace_toolbar = NodeRef::<leptos::html::Div>::new();
     provide_context(WorkspaceToolbarMount(workspace_toolbar));
@@ -106,35 +117,13 @@ fn IconRail() -> impl IntoView {
     }
 }
 
+/// The page title in the top bar. It is plain text, so dragging the window from it keeps working.
 #[component]
 fn ShellContext() -> impl IntoView {
-    let i18n = use_i18n();
-    let location = use_location();
-    let context = move || {
-        let path = location.pathname.get();
-        if path.starts_with("/admin") {
-            t_string!(i18n, shell.nav_admin).to_owned()
-        } else if path.starts_with("/settings/memory") {
-            t_string!(i18n, shell.nav_memory).to_owned()
-        } else if path.starts_with("/settings") {
-            t_string!(i18n, shell.nav_settings).to_owned()
-        } else if path.starts_with("/agents") {
-            t_string!(i18n, shell.nav_agents).to_owned()
-        } else if path.starts_with("/approvals") {
-            t_string!(i18n, admin.nav_approvals).to_owned()
-        } else if path.starts_with("/skills") {
-            t_string!(i18n, shell.nav_skills).to_owned()
-        } else if path.starts_with("/channel") {
-            t_string!(i18n, shell.chats).to_owned()
-        } else if path == "/bot" {
-            t_string!(i18n, shell.nav_bot).to_owned()
-        } else {
-            t_string!(i18n, shell.nav_chat).to_owned()
-        }
-    };
+    let title = expect_context::<ShellTitle>().0;
     view! {
         <div class="ob-shell-identity">
-            <span class="ob-shell-breadcrumb">{context}</span>
+            <span class="ob-shell-breadcrumb">{move || title.get().join(" / ")}</span>
         </div>
     }
 }

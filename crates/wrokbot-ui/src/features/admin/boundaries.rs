@@ -177,7 +177,7 @@ pub fn AdminBoundariesPage() -> impl IntoView {
                 <Notice tone=NoticeTone::Error>{move || t!(i18n, boundaries.save_error)}</Notice>
             </Show>
             <Show when=move || saved.get()>
-                <Notice tone=NoticeTone::Status>{move || t!(i18n, boundaries.saved)}</Notice>
+                <Notice tone=NoticeTone::Success>{move || t!(i18n, boundaries.saved)}</Notice>
             </Show>
             <Show when=move || {
                 !loading.get() && !load_error.get() && policy.get().is_none()

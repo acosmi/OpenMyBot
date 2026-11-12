@@ -9,7 +9,7 @@ use openbot_contracts::audit::AuditPage;
 use crate::api::ApiError;
 #[cfg(target_arch = "wasm32")]
 use crate::api::load_audit_page;
-use crate::features::layout::{PageHeader, PageShell, PageTopbar, PageWidth};
+use crate::features::layout::{PageActions, PageHeader, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
@@ -34,8 +34,7 @@ pub fn AdminAuditPage() -> impl IntoView {
 
     view! {
         <PageShell width=PageWidth::Table>
-            <PageTopbar>
-                <span>{move || t!(i18n, admin.nav_audit)}</span>
+            <PageActions>
                 <Show when=move || next_cursor.get().is_some()>
                     <Button
                         variant=ButtonVariant::Chip
@@ -47,7 +46,7 @@ pub fn AdminAuditPage() -> impl IntoView {
                         {move || t!(i18n, admin.audit_load_more)}
                     </Button>
                 </Show>
-            </PageTopbar>
+            </PageActions>
             <PageHeader
                 heading_id="admin-audit-title"
                 title=move || t_string!(i18n, admin.audit_title).to_owned()

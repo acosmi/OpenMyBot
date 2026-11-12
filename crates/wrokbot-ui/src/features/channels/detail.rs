@@ -6,9 +6,11 @@ use openbot_contracts::command::ChannelDetail;
 
 #[cfg(target_arch = "wasm32")]
 use crate::api::load_channel;
+use crate::features::agents::use_agent_directory;
 use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, use_i18n};
 use crate::primitives::{Notice, NoticeTone};
+use crate::shell::layout::set_shell_title;
 
 use super::ChannelConversation;
 
@@ -21,22 +23,30 @@ pub fn ChannelDetailPage() -> impl IntoView {
     let loading = RwSignal::new(true);
     let failed = RwSignal::new(false);
     install_detail_loader(params, channel, loading, failed);
+    let directory = use_agent_directory();
+    // The conversation signs replies with the assistant's name from the directory, so it waits
+    // for the first directory read; a later refresh keeps it mounted.
+    let directory_settled = Memo::new(move |_| {
+        !directory.loading.get() || directory.agents.with(|agents| !agents.is_empty())
+    });
+    set_shell_title(move || {
+        channel
+            .with(|detail| detail.as_ref().map(|detail| detail.name.clone()))
+            .into_iter()
+            .collect()
+    });
 
     view! {
         <PageShell width=PageWidth::Chat>
             <div class="ob-channel-page">
-            <a class="ob-conversation-back" href="/">{move || t!(i18n, common.back)}</a>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || failed.get()>
                 <Notice tone=NoticeTone::Error>{move || t!(i18n, channels.load_error)}</Notice>
             </Show>
-            <Show when=move || channel.get().is_some()>
-                {move || channel.get().map(|detail| view! {
-                    <p class="ob-conversation-context" role="note">{detail.name.clone()}</p>
-                    <ChannelConversation channel=detail />
-                })}
+            <Show when=move || channel.with(Option::is_some) && directory_settled.get()>
+                {move || channel.get().map(|detail| view! { <ChannelConversation channel=detail /> })}
             </Show>
             </div>
         </PageShell>

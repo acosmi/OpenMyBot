@@ -16,6 +16,8 @@ pub enum NoticeTone {
     Caution,
     /// Neutral progress or outcome.
     Status,
+    /// A confirmed save, connection or completion (green, UI spec v5.2 §2.4 E03).
+    Success,
 }
 
 /// Where the notice sits.
@@ -34,13 +36,14 @@ impl NoticeTone {
             Self::Error => "error",
             Self::Caution => "caution",
             Self::Status => "status",
+            Self::Success => "success",
         }
     }
 
     const fn role(self) -> &'static str {
         match self {
             Self::Error => "alert",
-            Self::Caution | Self::Status => "status",
+            Self::Caution | Self::Status | Self::Success => "status",
         }
     }
 
@@ -49,6 +52,7 @@ impl NoticeTone {
             Self::Error => Icon::CircleAlert,
             Self::Caution => Icon::TriangleAlert,
             Self::Status => Icon::Info,
+            Self::Success => Icon::CircleCheck,
         }
     }
 }
@@ -98,18 +102,20 @@ mod tests {
                 NoticeTone::Error.role(),
                 NoticeTone::Caution.role(),
                 NoticeTone::Status.role(),
+                NoticeTone::Success.role(),
             ],
-            ["alert", "status", "status"]
+            ["alert", "status", "status", "status"]
         );
         assert_eq!(
             [
                 NoticeTone::Error.as_str(),
                 NoticeTone::Caution.as_str(),
                 NoticeTone::Status.as_str(),
+                NoticeTone::Success.as_str(),
                 NoticePresentation::Banner.as_str(),
                 NoticePresentation::Inline.as_str(),
             ],
-            ["error", "caution", "status", "banner", "inline"]
+            ["error", "caution", "status", "success", "banner", "inline"]
         );
     }
 }

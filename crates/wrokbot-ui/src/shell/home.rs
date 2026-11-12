@@ -12,7 +12,8 @@ use openbot_contracts::text::trim_ecmascript;
 use crate::api::ApiError;
 use crate::api::channel_new_href;
 #[cfg(target_arch = "wasm32")]
-use crate::api::{channel_route_href, list_agents, mint_run_id, route_channel_message};
+use crate::api::{channel_route_href, mint_run_id, route_channel_message};
+use crate::features::agents::{AgentDirectory, use_agent_directory};
 use crate::features::channels::composer::model_intents::{RunSubmissionActions, SubmissionSource};
 use crate::features::channels::composer::models::{ModelComposer, ModelPicker};
 use crate::features::channels::composer::presentation::{
@@ -31,6 +32,7 @@ use crate::primitives::{
     Avatar, AvatarSize, Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone,
     Select, SelectContent, SelectItem, SelectTrigger, Textarea,
 };
+use crate::shell::layout::set_shell_title;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MentionSelection {
@@ -49,10 +51,14 @@ struct ActiveMention {
 pub fn HomePage() -> impl IntoView {
     let i18n = use_i18n();
     let navigate = use_navigate();
-    let agents = RwSignal::new(Vec::<AgentProfile>::new());
-    let loading = RwSignal::new(true);
-    let load_error = RwSignal::new(false);
-    let load_generation = RwSignal::new(0_u64);
+    let directory = use_agent_directory();
+    set_shell_title(move || vec![t_string!(i18n, shell.nav_chat).to_owned()]);
+    let AgentDirectory {
+        agents,
+        loading,
+        failed: load_error,
+        ..
+    } = directory;
     let draft = RwSignal::new(String::new());
     let agent_picker_open = RwSignal::new(false);
     let selected_mention = RwSignal::new(None::<MentionSelection>);
@@ -85,8 +91,6 @@ pub fn HomePage() -> impl IntoView {
     let submission_blocked = RwSignal::new(false);
     let resumable = RwSignal::new(None::<StartAttempt>);
     let submissions = expect_context::<RunSubmissionActions>();
-
-    install_home_agent_loader(load_generation, agents, loading, load_error);
 
     Effect::new(move |_| {
         if let Some(intent) = submissions.create_unknown(SubmissionSource::Home) {
@@ -378,13 +382,7 @@ pub fn HomePage() -> impl IntoView {
         }
         send.run(());
     });
-    let retry_agents = move |_| {
-        if let Some(next) = load_generation.get_untracked().checked_add(1) {
-            load_generation.set(next);
-        } else {
-            load_error.set(true);
-        }
-    };
+    let retry_agents = move |_| directory.refresh();
 
     let identity = Signal::derive(move || {
         let selected = frozen_model_agent
@@ -554,33 +552,6 @@ pub fn HomePage() -> impl IntoView {
             </div>
         </PageShell>
     }
-}
-
-fn install_home_agent_loader(
-    generation: RwSignal<u64>,
-    agents: RwSignal<Vec<AgentProfile>>,
-    loading: RwSignal<bool>,
-    error: RwSignal<bool>,
-) {
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(move |_| {
-        let current = generation.get();
-        loading.set(true);
-        error.set(false);
-        leptos::task::spawn_local_scoped_with_cancellation(async move {
-            match list_agents(false).await {
-                Ok(loaded) if generation.get_untracked() == current => agents.set(loaded),
-                Err(_) if generation.get_untracked() == current => {
-                    agents.set(Vec::new());
-                    error.set(true);
-                }
-                _ => return,
-            }
-            loading.set(false);
-        });
-    });
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = (generation, agents, loading, error);
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -3,11 +3,14 @@
 use leptos::context::Provider;
 use leptos::html;
 use leptos::prelude::*;
+use time::OffsetDateTime;
 
 use crate::icons::Icon;
 
 use super::modal::{ModalPresentation, modal_root_with_inline};
-use super::{DialogContent, IconSize, IconView, SheetSide};
+use super::{
+    Avatar, AvatarSize, Badge, BadgeTone, DialogContent, IconSize, IconView, SheetSide, Timestamp,
+};
 
 /// First-source breakpoint where the full desktop layout begins.
 pub const SIDEBAR_LARGE_BREAKPOINT_PX: u32 = 1101;
@@ -322,42 +325,111 @@ pub fn SidebarNavList(children: Children) -> impl IntoView {
     view! { <ul class="ob-sidebar-list">{children()}</ul> }
 }
 
-/// Same-origin navigation item with explicit current-page semantics.
+/// The one sidebar navigation row: a same-origin link, or a button when the destination is not a
+/// URL (a direct-assistant conversation). It shows an optional icon or avatar, a one-line label
+/// with its full text as the tooltip, an optional secondary line, an optional time and count, and
+/// marks the current destination with `aria-current="page"`. Row-end controls (`actions`) and
+/// content beneath the row (`below`) sit outside the activating element.
 #[component]
-pub fn SidebarNavLink(
-    #[prop(into)] href: String,
-    icon: Icon,
-    #[prop(into)] label: TextProp,
-    #[prop(optional, into)] current: MaybeProp<bool>,
+pub fn SidebarRow(
+    /// Same-origin destination; without it the row is a button running `on_activate`.
+    #[prop(optional, into)]
+    href: Option<String>,
+    /// Activation of a button row.
+    #[prop(optional)]
+    on_activate: Option<UnsyncCallback<()>>,
+    /// Leading icon.
+    #[prop(optional)]
+    icon: Option<Icon>,
+    /// Leading avatar seed; the avatar is named after the label.
+    #[prop(optional, into)]
+    avatar: Option<String>,
+    /// Visible label.
+    #[prop(into)]
+    label: TextProp,
+    /// Optional second line.
+    #[prop(optional, into)]
+    secondary: MaybeProp<String>,
+    /// Optional trailing time.
+    #[prop(optional_no_strip)]
+    time: Option<OffsetDateTime>,
+    /// Optional trailing count or short status.
+    #[prop(optional, into)]
+    badge: MaybeProp<String>,
+    /// Whether this row is the current destination.
+    #[prop(optional, into)]
+    current: MaybeProp<bool>,
+    /// Row-end controls.
+    #[prop(optional, into)]
+    actions: Option<ViewFn>,
+    /// Content shown beneath the row.
+    #[prop(optional, into)]
+    below: Option<ViewFn>,
 ) -> impl IntoView {
-    assert_same_origin_href(&href);
     assert!(
-        !label.get().is_empty(),
-        "SidebarNavLink label must be nonempty"
+        href.is_some() != on_activate.is_some(),
+        "SidebarRow is either a link or a button"
     );
-    let context = sidebar_context();
-    let click_context = context.clone();
-    let visible_label = label.clone();
-    let aria_label = label.clone();
-    let title_label = label;
-    view! {
-        <li class="ob-sidebar-list-item">
-            <a
-                class="ob-sidebar-link"
-                href=href
-                aria-label=move || aria_label.get()
-                aria-current=move || current.get().unwrap_or(false).then_some("page")
-                data-state=move || current.get().unwrap_or(false).then_some("current")
-                title=move || title_label.get()
-                on:click=move |_| {
-                    if click_context.viewport.get_untracked() == SidebarViewport::Compact {
-                        click_context.mobile_open.set(false);
-                    }
-                }
-            >
-                <IconView icon size=IconSize::Navigation />
-                <span class="ob-sidebar-link-label">{move || visible_label.get()}</span>
+    if let Some(href) = &href {
+        assert_same_origin_href(href);
+    }
+    let lead = (icon, avatar.map(|seed| (seed, label.get().to_string())));
+    let title = label.clone();
+    let content = move || {
+        view! {
+            {lead.0.map(|icon| view! { <IconView icon size=IconSize::Navigation /> })}
+            {lead.1.clone().map(|(seed, name)| view! {
+                <span class="ob-sidebar-row-avatar" aria-hidden="true">
+                    <Avatar principal_id=seed name size=AvatarSize::Medium />
+                </span>
+            })}
+            <span class="ob-sidebar-row-text">
+                <span class="ob-sidebar-row-label">{move || label.get()}</span>
+                {move || secondary.get().map(|text| view! {
+                    <span class="ob-sidebar-row-secondary">{text}</span>
+                })}
+            </span>
+            {time.map(|at| view! { <span class="ob-sidebar-row-time"><Timestamp at /></span> })}
+            {move || badge.get().map(|text| view! { <Badge tone=BadgeTone::Caution>{text}</Badge> })}
+        }
+    };
+    let aria_current = move || current.get().unwrap_or(false).then_some("page");
+    let main = match (href, on_activate) {
+        (Some(href), _) => view! {
+            <a class="ob-sidebar-row-main" href=href title=move || title.get() aria-current=aria_current>
+                {content()}
             </a>
+        }
+        .into_any(),
+        (None, Some(on_activate)) => {
+            let context = sidebar_context();
+            view! {
+                <button
+                    type="button"
+                    class="ob-sidebar-row-main"
+                    title=move || title.get()
+                    aria-current=aria_current
+                    on:click=move |_| {
+                        on_activate.run(());
+                        if context.viewport.get_untracked() == SidebarViewport::Compact {
+                            context.mobile_open.set(false);
+                        }
+                    }
+                >
+                    {content()}
+                </button>
+            }
+            .into_any()
+        }
+        (None, None) => unreachable!("checked above"),
+    };
+    view! {
+        <li class="ob-sidebar-row">
+            <div class="ob-sidebar-row-line">
+                {main}
+                {actions.map(|actions| view! { <span class="ob-sidebar-row-actions">{actions.run()}</span> })}
+            </div>
+            {below.map(|below| below.run())}
         </li>
     }
 }
@@ -568,7 +640,7 @@ fn assert_same_origin_href(href: &str) {
             && !href.starts_with("//")
             && href.len() <= 2048
             && !href.chars().any(char::is_control),
-        "SidebarNavLink href must be one bounded same-origin absolute path"
+        "SidebarRow href must be one bounded same-origin absolute path"
     );
 }
 

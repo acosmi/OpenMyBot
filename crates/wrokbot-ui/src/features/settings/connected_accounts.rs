@@ -11,8 +11,7 @@ use openbot_contracts::mcp::{McpConnection, McpConnections};
 #[cfg(target_arch = "wasm32")]
 use crate::api::{begin_mcp_connection, disconnect_mcp_connection, load_mcp_connections};
 use crate::features::layout::{
-    PageBackLink, PageEmpty, PageHeader, PageRows, PageSection, PageShell, PageTopbar, PageWidth,
-    RowMark,
+    PageEmpty, PageHeader, PageRows, PageSection, PageShell, PageWidth, RowMark,
 };
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
@@ -93,7 +92,7 @@ pub fn ConnectedAccountsPage() -> impl IntoView {
                 </Notice>
             </Show>
             <Show when=move || callback_notice.get() == Some(CallbackNotice::Connected)>
-                <Notice tone=NoticeTone::Status>
+                <Notice tone=NoticeTone::Success>
                     {move || t_string!(
                         i18n,
                         settings.connect_success,
@@ -234,12 +233,6 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
 
     view! {
         <PageShell width=PageWidth::Content>
-            <PageTopbar>
-                <PageBackLink
-                    href="/settings/connected-accounts".to_owned()
-                    label=move || t_string!(i18n, common.back).to_owned()
-                />
-            </PageTopbar>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
@@ -273,17 +266,14 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                         {move || t!(i18n, settings.connection_action_error)}
                     </Notice>
                 </Show>
-                <Show when=move || disconnect_notice.get().is_some()>
+                <Show when=move || disconnect_notice.get() == Some(DisconnectNotice::Revoked)>
+                    <Notice tone=NoticeTone::Success>
+                        {move || t!(i18n, settings.disconnect_revoked)}
+                    </Notice>
+                </Show>
+                <Show when=move || disconnect_notice.get() == Some(DisconnectNotice::Pending)>
                     <Notice tone=NoticeTone::Status>
-                        {move || match disconnect_notice.get() {
-                            Some(DisconnectNotice::Revoked) => {
-                                t_string!(i18n, settings.disconnect_revoked).to_owned()
-                            }
-                            Some(DisconnectNotice::Pending) => {
-                                t_string!(i18n, settings.disconnect_pending).to_owned()
-                            }
-                            None => String::new(),
-                        }}
+                        {move || t!(i18n, settings.disconnect_pending)}
                     </Notice>
                 </Show>
                 <PageSection

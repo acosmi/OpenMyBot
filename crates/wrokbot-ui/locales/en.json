@@ -34,7 +34,6 @@
     "create": "Create",
     "close": "Close",
     "confirm": "Confirm",
-    "back": "Back",
     "next": "Next",
     "open": "Open",
     "view": "View",
@@ -68,6 +67,7 @@
     "reset_to_default": "Reset to default"
   },
   "shell": {
+    "manage_agents": "Manage assistants",
     "sidebar_toggle": "Toggle sidebar",
     "sidebar_expand": "Expand sidebar",
     "sidebar_collapse": "Collapse sidebar",
@@ -76,7 +76,6 @@
     "nav_channels": "Channels",
     "nav_agents": "Assistants",
     "remote_agent": "Remote assistant",
-    "nav_bot": "Direct chat",
     "nav_skills": "Skills",
     "nav_computer": "Computer",
     "nav_gallery": "Components gallery",
@@ -101,14 +100,12 @@
     "breadcrumb_home": "Home",
     "skip_to_content": "Skip to content",
     "nav_chat": "New conversation",
-    "nav_library": "Components gallery",
     "workspace": "Workspace",
     "chats": "Chats",
     "account": "Account",
     "search_toggle": "Filter loaded conversations",
     "connections": "Connections",
     "account_menu": "Account and preferences",
-    "nav_tool_connections": "Tool connections",
     "tier_daily_work": "Daily work",
     "tier_capabilities": "Capabilities",
     "env_summary": "Environment",
@@ -172,8 +169,6 @@
   "bot_chat": {
     "title": "Browser Bot",
     "intro": "Ask it to open a page and watch it work.",
-    "agent_label": "Bot",
-    "agent_placeholder": "Choose a Bot",
     "agent_load_error": "Could not load Bots.",
     "no_agents": "No Bot is available for direct chat.",
     "new_chat": "New chat",
@@ -182,6 +177,7 @@
     "thread_error": "Could not prepare a conversation thread."
   },
   "channels": {
+    "unlisted_assistant": "Assistant",
     "model_agent_conflict": "The model selection does not match the current assistant. Select a supported built-in assistant and choose the model again, or clear the selection.",
     "model_selection_unavailable": "The selected model is not currently available. Wait for the model list to load or refresh it, then explicitly choose a current model or clear the selection.",
     "submit_conflict": "The model selection or conversation changed before this request was accepted. Review the current state, reselect the model if needed, and send a new request.",
@@ -411,7 +407,6 @@
   },
   "settings": {
     "title": "Settings",
-    "back_to_app": "Back to app",
     "preferences_title": "Preferences",
     "preferences_description": "Choose how Wrok Bot looks and reads for you. These preferences follow your account across devices in this deployment.",
     "nav_general": "General",
@@ -465,7 +460,6 @@
   },
   "admin": {
     "title": "Admin",
-    "back_to_app": "Back to Wrok Bot",
     "overview_intro": "Open the administrator surfaces that are implemented in this build.",
     "gate_error": "Administrator access could not be verified.",
     "nav_overview": "Overview",
@@ -550,7 +544,6 @@
     "component_draft_changes": "Description changes are waiting to be published.",
     "component_not_found": "No such component",
     "component_not_found_intro": "This deployment does not expose a component with that name.",
-    "component_back": "Back to components",
     "component_configuration": "Configuration",
     "component_configuration_intro": "What this component is for and which Bots and data functions it may use.",
     "component_publication": "Published",
@@ -602,7 +595,6 @@
     "playground_delete_description": "This removes the draft, published source and component grants. This cannot be undone.",
     "approvals_title": "Needs attention",
     "approvals_intro": "Review the authoritative effect, target and redacted arguments before deciding.",
-    "approval_pending": "Needs attention",
     "approval_approve": "Approve",
     "approval_reject": "Reject",
     "approval_empty_title": "No tool requests waiting",
@@ -892,6 +884,8 @@
     "reconciliation_required": "This window cannot confirm the result. Refresh the data to review it; do not repeat the original request."
   },
   "design_gallery": {
+    "section_tabs": "Section tabs",
+    "sidebar_row_secondary": "Two unread updates",
     "eyebrow": "Development only",
     "title": "Design gallery",
     "intro": "Deterministic primitive states for keyboard, accessibility and visual review.",
@@ -912,7 +906,8 @@
     "notices": "Notices, times and technical details",
     "notice_error": "The list could not be loaded.",
     "notice_caution": "The result has not been confirmed yet.",
-    "notice_status": "Changes saved.",
+    "notice_status": "Sync is still running.",
+    "notice_success": "Connection confirmed.",
     "toast_preview": "Saved without interrupting your work.",
     "toast_auto": "This status disappears after five seconds.",
     "show_toast": "Show status",
@@ -1220,9 +1215,8 @@
   },
   "bot_work": {
     "list_label": "Assistant work",
-    "filter_label": "Work filter",
-    "filter_active": "Active",
-    "filter_archived": "Archived",
+    "show_archived": "Show archived",
+    "show_active": "Show active",
     "default_title": "Untitled conversation",
     "list_error": "The work list could not be loaded.",
     "list_empty": "No conversation yet.",

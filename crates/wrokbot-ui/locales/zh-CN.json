@@ -34,7 +34,6 @@
     "create": "创建",
     "close": "关闭",
     "confirm": "确认",
-    "back": "返回",
     "next": "下一步",
     "open": "打开",
     "view": "查看",
@@ -68,6 +67,7 @@
     "reset_to_default": "恢复默认值"
   },
   "shell": {
+    "manage_agents": "管理助手",
     "sidebar_toggle": "折叠 / 展开侧栏",
     "sidebar_expand": "展开侧栏",
     "sidebar_collapse": "折叠侧栏",
@@ -76,7 +76,6 @@
     "nav_channels": "频道",
     "nav_agents": "助手",
     "remote_agent": "远程助手",
-    "nav_bot": "直接对话",
     "nav_skills": "技能",
     "nav_computer": "计算机",
     "nav_gallery": "组件库",
@@ -101,14 +100,12 @@
     "breadcrumb_home": "首页",
     "skip_to_content": "跳到主内容",
     "nav_chat": "新对话",
-    "nav_library": "组件库",
     "workspace": "工作空间",
     "chats": "历史对话",
     "account": "账户",
     "search_toggle": "筛选已加载会话",
     "connections": "连接",
     "account_menu": "账户与偏好设置",
-    "nav_tool_connections": "工具连接",
     "tier_daily_work": "日常工作",
     "tier_capabilities": "可复用能力",
     "env_summary": "执行环境",
@@ -172,8 +169,6 @@
   "bot_chat": {
     "title": "浏览器机器人",
     "intro": "让它打开页面，并观察它如何完成任务。",
-    "agent_label": "机器人",
-    "agent_placeholder": "选择机器人",
     "agent_load_error": "无法加载机器人。",
     "no_agents": "当前没有可直接对话的机器人。",
     "new_chat": "新对话",
@@ -182,6 +177,7 @@
     "thread_error": "无法准备对话线程。"
   },
   "channels": {
+    "unlisted_assistant": "助手",
     "model_agent_conflict": "模型选择与当前助手不匹配。请确认支持模型选择的内置助手并重新选择模型，或清除模型选择。",
     "model_selection_unavailable": "所选模型当前不可用。请等待模型列表加载或刷新列表，再显式选择当前模型，或清除选择。",
     "submit_conflict": "此次请求接受前，模型选择或会话状态已发生变化。请核对当前状态，必要时重新选择模型，再发起新的请求。",
@@ -411,7 +407,6 @@
   },
   "settings": {
     "title": "设置",
-    "back_to_app": "返回应用",
     "preferences_title": "偏好设置",
     "preferences_description": "选择 Wrok Bot 为你呈现和朗读内容的方式。这些偏好会在当前部署中随你的账户跨设备同步。",
     "nav_general": "通用",
@@ -465,7 +460,6 @@
   },
   "admin": {
     "title": "管理",
-    "back_to_app": "返回 Wrok Bot",
     "overview_intro": "进入当前版本已经实现的管理员功能。",
     "gate_error": "无法验证管理员权限。",
     "nav_overview": "总览",
@@ -550,7 +544,6 @@
     "component_draft_changes": "用途说明有尚未发布的更改。",
     "component_not_found": "没有这个组件",
     "component_not_found_intro": "此部署没有暴露该名称的组件。",
-    "component_back": "返回组件列表",
     "component_configuration": "配置",
     "component_configuration_intro": "管理组件用途，以及允许使用它的 Bot 和数据函数。",
     "component_publication": "发布状态",
@@ -602,7 +595,6 @@
     "playground_delete_description": "这会移除草稿、已发布源码和组件授权，且无法撤销。",
     "approvals_title": "需要处理",
     "approvals_intro": "决定前请核对权威操作类型、目标和已脱敏参数。",
-    "approval_pending": "需要处理",
     "approval_approve": "批准",
     "approval_reject": "拒绝",
     "approval_empty_title": "没有待处理的工具请求",
@@ -892,6 +884,8 @@
     "reconciliation_required": "当前窗口无法确认此次操作结果。请刷新数据后核对；不要重复提交原操作。"
   },
   "design_gallery": {
+    "section_tabs": "分区页签",
+    "sidebar_row_secondary": "两条未读更新",
     "eyebrow": "仅开发环境",
     "title": "设计画廊",
     "intro": "用于键盘、无障碍和视觉复核的确定性原语状态。",
@@ -912,7 +906,8 @@
     "notices": "提示、时间与技术详情",
     "notice_error": "列表加载失败。",
     "notice_caution": "结果尚未确认。",
-    "notice_status": "更改已保存。",
+    "notice_status": "同步仍在进行。",
+    "notice_success": "连接已确认。",
     "toast_preview": "已保存，不会打断当前操作。",
     "toast_auto": "这条状态会在五秒后消失。",
     "show_toast": "显示状态",
@@ -1220,9 +1215,8 @@
   },
   "bot_work": {
     "list_label": "助手工作",
-    "filter_label": "工作筛选",
-    "filter_active": "进行中",
-    "filter_archived": "已归档",
+    "show_archived": "显示已归档",
+    "show_active": "显示进行中",
     "default_title": "未命名会话",
     "list_error": "无法加载工作列表。",
     "list_empty": "还没有会话。",

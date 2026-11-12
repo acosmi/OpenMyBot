@@ -20,9 +20,7 @@ use crate::api::{
     set_component_publication,
 };
 use crate::features::gallery::ComponentPreview;
-use crate::features::layout::{
-    PageBackLink, PageEmpty, PageHeader, PageRows, PageSection, PageShell, PageTopbar, PageWidth,
-};
+use crate::features::layout::{PageEmpty, PageHeader, PageRows, PageSection, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
     Button, ButtonSize, ButtonVariant, Dialog, DialogBody, DialogContent, DialogFooter, Notice,
@@ -185,12 +183,6 @@ pub fn AdminComponentDetailPage() -> impl IntoView {
 
     view! {
         <PageShell width=PageWidth::Content>
-            <PageTopbar>
-                <PageBackLink
-                    href="/admin/components".to_owned()
-                    label=move || t_string!(i18n, admin.component_back).to_owned()
-                />
-            </PageTopbar>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>

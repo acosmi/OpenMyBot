@@ -2,7 +2,6 @@
 
 pub mod admin;
 pub mod agents;
-pub mod app_sidebar;
 pub mod approvals;
 pub mod bot_threads;
 pub mod channels;

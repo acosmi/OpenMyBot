@@ -38,7 +38,7 @@ use crate::api::{
     load_thread_conversation, mint_thread_id, stop_thread_work, submit_thread_input,
     thread_event_stream_path,
 };
-use crate::features::agents::{AgentPresence, AgentPresenceState};
+use crate::features::agents::{AgentPresence, AgentPresenceState, use_agent_directory};
 #[cfg(target_arch = "wasm32")]
 use crate::features::bot_threads::attention::read_attention_index;
 use crate::features::bot_threads::model::{ModelComposerV2, ModelPickerV2};
@@ -868,7 +868,18 @@ pub fn ChannelConversation(
     /// Current membership-authorized channel projection from the Server.
     channel: ChannelDetail,
 ) -> impl IntoView {
+    let i18n = use_i18n();
     let selected_agent = channel.agent_ids.first().cloned();
+    // The reply is signed by the assistant, never by the channel (UI spec v5.2 §7.5).
+    let profile = selected_agent.as_ref().and_then(|id| {
+        use_agent_directory()
+            .agents
+            .with_untracked(|agents| agents.iter().find(|agent| &agent.id == id).cloned())
+    });
+    let agent_name = profile.as_ref().map_or_else(
+        || t_string!(i18n, channels.unlisted_assistant).to_owned(),
+        |profile| profile.name.clone(),
+    );
     let agent_seed = selected_agent.as_ref().map_or_else(
         || channel.id.as_str().to_owned(),
         |id| id.as_str().to_owned(),
@@ -877,12 +888,12 @@ pub fn ChannelConversation(
         <ConversationSurface
             thread=channel.thread_id
             agent_id=selected_agent
-            agent_name=channel.name
+            agent_name
             agent_seed
             channel_active=channel.active
             anchor=ThreadRunAnchor::Channel { channel_id: channel.id }
             fresh_thread=false
-            agent_profile=None
+            agent_profile=profile
             direct_work=None
         />
     }

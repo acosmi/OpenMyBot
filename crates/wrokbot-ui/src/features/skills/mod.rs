@@ -19,6 +19,10 @@ use state::SkillPageState;
 /// Manage only the current actor’s own skills, including when the actor is an administrator.
 #[component]
 pub fn PersonalSkillsPage() -> impl IntoView {
+    let i18n = use_i18n();
+    crate::shell::layout::set_shell_title(move || {
+        vec![t_string!(i18n, shell.nav_skills).to_owned()]
+    });
     view! { <SkillsPage /> }
 }
 

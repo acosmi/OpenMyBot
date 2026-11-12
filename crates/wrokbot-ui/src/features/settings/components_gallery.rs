@@ -10,9 +10,7 @@ use crate::api::component_gallery_href;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{announce_component_catalogue, load_components};
 use crate::features::gallery::ComponentPreview;
-use crate::features::layout::{
-    PageBackLink, PageEmpty, PageHeader, PageSection, PageShell, PageTopbar, PageWidth,
-};
+use crate::features::layout::{PageEmpty, PageHeader, PageSection, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
@@ -129,12 +127,6 @@ pub fn ComponentGalleryDetailPage() -> impl IntoView {
 
     view! {
         <PageShell width=PageWidth::Content>
-            <PageTopbar>
-                <PageBackLink
-                    href="/settings/components-gallery".to_owned()
-                    label=move || t_string!(i18n, gallery.components_title).to_owned()
-                />
-            </PageTopbar>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>

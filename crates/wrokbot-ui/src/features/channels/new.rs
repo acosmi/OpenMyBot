@@ -15,9 +15,10 @@ use crate::api::channel_new_href;
 use crate::api::channel_route_href;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{
-    begin_thread_run_with_skills_and_model, create_channel, list_agents, load_agent,
-    load_thread_conversation, mint_run_id,
+    begin_thread_run_with_skills_and_model, create_channel, load_agent, load_thread_conversation,
+    mint_run_id,
 };
+use crate::features::agents::{AgentDirectory, use_agent_directory};
 use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
@@ -32,6 +33,7 @@ use super::composer::model_intents::{RunSubmissionActions, SubmissionSource};
 use super::composer::models::{ModelComposer, ModelPicker, ModelSelectionStatus};
 use super::composer::presentation::{AssistantIdentity, ComposerFrame, DraftSuggestions};
 use super::composer::skills::{SkillComposer, SkillPicker};
+use crate::shell::layout::set_shell_title;
 
 /// One recipient/message/run identity retained across a recoverable first-message retry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,13 +307,25 @@ pub fn ChannelNewPage() -> impl IntoView {
     let i18n = use_i18n();
     let query = use_query_map();
     let navigate = use_navigate();
-    let agents = RwSignal::new(Vec::<AgentProfile>::new());
+    let directory = use_agent_directory();
+    set_shell_title(move || vec![t_string!(i18n, shell.new_channel).to_owned()]);
+    // A requested assistant the visible directory does not list (for example a hidden one).
+    let unlisted = RwSignal::new(None::<AgentProfile>);
+    let agents = Signal::derive(move || {
+        let mut rows = directory.agents.get();
+        if let Some(profile) = unlisted.get()
+            && !rows.iter().any(|agent| agent.id == profile.id)
+        {
+            rows.push(profile);
+            rows.sort_by(|left, right| left.id.cmp(&right.id));
+        }
+        rows
+    });
     let selected = RwSignal::new(None::<String>);
     let selected_profile = RwSignal::new(None::<AgentProfile>);
     let loading = RwSignal::new(true);
     let load_error = RwSignal::new(false);
     let recipient_restore_missing = RwSignal::new(false);
-    let load_generation = RwSignal::new(0_u64);
     let draft = RwSignal::new(String::new());
     let frozen_model_agent = RwSignal::new(None::<BotId>);
     let skill_composer = SkillComposer::new(
@@ -402,12 +416,12 @@ pub fn ChannelNewPage() -> impl IntoView {
 
     install_recipient_loader(
         query,
-        agents,
+        directory,
+        unlisted,
         selected,
         selected_profile,
         loading,
         load_error,
-        load_generation,
     );
     Effect::new(move |_| {
         if selected.get().is_some() || loading.get() {
@@ -584,7 +598,6 @@ pub fn ChannelNewPage() -> impl IntoView {
     view! {
         <PageShell width=PageWidth::Chat>
             <div class="ob-channel-new">
-                <a class="ob-conversation-back" href="/agents">{move || t!(i18n, common.back)}</a>
                 <AssistantIdentity profile=Signal::derive(move || selected_profile.get()) title=move || t_string!(i18n, channels.recipient_placeholder).to_owned() description=move || t_string!(i18n, channels.new_intro).to_owned()/>
                 <Show when=move || loading.get()>
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
@@ -683,61 +696,64 @@ pub fn ChannelNewPage() -> impl IntoView {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Resolve the requested recipient from the shell directory; only an assistant it does not list
+/// is read on its own.
 fn install_recipient_loader(
     query: Memo<leptos_router::params::ParamsMap>,
-    agents: RwSignal<Vec<AgentProfile>>,
+    directory: AgentDirectory,
+    unlisted: RwSignal<Option<AgentProfile>>,
     selected: RwSignal<Option<String>>,
     selected_profile: RwSignal<Option<AgentProfile>>,
     loading: RwSignal<bool>,
     load_error: RwSignal<bool>,
-    generation: RwSignal<u64>,
 ) {
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
         let requested = query.get().get("agent");
-        let current = generation.get_untracked().saturating_add(1);
-        generation.set(current);
+        let directory_loading = directory.loading.get();
         selected.set(requested.clone());
         selected_profile.set(None);
-        loading.set(true);
         load_error.set(false);
+        loading.set(true);
+        if directory_loading {
+            return;
+        }
+        let Some(agent_id) = requested else {
+            load_error.set(directory.failed.get_untracked());
+            loading.set(false);
+            return;
+        };
+        let listed = directory.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.id.as_str() == agent_id)
+                .cloned()
+        });
+        if let Some(profile) = listed {
+            selected_profile.set(Some(profile));
+            loading.set(false);
+            return;
+        }
         leptos::task::spawn_local_scoped_with_cancellation(async move {
-            let roster = list_agents(false).await;
-            let direct = match requested.as_deref() {
-                Some(agent_id) => Some(load_agent(agent_id).await),
-                None => None,
-            };
-            if generation.get_untracked() != current {
-                return;
-            }
-            let roster_failed = roster.is_err();
-            let mut loaded = roster.unwrap_or_default();
-            match direct {
-                Some(Ok(profile)) => {
-                    if !loaded.iter().any(|agent| agent.id == profile.id) {
-                        loaded.push(profile.clone());
-                        loaded.sort_by(|left, right| left.id.cmp(&right.id));
-                    }
+            match load_agent(&agent_id).await {
+                Ok(profile) => {
+                    unlisted.set(Some(profile.clone()));
                     selected_profile.set(Some(profile));
                 }
-                Some(Err(_)) => load_error.set(true),
-                None if roster_failed => load_error.set(true),
-                None => {}
+                Err(_) => load_error.set(true),
             }
-            agents.set(loaded);
             loading.set(false);
         });
     });
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (
         query,
-        agents,
+        directory,
+        unlisted,
         selected,
         selected_profile,
         loading,
         load_error,
-        generation,
     );
 }
 

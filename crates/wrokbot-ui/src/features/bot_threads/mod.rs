@@ -1,4 +1,4 @@
-//! Direct-Bot work list: the Server's conversation directory and the work actions on it.
+//! Direct-assistant work list: the Server's conversation directory and the work actions on it.
 //!
 //! Every value shown here comes from the Server's own closed DTOs. The browser remembers only
 //! which conversation was opened most recently; the Server's list remains the only work identity.
@@ -7,7 +7,9 @@
 pub(crate) mod attention;
 pub(crate) mod model;
 pub(crate) mod pending;
+mod remembered;
 pub(crate) mod submit;
+pub(crate) mod work;
 
 use leptos::prelude::*;
 use openbot_contracts::command::{BotThreadSummary, ThreadForegroundRunState, ThreadStatusFilter};
@@ -18,11 +20,12 @@ use crate::api::{ApiError, complete_thread, list_bot_threads, set_thread_title};
 use crate::i18n::{Locale, t, t_string, td_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input, Notice,
-    NoticeTone, Timestamp,
+    Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input, Menu, MenuContent,
+    MenuItem, MenuTrigger, Notice, NoticePresentation, NoticeTone, SidebarRow,
 };
 
 use self::attention::AttentionIndex;
+pub(crate) use self::work::{BotWork, use_bot_work};
 
 /// Why a work-list action did not complete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,20 +41,14 @@ enum WorkNotice {
     },
 }
 
-/// The work list of one assistant.
+/// The work list of the assistant the `/bot` canvas shows, beneath its sidebar row.
 #[component]
 pub fn BotWorkList(
     /// The assistant whose conversations are listed.
     agent_id: BotId,
-    /// The conversation the canvas currently shows.
-    selected: Signal<Option<ThreadId>>,
-    /// Open the conversation the user picked in the list.
-    on_select: UnsyncCallback<ThreadId>,
-    /// Changes whenever the open conversation changed its work; the first page is read again.
-    #[prop(into)]
-    refresh: Signal<u64>,
 ) -> impl IntoView {
     let i18n = use_i18n();
+    let work = use_bot_work();
     let status = RwSignal::new(ThreadStatusFilter::Active);
     let rows = RwSignal::new(Vec::<BotThreadSummary>::new());
     let next_cursor = RwSignal::new(None::<String>);
@@ -62,11 +59,12 @@ pub fn BotWorkList(
     let loading = RwSignal::new(true);
     let failed = RwSignal::new(false);
     let attention = RwSignal::new(AttentionIndex::default());
+    let selected = Signal::derive(move || work.thread.get().map(|thread| thread.id));
 
     // A newer read reruns this Effect, which cancels the previous task: a late page never lands.
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
-        refresh.track();
+        work.changes.track();
         reread.track();
         let status = status.get();
         let after = continue_after.get_untracked();
@@ -101,91 +99,95 @@ pub fn BotWorkList(
         });
     });
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = (agent_id, refresh);
+    let _ = agent_id;
+    // The top bar names the open conversation as this list reports it.
+    Effect::new(move |_| {
+        let open = selected.get();
+        let title = rows.with(|rows| {
+            rows.iter()
+                .find(|row| Some(&row.thread_id) == open.as_ref())
+                .map(|row| title_text(i18n.get_locale(), row.title.as_deref()))
+        });
+        if title.is_some() {
+            work.thread_title.set(title);
+        }
+    });
 
     let read_again = UnsyncCallback::new(move |_| {
         reread.update(|value| *value = value.saturating_add(1));
     });
-    let load_more = UnsyncCallback::new(move |_| {
+    let load_more = move |_| {
         continue_after.set(next_cursor.get_untracked());
         reread.update(|value| *value = value.saturating_add(1));
-    });
+    };
+    let toggle_archived = move |_| {
+        status.update(|status| {
+            *status = match status {
+                ThreadStatusFilter::Active => ThreadStatusFilter::Archived,
+                ThreadStatusFilter::Archived => ThreadStatusFilter::Active,
+            }
+        });
+    };
 
     view! {
-        <section
-            class="ob-bot-work"
+        <ul
+            class="ob-sidebar-list ob-sidebar-work"
             aria-label=move || t_string!(i18n, bot_work.list_label).to_owned()
         >
-            <header class="ob-bot-work-header">
-                <div
-                    class="ob-bot-work-filters"
-                    role="group"
-                    aria-label=move || t_string!(i18n, bot_work.filter_label).to_owned()
-                >
-                    <Button
-                        variant=ButtonVariant::Ghost
-                        size=ButtonSize::Small
-                        selected=Signal::derive(move || status.get() == ThreadStatusFilter::Active)
-                        on_activate=move |_| status.set(ThreadStatusFilter::Active)
-                    >
-                        {move || t!(i18n, bot_work.filter_active)}
-                    </Button>
-                    <Button
-                        variant=ButtonVariant::Ghost
-                        size=ButtonSize::Small
-                        selected=Signal::derive(move || status.get() == ThreadStatusFilter::Archived)
-                        on_activate=move |_| status.set(ThreadStatusFilter::Archived)
-                    >
-                        {move || t!(i18n, bot_work.filter_archived)}
-                    </Button>
-                </div>
-                <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=read_again>
-                    <IconView icon=Icon::RefreshCw size=IconSize::Inline />
-                    <span>{move || t!(i18n, common.refresh)}</span>
+            // Every visible fact is part of the key, so a renamed, completed or newly busy
+            // conversation is shown again rather than keeping its earlier copy.
+            <For
+                each=move || rows.get()
+                key=|row| format!("{row:?}")
+                children=move |row| view! {
+                    <BotWorkRow row selected attention on_changed=read_again />
+                }
+            />
+        </ul>
+        <Show when=move || loading.get()>
+            <p class="ob-sidebar-loading" role="status">{move || t!(i18n, common.loading)}</p>
+        </Show>
+        <Show when=move || failed.get()>
+            <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
+                <span>{move || t!(i18n, bot_work.list_error)}</span>
+                <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| read_again.run(())>
+                    {move || t!(i18n, common.retry)}
                 </Button>
-            </header>
-            <Show when=move || loading.get()>
-                <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
-            </Show>
-            <Show when=move || failed.get()>
-                <Notice tone=NoticeTone::Error>{move || t!(i18n, bot_work.list_error)}</Notice>
-            </Show>
-            <Show when=move || !loading.get() && !failed.get() && rows.get().is_empty()>
-                <p class="ob-page-empty">{move || t!(i18n, bot_work.list_empty)}</p>
-            </Show>
-            <ul class="ob-bot-work-rows">
-                // Every visible fact is part of the key, so a renamed, completed or newly busy
-                // conversation is shown again rather than keeping its earlier copy.
-                <For
-                    each=move || rows.get()
-                    key=|row| format!("{row:?}")
-                    children=move |row| view! {
-                        <BotWorkRow row selected attention on_select on_changed=read_again />
-                    }
-                />
-            </ul>
+            </Notice>
+        </Show>
+        <Show when=move || !loading.get() && !failed.get() && rows.get().is_empty()>
+            <p class="ob-sidebar-search-empty">{move || t!(i18n, bot_work.list_empty)}</p>
+        </Show>
+        <div class="ob-sidebar-work-footer">
             <Show when=move || next_cursor.get().is_some()>
                 <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=load_more>
                     {move || t!(i18n, bot_work.load_more)}
                 </Button>
             </Show>
-        </section>
+            <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=toggle_archived>
+                {move || match status.get() {
+                    ThreadStatusFilter::Active => t_string!(i18n, bot_work.show_archived),
+                    ThreadStatusFilter::Archived => t_string!(i18n, bot_work.show_active),
+                }}
+            </Button>
+        </div>
     }
 }
 
-/// One visible conversation row.
+/// One visible conversation row with its rename and complete actions in the row menu.
 #[component]
 fn BotWorkRow(
     row: BotThreadSummary,
     selected: Signal<Option<ThreadId>>,
     attention: RwSignal<AttentionIndex>,
-    on_select: UnsyncCallback<ThreadId>,
     on_changed: UnsyncCallback<()>,
 ) -> impl IntoView {
     let i18n = use_i18n();
+    let work = use_bot_work();
     let thread = StoredValue::new(row.thread_id.clone());
     let notice = RwSignal::new(None::<WorkNotice>);
     let renaming = RwSignal::new(false);
+    let menu_open = RwSignal::new(false);
     let title = RwSignal::new(row.title.clone().unwrap_or_default());
     let busy = RwSignal::new(false);
 
@@ -248,115 +250,99 @@ fn BotWorkRow(
     });
 
     let foreground = row.foreground.as_ref().map(|foreground| foreground.state);
-    let state_tone = match foreground {
-        None => BadgeTone::Neutral,
-        Some(ThreadForegroundRunState::Queued | ThreadForegroundRunState::Running) => {
-            BadgeTone::Info
-        }
-        Some(ThreadForegroundRunState::Cancelling) => BadgeTone::Caution,
-        Some(ThreadForegroundRunState::ReconciliationRequired) => BadgeTone::Danger,
-    };
     let foreground_run = row.foreground.map(|foreground| foreground.run_id);
     let attention_count =
         Signal::derive(move || attention.with(|index| index.count_for(foreground_run.as_ref())));
     let row_title = row.title;
     let pending_inputs = row.pending_inputs;
-    let updated_at = row.updated_at;
-    let control_id = format!("bot-work-title-{}", row.thread_id.as_str());
+    let archived = row.status == ThreadStatusFilter::Archived;
+    let id_token = row.thread_id.as_str().to_owned();
+    let control_id = format!("bot-work-title-{id_token}");
+    let menu_id = format!("bot-work-menu-{id_token}");
 
     view! {
-        <li class="ob-bot-work-row">
-            <button
-                type="button"
-                class="ob-bot-work-open"
-                aria-current=move || {
-                    thread.with_value(|thread| {
-                        (selected.get().as_ref() == Some(thread)).then_some("page")
-                    })
+        <SidebarRow
+            on_activate=UnsyncCallback::new(move |_| work.open(thread.get_value()))
+            label=move || title_text(i18n.get_locale(), row_title.as_deref())
+            secondary=Signal::derive(move || {
+                let locale = i18n.get_locale();
+                let state = foreground.map_or_else(
+                    || td_string!(locale, bot_work.state_idle).to_owned(),
+                    |state| foreground_label(locale, state),
+                );
+                if pending_inputs > 0 {
+                    format!("{state} · {}", td_string!(locale, bot_work.pending_count, count = pending_inputs))
+                } else {
+                    state
                 }
-                on:click=move |_| on_select.run(thread.get_value())
-            >
-                <span class="ob-bot-work-title">
-                    {move || title_text(i18n.get_locale(), row_title.as_deref())}
-                </span>
-                <span class="ob-bot-work-meta">
-                    <Badge tone=state_tone>
-                        {move || foreground.map_or_else(
-                            || t_string!(i18n, bot_work.state_idle).to_owned(),
-                            |state| foreground_label(i18n.get_locale(), state),
-                        )}
-                    </Badge>
-                    {(pending_inputs > 0).then(|| view! {
-                        <span class="ob-bot-work-pending">
-                            {move || t_string!(i18n, bot_work.pending_count, count = pending_inputs).to_owned()}
-                        </span>
-                    })}
-                    <Show when=move || attention_count.get() != 0>
-                        <Badge tone=BadgeTone::Caution>
-                            {move || t_string!(i18n, bot_work.attention_count, count = attention_count.get()).to_owned()}
-                        </Badge>
-                    </Show>
-                    <span class="ob-bot-work-updated"><Timestamp at=updated_at /></span>
-                </span>
-            </button>
-            <div class="ob-bot-work-actions">
-                <Button
-                    variant=ButtonVariant::Ghost
-                    size=ButtonSize::Small
-                    disabled=busy
-                    on_activate=move |_| renaming.set(true)
-                >
-                    {move || t!(i18n, bot_work.rename)}
-                </Button>
-                // An archived conversation is already complete.
-                {(row.status == ThreadStatusFilter::Active).then(|| view! {
-                    <Button
-                        variant=ButtonVariant::Ghost
-                        size=ButtonSize::Small
-                        disabled=busy
-                        on_activate=complete
-                    >
-                        {move || t!(i18n, bot_work.complete)}
-                    </Button>
-                })}
-            </div>
-            <Show when=move || notice.get().is_some()>
-                <Notice tone=NoticeTone::Error>
-                    {move || notice.get().map(|notice| work_notice_text(i18n.get_locale(), notice))}
-                </Notice>
-            </Show>
-            <Show when=move || renaming.get()>
-                <div class="ob-bot-work-rename">
-                    <Field
-                        control_id=control_id.clone()
-                        label=move || t_string!(i18n, bot_work.rename).to_owned()
-                    >
-                        <Input
-                            value=title
-                            placeholder=move || t_string!(i18n, bot_work.title_placeholder).to_owned()
-                            on_submit=rename
-                        />
-                    </Field>
-                    <div class="ob-bot-work-rename-actions">
-                        <Button
-                            variant=ButtonVariant::Primary
-                            size=ButtonSize::Small
-                            disabled=busy
-                            on_activate=rename
+            })
+            time=Some(row.updated_at)
+            badge=Signal::derive(move || {
+                let count = attention_count.get();
+                (count != 0).then(|| t_string!(i18n, bot_work.attention_count, count = count).to_string())
+            })
+            current=Signal::derive(move || thread.with_value(|thread| selected.get().as_ref() == Some(thread)))
+            actions=move || view! {
+                <Menu id=menu_id.as_str() open=menu_open>
+                    <MenuTrigger disabled=busy>
+                        <IconView icon=Icon::Ellipsis size=IconSize::Inline />
+                        <span class="ob-visually-hidden">{move || t!(i18n, common.more_actions)}</span>
+                    </MenuTrigger>
+                    <MenuContent>
+                        <MenuItem disabled=busy on_select=move |_| renaming.set(true)>
+                            {move || t!(i18n, bot_work.rename)}
+                        </MenuItem>
+                        // An archived conversation is already complete.
+                        {(!archived).then(|| view! {
+                            <MenuItem disabled=busy on_select=complete>
+                                {move || t!(i18n, bot_work.complete)}
+                            </MenuItem>
+                        })}
+                    </MenuContent>
+                </Menu>
+            }
+            below=move || {
+                let control_id = control_id.clone();
+                view! {
+                <Show when=move || notice.get().is_some()>
+                    <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
+                        {move || notice.get().map(|notice| work_notice_text(i18n.get_locale(), notice))}
+                    </Notice>
+                </Show>
+                <Show when=move || renaming.get()>
+                    <div class="ob-bot-work-rename">
+                        <Field
+                            control_id=control_id.clone()
+                            label=move || t_string!(i18n, bot_work.rename).to_owned()
                         >
-                            {move || t!(i18n, common.save)}
-                        </Button>
-                        <Button
-                            variant=ButtonVariant::Ghost
-                            size=ButtonSize::Small
-                            on_activate=move |_| renaming.set(false)
-                        >
-                            {move || t!(i18n, common.cancel)}
-                        </Button>
+                            <Input
+                                value=title
+                                placeholder=move || t_string!(i18n, bot_work.title_placeholder).to_owned()
+                                on_submit=rename
+                            />
+                        </Field>
+                        <div class="ob-bot-work-rename-actions">
+                            <Button
+                                variant=ButtonVariant::Primary
+                                size=ButtonSize::Small
+                                disabled=busy
+                                on_activate=rename
+                            >
+                                {move || t!(i18n, common.save)}
+                            </Button>
+                            <Button
+                                variant=ButtonVariant::Ghost
+                                size=ButtonSize::Small
+                                on_activate=move |_| renaming.set(false)
+                            >
+                                {move || t!(i18n, common.cancel)}
+                            </Button>
+                        </div>
                     </div>
-                </div>
-            </Show>
-        </li>
+                </Show>
+                }
+            }
+        />
     }
 }
 

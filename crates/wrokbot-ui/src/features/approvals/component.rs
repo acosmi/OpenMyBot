@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::shell::layout::set_shell_title;
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use openbot_contracts::command::{AppEvent, SubscriptionRequest};
@@ -22,7 +23,7 @@ use crate::api::desktop_transport::{
 };
 #[cfg(target_arch = "wasm32")]
 use crate::api::list_pending_tool_approvals;
-use crate::features::layout::{PageHeader, PageShell, PageTopbar, PageWidth};
+use crate::features::layout::{PageActions, PageHeader, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
@@ -276,6 +277,7 @@ impl ToolApprovalActions {
 #[component]
 pub fn ApprovalPage() -> impl IntoView {
     let i18n = use_i18n();
+    set_shell_title(move || vec![t_string!(i18n, admin.nav_approvals).to_owned()]);
     let actions = expect_context::<ToolApprovalActions>();
     let refresh = actions.refresh;
     let loading = refresh.loading;
@@ -287,8 +289,7 @@ pub fn ApprovalPage() -> impl IntoView {
 
     view! {
         <PageShell width=PageWidth::Content>
-            <PageTopbar>
-                <p class="ob-eyebrow">{move || t!(i18n, admin.approval_pending)}</p>
+            <PageActions>
                 <Button
                     variant=ButtonVariant::Chip
                     size=ButtonSize::Medium
@@ -299,7 +300,7 @@ pub fn ApprovalPage() -> impl IntoView {
                     <IconView icon=Icon::RefreshCw size=IconSize::Inline />
                     {move || t!(i18n, common.refresh)}
                 </Button>
-            </PageTopbar>
+            </PageActions>
             <PageHeader
                 heading_id="approvals-title"
                 title=move || t_string!(i18n, admin.approvals_title).to_owned()
