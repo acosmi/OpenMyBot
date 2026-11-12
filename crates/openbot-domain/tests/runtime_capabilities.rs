@@ -807,6 +807,22 @@ fn two_states_inside_one_level_still_refuse_the_whole_projection() {
 }
 
 #[test]
+fn permission_and_unavailable_inside_the_os_level_refuse_the_whole_projection() {
+    let mut facts = facts_all_ready();
+    facts.os_accessibility = PermissionFact::Denied;
+    facts.os_input = PermissionFact::Unknown;
+    match project_current(&facts).unwrap_err() {
+        ProjectionFault::UnresolvedBlockers(conflict) => {
+            assert_eq!(conflict.capability(), CapabilityId::NativeControl);
+            assert!(!conflict.unconfigured());
+            assert!(conflict.permission_required());
+            assert!(conflict.unavailable());
+        }
+        other => panic!("expected unresolved blockers, got {other:?}"),
+    }
+}
+
+#[test]
 fn one_state_inside_one_level_reports_the_first_collected_reason() {
     let mut facts = facts_all_ready();
     facts.os_accessibility = PermissionFact::Denied;

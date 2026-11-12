@@ -15,9 +15,11 @@
 //! `permission_required` / `unavailable` / `ready` 都以「已支持」为前提。实现缺失或独立
 //! API 缺失时，其余观察不适用。
 //!
-//! 已支持之后，本核收集所有适用阻断项。**同一能力若同时落入两种以上阻断五态**，第一真源
-//! 未规定显示优先级，本核返回 [`ProjectionFault::UnresolvedBlockers`]，不丢掉阻断项去
-//! 返回 `ready`，也不另发一套产品优先级。可判定输入正常投影。
+//! Once supported, blockers are evaluated in five fixed levels (spec revision R487): release
+//! dependency, product permission, configuration, source facts, then OS permission and
+//! on-the-spot consent. Only the first level that has a blocker is collected and reported.
+//! Two different states inside that level return [`ProjectionFault::UnresolvedBlockers`];
+//! no blocker is dropped to return `ready`.
 //!
 //! `hostMode` 只进入输出与窗口形态校验；宿主模式本身不能使任何控制能力变为 `ready`。
 //!
@@ -853,7 +855,8 @@ pub enum BindingField {
     Host,
 }
 
-/// 同一能力同时出现多种阻断五态，规范未规定优先级。
+/// Two different blocking states inside the first blocking level of one capability
+/// (spec revision R487).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnresolvedBlockers {
     capability: CapabilityId,
@@ -921,7 +924,7 @@ pub enum ProjectionFault {
     /// revision 越界。
     #[error("runtime_capabilities_revision")]
     Revision(RevisionFault),
-    /// 多阻断态且规范未规定优先级。
+    /// Two different states inside the first blocking level (spec revision R487).
     #[error("runtime_capabilities_unresolved_blockers")]
     UnresolvedBlockers(UnresolvedBlockers),
 }

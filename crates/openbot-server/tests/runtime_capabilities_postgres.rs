@@ -989,6 +989,50 @@ async fn unconfigured_policy_hides_unknown_provider_and_projection_succeeds() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "requires root-owned isolated PostgreSQL"]
+async fn unproven_policy_and_missing_key_inside_one_level_refuse_entire_projection() {
+    let admin = admin_config("runtime_capabilities_same_level");
+    with_temp_database(&admin, "capsamelevel", |config| async move {
+        let mut fixture = Fixture::new(config, Mode::Sessions).await?;
+        fixture.install_actual(Mode::Sessions, None).await?;
+        // One rule over the count bound makes the acting policy unproven (unavailable); with no
+        // default key the model key is missing (unconfigured): two states inside one level.
+        seed_bounds_policy(&fixture, &[4; 257]).await?;
+        let before = fixture.fingerprint().await?;
+        let result = fixture.http(Method::GET, PATH, Some(COOKIE_A), b"").await?;
+        require(
+            result.status == StatusCode::SERVICE_UNAVAILABLE
+                && result.value == json!({"code":"dependency_unavailable"})
+                && fixture
+                    .application
+                    .last_error
+                    .lock()
+                    .map_err(|_| "actual App error observer poisoned".to_owned())?
+                    .as_ref()
+                    == Some(&AppError::DependencyUnavailable {
+                        dependency: "runtime_capabilities",
+                    }),
+            "same-level blockers emitted a prioritized or partial success",
+        )?;
+        require(
+            result.value.get("capabilities").is_none(),
+            "failed whole query leaked partial capability vector",
+        )?;
+        require(
+            fixture.port.as_ref().unwrap().calls() == (1, 1, 1),
+            "same-level error bypassed whole-result finalization/tail",
+        )?;
+        require(
+            fixture.fingerprint().await? == before,
+            "same-level failure wrote actual source facts",
+        )?;
+        fixture.finish().await;
+        Ok(())
+    })
+    .await;
+}
+
 async fn changed_auth(tag: &str, mode: Mode, sql: &str) {
     let admin = admin_config(tag);
     with_temp_database(&admin, tag, |config| async move {
