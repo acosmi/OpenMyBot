@@ -951,7 +951,11 @@ async fn legal_personal_config_scoped_key_without_provider_is_unavailable_not_re
 
 #[tokio::test]
 #[ignore = "requires root-owned isolated PostgreSQL"]
-async fn mixed_unconfigured_policy_and_unknown_provider_refuses_entire_projection() {
+async fn unconfigured_policy_hides_unknown_provider_and_projection_succeeds() {
+    use openbot_contracts::runtime_capabilities::{
+        RuntimeCapabilityId as Id, RuntimeCapabilityReasonCode as Reason,
+        RuntimeCapabilityState as State,
+    };
     let admin = admin_config("runtime_capabilities_mixed");
     with_temp_database(&admin, "capmixed", |config| async move {
         let mut fixture = Fixture::new(config, Mode::Sessions).await?;
@@ -960,30 +964,24 @@ async fn mixed_unconfigured_policy_and_unknown_provider_refuses_entire_projectio
         let before = fixture.fingerprint().await?;
         let result = fixture.http(Method::GET, PATH, Some(COOKIE_A), b"").await?;
         require(
-            result.status == StatusCode::SERVICE_UNAVAILABLE
-                && result.value == json!({"code":"dependency_unavailable"})
-                && fixture
-                    .application
-                    .last_error
-                    .lock()
-                    .map_err(|_| "actual App error observer poisoned".to_owned())?
-                    .as_ref()
-                    == Some(&AppError::DependencyUnavailable {
-                        dependency: "runtime_capabilities",
-                    }),
-            "mixed blockers emitted a prioritized or partial success",
+            result.status == StatusCode::OK,
+            "policy and provider blockers of different levels refused the query",
         )?;
+        let value: openbot_contracts::runtime_capabilities::RuntimeCapabilitiesResponse =
+            serde_json::from_value(result.value)
+                .map_err(|_| "direct HTTP DTO invalid".to_owned())?;
         require(
-            result.value.get("capabilities").is_none(),
-            "failed whole query leaked partial capability vector",
+            entry(&value, Id::AgentTools).state() == State::Unconfigured
+                && entry(&value, Id::AgentTools).reason_code() == Reason::PolicyUnconfigured,
+            "the policy level did not hide the later provider level",
         )?;
         require(
             fixture.port.as_ref().unwrap().calls() == (1, 1, 1),
-            "mixed error bypassed whole-result finalization/tail",
+            "query bypassed whole-result finalization/tail",
         )?;
         require(
             fixture.fingerprint().await? == before,
-            "mixed failure wrote actual source facts",
+            "query wrote actual source facts",
         )?;
         fixture.finish().await;
         Ok(())
@@ -1127,6 +1125,12 @@ async fn final_joint_wait(tag: &str, change: DuringFinalWait) {
     with_temp_database(&admin,tag,|config|async move {
         let mut fixture=Fixture::new(config,Mode::Sessions).await?; let gate=FinalizeGate::new();
         fixture.install_actual(Mode::Sessions,Some(gate.clone())).await?; let auth=fixture.auth(COOKIE_A).await?;
+        if matches!(change,DuringFinalWait::DefaultKeyInsert) {
+            // A configured policy keeps the late key visible: an unconfigured policy would
+            // hide the provider level and make the pre- and post-insert results equal.
+            fixture.pool.get().await.map_err(|_| "policy setup acquire failed".to_owned())?
+                .batch_execute("INSERT INTO public.action_policy(id,mode,deny,allow) VALUES('current','enforce',ARRAY['true'],'{}')").await.map_err(|_| "policy setup failed".to_owned())?;
+        }
         let app=fixture.application.clone(); let input=auth.clone();
         let pending=tokio::spawn(async move { app.execute(input,AppCommand::GetRuntimeCapabilities).await });
         gate.entered().await?;
@@ -1157,7 +1161,7 @@ async fn final_joint_wait(tag: &str, change: DuringFinalWait) {
             .map_err(|_| "actual use case task failed".to_owned())?;
         match change {
             DuringFinalWait::LogoutA|DuringFinalWait::OwnerClose|DuringFinalWait::GenerationNull|DuringFinalWait::RoleChange|DuringFinalWait::DenyInsert=>require(result==Err(AppError::Unauthenticated),"post-wait original authority leaked old whole projection")?,
-            DuringFinalWait::DefaultKeyInsert=>require(result==Err(AppError::DependencyUnavailable{dependency:"runtime_capabilities"}),"late key/policy mixed blockers reused old missing-key projection")?,
+            DuringFinalWait::DefaultKeyInsert=>{let value=projected(result.map_err(|_| "late key whole query failed".to_owned())?)?;require(entry(&value,Id::AgentTools).reason_code()==Reason::ProviderUnproven,"final SQL reused old missing-key projection")?;}
             DuringFinalWait::PolicyInsert=>{let value=projected(result.map_err(|_| "late policy whole query failed".to_owned())?)?;require(entry(&value,Id::AgentTools).reason_code()==Reason::ModelKeyMissing,"final SQL reused old absent-policy predicate")?;}
             DuringFinalWait::CustomInsert=>{let value=projected(result.map_err(|_| "late custom whole query failed".to_owned())?)?;require(entry(&value,Id::ModelCustomV1).reason_code()==Reason::ProviderUnproven,"final SQL reused old absent-custom predicate")?;}
             DuringFinalWait::SsoInsert=>{let value=projected(result.map_err(|_| "late SSO whole query failed".to_owned())?)?;require(entry(&value,Id::DynamicSso).reason_code()==Reason::ProviderUnproven,"final SQL reused old absent-SSO predicate or invented provider readiness")?;}
@@ -1204,7 +1208,7 @@ async fn actual_final_joint_wait_reobserves_negative_policy_insertion() {
 }
 #[tokio::test]
 #[ignore = "requires root-owned isolated PostgreSQL"]
-async fn actual_final_joint_wait_reobserves_negative_default_key_insertion_and_mixed_failure() {
+async fn actual_final_joint_wait_reobserves_negative_default_key_insertion() {
     final_joint_wait("capfinalkey", DuringFinalWait::DefaultKeyInsert).await;
 }
 #[tokio::test]
