@@ -2688,7 +2688,7 @@ async fn v2_custom_cost_cap_is_refused_as_unpriced_before_any_business_write_or_
         assert_eq!(tls.count(), 0);
 
         // Control: without the cap the very same original requests are accepted, so the
-        // refusal above was caused by the missing rate card and nothing else.
+        // cap alone triggered the refusal above. The context below shows the rate card is absent.
         budgets.replace(&auth(), None).await.unwrap();
         begin_thread_run_v2(
             &f.directory,
@@ -2713,7 +2713,8 @@ async fn v2_custom_cost_cap_is_refused_as_unpriced_before_any_business_write_or_
             assert_one_original_business_commit(&f, req).await;
         }
         let request = f.context().load(&lease(&begin)).await.unwrap();
-        assert!(request.rate_card.is_none() && request.cost_cap.is_none());
+        assert!(request.rate_card.is_none());
+        assert!(request.cost_cap.is_none());
         let output = events(
             f.adapter(tls.dialer(), Duration::from_secs(5))
                 .start(request)
@@ -2766,7 +2767,8 @@ async fn v2_cost_cap_set_after_admission_stays_frozen_out_of_the_run_and_refuses
         );
         let reloaded = f.context().load(&lease(&accepted)).await.unwrap();
         assert_eq!(reloaded.route, request.route);
-        assert!(reloaded.rate_card.is_none() && reloaded.cost_cap.is_none());
+        assert!(reloaded.rate_card.is_none());
+        assert!(reloaded.cost_cap.is_none());
         let output = events(
             f.adapter(tls.dialer(), Duration::from_secs(5))
                 .start(reloaded)
