@@ -1,7 +1,9 @@
-//! The assistant group: one row per visible assistant from the shell directory, the shown
-//! assistant's work list beneath its row, and its new-conversation control (UI spec v5.2 §5.2).
+//! The assistant group: one row per visible assistant from the shell directory, plus the shown
+//! assistant when the directory does not list it, with the shown assistant's work list beneath
+//! its row and its new-conversation control (UI spec v5.2 §5.2).
 
 use leptos::prelude::*;
+use openbot_contracts::agent::AgentProfile;
 
 use crate::features::agents::use_agent_directory;
 use crate::features::bot_threads::{BotWorkList, use_bot_work};
@@ -18,6 +20,13 @@ pub(super) fn SidebarAssistants() -> impl IntoView {
     let i18n = use_i18n();
     let directory = use_agent_directory();
     let work = use_bot_work();
+    let unlisted = Memo::new(move |_| {
+        work.agent.get().filter(|agent| {
+            directory
+                .agents
+                .with(|agents| agents.iter().all(|listed| listed.id != agent.id))
+        })
+    });
     view! {
         <SidebarGroup>
             <div class="ob-sidebar-group-heading">
@@ -37,51 +46,62 @@ pub(super) fn SidebarAssistants() -> impl IntoView {
                     <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| directory.refresh()>{move || t!(i18n, common.retry)}</Button>
                 </Notice>
             </Show>
-            <Show when=move || !directory.loading.get() && !directory.failed.get() && directory.agents.with(Vec::is_empty)>
+            <Show when=move || !directory.loading.get() && !directory.failed.get() && directory.agents.with(Vec::is_empty) && unlisted.with(Option::is_none)>
                 <p class="ob-sidebar-search-empty">{move || t!(i18n, agents.empty_title)}</p>
             </Show>
             <SidebarNavList>
                 <For each=move || directory.agents.get() key=|agent| agent.id.clone() children=move |agent| {
-                    let href = crate::api::bot_chat_href(agent.id.as_str()).ok()?;
-                    let id = agent.id.clone();
-                    let shown = Memo::new(move |_| work.agent_id().as_ref() == Some(&id));
-                    let remote = agent.endpoint.is_some();
-                    let list_agent = agent.id.clone();
-                    Some(view! {
-                        <SidebarRow
-                            href
-                            avatar=agent.avatar_seed
-                            label=agent.name
-                            current=shown
-                            actions=move || view! {
-                                {remote.then(|| view! {
-                                    <span class="ob-sidebar-row-marker" title=move || t_string!(i18n, shell.remote_agent).to_owned()>
-                                        <IconView icon=Icon::Globe size=IconSize::Inline />
-                                        <span class="ob-visually-hidden">{move || t!(i18n, shell.remote_agent)}</span>
-                                    </span>
-                                })}
-                                <Show when=move || shown.get()>
-                                    <button class="ob-sidebar-row-action" type="button"
-                                        aria-label=move || t_string!(i18n, bot_chat.new_chat).to_owned()
-                                        title=move || t_string!(i18n, bot_chat.new_chat).to_owned()
-                                        disabled=move || work.resolving.get() || work.new_pending.get()
-                                        on:click=move |_| work.start_new()>
-                                        <IconView icon=Icon::Plus size=IconSize::Inline />
-                                    </button>
-                                </Show>
-                            }
-                            below=move || {
-                                let list_agent = list_agent.clone();
-                                view! {
-                                    <Show when=move || shown.get()>
-                                        <BotWorkList agent_id=list_agent.clone() />
-                                    </Show>
-                                }
-                            }
-                        />
-                    })
+                    view! { <AssistantRow agent /> }
                 } />
+                // An assistant opened by link that the directory does not list keeps its work list.
+                {move || unlisted.get().map(|agent| view! { <AssistantRow agent /> })}
             </SidebarNavList>
         </SidebarGroup>
     }
+}
+
+/// One assistant row: the shown assistant also carries its new-conversation control and its work
+/// list.
+#[component]
+fn AssistantRow(agent: AgentProfile) -> impl IntoView {
+    let i18n = use_i18n();
+    let work = use_bot_work();
+    let href = crate::api::bot_chat_href(agent.id.as_str()).ok();
+    let id = agent.id.clone();
+    let shown = Memo::new(move |_| work.agent_id().as_ref() == Some(&id));
+    let remote = agent.endpoint.is_some();
+    let list_agent = agent.id.clone();
+    href.map(move |href| view! {
+        <SidebarRow
+            href
+            avatar=agent.avatar_seed
+            label=agent.name
+            current=shown
+            actions=move || view! {
+                {remote.then(|| view! {
+                    <span class="ob-sidebar-row-marker" title=move || t_string!(i18n, shell.remote_agent).to_owned()>
+                        <IconView icon=Icon::Globe size=IconSize::Inline />
+                        <span class="ob-visually-hidden">{move || t!(i18n, shell.remote_agent)}</span>
+                    </span>
+                })}
+                <Show when=move || shown.get()>
+                    <button class="ob-sidebar-row-action" type="button"
+                        aria-label=move || t_string!(i18n, bot_chat.new_chat).to_owned()
+                        title=move || t_string!(i18n, bot_chat.new_chat).to_owned()
+                        disabled=move || work.resolving.get() || work.new_pending.get()
+                        on:click=move |_| work.start_new()>
+                        <IconView icon=Icon::Plus size=IconSize::Inline />
+                    </button>
+                </Show>
+            }
+            below=move || {
+                let list_agent = list_agent.clone();
+                view! {
+                    <Show when=move || shown.get()>
+                        <BotWorkList agent_id=list_agent.clone() />
+                    </Show>
+                }
+            }
+        />
+    })
 }

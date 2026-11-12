@@ -9,11 +9,22 @@ use super::timing::schedule_timeout;
 
 const TYPEAHEAD_RESET_MS: i32 = 500;
 
+/// Which edge of the trigger the root popup lines up with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MenuAlign {
+    /// The popup starts at the trigger's inline-start edge.
+    #[default]
+    Start,
+    /// The popup ends at the trigger's inline-end edge, for triggers at the end of a row.
+    End,
+}
+
 #[derive(Clone)]
 struct RootMenu {
     open: RwSignal<bool>,
     trigger_ref: NodeRef<html::Button>,
     on_close: Option<UnsyncCallback<()>>,
+    align: MenuAlign,
 }
 
 #[derive(Clone)]
@@ -35,6 +46,7 @@ pub fn Menu(
     #[prop(into)] id: String,
     open: RwSignal<bool>,
     #[prop(optional)] on_close: Option<UnsyncCallback<()>>,
+    #[prop(optional)] align: MenuAlign,
     children: Children,
 ) -> impl IntoView {
     assert_dom_id(&id);
@@ -43,6 +55,7 @@ pub fn Menu(
         open,
         trigger_ref,
         on_close,
+        align,
     };
     let context = MenuContext {
         id,
@@ -130,6 +143,7 @@ pub fn MenuContent(children: Children) -> impl IntoView {
     let content_id = format!("{}-content", context.id);
     let trigger_id = format!("{}-trigger", context.id);
     let is_root = context.parent_trigger.is_none();
+    let align_end = is_root && context.root.align == MenuAlign::End;
     let dismiss_root = context.root.clone();
     let key_context = context.clone();
     view! {
@@ -149,6 +163,7 @@ pub fn MenuContent(children: Children) -> impl IntoView {
             tabindex="-1"
             node_ref=context.content_ref
             data-level=if is_root { "root" } else { "sub" }
+            data-align=align_end.then_some("end")
             data-state=move || menu_state_tokens(context.open.get(), false)
             on:keydown=move |event| handle_menu_key(event, key_context.clone())
         >

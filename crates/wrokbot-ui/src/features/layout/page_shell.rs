@@ -51,9 +51,13 @@ pub fn PageHeader(
     /// Stable h1 DOM token.
     #[prop(into)]
     heading_id: String,
-    /// Visible localized h1 text.
+    /// Localized h1 text.
     #[prop(into)]
     title: TextProp,
+    /// The top bar already shows this same title, so the h1 is kept for assistive technology
+    /// only instead of stacking a second visible title (UI spec v5.2 §5.4).
+    #[prop(optional)]
+    title_in_top_bar: bool,
     /// Optional localized explanatory sentence.
     #[prop(optional, into)]
     description: TextProp,
@@ -66,7 +70,10 @@ pub fn PageHeader(
     let visible_description = description.clone();
     view! {
         <header class="ob-page-header">
-            <h1 id=heading_id class="ob-page-title">{move || title.get()}</h1>
+            <h1
+                id=heading_id
+                class=if title_in_top_bar { "ob-page-title ob-visually-hidden" } else { "ob-page-title" }
+            >{move || title.get()}</h1>
             <p
                 class="ob-page-intro"
                 hidden=move || visible_description.get().trim().is_empty()

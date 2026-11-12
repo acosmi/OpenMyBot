@@ -6,6 +6,7 @@
 //! context. This layout therefore owns only their common full-height placement.
 
 use leptos::prelude::*;
+use leptos_meta::Title;
 
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
@@ -117,11 +118,19 @@ fn IconRail() -> impl IntoView {
     }
 }
 
-/// The page title in the top bar. It is plain text, so dragging the window from it keeps working.
+/// The page title in the top bar and the browser tab. The top-bar title is plain text, so dragging
+/// the window from it keeps working.
 #[component]
 fn ShellContext() -> impl IntoView {
     let title = expect_context::<ShellTitle>().0;
     view! {
+        <Title text=move || title.with(|segments| {
+            if segments.is_empty() {
+                "Wrok Bot".to_owned()
+            } else {
+                format!("{} — Wrok Bot", segments.join(" / "))
+            }
+        }) />
         <div class="ob-shell-identity">
             <span class="ob-shell-breadcrumb">{move || title.get().join(" / ")}</span>
         </div>

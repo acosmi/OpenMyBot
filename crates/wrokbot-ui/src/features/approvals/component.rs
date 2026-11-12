@@ -303,7 +303,8 @@ pub fn ApprovalPage() -> impl IntoView {
             </PageActions>
             <PageHeader
                 heading_id="approvals-title"
-                title=move || t_string!(i18n, admin.approvals_title).to_owned()
+                title=move || t_string!(i18n, admin.nav_approvals).to_owned()
+                title_in_top_bar=true
                 description=move || t_string!(i18n, admin.approvals_intro).to_owned()
             />
 

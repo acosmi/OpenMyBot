@@ -17,8 +17,8 @@ use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
     Badge, BadgeTone, Button, ButtonSize, ButtonVariant, IconSize, IconView, Item, ItemAction,
-    ItemActions, ItemDescription, ItemMedia, ItemTitle, Menu, MenuContent, MenuItem, MenuTrigger,
-    Notice, NoticeTone, Timestamp,
+    ItemActions, ItemDescription, ItemMedia, ItemTitle, Menu, MenuAlign, MenuContent, MenuItem,
+    MenuTrigger, Notice, NoticeTone, Timestamp,
 };
 
 const GOOGLE_DRIVE_SERVER_ID: &str = "google-drive";
@@ -320,7 +320,7 @@ pub fn ConnectedAccountDetailPage() -> impl IntoView {
                                             {move || t!(i18n, settings.connected)}
                                         </Badge>
                                         <div class="ob-connected-account-menu">
-                                            <Menu id="connected-account-actions" open=menu_open>
+                                            <Menu id="connected-account-actions" open=menu_open align=MenuAlign::End>
                                                 <MenuTrigger disabled=Signal::derive(move || action_pending.get() || write_lock.get())>
                                                     <IconView icon=Icon::Ellipsis size=IconSize::Inline />
                                                     <span class="ob-visually-hidden">

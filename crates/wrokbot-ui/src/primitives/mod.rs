@@ -60,7 +60,9 @@ pub use item::{Item, ItemAction, ItemActions, ItemDescription, ItemMedia, ItemTi
 pub use kbd::{Kbd, KbdKey, KbdModifier};
 pub use label::Label;
 pub use locale_switch::LocaleSwitch;
-pub use menu::{Menu, MenuContent, MenuItem, MenuSeparator, MenuSub, MenuSubTrigger, MenuTrigger};
+pub use menu::{
+    Menu, MenuAlign, MenuContent, MenuItem, MenuSeparator, MenuSub, MenuSubTrigger, MenuTrigger,
+};
 pub use message::{
     Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageGroup,
     MessageHeader,

@@ -18,6 +18,7 @@ pub fn AdminHomePage() -> impl IntoView {
             <PageHeader
                 heading_id="admin-home-title"
                 title=move || t_string!(i18n, admin.title).to_owned()
+                title_in_top_bar=true
                 description=move || t_string!(i18n, admin.overview_intro).to_owned()
             />
             <PageRows>

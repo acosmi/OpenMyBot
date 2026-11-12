@@ -101,6 +101,7 @@ pub fn AgentsPage() -> impl IntoView {
                                 <PageHeader
                                     heading_id="agents-page-title"
                                     title=move || t_string!(i18n, agents.title).to_owned()
+                                    title_in_top_bar=true
                                 />
                                 <Button
                                     variant=ButtonVariant::Primary

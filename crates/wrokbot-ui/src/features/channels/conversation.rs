@@ -2085,6 +2085,14 @@ fn ConversationSurface(
                 .with_button(t_string!(i18n, channels.reread), retry_snapshot),
             );
         }
+        // The stop receipt is shown once; stopping an unverified run also raises the hold
+        // notice below, so the receipt ranks as a caution and is listed first to stay visible.
+        if let Some(receipt) = stop_receipt.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Caution,
+                stop_receipt_text(locale, receipt),
+            ));
+        }
         if direct
             && state.with(|state| {
                 matches!(
@@ -2096,12 +2104,6 @@ fn ConversationSurface(
             notices.push(SlotNotice::new(
                 NoticeTone::Caution,
                 t_string!(i18n, bot_work.reconciliation_pending_hold),
-            ));
-        }
-        if let Some(receipt) = stop_receipt.get() {
-            notices.push(SlotNotice::new(
-                NoticeTone::Status,
-                stop_receipt_text(locale, receipt),
             ));
         }
         notices

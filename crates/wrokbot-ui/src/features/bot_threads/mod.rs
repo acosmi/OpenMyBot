@@ -20,8 +20,8 @@ use crate::api::{ApiError, complete_thread, list_bot_threads, set_thread_title};
 use crate::i18n::{Locale, t, t_string, td_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input, Menu, MenuContent,
-    MenuItem, MenuTrigger, Notice, NoticePresentation, NoticeTone, SidebarRow,
+    Button, ButtonSize, ButtonVariant, Field, IconSize, IconView, Input, Menu, MenuAlign,
+    MenuContent, MenuItem, MenuTrigger, Notice, NoticePresentation, NoticeTone, SidebarRow,
 };
 
 use self::attention::AttentionIndex;
@@ -283,7 +283,7 @@ fn BotWorkRow(
             })
             current=Signal::derive(move || thread.with_value(|thread| selected.get().as_ref() == Some(thread)))
             actions=move || view! {
-                <Menu id=menu_id.as_str() open=menu_open>
+                <Menu id=menu_id.as_str() open=menu_open align=MenuAlign::End>
                     <MenuTrigger disabled=busy>
                         <IconView icon=Icon::Ellipsis size=IconSize::Inline />
                         <span class="ob-visually-hidden">{move || t!(i18n, common.more_actions)}</span>

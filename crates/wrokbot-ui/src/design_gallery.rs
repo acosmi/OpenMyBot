@@ -27,15 +27,15 @@ use crate::primitives::{
     DialogBody, DialogClose, DialogContent, DialogFooter, DialogTrigger, Field, IconSize, IconView,
     Input, InputGroup, InputGroupAffix, InputGroupAffixPosition, InputPreviewState, InputType,
     Item, ItemAction, ItemActions, ItemDescription, ItemMedia, ItemTitle, Kbd, KbdKey, KbdModifier,
-    Menu, MenuContent, MenuItem, MenuSeparator, MenuSub, MenuSubTrigger, MenuTrigger, Message,
-    MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageGroup, MessageHeader,
-    MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem,
-    MessageScrollerViewport, Notice, NoticePresentation, NoticeTone, Select, SelectContent,
-    SelectGroup, SelectItem, SelectTrigger, Separator, SeparatorOrientation, Sheet, SheetSide,
-    Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupLabel, SidebarHeader,
-    SidebarNavList, SidebarProvider, SidebarRow, SidebarTrigger, Skeleton, SkeletonShape, Switch,
-    TechnicalDetails, Textarea, TextareaPreviewState, Timestamp, Toast, ToastPreviewState, Tooltip,
-    TooltipTrigger, TooltipTriggerAction,
+    Menu, MenuAlign, MenuContent, MenuItem, MenuSeparator, MenuSub, MenuSubTrigger, MenuTrigger,
+    Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageGroup,
+    MessageHeader, MessageScroller, MessageScrollerButton, MessageScrollerContent,
+    MessageScrollerItem, MessageScrollerViewport, Notice, NoticePresentation, NoticeTone, Select,
+    SelectContent, SelectGroup, SelectItem, SelectTrigger, Separator, SeparatorOrientation, Sheet,
+    SheetSide, Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupLabel,
+    SidebarHeader, SidebarNavList, SidebarProvider, SidebarRow, SidebarTrigger, Skeleton,
+    SkeletonShape, Switch, TechnicalDetails, Textarea, TextareaPreviewState, Timestamp, Toast,
+    ToastPreviewState, Tooltip, TooltipTrigger, TooltipTriggerAction,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +67,7 @@ pub fn DesignGallery() -> impl IntoView {
     let sheet_open = RwSignal::new(false);
     let sheet_close_count = RwSignal::new(0_u32);
     let menu_open = RwSignal::new(false);
+    let end_menu_open = RwSignal::new(false);
     let menu_select_count = RwSignal::new(0_u32);
     let menu_close_count = RwSignal::new(0_u32);
     let combobox_open = RwSignal::new(false);
@@ -479,6 +480,27 @@ pub fn DesignGallery() -> impl IntoView {
                                                 label=move || t_string!(i18n, shell.nav_settings).to_owned()
                                                 actions=move || view! {
                                                     <span class="ob-sidebar-row-marker"><IconView icon=Icon::Globe size=IconSize::Inline /></span>
+                                                }
+                                            />
+                                            <SidebarRow
+                                                on_activate=UnsyncCallback::new(move |_| item_count.update(|count| *count += 1))
+                                                icon=Icon::LayoutGrid
+                                                label=move || t_string!(i18n, design_gallery.menu_end).to_owned()
+                                                actions=move || view! {
+                                                    <Menu id="design-menu-end" open=end_menu_open align=MenuAlign::End>
+                                                        <MenuTrigger>
+                                                            <IconView icon=Icon::Ellipsis size=IconSize::Inline />
+                                                            <span class="ob-visually-hidden">{move || t!(i18n, common.more_actions)}</span>
+                                                        </MenuTrigger>
+                                                        <MenuContent>
+                                                            <MenuItem on_select=move |_| menu_select_count.update(|count| *count += 1)>
+                                                                {move || t!(i18n, design_gallery.menu_copy)}
+                                                            </MenuItem>
+                                                            <MenuItem on_select=move |_| menu_select_count.update(|count| *count += 1)>
+                                                                {move || t!(i18n, design_gallery.menu_delete)}
+                                                            </MenuItem>
+                                                        </MenuContent>
+                                                    </Menu>
                                                 }
                                             />
                                         </SidebarNavList>

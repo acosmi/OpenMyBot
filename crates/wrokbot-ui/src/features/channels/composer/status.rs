@@ -187,6 +187,12 @@ mod tests {
             .as_deref(),
             Some("error")
         );
+        // A one-time receipt listed before an equal-rank caution, such as the stop receipt
+        // before the hold notice, stays visible.
+        assert_eq!(
+            shown(&[(Caution, false, "stop receipt"), (Caution, false, "hold")]).as_deref(),
+            Some("stop receipt")
+        );
         // The blocking flag only orders cautions; it never lifts a status above a caution.
         assert_eq!(
             shown(&[(Status, true, "status"), (Caution, false, "caution")]).as_deref(),

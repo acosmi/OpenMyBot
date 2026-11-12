@@ -806,11 +806,6 @@ summary:focus-visible,
   padding: calc(var(--spacing) * 4);
 }
 
-.ob-connected-account-menu .ob-menu-content {
-  inset-inline-start: auto;
-  inset-inline-end: 0;
-}
-
 .ob-connected-account-menu .ob-menu-item,
 .ob-gallery-activity-refused p,
 .ob-field-error {
@@ -3168,6 +3163,8 @@ summary:focus-visible,
   gap: 0;
 }
 
+.ob-menu-content[data-align="end"] { inset-inline: auto 0; }
+
 .ob-menu-content[data-level="sub"] {
   inset-block-start: 0;
   inset-inline-start: calc(100% + var(--spacing));
@@ -3649,7 +3646,7 @@ summary::-webkit-details-marker {
 .ob-sidebar-group-label { padding: 10px 8px 5px; font-size: var(--size-nav-group-font); font-weight: 600; color: var(--fg-nav-group); }
 .ob-sidebar-list { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; }
 
-.ob-sidebar-row-line { display: flex; align-items: center; min-width: 0; border-radius: var(--radius-sm); color: var(--fg-secondary); transition: background var(--motion-duration-hover) var(--motion-ease-enter); }
+.ob-sidebar-row-line { position: relative; display: flex; align-items: center; min-width: 0; border-radius: var(--radius-sm); color: var(--fg-secondary); transition: background var(--motion-duration-hover) var(--motion-ease-enter); }
 .ob-sidebar-row-main { display: flex; flex: 1 1 auto; align-items: center; min-width: 0; min-height: var(--size-sidebar-item); gap: 9px; padding: 7px 9px; border: 0; border-radius: inherit; background: transparent; color: inherit; font: inherit; font-size: var(--size-nav-font); font-weight: 500; text-align: start; text-decoration: none; cursor: pointer; }
 .ob-sidebar-row-main > .ob-icon { flex: none; width: var(--size-rail-icon); height: var(--size-rail-icon); }
 .ob-sidebar-row-avatar { display: flex; flex: none; }
@@ -3660,6 +3657,9 @@ summary::-webkit-details-marker {
 .ob-sidebar-row-time { flex: none; font-size: var(--size-aux-time-font); color: var(--fg-weak); }
 .ob-sidebar-row-line:is(:hover, :has(> [aria-current="page"])) :is(.ob-sidebar-row-secondary, .ob-sidebar-row-time) { color: var(--fg-muted); }
 .ob-sidebar-row-actions { display: flex; flex: none; align-items: center; gap: 2px; padding-inline-end: 4px; }
+/* UI spec v5.2 §2.6: a row-end menu anchors to the row, so it stays inside the sidebar. */
+.ob-sidebar-row-actions > .ob-menu-root { position: static; }
+.ob-sidebar-row-actions .ob-menu-content { max-width: 100%; }
 .ob-sidebar-row-action, .ob-sidebar-row-marker { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 7px; background: transparent; color: var(--fg-muted); }
 .ob-sidebar-row-action { cursor: pointer; }
 .ob-sidebar-row-action:is(:hover, :focus-visible) { background: var(--bg-chip); color: var(--fg); }
