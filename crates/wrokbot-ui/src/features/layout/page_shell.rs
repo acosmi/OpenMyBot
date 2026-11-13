@@ -72,7 +72,8 @@ pub fn PageHeader(
         <header class="ob-page-header">
             <h1
                 id=heading_id
-                class=if title_in_top_bar { "ob-page-title ob-visually-hidden" } else { "ob-page-title" }
+                class="ob-page-title"
+                class:ob-visually-hidden=title_in_top_bar
             >{move || title.get()}</h1>
             <p
                 class="ob-page-intro"

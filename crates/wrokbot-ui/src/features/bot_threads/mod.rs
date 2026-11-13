@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(label(ThreadForegroundRunState::Cancelling), "Cancelling");
         assert_eq!(
             label(ThreadForegroundRunState::ReconciliationRequired),
-            "Needs reconciliation"
+            "Result needs verification"
         );
     }
 
@@ -430,7 +430,7 @@ mod tests {
                     pending_inputs: 2,
                 }
             ),
-            "This conversation still has a foreground run (Running) and waiting inputs (2), \
+            "This conversation still has a task in progress (Running) and 2 waiting inputs, \
              so it cannot be completed yet."
         );
         // Without a foreground the text names no state at all, never an idle one.
