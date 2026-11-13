@@ -145,7 +145,8 @@ pub(crate) fn UnknownFacts(
             });
         }
     });
-    view! { <section class="ob-unknown-facts" data-unknown-run=run.as_str().to_owned()>
+    let run_attribute = run.as_str().to_owned();
+    view! { <section class="ob-unknown-facts" data-unknown-run=run_attribute>
         <h3>{move || t!(i18n, admin.unknown_title)}</h3>
         <TechnicalDetails copy=format!("{}\n{}", thread.as_str(), run.as_str())><code>{thread.as_str().to_owned()}</code><code>{run.as_str().to_owned()}</code></TechnicalDetails>
         <p>{move || t!(i18n, admin.unknown_boundary)}</p>

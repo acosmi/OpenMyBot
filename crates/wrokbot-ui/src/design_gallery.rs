@@ -106,7 +106,7 @@ pub fn DesignGallery() -> impl IntoView {
         Signal::derive(|| true),
         Signal::derive(|| None),
     ));
-    let gallery_action = |label: Signal<String>| ComposerAction {
+    let gallery_action = move |label: Signal<String>| ComposerAction {
         disabled: Signal::derive(|| false),
         loading: Signal::derive(|| false),
         label,

@@ -515,7 +515,7 @@ fn RemoteAttentionCard(
 #[component]
 fn DecisionReference(source: SourceReference, phase: Signal<Option<Phase>>) -> impl IntoView {
     view! { <article class="ob-review-card" data-decision-reference=source.id>
-        <div class="ob-approval-source"><TechnicalDetails copy=[Some(source.bot.as_str()), Some(source.run.as_str()), source.call.as_deref()].into_iter().flatten().collect::<Vec<_>>().join("\n")><code>{source.bot}</code><code>{source.run}</code>{source.call.map(|call| view! { <code>{call}</code> })}</TechnicalDetails></div>
+        <div class="ob-approval-source"><TechnicalDetails copy={[Some(source.bot.as_str()), Some(source.run.as_str()), source.call.as_deref()].into_iter().flatten().collect::<Vec<_>>().join("\n")}><code>{source.bot}</code><code>{source.run}</code>{source.call.map(|call| view! { <code>{call}</code> })}</TechnicalDetails></div>
         <DecisionStatus phase/>
     </article> }
 }
