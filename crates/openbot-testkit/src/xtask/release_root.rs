@@ -137,7 +137,7 @@ struct CaptureRequest {
 /// The recorded signer of a PostgreSQL bundle; `-` marks an ad-hoc signature.
 #[derive(Deserialize)]
 struct BundleIdentity {
-    signing_identity: Option<String>,
+    signing_identity: String,
 }
 
 #[derive(Serialize)]
@@ -206,6 +206,15 @@ pub(super) fn run(workspace: &Path, args: &[String]) -> Result<()> {
         .get("maintenance")
         .map(|path| load_tree(path, None))
         .transpose()?;
+    // The launcher build pins the maintenance bundle by the digest of this outer file.
+    let maintenance_outer = maintenance
+        .as_ref()
+        .map(|tree| {
+            tree.get(MAINTENANCE_OUTER_FILE)
+                .map(|(bytes, _)| sha256(bytes))
+                .context("release_root_maintenance_outer_missing")
+        })
+        .transpose()?;
     let required = |name: &str| -> Result<Vec<u8>> {
         json_input(name)?.ok_or_else(|| anyhow!("release_root_option_missing: --{name}"))
     };
@@ -232,17 +241,9 @@ pub(super) fn run(workspace: &Path, args: &[String]) -> Result<()> {
         .context("release_root_postgres_manifest_missing")?;
     let signing_identity = serde_json::from_slice::<BundleIdentity>(postgres_manifest)
         .context("release_root_postgres_manifest_invalid")?
-        .signing_identity
-        .context("release_root_postgres_manifest_invalid")?;
+        .signing_identity;
     // An ad-hoc signed bundle may serve a development root only, never a release root.
-    let maintenance_identity = maintenance
-        .as_ref()
-        .and_then(|tree| tree.get("postgres-maintenance/manifest.json"))
-        .map(|(bytes, _)| serde_json::from_slice::<BundleIdentity>(bytes))
-        .transpose()
-        .context("release_root_maintenance_manifest_invalid")?
-        .and_then(|identity| identity.signing_identity);
-    if release && (signing_identity == "-" || maintenance_identity.as_deref() == Some("-")) {
+    if release && signing_identity == "-" {
         bail!("release_root_ad_hoc_signature_refused: release mode requires a signing identity");
     }
     let engine = fs::read_to_string(workspace.join("crates/openbot-contracts/src/engine.rs"))
@@ -327,11 +328,8 @@ pub(super) fn run(workspace: &Path, args: &[String]) -> Result<()> {
     let manifest_sha256 = sha256(&manifest_bytes);
     let mut launcher_build_env =
         BTreeMap::from([("WROK_BOT_DESKTOP_RELEASE_SHA256", manifest_sha256.clone())]);
-    if let Some((outer, _)) = maintenance
-        .as_ref()
-        .and_then(|tree| tree.get(MAINTENANCE_OUTER_FILE))
-    {
-        launcher_build_env.insert("WROK_BOT_PG_MAINTENANCE_BUNDLE_SHA256", sha256(outer));
+    if let Some(outer) = maintenance_outer {
+        launcher_build_env.insert("WROK_BOT_PG_MAINTENANCE_BUNDLE_SHA256", outer);
     }
     let check_release = launcher
         .map(|launcher| -> Result<CheckRelease> {
@@ -709,16 +707,6 @@ mod tests {
             .cloned()
             .collect();
         rejected(&without_mode, &temp, "release_root_option_missing: --mode");
-        temp.write(
-            "in/maintenance/postgres-maintenance/manifest.json",
-            br#"{"signing_identity":"-"}"#,
-        );
-        rejected(&args, &temp, "release_root_ad_hoc_signature_refused");
-        fs::remove_file(
-            temp.0
-                .join("in/maintenance/postgres-maintenance/manifest.json"),
-        )
-        .unwrap();
         temp.write("in/postgres/manifest.json", br#"{"signing_identity":"-"}"#);
         rejected(&args, &temp, "release_root_ad_hoc_signature_refused");
         build(&mode(&args, "development"), &temp.0.join("dev")).unwrap();
@@ -729,14 +717,27 @@ mod tests {
     }
 
     #[test]
-    fn release_mode_refuses_budgets_without_run_deadline() {
+    fn release_mode_requires_both_run_budgets() {
         let temp = Temp::new();
         let args = inputs(&temp);
-        temp.write(
-            "in/budgets.json",
-            br#"{"stall_timeout_ms":30000,"max_output_tokens":4096}"#,
-        );
-        rejected(&args, &temp, "release_root_agent_budgets_refused");
+        for budgets in [
+            &br#"{"stall_timeout_ms":30000,"max_output_tokens":4096}"#[..],
+            br#"{"run_deadline_ms":300000,"max_output_tokens":4096}"#,
+        ] {
+            temp.write("in/budgets.json", budgets);
+            rejected(&args, &temp, "release_root_agent_budgets_refused");
+        }
+        temp.write("in/budgets.json", br#"{"max_output_tokens":4096}"#);
+        let mut development = args.clone();
+        let index = development.iter().position(|arg| arg == "--mode").unwrap();
+        development[index + 1] = "development".to_owned();
+        build(&development, &temp.0.join("dev")).unwrap();
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(temp.0.join("dev/resources").join(RELEASE_MANIFEST_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["agent_budgets"]["stall_timeout_ms"], Value::Null);
+        assert_eq!(manifest["agent_budgets"]["run_deadline_ms"], Value::Null);
     }
 
     #[test]
@@ -866,6 +867,15 @@ mod tests {
             &replace("--tenant", &tenant),
             &temp,
             "release_root_inventory_invalid: brand.yaml",
+        );
+
+        let maintenance = temp.0.join("maintenance-without-outer");
+        fs::create_dir(&maintenance).unwrap();
+        fs::write(maintenance.join("other.json"), b"{}").unwrap();
+        rejected(
+            &replace("--maintenance", &maintenance),
+            &temp,
+            "release_root_maintenance_outer_missing",
         );
 
         let setuid = temp.0.join("pg-setuid");
