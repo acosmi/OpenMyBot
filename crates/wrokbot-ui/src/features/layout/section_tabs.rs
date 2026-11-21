@@ -26,7 +26,7 @@ pub fn SectionTabs(
 
 /// One tab. A `nested` tab stays current on the pages beneath its destination.
 #[component]
-pub fn SectionTab(
+pub(crate) fn SectionTab(
     href: &'static str,
     icon: Icon,
     #[prop(into)] label: TextProp,

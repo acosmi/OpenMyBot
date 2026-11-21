@@ -50,9 +50,12 @@ pub(crate) struct StartAttempt {
 pub(crate) enum SubmissionNotice {
     ModelAgentConflict,
     ModelSelectionUnavailable,
+    #[cfg(any(target_arch = "wasm32", test))]
     Conflict,
     Rejected,
+    #[cfg(target_arch = "wasm32")]
     NavigationFailed,
+    #[cfg(target_arch = "wasm32")]
     RoutingFailed,
 }
 
@@ -72,7 +75,7 @@ pub(crate) fn submission_slot_notice(
     i18n: leptos_i18n::I18nContext<crate::i18n::Locale>,
     notice: Option<SubmissionNotice>,
     model_status: ModelSelectionStatus,
-    show_channels: UnsyncCallback<()>,
+    _show_channels: UnsyncCallback<()>,
 ) -> Option<SlotNotice> {
     let text = match notice? {
         SubmissionNotice::ModelAgentConflict
@@ -88,17 +91,20 @@ pub(crate) fn submission_slot_notice(
         SubmissionNotice::ModelAgentConflict | SubmissionNotice::ModelSelectionUnavailable => {
             return None;
         }
+        #[cfg(any(target_arch = "wasm32", test))]
         SubmissionNotice::Conflict => t_string!(i18n, channels.submit_conflict),
         SubmissionNotice::Rejected => t_string!(i18n, channels.submit_rejected),
+        #[cfg(target_arch = "wasm32")]
         SubmissionNotice::NavigationFailed => {
             return Some(
                 SlotNotice::new(
                     NoticeTone::Error,
                     t_string!(i18n, channels.navigation_failed),
                 )
-                .with_button(t_string!(i18n, channels.show_list), show_channels),
+                .with_button(t_string!(i18n, channels.show_list), _show_channels),
             );
         }
+        #[cfg(target_arch = "wasm32")]
         SubmissionNotice::RoutingFailed => t_string!(i18n, home.routing_failed),
     };
     Some(SlotNotice::new(NoticeTone::Error, text))

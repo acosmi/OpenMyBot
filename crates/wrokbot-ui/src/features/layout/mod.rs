@@ -13,5 +13,6 @@ pub use page_shell::{
     PageActions, PageEmpty, PageHeader, PageRows, PageSection, PageShell, PageWidth,
 };
 pub use row_mark::RowMark;
-pub use section_tabs::{SectionTab, SectionTabs};
+pub(crate) use section_tabs::SectionTab;
+pub use section_tabs::SectionTabs;
 pub use stagger::StaggerItem;
