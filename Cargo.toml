@@ -43,9 +43,9 @@ version = "0.0.0"
 # repository contract §3 固定基线：Rust `1.98.0`，edition 2024。与 rust-toolchain.toml 同值。
 edition = "2024"
 rust-version = "1.98.0"
-# 第一方代码个人免费使用，企业使用需取得授权；完整条款见仓根 LICENSE。
+# 第一方社区使用许可及小规模商用登记条款见仓根 LICENSE。
 # 第三方组件继续适用各自许可证，见 NOTICE 与 provenance/sources.spdx.json。
-license = "LicenseRef-WrokBot-Personal-Free-Enterprise-Authorization"
+license = "LicenseRef-WrokBot-Community-1.0"
 publish = false
 
 # v3 §16.3〈Supply chain〉：核心 crate `unsafe_code = "deny"`。
