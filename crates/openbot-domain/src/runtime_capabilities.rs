@@ -15,9 +15,11 @@
 //! `permission_required` / `unavailable` / `ready` 都以「已支持」为前提。实现缺失或独立
 //! API 缺失时，其余观察不适用。
 //!
-//! 已支持之后，本核收集所有适用阻断项。**同一能力若同时落入两种以上阻断五态**，第一真源
-//! 未规定显示优先级，本核返回 [`ProjectionFault::UnresolvedBlockers`]，不丢掉阻断项去
-//! 返回 `ready`，也不另发一套产品优先级。可判定输入正常投影。
+//! Once supported, blockers are evaluated in five fixed levels (spec revision R487): release
+//! dependency, product permission, configuration, source facts, then OS permission and
+//! on-the-spot consent. Only the first level that has a blocker is collected and reported.
+//! Two different states inside that level return [`ProjectionFault::UnresolvedBlockers`];
+//! no blocker is dropped to return `ready`.
 //!
 //! `hostMode` 只进入输出与窗口形态校验；宿主模式本身不能使任何控制能力变为 `ready`。
 //!
@@ -150,6 +152,7 @@ impl CapabilityId {
                 | Self::ModelSelectionV2
                 | Self::ModelSdkGateway
                 | Self::ModelAccountBridge
+                | Self::PixelEgress
         )
     }
 }
@@ -852,7 +855,8 @@ pub enum BindingField {
     Host,
 }
 
-/// 同一能力同时出现多种阻断五态，规范未规定优先级。
+/// Two different blocking states inside the first blocking level of one capability
+/// (spec revision R487).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnresolvedBlockers {
     capability: CapabilityId,
@@ -920,7 +924,7 @@ pub enum ProjectionFault {
     /// revision 越界。
     #[error("runtime_capabilities_revision")]
     Revision(RevisionFault),
-    /// 多阻断态且规范未规定优先级。
+    /// Two different states inside the first blocking level (spec revision R487).
     #[error("runtime_capabilities_unresolved_blockers")]
     UnresolvedBlockers(UnresolvedBlockers),
 }
@@ -1157,25 +1161,36 @@ fn project_one(
         SupportGate::Unsupported(reason) => Ok(status(id, CapabilityState::Unsupported, reason)),
         SupportGate::Unproven(reason) => Ok(status(id, CapabilityState::Unavailable, reason)),
         SupportGate::Implemented { release_dependency } => {
-            let mut blockers = Vec::with_capacity(8);
-            push_release(&mut blockers, release_dependency);
-            add_applicable_blockers(id, facts, &mut blockers);
+            let mut blockers = Vec::with_capacity(2);
+            add_first_level_blockers(id, facts, release_dependency, &mut blockers);
             finish(id, &blockers)
         }
     }
 }
 
-fn add_applicable_blockers(
+/// Spec revision R487: after the support gate, blockers are evaluated in five fixed levels
+/// (release dependency, product permission, configuration, source facts, OS permission and
+/// on-the-spot consent). Only the first level with a blocker is collected, so `finish` sees
+/// one level: same state reports the first collected reason, two states refuse the query.
+fn add_first_level_blockers(
     id: CapabilityId,
     facts: &RuntimeCapabilityFacts,
+    release_dependency: Evidence,
     blockers: &mut Vec<Blocker>,
 ) {
+    push_release(blockers, release_dependency);
+    if !blockers.is_empty() {
+        return;
+    }
     match facts.product_permissions[id.ordinal()] {
         PermissionFact::Granted => {}
         PermissionFact::Denied => blockers.push(perm(ReasonCode::ProductPermissionRequired)),
         PermissionFact::Unknown | PermissionFact::Expired => {
             blockers.push(unavail(ReasonCode::ProductPermissionUnproven))
         }
+    }
+    if !blockers.is_empty() {
+        return;
     }
     if id.is_acting() {
         push_policy(blockers, facts.acting_policy);
@@ -1193,52 +1208,64 @@ fn add_applicable_blockers(
         push_model_key(blockers, model.key);
     }
     match id {
-        CapabilityId::Workspace => {}
-        CapabilityId::AgentTools => {
-            if model.key == ModelKeyFact::Present {
-                push_provider(blockers, model.provider);
-            }
-        }
-        CapabilityId::ModelCustomV1 => {
-            push_config(blockers, facts.custom_model_config);
-            if model.key == ModelKeyFact::Present {
-                push_provider(blockers, model.provider);
-            }
-        }
-        CapabilityId::ModelSelectionV2 => {
-            push_config(blockers, facts.selection_v2_config);
-            if model.key == ModelKeyFact::Present {
-                push_provider(blockers, model.provider);
-            }
-        }
-        CapabilityId::ModelSdkGateway => {
-            push_config(blockers, facts.sdk_gateway_config);
-            if model.key == ModelKeyFact::Present {
-                push_provider(blockers, model.provider);
-            }
-        }
+        CapabilityId::ModelCustomV1 => push_config(blockers, facts.custom_model_config),
+        CapabilityId::ModelSelectionV2 => push_config(blockers, facts.selection_v2_config),
+        CapabilityId::ModelSdkGateway => push_config(blockers, facts.sdk_gateway_config),
+        CapabilityId::ModelAccountBridge => push_config(blockers, facts.account_bridge_config),
+        CapabilityId::BackupRestore => push_config(blockers, facts.backup_config),
+        CapabilityId::DynamicSso => push_config(blockers, facts.sso_config),
+        CapabilityId::DevicePairing => push_config(blockers, facts.pairing_config),
+        CapabilityId::Workspace
+        | CapabilityId::AgentTools
+        | CapabilityId::BrowserControl
+        | CapabilityId::NativeControl
+        | CapabilityId::PixelEgress
+        | CapabilityId::LocalConfirmation => {}
+    }
+    if !blockers.is_empty() {
+        return;
+    }
+    // Reaching this level means every model key and configuration above is present.
+    match id {
+        CapabilityId::AgentTools
+        | CapabilityId::ModelCustomV1
+        | CapabilityId::ModelSelectionV2
+        | CapabilityId::ModelSdkGateway => push_provider(blockers, model.provider),
         CapabilityId::ModelAccountBridge => {
-            push_config(blockers, facts.account_bridge_config);
             push_bridge_source(blockers, facts.account_bridge_source);
-            if model.key == ModelKeyFact::Present
-                && facts.account_bridge_source == BridgeSourceFact::Available
-            {
+            if facts.account_bridge_source == BridgeSourceFact::Available {
                 push_provider(blockers, model.provider);
             }
         }
-        CapabilityId::BrowserControl => {
+        CapabilityId::BrowserControl => push_source(
+            blockers,
+            facts.computer_source,
+            ReasonCode::ComputerSourceMissing,
+        ),
+        CapabilityId::NativeControl => push_source(
+            blockers,
+            facts.native_source,
+            ReasonCode::NativeSourceMissing,
+        ),
+        CapabilityId::PixelEgress => {
             push_source(
                 blockers,
-                facts.computer_source,
-                ReasonCode::ComputerSourceMissing,
+                facts.screen_source,
+                ReasonCode::ScreenSourceMissing,
             );
+            push_provider(blockers, model.provider);
         }
+        CapabilityId::DynamicSso => push_provider(blockers, facts.sso_provider),
+        CapabilityId::Workspace
+        | CapabilityId::LocalConfirmation
+        | CapabilityId::BackupRestore
+        | CapabilityId::DevicePairing => {}
+    }
+    if !blockers.is_empty() {
+        return;
+    }
+    match id {
         CapabilityId::NativeControl => {
-            push_source(
-                blockers,
-                facts.native_source,
-                ReasonCode::NativeSourceMissing,
-            );
             push_os_permission(
                 blockers,
                 facts.os_accessibility,
@@ -1251,31 +1278,26 @@ fn add_applicable_blockers(
             );
         }
         CapabilityId::PixelEgress => {
-            push_source(
-                blockers,
-                facts.screen_source,
-                ReasonCode::ScreenSourceMissing,
-            );
             push_os_permission(
                 blockers,
                 facts.os_capture,
                 ReasonCode::OsPermissionCaptureRequired,
             );
             push_pixel_consent(blockers, facts.pixel_model_consent);
-            push_provider(blockers, model.provider);
-            push_model_key(blockers, facts.model_key);
         }
         CapabilityId::LocalConfirmation => {
             push_local_confirmation(blockers, facts.local_confirmation);
         }
-        CapabilityId::BackupRestore => push_config(blockers, facts.backup_config),
-        CapabilityId::DynamicSso => {
-            push_config(blockers, facts.sso_config);
-            if facts.sso_config == ConfigFact::Present {
-                push_provider(blockers, facts.sso_provider);
-            }
-        }
-        CapabilityId::DevicePairing => push_config(blockers, facts.pairing_config),
+        CapabilityId::Workspace
+        | CapabilityId::AgentTools
+        | CapabilityId::ModelCustomV1
+        | CapabilityId::ModelSelectionV2
+        | CapabilityId::ModelSdkGateway
+        | CapabilityId::ModelAccountBridge
+        | CapabilityId::BrowserControl
+        | CapabilityId::BackupRestore
+        | CapabilityId::DynamicSso
+        | CapabilityId::DevicePairing => {}
     }
 }
 

@@ -95,6 +95,10 @@ The guard checks staged content before commits and the complete history being pu
 
 ## License and acknowledgements
 
-First-party code is free for personal use. Enterprise use requires authorization; see [LICENSE](LICENSE) for the terms.
+Noncommercial personal use, study, teaching, and research are free and require no registration, including at universities and research institutions.
+
+For small-scale commercial use, send one registration email before you start. You can begin as soon as you send it. Internal deployments and paid online services qualify if you have fewer than **1,000 monthly active users** and the relevant products or services generated less than **CNY 1 million** over the **trailing 12 months**. A registered business that reaches either threshold has **60 calendar days** to obtain a written license or agree on a written extension. Obtain written authorization in advance if you already meet either threshold before first commercial use, or if you distribute this software, its container images, or its installers to customers.
+
+For registration, licensing, or an extension, email any one of <bot@wrokbot.com>, <bot@openmybot.com>, or <fuwu@acosmi.com>. Registration details, counting rules, and full terms are in [LICENSE](LICENSE).
 
 Product and technical planning draws on grok bot and open bot, together with the open-source project crabcode-tui. See [NOTICE](NOTICE) for third-party acknowledgements. Third-party code, fonts, icons, and other assets retain their respective licenses.

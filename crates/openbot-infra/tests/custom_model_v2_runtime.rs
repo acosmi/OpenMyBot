@@ -2604,3 +2604,191 @@ async fn v2_original_rollback_ack_after_adapter_deadline_is_known_late_without_s
     })
     .await;
 }
+
+/// No business row exists for a refused original request.
+fn absent_business_image() -> Value {
+    json!({"run":null,"thread":null,"input":null,"events":null,"dispatch":null,"snapshot":null})
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly owned PG and TLS; selected include-ignored only"]
+async fn v2_custom_cost_cap_is_refused_as_unpriced_before_any_business_write_or_network() {
+    use openbot_application::{
+        NoArtifactAdministration, RunCostBudgetAdministration, RunCostCap,
+        use_cases::thread::{begin_thread_run_v2, submit_thread_input},
+    };
+    use openbot_contracts::{
+        command::ThreadInputOutcome,
+        error::{AppError, ErrorCode},
+    };
+    let admin = harness::admin_config("v2_runtime_unpriced");
+    harness::with_temp_database(&admin, "v2runtimeunpriced", |config| async move {
+        let f = Fixture::new(config).await;
+        let tls = TlsFixture::new(vec![ResponsePlan::ok(chat_text())]).await;
+        let budgets = openbot_infra::run_cost_budget::PostgresRunCostBudgetAdministration::new(
+            f.pool.clone(),
+        );
+        budgets
+            .replace(&auth(), Some(RunCostCap::new("USD".into(), 1_000).unwrap()))
+            .await
+            .unwrap();
+        let protocol = CustomModelProtocol::OpenaiChatCompletions;
+        let (_, begin) = f.pending(60, protocol, &tls.endpoint(), false).await;
+        let (_, submit) = f.pending(61, protocol, &tls.endpoint(), false).await;
+        // A custom model has no authoritative rate card, so a cost cap can never be proven.
+        let unpriced = AppError::MalformedPayload {
+            field: "custom_model_unpriced",
+        };
+        assert_eq!(
+            (unpriced.http_status(), unpriced.code()),
+            (400, ErrorCode::MALFORMED_PAYLOAD)
+        );
+        let refused = begin_thread_run_v2(
+            &f.directory,
+            &NoArtifactAdministration,
+            &auth(),
+            begin.command.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused, unpriced);
+        let refused = submit_thread_input(
+            &f.directory,
+            &NoArtifactAdministration,
+            &auth(),
+            submit.command.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused, unpriced);
+        for req in [&begin, &submit] {
+            assert_eq!(
+                original_business_image(&f, req).await,
+                absent_business_image()
+            );
+        }
+        let retained: i64 = f
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT (SELECT count(*) FROM public.threads)
+                   +(SELECT count(*) FROM public.thread_run_occupancy)
+                   +(SELECT count(*) FROM openbot_internal.thread_pending_inputs)",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            retained, 0,
+            "no conversation, slot or pending input survives"
+        );
+        assert_eq!(tls.count(), 0);
+
+        // Control: without the cap the very same original requests are accepted, so the
+        // refusal above was caused by the missing rate card and nothing else.
+        budgets.replace(&auth(), None).await.unwrap();
+        begin_thread_run_v2(
+            &f.directory,
+            &NoArtifactAdministration,
+            &auth(),
+            begin.command.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            submit_thread_input(
+                &f.directory,
+                &NoArtifactAdministration,
+                &auth(),
+                submit.command.clone()
+            )
+            .await
+            .unwrap(),
+            ThreadInputOutcome::Started(_)
+        ));
+        for req in [&begin, &submit] {
+            assert_one_original_business_commit(&f, req).await;
+        }
+        let request = f.context().load(&lease(&begin)).await.unwrap();
+        assert!(request.rate_card.is_none() && request.cost_cap.is_none());
+        let output = events(
+            f.adapter(tls.dialer(), Duration::from_secs(5))
+                .start(request)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(output.last(), Some(&ProviderEvent::Completed));
+        assert_eq!(tls.count(), 1);
+        tls.stop().await;
+        f.finish().await;
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly owned PG and TLS; selected include-ignored only"]
+async fn v2_cost_cap_set_after_admission_stays_frozen_out_of_the_run_and_refuses_the_next() {
+    use openbot_application::{RunCostBudgetAdministration, RunCostCap, ThreadDirectoryError};
+    let admin = harness::admin_config("v2_runtime_cap_after_admission");
+    harness::with_temp_database(&admin, "v2runtimecapafter", |config| async move {
+        let f = Fixture::new(config).await;
+        let tls = TlsFixture::new(vec![ResponsePlan::ok(chat_text())]).await;
+        let protocol = CustomModelProtocol::OpenaiChatCompletions;
+        let (_, accepted, request) = f.begin(62, protocol, &tls.endpoint(), false).await;
+        openbot_infra::run_cost_budget::PostgresRunCostBudgetAdministration::new(f.pool.clone())
+            .replace(&auth(), Some(RunCostCap::new("USD".into(), 1_000).unwrap()))
+            .await
+            .unwrap();
+        // Admission copied the then-absent cap into the Run; a later preference only
+        // governs future Runs, so the start gate never sees a cap on this Run.
+        let frozen = f
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT budget_cost_currency,budget_max_cost_micro_units FROM public.runs WHERE run_id=$1",
+                &[&accepted.command.run_id.as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                frozen.get::<_, Option<String>>(0),
+                frozen.get::<_, Option<i64>>(1)
+            ),
+            (None, None)
+        );
+        let reloaded = f.context().load(&lease(&accepted)).await.unwrap();
+        assert_eq!(reloaded.route, request.route);
+        assert!(reloaded.rate_card.is_none() && reloaded.cost_cap.is_none());
+        let output = events(
+            f.adapter(tls.dialer(), Duration::from_secs(5))
+                .start(reloaded)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(output.last(), Some(&ProviderEvent::Completed));
+        assert_eq!(tls.count(), 1);
+
+        let (_, next) = f.pending(63, protocol, &tls.endpoint(), false).await;
+        assert!(matches!(
+            f.directory.begin_thread_run_v2(next.clone()).await,
+            Err(ThreadDirectoryError::InvalidInput {
+                field: "custom_model_unpriced"
+            })
+        ));
+        assert_eq!(original_business_image(&f, &next).await, absent_business_image());
+        assert_eq!(tls.count(), 1);
+        tls.stop().await;
+        f.finish().await;
+        Ok(())
+    })
+    .await;
+}
