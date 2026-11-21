@@ -62,6 +62,7 @@ pub async fn resolve_run(
 }
 
 pub struct SessionStart<'a> {
+    pub host: crate::HostKind,
     pub run_id: &'a str,
     pub binding_id: Uuid,
     pub workspace_dir: &'a str,
@@ -73,7 +74,7 @@ pub async fn upsert_session(
     input: SessionStart<'_>,
     deadline: Instant,
 ) -> Result<Uuid, StoreError> {
-    let written = rows(client, "INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at) VALUES ($1,'session',$2,$3,'crabcode',$4,statement_timestamp()) ON CONFLICT (run_id) WHERE record_kind='session' DO UPDATE SET binding_id=EXCLUDED.binding_id,workspace_dir=EXCLUDED.workspace_dir,started_at=EXCLUDED.started_at,host_version=NULL,args_sha256=NULL,native_session_id=NULL,resumed_from=NULL,resumable=NULL,child_pid=NULL,pgid=NULL,init_at=NULL,last_event_at=NULL,last_event_seq=NULL,output_bytes=NULL,ended_at=NULL,exit_code=NULL,exit_signal=NULL,end_reason=NULL,stop_outcome=NULL,stop_confirmed_at=NULL,result_summary=NULL,artifact_paths=NULL,stderr_tail=NULL RETURNING record_id", &[&Uuid::now_v7(), &input.run_id, &input.binding_id, &input.workspace_dir], deadline, ERROR).await?;
+    let written = rows(client, "INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at) VALUES ($1,'session',$2,$3,$5,$4,statement_timestamp()) ON CONFLICT (run_id) WHERE record_kind='session' DO UPDATE SET binding_id=EXCLUDED.binding_id,host_kind=EXCLUDED.host_kind,workspace_dir=EXCLUDED.workspace_dir,started_at=EXCLUDED.started_at,host_version=NULL,args_sha256=NULL,native_session_id=NULL,resumed_from=NULL,resumable=NULL,child_pid=NULL,pgid=NULL,init_at=NULL,last_event_at=NULL,last_event_seq=NULL,output_bytes=NULL,ended_at=NULL,exit_code=NULL,exit_signal=NULL,end_reason=NULL,stop_outcome=NULL,stop_confirmed_at=NULL,result_summary=NULL,artifact_paths=NULL,stderr_tail=NULL RETURNING record_id", &[&Uuid::now_v7(), &input.run_id, &input.binding_id, &input.workspace_dir, &input.host.as_str()], deadline, ERROR).await?;
     written.first().ok_or(ERROR)?.try_get(0).map_err(|_| ERROR)
 }
 /// One changed session row, or the store error.
@@ -421,6 +422,7 @@ pub async fn run_facts(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanSession {
     pub record_id: Uuid,
+    pub host: crate::HostKind,
     pub run_id: String,
     pub pgid: Option<i32>,
 }
@@ -430,12 +432,13 @@ pub async fn list_orphan_sessions(
     deadline: Instant,
 ) -> Result<Vec<OrphanSession>, StoreError> {
     let error = StoreError::ReconcileFailed;
-    rows(client, "SELECT record_id,run_id,pgid FROM openmybot.host_driver_sessions WHERE record_kind='session' AND ended_at IS NULL ORDER BY started_at,record_id", &[], deadline, error)
+    rows(client, "SELECT record_id,run_id,pgid,host_kind FROM openmybot.host_driver_sessions WHERE record_kind='session' AND ended_at IS NULL ORDER BY started_at,record_id", &[], deadline, error)
         .await?
         .iter()
         .map(|row| {
             Ok(OrphanSession {
                 record_id: row.try_get(0).map_err(|_| error)?,
+                host: crate::HostKind::parse(row.try_get(3).map_err(|_| error)?).ok_or(error)?,
                 run_id: row.try_get(1).map_err(|_| error)?,
                 pgid: row.try_get(2).map_err(|_| error)?,
             })

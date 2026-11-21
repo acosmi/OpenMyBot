@@ -1,4 +1,6 @@
-//! CrabCode host driver: one stdio child per run behind the engine's provider ports.
+//! Host driver: one stdio child per run behind the engine's provider ports, one driver per host
+//! of the per-host parameter table.
+mod host;
 mod jcs;
 mod mapping;
 mod permission;
@@ -8,6 +10,8 @@ mod spawn;
 mod window;
 mod workspace;
 
+pub use host::{HostProfile, profile};
+pub use omb_store::HostKind;
 pub use session::HostDriverSession;
 pub use window::{AcceptedVersion, VersionWindow, WindowError};
 pub use workspace::{WorkspaceRootError, WorkspaceRoots};
@@ -36,9 +40,9 @@ pub const DELIVERY_ARTIFACTS_MAX: usize = 20;
 pub const CC_READONLY_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "LS"];
 /// How often a waiting permission request reads its row for the owner's decision.
 pub const PERMISSION_POLL: Duration = Duration::from_millis(250);
-/// `{run}`, `{tool}` and `{id}` are filled by the driver; the store fills `{expires}` from the
-/// permission row it writes in the same statement.
-pub const OMB_NOTICE_PERMISSION_V1: &str = "CrabCode run {run} 请求使用工具 {tool}，许可 {id}，{expires} 到期。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝；渠道回复不构成批准。";
+/// `{host}` (the host's display name), `{run}`, `{tool}` and `{id}` are filled by the driver; the
+/// store fills `{expires}` from the permission row it writes in the same statement.
+pub const OMB_NOTICE_PERMISSION_V2: &str = "{host} run {run} 请求使用工具 {tool}，许可 {id}，{expires} 到期。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝；渠道回复不构成批准。";
 
 /// Per-driver budgets; the default is the specification's constants.
 #[derive(Clone, Copy, Debug)]
@@ -75,10 +79,11 @@ impl Default for Limits {
 }
 
 pub struct HostDriverConfig {
+    pub kind: HostKind,
     /// `None` refuses every start with `spawn_failed`.
     pub binary: Option<PathBuf>,
     pub home: PathBuf,
-    /// `<data>/hosts/crabcode/tmp`.
+    /// `<data>/hosts/<host>/tmp`.
     pub tmp_dir: PathBuf,
     pub roots: WorkspaceRoots,
     pub window: VersionWindow,
@@ -94,7 +99,8 @@ pub(crate) struct Shared {
     pub(crate) tasks: Mutex<JoinSet<()>>,
 }
 
-/// The driver: owns the adapter registered under the `crabcode` extension and every live session.
+/// The driver of one host: owns the adapter registered under the host's extension key and every
+/// live session of that host.
 pub struct HostDriver {
     shared: Arc<Shared>,
 }
@@ -110,6 +116,21 @@ impl HostDriver {
             }),
         }
     }
+    /// The driver of another host on the same store, sharing this driver's live-child count.
+    pub fn sibling(&self, config: HostDriverConfig) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                config,
+                store: Arc::clone(&self.shared.store),
+                children: Arc::clone(&self.shared.children),
+                shutdown: watch::Sender::new(false),
+                tasks: Mutex::new(JoinSet::new()),
+            }),
+        }
+    }
+    pub fn kind(&self) -> HostKind {
+        self.shared.config.kind
+    }
     pub fn adapter(&self) -> Arc<HostDriverAdapter> {
         Arc::new(HostDriverAdapter {
             shared: Arc::clone(&self.shared),
@@ -124,7 +145,7 @@ impl HostDriver {
     }
 }
 
-/// `ProviderAdapter` for the `crabcode` extension key.
+/// `ProviderAdapter` for one host's extension key.
 pub struct HostDriverAdapter {
     pub(crate) shared: Arc<Shared>,
 }

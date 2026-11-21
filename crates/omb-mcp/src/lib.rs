@@ -1,7 +1,7 @@
 //! The `openmybot mcp` stdio server: five tools, each call forwarded once to the local daemon.
 mod tools;
 
-use omb_daemon::{CallOptions, DaemonError};
+use omb_daemon::{CallOptions, DaemonError, HostKind};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -14,7 +14,7 @@ use rmcp::{
 use serde_json::Value;
 use std::{borrow::Cow, path::PathBuf, time::Duration};
 
-/// The two revisions this server speaks and no other: the current CrabCode client negotiates
+/// The two revisions this server speaks and no other: the current host clients negotiate
 /// the older one through `initialize`; a client of the stateless revision uses
 /// `server/discover`.
 const SUPPORTED_VERSIONS: &[ProtocolVersion] =
@@ -24,6 +24,8 @@ pub const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct McpOptions {
     pub data_dir: PathBuf,
+    /// The calling host: every call routes to this host's binding.
+    pub host: HostKind,
     /// The process runs as a host-driver child; the caller reads this once at start.
     pub nested: bool,
 }
@@ -32,6 +34,7 @@ pub struct McpOptions {
 pub async fn serve(options: McpOptions) -> Result<(), DaemonError> {
     let bridge = Bridge {
         data_dir: options.data_dir,
+        host: options.host,
         nested: options.nested,
     };
     match bridge.serve(rmcp::transport::stdio()).await {
@@ -46,6 +49,7 @@ pub async fn serve(options: McpOptions) -> Result<(), DaemonError> {
 
 struct Bridge {
     data_dir: PathBuf,
+    host: HostKind,
     nested: bool,
 }
 impl ServerHandler for Bridge {
@@ -71,7 +75,8 @@ impl ServerHandler for Bridge {
     ) -> Result<ListToolsResult, McpError> {
         Ok(ListToolsResult::with_all_items(tools::list()))
     }
-    /// A nested call is refused first, then an unknown tool; arguments go to the daemon as sent.
+    /// A nested call is refused first, then an unknown tool; arguments go to the daemon as sent,
+    /// with `host` set to this server's host over any value the caller put there.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -86,12 +91,14 @@ impl ServerHandler for Bridge {
         let Some(def) = tools::DEFS.iter().find(|def| def.name == request.name) else {
             return Err(McpError::invalid_params("unknown tool", None));
         };
+        let mut args = request.arguments.unwrap_or_default();
+        args.insert("host".into(), self.host.as_str().into());
         let called = tokio::time::timeout(
             MCP_CALL_TIMEOUT,
             omb_daemon::call_mcp(CallOptions {
                 data_dir: self.data_dir.clone(),
                 op: def.op.into(),
-                args: Value::Object(request.arguments.unwrap_or_default()),
+                args: Value::Object(args),
             }),
         )
         .await
@@ -143,6 +150,7 @@ mod tests {
         let (server_writer, reader) = tokio::io::duplex(65536);
         let bridge = Bridge {
             data_dir: data_dir.to_path_buf(),
+            host: HostKind::Crabcode,
             nested,
         };
         tokio::spawn(async move {
@@ -298,6 +306,7 @@ mod tests {
         );
         let bridge = Bridge {
             data_dir: dir,
+            host: HostKind::Crabcode,
             nested: false,
         };
         assert_eq!(
@@ -333,7 +342,7 @@ mod tests {
             assert_eq!(texts(&failed), [error.code()]);
             assert_eq!(failed.structured_content, None);
         }
-        assert_eq!(DaemonError::ALL.len(), 51);
+        assert_eq!(DaemonError::ALL.len(), 53);
     }
 
     #[tokio::test]

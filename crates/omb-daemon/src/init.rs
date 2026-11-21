@@ -38,6 +38,10 @@ pub async fn init(options: InitOptions) -> Result<InitResult, DaemonError> {
         // initdb requires its target to be absent or empty; the directory remains private either way.
         config::make_dir(&root.join(name))?;
     }
+    for kind in omb_hostdriver::HostKind::ALL {
+        config::make_dir(&root.join(format!("hosts/{}", kind.as_str())))?;
+        config::make_dir(&root.join(format!("hosts/{}/tmp", kind.as_str())))?;
+    }
     for name in ["keys/vault-kek.key", "keys/app-master.key"] {
         let mut key = [0; 32];
         getrandom::fill(&mut key).map_err(|_| DaemonError::InitFailed)?;
@@ -49,6 +53,7 @@ pub async fn init(options: InitOptions) -> Result<InitResult, DaemonError> {
     let config = Config {
         deployment_id: format!("omb-local-{}", config::hex_random(16)?),
         pg_bin_dir: options.pg_bin_dir.clone(),
+        workspace_roots: Vec::new(),
         hosts: Hosts::default(),
         plugins: PluginsConfig::default(),
     };

@@ -18,8 +18,6 @@ use tokio::{
     time::Instant,
 };
 
-const BOT_ID: &str = "omb-crabcode";
-
 /// `min` doubled per attempt, capped at `max`.
 pub(crate) fn backoff_ceiling(attempt: u32, min: Duration, max: Duration) -> Duration {
     min.checked_mul(2u32.saturating_pow(attempt))
@@ -44,7 +42,7 @@ fn request(item: DispatchItem) -> BeginDelegatedThreadRun {
         trigger_id: item.record_id.to_string(),
         thread_id: ThreadId::new(item.thread_id),
         run_id: RunId::new(item.run_id),
-        bot_id: BotId::new(BOT_ID),
+        bot_id: BotId::new(crate::delegation::bot_id(item.host)),
         untrusted_material: Some(DelegatedUntrustedMaterial {
             source_ref: format!("omb:channel_events:{}", item.record_id),
             text: item.text,
@@ -179,6 +177,7 @@ mod tests {
         DispatchItem {
             record_id: Uuid::parse_str("0192f1a2-3b4c-7d5e-8f60-000000000001").unwrap(),
             binding_id: Uuid::parse_str("0192f1a2-3b4c-7d5e-8f60-718293a4b5c6").unwrap(),
+            host: omb_store::HostKind::Crabcode,
             revision: 3,
             thread_id: "550e8400-e29b-41d4-a716-446655440000".into(),
             run_id: "3b5a3661-5a30-58d9-9995-50796e16f538".into(),

@@ -6,12 +6,14 @@
     reason = "shared harness copy; each target uses a subset"
 )]
 mod harness {
-    pub use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots};
+    pub use omb_hostdriver::{
+        HostDriver, HostDriverConfig, HostKind, Limits, VersionWindow, WorkspaceRoots,
+    };
     pub use omb_store::{
         Decided, Decision, migrate,
         testkit::{
             Fixture, Session, deadline, decide, insert_event_for_run, insert_host_binding,
-            insert_sender_in, set_terminal,
+            insert_host_binding_for, insert_sender_in, set_terminal,
         },
     };
     pub use openbot_application::{
@@ -107,6 +109,7 @@ mod harness {
         }
         pub fn config(&self, window: VersionWindow, limits: Limits) -> HostDriverConfig {
             HostDriverConfig {
+                kind: HostKind::Crabcode,
                 binary: Some(PathBuf::from(FAKE)),
                 home: self.home.clone(),
                 tmp_dir: self.home.clone(),
@@ -406,6 +409,180 @@ async fn child_receives_argv_with_double_dash_then_flags() {
             "--verbose"
         ])
     );
+    env.stop().await;
+}
+
+/// A Claude Code driver over the fake, with the given window.
+fn claude(env: &Env, window: VersionWindow, limits: Limits) -> HostDriver {
+    HostDriver::new(
+        HostDriverConfig {
+            kind: HostKind::Claude,
+            ..env.config(window, limits)
+        },
+        Arc::clone(&env.store),
+    )
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn claude_child_receives_its_own_argv_without_double_dash_and_row_is_claude() {
+    let env = Env::new().await;
+    let binding = insert_host_binding_for(
+        env.client(),
+        HostKind::Claude,
+        env.workspace.to_str().unwrap(),
+    )
+    .await;
+    env.event(binding, "r1", "TH").await;
+    let driver = claude(
+        &env,
+        env.window_with("1.1.16", "happy", &["--model", "m"], &[]),
+        quick(),
+    );
+    let mut session = start(&driver, binding).await.unwrap();
+    assert!(matches!(
+        terminal(&mut session).await.last(),
+        Some(ProviderEvent::Completed)
+    ));
+    let starts = of(&env.observed(), "start");
+    assert_eq!(starts[0]["argv"], json!([FAKE, "--version"]));
+    assert_eq!(
+        starts[1]["argv"],
+        json!([
+            FAKE,
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "default",
+            "--permission-prompt-tool",
+            "stdio",
+            "--setting-sources=",
+            "--strict-mcp-config",
+            "--model",
+            "m"
+        ])
+    );
+    let row = env.row("r1").await;
+    assert_eq!(row["host_kind"], "claude");
+    assert_eq!(row["end_reason"], "result_success");
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn claude_embedded_window_rejects_every_version_and_child_receives_no_input() {
+    let env = Env::new().await;
+    let binding = insert_host_binding_for(
+        env.client(),
+        HostKind::Claude,
+        env.workspace.to_str().unwrap(),
+    )
+    .await;
+    env.event(binding, "r1", "TH").await;
+    let driver = claude(&env, VersionWindow::embedded(HostKind::Claude), quick());
+    assert_eq!(
+        start(&driver, binding).await.err(),
+        Some(ProviderPortError::Unavailable)
+    );
+    let row = env.row("r1").await;
+    assert_eq!(row["end_reason"], "version_rejected");
+    assert_eq!(row["host_kind"], "claude");
+    // The empty window gives the probe no extra environment, so the fake writes no report.
+    assert!(env.observed().is_empty());
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn claude_forbidden_settings_argument_is_spawn_failed() {
+    let env = Env::new().await;
+    let binding = insert_host_binding_for(
+        env.client(),
+        HostKind::Claude,
+        env.workspace.to_str().unwrap(),
+    )
+    .await;
+    env.event(binding, "r1", "TH").await;
+    let driver = claude(
+        &env,
+        env.window_with("1.1.16", "happy", &["--settings={}"], &[]),
+        quick(),
+    );
+    assert_eq!(
+        start(&driver, binding).await.err(),
+        Some(ProviderPortError::Unavailable)
+    );
+    assert_eq!(env.row("r1").await["end_reason"], "spawn_failed");
+    assert_eq!(of(&env.observed(), "start").len(), 1);
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn control_cancel_request_is_counted_and_ignored() {
+    let env = Env::new().await;
+    let binding = env.host().await;
+    env.event(binding, "r1", "TH").await;
+    let driver = env.driver(env.window("cancel_request", &[]), quick());
+    let mut session = start(&driver, binding).await.unwrap();
+    assert!(matches!(
+        terminal(&mut session).await.last(),
+        Some(ProviderEvent::Completed)
+    ));
+    let row = env.row("r1").await;
+    assert_eq!(row["end_reason"], "result_success");
+    // Nothing was answered: the only control frame sent is initialize.
+    let sent = stdin(&env.observed());
+    assert!(
+        sent.iter()
+            .filter(|frame| frame["type"] == "control_response")
+            .count()
+            == 0
+    );
+    env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn hosts_share_one_live_child_limit() {
+    let env = Env::new().await;
+    let crab = env.host().await;
+    let other = insert_host_binding_for(
+        env.client(),
+        HostKind::Claude,
+        env.workspace.to_str().unwrap(),
+    )
+    .await;
+    env.event(crab, "r1", "TH").await;
+    env.event(other, "r2", "TC").await;
+    let limits = Limits {
+        max_children: 1,
+        ..quick()
+    };
+    let crabcode = env.driver(env.window("cooperative", &[]), limits);
+    let claude = crabcode.sibling(HostDriverConfig {
+        kind: HostKind::Claude,
+        ..env.config(env.window("cooperative", &[]), limits)
+    });
+    let mut live = start(&crabcode, crab).await.unwrap();
+    started(&mut live).await;
+    assert_eq!(
+        start(&claude, other).await.err(),
+        Some(ProviderPortError::Unavailable)
+    );
+    assert_eq!(env.row("r2").await["end_reason"], "spawn_failed");
+    assert!(matches!(
+        live.request_stop().await.unwrap(),
+        StopOutcome::Confirmed { .. }
+    ));
+    let mut session = start(&claude, other).await.unwrap();
+    started(&mut session).await;
+    assert_eq!(env.row("r2").await["host_kind"], "claude");
+    session.request_stop().await.unwrap();
     env.stop().await;
 }
 

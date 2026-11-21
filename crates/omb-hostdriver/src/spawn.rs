@@ -1,4 +1,5 @@
 //! Child construction: argv, the forbidden-token check, the closed environment and the group.
+use crate::host::HostProfile;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -11,30 +12,8 @@ use std::{
     },
 };
 
-/// Arguments that would widen the child's authority; any argument after `--` equal to one of
-/// them refuses the start.
-const FORBIDDEN: [&str; 7] = [
-    "--sdk-url",
-    "--dangerously-skip-permissions",
-    "--allowedTools",
-    "--allowed-tools",
-    "bypassPermissions",
-    "acceptEdits",
-    "remote-control",
-];
-/// Fixed protocol arguments after `--print --`.
-const PROTOCOL: [&str; 8] = [
-    "--input-format",
-    "stream-json",
-    "--output-format",
-    "stream-json",
-    "--permission-mode",
-    "default",
-    "--permission-prompt-tool",
-    "stdio",
-];
-
 pub(crate) struct SpawnSpec<'a> {
+    pub profile: &'static HostProfile,
     pub binary: &'a Path,
     /// Already the workspace's real path.
     pub cwd: &'a Path,
@@ -45,15 +24,11 @@ pub(crate) struct SpawnSpec<'a> {
     pub resume: Option<&'a str>,
 }
 impl SpawnSpec<'_> {
-    /// `[binary, --print, --, protocol flags…, (--resume <id>)?, extra_args…]`; the binary is
-    /// the configured absolute path, never searched on `PATH`.
+    /// `[binary, host prefix…, (--resume <id>)?, extra_args…]`; the binary is the configured
+    /// absolute path, never searched on `PATH`.
     pub(crate) fn argv(&self) -> Vec<OsString> {
-        let mut argv = vec![
-            self.binary.as_os_str().to_owned(),
-            "--print".into(),
-            "--".into(),
-        ];
-        argv.extend(PROTOCOL.iter().map(OsString::from));
+        let mut argv = vec![self.binary.as_os_str().to_owned()];
+        argv.extend(self.profile.prefix.iter().map(OsString::from));
         if let Some(id) = self.resume {
             argv.push("--resume".into());
             argv.push(id.into());
@@ -61,10 +36,24 @@ impl SpawnSpec<'_> {
         argv.extend(self.extra_args.iter().map(OsString::from));
         argv
     }
+    /// Any argument after the host prefix that is a forbidden word (`--x=y` checked as `--x`)
+    /// or starts with a forbidden prefix.
     pub(crate) fn refused(&self) -> bool {
-        self.argv()[3..]
+        let profile = self.profile;
+        self.argv()[1 + profile.prefix.len()..]
             .iter()
-            .any(|argument| FORBIDDEN.iter().any(|forbidden| argument == *forbidden))
+            .any(|argument| {
+                let argument = argument.to_string_lossy();
+                let word = match argument.split_once('=') {
+                    Some((flag, _)) if flag.starts_with("--") => flag,
+                    _ => &argument,
+                };
+                profile.forbidden.contains(&word)
+                    || profile
+                        .forbidden_prefixes
+                        .iter()
+                        .any(|prefix| argument.starts_with(prefix))
+            })
     }
     /// SHA-256 over the arguments after the binary, joined by NUL.
     pub(crate) fn args_sha256(&self) -> [u8; 32] {
@@ -127,9 +116,12 @@ impl Drop for Slot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::profile;
+    use omb_store::HostKind;
     use std::path::PathBuf;
 
     struct Owned {
+        kind: HostKind,
         binary: PathBuf,
         extra_args: Vec<String>,
         extra_env: BTreeMap<String, String>,
@@ -138,6 +130,7 @@ mod tests {
     impl Owned {
         fn new() -> Self {
             Self {
+                kind: HostKind::Crabcode,
                 binary: PathBuf::from("/opt/crab/bin/crabcode"),
                 extra_args: Vec::new(),
                 extra_env: BTreeMap::new(),
@@ -146,6 +139,7 @@ mod tests {
         }
         fn spec(&self) -> SpawnSpec<'_> {
             SpawnSpec {
+                profile: profile(self.kind),
                 binary: &self.binary,
                 cwd: Path::new("/work"),
                 home: Path::new("/home/owner"),
@@ -202,23 +196,72 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_tokens_are_refused_in_every_argument_after_double_dash() {
+    fn claude_argv_has_no_double_dash_and_adds_verbose_and_isolated_sources() {
         let mut owned = Owned::new();
+        owned.kind = HostKind::Claude;
+        owned.binary = PathBuf::from("/opt/homebrew/bin/claude");
+        owned.resume = Some("s1".into());
+        owned.extra_args = vec!["--model".into(), "m".into()];
+        assert_eq!(
+            strings(owned.spec().argv()),
+            [
+                "/opt/homebrew/bin/claude",
+                "--print",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "default",
+                "--permission-prompt-tool",
+                "stdio",
+                "--setting-sources=",
+                "--strict-mcp-config",
+                "--resume",
+                "s1",
+                "--model",
+                "m",
+            ]
+        );
+        // The prefix itself carries words that are forbidden after it.
         assert!(!owned.spec().refused());
-        for token in FORBIDDEN {
-            owned.extra_args = vec!["--verbose".into(), token.into()];
-            owned.resume = None;
-            assert!(owned.spec().refused(), "extra {token}");
-            owned.extra_args = Vec::new();
-            owned.resume = Some(token.into());
-            assert!(owned.spec().refused(), "resume {token}");
+    }
+
+    #[test]
+    fn forbidden_tokens_are_refused_in_every_argument_after_the_prefix() {
+        for kind in HostKind::ALL {
+            let mut owned = Owned::new();
+            owned.kind = kind;
+            assert!(!owned.spec().refused(), "{kind:?}");
+            for token in profile(kind).forbidden {
+                owned.extra_args = vec!["--verbose".into(), (*token).into()];
+                owned.resume = None;
+                assert!(owned.spec().refused(), "{kind:?} extra {token}");
+                owned.extra_args = Vec::new();
+                owned.resume = Some((*token).into());
+                assert!(owned.spec().refused(), "{kind:?} resume {token}");
+                if token.starts_with("--") {
+                    owned.resume = None;
+                    owned.extra_args = vec![format!("{token}=x")];
+                    assert!(owned.spec().refused(), "{kind:?} {token}=x");
+                }
+            }
+            owned.resume = Some("session".into());
+            owned.extra_args = vec!["--allowedToolsX".into(), "acceptEdits2".into()];
+            assert!(!owned.spec().refused(), "{kind:?}");
         }
-        owned.resume = Some("session".into());
-        owned.extra_args = vec![
-            "--allowedToolsX".into(),
-            "acceptEdits2".into(),
-            "--sdk-url=x".into(),
-        ];
+        let mut owned = Owned::new();
+        owned.extra_args = vec!["--model".into(), "account:work".into()];
+        assert!(owned.spec().refused());
+        owned.extra_args = vec!["--model".into(), "acct:work".into()];
+        assert!(!owned.spec().refused());
+        // `--settings` is CrabCode's verified extra argument and forbidden only for Claude Code.
+        owned.extra_args = vec!["--settings".into(), "{}".into()];
+        assert!(!owned.spec().refused());
+        owned.kind = HostKind::Claude;
+        assert!(owned.spec().refused());
+        owned.extra_args = vec!["--model".into(), "account:work".into()];
         assert!(!owned.spec().refused());
     }
 

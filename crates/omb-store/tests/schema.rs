@@ -1,8 +1,6 @@
-#[path = "../src/testkit.rs"]
-mod testkit;
 use omb_store::migrate;
+use omb_store::testkit::{Fixture, Session, deadline};
 use std::collections::BTreeMap;
-use testkit::{Fixture, Session, deadline};
 async fn setup() -> (Fixture, Session) {
     let mut fixture = Fixture::new().await;
     let mut session = fixture.connect().await;
@@ -10,7 +8,7 @@ async fn setup() -> (Fixture, Session) {
     (fixture, session)
 }
 const RECEIVER: &str = "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,created_at) VALUES('00000000-0000-0000-0000-000000000001','receiver','telegram','1','envelope','active',statement_timestamp())";
-const HOST: &str = "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,workspace_dir,granted_generation,status,created_at) VALUES('00000000-0000-0000-0000-000000000002','host','host','crabcode','host:crabcode','/test-workspace',1,'active',statement_timestamp())";
+const HOST: &str = "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,host_kind,workspace_dir,granted_generation,status,created_at) VALUES('00000000-0000-0000-0000-000000000002','host','host','crabcode','host:crabcode','crabcode','/test-workspace',1,'active',statement_timestamp())";
 const EVENT: &str = "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,disposition) VALUES($1,'event','telegram',$2,$3,statement_timestamp(),'rejected_malformed')";
 
 // Independent catalog oracle from the frozen column/constraint inventory; not read from migration bytes.
@@ -31,7 +29,7 @@ const EXPECTED_CHECKS: &[(&str, &[&str])] = &[
             "run_deadline_seconds BETWEEN 1 AND 86400",
             "binding_kind <> 'receiver' OR (channel_kind ~ '^[a-z][a-z0-9_]{0,31}$' AND channel_kind <> 'host' AND credential_envelope IS NOT NULL AND sender_key IS NULL AND chat_key IS NULL AND workspace_dir IS NULL AND thread_id IS NULL AND status <> 'pending')",
             "binding_kind <> 'sender' OR (channel_kind ~ '^[a-z][a-z0-9_]{0,31}$' AND channel_kind <> 'host' AND (status <> 'pending' OR (pairing_code_hash IS NOT NULL AND pairing_expires_at IS NOT NULL AND workspace_dir IS NOT NULL AND thread_id IS NOT NULL AND granted_generation IS NOT NULL AND sender_key IS NULL)) AND (status NOT IN ('active','suspended') OR (sender_key IS NOT NULL AND chat_key IS NOT NULL AND workspace_dir IS NOT NULL AND thread_id IS NOT NULL AND granted_generation IS NOT NULL AND pairing_code_hash IS NULL)))",
-            "binding_kind <> 'host' OR (channel_kind='host' AND source_key='crabcode' AND sender_key IS NOT NULL AND sender_key='host:crabcode' AND workspace_dir IS NOT NULL AND granted_generation IS NOT NULL AND status <> 'pending')",
+            "binding_kind <> 'host' OR (channel_kind='host' AND source_key IN ('crabcode','claude','dsh','pi') AND sender_key IS NOT NULL AND sender_key='host:' || source_key AND workspace_dir IS NOT NULL AND granted_generation IS NOT NULL AND status <> 'pending')",
             "octet_length(source_key)<=128",
             "octet_length(sender_key)<=128",
             "octet_length(chat_key)<=128",
@@ -41,6 +39,8 @@ const EXPECTED_CHECKS: &[(&str, &[&str])] = &[
             "channel_kind ~ '^[a-z][a-z0-9_]{0,31}$'",
             "status IN ('pending','active','suspended','revoked','expired')",
             "status_reason IN ('superseded','pairing_expired','owner_revoked','receiver_replaced','restore_detected','credential_rejected','webhook_conflict','grant_stale')",
+            "host_kind IN ('crabcode','claude','dsh','pi')",
+            "(binding_kind = 'receiver') = (host_kind IS NULL) AND (binding_kind <> 'host' OR host_kind = source_key)",
         ],
     ),
     (
@@ -82,7 +82,7 @@ const EXPECTED_CHECKS: &[(&str, &[&str])] = &[
             "octet_length(native_request_id)<=128",
             "octet_length(input_sha256)=32",
             "record_kind IN ('session','permission')",
-            "host_kind IN ('crabcode')",
+            "host_kind IN ('crabcode','claude','dsh','pi')",
             "end_reason IN ('result_success','result_error','stop_requested','output_limit','line_limit','stalled','protocol_error','child_exited','spawn_failed','version_rejected','init_timeout','resume_failed')",
             "stop_outcome IN ('confirmed','unknown')",
             "decision IN ('allow','deny')",
@@ -217,6 +217,10 @@ async fn catalog_matches_six_tables_all_columns_types_nullability_and_defaults()
     );
     expected.insert(
         ("channel_bindings".to_owned(), "chat_key".to_owned()),
+        ("text".to_owned(), false, None),
+    );
+    expected.insert(
+        ("channel_bindings".to_owned(), "host_kind".to_owned()),
         ("text".to_owned(), false, None),
     );
     expected.insert(
@@ -678,7 +682,7 @@ async fn catalog_matches_six_tables_all_columns_types_nullability_and_defaults()
         .iter()
         .map(|r| ((r.get(0), r.get(1)), (r.get(2), r.get(3), r.get(4))))
         .collect();
-    assert_eq!(actual.len(), 122);
+    assert_eq!(actual.len(), 123);
     assert_eq!(actual, expected);
     session.close().await;
     fixture.stop().await;
@@ -742,13 +746,13 @@ async fn catalog_matches_primary_foreign_unique_and_check_constraints() {
     .collect();
     assert_eq!(actual_fk, expected_fk);
     let indexes=session.client.query("SELECT c.relname,pg_get_expr(i.indpred,i.indrelid),i.indnkeyatts FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='openmybot' AND i.indisunique AND NOT i.indisprimary",&[]).await.unwrap();
-    assert_eq!(indexes.len(), 9);
+    assert_eq!(indexes.len(), 10);
     assert_eq!(
         indexes
             .iter()
             .filter(|r| r.get::<_, Option<String>>(1).is_some())
             .count(),
-        6
+        7
     );
     let primary=session.client.query("SELECT t.relname,a.attname FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=c.connamespace JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=ANY(c.conkey) WHERE n.nspname='openmybot' AND c.contype='p'",&[]).await.unwrap();
     let actual_primary: BTreeMap<String, String> =
@@ -782,7 +786,12 @@ async fn catalog_matches_primary_foreign_unique_and_check_constraints() {
         (
             "channel_bindings",
             "binding_kind,channel_kind",
-            Some("status=ANYARRAY['pending','active','suspended']"),
+            Some("status=ANYARRAY['pending','active','suspended']ANDbinding_kind<>'host'"),
+        ),
+        (
+            "channel_bindings",
+            "source_key",
+            Some("status=ANYARRAY['pending','active','suspended']ANDbinding_kind='host'"),
         ),
         ("channel_events", "channel_kind,source_key,event_key", None),
         ("channel_events", "run_id", Some("run_idISNOTNULL")),
@@ -1026,6 +1035,7 @@ async fn binding_i1_i2_i3_accept_and_reject_each_shape() {
         "workspace_dir='x'",
         "thread_id='x'",
         "status='pending'",
+        "host_kind='crabcode'",
     ] {
         rejected(
             &session.client,
@@ -1038,6 +1048,11 @@ async fn binding_i1_i2_i3_accept_and_reject_each_shape() {
     for change in [
         "channel_kind='telegram'",
         "source_key='crabcode-other'",
+        "source_key='codex',sender_key='host:codex',host_kind='codex'",
+        "source_key='claude'",
+        "source_key='claude',sender_key='host:claude'",
+        "host_kind='claude'",
+        "host_kind=NULL",
         "sender_key=NULL",
         "sender_key='other'",
         "workspace_dir=NULL",
@@ -1050,7 +1065,11 @@ async fn binding_i1_i2_i3_accept_and_reject_each_shape() {
         )
         .await;
     }
-    session.client.batch_execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,pairing_code_hash,pairing_expires_at,workspace_dir,thread_id,granted_generation,status,created_at) VALUES('00000000-0000-0000-0000-000000000003','sender','telegram','1',decode(repeat('aa',32),'hex'),statement_timestamp(),'/workspace','thread',1,'pending',statement_timestamp())").await.unwrap();
+    // Each first-batch host is a valid host row.
+    for host in ["claude", "dsh", "pi", "crabcode"] {
+        session.client.batch_execute(&format!("UPDATE openmybot.channel_bindings SET source_key='{host}',sender_key='host:{host}',host_kind='{host}' WHERE binding_kind='host'")).await.unwrap();
+    }
+    session.client.batch_execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,host_kind,pairing_code_hash,pairing_expires_at,workspace_dir,thread_id,granted_generation,status,created_at) VALUES('00000000-0000-0000-0000-000000000003','sender','telegram','1','claude',decode(repeat('aa',32),'hex'),statement_timestamp(),'/workspace','thread',1,'pending',statement_timestamp())").await.unwrap();
     for change in [
         "pairing_code_hash=NULL",
         "pairing_expires_at=NULL",
@@ -1059,6 +1078,8 @@ async fn binding_i1_i2_i3_accept_and_reject_each_shape() {
         "granted_generation=NULL",
         "sender_key='x'",
         "channel_kind='host'",
+        "host_kind=NULL",
+        "host_kind='codex'",
     ] {
         rejected(
             &session.client,
@@ -1419,6 +1440,20 @@ async fn partial_uniques_hold_for_live_bindings_sessions_permissions_and_runs() 
         .await
         .unwrap();
     session.client.batch_execute(HOST).await.unwrap();
+    // One live host binding per host: a second CrabCode row is refused, a Claude Code row is not.
+    rejected(
+        &session.client,
+        &HOST.replace("000000000002", "000000000021"),
+    )
+    .await;
+    session
+        .client
+        .batch_execute(&HOST.replace("000000000002", "000000000022").replace(
+            "'crabcode','host:crabcode','crabcode'",
+            "'claude','host:claude','claude'",
+        ))
+        .await
+        .unwrap();
     let base = "INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at) VALUES('00000000-0000-0000-0000-000000000010','session','run','00000000-0000-0000-0000-000000000002','crabcode','/workspace',statement_timestamp())";
     session.client.batch_execute(base).await.unwrap();
     rejected(

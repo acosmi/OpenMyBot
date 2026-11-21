@@ -50,7 +50,9 @@ impl Env {
             .unwrap()
     }
     async fn binding_state(&self) -> HostBindingState {
-        host_binding_state(self.client(), deadline()).await.unwrap()
+        host_binding_state(self.client(), omb_store::HostKind::Crabcode, deadline())
+            .await
+            .unwrap()
     }
     async fn state(&self, binding: Uuid, run: &str) -> RunState {
         self.run(binding, run).await.unwrap().state
@@ -202,6 +204,7 @@ async fn summary_and_artifacts_come_from_the_session_row() {
     env.event(host, "ended", "dispatched").await;
     env.event(host, "never-started", "dispatched").await;
     let start = || SessionStart {
+        host: omb_store::HostKind::Crabcode,
         run_id: "ended",
         binding_id: host,
         workspace_dir: "/w/host",
@@ -335,6 +338,7 @@ async fn every_deadline_taking_store_function_refuses_a_past_deadline() {
     assert_eq!(
         accept_host_begin(
             &mut env.session.client,
+            omb_store::HostKind::Crabcode,
             &operation,
             &message,
             "T-host",
@@ -351,7 +355,7 @@ async fn every_deadline_taking_store_function_refuses_a_past_deadline() {
         .get(0);
     assert_eq!(events, 0);
     assert_eq!(
-        host_binding_state(env.client(), past).await,
+        host_binding_state(env.client(), omb_store::HostKind::Crabcode, past).await,
         Err(StoreError::BindingFailed)
     );
     assert_eq!(
@@ -365,6 +369,7 @@ async fn every_deadline_taking_store_function_refuses_a_past_deadline() {
     assert!(matches!(
         accept_host_begin(
             &mut env.session.client,
+            omb_store::HostKind::Crabcode,
             &operation,
             &message,
             "T-host",

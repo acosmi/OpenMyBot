@@ -1,4 +1,4 @@
-//! The only translation of CrabCode frames into engine provider events and session row fields.
+//! The only translation of SDK control protocol frames into engine provider events and session row fields.
 use crate::protocol::{Block, Frame};
 use openbot_application::{ProviderEvent, ProviderOutputKind, ProviderUsage};
 use serde_json::Value;

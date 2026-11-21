@@ -75,6 +75,8 @@ fn code_hash(binding_id: Uuid, code: &str) -> [u8; 32] {
 
 pub struct PairStart<'a> {
     pub channel: ChannelKind,
+    /// The host the sender's runs go to.
+    pub host: crate::HostKind,
     /// Already verified real path.
     pub workspace_dir: &'a str,
     pub thread_id: &'a str,
@@ -120,7 +122,7 @@ pub async fn pair_start(
         let binding_id = Uuid::now_v7();
         let code = PairCode::generate()?;
         let hash = code_hash(binding_id, &code.0).to_vec();
-        let inserted = unique_rows(client, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,workspace_dir,thread_id,granted_generation,run_deadline_seconds,pairing_code_hash,pairing_expires_at,status,created_at) VALUES ($1,'sender',$2,$3,$4,$5,$6,$7,$8,statement_timestamp()+make_interval(secs=>$9),'pending',statement_timestamp()) RETURNING pairing_expires_at", &[&binding_id, &channel, &source_key, &input.workspace_dir, &input.thread_id, &generation, &run_deadline, &hash, &PAIR_TTL.as_secs_f64()], deadline, StoreError::ChannelAlreadyBound, error).await?;
+        let inserted = unique_rows(client, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,host_kind,workspace_dir,thread_id,granted_generation,run_deadline_seconds,pairing_code_hash,pairing_expires_at,status,created_at) VALUES ($1,'sender',$2,$3,$10,$4,$5,$6,$7,$8,statement_timestamp()+make_interval(secs=>$9),'pending',statement_timestamp()) RETURNING pairing_expires_at", &[&binding_id, &channel, &source_key, &input.workspace_dir, &input.thread_id, &generation, &run_deadline, &hash, &PAIR_TTL.as_secs_f64(), &input.host.as_str()], deadline, StoreError::ChannelAlreadyBound, error).await?;
         let expires_at = inserted
             .first()
             .ok_or(error)?

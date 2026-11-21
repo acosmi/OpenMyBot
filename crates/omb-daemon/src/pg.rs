@@ -1119,6 +1119,7 @@ mod tests {
         let cfg = Config {
             deployment_id: String::new(),
             pg_bin_dir: PathBuf::from("/unavailable-pg"),
+            workspace_roots: Vec::new(),
             hosts: Default::default(),
             plugins: Default::default(),
         };

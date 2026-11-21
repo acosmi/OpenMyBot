@@ -1,18 +1,16 @@
-#[path = "../src/testkit.rs"]
-mod testkit;
+use omb_store::testkit::{Fixture, deadline};
 use omb_store::{StoreError, migrate};
 use sha2::{Digest, Sha256};
-use testkit::{Fixture, deadline};
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn bootstrap_and_initial_migration_create_exact_version_record() {
     let mut fixture = Fixture::new().await;
     let mut session = fixture.connect().await;
     let result = migrate(&mut session.client, deadline()).await.unwrap();
-    assert_eq!(result.applied_count, 2);
-    assert_eq!(result.current_version, 2);
+    assert_eq!(result.applied_count, 3);
+    assert_eq!(result.current_version, 3);
     let rows=session.client.query("SELECT version,name,sha256,applied_at<=statement_timestamp() FROM openmybot.omb_migrations ORDER BY version",&[]).await.unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     for (row, (version, name, sql)) in rows.iter().zip([
         (
             1,
@@ -23,6 +21,11 @@ async fn bootstrap_and_initial_migration_create_exact_version_record() {
             2,
             "omb_0002_open_channel_kind.sql",
             &include_bytes!("../migrations/omb_0002_open_channel_kind.sql")[..],
+        ),
+        (
+            3,
+            "omb_0003_hosts.sql",
+            &include_bytes!("../migrations/omb_0003_hosts.sql")[..],
         ),
     ]) {
         assert_eq!(row.get::<_, i32>(0), version);
@@ -111,7 +114,7 @@ async fn unknown_database_version_is_rejected_without_mutation() {
     let mut fixture = Fixture::new().await;
     let mut session = fixture.connect().await;
     migrate(&mut session.client, deadline()).await.unwrap();
-    session.client.batch_execute("INSERT INTO openmybot.omb_migrations VALUES(3,'fixture-newer',decode(repeat('11',32),'hex'),statement_timestamp())").await.unwrap();
+    session.client.batch_execute("INSERT INTO openmybot.omb_migrations VALUES(4,'fixture-newer',decode(repeat('11',32),'hex'),statement_timestamp())").await.unwrap();
     assert_eq!(
         migrate(&mut session.client, deadline()).await.unwrap_err(),
         StoreError::SchemaNewer
@@ -123,7 +126,7 @@ async fn unknown_database_version_is_rejected_without_mutation() {
             .await
             .unwrap()
             .get::<_, i64>(0),
-        3
+        4
     );
     session.close().await;
     fixture.stop().await;
@@ -175,7 +178,7 @@ async fn failed_migration_rolls_back_ddl_and_version_record() {
             .await
             .unwrap()
             .applied_count,
-        2
+        3
     );
     session.close().await;
     fixture.stop().await;
@@ -215,7 +218,7 @@ async fn concurrent_migrators_apply_once_under_transaction_lock() {
             .await
             .unwrap()
             .applied_count,
-        2
+        3
     );
     candidate.close().await;
     holder.close().await;
@@ -229,14 +232,14 @@ async fn concurrent_migrators_apply_once_under_transaction_lock() {
             migrate(&mut a.client, deadline()),
             migrate(&mut b.client, deadline())
         );
-        assert_eq!(x.unwrap().applied_count + y.unwrap().applied_count, 2);
+        assert_eq!(x.unwrap().applied_count + y.unwrap().applied_count, 3);
         assert_eq!(
             a.client
                 .query_one("SELECT count(*)::bigint FROM openmybot.omb_migrations", &[])
                 .await
                 .unwrap()
                 .get::<_, i64>(0),
-            2
+            3
         );
         a.close().await;
         b.close().await;
@@ -245,32 +248,60 @@ async fn concurrent_migrators_apply_once_under_transaction_lock() {
 }
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
-async fn upgrade_from_version_one_applies_only_the_second_migration() {
+async fn upgrade_from_version_two_applies_the_third_and_fills_host_kind() {
     let mut fixture = Fixture::new().await;
     let mut session = fixture.connect().await;
-    let initial = include_bytes!("../migrations/omb_0001_initial.sql");
     session.client.batch_execute("CREATE SCHEMA openmybot; CREATE TABLE openmybot.omb_migrations(version integer PRIMARY KEY,name text NOT NULL,sha256 bytea NOT NULL CHECK(octet_length(sha256)=32),applied_at timestamptz NOT NULL)").await.unwrap();
-    session
-        .client
-        .batch_execute(std::str::from_utf8(initial).unwrap())
-        .await
-        .unwrap();
-    session.client.execute("INSERT INTO openmybot.omb_migrations VALUES(1,'omb_0001_initial.sql',$1,statement_timestamp())", &[&Sha256::digest(initial).to_vec()]).await.unwrap();
+    for (version, name, sql) in [
+        (
+            1,
+            "omb_0001_initial.sql",
+            &include_bytes!("../migrations/omb_0001_initial.sql")[..],
+        ),
+        (
+            2,
+            "omb_0002_open_channel_kind.sql",
+            &include_bytes!("../migrations/omb_0002_open_channel_kind.sql")[..],
+        ),
+    ] {
+        session
+            .client
+            .batch_execute(std::str::from_utf8(sql).unwrap())
+            .await
+            .unwrap();
+        session
+            .client
+            .execute(
+                "INSERT INTO openmybot.omb_migrations VALUES($1,$2,$3,statement_timestamp())",
+                &[&version, &name, &Sha256::digest(sql).to_vec()],
+            )
+            .await
+            .unwrap();
+    }
+    // One binding of each kind as version 2 holds them.
+    session.client.batch_execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,created_at) VALUES('00000000-0000-0000-0000-000000000001','receiver','telegram','1','envelope','active',statement_timestamp()); INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,workspace_dir,granted_generation,status,created_at) VALUES('00000000-0000-0000-0000-000000000002','host','host','crabcode','host:crabcode','/workspace',1,'active',statement_timestamp()); INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,pairing_code_hash,pairing_expires_at,workspace_dir,thread_id,granted_generation,status,created_at) VALUES('00000000-0000-0000-0000-000000000003','sender','telegram','1',decode(repeat('aa',32),'hex'),statement_timestamp(),'/workspace','thread',1,'pending',statement_timestamp())").await.unwrap();
     let result = migrate(&mut session.client, deadline()).await.unwrap();
     assert_eq!(result.applied_count, 1);
-    assert_eq!(result.current_version, 2);
-    let versions: Vec<i32> = session
+    assert_eq!(result.current_version, 3);
+    let kinds: Vec<(String, Option<String>)> = session
         .client
         .query(
-            "SELECT version FROM openmybot.omb_migrations ORDER BY version",
+            "SELECT binding_kind,host_kind FROM openmybot.channel_bindings ORDER BY binding_id",
             &[],
         )
         .await
         .unwrap()
         .iter()
-        .map(|r| r.get(0))
+        .map(|r| (r.get(0), r.get(1)))
         .collect();
-    assert_eq!(versions, [1, 2]);
+    assert_eq!(
+        kinds,
+        [
+            ("receiver".to_owned(), None),
+            ("host".to_owned(), Some("crabcode".to_owned())),
+            ("sender".to_owned(), Some("crabcode".to_owned())),
+        ]
+    );
     session.close().await;
     fixture.stop().await;
 }

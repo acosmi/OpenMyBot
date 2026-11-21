@@ -11,7 +11,7 @@ use omb_channel_sdk::protocol::VerifyFailure;
 use omb_hostdriver::WorkspaceRoots;
 use omb_store::{
     ChannelKind, Decided, Decision, EventCancel, GrantKind, HostAccept, HostBinding,
-    HostBindingState, HostMessage, IdentityKey, MCP_LIST_MAX, NewReceiver, OperationId,
+    HostBindingState, HostKind, HostMessage, IdentityKey, MCP_LIST_MAX, NewReceiver, OperationId,
     ReceiverRow, RunDeadline, Settled, StoreError, accept_host_begin, binding_run, binding_runs,
     cancel_pending, cancel_state, host_binding_state,
 };
@@ -92,6 +92,7 @@ struct RunArgs {
 #[serde(deny_unknown_fields)]
 struct PairArgs {
     channel: String,
+    host: String,
     workspace: PathBuf,
     run_deadline: Option<u32>,
 }
@@ -116,6 +117,7 @@ struct ReceiverArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostArgs {
+    host: String,
     workspace: PathBuf,
     run_deadline: Option<u32>,
 }
@@ -145,7 +147,7 @@ enum Request {
     BindingsReconfirm(Uuid),
     BindingsResetThread(Uuid, IdentityKey),
     BindingsReceiver(ChannelKind, BTreeMap<String, String>),
-    BindingsHost(PathBuf, Option<RunDeadline>),
+    BindingsHost(HostKind, PathBuf, Option<RunDeadline>),
     Decide(IdentityKey, Decision),
     Cancel(IdentityKey),
     PluginsList,
@@ -169,6 +171,10 @@ fn key(text: &str) -> Result<IdentityKey, DaemonError> {
 fn kind(text: &str) -> Result<ChannelKind, DaemonError> {
     ChannelKind::parse(text).ok_or(DaemonError::InvalidRequest)
 }
+/// A host on the wire is its stable identifier; the CLI resolves the owner's aliases.
+fn host(text: &str) -> Result<HostKind, DaemonError> {
+    HostKind::parse(text).ok_or(DaemonError::InvalidRequest)
+}
 fn run_deadline(seconds: Option<u32>) -> Result<Option<RunDeadline>, DaemonError> {
     seconds
         .map(|seconds| RunDeadline::parse(seconds).ok_or(DaemonError::InvalidRequest))
@@ -181,6 +187,7 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
             let args: PairArgs = decode(args)?;
             Request::PairStart(PairRequest {
                 channel: kind(&args.channel)?,
+                host: host(&args.host)?,
                 workspace: args.workspace,
                 run_deadline: run_deadline(args.run_deadline)?,
             })
@@ -205,7 +212,11 @@ fn parse(op: Op, args: Value) -> Result<Request, DaemonError> {
         }
         Op::BindingsHost => {
             let args: HostArgs = decode(args)?;
-            Request::BindingsHost(args.workspace, run_deadline(args.run_deadline)?)
+            Request::BindingsHost(
+                host(&args.host)?,
+                args.workspace,
+                run_deadline(args.run_deadline)?,
+            )
         }
         Op::Approve => Request::Decide(
             key(&decode::<PermissionArgs>(args)?.permission_id)?,
@@ -309,6 +320,8 @@ pub(crate) struct Ops {
     pub(crate) vault: CredentialRecordVault,
     pub(crate) owner: ActorId,
     pub(crate) roots: WorkspaceRoots,
+    /// The configured binary of each host that has one; a binding of another host is refused.
+    pub(crate) binaries: BTreeMap<HostKind, PathBuf>,
     pub(crate) plugins: Plugins,
     pub(crate) receiver: mpsc::Sender<ReceiverCommand>,
     pub(crate) wake: Arc<Notify>,
@@ -332,6 +345,7 @@ impl Ops {
                 self.plugins
                     .provider(&request.channel)
                     .ok_or(DaemonError::PluginNotInstalled)?;
+                self.configured(request.host)?;
                 let mut client = self.control.lock().await;
                 let started = pairing::pair(
                     &mut client,
@@ -358,6 +372,7 @@ impl Ops {
                             "binding_kind": view.binding_kind,
                             "channel_kind": view.channel_kind,
                             "source_key": view.source_key,
+                            "host_kind": view.host_kind,
                             "sender_key": view.sender_key,
                             "status": view.status,
                             "status_reason": view.status_reason,
@@ -571,7 +586,8 @@ impl Ops {
                 started??;
                 Ok(json!({"binding_id": binding_id.to_string(), "source_key": source_key}))
             }
-            Request::BindingsHost(workspace, run_deadline) => {
+            Request::BindingsHost(host, workspace, run_deadline) => {
+                self.configured(host)?;
                 let workspace = self
                     .roots
                     .resolve(&workspace)
@@ -582,6 +598,7 @@ impl Ops {
                 let binding_id = omb_store::activate_host(
                     &mut *self.control.lock().await,
                     HostBinding {
+                        host,
                         workspace_dir,
                         granted_generation,
                         run_deadline,
@@ -795,6 +812,14 @@ impl Ops {
             "session": session,
             "permissions": permissions,
         }))
+    }
+    /// `host_not_configured` for a host whose `config.toml` section has no binary.
+    fn configured(&self, host: HostKind) -> Result<(), DaemonError> {
+        if self.binaries.contains_key(&host) {
+            Ok(())
+        } else {
+            Err(DaemonError::HostNotConfigured)
+        }
     }
     fn generation(&self) -> Result<u64, DaemonError> {
         Ok(self
@@ -1055,11 +1080,24 @@ impl CancelQueue {
 mod mcp {
     use super::*;
 
+    /// Every MCP operation names the calling host, which only routes to that host's binding.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct BeginArgs {
+        host: String,
         operation_id: String,
         message: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct McpRunArgs {
+        host: String,
+        run_id: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ListArgs {
+        host: String,
     }
     /// One MCP request after its single boundary parse.
     pub(super) enum McpRequest {
@@ -1069,30 +1107,48 @@ mod mcp {
         Result(IdentityKey),
         List,
     }
-    pub(super) fn parse(op: McpOp, args: Value) -> Result<McpRequest, DaemonError> {
+    pub(super) fn parse(op: McpOp, args: Value) -> Result<(HostKind, McpRequest), DaemonError> {
+        let run = |args: Value| -> Result<(HostKind, IdentityKey), DaemonError> {
+            let args: McpRunArgs = decode(args)?;
+            Ok((host(&args.host)?, key(&args.run_id)?))
+        };
         Ok(match op {
             McpOp::RunBegin => {
                 let args: BeginArgs = decode(args)?;
-                McpRequest::Begin(
-                    OperationId::parse(&args.operation_id).ok_or(DaemonError::InvalidRequest)?,
-                    HostMessage::parse(&args.message).ok_or(DaemonError::InvalidRequest)?,
+                (
+                    host(&args.host)?,
+                    McpRequest::Begin(
+                        OperationId::parse(&args.operation_id)
+                            .ok_or(DaemonError::InvalidRequest)?,
+                        HostMessage::parse(&args.message).ok_or(DaemonError::InvalidRequest)?,
+                    ),
                 )
             }
-            McpOp::RunStatus => McpRequest::Status(key(&decode::<RunArgs>(args)?.run_id)?),
-            McpOp::RunCancel => McpRequest::Cancel(key(&decode::<RunArgs>(args)?.run_id)?),
-            McpOp::RunResult => McpRequest::Result(key(&decode::<RunArgs>(args)?.run_id)?),
-            McpOp::ThreadList => {
-                decode::<NoArgs>(args)?;
-                McpRequest::List
+            McpOp::RunStatus => {
+                let (host, run_id) = run(args)?;
+                (host, McpRequest::Status(run_id))
             }
+            McpOp::RunCancel => {
+                let (host, run_id) = run(args)?;
+                (host, McpRequest::Cancel(run_id))
+            }
+            McpOp::RunResult => {
+                let (host, run_id) = run(args)?;
+                (host, McpRequest::Result(run_id))
+            }
+            McpOp::ThreadList => (host(&decode::<ListArgs>(args)?.host)?, McpRequest::List),
         })
     }
 
     impl Ops {
-        /// The live host binding, checked by every operation but `RunBegin`, whose acceptance
+        /// The host's live binding, checked by every operation but `RunBegin`, whose acceptance
         /// transaction checks it.
-        async fn host_binding(&self, deadline: Instant) -> Result<Uuid, DaemonError> {
-            match host_binding_state(&*self.control.lock().await, deadline)
+        async fn host_binding(
+            &self,
+            host: HostKind,
+            deadline: Instant,
+        ) -> Result<Uuid, DaemonError> {
+            match host_binding_state(&*self.control.lock().await, host, deadline)
                 .await
                 .map_err(|error| store_error(error, deadline))?
             {
@@ -1108,11 +1164,13 @@ mod mcp {
             deadline: Instant,
         ) -> Result<Value, DaemonError> {
             let failed = |error| store_error(error, deadline);
-            match parse(op, args)? {
+            let (host, request) = parse(op, args)?;
+            match request {
                 McpRequest::Begin(operation, message) => {
                     let thread = self.minter.mint().await?;
                     let accepted = accept_host_begin(
                         &mut *self.control.lock().await,
+                        host,
                         &operation,
                         &message,
                         thread.as_str(),
@@ -1138,7 +1196,7 @@ mod mcp {
                     }
                 }
                 McpRequest::Status(run_id) => {
-                    let binding_id = self.host_binding(deadline).await?;
+                    let binding_id = self.host_binding(host, deadline).await?;
                     let view = binding_run(
                         &*self.control.lock().await,
                         binding_id,
@@ -1153,7 +1211,7 @@ mod mcp {
                     )
                 }
                 McpRequest::Result(run_id) => {
-                    let binding_id = self.host_binding(deadline).await?;
+                    let binding_id = self.host_binding(host, deadline).await?;
                     let view = binding_run(
                         &*self.control.lock().await,
                         binding_id,
@@ -1174,7 +1232,7 @@ mod mcp {
                     }))
                 }
                 McpRequest::List => {
-                    let binding_id = self.host_binding(deadline).await?;
+                    let binding_id = self.host_binding(host, deadline).await?;
                     let runs: Vec<Value> = binding_runs(
                         &*self.control.lock().await,
                         binding_id,
@@ -1196,7 +1254,7 @@ mod mcp {
                     Ok(json!({ "runs": runs }))
                 }
                 McpRequest::Cancel(run_id) => {
-                    let binding_id = self.host_binding(deadline).await?;
+                    let binding_id = self.host_binding(host, deadline).await?;
                     let state = self
                         .canceller
                         .cancel(binding_id, run_id.as_str(), deadline)
@@ -1227,7 +1285,7 @@ mod tests {
         supervisor::{Context, PluginProcess},
     };
     use omb_channel_sdk::PLUGIN_MAX;
-    use omb_hostdriver::{HostDriverConfig, Limits, OMB_NOTICE_PERMISSION_V1};
+    use omb_hostdriver::{HostDriverConfig, Limits, OMB_NOTICE_PERMISSION_V2};
     use omb_store::{
         Claim, DispatchOutcome, Suspension, TerminalKind, lock_dispatch, record_dispatch,
         record_terminal, testkit,
@@ -1272,16 +1330,20 @@ mod tests {
             ),
             (
                 "pair_start",
-                json!({"channel": "telegram", "workspace": "/ws", "run_deadline": 60}),
+                json!({"channel": "telegram", "host": "crabcode", "workspace": "/ws", "run_deadline": 60}),
                 vec![
-                    json!({"workspace": "/ws"}),
+                    json!({"host": "crabcode", "workspace": "/ws"}),
                     json!({"channel": "telegram"}),
-                    json!({"channel": "telegram", "workspace": "/ws", "x": 1}),
-                    json!({"channel": 1, "workspace": "/ws"}),
-                    json!({"channel": "telegram", "workspace": "/ws", "run_deadline": "60"}),
-                    json!({"channel": "Slack", "workspace": "/ws"}),
-                    json!({"channel": "host", "workspace": "/ws"}),
-                    json!({"channel": "", "workspace": "/ws"}),
+                    json!({"channel": "telegram", "host": "crabcode", "workspace": "/ws", "x": 1}),
+                    json!({"channel": 1, "host": "crabcode", "workspace": "/ws"}),
+                    json!({"channel": "telegram", "host": "crabcode", "workspace": "/ws", "run_deadline": "60"}),
+                    json!({"channel": "Slack", "host": "crabcode", "workspace": "/ws"}),
+                    json!({"channel": "host", "host": "crabcode", "workspace": "/ws"}),
+                    json!({"channel": "", "host": "crabcode", "workspace": "/ws"}),
+                    json!({"channel": "telegram", "workspace": "/ws"}),
+                    json!({"channel": "telegram", "host": "wrok", "workspace": "/ws"}),
+                    json!({"channel": "telegram", "host": "dsh", "workspace": "/ws"}),
+                    json!({"channel": "telegram", "host": 1, "workspace": "/ws"}),
                 ],
             ),
             (
@@ -1370,12 +1432,15 @@ mod tests {
             ),
             (
                 "bindings_host",
-                json!({"workspace": "/ws"}),
+                json!({"host": "crabcode", "workspace": "/ws"}),
                 vec![
                     json!({}),
-                    json!({"workspace": 1}),
-                    json!({"workspace": "/ws", "run_deadline": -1}),
-                    json!({"workspace": "/ws", "x": 1}),
+                    json!({"host": "crabcode", "workspace": 1}),
+                    json!({"host": "crabcode", "workspace": "/ws", "run_deadline": -1}),
+                    json!({"host": "crabcode", "workspace": "/ws", "x": 1}),
+                    json!({"workspace": "/ws"}),
+                    json!({"host": "wrokcode", "workspace": "/ws"}),
+                    json!({"host": "pi", "workspace": "/ws"}),
                 ],
             ),
             (
@@ -1494,10 +1559,10 @@ mod tests {
     #[test]
     fn permission_notice_names_the_cli_commands() {
         for prefix in ["openmybot approve ", "openmybot deny "] {
-            let at = OMB_NOTICE_PERMISSION_V1.find(prefix).unwrap();
+            let at = OMB_NOTICE_PERMISSION_V2.find(prefix).unwrap();
             let word = prefix.trim_start_matches("openmybot ").trim_end();
             assert!(Op::parse(word).is_some(), "{word}");
-            assert!(OMB_NOTICE_PERMISSION_V1[at + prefix.len()..].starts_with("{id}"));
+            assert!(OMB_NOTICE_PERMISSION_V2[at + prefix.len()..].starts_with("{id}"));
         }
     }
 
@@ -1602,6 +1667,10 @@ mod tests {
                 vault: engine.vault.clone(),
                 owner: ActorId::new(SINGLE_USER_ACTOR_ID),
                 roots: WorkspaceRoots::parse(&home, &[workspace]).unwrap(),
+                binaries: std::collections::BTreeMap::from([(
+                    omb_store::HostKind::Crabcode,
+                    std::path::PathBuf::from("/usr/bin/false"),
+                )]),
                 plugins: Plugins::load(&fixture.root, Vec::new(), fixture.root.clone()).unwrap(),
                 receiver,
                 wake: Arc::new(Notify::new()),
@@ -1698,7 +1767,7 @@ mod tests {
                 cancel,
                 Outbound {
                     terminals,
-                    crabcode: None,
+                    binaries: std::collections::BTreeMap::new(),
                 },
                 Arc::clone(&self.ops.canceller.gate),
             )
@@ -1801,7 +1870,7 @@ mod tests {
             let thread = self.minted().await;
             let binding = Uuid::now_v7();
             let generation = i64::try_from(self.generation()).unwrap();
-            self.client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$5,'1001','telegram:42','telegram:42',$2,$3,$4,1,'active',statement_timestamp(),statement_timestamp())", &[&binding, &self.workspace(), &thread.as_str(), &generation, &channel]).await.unwrap();
+            self.client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,host_kind,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$5,'1001','crabcode','telegram:42','telegram:42',$2,$3,$4,1,'active',statement_timestamp(),statement_timestamp())", &[&binding, &self.workspace(), &thread.as_str(), &generation, &channel]).await.unwrap();
             (binding, thread)
         }
         /// A dispatched accepted message of the binding, begun through the delegated entry.
@@ -2649,7 +2718,7 @@ mod tests {
         let started = env
             .call(
                 "pair_start",
-                json!({"channel": "telegram", "workspace": env.workspace()}),
+                json!({"channel": "telegram", "host": "crabcode", "workspace": env.workspace()}),
             )
             .await
             .unwrap();
@@ -2689,7 +2758,7 @@ mod tests {
             assert_eq!(
                 env.call(
                     "pair_start",
-                    json!({"channel": "telegram", "workspace": workspace})
+                    json!({"channel": "telegram", "host": "crabcode", "workspace": workspace})
                 )
                 .await,
                 Err(DaemonError::WorkspaceInvalid),
@@ -2708,7 +2777,7 @@ mod tests {
         assert_eq!(
             env.call(
                 "pair_start",
-                json!({"channel": "telegram", "workspace": env.workspace()})
+                json!({"channel": "telegram", "host": "crabcode", "workspace": env.workspace()})
             )
             .await,
             Err(DaemonError::ChannelAlreadyBound)
@@ -2724,7 +2793,7 @@ mod tests {
         assert_eq!(
             env.call(
                 "pair_start",
-                json!({"channel": "telegram", "workspace": workspace})
+                json!({"channel": "telegram", "host": "crabcode", "workspace": workspace})
             )
             .await,
             Err(DaemonError::ReceiverNotActive)
@@ -2733,7 +2802,7 @@ mod tests {
         assert_eq!(
             env.call(
                 "pair_start",
-                json!({"channel": "feishu", "workspace": workspace})
+                json!({"channel": "feishu", "host": "crabcode", "workspace": workspace})
             )
             .await,
             Err(DaemonError::ReceiverNotActive)
@@ -2751,7 +2820,7 @@ mod tests {
             assert_eq!(
                 env.call(
                     "pair_start",
-                    json!({"channel": "telegram", "workspace": workspace, "run_deadline": seconds})
+                    json!({"channel": "telegram", "host": "crabcode", "workspace": workspace, "run_deadline": seconds})
                 )
                 .await,
                 Err(DaemonError::InvalidRequest)
@@ -2761,7 +2830,7 @@ mod tests {
             let started = env
                 .call(
                     "pair_start",
-                    json!({"channel": "telegram", "workspace": workspace, "run_deadline": seconds}),
+                    json!({"channel": "telegram", "host": "crabcode", "workspace": workspace, "run_deadline": seconds}),
                 )
                 .await
                 .unwrap();
@@ -2785,7 +2854,7 @@ mod tests {
         let activated = env
             .call(
                 "bindings_host",
-                json!({"workspace": workspace, "run_deadline": 900}),
+                json!({"host": "crabcode", "workspace": workspace, "run_deadline": 900}),
             )
             .await
             .unwrap();
@@ -2804,13 +2873,78 @@ mod tests {
     async fn bindings_host_twice_is_channel_already_bound() {
         let mut env = Env::start().await;
         let workspace = env.workspace();
-        env.call("bindings_host", json!({"workspace": workspace}))
-            .await
-            .unwrap();
+        env.call(
+            "bindings_host",
+            json!({"host": "crabcode", "workspace": workspace}),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            env.call("bindings_host", json!({"workspace": workspace}))
-                .await,
+            env.call(
+                "bindings_host",
+                json!({"host": "crabcode", "workspace": workspace})
+            )
+            .await,
             Err(DaemonError::ChannelAlreadyBound)
+        );
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn a_host_without_a_binary_is_host_not_configured_and_binds_nothing() {
+        let mut env = Env::start().await;
+        fixture::receiver(&env.client, "telegram").await;
+        let workspace = env.workspace();
+        assert_eq!(
+            env.call(
+                "bindings_host",
+                json!({"host": "claude", "workspace": workspace})
+            )
+            .await,
+            Err(DaemonError::HostNotConfigured)
+        );
+        assert_eq!(
+            env.call(
+                "pair_start",
+                json!({"channel": "telegram", "host": "claude", "workspace": workspace}),
+            )
+            .await,
+            Err(DaemonError::HostNotConfigured)
+        );
+        assert_eq!(
+            env.client
+                .query_one(
+                    "SELECT count(*) FROM openmybot.channel_bindings WHERE binding_kind <> 'receiver'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        env.stop().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "own PG17.11; explicit binary directory; serial"]
+    async fn mcp_operations_see_only_their_own_host_binding() {
+        let env = Env::start().await;
+        host_binding(&env).await;
+        mcp_call(&env, McpOp::ThreadList, json!({})).await.unwrap();
+        assert_eq!(
+            mcp_call_as(&env, HostKind::Claude, McpOp::ThreadList, json!({})).await,
+            Err(DaemonError::HostNotBound)
+        );
+        assert_eq!(
+            mcp_call_as(
+                &env,
+                HostKind::Claude,
+                McpOp::RunBegin,
+                begin("op-1", "hello")
+            )
+            .await,
+            Err(DaemonError::HostNotBound)
         );
         env.stop().await;
     }
@@ -2824,8 +2958,11 @@ mod tests {
             env.fixture.root.join("home/ws/missing"),
         ] {
             assert_eq!(
-                env.call("bindings_host", json!({"workspace": workspace}))
-                    .await,
+                env.call(
+                    "bindings_host",
+                    json!({"host": "crabcode", "workspace": workspace})
+                )
+                .await,
                 Err(DaemonError::WorkspaceInvalid)
             );
         }
@@ -3010,7 +3147,7 @@ mod tests {
         let paired = env
             .call(
                 "pair_start",
-                json!({"channel": "feishu", "workspace": env.workspace()}),
+                json!({"channel": "feishu", "host": "crabcode", "workspace": env.workspace()}),
             )
             .await
             .unwrap();
@@ -3301,7 +3438,7 @@ mod tests {
         let started = env
             .call(
                 "pair_start",
-                json!({"channel": "telegram", "workspace": env.workspace()}),
+                json!({"channel": "telegram", "host": "crabcode", "workspace": env.workspace()}),
             )
             .await
             .unwrap();
@@ -3743,13 +3880,16 @@ mod tests {
         let workspace = env.workspace();
         env.call(
             "pair_start",
-            json!({"channel": "telegram", "workspace": workspace}),
+            json!({"channel": "telegram", "host": "crabcode", "workspace": workspace}),
         )
         .await
         .unwrap();
-        env.call("bindings_host", json!({"workspace": workspace}))
-            .await
-            .unwrap();
+        env.call(
+            "bindings_host",
+            json!({"host": "crabcode", "workspace": workspace}),
+        )
+        .await
+        .unwrap();
         let listed = env.call("bindings_list", json!({})).await.unwrap();
         let bindings = listed["bindings"].as_array().unwrap();
         assert_eq!(bindings.len(), 3);
@@ -3762,6 +3902,7 @@ mod tests {
             "binding_id",
             "binding_kind",
             "channel_kind",
+            "host_kind",
             "source_key",
             "sender_key",
             "status",
@@ -3786,6 +3927,12 @@ mod tests {
                 .collect();
             keys.sort_unstable();
             assert_eq!(keys, expected);
+            let host = if binding["binding_kind"] == "receiver" {
+                serde_json::Value::Null
+            } else {
+                json!("crabcode")
+            };
+            assert_eq!(binding["host_kind"], host);
             assert!(rfc3339(&binding["created_at"]));
             for key in ["activated_at", "suspended_at", "reconfirmed_at"] {
                 assert!(binding[key].is_null() || rfc3339(&binding[key]), "{key}");
@@ -3979,15 +4126,20 @@ mod tests {
     #[test]
     fn mcp_arguments_parse_once_into_narrow_types() {
         let invalid = |op, args| matches!(mcp::parse(op, args), Err(DaemonError::InvalidRequest));
+        // Every operation names a host by its stable identifier.
+        let with_host = |mut args: Value| {
+            args["host"] = json!("crabcode");
+            args
+        };
         assert!(matches!(
-            mcp::parse(McpOp::RunBegin, json!({"operation_id": "a", "message": ""})),
-            Ok(mcp::McpRequest::Begin(operation, message))
+            mcp::parse(McpOp::RunBegin, json!({"host": "claude", "operation_id": "a", "message": ""})),
+            Ok((HostKind::Claude, mcp::McpRequest::Begin(operation, message)))
                 if operation.as_str() == "a" && message.as_str().is_empty()
         ));
         let longest = "a".repeat(125);
         assert!(matches!(
-            mcp::parse(McpOp::RunBegin, json!({"operation_id": longest, "message": "m"})),
-            Ok(mcp::McpRequest::Begin(operation, _)) if operation.as_str() == longest
+            mcp::parse(McpOp::RunBegin, json!({"host": "crabcode", "operation_id": longest, "message": "m"})),
+            Ok((HostKind::Crabcode, mcp::McpRequest::Begin(operation, _))) if operation.as_str() == longest
         ));
         for args in [
             json!({"operation_id": "a".repeat(126), "message": "m"}),
@@ -4001,15 +4153,25 @@ mod tests {
             json!({"operation_id": 1, "message": "m"}),
             json!({"operation_id": "a", "message": 5}),
         ] {
+            assert!(invalid(McpOp::RunBegin, with_host(args.clone())), "{args}");
+        }
+        for host in [json!("wrok"), json!("dsh"), json!(1), Value::Null] {
+            let args = json!({"host": host, "operation_id": "a", "message": "m"});
             assert!(invalid(McpOp::RunBegin, args.clone()), "{args}");
         }
+        assert!(invalid(
+            McpOp::RunBegin,
+            json!({"operation_id": "a", "message": "m"})
+        ));
         for op in [McpOp::RunStatus, McpOp::RunCancel, McpOp::RunResult] {
-            let key = match mcp::parse(op, json!({"run_id": "r1"})) {
-                Ok(
+            assert!(invalid(op, json!({"run_id": "r1"})), "{op:?}");
+            let key = match mcp::parse(op, json!({"host": "claude", "run_id": "r1"})) {
+                Ok((
+                    HostKind::Claude,
                     mcp::McpRequest::Status(key)
                     | mcp::McpRequest::Cancel(key)
                     | mcp::McpRequest::Result(key),
-                ) => key,
+                )) => key,
                 _ => panic!("{op:?}"),
             };
             assert_eq!(key, IdentityKey::parse("r1").unwrap());
@@ -4021,14 +4183,15 @@ mod tests {
                 json!({"run_id": "r1", "x": 1}),
                 json!({"run_id": 5}),
             ] {
-                assert!(invalid(op, args.clone()), "{op:?} {args}");
+                assert!(invalid(op, with_host(args.clone())), "{op:?} {args}");
             }
         }
         assert!(matches!(
-            mcp::parse(McpOp::ThreadList, json!({})),
-            Ok(mcp::McpRequest::List)
+            mcp::parse(McpOp::ThreadList, json!({"host": "crabcode"})),
+            Ok((HostKind::Crabcode, mcp::McpRequest::List))
         ));
-        assert!(invalid(McpOp::ThreadList, json!({"x": 1})));
+        assert!(invalid(McpOp::ThreadList, json!({})));
+        assert!(invalid(McpOp::ThreadList, with_host(json!({"x": 1}))));
         for op in [
             McpOp::RunBegin,
             McpOp::RunStatus,
@@ -4042,7 +4205,17 @@ mod tests {
         }
     }
 
+    /// As `openmybot mcp` (CrabCode by default) sends it: the arguments plus the host.
     async fn mcp_call(env: &Env, op: McpOp, args: Value) -> Result<Value, DaemonError> {
+        mcp_call_as(env, HostKind::Crabcode, op, args).await
+    }
+    async fn mcp_call_as(
+        env: &Env,
+        host: HostKind,
+        op: McpOp,
+        mut args: Value,
+    ) -> Result<Value, DaemonError> {
+        args["host"] = json!(host.as_str());
         env.ops.run_mcp(op, args, later()).await
     }
     fn begin(operation_id: &str, message: &str) -> Value {
@@ -4075,7 +4248,10 @@ mod tests {
     async fn bound(env: &mut Env) -> Uuid {
         let workspace = env.workspace();
         let bound = env
-            .call("bindings_host", json!({"workspace": workspace}))
+            .call(
+                "bindings_host",
+                json!({"host": "crabcode", "workspace": workspace}),
+            )
             .await
             .unwrap();
         Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap()
@@ -4343,6 +4519,7 @@ mod tests {
         let session = omb_store::upsert_session(
             client,
             omb_store::SessionStart {
+                host: omb_store::HostKind::Crabcode,
                 run_id: "ok",
                 binding_id: host,
                 workspace_dir: &workspace,
@@ -4551,7 +4728,7 @@ mod tests {
             cancel,
             Outbound {
                 terminals,
-                crabcode: None,
+                binaries: std::collections::BTreeMap::new(),
             },
             Arc::default(),
         )
@@ -4654,6 +4831,7 @@ mod tests {
         let thread = env.minted().await;
         let aged = accept_host_begin(
             &mut env.client,
+            omb_store::HostKind::Crabcode,
             &OperationId::parse("aged-1").unwrap(),
             &HostMessage::parse("old").unwrap(),
             thread.as_str(),
@@ -4801,6 +4979,7 @@ mod tests {
             for (operation, on) in [(&first, thread.clone()), (&second, env.minted().await)] {
                 let accepted = accept_host_begin(
                     &mut env.client,
+                    omb_store::HostKind::Crabcode,
                     &OperationId::parse(operation).unwrap(),
                     &HostMessage::parse("work").unwrap(),
                     on.as_str(),
@@ -4992,9 +5171,11 @@ mod tests {
         bound(&mut env).await;
         env.client.batch_execute("CREATE FUNCTION openmybot.fixture_commit_delay() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1.5); RETURN NULL; END $$; CREATE CONSTRAINT TRIGGER fixture_commit_delay AFTER INSERT ON openmybot.channel_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION openmybot.fixture_commit_delay()").await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
+        let mut args = begin("late-1", "m");
+        args["host"] = json!(HostKind::Crabcode.as_str());
         let accepted = env
             .ops
-            .run_mcp(McpOp::RunBegin, begin("late-1", "m"), deadline)
+            .run_mcp(McpOp::RunBegin, args, deadline)
             .await
             .unwrap();
         assert!(Instant::now() >= deadline);
@@ -5098,6 +5279,7 @@ mod tests {
             .unwrap();
             let HostAccept::Accepted(run) = accept_host_begin(
                 &mut env.client,
+                omb_store::HostKind::Crabcode,
                 &OperationId::parse(&operation).unwrap(),
                 &HostMessage::parse("work").unwrap(),
                 thread.as_str(),
@@ -5225,6 +5407,7 @@ mod tests {
         let thread = env.minted().await;
         let accepted = accept_host_begin(
             &mut env.client,
+            omb_store::HostKind::Crabcode,
             &OperationId::parse("lost-1").unwrap(),
             &HostMessage::parse("m").unwrap(),
             thread.as_str(),
@@ -5303,6 +5486,7 @@ mod tests {
             .unwrap();
             let HostAccept::Accepted(run) = accept_host_begin(
                 &mut env.client,
+                omb_store::HostKind::Crabcode,
                 &OperationId::parse(&operation).unwrap(),
                 &HostMessage::parse("work").unwrap(),
                 thread.as_str(),
@@ -5424,6 +5608,7 @@ mod tests {
             .unwrap();
             let HostAccept::Accepted(run) = accept_host_begin(
                 &mut env.client,
+                omb_store::HostKind::Crabcode,
                 &OperationId::parse(&operation).unwrap(),
                 &HostMessage::parse("work").unwrap(),
                 thread.as_str(),
@@ -5675,6 +5860,7 @@ mod tests {
         .unwrap();
         let HostAccept::Accepted(run) = accept_host_begin(
             &mut env.client,
+            omb_store::HostKind::Crabcode,
             &OperationId::parse("unknown-1").unwrap(),
             &HostMessage::parse("work").unwrap(),
             thread.as_str(),

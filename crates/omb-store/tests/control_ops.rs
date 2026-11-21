@@ -88,6 +88,7 @@ async fn pending_sender(client: &mut Client, channel: ChannelKind) -> Uuid {
     pair_start(
         client,
         PairStart {
+            host: omb_store::HostKind::Crabcode,
             channel,
             workspace_dir: "/workspaces/project",
             thread_id: "thread-P",
@@ -1018,6 +1019,7 @@ async fn run_facts_returns_event_session_and_permission_rows() {
     upsert_session(
         env.client(),
         SessionStart {
+            host: omb_store::HostKind::Crabcode,
             run_id: "r1",
             binding_id: host,
             workspace_dir: "/workspaces/host",
@@ -1220,6 +1222,7 @@ async fn pair_attempt_uses_the_passed_receiver_source_key_and_reads_no_receiver_
     let started = pair_start(
         &mut env.session.client,
         PairStart {
+            host: omb_store::HostKind::Crabcode,
             channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-P",
@@ -1280,6 +1283,7 @@ async fn testkit_insert_permission_row_satisfies_the_row_check_and_permission_ro
     let host = activate_host(
         &mut env.session.client,
         omb_store::HostBinding {
+            host: omb_store::HostKind::Crabcode,
             workspace_dir: "/workspaces/host",
             granted_generation: 1,
             run_deadline: None,

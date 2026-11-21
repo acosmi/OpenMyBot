@@ -1,24 +1,16 @@
 use crate::{DaemonError, DataDirectoryInput};
-use omb_hostdriver::WorkspaceRoots;
+use omb_hostdriver::{HostKind, WorkspaceRoots};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
-pub(crate) const DIRECTORIES: &[&str] = &[
-    "keys",
-    "pg",
-    "pg/data",
-    "run",
-    "tenant",
-    "hosts",
-    "hosts/crabcode",
-    "hosts/crabcode/tmp",
-    "logs",
-];
+pub(crate) const DIRECTORIES: &[&str] =
+    &["keys", "pg", "pg/data", "run", "tenant", "hosts", "logs"];
 pub(crate) const TOKEN_BYTES: usize = 32;
 pub(crate) const HBA: &[u8] = b"host all openmybot 127.0.0.1/32 scram-sha-256";
 
@@ -27,6 +19,9 @@ pub(crate) const HBA: &[u8] = b"host all openmybot 127.0.0.1/32 scram-sha-256";
 pub(crate) struct Config {
     pub(crate) deployment_id: String,
     pub(crate) pg_bin_dir: PathBuf,
+    /// One list for every host.
+    pub(crate) workspace_roots: Vec<PathBuf>,
+    #[serde(default)]
     pub(crate) hosts: Hosts,
     /// Absent in instances initialized before channel plugins.
     #[serde(default)]
@@ -39,39 +34,47 @@ pub(crate) struct PluginsConfig {
     #[serde(default)]
     pub(crate) path_extra: Vec<PathBuf>,
 }
+/// One optional section per host of `HostKind`; a host without a binary refuses every start.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Hosts {
-    pub(crate) crabcode: CrabcodeSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) crabcode: Option<HostSection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) claude: Option<HostSection>,
 }
-/// The `hosts.crabcode` section as written in `config.toml`.
+/// A `hosts.<host>` section as written in `config.toml`.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CrabcodeSection {
+pub(crate) struct HostSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) binary: Option<PathBuf>,
-    pub(crate) workspace_roots: Vec<PathBuf>,
 }
-/// The `hosts.crabcode` section as types: validated once at startup.
-pub(crate) struct Crabcode {
-    pub(crate) binary: Option<PathBuf>,
+/// The host sections and the workspace roots as types: validated once at startup.
+pub(crate) struct HostsConfig {
+    /// The configured binary of each host that has one.
+    pub(crate) binaries: BTreeMap<HostKind, PathBuf>,
     pub(crate) roots: WorkspaceRoots,
 }
-impl Crabcode {
-    /// The binary must be absolute; each root must be a proper subdirectory of `home` outside
+impl HostsConfig {
+    /// Every binary must be absolute; each root must be a proper subdirectory of `home` outside
     /// `home/Library`.
     pub(crate) fn parse(config: &Config, home: &Path) -> Result<Self, DaemonError> {
-        let section = &config.hosts.crabcode;
-        if section
-            .binary
-            .as_ref()
-            .is_some_and(|binary| !binary.is_absolute())
-        {
-            return Err(DaemonError::HostBinaryInvalid);
+        let mut binaries = BTreeMap::new();
+        for (kind, section) in [
+            (HostKind::Crabcode, &config.hosts.crabcode),
+            (HostKind::Claude, &config.hosts.claude),
+        ] {
+            if let Some(binary) = section.as_ref().and_then(|section| section.binary.clone()) {
+                if !binary.is_absolute() {
+                    return Err(DaemonError::HostBinaryInvalid);
+                }
+                binaries.insert(kind, binary);
+            }
         }
         Ok(Self {
-            binary: section.binary.clone(),
-            roots: WorkspaceRoots::parse(home, &section.workspace_roots)
+            binaries,
+            roots: WorkspaceRoots::parse(home, &config.workspace_roots)
                 .map_err(|_| DaemonError::WorkspaceRootInvalid)?,
         })
     }
@@ -215,6 +218,20 @@ pub(crate) fn load(root: &Path) -> Result<Config, DaemonError> {
     for name in DIRECTORIES {
         check(&root.join(name), true)?;
     }
+    // Instances initialized before a host was added get its directories here.
+    for kind in HostKind::ALL {
+        for name in [
+            format!("hosts/{}", kind.as_str()),
+            format!("hosts/{}/tmp", kind.as_str()),
+        ] {
+            let path = root.join(name);
+            if path.exists() {
+                check(&path, true)?;
+            } else {
+                make_dir(&path)?;
+            }
+        }
+    }
     check_tree(&root.join("pg/data"))?;
     check_tree(&root.join("logs"))?;
     for name in ["keys/vault-kek.key", "keys/app-master.key"] {
@@ -234,11 +251,9 @@ pub(crate) fn load(root: &Path) -> Result<Config, DaemonError> {
             Err(_) => return Err(DaemonError::DataDirPermissionsInvalid),
         }
     }
-    let config: Config = toml::from_str(
-        std::str::from_utf8(&read_private(&root.join("config.toml"), 64 * 1024)?)
-            .map_err(|_| DaemonError::DataDirPermissionsInvalid)?,
-    )
-    .map_err(|_| DaemonError::DataDirPermissionsInvalid)?;
+    let text = String::from_utf8(read_private(&root.join("config.toml"), 64 * 1024)?)
+        .map_err(|_| DaemonError::DataDirPermissionsInvalid)?;
+    let config = parse_config(&text)?;
     if !config.pg_bin_dir.is_absolute()
         || !config
             .plugins
@@ -253,6 +268,24 @@ pub(crate) fn load(root: &Path) -> Result<Config, DaemonError> {
         return Err(DaemonError::DataDirPermissionsInvalid);
     }
     Ok(config)
+}
+/// Unknown keys refuse startup; `workspace_roots` inside `[hosts.crabcode]` is the layout before
+/// the host table and is refused with its own code, without a silent migration.
+fn parse_config(text: &str) -> Result<Config, DaemonError> {
+    toml::from_str(text).map_err(|_| {
+        let old = toml::from_str::<toml::Table>(text).is_ok_and(|table| {
+            table
+                .get("hosts")
+                .and_then(|hosts| hosts.get("crabcode"))
+                .and_then(|crabcode| crabcode.get("workspace_roots"))
+                .is_some()
+        });
+        if old {
+            DaemonError::ConfigInvalid
+        } else {
+            DaemonError::DataDirPermissionsInvalid
+        }
+    })
 }
 fn check_tree(directory: &Path) -> Result<(), DaemonError> {
     for entry in fs::read_dir(directory).map_err(|_| DaemonError::DataDirPermissionsInvalid)? {
@@ -330,55 +363,82 @@ pub(crate) fn test_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    const BASE: &str = "deployment_id='omb-local-00000000000000000000000000000000'\npg_bin_dir='/pg'\nworkspace_roots=[]\n";
     #[test]
-    fn rejects_unknown_config_fields() {
-        let base = "deployment_id='omb-local-00000000000000000000000000000000'\npg_bin_dir='/pg'\n[hosts.crabcode]\nworkspace_roots=[]\n";
-        assert!(toml::from_str::<Config>(base).is_ok());
-        assert!(toml::from_str::<Config>(&format!("unknown=1\n{base}")).is_err());
-        assert!(toml::from_str::<Config>(&format!("{base}unknown=1\n")).is_err());
-        assert!(
-            toml::from_str::<Config>(
-                &base.replace("[hosts.crabcode]", "[hosts]\nunknown=1\n[hosts.crabcode]")
-            )
-            .is_err()
-        );
+    fn rejects_unknown_config_fields_and_hosts_outside_the_table() {
+        let base = format!("{BASE}[hosts.crabcode]\n[hosts.claude]\nbinary='/opt/claude'\n");
+        assert!(parse_config(&base).is_ok());
+        assert!(parse_config(BASE).is_ok());
+        for text in [
+            format!("unknown=1\n{base}"),
+            format!("{base}unknown=1\n"),
+            base.replace("[hosts.crabcode]", "[hosts]\nunknown=1\n[hosts.crabcode]"),
+            format!("{BASE}[hosts.dsh]\nbinary='/opt/dsh'\n"),
+            format!("{BASE}[hosts.pi]\n"),
+            format!("{BASE}[hosts.wrok]\n"),
+            format!("{BASE}[hosts.claude]\nworkspace_roots=[]\n"),
+            BASE.replace("workspace_roots=[]\n", ""),
+        ] {
+            assert_eq!(
+                parse_config(&text).err(),
+                Some(DaemonError::DataDirPermissionsInvalid),
+                "{text}"
+            );
+        }
     }
-    fn crabcode(binary: Option<&str>, roots: &[PathBuf]) -> Config {
+    #[test]
+    fn layout_with_roots_inside_the_crabcode_section_is_config_invalid() {
+        let old = "deployment_id='omb-local-00000000000000000000000000000000'\npg_bin_dir='/pg'\n[hosts.crabcode]\nbinary='/opt/crab/bin/crabcode'\nworkspace_roots=[]\n";
+        assert_eq!(parse_config(old).err(), Some(DaemonError::ConfigInvalid));
+        assert_eq!(
+            parse_config(&format!("workspace_roots=[]\n{old}")).err(),
+            Some(DaemonError::ConfigInvalid)
+        );
+        assert_eq!(DaemonError::ConfigInvalid.code(), "config_invalid");
+    }
+    fn hosts(crabcode: Option<&str>, claude: Option<&str>, roots: &[PathBuf]) -> Config {
+        let section = |binary: Option<&str>| {
+            binary.map(|binary| HostSection {
+                binary: Some(PathBuf::from(binary)),
+            })
+        };
         Config {
             deployment_id: "omb-local-00000000000000000000000000000000".into(),
             pg_bin_dir: "/pg".into(),
+            workspace_roots: roots.to_vec(),
             hosts: Hosts {
-                crabcode: CrabcodeSection {
-                    binary: binary.map(PathBuf::from),
-                    workspace_roots: roots.to_vec(),
-                },
+                crabcode: section(crabcode),
+                claude: section(claude),
             },
             plugins: PluginsConfig::default(),
         }
     }
     #[test]
-    fn crabcode_section_is_parsed_once_into_typed_roots_and_absolute_binary() {
+    fn host_sections_and_roots_are_parsed_once_into_typed_binaries_and_roots() {
         let home = test_dir();
         let project = home.join("code/project");
         fs::create_dir_all(&project).unwrap();
         let text = format!(
-            "deployment_id='omb-local-00000000000000000000000000000000'\npg_bin_dir='/pg'\n[hosts.crabcode]\nbinary='/opt/crab/bin/crabcode'\nworkspace_roots=['{}']\n",
-            home.join("code").display()
+            "{}[hosts.crabcode]\nbinary='/opt/crab/bin/crabcode'\n[hosts.claude]\n",
+            BASE.replace("[]", &format!("['{}']", home.join("code").display()))
         );
-        let config: Config = toml::from_str(&text).unwrap();
-        let parsed = Crabcode::parse(&config, &home).unwrap();
+        let parsed = HostsConfig::parse(&parse_config(&text).unwrap(), &home).unwrap();
         assert_eq!(
-            parsed.binary.as_deref(),
-            Some(Path::new("/opt/crab/bin/crabcode"))
+            parsed.binaries,
+            BTreeMap::from([(HostKind::Crabcode, PathBuf::from("/opt/crab/bin/crabcode"))])
         );
         assert_eq!(
             parsed.roots.resolve(&project),
             Some(fs::canonicalize(&project).unwrap())
         );
         assert_eq!(parsed.roots.resolve(&home), None);
-        let default = Crabcode::parse(&crabcode(None, &[]), &home).unwrap();
-        assert!(default.binary.is_none());
-        assert_eq!(default.roots.resolve(&project), None);
+        let both =
+            HostsConfig::parse(&hosts(Some("/a/crabcode"), Some("/b/claude"), &[]), &home).unwrap();
+        assert_eq!(both.binaries.len(), 2);
+        assert_eq!(both.binaries[&HostKind::Claude], PathBuf::from("/b/claude"));
+        let none = HostsConfig::parse(&hosts(None, None, &[]), &home).unwrap();
+        assert!(none.binaries.is_empty());
+        assert_eq!(none.roots.resolve(&project), None);
         fs::remove_dir_all(home).unwrap();
     }
     #[test]
@@ -394,7 +454,7 @@ mod tests {
             PathBuf::from("relative"),
         ] {
             assert_eq!(
-                Crabcode::parse(&crabcode(None, &[root]), &home).err(),
+                HostsConfig::parse(&hosts(None, None, &[root]), &home).err(),
                 Some(DaemonError::WorkspaceRootInvalid)
             );
         }
@@ -408,10 +468,15 @@ mod tests {
     #[test]
     fn relative_binary_refuses_startup() {
         let home = test_dir();
-        assert_eq!(
-            Crabcode::parse(&crabcode(Some("bin/crabcode"), &[]), &home).err(),
-            Some(DaemonError::HostBinaryInvalid)
-        );
+        for config in [
+            hosts(Some("bin/crabcode"), None, &[]),
+            hosts(None, Some("claude"), &[]),
+        ] {
+            assert_eq!(
+                HostsConfig::parse(&config, &home).err(),
+                Some(DaemonError::HostBinaryInvalid)
+            );
+        }
         assert_eq!(DaemonError::HostBinaryInvalid.code(), "host_binary_invalid");
         fs::remove_dir_all(home).unwrap();
     }
@@ -449,7 +514,8 @@ mod tests {
     }
     #[test]
     fn plugins_section_defaults_to_no_path_extra_and_a_relative_entry_refuses_startup() {
-        let base = "deployment_id='omb-local-00000000000000000000000000000000'\npg_bin_dir='/pg'\n[hosts.crabcode]\nworkspace_roots=[]\n";
+        let base = format!("{BASE}[hosts.crabcode]\n");
+        let base = base.as_str();
         assert!(
             toml::from_str::<Config>(base)
                 .unwrap()
@@ -477,6 +543,10 @@ mod tests {
             load(&root).unwrap().plugins.path_extra,
             [PathBuf::from("/opt/node/bin")]
         );
+        // The host directories of an instance initialized before a host was added are created.
+        for kind in HostKind::ALL {
+            check(&root.join(format!("hosts/{}/tmp", kind.as_str())), true).unwrap();
+        }
         write_private(
             &config,
             format!("{base}[plugins]\npath_extra=['node/bin']\n").as_bytes(),

@@ -1,6 +1,6 @@
-//! The version window: CrabCode versions accepted after a recorded real-host recheck.
-use crate::spawn::SpawnSpec;
-use omb_store::EndReason;
+//! The version window: host versions accepted after a recorded real-host recheck.
+use crate::{host::profile, spawn::SpawnSpec};
+use omb_store::{EndReason, HostKind};
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, time::Duration};
 use tokio::io::AsyncReadExt;
@@ -47,12 +47,23 @@ fn text(value: &Value) -> Result<String, WindowError> {
 }
 
 impl VersionWindow {
-    /// The manifest compiled into this binary.
-    pub fn embedded() -> Self {
-        Self::parse(include_str!(
-            "../../../openmybot/compat/crabcode/accepted.json"
-        ))
-        .expect("embedded version window parses")
+    /// The host's manifest compiled into this binary.
+    pub fn embedded(kind: HostKind) -> Self {
+        Self::for_host(kind, profile(kind).window).expect("embedded version window parses")
+    }
+    /// `parse`, and no entry's `extra_env` sets one of the host's forbidden variables.
+    fn for_host(kind: HostKind, json: &str) -> Result<Self, WindowError> {
+        let window = Self::parse(json)?;
+        let forbidden = profile(kind).forbidden_env;
+        if window.0.iter().any(|entry| {
+            entry
+                .extra_env
+                .keys()
+                .any(|key| forbidden.contains(&key.as_str()))
+        }) {
+            return Err(WindowError::Invalid);
+        }
+        Ok(window)
     }
     /// Closed schema: unknown fields, a gate other than `pass` or a malformed commit refuse the
     /// whole manifest; `gates`, `verified_at`, `engine_commit` and `record` are dropped after
@@ -109,7 +120,7 @@ impl VersionWindow {
     }
 }
 
-/// The first `X.Y.Z` of the first line.
+/// The first `X.Y.Z` of the first line, with the `-<prerelease>` that immediately follows it.
 pub(crate) fn parse_version_line(output: &str) -> Option<String> {
     let line = output.lines().next()?.as_bytes();
     let digits = |from: usize| {
@@ -136,6 +147,15 @@ pub(crate) fn parse_version_line(output: &str) -> Option<String> {
                     return None;
                 }
                 end += count;
+            }
+            if line.get(end) == Some(&b'-') {
+                let prerelease = line[end + 1..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric() || **b == b'.' || **b == b'-')
+                    .count();
+                if prerelease > 0 {
+                    end += 1 + prerelease;
+                }
             }
             Some(String::from_utf8_lossy(&line[start..end]).into_owned())
         })
@@ -255,6 +275,22 @@ mod tests {
             None
         );
         assert_eq!(parse_version_line("crabcode\n1.1.16\n"), None);
+        assert_eq!(
+            parse_version_line("2.1.319 (Claude Code)\n").as_deref(),
+            Some("2.1.319")
+        );
+        assert_eq!(
+            parse_version_line("0.2.2-rc.1\n").as_deref(),
+            Some("0.2.2-rc.1")
+        );
+        assert_eq!(
+            parse_version_line("codex-cli 0.167.0-alpha.4.1").as_deref(),
+            Some("0.167.0-alpha.4.1")
+        );
+        assert_eq!(
+            parse_version_line("pi 1.5.2- build").as_deref(),
+            Some("1.5.2")
+        );
         assert_eq!(parse_version_line(""), None);
     }
 
@@ -268,8 +304,26 @@ mod tests {
     }
 
     #[test]
-    fn embedded_manifest_parses() {
-        let window = VersionWindow::embedded();
-        assert!(window.0.iter().all(|accepted| !accepted.version.is_empty()));
+    fn embedded_manifests_parse_and_claude_is_empty_until_rechecked() {
+        for kind in HostKind::ALL {
+            let window = VersionWindow::embedded(kind);
+            assert!(window.0.iter().all(|accepted| !accepted.version.is_empty()));
+        }
+        assert!(VersionWindow::embedded(HostKind::Claude).0.is_empty());
+    }
+
+    #[test]
+    fn a_window_entry_setting_a_forbidden_variable_is_invalid_for_that_host() {
+        let json = manifest(
+            &entry(COMMIT, "pass", "")
+                .replace(r#"{"K":"V"}"#, r#"{"CRABCODE_PRINT_APP_SERVER":"1"}"#),
+        );
+        assert_eq!(
+            VersionWindow::for_host(HostKind::Crabcode, &json).unwrap_err(),
+            WindowError::Invalid
+        );
+        assert!(VersionWindow::for_host(HostKind::Claude, &json).is_ok());
+        let plain = manifest(&entry(COMMIT, "pass", ""));
+        assert!(VersionWindow::for_host(HostKind::Crabcode, &plain).is_ok());
     }
 }

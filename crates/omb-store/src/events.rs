@@ -417,6 +417,8 @@ pub async fn open_run(client: &Client, binding_id: Uuid) -> Result<Option<OpenRu
 pub struct DispatchItem {
     pub record_id: Uuid,
     pub binding_id: Uuid,
+    /// The binding's host, which picks the Bot.
+    pub host: crate::HostKind,
     pub revision: u64,
     pub thread_id: String,
     pub run_id: String,
@@ -435,13 +437,14 @@ pub enum Claim {
 /// its current thread did not end in reconciliation (a host binding has no thread to pause).
 pub async fn claim_dispatch(client: &Client) -> Result<Claim, StoreError> {
     let error = StoreError::DispatchFailed;
-    let heads = rows(client, "SELECT e.record_id,e.binding_id,b.revision,e.thread_id,e.run_id,e.text,e.dispatch_attempts,e.next_dispatch_at,e.next_dispatch_at IS NULL OR e.next_dispatch_at<=statement_timestamp() FROM openmybot.channel_events e JOIN openmybot.channel_bindings b ON b.binding_id=e.binding_id WHERE e.dispatch_status='pending' AND b.status='active' AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events p WHERE p.binding_id=e.binding_id AND p.dispatch_status='pending' AND (p.accepted_at,p.record_id)<(e.accepted_at,e.record_id)) AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.dispatch_status='dispatched' AND d.terminal_kind IS NULL) AND (SELECT d.terminal_kind FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.thread_id=b.thread_id AND d.dispatch_status='dispatched' ORDER BY d.dispatched_at DESC,d.record_id DESC LIMIT 1) IS DISTINCT FROM 'reconciliation_required' ORDER BY e.accepted_at,e.record_id", &[], Instant::now() + READ_BUDGET, error).await?;
+    let heads = rows(client, "SELECT e.record_id,e.binding_id,b.revision,e.thread_id,e.run_id,e.text,e.dispatch_attempts,e.next_dispatch_at,e.next_dispatch_at IS NULL OR e.next_dispatch_at<=statement_timestamp(),b.host_kind FROM openmybot.channel_events e JOIN openmybot.channel_bindings b ON b.binding_id=e.binding_id WHERE e.dispatch_status='pending' AND b.status='active' AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events p WHERE p.binding_id=e.binding_id AND p.dispatch_status='pending' AND (p.accepted_at,p.record_id)<(e.accepted_at,e.record_id)) AND NOT EXISTS (SELECT 1 FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.dispatch_status='dispatched' AND d.terminal_kind IS NULL) AND (SELECT d.terminal_kind FROM openmybot.channel_events d WHERE d.binding_id=e.binding_id AND d.thread_id=b.thread_id AND d.dispatch_status='dispatched' ORDER BY d.dispatched_at DESC,d.record_id DESC LIMIT 1) IS DISTINCT FROM 'reconciliation_required' ORDER BY e.accepted_at,e.record_id", &[], Instant::now() + READ_BUDGET, error).await?;
     let mut wake_at = None;
     for row in &heads {
         if row.try_get::<_, bool>(8).map_err(|_| error)? {
             return Ok(Claim::Item(DispatchItem {
                 record_id: row.try_get(0).map_err(|_| error)?,
                 binding_id: row.try_get(1).map_err(|_| error)?,
+                host: crate::HostKind::parse(row.try_get(9).map_err(|_| error)?).ok_or(error)?,
                 revision: count(row, 2, error)?,
                 thread_id: row.try_get(3).map_err(|_| error)?,
                 run_id: row.try_get(4).map_err(|_| error)?,
@@ -787,11 +790,12 @@ fn host_fingerprint(binding_id: Uuid, operation: &OperationId, message: &HostMes
     );
     Sha256::digest(text.as_bytes()).into()
 }
-/// Accepts one host run request in one transaction: the live host binding, the operation's
+/// Accepts one host run request in one transaction: the host's live binding, the operation's
 /// earlier acceptance and the binding's pending queue decide; only a new operation writes its
 /// pending event, on `thread_id` minted by the caller.
 pub async fn accept_host_begin(
     client: &mut Client,
+    host: crate::HostKind,
     operation: &OperationId,
     message: &HostMessage,
     thread_id: &str,
@@ -799,6 +803,7 @@ pub async fn accept_host_begin(
 ) -> Result<HostAccept, StoreError> {
     let error = StoreError::EventFailed;
     let event_key = format!("op:{}", operation.as_str());
+    let host = host.as_str();
     timely(deadline, Ok(()), error)?;
     let tx = timeout_at(deadline, client.transaction())
         .await
@@ -809,7 +814,7 @@ pub async fn accept_host_begin(
             .await
             .map_err(|_| error)?
             .map_err(|_| error)?;
-        let bound = rows(&tx, "SELECT binding_id,status FROM openmybot.channel_bindings WHERE binding_kind='host' AND status IN ('pending','active','suspended') FOR SHARE", &[], deadline, error).await?;
+        let bound = rows(&tx, "SELECT binding_id,status FROM openmybot.channel_bindings WHERE binding_kind='host' AND source_key=$1 AND status IN ('pending','active','suspended') FOR SHARE", &[&host], deadline, error).await?;
         let Some(binding) = bound.first() else {
             return Ok(HostAccept::NotBound);
         };
@@ -818,9 +823,9 @@ pub async fn accept_host_begin(
         }
         let binding_id: Uuid = binding.try_get(0).map_err(|_| error)?;
         // Serializes concurrent begins of one operation; the next statement sees the winner's row.
-        rows(&tx, "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1,0))", &[&format!("host\ncrabcode\n{event_key}")], deadline, error).await?;
+        rows(&tx, "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1,0))", &[&format!("host\n{host}\n{event_key}")], deadline, error).await?;
         let fingerprint = host_fingerprint(binding_id, operation, message);
-        let seen = rows(&tx, "SELECT fingerprint,run_id,thread_id FROM openmybot.channel_events WHERE channel_kind='host' AND source_key='crabcode' AND event_key=$1", &[&event_key], deadline, error).await?;
+        let seen = rows(&tx, "SELECT fingerprint,run_id,thread_id FROM openmybot.channel_events WHERE channel_kind='host' AND source_key=$2 AND event_key=$1", &[&event_key, &host], deadline, error).await?;
         if let Some(row) = seen.first() {
             let stored: Option<Vec<u8>> = row.try_get(0).map_err(|_| error)?;
             if stored.is_some_and(|stored| stored[..] != fingerprint[..]) {
@@ -837,7 +842,7 @@ pub async fn accept_host_begin(
         }
         let record_id = Uuid::now_v7();
         let run = run_id(binding_id, record_id).to_string();
-        rows(&tx, "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,event_type,occurred_at,accepted_at,fingerprint,sender_key,chat_key,binding_id,disposition,command,text,text_sha256,run_id,thread_id,dispatch_status) VALUES ($1,'event','host','crabcode',$2,'host.run_begin',NULL,statement_timestamp(),$3,'host:crabcode',NULL,$4,'accepted_message',NULL,$5,$6,$7,$8,'pending') RETURNING record_id", &[&record_id, &event_key, &fingerprint.as_slice(), &binding_id, &message.as_str(), &Sha256::digest(message.as_str().as_bytes()).as_slice(), &run, &thread_id], deadline, error).await?;
+        rows(&tx, "INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,event_type,occurred_at,accepted_at,fingerprint,sender_key,chat_key,binding_id,disposition,command,text,text_sha256,run_id,thread_id,dispatch_status) VALUES ($1,'event','host',$9,$2,'host.run_begin',NULL,statement_timestamp(),$3,'host:' || $9,NULL,$4,'accepted_message',NULL,$5,$6,$7,$8,'pending') RETURNING record_id", &[&record_id, &event_key, &fingerprint.as_slice(), &binding_id, &message.as_str(), &Sha256::digest(message.as_str().as_bytes()).as_slice(), &run, &thread_id, &host], deadline, error).await?;
         Ok(HostAccept::Accepted(HostRun {
             run_id: run,
             thread_id: thread_id.to_owned(),
