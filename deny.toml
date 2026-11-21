@@ -87,7 +87,7 @@ allow = [
 # 置信度阈值：低于它 cargo-deny 会认为"没看懂这份 LICENSE 文本"并按 unknown 处理（= 拒绝）。
 confidence-threshold = 0.93
 # 第一方 crate 全部 `publish = false`（见 workspace 根 Cargo.toml），
-# 它们的 `LicenseRef-WrokBot-Personal-Free-Enterprise-Authorization` 不需要、也不应该出现在上面的 allow 白名单里。
+# 它们的 `LicenseRef-WrokBot-Community-1.0` 由下方的 private.ignore 排除。
 private = { ignore = true }
 # 单 crate 豁免。**空**是刻意的：任何豁免都必须带书面理由与 owner（v3 §23.1 末段
 #"所有复用生成机器可读 provenance"），不允许为了让闸门变绿而顺手加一行。
