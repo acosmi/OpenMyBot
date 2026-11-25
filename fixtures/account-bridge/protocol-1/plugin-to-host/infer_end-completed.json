@@ -1,0 +1,13 @@
+{
+  "type": "infer_end",
+  "requestId": "req-0001",
+  "outcome": {
+    "status": "completed",
+    "usage": {
+      "inputTokens": 9,
+      "outputTokens": 2,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  }
+}

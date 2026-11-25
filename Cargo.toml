@@ -23,6 +23,7 @@ members = [
     "crates/omb-channel-sdk",
     "crates/omb-hostdriver",
     "crates/omb-mcp",
+    "crates/openbot-account-bridge",
     "crates/openbot-contracts",
     "crates/openbot-domain",
     "crates/openbot-application",

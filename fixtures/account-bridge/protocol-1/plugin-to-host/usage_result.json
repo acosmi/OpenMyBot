@@ -1,0 +1,7 @@
+{
+  "type": "usage_result",
+  "requestId": "req-0001",
+  "usage": {
+    "windows": [{ "name": "fixture-window", "usedPercent": 12 }]
+  }
+}

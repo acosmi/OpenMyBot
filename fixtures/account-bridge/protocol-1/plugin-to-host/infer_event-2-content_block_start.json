@@ -1,0 +1,9 @@
+{
+  "type": "infer_event",
+  "requestId": "req-0001",
+  "event": {
+    "type": "content_block_start",
+    "index": 0,
+    "content_block": { "type": "text", "text": "" }
+  }
+}

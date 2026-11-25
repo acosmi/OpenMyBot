@@ -1,0 +1,6 @@
+{
+  "type": "hello_ok",
+  "protocol": "wrokbot-account-bridge/1",
+  "pluginVersion": "0.0.0-fixture.1",
+  "connectors": ["openai", "anthropic", "xai", "qwen", "kimi", "zai"]
+}

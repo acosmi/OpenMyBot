@@ -1,0 +1,6 @@
+{
+  "type": "login_start",
+  "requestId": "req-0001",
+  "attemptId": "00000000-0000-4000-8000-00000000a001",
+  "connector": "openai"
+}
