@@ -97,6 +97,9 @@ mod first_source;
 #[path = "../xtask/acceptance.rs"]
 mod acceptance;
 
+#[path = "../xtask/release.rs"]
+mod release;
+
 // ---------------------------------------------------------------------------
 // 契约常量
 // ---------------------------------------------------------------------------
@@ -265,6 +268,7 @@ fn main() -> ExitCode {
         }
         Some("first-source-check") => first_source::run(&args[1..]),
         Some("acceptance-check") => acceptance::run(&args[1..]),
+        Some("release") => workspace_root().and_then(|root| release::run(&root, &args[1..])),
         Some("ci") => cmd_ci(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
@@ -329,6 +333,11 @@ xtask —— OpenBot 仓库闸门驱动器
   cargo xtask acceptance-check --record <json> --candidate <manifest> --evidence-root <dir> [--spec <first-source.md>] [--json]
                                       核 v5/macOS 与 v6 M0/M1/full_v6 收集集合；v6 必须绑定 --spec，
                                       full_v5 及 full_v6 聚合关闭准入明确未支持
+  cargo xtask release root --mode development|release --ui <dir> --tenant <dir> --postgres <dir>
+                          [--maintenance <dir>]
+                          --provider <json> --agent-budgets <json> --recovery-control <json>
+                          [--normal-capture <json>] --out <new dir> [--check-with <wrok-bot>]
+                                      Assemble a Desktop release root and its outer manifest digest
   cargo xtask ci                      按 v3 §16.3 顺序跑本机可执行的闸门段
   cargo xtask help                    打印本帮助
 "
