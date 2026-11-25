@@ -21,7 +21,6 @@ use openbot_contracts::memory::{
     MemorySensitivity, MemoryStatus,
 };
 use sha2::{Digest, Sha256};
-use time::format_description::well_known::Rfc3339;
 
 #[cfg(target_arch = "wasm32")]
 use crate::api::{
@@ -32,7 +31,8 @@ use crate::features::layout::{PageEmpty, PageHeader, PageRows, PageSection, Page
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
     Badge, BadgeTone, Button, ButtonSize, ButtonVariant, Dialog, DialogBody, DialogClose,
-    DialogContent, DialogFooter, Field, Input, InputType, Switch, Textarea,
+    DialogContent, DialogFooter, Field, Input, InputType, Notice, NoticeTone, Switch, Textarea,
+    Timestamp,
 };
 
 /// Native memory list and control destination required by v3 §3.1 item 7.
@@ -294,6 +294,33 @@ pub fn MemoryPage() -> impl IntoView {
         }
     });
 
+    // Deleting erases the content, so it is confirmed first; forbidding is not.
+    let delete_open = RwSignal::new(false);
+    let delete_target = RwSignal::new(None::<String>);
+    let delete_excerpt = RwSignal::new(None::<String>);
+    let request_mutation =
+        UnsyncCallback::new(move |(memory_id, mutation): (String, MemoryMutation)| {
+            if matches!(mutation, MemoryMutation::Delete) {
+                delete_excerpt.set(memories.with_untracked(|rows| {
+                    rows.iter()
+                        .find(|row| row.memory_id == memory_id)
+                        .and_then(|row| row.content.as_deref().map(memory_excerpt))
+                }));
+                delete_target.set(Some(memory_id));
+                delete_open.set(true);
+            } else {
+                mutate.run((memory_id, mutation));
+            }
+        });
+    let close_delete = UnsyncCallback::new(move |_| delete_target.set(None));
+    let confirm_delete = move |_| {
+        if let Some(memory_id) = delete_target.get_untracked() {
+            mutate.run((memory_id, MemoryMutation::Delete));
+        }
+        delete_target.set(None);
+        delete_open.set(false);
+    };
+
     view! {
         <PageShell width=PageWidth::Content>
             <div class="ob-memory-page">
@@ -306,18 +333,18 @@ pub fn MemoryPage() -> impl IntoView {
                     reload_generation
                     pending_ids
                     on_correct=open_correction
-                    on_mutate=mutate
+                    on_mutate=request_mutation
                 />
                 <Show when=move || loading.get()>
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
                 </Show>
                 <Show when=move || load_error.get() != MemoryReadIssue::None>
-                    <div class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         <span>{move || if load_error.get() == MemoryReadIssue::ReconciliationRequired { t_string!(i18n, memory.reconciliation_required).to_owned() } else { t_string!(i18n, memory.load_error).to_owned() }}</span>
                         <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>
                             {move || t!(i18n, models.refresh)}
                         </Button>
-                    </div>
+                    </Notice>
                 </Show>
                 <Show when=move || !loading.get() && load_error.get() == MemoryReadIssue::None>
                     <PageSection
@@ -338,7 +365,7 @@ pub fn MemoryPage() -> impl IntoView {
                             </Field>
                         </div>
                         <Show when=move || control_error.get()>
-                            <p class="ob-alert" role="alert">{move || t!(i18n, memory.control_error)}</p>
+                            <Notice tone=NoticeTone::Error>{move || t!(i18n, memory.control_error)}</Notice>
                         </Show>
                     </PageSection>
                     <PageSection
@@ -361,7 +388,7 @@ pub fn MemoryPage() -> impl IntoView {
                                             writes_enabled=Signal::derive(move || writes_enabled.get())
                                             pending_ids
                                             on_correct=open_correction
-                                            on_mutate=mutate
+                                            on_mutate=request_mutation
                                         />
                                     }
                                 />
@@ -379,11 +406,36 @@ pub fn MemoryPage() -> impl IntoView {
                         </Show>
                     </PageSection>
                     <Show when=move || action_error.get()>
-                        <p class="ob-alert" role="alert">{move || t!(i18n, memory.action_error)}</p>
+                        <Notice tone=NoticeTone::Error>{move || t!(i18n, memory.action_error)}</Notice>
                     </Show>
                 </Show>
             </div>
         </PageShell>
+        <Dialog id="memory-delete-dialog" open=delete_open on_close=close_delete>
+            <DialogContent
+                title=move || t_string!(i18n, memory.delete_title).to_owned()
+                description=move || t_string!(i18n, memory.delete_description).to_owned()
+            >
+                <Show when=move || delete_excerpt.with(Option::is_some)>
+                    <DialogBody>
+                        <p class="ob-memory-content">{move || delete_excerpt.get()}</p>
+                    </DialogBody>
+                </Show>
+                <DialogFooter>
+                    <DialogClose id="memory-delete-cancel">
+                        {move || t!(i18n, common.cancel)}
+                    </DialogClose>
+                    <Button
+                        id="memory-delete-confirm"
+                        variant=ButtonVariant::DangerText
+                        size=ButtonSize::Medium
+                        on_activate=confirm_delete
+                    >
+                        {move || t!(i18n, memory.delete_entry)}
+                    </Button>
+                </DialogFooter>
+            </DialogContent>
+        </Dialog>
         <Dialog id="memory-correct-dialog" open=correct_open on_close=close_correction>
             <DialogContent
                 title=move || t_string!(i18n, memory.correct_title).to_owned()
@@ -516,7 +568,7 @@ fn MemorySearch(
                 </Button>
             </div>
             <Show when=move || failed.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, memory.load_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, memory.load_error)}</Notice>
             </Show>
             <Show when=move || results.get().is_some_and(|records| records.is_empty())>
                 <PageEmpty>{move || t!(i18n, common.no_results)}</PageEmpty>
@@ -580,7 +632,7 @@ fn MemoryRow(
     let scope = record.scope.clone();
     let tags = StoredValue::new(record.tags.clone());
     let source = StoredValue::new(record.source.clone());
-    let created_at = format_timestamp(record.created_at);
+    let created_at = record.created_at;
     let status = record.status;
     let kind = record.memory_kind;
     let sensitivity = record.sensitivity;
@@ -604,7 +656,7 @@ fn MemoryRow(
             </p>
             <p class="ob-memory-scope">{move || scope_label(i18n, &scope)}</p>
             <div class="ob-memory-provenance">
-                <span>{move || t_string!(i18n, memory.created_at, when = created_at.as_str()).to_owned()}</span>
+                <span>{move || t!(i18n, memory.created)} " " <Timestamp at=created_at /></span>
                 <span>{move || t_string!(i18n, memory.origin, value = origin_label(i18n, origin)).to_owned()}</span>
                 <Show when=move || source.get_value().is_some()>
                     {move || source.get_value().map(|source| t_string!(
@@ -737,12 +789,6 @@ fn memory_excerpt(raw: &str) -> String {
 
 fn correct_trigger_id(memory_id: &str) -> String {
     format!("{}-correct", memory_dom_id(memory_id))
-}
-
-fn format_timestamp(timestamp: time::OffsetDateTime) -> String {
-    timestamp
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| timestamp.unix_timestamp().to_string())
 }
 
 fn dismiss_correction(
@@ -928,10 +974,6 @@ mod tests {
         let long = "x".repeat(90);
         assert_eq!(memory_excerpt(&long).chars().count(), 81);
         assert_eq!(correct_trigger_id("memory-1").len(), 31);
-        assert_eq!(
-            format_timestamp(OffsetDateTime::UNIX_EPOCH),
-            "1970-01-01T00:00:00Z"
-        );
         assert_eq!(status_name(MemoryStatus::Forbidden), "forbidden");
         assert_eq!(status_tone(MemoryStatus::Deleted), BadgeTone::Danger);
     }

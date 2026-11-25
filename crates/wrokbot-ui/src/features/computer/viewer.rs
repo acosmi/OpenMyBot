@@ -5,7 +5,7 @@
 use crate::{
     features::computer::ComputerPlaceholder,
     i18n::{Locale, t, t_string, use_i18n},
-    primitives::{Button, ButtonSize, ButtonVariant},
+    primitives::{Button, ButtonSize, ButtonVariant, timestamp::localized_date_time},
 };
 use leptos::prelude::*;
 use openbot_contracts::screen::ScreenSessionTarget;
@@ -234,73 +234,15 @@ pub(crate) fn ScreenViewer(
     }
 }
 
-fn source_capture_millis(ms: i64) -> Option<f64> {
-    // JS Date's range is narrower than i64 and remains within exact integer f64 milliseconds.
-    (ms > 0 && ms <= 8_640_000_000_000_000).then_some(ms as f64)
-}
-
 fn format_source_capture(ms: i64, locale: Locale) -> Option<(String, String)> {
-    let millis = source_capture_millis(ms)?;
-    #[cfg(target_arch = "wasm32")]
-    {
-        use wasm_bindgen::JsValue;
-        let date = js_sys::Date::new(&JsValue::from_f64(millis));
-        if !date.get_time().is_finite() {
-            return None;
-        }
-        let options = js_sys::Object::new();
-        for (key, value) in [
-            ("year", "numeric"),
-            ("month", "2-digit"),
-            ("day", "2-digit"),
-            ("hour", "2-digit"),
-            ("minute", "2-digit"),
-            ("second", "2-digit"),
-            ("timeZoneName", "short"),
-        ] {
-            js_sys::Reflect::set(&options, &JsValue::from_str(key), &JsValue::from_str(value))
-                .ok()?;
-        }
-        let locale = match locale {
-            Locale::en => "en",
-            Locale::zh_CN => "zh-CN",
-        };
-        Some((
-            date.to_iso_string().as_string()?,
-            date.to_locale_string(locale, options.as_ref())
-                .as_string()?,
-        ))
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = millis;
-        let date =
-            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()?;
-        let datetime = date
-            .format(&time::format_description::well_known::Rfc3339)
-            .ok()?;
-        let label = match locale {
-            Locale::en => format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-                date.year(),
-                u8::from(date.month()),
-                date.day(),
-                date.hour(),
-                date.minute(),
-                date.second(),
-            ),
-            Locale::zh_CN => format!(
-                "{:04}年{:02}月{:02}日 {:02}:{:02}:{:02} UTC",
-                date.year(),
-                u8::from(date.month()),
-                date.day(),
-                date.hour(),
-                date.minute(),
-                date.second(),
-            ),
-        };
-        Some((datetime, label))
-    }
+    let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .ok()
+        .filter(|_| ms > 0)?;
+    Some((
+        at.format(&time::format_description::well_known::Rfc3339)
+            .ok()?,
+        localized_date_time(at, locale),
+    ))
 }
 
 fn screen_url(origin: &str) -> Option<String> {

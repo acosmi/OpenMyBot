@@ -5,9 +5,9 @@ use crate::features::admin::plugins::PluginActions;
 use crate::features::layout::{PageEmpty, PageHeader, PageRows, PageSection, PageShell};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
-    Button, ButtonVariant, Dialog, DialogBody, DialogContent, DialogFooter, Field, Input,
-    SecretInput, SecretInputController, SecretInputPolicy, SecretInputStatus, Select,
-    SelectContent, SelectItem, SelectTrigger,
+    Button, ButtonVariant, Dialog, DialogBody, DialogContent, DialogFooter, Field, Input, Notice,
+    NoticePresentation, NoticeTone, SecretInput, SecretInputController, SecretInputPolicy,
+    SecretInputStatus, Select, SelectContent, SelectItem, SelectTrigger, TechnicalDetails,
 };
 use leptos::prelude::*;
 use openbot_contracts::credential_admin::{
@@ -122,10 +122,10 @@ pub fn AdminCredentialsPage() -> impl IntoView {
             <div class="ob-page-primary-action"><Button id="credentials-add" variant=ButtonVariant::Primary disabled=actions.busy
                 on_activate=move|_|dialog.set(Some(CredentialDialog::Create(state.page.get_untracked().and_then(|p|p.model_reference))))>{move||t!(i18n,credentials.add)}</Button></div>
             <Show when=move||actions.busy.get()&&!actions.unknown.get()><p role="status" class="ob-loading">{move||t!(i18n,plugins.saving)}</p></Show>
-            <Show when=move||actions.failed.get()&&!actions.unknown.get()&&actions.target.get().is_some_and(|id|id.starts_with("credential:"))><p class="ob-alert" role="alert">{move||t!(i18n,plugins.write_error)}</p></Show>
-            {move||saved.get().map(|id|view!{<p class="ob-plugin-value" role="status"><span>{move||t!(i18n,credentials.saved)}</span><code>{id}</code></p>})}
+            <Show when=move||actions.failed.get()&&!actions.unknown.get()&&actions.target.get().is_some_and(|id|id.starts_with("credential:"))><Notice tone=NoticeTone::Error>{move||t!(i18n,plugins.write_error)}</Notice></Show>
+            {move||saved.get().map(|id|view!{<Notice tone=NoticeTone::Success><span>{move||t!(i18n,credentials.saved)}</span><TechnicalDetails copy=id.clone()><code>{id}</code></TechnicalDetails></Notice>})}
             <Show when=move||state.loading.get()><p class="ob-loading" role="status">{move||t!(i18n,common.loading)}</p></Show>
-            <Show when=move||state.failed.get()><div class="ob-alert" role="alert"><span>{move||t!(i18n,credentials.load_error)}</span><Button on_activate=move|_|state.load()>{move||t!(i18n,common.retry)}</Button></div></Show>
+            <Show when=move||state.failed.get()><Notice tone=NoticeTone::Error><span>{move||t!(i18n,credentials.load_error)}</span><Button on_activate=move|_|state.load()>{move||t!(i18n,common.retry)}</Button></Notice></Show>
             <PageSection heading_id="credentials-configured" title=move||t_string!(i18n,credentials.configured).to_owned()>
                 {move||state.page.get().map(|page|if page.credentials.is_empty(){view!{<PageEmpty>{move||t!(i18n,credentials.empty)}</PageEmpty>}.into_any()}else{view!{<PageRows>{page.credentials.into_iter().map(|row|view!{<CredentialRow row dialog/>}).collect_view()}</PageRows>}.into_any()})}
             </PageSection>
@@ -321,9 +321,9 @@ fn CredentialForm(
             <DialogContent title=move||match dialog.get(){Some(CredentialDialog::Rotate(_))=>t_string!(i18n,credentials.rotate).to_owned(),Some(CredentialDialog::Revoke(_))=>t_string!(i18n,credentials.revoke).to_owned(),_=>t_string!(i18n,credentials.add).to_owned()}>
                 <DialogBody>
                     <crate::configuration_writes::ConfigurationWriteNotice />
-                    <Show when=move||invalid.get()><p class="ob-alert" role="alert">{move||t!(i18n,credentials.invalid)}</p></Show>
-                    <Show when=move||attempted.get()&&actions.failed.get()&&!actions.unknown.get()><p class="ob-alert" role="alert">{move||t!(i18n,plugins.write_error)}</p></Show>
-                    <Show when=move||authentication_needed.get()><p class="ob-alert" role="alert">{move||t!(i18n,credentials.authentication_needed)}</p></Show>
+                    <Show when=move||invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move||t!(i18n,credentials.invalid)}</Notice></Show>
+                    <Show when=move||attempted.get()&&actions.failed.get()&&!actions.unknown.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move||t!(i18n,plugins.write_error)}</Notice></Show>
+                    <Show when=move||authentication_needed.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move||t!(i18n,credentials.authentication_needed)}</Notice></Show>
                     <Show when=move||matches!(dialog.get(),Some(CredentialDialog::Revoke(_))) fallback=move||view!{
                         <Select id="credential-kind" open=kind_open value=kind disabled=Signal::derive(move||actions.busy.get()||matches!(dialog.get(),Some(CredentialDialog::Rotate(_))))>
                             <SelectTrigger aria_label=move||t_string!(i18n,credentials.kind).to_owned() placeholder=move||t_string!(i18n,credentials.kind).to_owned()/>

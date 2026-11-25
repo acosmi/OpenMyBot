@@ -12,13 +12,17 @@ use crate::features::layout::{
 };
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonVariant, IconSize, IconView, Input};
+use crate::primitives::{Button, ButtonVariant, IconSize, IconView, Input, Notice, NoticeTone};
 use forms::{SkillDialog, SkillDialogs};
 use state::SkillPageState;
 
 /// Manage only the current actor’s own skills, including when the actor is an administrator.
 #[component]
 pub fn PersonalSkillsPage() -> impl IntoView {
+    let i18n = use_i18n();
+    crate::shell::layout::set_shell_title(move || {
+        vec![t_string!(i18n, shell.nav_skills).to_owned()]
+    });
     view! { <SkillsPage /> }
 }
 
@@ -98,7 +102,7 @@ fn SkillsPage(#[prop(optional)] deployment: bool) -> impl IntoView {
             </div>
             <Input value=search input_type=crate::primitives::InputType::Search aria_label=move || t_string!(i18n,skills.search).to_owned() placeholder=move || t_string!(i18n,skills.search).to_owned() />
             <Show when=move || state.loading.get()><p role="status" class="ob-loading">{move || t!(i18n,common.loading)}</p></Show>
-            <Show when=move || state.error.get()><div class="ob-alert" role="alert"><span>{move || t!(i18n,skills.load_error)}</span><Button on_activate=move |_| state.reload(deployment)>{move || t!(i18n,common.retry)}</Button></div></Show>
+            <Show when=move || state.error.get()><Notice tone=NoticeTone::Error><span>{move || t!(i18n,skills.load_error)}</span><Button on_activate=move |_| state.reload(deployment)>{move || t!(i18n,common.retry)}</Button></Notice></Show>
             <PageSection heading_id="skills-list-title" title=move || t_string!(i18n,skills.saved).to_owned()>
                 <Show when=move || !state.loading.get() && !state.error.get() && rows.get().is_empty()>
                     <PageEmpty>{move || if search.get().trim().is_empty(){t_string!(i18n,skills.empty).to_owned()}else{t_string!(i18n,skills.no_match).to_owned()}}</PageEmpty>

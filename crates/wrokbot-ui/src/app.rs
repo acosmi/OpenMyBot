@@ -19,7 +19,7 @@ use crate::features::settings::{
     ConnectedAccountsPage, ModelServicesPage, SettingsPage, SettingsShell,
 };
 use crate::features::skills::{DeploymentSkillsPage, PersonalSkillsPage};
-use crate::i18n::{I18nContextProvider, t, use_i18n};
+use crate::i18n::{I18nContextProvider, t, t_string, use_i18n};
 use crate::shell::{
     AdminComponentDetailPage, AdminComponentsPage, AppLayout, AuthenticatedBoundary, BotChatPage,
     HomePage, RootLayout,
@@ -259,6 +259,9 @@ fn SettingsComponentGalleryDetailRoute() -> impl IntoView {
 #[component]
 fn NotFound() -> impl IntoView {
     let i18n = use_i18n();
+    crate::shell::layout::set_shell_title(move || {
+        vec![t_string!(i18n, errors.not_found_title).to_owned()]
+    });
     view! {
         <section class="ob-page">
             <h1 class="ob-page-title">{move || t!(i18n, errors.not_found_title)}</h1>

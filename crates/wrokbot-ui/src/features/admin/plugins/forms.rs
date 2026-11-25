@@ -9,8 +9,8 @@ use crate::features::layout::{
 };
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
-    Button, ButtonVariant, Field, Input, InputType, SecretInput, SecretInputController,
-    SecretInputPolicy, Textarea,
+    Button, ButtonVariant, Field, Input, InputType, Notice, NoticePresentation, NoticeTone,
+    SecretInput, SecretInputController, SecretInputPolicy, Textarea,
 };
 use crate::primitives::{Select, SelectContent, SelectItem, SelectTrigger};
 
@@ -171,8 +171,8 @@ pub fn PluginDialogs(
                 _ => t_string!(i18n, plugins.remove).to_owned(),
             }>
                 <div class="ob-library-form">
-                    <Show when=move || invalid.get()><p class="ob-alert" role="alert">{move || t!(i18n, plugins.invalid)}</p></Show>
-                    <Show when=move || attempted.get() && actions.failed.get() && !actions.unknown.get()><p class="ob-alert" role="alert">{move || t!(i18n, plugins.write_error)}</p></Show>
+                    <Show when=move || invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, plugins.invalid)}</Notice></Show>
+                    <Show when=move || attempted.get() && actions.failed.get() && !actions.unknown.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, plugins.write_error)}</Notice></Show>
                     {move || dialog.get().and_then(|selected| match selected {PluginDialog::OAuth(id)|PluginDialog::Remove(id)=>Some(view!{<p class="ob-page-intro"><code>{id}</code></p>}),PluginDialog::Custom=>None})}
                     <Show when=move || matches!(dialog.get(), Some(PluginDialog::Custom))>
                         <Field control_id="plugin-id" label=move || t_string!(i18n, plugins.id).to_owned() disabled=actions.busy><Input value=id /></Field>

@@ -9,7 +9,9 @@ use crate::features::layout::{
     editor_location::EditorLocation, library_editor::LibraryEditorFrame,
 };
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonVariant, Field, Input, Textarea};
+use crate::primitives::{
+    Button, ButtonVariant, Field, Input, Notice, NoticePresentation, NoticeTone, Textarea,
+};
 use crate::revision_editor::{Apply, AttemptToken, EditorCore, FailureClass, Phase};
 use leptos::prelude::*;
 use openbot_contracts::mcp::{McpAdminSkill, PluginSkillMutation};
@@ -791,15 +793,15 @@ pub fn SkillDialogs(
                     <Button disabled=state.loading on_activate=move |_| state.reload(deployment)>{move ||t!(i18n,common.retry)}</Button>
                 }>
                 <div class="ob-library-form">
-                    <Show when=move || invalid.get()><p class="ob-alert" role="alert">{move ||t!(i18n,skills.invalid)}</p></Show>
-                    <Show when=move || collision.get()><p class="ob-alert" role="alert">{move ||t!(i18n,skills.collision)}</p></Show>
-                    <Show when=move || attempted.get() && actions.failed.get() && !actions.unknown.get() && !matches!(dialog.get(), Some(SkillDialog::Edit(_)))><p class="ob-alert" role="alert">{move ||t!(i18n,skills.write_error)}</p></Show>
+                    <Show when=move || invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n,skills.invalid)}</Notice></Show>
+                    <Show when=move || collision.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n,skills.collision)}</Notice></Show>
+                    <Show when=move || attempted.get() && actions.failed.get() && !actions.unknown.get() && !matches!(dialog.get(), Some(SkillDialog::Edit(_)))><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n,skills.write_error)}</Notice></Show>
                     <Show when=move || matches!(dialog.get(), Some(SkillDialog::Edit(_)))>
                         <EditorNotice id_prefix="skill-editor" phase=editor_phase busy=recovery_busy
                             can_retry=Signal::derive(move ||skill_editor.original.get().is_some())
                             on_compare=compare on_load=load on_retry=retry on_reapply=reapply />
                         <Show when=move || skill_editor.read_failed.get() || (!state.loading.get() && !readable.get())>
-                            <p class="ob-alert" role="alert">{move || t!(i18n,revision_editor.read_failed)}</p>
+                            <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n,revision_editor.read_failed)}</Notice>
                         </Show>
                         <Show when=move || skill_editor.comparison.get()>
                             <section class="ob-library-form" data-skill-comparison="local">
@@ -830,7 +832,7 @@ pub fn SkillDialogs(
                         <p>{move ||t!(i18n,skills.grants_intro)}</p>
                         {move || {
                             let Some(d)=data.get() else{return view!{<p role="status">{move ||t!(i18n,common.loading)}</p>}.into_any();};
-                            if !d.agents_available{return view!{<p class="ob-alert" role="alert">{move ||t!(i18n,skills.agents_error)}</p>}.into_any();}
+                            if !d.agents_available{return view!{<Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n,skills.agents_error)}</Notice>}.into_any();}
                             let Some(skill)=d.selected(&slug.get(),deployment) else{return view!{<p role="status">{move ||t!(i18n,skills.no_longer_available)}</p>}.into_any();};
                             let grant_set=skill.granted_to.into_iter().collect::<std::collections::BTreeSet<_>>();
                             let unavailable_count=grant_set.iter().filter(|id|!d.agents.iter().any(|a|a.id.as_str()==id.as_str())).count();

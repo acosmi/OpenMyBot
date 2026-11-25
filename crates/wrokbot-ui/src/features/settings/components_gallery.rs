@@ -10,12 +10,12 @@ use crate::api::component_gallery_href;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{announce_component_catalogue, load_components};
 use crate::features::gallery::ComponentPreview;
-use crate::features::layout::{
-    PageBackLink, PageEmpty, PageHeader, PageSection, PageShell, PageTopbar, PageWidth,
-};
+use crate::features::layout::{PageEmpty, PageHeader, PageSection, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonSize, ButtonVariant, IconSize, IconView};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, IconSize, IconView, Notice, NoticeTone,
+};
 
 /// Published compiled components this deployment can currently offer.
 #[component]
@@ -48,7 +48,7 @@ pub fn ComponentsGalleryPage() -> impl IntoView {
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, gallery.components_load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -57,7 +57,7 @@ pub fn ComponentsGalleryPage() -> impl IntoView {
                     >
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || !loading.get() && !load_error.get()>
                 <Show
@@ -127,17 +127,11 @@ pub fn ComponentGalleryDetailPage() -> impl IntoView {
 
     view! {
         <PageShell width=PageWidth::Content>
-            <PageTopbar>
-                <PageBackLink
-                    href="/settings/components-gallery".to_owned()
-                    label=move || t_string!(i18n, gallery.components_title).to_owned()
-                />
-            </PageTopbar>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, gallery.components_load_error)}</span>
                     <Button
                         variant=ButtonVariant::Ghost
@@ -146,7 +140,7 @@ pub fn ComponentGalleryDetailPage() -> impl IntoView {
                     >
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || !loading.get() && !load_error.get() && component.get().is_none()>
                 <PageHeader

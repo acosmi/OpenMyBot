@@ -7,9 +7,9 @@ use crate::{
     },
     i18n::{t, t_string, use_i18n},
     primitives::{
-        Button, ButtonVariant, Dialog, DialogContent, Field, Input, InputType, Label, SecretInput,
-        SecretInputController, SecretInputPolicy, Select, SelectContent, SelectItem, SelectTrigger,
-        Switch,
+        Button, ButtonVariant, Dialog, DialogContent, Field, Input, InputType, Label, Notice,
+        NoticePresentation, NoticeTone, SecretInput, SecretInputController, SecretInputPolicy,
+        Select, SelectContent, SelectItem, SelectTrigger, Switch,
     },
 };
 use leptos::prelude::*;
@@ -55,7 +55,7 @@ pub(super) fn ModelEditor(target: EditTarget, close: UnsyncCallback<()>) -> impl
                     {move || current.get().map(|result| match result {
                         Ok(Some(base)) if !deleting && base.has_credential => view! { <super::revision::ModelRevisionEditor base close/> }.into_any(),
                         Ok(base) => view! { <ModelForm base deleting close/> }.into_any(),
-                        Err(_) => view! { <div class="ob-library-form"><p class="ob-alert" role="alert">{move ||t!(i18n, models.load_failed)}</p><Button on_activate=move |_| current.refetch()>{move ||t!(i18n, models.refresh)}</Button><Button on_activate=move |_|close.run(())>{move ||t!(i18n, common.close)}</Button></div> }.into_any()
+                        Err(_) => view! { <div class="ob-library-form"><Notice tone=NoticeTone::Error>{move ||t!(i18n, models.load_failed)}</Notice><Button on_activate=move |_| current.refetch()>{move ||t!(i18n, models.refresh)}</Button><Button on_activate=move |_|close.run(())>{move ||t!(i18n, common.close)}</Button></div> }.into_any()
                     })}
                 </Suspense>
     }
@@ -189,10 +189,10 @@ pub(super) fn ModelForm(
     };
     view! {
         <div class="ob-library-form" class:ob-modal-body=deleting>
-            <Show when=move || invalid.get() || matches!(actions.status.get(), Status::Failed(WriteError::InvalidInput))><p class="ob-alert" role="alert">{move ||t!(i18n, models.invalid)}</p></Show>
-            <Show when=move || matches!(actions.status.get(), Status::Failed(WriteError::Rejected(ApiError::Conflict|ApiError::NotFound)))><p class="ob-alert" role="alert">{move ||t!(i18n, models.conflict)}</p></Show>
-            <Show when=move || matches!(actions.status.get(), Status::Failed(WriteError::Rejected(ApiError::Unauthorized|ApiError::Forbidden)))><p class="ob-alert" role="alert">{move ||t!(i18n, models.authentication)}</p></Show>
-            <Show when=move || matches!(actions.status.get(), Status::Failed(WriteError::Unknown))><p class="ob-alert" role="alert">{move ||t!(i18n, models.unknown)}</p></Show>
+            <Show when=move || invalid.get() || matches!(actions.status.get(), Status::Failed(WriteError::InvalidInput))><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n, models.invalid)}</Notice></Show>
+            <Show when=move || matches!(actions.status.get(), Status::Failed(WriteError::Rejected(ApiError::Conflict|ApiError::NotFound)))><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n, models.conflict)}</Notice></Show>
+            <Show when=move || matches!(actions.status.get(), Status::Failed(WriteError::Rejected(ApiError::Unauthorized|ApiError::Forbidden)))><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n, models.authentication)}</Notice></Show>
+            <Show when=move || matches!(actions.status.get(), Status::Failed(WriteError::Unknown))><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n, models.unknown)}</Notice></Show>
             <Show when=move || deleting fallback=move || view! {
                 <Field control_id="model-name" label=move ||t_string!(i18n, models.name).to_owned() disabled=blocked><Input value=name/></Field>
                 <div class="ob-field ob-model-protocol"><Label for_id="model-protocol">{move ||t!(i18n, models.protocol)}</Label>

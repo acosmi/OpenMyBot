@@ -74,6 +74,7 @@ fn generate_token_css(tokens: &toml::Value) -> Result<String, Box<dyn Error>> {
     write_scalar_section(&mut css, table(tokens, "z_index")?, "z", None)?;
     write_scalar_section(&mut css, table(tokens, "size")?, "size", Some("px"))?;
     write_scalar_section(&mut css, table(tokens, "motion")?, "motion", None)?;
+    write_scalar_section(&mut css, table(tokens, "opacity")?, "opacity", None)?;
     css.push_str("}\n\n");
 
     writeln!(&mut css, "{} {{", string(meta, "dark_selector")?)?;
@@ -88,17 +89,41 @@ fn generate_token_css(tokens: &toml::Value) -> Result<String, Box<dyn Error>> {
     write_color_vars(&mut css, dark, overrides)?;
     css.push_str("  }\n}\n\n");
 
-    let cjk = table(tokens, "typography")?
+    // CJK overrides only the type-scale line-height variables, never `line-height` itself:
+    // rules that read the variables (helper/error text, body controls) get the roomier value,
+    // while containers that declare their own line-height keep it for their descendants.
+    let typography = table(tokens, "typography")?;
+    let cjk = typography
         .get("cjk")
         .and_then(toml::Value::as_table)
         .ok_or("tokens.toml missing typography.cjk")?;
+    let scale = typography
+        .get("scale")
+        .and_then(toml::Value::as_table)
+        .ok_or("tokens.toml missing typography.scale")?;
+    let steps = cjk
+        .get("scale_steps")
+        .and_then(toml::Value::as_array)
+        .ok_or("tokens.toml missing typography.cjk.scale_steps")?;
+    let line_height = string(cjk, "line_height")?;
     writeln!(&mut css, "{} {{", string(cjk, "selector")?)?;
-    writeln!(&mut css, "  line-height: {};", string(cjk, "line_height")?)?;
     writeln!(
         &mut css,
         "  hanging-punctuation: {};",
         string(cjk, "hanging_punctuation")?
     )?;
+    for step in steps {
+        let step = step.as_str().ok_or("typography.cjk.scale_steps member")?;
+        let size = scale
+            .get(step)
+            .and_then(|value| value.get("size"))
+            .and_then(toml::Value::as_integer)
+            .ok_or_else(|| format!("tokens.toml missing typography.scale.{step}.size"))?;
+        writeln!(
+            &mut css,
+            "  --text-{step}--line-height: calc({size}px * {line_height});"
+        )?;
+    }
     css.push_str("}\n");
     Ok(css)
 }

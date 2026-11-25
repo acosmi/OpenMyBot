@@ -1,5 +1,6 @@
 //! `/agents` roster destination with URL-owned read-only detail state.
 
+use crate::shell::layout::set_shell_title;
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use openbot_contracts::agent::{AgentProfile, AgentVisibility};
@@ -11,7 +12,7 @@ use crate::features::layout::{
     PageWidth, StaggerItem,
 };
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonSize, ButtonVariant};
+use crate::primitives::{Button, ButtonSize, ButtonVariant, Notice, NoticeTone};
 
 use super::{AgentCard, AgentEditor, AgentProfilePanel};
 
@@ -19,6 +20,7 @@ use super::{AgentCard, AgentEditor, AgentProfilePanel};
 #[component]
 pub fn AgentsPage() -> impl IntoView {
     let i18n = use_i18n();
+    set_shell_title(move || vec![t_string!(i18n, shell.nav_agents).to_owned()]);
     let query = use_query_map();
     let navigate = use_navigate();
     let creating = Memo::new(move |_| query.get().get("new").as_deref() == Some("true"));
@@ -32,7 +34,7 @@ pub fn AgentsPage() -> impl IntoView {
     let loading = RwSignal::new(true);
     let load_error = RwSignal::new(false);
     let reload_generation = RwSignal::new(0_u64);
-    let directory_generation = use_context::<super::AgentDirectoryGeneration>();
+    let directory = super::use_agent_directory();
     install_agent_loader(
         reload_generation,
         agents,
@@ -75,11 +77,7 @@ pub fn AgentsPage() -> impl IntoView {
     let changed_navigate = navigate.clone();
     let changed = UnsyncCallback::new(move |agent: AgentProfile| {
         reload_generation.update(|generation| *generation = generation.saturating_add(1));
-        if let Some(directory) = directory_generation {
-            directory
-                .0
-                .update(|generation| *generation = generation.saturating_add(1));
-        }
+        directory.refresh();
         let href = crate::api::agent_profile_href(agent.id.as_str())
             .expect("server Agent id must be route-safe");
         changed_navigate(&href, Default::default());
@@ -87,11 +85,7 @@ pub fn AgentsPage() -> impl IntoView {
     let closed_navigate = navigate;
     let closed = UnsyncCallback::new(move |_| {
         reload_generation.update(|generation| *generation = generation.saturating_add(1));
-        if let Some(directory) = directory_generation {
-            directory
-                .0
-                .update(|generation| *generation = generation.saturating_add(1));
-        }
+        directory.refresh();
         closed_navigate("/agents", Default::default());
     });
     let detail_agent = Signal::derive(move || selected_agent_id.get());
@@ -107,6 +101,7 @@ pub fn AgentsPage() -> impl IntoView {
                                 <PageHeader
                                     heading_id="agents-page-title"
                                     title=move || t_string!(i18n, agents.title).to_owned()
+                                    title_in_top_bar=true
                                 />
                                 <Button
                                     variant=ButtonVariant::Primary
@@ -120,7 +115,7 @@ pub fn AgentsPage() -> impl IntoView {
                                 </div>
                             </Show>
                             <Show when=move || load_error.get()>
-                                <div class="ob-alert" role="alert">
+                                <Notice tone=NoticeTone::Error>
                                     <span>{move || t!(i18n, agents.load_error)}</span>
                                     <Button
                                         variant=ButtonVariant::Ghost
@@ -129,7 +124,7 @@ pub fn AgentsPage() -> impl IntoView {
                                     >
                                         {move || t!(i18n, common.retry)}
                                     </Button>
-                                </div>
+                                </Notice>
                             </Show>
                             <Show when=move || !loading.get() && !load_error.get()>
                                 <PageSection

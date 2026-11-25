@@ -816,7 +816,7 @@ mod tests {
     fn all_three_realtime_owners_select_tauri_and_keep_the_web_fallback() {
         let cases = [
             (
-                include_str!("shell/app_sidebar.rs"),
+                include_str!("shell/app_sidebar/channels.rs"),
                 "SubscriptionRequest::ChannelActivity",
                 "WebSocket::open_with_protocol",
             ),

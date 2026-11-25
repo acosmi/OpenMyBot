@@ -12,12 +12,12 @@ use openbot_contracts::mcp::{
 
 use crate::api::plugins as api;
 use crate::features::layout::{
-    DetailPanelLayout, DetailPanelMain, PageBackLink, PageEmpty, PageHeader, PageRows, PageSection,
-    PageShell, PageTopbar, editor_location::EditorLocation,
+    DetailPanelLayout, DetailPanelMain, PageEmpty, PageHeader, PageRows, PageSection, PageShell,
+    editor_location::EditorLocation,
 };
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
-use crate::primitives::{Button, ButtonVariant, IconSize, IconView, Switch};
+use crate::primitives::{Button, ButtonVariant, IconSize, IconView, Notice, NoticeTone, Switch};
 use forms::{PluginDialog, PluginDialogs};
 pub(crate) use state::PluginActions;
 use state::{PluginData, PluginPageState};
@@ -97,23 +97,20 @@ pub fn AdminPluginsPage() -> impl IntoView {
                             .or_else(|| data.page.catalogue.iter().find(|row| &row.key == key).map(|row| row.title.clone()))))
                 }).unwrap_or_else(|| t_string!(i18n, plugins.title).to_owned());
                 view! {
-                    <Show when=move || server.is_some()>
-                        <PageTopbar><PageBackLink href="/admin/plugins" label=move || t_string!(i18n, plugins.title).to_owned() /></PageTopbar>
-                    </Show>
                     <PageHeader heading_id="plugins-title" title=heading description=move || t_string!(i18n, plugins.intro).to_owned() />
                 }
             }}
             <Show when=move || actions.busy.get() && !actions.unknown.get()><p class="ob-loading" role="status">{move || t!(i18n, plugins.saving)}</p></Show>
-            <Show when=move || actions.unknown.get()><p class="ob-alert" role="alert">{move || t!(i18n, plugins.write_unknown)}</p></Show>
+            <Show when=move || actions.unknown.get()><Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.write_unknown)}</Notice></Show>
             <Show when=move || actions.failed.get() && !actions.unknown.get() && scope.get().0.is_none_or(|id| actions.target.get().as_deref() == Some(&id))>
-                <p class="ob-alert" role="alert">{move || t!(i18n, plugins.write_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.write_error)}</Notice>
             </Show>
             <Show when=move || state.loading.get()><p class="ob-loading" role="status">{move || t!(i18n, common.loading)}</p></Show>
             <Show when=move || state.error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, plugins.load_error)}</span>
                     <Button variant=ButtonVariant::Ghost on_activate=move |_| state.reload()>{move || t!(i18n, common.retry)}</Button>
-                </div>
+                </Notice>
             </Show>
             {move || state.data.get().map(|data| {
                 let (server, tool) = scope.get();
@@ -260,9 +257,9 @@ fn PluginDetail(data: PluginData, server_id: String, editor: EditorLocation) -> 
                             <a class="ob-button" data-size="md" data-variant="secondary" href=api::account_href(&key.get_value()).expect("validated server")>{move || t!(i18n, plugins.personal_manage)}</a>
                         </div>
                     </Show>
-                    <Show when=move || connect_error.get()><p class="ob-alert" role="alert">{move || t!(i18n, plugins.connect_error)}</p></Show>
+                    <Show when=move || connect_error.get()><Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.connect_error)}</Notice></Show>
                 </Show>
-                <Show when=move || !callback_available><p class="ob-alert">{move || t!(i18n, plugins.callback_unavailable)}</p></Show>
+                <Show when=move || !callback_available><Notice tone=NoticeTone::Caution>{move || t!(i18n, plugins.callback_unavailable)}</Notice></Show>
                 {callback.get_value().map(|uri| view! { <div class="ob-plugin-value"><span>{move || t!(i18n, plugins.redirect_uri)}</span><code>{uri}</code></div> })}
             </PageSection>
             {server.get_value().map(|server| view! { <ServerFacts server /> })}
@@ -286,30 +283,33 @@ fn ServerFacts(server: McpAdminServer) -> impl IntoView {
     view! {
         <div class="ob-plugin-value"><span>{move || t!(i18n, plugins.endpoint)}</span><code>{server.url}</code></div>
         <div class="ob-plugin-value"><span>{move || t!(i18n, plugins.private_egress)}</span><code>{if server.egress_allow_cidrs.is_empty() { "—".to_owned() } else { server.egress_allow_cidrs.join(", ") }}</code></div>
-        {server.last_error.map(|_| view! { <p class="ob-alert" role="alert">{move || t!(i18n, plugins.catalog_error)}</p> })}
+        {server.last_error.map(|_| view! { <Notice tone=NoticeTone::Error>{move || t!(i18n, plugins.catalog_error)}</Notice> })}
     }
 }
 
 #[component]
 fn PluginTool(data: PluginData, server_id: String, tool_name: String) -> impl IntoView {
     let i18n = use_i18n();
-    let tool = data
+    let server = data
         .page
         .servers
         .iter()
-        .find(|server| server.id == server_id)
+        .find(|server| server.id == server_id);
+    let server_title = server.map(|server| server.title.clone());
+    let tool = server
         .and_then(|server| server.tools.iter().find(|tool| tool.name == tool_name))
         .cloned();
-    let Some(tool) = tool else {
+    let (Some(tool), Some(server_title)) = (tool, server_title) else {
         return view! { <PageEmpty>{move || t!(i18n, plugins.tool_missing)}</PageEmpty> }
             .into_any();
     };
     let effect = tool.effect;
     let description = tool.description.clone();
     view! {
-        <PageTopbar><PageBackLink href=api::plugin_href(&server_id).expect("validated id") label=server_id /></PageTopbar>
         <PageSection heading_id="plugin-tool-effect" title=move || t_string!(i18n, plugins.effect).to_owned()>
             <p>{description}</p><p class="text-fg-secondary">{move || effect_label(i18n, effect)}</p>
+            // The tool's own server, reached from the page body (UI spec v5.2 §6.1).
+            <p class="text-fg-secondary">{move || t!(i18n, plugins.tool_server)} " " <a href=api::plugin_href(&server_id).expect("validated id")>{server_title}</a></p>
         </PageSection>
         <PageSection heading_id="plugin-tool-agents" title=move || t_string!(i18n, plugins.agents).to_owned()
             description=move || t_string!(i18n, plugins.grants_intro).to_owned()>

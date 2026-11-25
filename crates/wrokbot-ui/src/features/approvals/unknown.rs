@@ -3,7 +3,9 @@
 use crate::api::ApiError;
 use crate::api::reconciliation;
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Button, ButtonSize, ButtonVariant};
+use crate::primitives::{
+    Button, ButtonSize, ButtonVariant, Notice, NoticeTone, TechnicalDetails, Timestamp,
+};
 use leptos::prelude::*;
 use openbot_contracts::ids::{RunId, ThreadId};
 use openbot_contracts::reconciliation::{
@@ -143,31 +145,34 @@ pub(crate) fn UnknownFacts(
             });
         }
     });
-    view! { <section class="ob-unknown-facts" data-unknown-run=run.as_str().to_owned()>
+    let run_attribute = run.as_str().to_owned();
+    view! { <section class="ob-unknown-facts" data-unknown-run=run_attribute>
         <h3>{move || t!(i18n, admin.unknown_title)}</h3>
-        <p><code>{thread.as_str().to_owned()}</code> " · " <code>{run.as_str().to_owned()}</code></p>
+        <TechnicalDetails copy=format!("{}\n{}", thread.as_str(), run.as_str())><code>{thread.as_str().to_owned()}</code><code>{run.as_str().to_owned()}</code></TechnicalDetails>
         <p>{move || t!(i18n, admin.unknown_boundary)}</p>
         <section><h4>{move || t!(i18n, admin.unknown_attempts)}</h4>
             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small disabled=Signal::derive(move || attempts.get().busy) on_activate=move |_| read_attempts.run(None)>{move || t!(i18n, channels.reread)}</Button>
-            <Show when=move || attempts.get().error><p class="ob-alert" role="alert">{move || t!(i18n, admin.unknown_read_error)}</p></Show>
+            <Show when=move || attempts.get().error><Notice tone=NoticeTone::Error>{move || t!(i18n, admin.unknown_read_error)}</Notice></Show>
             {move || attempts.get().page.map(|page| { let next=page.next; let empty=page.attempts.is_empty(); let rows=page.attempts; view! {
                 <FactObservation observed=page.observed_at blocked=page.foreground_blocked terminal=page.terminal_event_sequence/>
                 <Show when=move || empty><p>{move || t!(i18n, admin.unknown_empty)}</p></Show>
-                <ul>{rows.into_iter().map(|row| view! { <li><code>{row.tool_call_id}</code> " / " <code>{row.attempt_id}</code>
+                <ul>{rows.into_iter().map(|row| view! { <li>
                     <p>{move || format!("{:?} · {}", row.status, row.recorded_commit_state.map_or_else(|| t_string!(i18n, admin.unknown_not_recorded).to_owned(), |state| format!("{state:?}")))}</p>
-                    <time>{format_time(row.created_at)}</time>
+                    <Timestamp at=row.created_at />
+                    <TechnicalDetails copy=format!("{}\n{}", row.tool_call_id, row.attempt_id)><code>{row.tool_call_id}</code><code>{row.attempt_id}</code></TechnicalDetails>
                 </li> }).collect_view()}</ul>
                 {next.map(|next| view! { <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| read_attempts.run(Some(next))>{move || t!(i18n, common.next)}</Button> })}
             } })}
         </section>
         <section><h4>{move || t!(i18n, admin.unknown_receipts)}</h4>
             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small disabled=Signal::derive(move || receipts.get().busy) on_activate=move |_| read_receipts.run(None)>{move || t!(i18n, channels.reread)}</Button>
-            <Show when=move || receipts.get().error><p class="ob-alert" role="alert">{move || t!(i18n, admin.unknown_read_error)}</p></Show>
+            <Show when=move || receipts.get().error><Notice tone=NoticeTone::Error>{move || t!(i18n, admin.unknown_read_error)}</Notice></Show>
             {move || receipts.get().page.map(|page| { let next=page.next; let empty=page.receipts.is_empty(); let rows=page.receipts; view! {
                 <FactObservation observed=page.observed_at blocked=page.foreground_blocked terminal=page.terminal_event_sequence/>
                 <Show when=move || empty><p>{move || t!(i18n, admin.unknown_empty)}</p></Show>
-                <ul>{rows.into_iter().map(|row| view! { <li><code>{row.receipt_id}</code> " · " <code>{row.tool_call_id}</code> " / " <code>{row.attempt_id}</code>
-                    <p>{move || t!(i18n, admin.unknown_memory_fact)}</p><time>{format_time(row.recorded_at)}</time>
+                <ul>{rows.into_iter().map(|row| view! { <li>
+                    <p>{move || t!(i18n, admin.unknown_memory_fact)}</p><Timestamp at=row.recorded_at />
+                    <TechnicalDetails copy=format!("{}\n{}\n{}", row.receipt_id, row.tool_call_id, row.attempt_id)><code>{row.receipt_id}</code><code>{row.tool_call_id}</code><code>{row.attempt_id}</code></TechnicalDetails>
                 </li> }).collect_view()}</ul>
                 {next.map(|next| view! { <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| read_receipts.run(Some(next))>{move || t!(i18n, common.next)}</Button> })}
             } })}
@@ -200,11 +205,8 @@ fn bind_terminal(terminal: RwSignal<Option<u64>>, sequence: u64) -> Result<(), A
 #[component]
 fn FactObservation(observed: time::OffsetDateTime, blocked: bool, terminal: u64) -> impl IntoView {
     let i18n = use_i18n();
-    view! { <p class="ob-page-intro"><time>{format_time(observed)}</time> " · " <code>{terminal}</code> " · " {move || if blocked { t_string!(i18n, admin.unknown_blocked).to_owned() } else { t_string!(i18n, admin.unknown_unblocked_fact).to_owned() }}</p> }
-}
-fn format_time(time: time::OffsetDateTime) -> String {
-    time.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
+    view! { <p class="ob-page-intro"><Timestamp at=observed /> " · " {move || if blocked { t_string!(i18n, admin.unknown_blocked).to_owned() } else { t_string!(i18n, admin.unknown_unblocked_fact).to_owned() }}</p>
+    <TechnicalDetails copy=terminal.to_string()><code>{terminal}</code></TechnicalDetails> }
 }
 
 #[cfg(test)]

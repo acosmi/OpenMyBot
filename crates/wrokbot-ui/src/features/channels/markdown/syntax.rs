@@ -10,13 +10,10 @@
 //!   - `text-success`: strings, character literals
 //!   - `text-caution`: numbers, constants, boolean literals
 //! - Bounded fallback for unknown languages and plain text.
-//! - Clipboard copy button with bilingual accessibility and zero logging.
 
 use std::sync::OnceLock;
 use syntect::dumps::from_uncompressed_data;
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
 
 /// Statically cached 24-language SyntaxSet.
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -227,43 +224,4 @@ pub fn highlight_code(code: &str, lang: &str) -> Vec<Vec<HighlightedSpan>> {
     }
 
     lines
-}
-
-/// Clipboard failure intentionally carries no browser error or copied content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ClipboardUnavailable;
-
-/// Await the actual clipboard receipt without logging copied content or browser errors.
-pub async fn copy_code_to_clipboard(text: &str) -> Result<(), ClipboardUnavailable> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let window = web_sys::window().ok_or(ClipboardUnavailable)?;
-        let clipboard = js_sys::Reflect::get(
-            &window.navigator(),
-            &wasm_bindgen::JsValue::from_str("clipboard"),
-        )
-        .map_err(|_| ClipboardUnavailable)?;
-        if clipboard.is_null() || clipboard.is_undefined() {
-            return Err(ClipboardUnavailable);
-        }
-        let write_text =
-            js_sys::Reflect::get(&clipboard, &wasm_bindgen::JsValue::from_str("writeText"))
-                .map_err(|_| ClipboardUnavailable)?
-                .dyn_into::<js_sys::Function>()
-                .map_err(|_| ClipboardUnavailable)?;
-        let promise = write_text
-            .call1(&clipboard, &wasm_bindgen::JsValue::from_str(text))
-            .map_err(|_| ClipboardUnavailable)?
-            .dyn_into::<js_sys::Promise>()
-            .map_err(|_| ClipboardUnavailable)?;
-        wasm_bindgen_futures::JsFuture::from(promise)
-            .await
-            .map_err(|_| ClipboardUnavailable)?;
-        Ok(())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = text;
-        Err(ClipboardUnavailable)
-    }
 }

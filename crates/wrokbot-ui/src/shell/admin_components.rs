@@ -20,13 +20,11 @@ use crate::api::{
     set_component_publication,
 };
 use crate::features::gallery::ComponentPreview;
-use crate::features::layout::{
-    PageBackLink, PageEmpty, PageHeader, PageRows, PageSection, PageShell, PageTopbar, PageWidth,
-};
+use crate::features::layout::{PageEmpty, PageHeader, PageRows, PageSection, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::primitives::{
-    Button, ButtonSize, ButtonVariant, Dialog, DialogBody, DialogContent, DialogFooter, Switch,
-    Textarea,
+    Button, ButtonSize, ButtonVariant, Dialog, DialogBody, DialogContent, DialogFooter, Notice,
+    NoticeTone, Switch, Textarea,
 };
 
 #[derive(Clone)]
@@ -101,12 +99,12 @@ pub fn AdminComponentsPage() -> impl IntoView {
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, admin.components_load_error)}</span>
                     <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || {
                 !loading.get()
@@ -185,22 +183,16 @@ pub fn AdminComponentDetailPage() -> impl IntoView {
 
     view! {
         <PageShell width=PageWidth::Content>
-            <PageTopbar>
-                <PageBackLink
-                    href="/admin/components".to_owned()
-                    label=move || t_string!(i18n, admin.component_back).to_owned()
-                />
-            </PageTopbar>
             <Show when=move || loading.get()>
                 <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
             </Show>
             <Show when=move || load_error.get()>
-                <div class="ob-alert" role="alert">
+                <Notice tone=NoticeTone::Error>
                     <span>{move || t!(i18n, admin.components_load_error)}</span>
                     <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=retry>
                         {move || t!(i18n, common.retry)}
                     </Button>
-                </div>
+                </Notice>
             </Show>
             <Show when=move || not_found.get()>
                 <PageHeader
@@ -210,7 +202,7 @@ pub fn AdminComponentDetailPage() -> impl IntoView {
                 />
             </Show>
             <Show when=move || mutation_error.get()>
-                <p class="ob-alert" role="alert">{move || t!(i18n, admin.component_mutation_error)}</p>
+                <Notice tone=NoticeTone::Error>{move || t!(i18n, admin.component_mutation_error)}</Notice>
             </Show>
             <For
                 each=move || data.get().into_iter()

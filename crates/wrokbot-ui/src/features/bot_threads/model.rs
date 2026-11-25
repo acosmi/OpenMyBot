@@ -14,7 +14,9 @@ use openbot_contracts::versioned_model_selection::{
 #[cfg(target_arch = "wasm32")]
 use crate::api::list_custom_model_catalog;
 use crate::i18n::{t, t_string, use_i18n};
-use crate::primitives::{Select, SelectContent, SelectItem, SelectTrigger};
+use crate::primitives::{
+    Notice, NoticePresentation, NoticeTone, Select, SelectContent, SelectItem, SelectTrigger,
+};
 
 /// Closed status of the catalog the picker reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,7 +220,16 @@ pub fn ModelPickerV2(state: ModelComposerV2, disabled: Signal<bool>) -> impl Int
                             t_string!(i18n, common.loading).to_owned()
                         }
                         CatalogStatus::Ready if state.selected.get().is_some() => {
-                            t_string!(i18n, models.custom_source).to_owned()
+                            let key = picker_value.get();
+                            state
+                                .choices
+                                .get()
+                                .into_iter()
+                                .find(|choice| choice.selection.as_ref().map(selection_key) == key)
+                                .map_or_else(
+                                    || t_string!(i18n, models.custom_source).to_owned(),
+                                    |choice| choice.name,
+                                )
                         }
                         CatalogStatus::Ready if state.repick.get() => {
                             t_string!(i18n, bot_work.model_repick).to_owned()
@@ -260,18 +271,13 @@ pub fn ModelPickerV2(state: ModelComposerV2, disabled: Signal<bool>) -> impl Int
                         <p role="status">{move || t!(i18n, common.loading)}</p>
                     </Show>
                     <Show when=move || state.status.get()==CatalogStatus::Failed>
-                        <p class="ob-alert" role="alert">{move || t!(i18n, models.load_failed)}</p>
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, models.load_failed)}</Notice>
                     </Show>
                     <Show when=move || state.status.get()==CatalogStatus::Ready && state.choices.get().is_empty()>
                         <p>{move || t!(i18n, models.none_available)}</p>
                     </Show>
                 </SelectContent>
             </Select>
-            <Show when=move || !state.supports_explicit.get()>
-                <span class="ob-page-empty" role="status">
-                    {move || t!(i18n, bot_work.remote_assistant_unsupported)}
-                </span>
-            </Show>
         </div>
     }
 }

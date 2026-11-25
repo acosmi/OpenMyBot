@@ -4,7 +4,7 @@ use crate::{
     i18n::{t, t_string, use_i18n},
     primitives::{
         Button, ButtonVariant, Dialog, DialogBody, DialogClose, DialogContent, DialogFooter, Field,
-        Switch, Textarea,
+        Notice, NoticePresentation, NoticeTone, Switch, Textarea,
     },
 };
 use leptos::prelude::*;
@@ -246,8 +246,8 @@ pub(crate) fn RememberDialog(review: RememberReview) -> impl IntoView {
                         <Switch checked=review.sensitive disabled=disabled/>
                     </Field>
                     <Show when=move || review.loading.get()><p role="status">{move || t!(i18n, common.loading)}</p></Show>
-                    <Show when=move || !review.loading.get() && !review.enabled.get() && !review.failed.get()><p class="ob-alert">{move || t!(i18n, memory.remember_disabled)}</p></Show>
-                    <Show when=move || review.failed.get() || status.get() == Some(RememberStatus::Unknown)><p class="ob-alert" role="alert">{move || t!(i18n, memory.remember_error)}</p></Show>
+                    <Show when=move || !review.loading.get() && !review.enabled.get() && !review.failed.get()><Notice tone=NoticeTone::Caution presentation=NoticePresentation::Inline>{move || t!(i18n, memory.remember_disabled)}</Notice></Show>
+                    <Show when=move || review.failed.get() || status.get() == Some(RememberStatus::Unknown)><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move || t!(i18n, memory.remember_error)}</Notice></Show>
                     <Show when=move || status.get() == Some(RememberStatus::Saved)><p role="status">{move || t!(i18n, memory.remember_saved)}</p></Show>
                     <a class="ob-plugin-link" href="/settings/memory">{move || t!(i18n, memory.remember_manage)}</a>
                 </DialogBody>

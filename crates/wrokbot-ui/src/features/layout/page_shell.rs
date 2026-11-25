@@ -39,33 +39,10 @@ pub fn PageShell(
     }
 }
 
-/// In-content breadcrumb/action row below the single application toolbar.
+/// Row of page-level actions (refresh, load more) above the page content.
 #[component]
-pub fn PageTopbar(children: Children) -> impl IntoView {
+pub fn PageActions(children: Children) -> impl IntoView {
     view! { <div class="ob-page-actions">{children()}</div> }
-}
-
-/// Same-origin back navigation used inside a PageTopbar.
-#[component]
-pub fn PageBackLink(
-    /// Bounded same-origin destination.
-    #[prop(into)]
-    href: String,
-    /// Visible localized link label.
-    #[prop(into)]
-    label: TextProp,
-) -> impl IntoView {
-    assert_same_origin_href(&href);
-    assert!(
-        !label.get().trim().is_empty(),
-        "back label must be nonempty"
-    );
-    view! {
-        <a class="ob-page-back" href=href>
-            <span aria-hidden="true">"‹"</span>
-            <span>{move || label.get()}</span>
-        </a>
-    }
 }
 
 /// The page's unique h1 and optional explanatory sentence.
@@ -74,9 +51,13 @@ pub fn PageHeader(
     /// Stable h1 DOM token.
     #[prop(into)]
     heading_id: String,
-    /// Visible localized h1 text.
+    /// Localized h1 text.
     #[prop(into)]
     title: TextProp,
+    /// The top bar already shows this same title, so the h1 is kept for assistive technology
+    /// only instead of stacking a second visible title (UI spec v5.2 §5.4).
+    #[prop(optional)]
+    title_in_top_bar: bool,
     /// Optional localized explanatory sentence.
     #[prop(optional, into)]
     description: TextProp,
@@ -89,7 +70,11 @@ pub fn PageHeader(
     let visible_description = description.clone();
     view! {
         <header class="ob-page-header">
-            <h1 id=heading_id class="ob-page-title">{move || title.get()}</h1>
+            <h1
+                id=heading_id
+                class="ob-page-title"
+                class:ob-visually-hidden=title_in_top_bar
+            >{move || title.get()}</h1>
             <p
                 class="ob-page-intro"
                 hidden=move || visible_description.get().trim().is_empty()
@@ -158,34 +143,15 @@ fn assert_dom_id(id: &str) {
     );
 }
 
-fn assert_same_origin_href(href: &str) {
-    assert!(
-        href.starts_with('/')
-            && !href.starts_with("//")
-            && href.len() <= 2048
-            && !href
-                .bytes()
-                .any(|byte| byte.is_ascii_control() || byte == b'\\'),
-        "PageBackLink href must be one bounded same-origin absolute path"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn widths_ids_and_back_links_are_closed() {
+    fn widths_and_ids_are_closed() {
         assert_eq!(PageWidth::Content.as_str(), "content");
         assert_eq!(PageWidth::Table.as_str(), "table");
         assert_eq!(PageWidth::Chat.as_str(), "chat");
         assert_dom_id("settings-connected-accounts");
-        assert_same_origin_href("/settings?tab=general#theme");
-    }
-
-    #[test]
-    #[should_panic(expected = "same-origin")]
-    fn page_back_rejects_external_destinations() {
-        assert_same_origin_href("https://attacker.example/settings");
     }
 }

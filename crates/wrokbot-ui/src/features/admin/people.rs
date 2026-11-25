@@ -15,7 +15,8 @@ use crate::features::layout::{PageHeader, PageSection, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::icons::Icon;
 use crate::primitives::{
-    Button, ButtonSize, ButtonVariant, IconSize, IconView, Input, InputType, Switch,
+    Button, ButtonSize, ButtonVariant, IconSize, IconView, Input, InputType, Notice, NoticeTone,
+    Switch,
 };
 
 const PEOPLE_SEARCH_DEBOUNCE_MS: i32 = 250;
@@ -149,9 +150,9 @@ pub fn AdminPeoplePage() -> impl IntoView {
                 description=move || t_string!(i18n, admin.people_section_intro).to_owned()
             >
                 <Show when=move || mutation_error.get()>
-                    <p class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         {move || t!(i18n, admin.people_mutation_error)}
-                    </p>
+                    </Notice>
                 </Show>
                 <div class="ob-people-search">
                     <Input
@@ -162,7 +163,7 @@ pub fn AdminPeoplePage() -> impl IntoView {
                     />
                 </div>
                 <Show when=move || load_error.get()>
-                    <div class="ob-alert" role="alert">
+                    <Notice tone=NoticeTone::Error>
                         <span>{move || t!(i18n, admin.people_load_error)}</span>
                         <Button
                             variant=ButtonVariant::Ghost
@@ -173,7 +174,7 @@ pub fn AdminPeoplePage() -> impl IntoView {
                         >
                             {move || t!(i18n, common.retry)}
                         </Button>
-                    </div>
+                    </Notice>
                 </Show>
                 <Show when=move || loading.get() && people.with(Vec::is_empty)>
                     <div class="ob-loading" role="status">

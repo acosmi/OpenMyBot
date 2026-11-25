@@ -22,7 +22,9 @@ use super::composer::model_intents::RunIntent;
 use crate::{
     api::artifacts::MetadataError,
     i18n::{t, use_i18n},
-    primitives::{Button, ButtonSize, ButtonVariant},
+    primitives::{
+        Button, ButtonSize, ButtonVariant, Notice, NoticePresentation, NoticeTone, TechnicalDetails,
+    },
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -873,6 +875,12 @@ impl ArtifactSourceObserver {
             && self.thread.try_get_untracked().flatten().as_ref() == Some(&source.thread)
             && self.bot.try_get_value().flatten().as_ref() == Some(&source.bot)
             && self.anchor.try_get_value().as_ref() == Some(&source.anchor)
+    }
+
+    /// Whether this message offers "save as artifact": it is the one message that can be saved, or
+    /// it has a save whose outcome the user can still follow.
+    pub(crate) fn offers_save(self, message: &str) -> bool {
+        self.selection(message).is_some() || self.actions.visible_operation(self, message).is_some()
     }
 
     fn selection(self, message: &str) -> Option<UserSource> {
@@ -2085,9 +2093,9 @@ pub(crate) fn ArtifactUnknownNotice() -> impl IntoView {
     let actions = expect_context::<ArtifactActions>();
     view! {
         <Show when=move || actions.has_unknown()>
-            <p class="ob-alert" role="status" data-artifact-save-unknown="">
+            <Notice tone=NoticeTone::Caution>
                 {move || t!(i18n, artifacts.unknown)}
-            </p>
+            </Notice>
         </Show>
     }
 }
@@ -2138,14 +2146,11 @@ pub(crate) fn ArtifactMessageActions(
             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small disabled=disabled on_activate=save>
                 {move || t!(i18n, artifacts.save)}
             </Button>
-            <Show when=move || eligible.get().is_none() && operation.get().is_none()>
-                <span class="ob-tool-source">{move || t!(i18n, artifacts.source_unavailable)}</span>
-            </Show>
             <Show when=move || phase.get() == Some(SavePhase::Saving)>
                 <span role="status">{move || t!(i18n, artifacts.saving)}</span>
             </Show>
             <Show when=move || phase.get() == Some(SavePhase::NotSubmitted)>
-                <span class="ob-alert" role="status">{move || t!(i18n, artifacts.not_submitted)}</span>
+                <Notice tone=NoticeTone::Caution presentation=NoticePresentation::Inline>{move || t!(i18n, artifacts.not_submitted)}</Notice>
             </Show>
             <Show when=move || phase.get() == Some(SavePhase::Unknown)>
                 <Button variant=ButtonVariant::Ghost size=ButtonSize::Small disabled=receipt_disabled on_activate=check_receipt>
@@ -2192,32 +2197,43 @@ fn ArtifactMetadataView(actions: ArtifactActions, mount: u64) -> impl IntoView {
                     // The API rejects these200 shapes. Keep the view closed as well.
                     ArtifactMetadata::Deleted(_) | ArtifactMetadata::Expired(_) => return ().into_any(),
                 };
+                let technical_copy = format!(
+                    "{}\n{}\n{}\n{}",
+                    record.artifact_id,
+                    record.sha256,
+                    record.source_thread_id.as_str(),
+                    record.source_run_id.as_str()
+                );
                 view! {
                     <details open>
                         <summary>{move || t!(i18n, artifacts.details)}</summary>
                         <p>{move || if partial { t!(i18n, artifacts.failed_partial).into_any() } else { t!(i18n, artifacts.available).into_any() }}</p>
                         <dl>
-                            <dt>{move || t!(i18n, artifacts.identifier)}</dt><dd><code>{record.artifact_id}</code></dd>
                             <dt>{move || t!(i18n, artifacts.media_type)}</dt><dd>{record.media_type}</dd>
                             <dt>{move || t!(i18n, artifacts.size)}</dt><dd>{record.byte_length.to_string()}</dd>
-                            <dt>{move || t!(i18n, artifacts.digest)}</dt><dd><code>{record.sha256}</code></dd>
-                            <dt>{move || t!(i18n, artifacts.source_thread)}</dt><dd><code>{record.source_thread_id.as_str().to_owned()}</code></dd>
-                            <dt>{move || t!(i18n, artifacts.source_run)}</dt><dd><code>{record.source_run_id.as_str().to_owned()}</code></dd>
                         </dl>
+                        <TechnicalDetails copy=technical_copy>
+                            <dl>
+                                <dt>{move || t!(i18n, artifacts.identifier)}</dt><dd><code>{record.artifact_id}</code></dd>
+                                <dt>{move || t!(i18n, artifacts.digest)}</dt><dd><code>{record.sha256}</code></dd>
+                                <dt>{move || t!(i18n, artifacts.source_thread)}</dt><dd><code>{record.source_thread_id.as_str().to_owned()}</code></dd>
+                                <dt>{move || t!(i18n, artifacts.source_run)}</dt><dd><code>{record.source_run_id.as_str().to_owned()}</code></dd>
+                            </dl>
+                        </TechnicalDetails>
                         <p class="ob-tool-source">{move || t!(i18n, artifacts.retention)}</p>
                         <p class="ob-tool-source">{move || t!(i18n, artifacts.limits)}</p>
                     </details>
                 }.into_any()
             }
             MetadataState::Failed(error) => view! {
-                <p class="ob-alert" role="status">{move || match error {
+                <Notice tone=NoticeTone::Caution>{move || match error {
                     MetadataError::Unauthorized => t!(i18n, artifacts.unauthorized).into_any(),
                     MetadataError::Forbidden | MetadataError::NotFound => t!(i18n, artifacts.not_visible).into_any(),
                     MetadataError::Gone(ArtifactGoneStatus::Deleted) => t!(i18n, artifacts.deleted).into_any(),
                     MetadataError::Gone(ArtifactGoneStatus::Expired) => t!(i18n, artifacts.expired).into_any(),
                     MetadataError::Unavailable => t!(i18n, artifacts.unavailable).into_any(),
                     MetadataError::InvalidResponse => t!(i18n, artifacts.invalid_response).into_any(),
-                }}</p>
+                }}</Notice>
             }.into_any(),
             MetadataState::Idle | MetadataState::Loading => ().into_any(),
         }}

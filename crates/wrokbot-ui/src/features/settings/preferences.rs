@@ -9,7 +9,8 @@ use crate::features::layout::{PageHeader, PageSection, PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
 use crate::preferences::PreferenceSaveStatus;
 use crate::primitives::{
-    Button, ButtonSize, ButtonVariant, Field, Input, LocaleSwitch, Switch, ThemeToggle,
+    Button, ButtonSize, ButtonVariant, Field, Input, LocaleSwitch, Notice, NoticePresentation,
+    NoticeTone, Switch, ThemeToggle,
 };
 
 const MICRO_UNITS_PER_UNIT: u128 = 1_000_000;
@@ -182,7 +183,7 @@ pub fn SettingsPage() -> impl IntoView {
                                 </p>
                             </Show>
                             <Show when=move || load_error.get()>
-                                <div class="ob-alert" role="alert">
+                                <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                                     <span>{move || t!(i18n, settings.run_cost_budget_load_error)}</span>
                                     <Button
                                         variant=ButtonVariant::Ghost
@@ -191,7 +192,7 @@ pub fn SettingsPage() -> impl IntoView {
                                     >
                                         {move || t!(i18n, common.retry)}
                                     </Button>
-                                </div>
+                                </Notice>
                             </Show>
                             <Show when=move || !loading.get() && !load_error.get()>
                                 <Field
@@ -255,9 +256,9 @@ pub fn SettingsPage() -> impl IntoView {
                                     </Show>
                                 </div>
                                 <Show when=move || save_error_form.get().as_ref() == Some(&current_form())>
-                                    <p class="ob-preference-error" role="alert">
+                                    <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
                                         {move || t!(i18n, settings.run_cost_budget_save_error)}
-                                    </p>
+                                    </Notice>
                                 </Show>
                             </Show>
                         </div>

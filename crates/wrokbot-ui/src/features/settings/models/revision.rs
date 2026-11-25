@@ -7,7 +7,7 @@ use crate::{
     editor_runtime::{after, now_ms},
     features::channels::composer::models::ModelDirectory,
     i18n::{t, t_string, use_i18n},
-    primitives::{Button, Field, Input},
+    primitives::{Button, Field, Input, Notice, NoticePresentation, NoticeTone},
     revision_editor::{Apply, AttemptToken, EditorCore, FailureClass, Phase},
 };
 use leptos::prelude::*;
@@ -415,8 +415,8 @@ pub(super) fn ModelRevisionEditor(
                 <p class="ob-page-intro">{move ||t!(i18n,revision_editor.metadata_boundary)}</p>
                 <Field control_id="model-name" label=move ||t_string!(i18n,models.name).to_owned() invalid disabled=Signal::derive(move ||actions.status.get().locked())><Input value=driver.name on_edit=edit on_composition=composition/></Field>
                 <Field control_id="model-identifier" label=move ||t_string!(i18n,models.identifier).to_owned() invalid disabled=Signal::derive(move ||actions.status.get().locked())><Input value=driver.model on_edit=edit on_composition=composition/></Field>
-                <Show when=move ||invalid.get()><p class="ob-alert" role="alert">{move ||t!(i18n,models.invalid)}</p></Show>
-                <Show when=move ||driver.read_failed.get()><p class="ob-alert" role="alert">{move ||t!(i18n,revision_editor.read_failed)}</p></Show>
+                <Show when=move ||invalid.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n,models.invalid)}</Notice></Show>
+                <Show when=move ||driver.read_failed.get()><Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>{move ||t!(i18n,revision_editor.read_failed)}</Notice></Show>
                 <EditorNotice phase busy id_prefix="model-editor"
                     can_retry=Signal::derive(move ||{driver.core.track();driver.retained.get_value().is_some()})
                     on_compare=UnsyncCallback::new(move |_|driver.read(ReadChoice::Compare))

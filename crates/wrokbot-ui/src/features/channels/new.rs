@@ -15,21 +15,24 @@ use crate::api::channel_new_href;
 use crate::api::channel_route_href;
 #[cfg(target_arch = "wasm32")]
 use crate::api::{
-    begin_thread_run_with_skills_and_model, create_channel, list_agents, load_agent,
-    load_thread_conversation, mint_run_id,
+    begin_thread_run_with_skills_and_model, create_channel, load_agent, load_thread_conversation,
+    mint_run_id,
 };
+use crate::features::agents::{AgentDirectory, use_agent_directory};
 use crate::features::layout::{PageShell, PageWidth};
 use crate::i18n::{t, t_string, use_i18n};
-use crate::icons::Icon;
-use crate::primitives::{Button, ButtonSize, ButtonVariant, IconSize, IconView, Textarea};
+use crate::primitives::{NoticeTone, Textarea, use_sidebar};
 
 use super::RecipientField;
+use super::composer::controls::{ComposerAction, ComposerControls, ComposerModel, choice_notices};
 #[cfg(target_arch = "wasm32")]
 use super::composer::model_intents::{CreateIntent, RunIntent, RunRecovery, is_definite_rejection};
 use super::composer::model_intents::{RunSubmissionActions, SubmissionSource};
-use super::composer::models::{ModelComposer, ModelPicker, ModelSelectionStatus};
+use super::composer::models::{ModelComposer, ModelSelectionStatus};
 use super::composer::presentation::{AssistantIdentity, ComposerFrame, DraftSuggestions};
-use super::composer::skills::{SkillComposer, SkillPicker};
+use super::composer::skills::SkillComposer;
+use super::composer::status::{SlotNotice, StatusSlot};
+use crate::shell::layout::set_shell_title;
 
 /// One recipient/message/run identity retained across a recoverable first-message retry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,9 +50,12 @@ pub(crate) struct StartAttempt {
 pub(crate) enum SubmissionNotice {
     ModelAgentConflict,
     ModelSelectionUnavailable,
+    #[cfg(any(target_arch = "wasm32", test))]
     Conflict,
     Rejected,
+    #[cfg(target_arch = "wasm32")]
     NavigationFailed,
+    #[cfg(target_arch = "wasm32")]
     RoutingFailed,
 }
 
@@ -61,6 +67,60 @@ pub(crate) const fn model_notice(status: ModelSelectionStatus) -> Option<Submiss
         | ModelSelectionStatus::DirectoryFailed
         | ModelSelectionStatus::Unavailable => Some(SubmissionNotice::ModelSelectionUnavailable),
     }
+}
+
+/// The status-slot notice of the last refused submission. A model refusal shows only while the
+/// model choice still has that problem.
+pub(crate) fn submission_slot_notice(
+    i18n: leptos_i18n::I18nContext<crate::i18n::Locale>,
+    notice: Option<SubmissionNotice>,
+    model_status: ModelSelectionStatus,
+    _show_channels: UnsyncCallback<()>,
+) -> Option<SlotNotice> {
+    let text = match notice? {
+        SubmissionNotice::ModelAgentConflict
+            if model_notice(model_status) == Some(SubmissionNotice::ModelAgentConflict) =>
+        {
+            t_string!(i18n, channels.model_agent_conflict)
+        }
+        SubmissionNotice::ModelSelectionUnavailable
+            if model_notice(model_status) == Some(SubmissionNotice::ModelSelectionUnavailable) =>
+        {
+            t_string!(i18n, channels.model_selection_unavailable)
+        }
+        SubmissionNotice::ModelAgentConflict | SubmissionNotice::ModelSelectionUnavailable => {
+            return None;
+        }
+        #[cfg(any(target_arch = "wasm32", test))]
+        SubmissionNotice::Conflict => t_string!(i18n, channels.submit_conflict),
+        SubmissionNotice::Rejected => t_string!(i18n, channels.submit_rejected),
+        #[cfg(target_arch = "wasm32")]
+        SubmissionNotice::NavigationFailed => {
+            return Some(
+                SlotNotice::new(
+                    NoticeTone::Error,
+                    t_string!(i18n, channels.navigation_failed),
+                )
+                .with_button(t_string!(i18n, channels.show_list), _show_channels),
+            );
+        }
+        #[cfg(target_arch = "wasm32")]
+        SubmissionNotice::RoutingFailed => t_string!(i18n, home.routing_failed),
+    };
+    Some(SlotNotice::new(NoticeTone::Error, text))
+}
+
+/// The status-slot notice of a channel creation whose reply was lost; its action opens the
+/// sidebar's channel list, where the channel appears if it was created (UI spec v5.2 §7.4).
+pub(crate) fn create_uncertain_notice(
+    i18n: leptos_i18n::I18nContext<crate::i18n::Locale>,
+    show_channels: UnsyncCallback<()>,
+) -> SlotNotice {
+    SlotNotice::new(
+        NoticeTone::Error,
+        t_string!(i18n, channels.create_uncertain),
+    )
+    .with_button(t_string!(i18n, channels.show_list), show_channels)
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -303,13 +363,25 @@ pub fn ChannelNewPage() -> impl IntoView {
     let i18n = use_i18n();
     let query = use_query_map();
     let navigate = use_navigate();
-    let agents = RwSignal::new(Vec::<AgentProfile>::new());
+    let directory = use_agent_directory();
+    set_shell_title(move || vec![t_string!(i18n, shell.new_channel).to_owned()]);
+    // A requested assistant the visible directory does not list (for example a hidden one).
+    let unlisted = RwSignal::new(None::<AgentProfile>);
+    let agents = Signal::derive(move || {
+        let mut rows = directory.agents.get();
+        if let Some(profile) = unlisted.get()
+            && !rows.iter().any(|agent| agent.id == profile.id)
+        {
+            rows.push(profile);
+            rows.sort_by(|left, right| left.id.cmp(&right.id));
+        }
+        rows
+    });
     let selected = RwSignal::new(None::<String>);
     let selected_profile = RwSignal::new(None::<AgentProfile>);
     let loading = RwSignal::new(true);
     let load_error = RwSignal::new(false);
     let recipient_restore_missing = RwSignal::new(false);
-    let load_generation = RwSignal::new(0_u64);
     let draft = RwSignal::new(String::new());
     let frozen_model_agent = RwSignal::new(None::<BotId>);
     let skill_composer = SkillComposer::new(
@@ -400,12 +472,12 @@ pub fn ChannelNewPage() -> impl IntoView {
 
     install_recipient_loader(
         query,
-        agents,
+        directory,
+        unlisted,
         selected,
         selected_profile,
         loading,
         load_error,
-        load_generation,
     );
     Effect::new(move |_| {
         if selected.get().is_some() || loading.get() {
@@ -579,18 +651,78 @@ pub fn ChannelNewPage() -> impl IntoView {
         }
     });
 
+    let show_channels = {
+        let sidebar = use_sidebar();
+        UnsyncCallback::new(move |_| sidebar.show_history())
+    };
+    let model = ComposerModel::Run(model_composer);
+    let notices = Signal::derive(move || {
+        let mut notices = Vec::new();
+        if uncertain_create.get() {
+            notices.push(create_uncertain_notice(i18n, show_channels));
+        }
+        if begin_unknown.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, channels.begin_unknown),
+            ));
+        }
+        if submission_blocked.get() {
+            notices.push(
+                SlotNotice::new(
+                    NoticeTone::Error,
+                    t_string!(i18n, channels.submission_blocked),
+                )
+                .linked(
+                    submissions
+                        .barrier()
+                        .and_then(|barrier| barrier.href())
+                        .unwrap_or_else(|| "/".to_owned()),
+                ),
+            );
+        }
+        notices.extend(submission_slot_notice(
+            i18n,
+            notice.get(),
+            model_composer.selection_status(),
+            show_channels,
+        ));
+        if load_error.get() || recipient_restore_missing.get() {
+            notices.push(SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, channels.recipient_load_error),
+            ));
+        }
+        notices.extend(choice_notices(
+            i18n,
+            model,
+            skill_composer,
+            inputs_locked.get(),
+        ));
+        notices
+    });
+    let send_action = ComposerAction {
+        disabled: send_disabled,
+        loading: submitting.into(),
+        label: Signal::derive(move || {
+            if begin_unknown.get() {
+                t_string!(i18n, channels.retry_original).to_owned()
+            } else {
+                t_string!(i18n, channels.composer_send).to_owned()
+            }
+        }),
+        run: send,
+    };
+
     view! {
         <PageShell width=PageWidth::Chat>
             <div class="ob-channel-new">
-                <a class="ob-conversation-back" href="/agents">{move || t!(i18n, common.back)}</a>
                 <AssistantIdentity profile=Signal::derive(move || selected_profile.get()) title=move || t_string!(i18n, channels.recipient_placeholder).to_owned() description=move || t_string!(i18n, channels.new_intro).to_owned()/>
                 <Show when=move || loading.get()>
                     <div class="ob-loading" role="status">{move || t!(i18n, common.loading)}</div>
                 </Show>
-                <Show when=move || load_error.get() || recipient_restore_missing.get()>
-                    <p class="ob-alert" role="alert">{move || t!(i18n, channels.recipient_load_error)}</p>
-                </Show>
                 <div class="ob-home-footer">
+                <StatusSlot notices/>
                 <ComposerFrame busy=Signal::derive(move || submitting.get())>
                     <Textarea
                         value=draft
@@ -604,138 +736,104 @@ pub fn ChannelNewPage() -> impl IntoView {
                         on_keydown=UnsyncCallback::new(move |event| skill_composer.keyboard(event))
                         on_submit=send
                     />
-                <div class="ob-chat-controls">
-                <div class="ob-channel-new-recipient">
-                    <RecipientField
-                        agents=Signal::derive(move || {
-                            let restoring = resumable.get().is_some() || uncertain_create.get();
-                            if restoring && (loading.get() || load_error.get() || recipient_restore_missing.get()) {
-                                Vec::new()
-                            } else {
-                                agents.get()
-                            }
-                        })
-                        selected
-                        aria_label=move || t_string!(i18n, channels.recipient_label).to_owned()
-                        placeholder=move || t_string!(i18n, channels.recipient_placeholder).to_owned()
-                        empty_label=move || t_string!(i18n, channels.recipient_empty).to_owned()
-                        disabled=inputs_locked
-                        on_select=select
-                    />
-                    <Show when=move || resumable.get().is_some() || uncertain_create.get()>
-                        <p class="ob-page-empty" role="note">
-                            <strong>{move || t!(i18n, channels.recipient_label)}</strong>
-                            {move || {
-                                if loading.get() {
-                                    return t_string!(i18n, common.loading).to_owned();
-                                }
-                                let frozen_agent = resumable.get().map(|attempt| attempt.agent_id).or_else(|| submissions.create_unknown(SubmissionSource::ChannelNew).map(|intent| intent.agent_id));
-                                frozen_agent.and_then(|id| agents.get().into_iter().find(|profile| profile.id == id).map(|profile| profile.name)).unwrap_or_else(|| t_string!(i18n, common.unknown).to_owned())
-                            }}
-                        </p>
-                    </Show>
-                </div>
-                    <ModelPicker state=model_composer disabled=inputs_locked/>
-                    <SkillPicker state=skill_composer disabled=inputs_locked/>
-                    <span class="ob-chat-send">
-                        <Button
-                            variant=ButtonVariant::Primary
-                            size=ButtonSize::Medium
-                            disabled=send_disabled
-                            loading=submitting
-                            on_activate=move |_| send.run(())
-                        >
-                            <IconView icon=Icon::ArrowUp size=IconSize::Navigation />
-                            <span class="ob-visually-hidden">{move || if begin_unknown.get() {
-                                t_string!(i18n, channels.retry_original).to_owned()
-                            } else {
-                                t_string!(i18n, channels.composer_send).to_owned()
-                            }}</span>
-                        </Button>
-                    </span>
-                </div>
+                    <ComposerControls model skills=skill_composer disabled=inputs_locked send=send_action>
+                        <div class="ob-channel-new-recipient">
+                            <RecipientField
+                                agents=Signal::derive(move || {
+                                    let restoring = resumable.get().is_some() || uncertain_create.get();
+                                    if restoring && (loading.get() || load_error.get() || recipient_restore_missing.get()) {
+                                        Vec::new()
+                                    } else {
+                                        agents.get()
+                                    }
+                                })
+                                selected
+                                aria_label=move || t_string!(i18n, channels.recipient_label).to_owned()
+                                placeholder=move || t_string!(i18n, channels.recipient_placeholder).to_owned()
+                                empty_label=move || t_string!(i18n, channels.recipient_empty).to_owned()
+                                disabled=inputs_locked
+                                on_select=select
+                            />
+                            <Show when=move || resumable.get().is_some() || uncertain_create.get()>
+                                <p class="ob-chat-note" role="note">
+                                    <strong>{move || t!(i18n, channels.recipient_label)}</strong>
+                                    {move || {
+                                        if loading.get() {
+                                            return t_string!(i18n, common.loading).to_owned();
+                                        }
+                                        let frozen_agent = resumable.get().map(|attempt| attempt.agent_id).or_else(|| submissions.create_unknown(SubmissionSource::ChannelNew).map(|intent| intent.agent_id));
+                                        frozen_agent.and_then(|id| agents.get().into_iter().find(|profile| profile.id == id).map(|profile| profile.name)).unwrap_or_else(|| t_string!(i18n, common.unknown).to_owned())
+                                    }}
+                                </p>
+                            </Show>
+                        </div>
+                    </ComposerControls>
                 </ComposerFrame>
                 <DraftSuggestions on_choose=UnsyncCallback::new(move |text| { if !inputs_locked.get_untracked() { draft.set(text); } }) disabled=inputs_locked/>
                 </div>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelAgentConflict) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelAgentConflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_agent_conflict)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::ModelSelectionUnavailable) && model_notice(model_composer.selection_status())==Some(SubmissionNotice::ModelSelectionUnavailable)><p class="ob-alert" role="alert">{move || t!(i18n, channels.model_selection_unavailable)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Conflict)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_conflict)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::Rejected)><p class="ob-alert" role="alert">{move || t!(i18n, channels.submit_rejected)}</p></Show>
-                <Show when=move || notice.get()==Some(SubmissionNotice::NavigationFailed)><p class="ob-alert" role="alert">{move || t!(i18n, channels.navigation_failed)}</p></Show>
-                <Show when=move || uncertain_create.get()>
-                    <div class="ob-alert" role="alert">
-                        <p>{move || t!(i18n, channels.create_uncertain)}</p>
-                        <a href="/">{move || t!(i18n, home.title)}</a>
-                    </div>
-                </Show>
-                <Show when=move || begin_unknown.get()>
-                    <p class="ob-alert" role="alert">{move || t!(i18n, channels.begin_unknown)}</p>
-                </Show>
-                <Show when=move || submission_blocked.get()>
-                    <a class="ob-alert" role="alert" href=move || submissions.barrier().and_then(|barrier| barrier.href()).unwrap_or_else(|| "/".to_owned())>
-                        {move || t!(i18n, channels.submission_blocked)}
-                    </a>
-                </Show>
             </div>
         </PageShell>
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Resolve the requested recipient from the shell directory; only an assistant it does not list
+/// is read on its own.
 fn install_recipient_loader(
     query: Memo<leptos_router::params::ParamsMap>,
-    agents: RwSignal<Vec<AgentProfile>>,
+    directory: AgentDirectory,
+    unlisted: RwSignal<Option<AgentProfile>>,
     selected: RwSignal<Option<String>>,
     selected_profile: RwSignal<Option<AgentProfile>>,
     loading: RwSignal<bool>,
     load_error: RwSignal<bool>,
-    generation: RwSignal<u64>,
 ) {
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
         let requested = query.get().get("agent");
-        let current = generation.get_untracked().saturating_add(1);
-        generation.set(current);
+        let directory_loading = directory.loading.get();
         selected.set(requested.clone());
         selected_profile.set(None);
-        loading.set(true);
         load_error.set(false);
+        loading.set(true);
+        if directory_loading {
+            return;
+        }
+        let Some(agent_id) = requested else {
+            load_error.set(directory.failed.get_untracked());
+            loading.set(false);
+            return;
+        };
+        let listed = directory.agents.with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.id.as_str() == agent_id)
+                .cloned()
+        });
+        if let Some(profile) = listed {
+            selected_profile.set(Some(profile));
+            loading.set(false);
+            return;
+        }
         leptos::task::spawn_local_scoped_with_cancellation(async move {
-            let roster = list_agents(false).await;
-            let direct = match requested.as_deref() {
-                Some(agent_id) => Some(load_agent(agent_id).await),
-                None => None,
-            };
-            if generation.get_untracked() != current {
-                return;
-            }
-            let roster_failed = roster.is_err();
-            let mut loaded = roster.unwrap_or_default();
-            match direct {
-                Some(Ok(profile)) => {
-                    if !loaded.iter().any(|agent| agent.id == profile.id) {
-                        loaded.push(profile.clone());
-                        loaded.sort_by(|left, right| left.id.cmp(&right.id));
-                    }
+            match load_agent(&agent_id).await {
+                Ok(profile) => {
+                    unlisted.set(Some(profile.clone()));
                     selected_profile.set(Some(profile));
                 }
-                Some(Err(_)) => load_error.set(true),
-                None if roster_failed => load_error.set(true),
-                None => {}
+                Err(_) => load_error.set(true),
             }
-            agents.set(loaded);
             loading.set(false);
         });
     });
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (
         query,
-        agents,
+        directory,
+        unlisted,
         selected,
         selected_profile,
         loading,
         load_error,
-        generation,
     );
 }
 

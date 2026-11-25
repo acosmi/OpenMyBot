@@ -4,11 +4,19 @@
 use leptos::prelude::*;
 
 use crate::features::agents::{AgentPresence, AgentPresenceState};
+use crate::features::channels::composer::controls::{
+    ComposerAction, ComposerControls, ComposerModel,
+};
+use crate::features::channels::composer::models::ModelComposer;
+use crate::features::channels::composer::presentation::ComposerFrame;
+use crate::features::channels::composer::skills::SkillComposer;
+use crate::features::channels::composer::status::{SlotNotice, StatusSlot};
+use crate::features::channels::message_actions::MessageActions;
 use crate::features::computer::ComputerPlaceholder;
 use crate::features::gallery::{GalleryBadge, GalleryFrame, GalleryTone, QuoteCard, RefusedCard};
 use crate::features::layout::{
-    DetailPanel, DetailPanelLayout, DetailPanelMain, PageEmpty, PageRows, PageSection, PageShell,
-    PageTopbar, PageWidth, RowMark, StaggerItem,
+    DetailPanel, DetailPanelLayout, DetailPanelMain, PageActions, PageEmpty, PageRows, PageSection,
+    PageShell, PageWidth, RowMark, SectionTab, SectionTabs, StaggerItem,
 };
 use crate::features::settings::ComputerPlaceholderArt;
 use crate::i18n::{t, t_string, use_i18n};
@@ -19,14 +27,15 @@ use crate::primitives::{
     DialogBody, DialogClose, DialogContent, DialogFooter, DialogTrigger, Field, IconSize, IconView,
     Input, InputGroup, InputGroupAffix, InputGroupAffixPosition, InputPreviewState, InputType,
     Item, ItemAction, ItemActions, ItemDescription, ItemMedia, ItemTitle, Kbd, KbdKey, KbdModifier,
-    Menu, MenuContent, MenuItem, MenuSeparator, MenuSub, MenuSubTrigger, MenuTrigger, Message,
-    MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageGroup, MessageHeader,
-    MessageScroller, MessageScrollerButton, MessageScrollerContent, MessageScrollerItem,
-    MessageScrollerViewport, Select, SelectContent, SelectGroup, SelectItem, SelectTrigger,
-    Separator, SeparatorOrientation, Sheet, SheetSide, Sidebar, SidebarContent, SidebarFooter,
-    SidebarGroup, SidebarGroupLabel, SidebarHeader, SidebarNavLink, SidebarNavList,
-    SidebarProvider, SidebarTrigger, Skeleton, SkeletonShape, Switch, Textarea,
-    TextareaPreviewState, Toast, ToastPreviewState, Tooltip, TooltipTrigger, TooltipTriggerAction,
+    Menu, MenuAlign, MenuContent, MenuItem, MenuSeparator, MenuSub, MenuSubTrigger, MenuTrigger,
+    Message, MessageAlign, MessageAvatar, MessageContent, MessageFooter, MessageGroup,
+    MessageHeader, MessageScroller, MessageScrollerButton, MessageScrollerContent,
+    MessageScrollerItem, MessageScrollerViewport, Notice, NoticePresentation, NoticeTone, Select,
+    SelectContent, SelectGroup, SelectItem, SelectTrigger, Separator, SeparatorOrientation, Sheet,
+    SheetSide, Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupLabel,
+    SidebarHeader, SidebarNavList, SidebarProvider, SidebarRow, SidebarTrigger, Skeleton,
+    SkeletonShape, Switch, TechnicalDetails, Textarea, TextareaPreviewState, Timestamp, Toast,
+    ToastPreviewState, Tooltip, TooltipTrigger, TooltipTriggerAction,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +48,9 @@ struct ScrollerGalleryItem {
 #[component]
 pub fn DesignGallery() -> impl IntoView {
     let i18n = use_i18n();
+    crate::shell::layout::set_shell_title(move || {
+        vec![t_string!(i18n, design_gallery.title).to_owned()]
+    });
     let button_count = RwSignal::new(0_u32);
     let item_count = RwSignal::new(0_u32);
     let name = RwSignal::new(String::new());
@@ -55,6 +67,7 @@ pub fn DesignGallery() -> impl IntoView {
     let sheet_open = RwSignal::new(false);
     let sheet_close_count = RwSignal::new(0_u32);
     let menu_open = RwSignal::new(false);
+    let end_menu_open = RwSignal::new(false);
     let menu_select_count = RwSignal::new(0_u32);
     let menu_close_count = RwSignal::new(0_u32);
     let combobox_open = RwSignal::new(false);
@@ -82,6 +95,66 @@ pub fn DesignGallery() -> impl IntoView {
     let scroller_next_id = RwSignal::new(11_i32);
     let scroller_previous_id = RwSignal::new(-1_i32);
     let scroller_expanded_id = RwSignal::new(None::<i32>);
+    let sample_time = time::macros::datetime!(2026-11-12 09:41 UTC);
+    let composer_draft = RwSignal::new(String::new());
+    let composer_skills = SkillComposer::new(
+        composer_draft,
+        Signal::derive(|| None),
+        "design-composer-message",
+    );
+    let composer_model = ComposerModel::Run(ModelComposer::new(
+        Signal::derive(|| true),
+        Signal::derive(|| None),
+    ));
+    let gallery_action = move |label: Signal<String>| ComposerAction {
+        disabled: Signal::derive(|| false),
+        loading: Signal::derive(|| false),
+        label,
+        run: UnsyncCallback::new(move |_| button_count.update(|count| *count += 1)),
+    };
+    let retry = UnsyncCallback::new(move |_| button_count.update(|count| *count += 1));
+    let error_wins = Signal::derive(move || {
+        vec![
+            SlotNotice::new(
+                NoticeTone::Status,
+                t_string!(i18n, design_gallery.notice_status),
+            ),
+            SlotNotice::new(
+                NoticeTone::Caution,
+                t_string!(i18n, design_gallery.notice_caution),
+            ),
+            SlotNotice::new(
+                NoticeTone::Error,
+                t_string!(i18n, design_gallery.notice_error),
+            )
+            .with_button(t_string!(i18n, common.retry), retry),
+        ]
+    });
+    let blocking_caution_wins = Signal::derive(move || {
+        vec![
+            SlotNotice::new(
+                NoticeTone::Success,
+                t_string!(i18n, design_gallery.notice_success),
+            ),
+            SlotNotice::new(
+                NoticeTone::Caution,
+                t_string!(i18n, design_gallery.notice_caution),
+            )
+            .blocking(),
+        ]
+    });
+    let status_only = Signal::derive(move || {
+        vec![
+            SlotNotice::new(
+                NoticeTone::Status,
+                t_string!(i18n, design_gallery.notice_status),
+            )
+            .with_link(
+                "/settings/models",
+                t_string!(i18n, models.custom_setup_action),
+            ),
+        ]
+    });
 
     view! {
         <section class="ob-page ob-design-gallery" aria-labelledby="design-gallery-title">
@@ -379,7 +452,7 @@ pub fn DesignGallery() -> impl IntoView {
                             <Sidebar>
                                 <SidebarHeader>
                                     <IconView icon=Icon::Bot size=IconSize::Navigation />
-                                    <span class="ob-sidebar-link-label">{move || t!(i18n, common.app_name)}</span>
+                                    <span class="ob-account-name">{move || t!(i18n, common.app_name)}</span>
                                 </SidebarHeader>
                                 <SidebarContent>
                                     <SidebarGroup>
@@ -387,28 +460,55 @@ pub fn DesignGallery() -> impl IntoView {
                                             {move || t!(i18n, design_gallery.sidebar_group)}
                                         </SidebarGroupLabel>
                                         <SidebarNavList>
-                                            <SidebarNavLink
+                                            <SidebarRow
                                                 href="/approvals"
                                                 icon=Icon::ListChecks
                                                 label=move || t_string!(i18n, admin.nav_approvals).to_owned()
+                                                badge="2"
                                                 current=true
                                             />
-                                            <SidebarNavLink
+                                            <SidebarRow
                                                 href="/agents"
-                                                icon=Icon::Users
-                                                label=move || t_string!(i18n, shell.nav_agents).to_owned()
+                                                avatar="design-sidebar-assistant"
+                                                label=move || t_string!(i18n, design_gallery.avatar_ada).to_owned()
+                                                secondary=Signal::derive(move || t_string!(i18n, design_gallery.sidebar_row_secondary).to_owned())
+                                                time=Some(sample_time)
                                             />
-                                            <SidebarNavLink
-                                                href="/settings"
+                                            <SidebarRow
+                                                on_activate=UnsyncCallback::new(move |_| item_count.update(|count| *count += 1))
                                                 icon=Icon::Settings
                                                 label=move || t_string!(i18n, shell.nav_settings).to_owned()
+                                                actions=move || view! {
+                                                    <span class="ob-sidebar-row-marker"><IconView icon=Icon::Globe size=IconSize::Inline /></span>
+                                                }
+                                            />
+                                            <SidebarRow
+                                                on_activate=UnsyncCallback::new(move |_| item_count.update(|count| *count += 1))
+                                                icon=Icon::LayoutGrid
+                                                label=move || t_string!(i18n, design_gallery.menu_end).to_owned()
+                                                actions=move || view! {
+                                                    <Menu id="design-menu-end" open=end_menu_open align=MenuAlign::End>
+                                                        <MenuTrigger>
+                                                            <IconView icon=Icon::Ellipsis size=IconSize::Inline />
+                                                            <span class="ob-visually-hidden">{move || t!(i18n, common.more_actions)}</span>
+                                                        </MenuTrigger>
+                                                        <MenuContent>
+                                                            <MenuItem on_select=move |_| menu_select_count.update(|count| *count += 1)>
+                                                                {move || t!(i18n, design_gallery.menu_copy)}
+                                                            </MenuItem>
+                                                            <MenuItem on_select=move |_| menu_select_count.update(|count| *count += 1)>
+                                                                {move || t!(i18n, design_gallery.menu_delete)}
+                                                            </MenuItem>
+                                                        </MenuContent>
+                                                    </Menu>
+                                                }
                                             />
                                         </SidebarNavList>
                                     </SidebarGroup>
                                 </SidebarContent>
                                 <SidebarFooter>
                                     <IconView icon=Icon::User size=IconSize::Navigation />
-                                    <span class="ob-sidebar-link-label">
+                                    <span class="ob-account-name">
                                         {move || t!(i18n, design_gallery.sidebar_user)}
                                     </span>
                                 </SidebarFooter>
@@ -676,6 +776,69 @@ pub fn DesignGallery() -> impl IntoView {
                     </div>
                 </section>
 
+                <section class="ob-design-section" aria-labelledby="design-notices-title">
+                    <h2 id="design-notices-title">{move || t!(i18n, design_gallery.notices)}</h2>
+                    <div class="ob-design-stack" id="design-notices">
+                        <Notice tone=NoticeTone::Error>
+                            <span>{move || t!(i18n, design_gallery.notice_error)}</span>
+                            <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| button_count.update(|count| *count += 1)>
+                                {move || t!(i18n, common.retry)}
+                            </Button>
+                        </Notice>
+                        <Notice tone=NoticeTone::Caution>{move || t!(i18n, design_gallery.notice_caution)}</Notice>
+                        <Notice tone=NoticeTone::Status>{move || t!(i18n, design_gallery.notice_status)}</Notice>
+                        <Notice tone=NoticeTone::Success>{move || t!(i18n, design_gallery.notice_success)}</Notice>
+                        <Notice tone=NoticeTone::Error presentation=NoticePresentation::Inline>
+                            <span>{move || t!(i18n, design_gallery.notice_error)}</span>
+                            <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| button_count.update(|count| *count += 1)>
+                                {move || t!(i18n, common.retry)}
+                            </Button>
+                        </Notice>
+                        <Notice tone=NoticeTone::Caution presentation=NoticePresentation::Inline>{move || t!(i18n, design_gallery.notice_caution)}</Notice>
+                        <Notice tone=NoticeTone::Status presentation=NoticePresentation::Inline>{move || t!(i18n, design_gallery.notice_status)}</Notice>
+                        <Separator decorative=true />
+                        <Timestamp at=sample_time />
+                        <TechnicalDetails copy="run_01JC0000000000000000000000\ncall_7f3a">
+                            <code>"run_01JC0000000000000000000000"</code>
+                            <code>"call_7f3a"</code>
+                        </TechnicalDetails>
+                    </div>
+                </section>
+
+                <section class="ob-design-section" aria-labelledby="design-composer-title">
+                    <h2 id="design-composer-title">{move || t!(i18n, design_gallery.composer)}</h2>
+                    <div class="ob-design-stack" id="design-composer">
+                        <StatusSlot notices=error_wins/>
+                        <StatusSlot notices=blocking_caution_wins/>
+                        <StatusSlot notices=status_only/>
+                        <ComposerFrame busy=Signal::derive(|| false)>
+                            <Textarea
+                                value=composer_draft
+                                id="design-composer-message"
+                                aria_label=move || t_string!(i18n, channels.composer_placeholder).to_owned()
+                            />
+                            <ComposerControls
+                                model=composer_model
+                                skills=composer_skills
+                                disabled=Signal::derive(|| false)
+                                send=gallery_action(Signal::derive(move || t_string!(i18n, channels.composer_send).to_owned()))
+                                take_over=(Signal::derive(|| true), gallery_action(Signal::derive(move || t_string!(i18n, bot_work.stop_and_take_over).to_owned())))
+                            />
+                        </ComposerFrame>
+                        <Message
+                            align=MessageAlign::End
+                            aria_label=move || t_string!(i18n, design_gallery.composer_label).to_owned()
+                        >
+                            <MessageContent>
+                                <Bubble kind=BubbleKind::User>
+                                    {move || t!(i18n, design_gallery.user_message)}
+                                </Bubble>
+                                <MessageActions on_remember=Some(retry)/>
+                            </MessageContent>
+                        </Message>
+                    </div>
+                </section>
+
                 <section class="ob-design-section" aria-labelledby="design-feedback-primitives-title">
                     <h2 id="design-feedback-primitives-title">
                         {move || t!(i18n, design_gallery.feedback_primitives)}
@@ -858,8 +1021,14 @@ pub fn DesignGallery() -> impl IntoView {
                     <div class="ob-design-layout-preview" id="design-layout-example">
                         <DetailPanelLayout open=detail_open>
                             <DetailPanelMain>
+                                <SectionTabs label=move || t_string!(i18n, design_gallery.section_tabs).to_owned()>
+                                    <SectionTab href="/_design" icon=Icon::LayoutGrid
+                                        label=move || t_string!(i18n, design_gallery.title).to_owned() />
+                                    <SectionTab href="/settings" icon=Icon::Settings nested=true
+                                        label=move || t_string!(i18n, shell.nav_settings).to_owned() />
+                                </SectionTabs>
                                 <PageShell width=PageWidth::Content>
-                                    <PageTopbar>
+                                    <PageActions>
                                         <span>{move || t!(i18n, design_gallery.layout_topbar)}</span>
                                         <div class="ob-design-row">
                                             <Button
@@ -873,7 +1042,7 @@ pub fn DesignGallery() -> impl IntoView {
                                                 {detail_close_count}
                                             </output>
                                         </div>
-                                    </PageTopbar>
+                                    </PageActions>
                                     <PageSection
                                         heading_id="design-layout-section"
                                         title=move || t_string!(i18n, design_gallery.layout_section).to_owned()
@@ -969,19 +1138,19 @@ pub fn DesignGallery() -> impl IntoView {
                             }.into_any()
                         >
                             <div class="ob-design-row">
-                                <GalleryBadge tone=GalleryTone::Neutral>"Neutral"</GalleryBadge>
-                                <GalleryBadge tone=GalleryTone::Caution>"Caution"</GalleryBadge>
-                                <GalleryBadge tone=GalleryTone::Negative>"Negative"</GalleryBadge>
+                                <GalleryBadge tone=GalleryTone::Neutral>{move || t!(i18n, gallery.tone_neutral)}</GalleryBadge>
+                                <GalleryBadge tone=GalleryTone::Caution>{move || t!(i18n, gallery.tone_caution)}</GalleryBadge>
+                                <GalleryBadge tone=GalleryTone::Negative>{move || t!(i18n, gallery.tone_negative)}</GalleryBadge>
                             </div>
                         </GalleryFrame>
                         <QuoteCard
-                            quote="The exact words remain attached to their source.".to_owned()
-                            attribution="the fixture".to_owned()
-                            context="Compiled Rust renderer".to_owned()
+                            quote=t_string!(i18n, gallery.sample_quote).to_owned()
+                            attribution=t_string!(i18n, gallery.sample_quote_attribution).to_owned()
+                            context=t_string!(i18n, gallery.sample_quote_context).to_owned()
                         />
                         <RefusedCard
-                            title="Quotation".to_owned()
-                            reason="This component is not available to this coworker.".to_owned()
+                            title=t_string!(i18n, gallery.quotation).to_owned()
+                            reason=t_string!(i18n, gallery.activity_refused_component).to_owned()
                         />
                     </div>
                 </section>

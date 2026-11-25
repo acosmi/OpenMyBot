@@ -3,7 +3,7 @@ use crate::{
     api::load_current_user,
     features::layout::PageSection,
     i18n::{t, t_string, use_i18n},
-    primitives::{Button, ButtonSize, ButtonVariant},
+    primitives::{Button, ButtonSize, ButtonVariant, Notice, NoticeTone},
 };
 use leptos::prelude::*;
 use openbot_contracts::auth::Role;
@@ -28,10 +28,10 @@ pub(super) fn AccountSummary() -> impl IntoView {
                         }.into_any()
                     }
                     Err(_) => view! {
-                        <div class="ob-alert" role="alert">
+                        <Notice tone=NoticeTone::Error>
                             <span>{move || t!(i18n, account.load_failed)}</span>
                             <Button variant=ButtonVariant::Ghost size=ButtonSize::Small on_activate=move |_| user.refetch()>{move || t!(i18n, common.retry)}</Button>
-                        </div>
+                        </Notice>
                     }.into_any()
                 })}
             </Suspense>
