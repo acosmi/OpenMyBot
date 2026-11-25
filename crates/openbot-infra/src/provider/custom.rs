@@ -688,7 +688,12 @@ mod v2_vault_tests {
                     assert!(matches!(result,Err(ProviderPortError::CommitUnknown)));
                     assert_eq!(adapter.v2_vault_opens.load(Ordering::SeqCst),1);assert_eq!(dns.0.load(Ordering::SeqCst),1);
                 }else{
-                    assert!(matches!(result,Err(ProviderPortError::InvalidRequest{..})),"closed current predicate {mode}");
+                    if mode==7{
+                        // Only the start gate for a cost cap on an unpriced custom Run may refuse here.
+                        assert!(matches!(result,Err(ProviderPortError::InvalidRequest{field:"custom_model_unpriced"})),"unpriced cost cap {mode}");
+                    }else{
+                        assert!(matches!(result,Err(ProviderPortError::InvalidRequest{..})),"closed current predicate {mode}");
+                    }
                     assert_eq!(adapter.v2_vault_opens.load(Ordering::SeqCst),0,"actual provider Vault call {mode}");
                     assert_eq!(dns.0.load(Ordering::SeqCst),0,"actual DNS before effect {mode}");
                 }
