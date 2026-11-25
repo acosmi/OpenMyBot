@@ -21,6 +21,7 @@
 //! - `electron-shim-check` —— 在 P1 写 shim 前先锁定文件、LOC 与 API allowlist。
 //! - `first-source-check` —— 只读核第一真源版本/R 行/PA/引擎/GUI 指针与冻结历史。
 //! - `acceptance-check` —— 核 v5/macOS 与 v6 M0/M1/full_v6 收集记录；不认证产品或发行。
+//! - `release`      —— macOS release signing, app assembly, notarization and verification.
 //! - `ci`           —— 按 v3 §16.3 的固定顺序跑本机可执行的那一段闸门。
 //!
 //! 用法（`.cargo/config.toml` 已配 alias）：
@@ -96,6 +97,21 @@ mod first_source;
 
 #[path = "../xtask/acceptance.rs"]
 mod acceptance;
+
+#[path = "../xtask/release.rs"]
+mod release;
+
+#[cfg(target_os = "macos")]
+#[path = "../xtask/release_sign.rs"]
+mod release_sign;
+
+#[cfg(target_os = "macos")]
+#[path = "../xtask/release_app.rs"]
+mod release_app;
+
+#[cfg(target_os = "macos")]
+#[path = "../xtask/release_check.rs"]
+mod release_check;
 
 // ---------------------------------------------------------------------------
 // 契约常量
@@ -265,6 +281,7 @@ fn main() -> ExitCode {
         }
         Some("first-source-check") => first_source::run(&args[1..]),
         Some("acceptance-check") => acceptance::run(&args[1..]),
+        Some("release") => workspace_root().and_then(|root| release::run(&root, &args[1..])),
         Some("ci") => cmd_ci(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
@@ -329,6 +346,15 @@ xtask —— OpenBot 仓库闸门驱动器
   cargo xtask acceptance-check --record <json> --candidate <manifest> --evidence-root <dir> [--spec <first-source.md>] [--json]
                                       核 v5/macOS 与 v6 M0/M1/full_v6 收集集合；v6 必须绑定 --spec，
                                       full_v5 及 full_v6 聚合关闭准入明确未支持
+  cargo xtask release sign-components --root-inputs <dir> [--root-inputs <dir>...] [--identity <name|->] [--verify-only]
+  cargo xtask release app --root <dir> --launcher <wrok-bot> --out <dir> --version <x.y.z> --minimum-macos <ver>
+  cargo xtask release sign-app --app <Wrok Bot.app> [--identity <name|->] [--entitlements <plist>]
+  cargo xtask release notarize --app <Wrok Bot.app> --keychain-profile <name> --out <dir> [--dry-run]
+  cargo xtask release check --app <Wrok Bot.app> --out <dir> [--expect-team <TEAMID>]
+  cargo xtask release all <app options> [--identity <name|->] [--entitlements <plist>]
+                          [--keychain-profile <name>] [--expect-team <TEAMID>] [--dry-run-notarize]
+                                      macOS: sign components, assemble, sign the app last, notarize
+                                      (never for ad-hoc `-`), check; <name> is the certificate common name
   cargo xtask ci                      按 v3 §16.3 顺序跑本机可执行的闸门段
   cargo xtask help                    打印本帮助
 "
