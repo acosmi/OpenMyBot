@@ -31,6 +31,7 @@ pub use control::{call, call_mcp, status};
 pub use daemon::daemon;
 pub use engine::Engine;
 pub use init::init;
+pub use omb_store::HostKind;
 pub use pairing::{PairRequest, pair};
 pub use pg::Postgres;
 
@@ -169,6 +170,8 @@ errors! {
     BindingStateInvalid => ("binding_state_invalid", Rejected),
     BindingFailed => ("binding_failed", Internal),
     HostBinaryInvalid => ("host_binary_invalid", Rejected),
+    ConfigInvalid => ("config_invalid", Rejected),
+    HostNotConfigured => ("host_not_configured", Rejected),
     WorkspaceRootInvalid => ("workspace_root_invalid", Rejected),
     AgentRuntimeFailed => ("agent_runtime_failed", Internal),
     PermissionNotPending => ("permission_not_pending", Rejected),
@@ -368,7 +371,7 @@ mod tests {
         for error in DaemonError::ALL {
             assert_eq!(DaemonError::from_code(error.code()), Some(*error));
         }
-        assert_eq!(DaemonError::ALL.len(), 51);
+        assert_eq!(DaemonError::ALL.len(), 53);
         assert_eq!(DaemonError::from_code("channel_not_supported"), None);
         for unknown in ["", "INTERNAL_ERROR", "not_a_code", "internal_error "] {
             assert_eq!(DaemonError::from_code(unknown), None);

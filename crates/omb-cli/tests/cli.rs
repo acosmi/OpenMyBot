@@ -186,6 +186,10 @@ fn control_forms() -> Vec<(Vec<&'static str>, &'static [u8])> {
             vec!["bindings", "host", "crabcode", "--workspace", "/ws"],
             b"",
         ),
+        (
+            vec!["bindings", "host", "claude", "--workspace", "/ws"],
+            b"",
+        ),
         (vec!["approve", "hp1"], b""),
         (vec!["deny", "hp1"], b""),
         (vec!["cancel", "r1"], b""),
@@ -426,7 +430,7 @@ async fn request_frame_carries_op_and_args_and_the_secret_only_in_args_and_never
                 "60",
             ],
             "pair_start",
-            json!({"channel": "feishu", "workspace": "/ws", "run_deadline": 60}),
+            json!({"channel": "feishu", "host": "crabcode", "workspace": "/ws", "run_deadline": 60}),
         ),
         (vec!["bindings", "list"], "bindings_list", json!({})),
         (
@@ -450,6 +454,16 @@ async fn request_frame_carries_op_and_args_and_the_secret_only_in_args_and_never
             vec!["plugins", "remove", "chat"],
             "plugins_remove",
             json!({"name": "chat"}),
+        ),
+        (
+            vec!["bindings", "host", "wrok", "--workspace", "/ws"],
+            "bindings_host",
+            json!({"host": "crabcode", "workspace": "/ws"}),
+        ),
+        (
+            vec!["pair", "telegram", "--workspace", "/ws", "--host", "claude"],
+            "pair_start",
+            json!({"channel": "telegram", "host": "claude", "workspace": "/ws"}),
         ),
     ] {
         let (_, request) = answered(&args, b"", ok.clone()).await;
@@ -567,7 +581,7 @@ async fn mcp_nested_env_refuses_every_call_without_a_connection() {
 }
 
 #[tokio::test]
-async fn mcp_sends_hello_mcp_with_the_op_and_arguments_verbatim() {
+async fn mcp_sends_hello_mcp_with_the_op_and_arguments_plus_its_host() {
     let data = [
         json!({"run_id": "r1", "thread_id": "T1", "state": "accepted"}),
         json!({"run_id": "r1", "state": "running", "permission_ids": []}),
@@ -596,8 +610,9 @@ async fn mcp_sends_hello_mcp_with_the_op_and_arguments_verbatim() {
         "mcp_thread_list",
     ];
     assert_eq!(records.len(), 5);
-    for ((recorded, op), (_, arguments)) in records.iter().zip(ops).zip(five_calls()) {
+    for ((recorded, op), (_, mut arguments)) in records.iter().zip(ops).zip(five_calls()) {
         assert_eq!(recorded.0, hello);
+        arguments["host"] = json!("crabcode");
         assert_eq!(
             recorded.1,
             json!({"type": "request", "op": op, "args": arguments})
@@ -617,12 +632,30 @@ async fn mcp_sends_hello_mcp_with_the_op_and_arguments_verbatim() {
     let records = server.await.unwrap();
     assert_eq!(
         records[0].1,
-        json!({"type": "request", "op": "mcp_thread_list", "args": {}})
+        json!({"type": "request", "op": "mcp_thread_list", "args": {"host": "crabcode"}})
     );
     assert_eq!(
         records[1].1,
-        json!({"type": "request", "op": "mcp_run_status", "args": odd})
+        json!({"type": "request", "op": "mcp_run_status", "args": {"run_id": 7, "x": [1], "host": "crabcode"}})
     );
+    // `--host` routes every call to that host; a caller's own `host` argument is replaced.
+    let (root_claude, listener) = data_dir();
+    let server = serve(listener, vec![success(json!({"runs": []}))]);
+    let mut claude = spawn_mcp(Some(&root_claude), &[], &["--host", "claude"]);
+    claude.send(&call(
+        1,
+        "wrok_thread_list",
+        Some(json!({"host": "crabcode"})),
+    ));
+    tool_data(&claude.recv(WITHIN).await, &json!({"runs": []}));
+    let records = server.await.unwrap();
+    assert_eq!(
+        records[0].1,
+        json!({"type": "request", "op": "mcp_thread_list", "args": {"host": "claude"}})
+    );
+    let (status, _, _) = claude.finish(WITHIN).await;
+    assert_eq!(status.code(), Some(0));
+    std::fs::remove_dir_all(&root_claude).unwrap();
     let (status, rest, errors) = child.finish(WITHIN).await;
     assert_eq!(status.code(), Some(0));
     for text in answers.iter().chain(&rest).chain([&errors]) {
@@ -897,7 +930,7 @@ async fn mcp_serves_the_2025_11_25_initialize_flow_through_the_daemon_bridge() {
     assert_eq!(records[0].0["client"], "mcp");
     assert_eq!(
         records[0].1,
-        json!({"type": "request", "op": "mcp_run_status", "args": {"run_id": "r1"}})
+        json!({"type": "request", "op": "mcp_run_status", "args": {"run_id": "r1", "host": "crabcode"}})
     );
     let (status, _, errors) = child.finish(WITHIN).await;
     assert_eq!(status.code(), Some(0));

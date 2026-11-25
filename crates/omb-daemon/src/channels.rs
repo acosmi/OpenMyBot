@@ -25,7 +25,7 @@ use openbot_contracts::ids::ActorId;
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
 };
@@ -263,10 +263,10 @@ pub(crate) fn start_heartbeat(connection: Connection, token_id: Uuid, timings: T
 }
 
 /// What the outbound side starts from: the engine's terminal notices and the configured host
-/// binary that startup reconciliation compares orphan process-group leaders with.
+/// binaries that startup reconciliation compares orphan process-group leaders with.
 pub(crate) struct Outbound {
     pub(crate) terminals: mpsc::Receiver<RunTerminalNotice>,
-    pub(crate) crabcode: Option<PathBuf>,
+    pub(crate) binaries: BTreeMap<omb_store::HostKind, PathBuf>,
 }
 
 /// The kind's supervisor, started on first use.
@@ -378,7 +378,7 @@ impl Channels {
         let reconciler = Reconciler {
             application: engine.assembly.application.clone(),
             resolver: engine.resolver.clone(),
-            crabcode: outbound.crabcode,
+            binaries: outbound.binaries,
             term_grace: CC_TERM_GRACE,
             kill_grace: CC_KILL_GRACE,
             replay_deadline: REPLAY_DEADLINE,
@@ -618,7 +618,7 @@ mod tests {
     fn outbound() -> Outbound {
         Outbound {
             terminals: mpsc::channel(TERMINAL_QUEUE).1,
-            crabcode: None,
+            binaries: BTreeMap::new(),
         }
     }
 
@@ -722,6 +722,7 @@ mod tests {
         let started = pair_start(
             &mut client,
             PairStart {
+                host: omb_store::HostKind::Crabcode,
                 channel: TELEGRAM,
                 workspace_dir: "/workspaces/project",
                 thread_id: minted.thread_id.as_str(),
@@ -1916,7 +1917,7 @@ mod tests {
             plugins,
             Outbound {
                 terminals,
-                crabcode: None,
+                binaries: BTreeMap::new(),
             },
         )
         .await;
@@ -1968,7 +1969,7 @@ mod tests {
             plugins,
             Outbound {
                 terminals,
-                crabcode: None,
+                binaries: BTreeMap::new(),
             },
         )
         .await;
@@ -2030,7 +2031,7 @@ mod tests {
             plugins,
             Outbound {
                 terminals,
-                crabcode: None,
+                binaries: BTreeMap::new(),
             },
         )
         .await;
@@ -2071,7 +2072,7 @@ mod tests {
             plugins,
             Outbound {
                 terminals,
-                crabcode: None,
+                binaries: BTreeMap::new(),
             },
         )
         .await;
@@ -2124,6 +2125,10 @@ mod tests {
                 &[fixture.root.join("home/ws")],
             )
             .unwrap(),
+            binaries: std::collections::BTreeMap::from([(
+                omb_store::HostKind::Crabcode,
+                std::path::PathBuf::from("/usr/bin/false"),
+            )]),
             plugins: none(&fixture),
             receiver: mpsc::channel(8).0,
             wake: channels.wake(),
@@ -2634,6 +2639,7 @@ mod tests {
         let started_pair = pair_start(
             &mut client,
             PairStart {
+                host: omb_store::HostKind::Crabcode,
                 channel: FEISHU,
                 workspace_dir: "/workspaces/project",
                 thread_id: minted.thread_id.as_str(),

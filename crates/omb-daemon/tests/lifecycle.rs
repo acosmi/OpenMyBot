@@ -320,6 +320,8 @@ async fn init_creates_private_independent_pg_cluster() {
         "hosts",
         "hosts/crabcode",
         "hosts/crabcode/tmp",
+        "hosts/claude",
+        "hosts/claude/tmp",
         "logs",
     ] {
         assert_private(&fixture.root.join(dir), 0o700);
@@ -738,8 +740,8 @@ async fn daemon_runs_store_migrations_before_control_token_publication() {
     let mut process =
         fixture.spawn("daemon_runs_store_migrations_before_control_token_publication");
     wait_for_token(&fixture).await;
-    let rows=query_own(&fixture,"SELECT (SELECT count(*)::bigint FROM openmybot.omb_migrations),(SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='openmybot')").await;
-    assert_eq!(rows[0].get::<_, i64>(0), 2);
+    let rows=query_own(&fixture,"SELECT (SELECT array_agg(version ORDER BY version) FROM openmybot.omb_migrations),(SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='openmybot')").await;
+    assert_eq!(rows[0].get::<_, Vec<i32>>(0), [1, 2, 3]);
     assert_eq!(rows[0].get::<_, i64>(1), 6);
     fixture.ready().await;
     let token = fs::read(fixture.root.join("run/control.token")).unwrap();
@@ -1028,13 +1030,14 @@ async fn daemon_restart_records_daemon_down_gap() {
     assert_runtime_released(&fixture);
 }
 
-/// Rewrites the `hosts.crabcode` section of the initialized `config.toml`.
+/// Rewrites the `hosts.crabcode` section and the workspace roots of the initialized
+/// `config.toml`.
 fn configure_crabcode(fixture: &Fixture, binary: &str, roots: &[PathBuf]) {
     let path = fixture.root.join("config.toml");
     let mut config: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     let mut section = toml::Table::new();
     section.insert("binary".into(), toml::Value::String(binary.into()));
-    section.insert(
+    config.insert(
         "workspace_roots".into(),
         toml::Value::Array(
             roots
@@ -1049,6 +1052,31 @@ fn configure_crabcode(fixture: &Fixture, binary: &str, roots: &[PathBuf]) {
         .unwrap()
         .insert("crabcode".into(), toml::Value::Table(section));
     fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn daemon_start_refuses_roots_inside_the_crabcode_section_as_config_invalid() {
+    if child_entry().await {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.initialize().await;
+    let path = fixture.root.join("config.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("workspace_roots = []\n", "");
+    fs::write(
+        &path,
+        format!("{text}\n[hosts.crabcode]\nbinary = \"/usr/bin/false\"\nworkspace_roots = []\n"),
+    )
+    .unwrap();
+    let mut process =
+        fixture.spawn("daemon_start_refuses_roots_inside_the_crabcode_section_as_config_invalid");
+    assert_eq!(process.wait().await, 4);
+    assert!(process.output().contains("config_invalid"));
+    assert!(!fixture.root.join("pg/data/postmaster.pid").exists());
+    assert_runtime_released(&fixture);
 }
 
 #[tokio::test]
@@ -1218,7 +1246,7 @@ async fn daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket
         op(
             &fixture,
             "pair_start",
-            serde_json::json!({"channel": "telegram", "workspace": workspace}),
+            serde_json::json!({"channel": "telegram", "host": "crabcode", "workspace": workspace}),
         )
     };
     assert_eq!(pair().await, Err(DaemonError::PluginNotInstalled));
@@ -1227,7 +1255,7 @@ async fn daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket
     let host = op(
         &fixture,
         "bindings_host",
-        serde_json::json!({"workspace": workspace}),
+        serde_json::json!({"host": "crabcode", "workspace": workspace}),
     )
     .await
     .unwrap();
@@ -1243,7 +1271,7 @@ async fn daemon_serves_pair_start_bindings_list_and_host_over_the_control_socket
         op(
             &fixture,
             "bindings_host",
-            serde_json::json!({"workspace": workspace})
+            serde_json::json!({"host": "crabcode", "workspace": workspace})
         )
         .await,
         Err(DaemonError::ChannelAlreadyBound)
@@ -1488,7 +1516,7 @@ async fn plugin_telegram_real_binary_happy_line_through_daemon_process() {
     let started = op(
         &fixture,
         "pair_start",
-        serde_json::json!({"channel": "telegram", "workspace": workspace}),
+        serde_json::json!({"channel": "telegram", "host": "crabcode", "workspace": workspace}),
     )
     .await
     .unwrap();
@@ -1550,7 +1578,7 @@ async fn daemon_restore_detected_suspends_bindings_and_expires_pending_events_un
     let host = op(
         &fixture,
         "bindings_host",
-        serde_json::json!({"workspace": workspace}),
+        serde_json::json!({"host": "crabcode", "workspace": workspace}),
     )
     .await
     .unwrap();

@@ -102,6 +102,10 @@ impl Prepared {
     /// The engine pool connects through `database`, a test wire proxy; the listener stays direct.
     pub(crate) async fn through(mut self, database: &DatabaseConfig) -> Self {
         self.pool = pool::connect(database).await.unwrap();
+        self.principal =
+            load_single_user_principal(&self.pool, self.deployment.clone(), self.tenant.clone())
+                .await
+                .unwrap();
         self
     }
 }
@@ -126,7 +130,7 @@ impl Engine {
 pub(crate) async fn assemble(
     root: &Path,
     prepared: Prepared,
-    host: &HostDriver,
+    hosts: &[HostDriver],
     run_event_subscriber: Option<Arc<dyn RunTerminalSubscriber>>,
 ) -> Result<Engine, DaemonError> {
     let Prepared {
@@ -162,7 +166,16 @@ pub(crate) async fn assemble(
     let ui_audit_key = derive_application_key(&master, ApplicationKeyPurpose::AuditCheckpoint)
         .map_err(|_| DaemonError::EngineAssemblyFailed)?;
     let agent_audit_key = SecretBytes::new(audit_key.expose().to_vec());
-    let crabcode: Arc<dyn ProviderAdapter> = host.adapter();
+    // One adapter per host, under the host's extension key.
+    let extra_provider_adapters = hosts
+        .iter()
+        .map(|host| {
+            let adapter: Arc<dyn ProviderAdapter> = host.adapter();
+            ProviderExtensionKey::new(host.kind().as_str())
+                .map(|key| (key, adapter))
+                .map_err(|_| DaemonError::EngineAssemblyFailed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let ui_preferences = Arc::new(
         PostgresUiPreferenceAdministration::new(
             pool.clone(),
@@ -224,10 +237,7 @@ pub(crate) async fn assemble(
         stall_timeout: None,
         oauth_public_url: None,
         app_url: None,
-        extra_provider_adapters: vec![(
-            ProviderExtensionKey::new("crabcode").map_err(|_| DaemonError::EngineAssemblyFailed)?,
-            crabcode,
-        )],
+        extra_provider_adapters,
         run_event_subscriber,
         delegation_authority: Some(authority.clone()),
     })

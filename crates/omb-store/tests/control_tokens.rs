@@ -1,7 +1,5 @@
-#[path = "../src/testkit.rs"]
-mod testkit;
+use omb_store::testkit::{Fixture, Session, deadline};
 use omb_store::{ControlTokenStart, StoreError, migrate, start_control_token, stop_control_token};
-use testkit::{Fixture, Session, deadline};
 use uuid::Uuid;
 async fn setup() -> (Fixture, Session) {
     let mut fixture = Fixture::new().await;
@@ -226,8 +224,8 @@ async fn concurrent_token_starts_never_leave_two_live_rows() {
 // Receiver and host active, one pending sender, events with and without pending dispatch, one session.
 const ROWS: &str = "DELETE FROM openmybot.host_driver_sessions; DELETE FROM openmybot.channel_events; DELETE FROM openmybot.channel_bindings; \
 INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,credential_envelope,status,revision,created_at,activated_at) VALUES('00000000-0000-0000-0000-000000000001','receiver','telegram','1','envelope','active',1,statement_timestamp(),statement_timestamp()); \
-INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,workspace_dir,granted_generation,status,revision,created_at,activated_at) VALUES('00000000-0000-0000-0000-000000000002','host','host','crabcode','host:crabcode','/fixture',1,'active',1,statement_timestamp(),statement_timestamp()); \
-INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,workspace_dir,thread_id,granted_generation,pairing_code_hash,pairing_expires_at,status,created_at) VALUES('00000000-0000-0000-0000-000000000005','sender','telegram','1','/fixture','thread',1,decode(repeat('ab',32),'hex'),statement_timestamp()+interval '10 minutes','pending',statement_timestamp()); \
+INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,host_kind,workspace_dir,granted_generation,status,revision,created_at,activated_at) VALUES('00000000-0000-0000-0000-000000000002','host','host','crabcode','host:crabcode','crabcode','/fixture',1,'active',1,statement_timestamp(),statement_timestamp()); \
+INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,host_kind,workspace_dir,thread_id,granted_generation,pairing_code_hash,pairing_expires_at,status,created_at) VALUES('00000000-0000-0000-0000-000000000005','sender','telegram','1','crabcode','/fixture','thread',1,decode(repeat('ab',32),'hex'),statement_timestamp()+interval '10 minutes','pending',statement_timestamp()); \
 INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,disposition) VALUES('00000000-0000-0000-0000-000000000003','event','host','crabcode','e',statement_timestamp(),'rejected_malformed'); \
 INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status) VALUES('00000000-0000-0000-0000-000000000006','event','host','crabcode','op:1',statement_timestamp(),'00000000-0000-0000-0000-000000000002','accepted_message','work',decode(repeat('cd',32),'hex'),'run-pending','thread','pending'); \
 INSERT INTO openmybot.channel_events(record_id,record_kind,channel_kind,source_key,event_key,accepted_at,binding_id,disposition,text,text_sha256,run_id,thread_id,dispatch_status,dispatched_at) VALUES('00000000-0000-0000-0000-000000000007','event','host','crabcode','op:2',statement_timestamp(),'00000000-0000-0000-0000-000000000002','accepted_message','work',decode(repeat('cd',32),'hex'),'run-dispatched','thread','dispatched',statement_timestamp()); \

@@ -10,8 +10,8 @@ use crate::{
     channels::{Channels, Outbound, utc_millis},
     config,
     control::{self, ControlState, ENGINE_PIN},
-    delegation::fixture::Fixture,
-    ops::{BindingRunCanceller, CancelQueue, Op, Ops, ReceiverCommand, ThreadMinter},
+    delegation::fixture::{Fixture, idle_claude},
+    ops::{BindingRunCanceller, CancelQueue, McpOp, Op, Ops, ReceiverCommand, ThreadMinter},
     plugins::{
         Plugins,
         tests::{Logs, fake_channel, package},
@@ -227,8 +227,11 @@ struct Rig {
 }
 impl Rig {
     /// Everything up to the channel tasks, in the daemon's order.
-    async fn prepare(host: fn(&Path) -> HostDriverConfig) -> Rig {
-        let mut fixture = Fixture::start_with_host(host).await;
+    async fn prepare(
+        host: fn(&Path) -> HostDriverConfig,
+        claude: fn(&Path) -> HostDriverConfig,
+    ) -> Rig {
+        let mut fixture = Fixture::start_with_hosts(host, claude).await;
         let token = control_token(&mut fixture).await;
         let runtime = AgentRuntime::start(fixture.engine(), fixture.pg.database_config()).unwrap();
         let control = fixture
@@ -257,6 +260,10 @@ impl Rig {
             vault: engine.vault.clone(),
             owner: ActorId::new(SINGLE_USER_ACTOR_ID),
             roots: WorkspaceRoots::parse(&home, &[home.join("ws")]).unwrap(),
+            binaries: std::collections::BTreeMap::from([
+                (omb_store::HostKind::Crabcode, agent::fake()),
+                (omb_store::HostKind::Claude, agent::fake()),
+            ]),
             plugins: plugins.clone(),
             receiver,
             // Replaced by the channels' wake-up at every start of the channel tasks.
@@ -312,7 +319,10 @@ impl Rig {
             cancel,
             Outbound {
                 terminals,
-                crabcode: Some(agent::fake()),
+                binaries: std::collections::BTreeMap::from([(
+                    omb_store::HostKind::Crabcode,
+                    agent::fake(),
+                )]),
             },
             Arc::clone(&gate),
         )
@@ -336,7 +346,15 @@ impl Rig {
         self.channels = Some(channels);
     }
     async fn start(host: fn(&Path) -> HostDriverConfig, timings: Timings) -> Rig {
-        let mut rig = Rig::prepare(host).await;
+        Rig::start_hosts(host, idle_claude, timings).await
+    }
+    /// Like `start`, with the Claude Code driver configured by `claude`.
+    async fn start_hosts(
+        host: fn(&Path) -> HostDriverConfig,
+        claude: fn(&Path) -> HostDriverConfig,
+        timings: Timings,
+    ) -> Rig {
+        let mut rig = Rig::prepare(host, claude).await;
         let terminals = rig.fixture.take_terminals();
         rig.start_channels(timings, terminals).await;
         rig
@@ -383,12 +401,12 @@ impl Rig {
         .unwrap();
     }
     /// A pending sender of `channel` on the workspace: its binding id and one-time code.
-    async fn pair_start(&mut self, channel: &str) -> (Uuid, String) {
+    async fn pair_start(&mut self, channel: &str, host: &str) -> (Uuid, String) {
         let workspace = self.fixture.root.join("home/ws");
         let started = self
             .call(
                 "pair_start",
-                json!({"channel": channel, "workspace": workspace}),
+                json!({"channel": channel, "host": host, "workspace": workspace}),
             )
             .await
             .unwrap();
@@ -400,7 +418,7 @@ impl Rig {
     /// Pairs the owner's Telegram chat with update `1`; returns the active sender and the used
     /// code.
     async fn pair(&mut self) -> (Uuid, String) {
-        let (binding, code) = self.pair_start("telegram").await;
+        let (binding, code) = self.pair_start("telegram", "crabcode").await;
         self.telegram
             .push(&update(1, OWNER, OWNER, &format!("/pair {code}")));
         let reply = until(LIMIT, async || self.sent().into_iter().next()).await;
@@ -558,7 +576,7 @@ impl Rig {
 #[tokio::test]
 #[ignore = "own PG17.11; explicit binary directory; serial"]
 async fn injected_pending_host_events_dispatch_in_order_on_a_fingerprint_minted_thread() {
-    let mut rig = Rig::prepare(agent::happy).await;
+    let mut rig = Rig::prepare(agent::happy, idle_claude).await;
     let engine = rig.fixture.engine();
     let mut entropy = [0; 16];
     getrandom::fill(&mut entropy).unwrap();
@@ -573,6 +591,7 @@ async fn injected_pending_host_events_dispatch_in_order_on_a_fingerprint_minted_
     let binding = omb_store::activate_host(
         &mut rig.client,
         omb_store::HostBinding {
+            host: omb_store::HostKind::Crabcode,
             workspace_dir: workspace.to_str().unwrap(),
             granted_generation: generation,
             run_deadline: None,
@@ -918,7 +937,7 @@ async fn feishu_redelivery_racing_dispatch_adds_no_run() {
     let mut rig = Rig::start(agent::happy, timings()).await;
     rig.bind("feishu").await;
     // Pairs the Feishu chat `oc_rig` of `ou_rig`.
-    let (binding, code) = rig.pair_start("feishu").await;
+    let (binding, code) = rig.pair_start("feishu", "crabcode").await;
     rig.feishu
         .push(&feishu_text("ev_rig_pair", &format!("/pair {code}")));
     let reply = until(LIMIT, async || rig.feishu.sent().into_iter().next()).await;
@@ -1060,7 +1079,7 @@ async fn pairing_code_is_single_use_end_to_end() {
 async fn five_wrong_pair_codes_lock_and_the_right_code_is_refused_without_replies() {
     let mut rig = Rig::start(agent::happy, timings()).await;
     rig.bind("telegram").await;
-    let (binding, code) = rig.pair_start("telegram").await;
+    let (binding, code) = rig.pair_start("telegram", "crabcode").await;
     // The first symbol replaced by another Crockford base32 symbol.
     let wrong = format!(
         "{}{}",
@@ -1622,7 +1641,7 @@ fn install_first_party(plugins: &Plugins, kind: &str, base: &str) {
 }
 /// The assembly with the first-party plugin of `kind` against a fresh fake platform.
 async fn first_party(kind: &str) -> (Rig, Platform) {
-    let mut rig = Rig::prepare(agent::happy).await;
+    let mut rig = Rig::prepare(agent::happy, idle_claude).await;
     let platform = Platform::start().await;
     let base = match kind {
         "telegram" => &platform.telegram,
@@ -1669,7 +1688,7 @@ fn feishu_event(event_id: &str, chat: &str, chat_type: &str, text: &str) -> Valu
 /// owner's private chat with update 1.
 async fn pair_telegram(rig: &mut Rig, platform: &mut Platform) {
     rig.bind("telegram").await;
-    let (binding, code) = rig.pair_start("telegram").await;
+    let (binding, code) = rig.pair_start("telegram", "crabcode").await;
     platform
         .push_update(bot_update(1, OWNER, OWNER, &format!("/pair {code}")))
         .await;
@@ -1695,7 +1714,7 @@ async fn pair_feishu(rig: &mut Rig, platform: &mut Platform) {
         .unwrap();
     let receiver = Uuid::parse_str(bound["binding_id"].as_str().unwrap()).unwrap();
     assert_eq!(rig.binding(receiver).await["source_key"], "cli_rig");
-    let (binding, code) = rig.pair_start("feishu").await;
+    let (binding, code) = rig.pair_start("feishu", "crabcode").await;
     platform
         .push_event(&feishu_event(
             "ev_pair",
@@ -1976,5 +1995,88 @@ async fn e2e_feishu_redelivered_event_adds_no_run() {
         1
     );
     assert_eq!(event_conflicts(&rig).await, 0);
+    rig.stop().await;
+}
+
+/// T12 setup: a Telegram sender paired to Claude Code and a host binding of CrabCode, side by
+/// side; returns the run of one Telegram message and the run of one host begin.
+async fn runs_on_both_hosts(rig: &mut Rig) -> (String, String) {
+    rig.bind("telegram").await;
+    let (sender, code) = rig.pair_start("telegram", "claude").await;
+    rig.telegram
+        .push(&update(1, OWNER, OWNER, &format!("/pair {code}")));
+    let reply = until(LIMIT, async || rig.sent().into_iter().next()).await;
+    assert!(body(&reply).starts_with("绑定成功"), "{reply}");
+    let workspace = rig.fixture.root.join("home/ws");
+    let host = rig
+        .call(
+            "bindings_host",
+            json!({"host": "crabcode", "workspace": workspace}),
+        )
+        .await
+        .unwrap();
+    let host = Uuid::parse_str(host["binding_id"].as_str().unwrap()).unwrap();
+    assert_eq!(rig.binding(sender).await["host_kind"], "claude");
+    assert_eq!(rig.binding(host).await["host_kind"], "crabcode");
+    rig.telegram
+        .push(&update(2, OWNER, OWNER, "please do the work"));
+    let channel_run = rig.run_of(2).await;
+    let begun = rig
+        .ops
+        .as_ref()
+        .unwrap()
+        .run_mcp(
+            McpOp::RunBegin,
+            json!({"host": "crabcode", "operation_id": "op-1", "message": "please do the work"}),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    (channel_run, begun["run_id"].as_str().unwrap().to_owned())
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn each_binding_runs_only_on_its_own_host() {
+    let mut rig = Rig::start_hosts(agent::happy, agent::claude_happy, timings()).await;
+    let (channel_run, host_run) = runs_on_both_hosts(&mut rig).await;
+    for (run, host) in [(&channel_run, "claude"), (&host_run, "crabcode")] {
+        assert_eq!(rig.terminal_of(run).await, "succeeded");
+        let rows = sessions(&rig, run).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["host_kind"], host, "{rows:?}");
+        assert_eq!(rows[0]["end_reason"], "result_success", "{rows:?}");
+    }
+    rig.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "own PG17.11; explicit binary directory; serial"]
+async fn a_host_without_a_binary_fails_only_its_own_runs_as_spawn_failed() {
+    let mut rig = Rig::start_hosts(agent::happy, idle_claude, timings()).await;
+    let (channel_run, host_run) = runs_on_both_hosts(&mut rig).await;
+    assert_eq!(rig.terminal_of(&host_run).await, "succeeded");
+    let rows = sessions(&rig, &host_run).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["host_kind"], "crabcode");
+    // The engine retries an unavailable provider start before the run fails.
+    let terminal = until(Duration::from_secs(240), async || {
+        rig.client
+            .query_one(
+                "SELECT terminal_kind FROM openmybot.channel_events WHERE run_id=$1",
+                &[&channel_run],
+            )
+            .await
+            .unwrap()
+            .get::<_, Option<String>>(0)
+    })
+    .await;
+    assert_eq!(terminal, "failed");
+    let rows = sessions(&rig, &channel_run).await;
+    assert!(!rows.is_empty());
+    for row in &rows {
+        assert_eq!(row["host_kind"], "claude", "{row}");
+        assert_eq!(row["end_reason"], "spawn_failed", "{row}");
+    }
     rig.stop().await;
 }

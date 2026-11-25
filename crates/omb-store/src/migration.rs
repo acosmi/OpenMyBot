@@ -14,6 +14,11 @@ const MIGRATIONS: &[(i32, &str, &[u8])] = &[
         "omb_0002_open_channel_kind.sql",
         include_bytes!("../migrations/omb_0002_open_channel_kind.sql"),
     ),
+    (
+        3,
+        "omb_0003_hosts.sql",
+        include_bytes!("../migrations/omb_0003_hosts.sql"),
+    ),
 ];
 const BOOTSTRAP: &str = "CREATE SCHEMA IF NOT EXISTS openmybot; CREATE TABLE IF NOT EXISTS openmybot.omb_migrations(version integer PRIMARY KEY,name text NOT NULL,sha256 bytea NOT NULL CHECK(octet_length(sha256)=32),applied_at timestamptz NOT NULL)";
 #[derive(Debug, PartialEq, Eq)]

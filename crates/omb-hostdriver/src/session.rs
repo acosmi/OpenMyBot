@@ -1,6 +1,8 @@
 //! Adapter start, the per-run session task, the stop ladder and run identification.
 use crate::{
-    DELIVERY_ARTIFACTS_MAX, HostDriverAdapter, STDERR_TAIL_MAX, Shared, jcs,
+    DELIVERY_ARTIFACTS_MAX, HostDriverAdapter, STDERR_TAIL_MAX, Shared,
+    host::profile,
+    jcs,
     mapping::{Mapped, Mapper},
     permission::{self, Pending},
     protocol::{self, Frame, LineError},
@@ -71,7 +73,7 @@ pub(crate) fn confirm(reaped: bool, group_empty: bool, at: SystemTime) -> StopOu
 }
 
 /// The binding named by the marker line of the first user message after the last assistant
-/// message, and the text sent to CrabCode: those user messages without the marker line, joined
+/// message, and the text sent to the host: those user messages without the marker line, joined
 /// by a blank line.
 pub(crate) fn run_marker(
     messages: &[ProviderMessage],
@@ -174,6 +176,7 @@ struct Spawned {
 impl HostDriverAdapter {
     async fn spawn(&self, target: &RunTarget) -> Result<Spawned, EndReason> {
         let config = &self.shared.config;
+        let profile = profile(config.kind);
         let binary = config.binary.as_deref().ok_or(EndReason::SpawnFailed)?;
         let workspace = config
             .roots
@@ -185,6 +188,7 @@ impl HostDriverAdapter {
         let probe = config.window.first();
         let accepted = window::verify(
             &SpawnSpec {
+                profile,
                 binary,
                 cwd: &workspace,
                 home: &config.home,
@@ -198,6 +202,7 @@ impl HostDriverAdapter {
         )
         .await?;
         let spec = SpawnSpec {
+            profile,
             binary,
             cwd: &workspace,
             home: &config.home,
@@ -242,6 +247,7 @@ impl ProviderAdapter for HostDriverAdapter {
         let record = omb_store::upsert_session(
             store,
             SessionStart {
+                host: self.shared.config.kind,
                 run_id: &target.run_id,
                 binding_id: binding,
                 workspace_dir: &target.workspace_dir,
@@ -646,9 +652,10 @@ impl Run {
         let permission_id = permission::permission_id();
         let bytes = jcs::jcs(&input);
         let summary = jcs::summary(&bytes);
-        let readonly = permission::readonly(&tool_name, &input, &self.workspace);
+        let profile = profile(self.shared.config.kind);
+        let readonly = permission::readonly(profile, &tool_name, &input, &self.workspace);
         let notice = (self.target.kind == GrantKind::Sender && !readonly)
-            .then(|| permission::notice(&self.target.run_id, &tool_name, &permission_id));
+            .then(|| permission::notice(profile, &self.target.run_id, &tool_name, &permission_id));
         let row = PermissionNew {
             run_id: &self.target.run_id,
             binding_id: self.target.binding_id,

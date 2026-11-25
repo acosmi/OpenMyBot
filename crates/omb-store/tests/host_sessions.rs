@@ -60,6 +60,7 @@ impl Env {
         upsert_session(
             self.client(),
             SessionStart {
+                host: omb_store::HostKind::Crabcode,
                 run_id: run,
                 binding_id: binding,
                 workspace_dir: "/w/sender",
@@ -973,6 +974,7 @@ async fn store_errors_map_to_host_session_failed() {
         upsert_session(
             env.client(),
             SessionStart {
+                host: omb_store::HostKind::Crabcode,
                 run_id: &"r".repeat(129),
                 binding_id: env.host,
                 workspace_dir: "/w"
@@ -987,6 +989,7 @@ async fn store_errors_map_to_host_session_failed() {
         upsert_session(
             env.client(),
             SessionStart {
+                host: omb_store::HostKind::Crabcode,
                 run_id: "r1",
                 binding_id: Uuid::now_v7(),
                 workspace_dir: "/w"

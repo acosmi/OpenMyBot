@@ -1,6 +1,6 @@
 //! Closed local command parsing; credentials never enter arguments. Channel kinds are free words
-//! the daemon checks.
-use omb_daemon::{DaemonError, ErrorClass};
+//! the daemon checks; host names are parsed here, where `wrok` and `wrokcode` name CrabCode.
+use omb_daemon::{DaemonError, ErrorClass, HostKind};
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -19,6 +19,7 @@ pub enum Command {
     },
     Pair {
         channel: String,
+        host: HostKind,
         workspace: PathBuf,
         run_deadline: Option<u32>,
     },
@@ -38,6 +39,7 @@ pub enum Command {
         channel: String,
     },
     BindingsHost {
+        host: HostKind,
         workspace: PathBuf,
         run_deadline: Option<u32>,
     },
@@ -61,7 +63,10 @@ pub enum Command {
     PluginsRemove {
         name: String,
     },
-    Mcp,
+    /// Calls route to this host's binding.
+    Mcp {
+        host: HostKind,
+    },
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
@@ -111,7 +116,9 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
     let allowed: &[&str] = match words.as_slice() {
         ["init"] => &["--pg-bin-dir"],
         ["status"] => &["--run"],
-        ["pair", _] | ["bindings", "host", "crabcode"] => &["--workspace", "--run-deadline"],
+        ["pair", _] => &["--workspace", "--run-deadline", "--host"],
+        ["bindings", "host", _] => &["--workspace", "--run-deadline"],
+        ["mcp"] => &["--host"],
         ["bindings", "reset-thread", _] => &["--ack-unknown"],
         ["plugins", "add"] => &["--built-in"],
         _ => &[],
@@ -139,6 +146,8 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         path.to_str().ok_or(UsageError)?;
         Ok(path)
     };
+    let host = |name: &str| HostKind::parse_name(name).ok_or(UsageError);
+    let host_flag = || text("--host")?.map_or(Ok(HostKind::Crabcode), |name| host(&name));
     let run_deadline = || {
         text("--run-deadline")?
             .map(|seconds| seconds.parse::<u32>().map_err(|_| UsageError))
@@ -154,6 +163,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         },
         ["pair", channel] if !channel.is_empty() => Command::Pair {
             channel: (*channel).into(),
+            host: host_flag()?,
             workspace: workspace()?,
             run_deadline: run_deadline()?,
         },
@@ -171,7 +181,8 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["bindings", "receiver", channel] if !channel.is_empty() => Command::BindingsReceiver {
             channel: (*channel).into(),
         },
-        ["bindings", "host", "crabcode"] => Command::BindingsHost {
+        ["bindings", "host", name] => Command::BindingsHost {
+            host: host(name)?,
             workspace: workspace()?,
             run_deadline: run_deadline()?,
         },
@@ -194,7 +205,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Invocation, UsageError> {
         ["plugins", "remove", name] => Command::PluginsRemove {
             name: (*name).into(),
         },
-        ["mcp"] if !json => Command::Mcp,
+        ["mcp"] if !json => Command::Mcp { host: host_flag()? },
         _ => return Err(UsageError),
     };
     Ok(Invocation {
@@ -214,19 +225,20 @@ impl Command {
             args
         };
         Some(match self {
-            Self::Init { .. } | Self::Daemon | Self::Mcp | Self::BindingsReceiver { .. } => {
+            Self::Init { .. } | Self::Daemon | Self::Mcp { .. } | Self::BindingsReceiver { .. } => {
                 return None;
             }
             Self::Status { run: None } => ("status", json!({})),
             Self::Status { run: Some(run_id) } => ("status_run", json!({"run_id": run_id})),
             Self::Pair {
                 channel,
+                host,
                 workspace,
                 run_deadline,
             } => (
                 "pair_start",
                 with_deadline(
-                    json!({"channel": channel, "workspace": workspace}),
+                    json!({"channel": channel, "host": host.as_str(), "workspace": workspace}),
                     run_deadline,
                 ),
             ),
@@ -245,11 +257,15 @@ impl Command {
                 json!({"binding_id": binding_id, "ack_unknown": ack_unknown}),
             ),
             Self::BindingsHost {
+                host,
                 workspace,
                 run_deadline,
             } => (
                 "bindings_host",
-                with_deadline(json!({"workspace": workspace}), run_deadline),
+                with_deadline(
+                    json!({"host": host.as_str(), "workspace": workspace}),
+                    run_deadline,
+                ),
             ),
             Self::Approve { permission_id } => ("approve", json!({"permission_id": permission_id})),
             Self::Deny { permission_id } => ("deny", json!({"permission_id": permission_id})),
@@ -386,6 +402,7 @@ mod tests {
             command(&["pair", "telegram", "--workspace", "/ws"]),
             Ok(Command::Pair {
                 channel: "telegram".into(),
+                host: HostKind::Crabcode,
                 workspace: "/ws".into(),
                 run_deadline: None
             })
@@ -401,15 +418,40 @@ mod tests {
             ]),
             Ok(Command::Pair {
                 channel: "feishu".into(),
+                host: HostKind::Crabcode,
                 workspace: "/ws".into(),
                 run_deadline: Some(900)
             })
         );
+        for (name, host) in [
+            ("claude", HostKind::Claude),
+            ("crabcode", HostKind::Crabcode),
+            ("wrok", HostKind::Crabcode),
+            ("wrokcode", HostKind::Crabcode),
+        ] {
+            assert_eq!(
+                command(&["pair", "telegram", "--workspace", "/ws", "--host", name]),
+                Ok(Command::Pair {
+                    channel: "telegram".into(),
+                    host,
+                    workspace: "/ws".into(),
+                    run_deadline: None
+                })
+            );
+        }
+        for name in ["dsh", "pi", "Claude", ""] {
+            assert_eq!(
+                command(&["pair", "telegram", "--workspace", "/ws", "--host", name]),
+                Err(UsageError),
+                "{name}"
+            );
+        }
         // Any channel word goes to the daemon, which answers `plugin_not_installed`.
         assert_eq!(
             command(&["pair", "slack", "--workspace", "/ws"]),
             Ok(Command::Pair {
                 channel: "slack".into(),
+                host: HostKind::Crabcode,
                 workspace: "/ws".into(),
                 run_deadline: None
             })
@@ -503,8 +545,33 @@ mod tests {
                     "60",
                 ],
                 Command::BindingsHost {
+                    host: HostKind::Crabcode,
                     workspace: "/ws".into(),
                     run_deadline: Some(60),
+                },
+            ),
+            (
+                vec!["bindings", "host", "claude", "--workspace", "/ws"],
+                Command::BindingsHost {
+                    host: HostKind::Claude,
+                    workspace: "/ws".into(),
+                    run_deadline: None,
+                },
+            ),
+            (
+                vec!["bindings", "host", "wrok", "--workspace", "/ws"],
+                Command::BindingsHost {
+                    host: HostKind::Crabcode,
+                    workspace: "/ws".into(),
+                    run_deadline: None,
+                },
+            ),
+            (
+                vec!["bindings", "host", "wrokcode", "--workspace", "/ws"],
+                Command::BindingsHost {
+                    host: HostKind::Crabcode,
+                    workspace: "/ws".into(),
+                    run_deadline: None,
                 },
             ),
         ] {
@@ -515,8 +582,19 @@ mod tests {
             vec!["bindings", "receiver"],
             vec!["bindings", "receiver", ""],
             vec!["bindings", "receiver", "feishu", "--app-id", "cli_a"],
-            vec!["bindings", "host", "claude", "--workspace", "/ws"],
+            vec!["bindings", "host", "dsh", "--workspace", "/ws"],
+            vec!["bindings", "host", "pi", "--workspace", "/ws"],
+            vec!["bindings", "host", "codex", "--workspace", "/ws"],
             vec!["bindings", "host", "crabcode"],
+            vec![
+                "bindings",
+                "host",
+                "claude",
+                "--workspace",
+                "/ws",
+                "--host",
+                "claude",
+            ],
             vec!["bindings", "list", "extra"],
             vec!["bindings", "revoke"],
             vec!["bindings", "list", "--app-id", "x"],
@@ -632,11 +710,27 @@ mod tests {
         }
     }
     #[test]
-    fn mcp_takes_no_words_flags_or_json() {
-        assert_eq!(command(&["mcp"]), Ok(Command::Mcp));
+    fn mcp_takes_only_the_host_flag_and_no_words_or_json() {
+        let crabcode = Command::Mcp {
+            host: HostKind::Crabcode,
+        };
+        assert_eq!(command(&["mcp"]), Ok(crabcode));
+        for (name, host) in [
+            ("claude", HostKind::Claude),
+            ("crabcode", HostKind::Crabcode),
+            ("wrok", HostKind::Crabcode),
+            ("wrokcode", HostKind::Crabcode),
+        ] {
+            assert_eq!(command(&["mcp", "--host", name]), Ok(Command::Mcp { host }));
+        }
         for values in [["--data-dir", "/d", "mcp"], ["mcp", "--data-dir", "/d"]] {
             let invocation = parse_args(&args(&values)).unwrap();
-            assert_eq!(invocation.command, Command::Mcp);
+            assert_eq!(
+                invocation.command,
+                Command::Mcp {
+                    host: HostKind::Crabcode
+                }
+            );
             assert_eq!(invocation.data_dir, Some(PathBuf::from("/d")));
         }
         for values in [
@@ -647,6 +741,10 @@ mod tests {
             vec!["mcp", "--workspace", "/w"],
             vec!["--json", "mcp", "run", "begin"],
             vec!["mcp", "--data-dir", "relative"],
+            vec!["mcp", "--host"],
+            vec!["mcp", "--host", "dsh"],
+            vec!["mcp", "--host", "claude", "--host", "claude"],
+            vec!["--host", "claude", "mcp"],
         ] {
             assert_eq!(command(&values), Err(UsageError), "{values:?}");
         }
@@ -667,7 +765,12 @@ mod tests {
             (
                 vec!["pair", "telegram", "--workspace", "/ws"],
                 "pair_start",
-                json!({"channel": "telegram", "workspace": "/ws"}),
+                json!({"channel": "telegram", "host": "crabcode", "workspace": "/ws"}),
+            ),
+            (
+                vec!["pair", "telegram", "--workspace", "/ws", "--host", "claude"],
+                "pair_start",
+                json!({"channel": "telegram", "host": "claude", "workspace": "/ws"}),
             ),
             (
                 vec![
@@ -679,7 +782,7 @@ mod tests {
                     "60",
                 ],
                 "pair_start",
-                json!({"channel": "feishu", "workspace": "/ws", "run_deadline": 60}),
+                json!({"channel": "feishu", "host": "crabcode", "workspace": "/ws", "run_deadline": 60}),
             ),
             (vec!["bindings", "list"], "bindings_list", json!({})),
             (
@@ -700,7 +803,17 @@ mod tests {
             (
                 vec!["bindings", "host", "crabcode", "--workspace", "/ws"],
                 "bindings_host",
-                json!({"workspace": "/ws"}),
+                json!({"host": "crabcode", "workspace": "/ws"}),
+            ),
+            (
+                vec!["bindings", "host", "wrokcode", "--workspace", "/ws"],
+                "bindings_host",
+                json!({"host": "crabcode", "workspace": "/ws"}),
+            ),
+            (
+                vec!["bindings", "host", "claude", "--workspace", "/ws"],
+                "bindings_host",
+                json!({"host": "claude", "workspace": "/ws"}),
             ),
             (
                 vec![
@@ -713,7 +826,7 @@ mod tests {
                     "5",
                 ],
                 "bindings_host",
-                json!({"workspace": "/ws", "run_deadline": 5}),
+                json!({"host": "crabcode", "workspace": "/ws", "run_deadline": 5}),
             ),
             (
                 vec!["approve", "hp1"],

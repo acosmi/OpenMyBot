@@ -1,13 +1,11 @@
-#[path = "../src/testkit.rs"]
-mod testkit;
+use omb_store::testkit::{
+    Fixture, Session, deadline, insert_receiver, set_accepted_at, set_pairing_expires_at,
+};
 use omb_store::{
     AcceptedEvent, ChannelKind, IdentityKey, PairAttempt, PairOutcome, PairStart, PairStarted,
     RunDeadline, StoreError, migrate, pair_attempt, pair_start, revoke_binding,
 };
 use sha2::{Digest, Sha256};
-use testkit::{
-    Fixture, Session, deadline, insert_receiver, set_accepted_at, set_pairing_expires_at,
-};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -22,6 +20,7 @@ async fn start(client: &mut Client, channel: ChannelKind) -> Result<PairStarted,
     pair_start(
         client,
         PairStart {
+            host: omb_store::HostKind::Crabcode,
             channel,
             workspace_dir: "/workspaces/project",
             thread_id: "thread-1",

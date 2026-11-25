@@ -108,6 +108,7 @@ fn run_v5(binding: Uuid, record: Uuid) -> String {
 async fn begin(client: &mut Client, id: &str, message: &str, thread: &str) -> HostAccept {
     accept_host_begin(
         client,
+        omb_store::HostKind::Crabcode,
         &OperationId::parse(id).unwrap(),
         &HostMessage::parse(message).unwrap(),
         thread,

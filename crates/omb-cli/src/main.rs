@@ -15,7 +15,7 @@ async fn main() -> ExitCode {
         }
     };
     let json = invocation.json;
-    let serving = invocation.command == Command::Mcp;
+    let serving = matches!(invocation.command, Command::Mcp { .. });
     // Read once at start: a host-driver child's MCP server refuses every tool call.
     let nested = std::env::var_os("OPENMYBOT_HOST_DRIVER_CHILD").is_some_and(|value| value == "1");
     let result: Result<serde_json::Value, DaemonError> = async {
@@ -41,8 +41,13 @@ async fn main() -> ExitCode {
                 serde_json::to_value(omb_daemon::status(StatusOptions { data_dir }).await?)
                     .map_err(|_| DaemonError::InternalError)
             }
-            Command::Mcp => {
-                omb_mcp::serve(omb_mcp::McpOptions { data_dir, nested }).await?;
+            Command::Mcp { host } => {
+                omb_mcp::serve(omb_mcp::McpOptions {
+                    data_dir,
+                    host,
+                    nested,
+                })
+                .await?;
                 Ok(serde_json::Value::Null)
             }
             Command::BindingsReceiver { channel } => {

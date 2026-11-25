@@ -2,7 +2,7 @@
 //! backfill with the cleaner every `sweep_interval`. Runs are never created here.
 use crate::{ChannelError, Connection, Task, Timings};
 use omb_store::{
-    EndReason, OpenRun, SessionEnd, StopRecord, StoreError, TerminalKind, clear_content,
+    EndReason, HostKind, OpenRun, SessionEnd, StopRecord, StoreError, TerminalKind, clear_content,
     delete_expired, deny_undecided_permissions, end_session, list_orphan_sessions,
     mark_sending_unknown, record_terminal, unfinished_runs,
 };
@@ -18,6 +18,7 @@ use openbot_contracts::{
 use openbot_server::SingleUserAuthResolver;
 use rustix::process::{Pid, Signal};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -40,8 +41,9 @@ pub(crate) const REPLAY_DEADLINE: Duration = Duration::from_secs(10);
 pub(crate) struct Reconciler {
     pub(crate) application: Arc<dyn ApplicationService>,
     pub(crate) resolver: SingleUserAuthResolver,
-    /// The configured host binary; without one no process group is ever signalled.
-    pub(crate) crabcode: Option<PathBuf>,
+    /// The configured binary of each host; a session of a host without one never has its
+    /// process group signalled.
+    pub(crate) binaries: BTreeMap<HostKind, PathBuf>,
     pub(crate) term_grace: Duration,
     pub(crate) kill_grace: Duration,
     pub(crate) replay_deadline: Duration,
@@ -64,7 +66,9 @@ pub(crate) async fn startup(
     for orphan in list_orphan_sessions(client, deadline()).await? {
         let (reason, stop) = match orphan.pgid.and_then(Pid::from_raw) {
             None => (EndReason::ChildExited, None),
-            Some(group) => end_of_group(group, reconciler).await,
+            Some(group) => {
+                end_of_group(group, reconciler.binaries.get(&orphan.host), reconciler).await
+            }
         };
         end_session(
             client,
@@ -206,8 +210,12 @@ fn terminal_of(kind: ThreadRunEventKind) -> Option<TerminalKind> {
 }
 
 /// The end of an orphan session whose row names `group`: a vanished group exited; a group led by
-/// the configured host binary is terminated; any other group is left untouched.
-async fn end_of_group(group: Pid, reconciler: &Reconciler) -> (EndReason, Option<StopRecord>) {
+/// the configured binary of the session's host is terminated; any other group is left untouched.
+async fn end_of_group(
+    group: Pid,
+    binary: Option<&PathBuf>,
+    reconciler: &Reconciler,
+) -> (EndReason, Option<StopRecord>) {
     if rustix::process::test_kill_process_group(group) == Err(rustix::io::Errno::SRCH) {
         let at = SystemTime::now().into();
         return (EndReason::ChildExited, Some(StopRecord::Confirmed { at }));
@@ -228,7 +236,7 @@ async fn end_of_group(group: Pid, reconciler: &Reconciler) -> (EndReason, Option
         Ok(Ok(output)) if output.status.success() => String::from_utf8(output.stdout).ok(),
         _ => None,
     };
-    if !output.is_some_and(|text| leader_matches(&text, reconciler.crabcode.as_deref())) {
+    if !output.is_some_and(|text| leader_matches(&text, binary.map(PathBuf::as_path))) {
         return (EndReason::ChildExited, Some(StopRecord::Unknown));
     }
     let _ = rustix::process::kill_process_group(group, Signal::TERM);
@@ -331,7 +339,7 @@ pub(crate) mod tests {
         Reconciler {
             application: engine.assembly.application.clone(),
             resolver: engine.resolver.clone(),
-            crabcode: None,
+            binaries: BTreeMap::new(),
             term_grace: Duration::from_millis(300),
             kill_grace: Duration::from_secs(2),
             replay_deadline: REPLAY_DEADLINE,
@@ -383,7 +391,7 @@ pub(crate) mod tests {
         .unwrap();
         let binding = Uuid::now_v7();
         let identity = format!("{channel}:42");
-        client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$5,'1001',$6,$6,$2,$3,$4,1,'active',statement_timestamp(),statement_timestamp())", &[&binding, &workspace.to_str().unwrap(), &thread.as_str(), &generation, &channel, &identity]).await.unwrap();
+        client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,host_kind,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$5,'1001','crabcode',$6,$6,$2,$3,$4,1,'active',statement_timestamp(),statement_timestamp())", &[&binding, &workspace.to_str().unwrap(), &thread.as_str(), &generation, &channel, &identity]).await.unwrap();
         (binding, thread)
     }
     /// A dispatched accepted message of the binding, begun through the delegated entry. Its
@@ -506,7 +514,7 @@ pub(crate) mod tests {
     }
     fn orphan_reconciler(fixture: &Fixture, kill_grace: Duration) -> Reconciler {
         Reconciler {
-            crabcode: Some(agent::fake()),
+            binaries: BTreeMap::from([(HostKind::Crabcode, agent::fake())]),
             kill_grace,
             ..reconciler(fixture)
         }

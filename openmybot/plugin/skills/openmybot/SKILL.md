@@ -20,7 +20,7 @@ These tools hand work to the local OpenMyBot daemon and report on it. Each run e
 A failed call returns an error result whose text is one code:
 
 - `wrok_not_running`: the daemon is not running. Ask the owner to start `openmybot daemon`; these tools never start it.
-- `host_not_bound`: no host binding exists. Ask the owner to run `openmybot bindings host crabcode --workspace <directory>`.
+- `host_not_bound`: this host has no host binding. Ask the owner to run `openmybot bindings host <host> --workspace <directory>`, with `crabcode` or `claude` as `<host>` for the host you are running in.
 - `host_binding_suspended`: the owner has to run `openmybot bindings reconfirm <binding_id>`.
 - `run_not_found`: the run does not belong to this host binding.
 - `dispatch_queue_full`: 20 runs are already waiting; try again later.

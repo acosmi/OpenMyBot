@@ -1,4 +1,4 @@
-//! The CrabCode stdio control protocol subset: bounded line parsing and the four outgoing frames.
+//! The SDK control protocol subset (CrabCode, Claude Code): bounded line parsing and the four outgoing frames.
 //! Nothing here leaves the crate; `mapping` alone turns these frames into engine events and rows.
 use omb_store::KEY_MAX;
 use serde_json::{Value, json};
@@ -238,6 +238,12 @@ mod tests {
             parse(r#"{"type":"stream_event","event":{}}"#),
             Ok(Frame::Unknown)
         );
+        for text in [
+            r#"{"type":"control_cancel_request","request_id":"r1"}"#,
+            r#"{"type":"prompt_suggestion","suggestion":"next"}"#,
+        ] {
+            assert_eq!(parse(text), Ok(Frame::Unknown), "{text}");
+        }
         assert_eq!(
             parse(r#"{"type":"control_response","response":{}}"#),
             Ok(Frame::ControlResponse)

@@ -168,11 +168,13 @@ async fn list_orphan_sessions_returns_unended_session_rows_only() {
         [
             OrphanSession {
                 record_id: with_group,
+                host: omb_store::HostKind::Crabcode,
                 run_id: "run-1".into(),
                 pgid: Some(4242),
             },
             OrphanSession {
                 record_id: without,
+                host: omb_store::HostKind::Crabcode,
                 run_id: "run-2".into(),
                 pgid: None,
             },

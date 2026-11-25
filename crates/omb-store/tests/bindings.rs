@@ -1,11 +1,9 @@
-#[path = "../src/testkit.rs"]
-mod testkit;
+use omb_store::testkit::{Fixture, Session, deadline, insert_receiver};
 use omb_store::{
     AcceptedEvent, AuthorityRow, ChannelKind, GrantKind, HostBinding, IdentityKey, PairAttempt,
     PairOutcome, PairStart, RunDeadline, StoreError, activate_host, authority_row, migrate,
     pair_attempt, pair_start, reconfirm_binding, revoke_binding,
 };
-use testkit::{Fixture, Session, deadline, insert_receiver};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -19,6 +17,7 @@ async fn host(client: &mut Client) -> Result<Uuid, StoreError> {
     activate_host(
         client,
         HostBinding {
+            host: omb_store::HostKind::Crabcode,
             workspace_dir: "/workspaces/host",
             granted_generation: 3,
             run_deadline: RunDeadline::parse(900),
@@ -31,6 +30,7 @@ async fn pending_sender(client: &mut Client) -> Uuid {
     pair_start(
         client,
         PairStart {
+            host: omb_store::HostKind::Crabcode,
             channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-1",
@@ -48,6 +48,7 @@ async fn active_sender(client: &mut Client) -> Uuid {
     let started = pair_start(
         client,
         PairStart {
+            host: omb_store::HostKind::Crabcode,
             channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-1",
@@ -300,6 +301,7 @@ async fn authority_row_returns_only_active_sender_or_host() {
         authority_row(&session.client, host_id).await.unwrap(),
         Some(AuthorityRow {
             kind: GrantKind::Host,
+            host: omb_store::HostKind::Crabcode,
             revision: 1,
             granted_generation: 3,
             run_deadline_seconds: Some(900)
@@ -316,6 +318,7 @@ async fn authority_row_returns_only_active_sender_or_host() {
         authority_row(&session.client, sender).await.unwrap(),
         Some(AuthorityRow {
             kind: GrantKind::Sender,
+            host: omb_store::HostKind::Crabcode,
             revision: 1,
             granted_generation: 4,
             run_deadline_seconds: None

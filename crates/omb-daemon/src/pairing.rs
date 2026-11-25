@@ -9,6 +9,7 @@ use tokio::time::Instant;
 
 pub struct PairRequest {
     pub channel: omb_store::ChannelKind,
+    pub host: omb_store::HostKind,
     pub workspace: PathBuf,
     pub run_deadline: Option<omb_store::RunDeadline>,
 }
@@ -43,6 +44,7 @@ pub async fn pair(
         client,
         omb_store::PairStart {
             channel: request.channel,
+            host: request.host,
             workspace_dir,
             thread_id: minted.thread_id.as_str(),
             granted_generation,
@@ -88,6 +90,7 @@ mod tests {
     fn request(workspace: PathBuf) -> PairRequest {
         PairRequest {
             channel: omb_store::ChannelKind::from_static("telegram"),
+            host: omb_store::HostKind::Crabcode,
             workspace,
             run_deadline: omb_store::RunDeadline::parse(300),
         }

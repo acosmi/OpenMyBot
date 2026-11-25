@@ -385,14 +385,23 @@ pub async fn insert_sender(
     thread_id: &str,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
-    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$2,$3,$4,$4,'/workspaces/project',$5,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&channel,&source_key,&sender_key,&thread_id]).await.unwrap(),1);
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at,host_kind) VALUES ($1,'sender',$2,$3,$4,$4,'/workspaces/project',$5,1,1,'active',statement_timestamp(),statement_timestamp(),'crabcode')",&[&id,&channel,&source_key,&sender_key,&thread_id]).await.unwrap(),1);
     id
 }
-/// An active host binding on the given workspace, revision 1.
+/// An active CrabCode host binding on the given workspace, revision 1.
 #[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
 pub async fn insert_host_binding(client: &tokio_postgres::Client, workspace: &str) -> uuid::Uuid {
+    insert_host_binding_for(client, crate::HostKind::Crabcode, workspace).await
+}
+/// An active host binding of the given host on the given workspace, revision 1.
+#[allow(dead_code, reason = "used by omb_store::testkit consumers only")]
+pub async fn insert_host_binding_for(
+    client: &tokio_postgres::Client,
+    host: crate::HostKind,
+    workspace: &str,
+) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
-    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,workspace_dir,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'host','host','crabcode','host:crabcode',$2,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&workspace]).await.unwrap(),1);
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,host_kind,workspace_dir,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'host','host',$3,'host:' || $3,$3,$2,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&workspace,&host.as_str()]).await.unwrap(),1);
     id
 }
 /// Like `insert_sender`, on the given channel and workspace.
@@ -406,7 +415,7 @@ pub async fn insert_sender_in(
     workspace: &str,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
-    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at) VALUES ($1,'sender',$2,$3,$4,$4,$5,$6,1,1,'active',statement_timestamp(),statement_timestamp())",&[&id,&channel,&source_key,&sender_key,&workspace,&thread_id]).await.unwrap(),1);
+    assert_eq!(client.execute("INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,chat_key,workspace_dir,thread_id,granted_generation,revision,status,created_at,activated_at,host_kind) VALUES ($1,'sender',$2,$3,$4,$4,$5,$6,1,1,'active',statement_timestamp(),statement_timestamp(),'crabcode')",&[&id,&channel,&source_key,&sender_key,&workspace,&thread_id]).await.unwrap(),1);
     id
 }
 /// An accepted message of the binding carrying the given run, thread and dispatch status.
@@ -484,7 +493,7 @@ pub async fn insert_ended_session(
     artifacts: &[&str],
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
-    assert_eq!(client.execute("INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at,ended_at,end_reason,result_summary,artifact_paths,stderr_tail) SELECT $1,'session',$3,b.binding_id,'crabcode',b.workspace_dir,statement_timestamp(),statement_timestamp(),$4,$5,$6,'' FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding,&run_id,&end_reason,&summary,&artifacts]).await.unwrap(),1);
+    assert_eq!(client.execute("INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at,ended_at,end_reason,result_summary,artifact_paths,stderr_tail) SELECT $1,'session',$3,b.binding_id,b.host_kind,b.workspace_dir,statement_timestamp(),statement_timestamp(),$4,$5,$6,'' FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding,&run_id,&end_reason,&summary,&artifacts]).await.unwrap(),1);
     id
 }
 /// A session row of the run that started and never ended, with the given process group.
@@ -496,7 +505,7 @@ pub async fn insert_orphan_session(
     pgid: Option<i32>,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
-    assert_eq!(client.execute("INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at,child_pid,pgid) SELECT $1,'session',$3,b.binding_id,'crabcode',b.workspace_dir,statement_timestamp(),$4,$4 FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding,&run_id,&pgid]).await.unwrap(),1);
+    assert_eq!(client.execute("INSERT INTO openmybot.host_driver_sessions(record_id,record_kind,run_id,binding_id,host_kind,workspace_dir,started_at,child_pid,pgid) SELECT $1,'session',$3,b.binding_id,b.host_kind,b.workspace_dir,statement_timestamp(),$4,$4 FROM openmybot.channel_bindings b WHERE b.binding_id=$2",&[&id,&binding,&run_id,&pgid]).await.unwrap(),1);
     id
 }
 /// Moves one timestamp column of one row, selected by its uuid key, relative to the database clock.

@@ -9,7 +9,7 @@
 //! per-version arguments to the window entry. The report holds no absolute path and no credential; it is rewritten
 //! after every step, so a failed gate still leaves it behind.
 use omb_hostdriver::{
-    CC_STOP_GRACE, HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots,
+    CC_STOP_GRACE, HostDriver, HostDriverConfig, HostKind, Limits, VersionWindow, WorkspaceRoots,
 };
 use omb_store::{
     Decision, migrate,
@@ -686,6 +686,7 @@ async fn real_crabcode_recheck() {
     let driver_with = |window: VersionWindow| {
         HostDriver::new(
             HostDriverConfig {
+                kind: HostKind::Crabcode,
                 binary: Some(binary.clone()),
                 home: home.clone(),
                 tmp_dir: tmp.clone(),

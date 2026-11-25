@@ -978,7 +978,7 @@ pub(crate) mod tests {
                 mpsc::channel(CANCEL_QUEUE).0,
                 Outbound {
                     terminals: mpsc::channel(TERMINAL_QUEUE).1,
-                    crabcode: None,
+                    binaries: std::collections::BTreeMap::new(),
                 },
                 Arc::default(),
             )

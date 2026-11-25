@@ -1,6 +1,6 @@
 //! `can_use_tool` relay: permission ids, the read-only rule, notices, responses and the
 //! decision poll.
-use crate::{OMB_NOTICE_PERMISSION_V1, protocol};
+use crate::{OMB_NOTICE_PERMISSION_V2, host::HostProfile, protocol};
 use omb_store::{DecidedVia, Decision, StoreError};
 use serde_json::Value;
 use std::path::Path;
@@ -18,10 +18,15 @@ pub(crate) fn permission_id() -> String {
     id
 }
 
-/// Allowed without the owner only for a read-only tool whose path field resolves inside the
-/// workspace, and for `Glob`, whose pattern neither contains `..` nor starts with `/`.
-pub(crate) fn readonly(tool_name: &str, input: &Value, workspace: &Path) -> bool {
-    if !crate::CC_READONLY_TOOLS.contains(&tool_name) {
+/// Allowed without the owner only for one of the host's read-only tools whose path field resolves
+/// inside the workspace, and for `Glob`, whose pattern neither contains `..` nor starts with `/`.
+pub(crate) fn readonly(
+    profile: &HostProfile,
+    tool_name: &str,
+    input: &Value,
+    workspace: &Path,
+) -> bool {
+    if !profile.readonly_tools.contains(&tool_name) {
         return false;
     }
     if tool_name == "Glob"
@@ -47,11 +52,17 @@ pub(crate) fn readonly(tool_name: &str, input: &Value, workspace: &Path) -> bool
     std::fs::canonicalize(path).is_ok_and(|real| real.starts_with(workspace))
 }
 
-/// The notice with the run's first 8 characters, the tool and the id; `{expires}` stays for the
-/// store.
-pub(crate) fn notice(run_id: &str, tool_name: &str, permission_id: &str) -> String {
+/// The notice with the host's display name, the run's first 8 characters, the tool and the id;
+/// `{expires}` stays for the store.
+pub(crate) fn notice(
+    profile: &HostProfile,
+    run_id: &str,
+    tool_name: &str,
+    permission_id: &str,
+) -> String {
     let run: String = run_id.chars().take(8).collect();
-    OMB_NOTICE_PERMISSION_V1
+    OMB_NOTICE_PERMISSION_V2
+        .replace("{host}", profile.display_name)
         .replace("{run}", &run)
         .replace("{tool}", tool_name)
         .replace("{id}", permission_id)
@@ -101,7 +112,8 @@ pub(crate) async fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{jcs, workspace::tests::temp};
+    use crate::{host::profile, jcs, workspace::tests::temp};
+    use omb_store::HostKind;
     use serde_json::json;
 
     #[test]
@@ -152,41 +164,87 @@ mod tests {
         std::fs::write(outside.join("secret"), "x").unwrap();
         std::os::unix::fs::symlink(outside.join("secret"), root.join("src/link")).unwrap();
         let workspace = std::fs::canonicalize(&root).unwrap();
+        let crab = profile(HostKind::Crabcode);
         let file = workspace.join("src/a.rs");
-        assert!(readonly("Read", &json!({"file_path": file}), &workspace));
         assert!(readonly(
+            crab,
+            "Read",
+            &json!({"file_path": file}),
+            &workspace
+        ));
+        assert!(readonly(
+            crab,
             "Read",
             &json!({"file_path": "src/a.rs"}),
             &workspace
         ));
         assert!(readonly(
+            crab,
             "Grep",
             &json!({"pattern": "x", "path": "src"}),
             &workspace
         ));
-        assert!(readonly("Grep", &json!({"pattern": "x"}), &workspace));
-        assert!(readonly("Glob", &json!({"pattern": "**/*.rs"}), &workspace));
-        assert!(readonly("LS", &json!({}), &workspace));
-        assert!(!readonly("Write", &json!({"file_path": file}), &workspace));
-        assert!(!readonly("Bash", &json!({"command": "ls"}), &workspace));
-        assert!(!readonly("Read", &json!({}), &workspace));
-        assert!(!readonly(
+        assert!(readonly(crab, "Grep", &json!({"pattern": "x"}), &workspace));
+        assert!(readonly(
+            crab,
+            "Glob",
+            &json!({"pattern": "**/*.rs"}),
+            &workspace
+        ));
+        assert!(readonly(crab, "LS", &json!({}), &workspace));
+        // Claude Code lists no `LS`; its other read-only tools follow the same path rule.
+        let claude = profile(HostKind::Claude);
+        assert!(!readonly(claude, "LS", &json!({}), &workspace));
+        assert!(readonly(
+            claude,
             "Read",
-            &json!({"file_path": "src/missing.rs"}),
+            &json!({"file_path": "src/a.rs"}),
             &workspace
         ));
         assert!(!readonly(
+            claude,
             "Read",
             &json!({"file_path": "src/link"}),
             &workspace
         ));
         assert!(!readonly(
+            crab,
+            "Write",
+            &json!({"file_path": file}),
+            &workspace
+        ));
+        assert!(!readonly(
+            crab,
+            "Bash",
+            &json!({"command": "ls"}),
+            &workspace
+        ));
+        assert!(!readonly(crab, "Read", &json!({}), &workspace));
+        assert!(!readonly(
+            crab,
+            "Read",
+            &json!({"file_path": "src/missing.rs"}),
+            &workspace
+        ));
+        assert!(!readonly(
+            crab,
+            "Read",
+            &json!({"file_path": "src/link"}),
+            &workspace
+        ));
+        assert!(!readonly(
+            crab,
             "Read",
             &json!({"file_path": outside.join("secret")}),
             &workspace
         ));
-        assert!(!readonly("LS", &json!({"path": "src/../.."}), &workspace));
-        assert!(!readonly("Grep", &json!({"path": 7}), &workspace));
+        assert!(!readonly(
+            crab,
+            "LS",
+            &json!({"path": "src/../.."}),
+            &workspace
+        ));
+        assert!(!readonly(crab, "Grep", &json!({"path": 7}), &workspace));
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
     }
@@ -195,14 +253,16 @@ mod tests {
     fn glob_pattern_with_dotdot_substring_or_leading_slash_waits_for_human() {
         let root = temp("glob");
         let workspace = std::fs::canonicalize(&root).unwrap();
+        let crab = profile(HostKind::Crabcode);
         assert!(readonly(
+            crab,
             "Glob",
             &json!({"pattern": "src/*.rs"}),
             &workspace
         ));
         for pattern in ["../*", "a..b", "src/**/..", "/etc/*"] {
             assert!(
-                !readonly("Glob", &json!({"pattern": pattern}), &workspace),
+                !readonly(crab, "Glob", &json!({"pattern": pattern}), &workspace),
                 "{pattern}"
             );
         }
@@ -230,14 +290,20 @@ mod tests {
     }
 
     #[test]
-    fn notice_text_fills_tool_and_id_into_the_constant() {
+    fn notice_text_fills_host_tool_and_id_into_the_constant() {
+        let crab = profile(HostKind::Crabcode);
         assert_eq!(
-            notice("3b5a3661-5a30-58d9", "Write", "hp0123456789"),
-            "CrabCode run 3b5a3661 请求使用工具 Write，许可 hp0123456789，{expires} 到期。在本机执行 openmybot approve hp0123456789 放行，或 openmybot deny hp0123456789 拒绝；渠道回复不构成批准。"
+            notice(crab, "3b5a3661-5a30-58d9", "Write", "hp0123456789"),
+            "wrok Code run 3b5a3661 请求使用工具 Write，许可 hp0123456789，{expires} 到期。在本机执行 openmybot approve hp0123456789 放行，或 openmybot deny hp0123456789 拒绝；渠道回复不构成批准。"
         );
-        let text = notice("r1", "Bash", "hp0000000001");
-        assert!(text.starts_with("CrabCode run r1 请求使用工具 Bash，"));
-        assert!(text.contains("{expires}") && !text.contains("{run}") && !text.contains("{tool}"));
+        let text = notice(profile(HostKind::Claude), "r1", "Bash", "hp0000000001");
+        assert!(text.starts_with("Claude Code run r1 请求使用工具 Bash，"));
+        assert!(
+            text.contains("{expires}")
+                && !text.contains("{host}")
+                && !text.contains("{run}")
+                && !text.contains("{tool}")
+        );
         assert!(text.ends_with("渠道回复不构成批准。"));
     }
 }

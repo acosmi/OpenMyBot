@@ -32,12 +32,41 @@ impl RunDeadline {
     }
 }
 
+/// The hosts this build drives, stored as their stable identifiers (the host's real executable
+/// name); a product rename changes none of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HostKind {
+    Crabcode,
+    Claude,
+}
+impl HostKind {
+    pub const ALL: [HostKind; 2] = [Self::Crabcode, Self::Claude];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Crabcode => "crabcode",
+            Self::Claude => "claude",
+        }
+    }
+    /// A stored or wire value: stable identifiers only.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == text)
+    }
+    /// A host name the owner types: `wrok` and `wrokcode` also name CrabCode.
+    pub fn parse_name(text: &str) -> Option<Self> {
+        match text {
+            "wrok" | "wrokcode" => Some(Self::Crabcode),
+            _ => Self::parse(text),
+        }
+    }
+}
+
 pub struct HostBinding<'a> {
+    pub host: HostKind,
     pub workspace_dir: &'a str,
     pub granted_generation: u64,
     pub run_deadline: Option<RunDeadline>,
 }
-/// Activates the single local host binding.
+/// Activates the host's single local binding.
 pub async fn activate_host(
     client: &mut Client,
     input: HostBinding<'_>,
@@ -50,9 +79,10 @@ pub async fn activate_host(
         .map(|value| i32::try_from(value.get()).map_err(|_| error))
         .transpose()?;
     let binding_id = Uuid::now_v7();
+    let host = input.host.as_str();
     let result = async {
         command(client, "BEGIN", deadline, error).await?;
-        unique_rows(client, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,workspace_dir,granted_generation,run_deadline_seconds,revision,status,created_at,activated_at) VALUES ($1,'host','host','crabcode','host:crabcode',$2,$3,$4,1,'active',statement_timestamp(),statement_timestamp()) RETURNING binding_id", &[&binding_id, &input.workspace_dir, &generation, &run_deadline], deadline, StoreError::ChannelAlreadyBound, error).await?;
+        unique_rows(client, "INSERT INTO openmybot.channel_bindings(binding_id,binding_kind,channel_kind,source_key,sender_key,host_kind,workspace_dir,granted_generation,run_deadline_seconds,revision,status,created_at,activated_at) VALUES ($1,'host','host',$2,'host:' || $2,$2,$3,$4,$5,1,'active',statement_timestamp(),statement_timestamp()) RETURNING binding_id", &[&binding_id, &host, &input.workspace_dir, &generation, &run_deadline], deadline, StoreError::ChannelAlreadyBound, error).await?;
         timely(deadline, Ok(binding_id), error)
     }
     .await;
@@ -181,6 +211,7 @@ pub enum GrantKind {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AuthorityRow {
     pub kind: GrantKind,
+    pub host: HostKind,
     pub revision: u64,
     pub granted_generation: u64,
     pub run_deadline_seconds: Option<u32>,
@@ -192,7 +223,7 @@ pub async fn authority_row(
     binding_id: Uuid,
 ) -> Result<Option<AuthorityRow>, StoreError> {
     let found = client
-        .query("SELECT binding_kind='host',revision,granted_generation,run_deadline_seconds FROM openmybot.channel_bindings WHERE binding_id=$1 AND status='active' AND binding_kind IN ('sender','host')", &[&binding_id])
+        .query("SELECT binding_kind='host',revision,granted_generation,run_deadline_seconds,host_kind FROM openmybot.channel_bindings WHERE binding_id=$1 AND status='active' AND binding_kind IN ('sender','host')", &[&binding_id])
         .await
         .map_err(|_| StoreError::BindingFailed)?;
     let Some(row) = found.first() else {
@@ -205,6 +236,7 @@ pub async fn authority_row(
             } else {
                 GrantKind::Sender
             },
+            host: HostKind::parse(row.try_get(4).ok()?)?,
             revision: u64::try_from(row.try_get::<_, i64>(1).ok()?).ok()?,
             granted_generation: u64::try_from(row.try_get::<_, i64>(2).ok()?).ok()?,
             run_deadline_seconds: row
@@ -218,7 +250,7 @@ pub async fn authority_row(
     Ok(convert())
 }
 
-/// The live host binding; `binding_live_kind` keeps at most one.
+/// The host's live binding; `host_live_kind` keeps at most one per host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostBindingState {
     NotBound,
@@ -227,10 +259,11 @@ pub enum HostBindingState {
 }
 pub async fn host_binding_state(
     client: &Client,
+    host: HostKind,
     deadline: Instant,
 ) -> Result<HostBindingState, StoreError> {
     let error = StoreError::BindingFailed;
-    let found = rows(client, "SELECT binding_id,status FROM openmybot.channel_bindings WHERE binding_kind='host' AND status IN ('active','suspended')", &[], deadline, error).await?;
+    let found = rows(client, "SELECT binding_id,status FROM openmybot.channel_bindings WHERE binding_kind='host' AND source_key=$1 AND status IN ('active','suspended')", &[&host.as_str()], deadline, error).await?;
     let Some(row) = found.first() else {
         return Ok(HostBindingState::NotBound);
     };
@@ -247,6 +280,7 @@ pub struct BindingView {
     pub channel_kind: String,
     pub source_key: String,
     pub sender_key: Option<String>,
+    pub host_kind: Option<String>,
     pub status: String,
     pub status_reason: Option<String>,
     pub revision: u64,
@@ -265,7 +299,7 @@ pub async fn list_bindings(
     deadline: Instant,
 ) -> Result<Vec<BindingView>, StoreError> {
     let error = StoreError::BindingFailed;
-    rows(client, "SELECT binding_id,binding_kind,channel_kind,source_key,sender_key,status,status_reason,revision,thread_generation,workspace_dir,thread_id,run_deadline_seconds,created_at,activated_at,suspended_at,reconfirmed_at FROM openmybot.channel_bindings WHERE status IN ('pending','active','suspended') ORDER BY binding_kind,channel_kind,created_at", &[], deadline, error)
+    rows(client, "SELECT binding_id,binding_kind,channel_kind,source_key,sender_key,status,status_reason,revision,thread_generation,workspace_dir,thread_id,run_deadline_seconds,created_at,activated_at,suspended_at,reconfirmed_at,host_kind FROM openmybot.channel_bindings WHERE status IN ('pending','active','suspended') ORDER BY binding_kind,channel_kind,created_at", &[], deadline, error)
         .await?
         .iter()
         .map(|row| {
@@ -293,6 +327,7 @@ pub async fn list_bindings(
                 activated_at: row.try_get(13).map_err(|_| error)?,
                 suspended_at: row.try_get(14).map_err(|_| error)?,
                 reconfirmed_at: row.try_get(15).map_err(|_| error)?,
+                host_kind: row.try_get(16).map_err(|_| error)?,
             })
         })
         .collect()
@@ -384,6 +419,21 @@ mod tests {
         assert!(IdentityKey::parse("telegram:é").is_none());
         assert!(IdentityKey::parse("").is_none());
         assert!(IdentityKey::parse("telegram:\n1").is_none());
+    }
+    #[test]
+    fn host_kind_round_trips_stable_identifiers_and_names_take_the_wrok_aliases() {
+        for kind in HostKind::ALL {
+            assert_eq!(HostKind::parse(kind.as_str()), Some(kind));
+            assert_eq!(HostKind::parse_name(kind.as_str()), Some(kind));
+        }
+        assert_eq!(HostKind::parse_name("wrok"), Some(HostKind::Crabcode));
+        assert_eq!(HostKind::parse_name("wrokcode"), Some(HostKind::Crabcode));
+        for stored in ["wrok", "wrokcode", "dsh", "pi", "codex", "Claude", ""] {
+            assert_eq!(HostKind::parse(stored), None, "{stored}");
+        }
+        for name in ["dsh", "pi", "codex", "CRABCODE", "wrok-code"] {
+            assert_eq!(HostKind::parse_name(name), None, "{name}");
+        }
     }
     #[test]
     fn run_deadline_accepts_1_and_86400_only() {

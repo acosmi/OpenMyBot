@@ -6,12 +6,14 @@
     reason = "shared harness copy; each target uses a subset"
 )]
 mod harness {
-    pub use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots};
+    pub use omb_hostdriver::{
+        HostDriver, HostDriverConfig, HostKind, Limits, VersionWindow, WorkspaceRoots,
+    };
     pub use omb_store::{
         Decided, Decision, migrate,
         testkit::{
             Fixture, Session, deadline, decide, insert_event_for_run, insert_host_binding,
-            insert_sender_in, set_terminal,
+            insert_host_binding_for, insert_sender_in, set_terminal,
         },
     };
     pub use openbot_application::{
@@ -107,6 +109,7 @@ mod harness {
         }
         pub fn config(&self, window: VersionWindow, limits: Limits) -> HostDriverConfig {
             HostDriverConfig {
+                kind: HostKind::Crabcode,
                 binary: Some(PathBuf::from(FAKE)),
                 home: self.home.clone(),
                 tmp_dir: self.home.clone(),
@@ -629,7 +632,7 @@ async fn sender_run_permission_row_carries_notice_delivery_row() {
     assert_eq!(
         delivery["body"],
         format!(
-            "CrabCode run r1 请求使用工具 Write，许可 {id}，{expiry} 到期。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝；渠道回复不构成批准。"
+            "wrok Code run r1 请求使用工具 Write，许可 {id}，{expiry} 到期。在本机执行 openmybot approve {id} 放行，或 openmybot deny {id} 拒绝；渠道回复不构成批准。"
         )
     );
     decide(env.client(), &id, Decision::Deny).await;

@@ -6,12 +6,14 @@
     reason = "shared harness copy; each target uses a subset"
 )]
 mod harness {
-    pub use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow, WorkspaceRoots};
+    pub use omb_hostdriver::{
+        HostDriver, HostDriverConfig, HostKind, Limits, VersionWindow, WorkspaceRoots,
+    };
     pub use omb_store::{
         Decided, Decision, migrate,
         testkit::{
             Fixture, Session, deadline, decide, insert_event_for_run, insert_host_binding,
-            insert_sender_in, set_terminal,
+            insert_host_binding_for, insert_sender_in, set_terminal,
         },
     };
     pub use openbot_application::{
@@ -107,6 +109,7 @@ mod harness {
         }
         pub fn config(&self, window: VersionWindow, limits: Limits) -> HostDriverConfig {
             HostDriverConfig {
+                kind: HostKind::Crabcode,
                 binary: Some(PathBuf::from(FAKE)),
                 home: self.home.clone(),
                 tmp_dir: self.home.clone(),

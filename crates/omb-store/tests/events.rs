@@ -494,6 +494,7 @@ async fn pending_pair(client: &mut Client) -> omb_store::PairStarted {
     pair_start(
         client,
         PairStart {
+            host: omb_store::HostKind::Crabcode,
             channel: ChannelKind::from_static("telegram"),
             workspace_dir: "/workspaces/project",
             thread_id: "thread-P",

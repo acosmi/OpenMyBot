@@ -232,6 +232,13 @@ async fn main() {
             child.success(&text).await;
             child.until_eof().await;
         }
+        "cancel_request" => {
+            child.init().await;
+            emit(&json!({"type": "control_cancel_request", "request_id": "c1"})).await;
+            child.text(&text).await;
+            child.success(&text).await;
+            child.until_eof().await;
+        }
         "no_init" => child.until_eof().await,
         "non_json" => {
             child.init().await;

@@ -159,6 +159,7 @@ pub(crate) mod tests {
             "record": "compat/crabcode/1.1.16.md"
         }]});
         HostDriverConfig {
+            kind: omb_hostdriver::HostKind::Crabcode,
             binary: Some(fake()),
             home: home.clone(),
             tmp_dir: root.join("hosts/crabcode/tmp"),
@@ -177,6 +178,14 @@ pub(crate) mod tests {
     }
     pub(crate) fn happy(root: &Path) -> HostDriverConfig {
         host(root, "happy", quick(), &[])
+    }
+    /// `happy` as the Claude Code host.
+    pub(crate) fn claude_happy(root: &Path) -> HostDriverConfig {
+        HostDriverConfig {
+            kind: omb_hostdriver::HostKind::Claude,
+            tmp_dir: root.join("hosts/claude/tmp"),
+            ..happy(root)
+        }
     }
     pub(crate) fn cooperative(root: &Path) -> HostDriverConfig {
         host(root, "cooperative", quick(), &[])
@@ -219,6 +228,7 @@ pub(crate) mod tests {
         let binding = omb_store::activate_host(
             &mut client,
             omb_store::HostBinding {
+                host: omb_store::HostKind::Crabcode,
                 workspace_dir: workspace.to_str().unwrap(),
                 granted_generation: local.auth_generation().get(),
                 run_deadline: None,
@@ -528,7 +538,7 @@ pub(crate) mod tests {
         let row = initialized(&client, &run.run).await;
         assert!(!group_gone(&row));
         runtime.stop().await;
-        fixture.host.as_ref().unwrap().shutdown().await;
+        fixture.shutdown_hosts().await;
         assert!(group_gone(&row));
         assert!(session(&client, &run.run).await["end_reason"].is_string());
         drop(client);

@@ -10,7 +10,7 @@ use crate::{
     pg::{self, Postgres},
     plugins::Plugins,
 };
-use omb_hostdriver::{HostDriver, HostDriverConfig, Limits, VersionWindow};
+use omb_hostdriver::{HostDriver, HostDriverConfig, HostKind, Limits, VersionWindow};
 use openbot_application::RunTerminalNotice;
 use openbot_contracts::ids::ActorId;
 use openbot_infra::auth::single_user::SINGLE_USER_ACTOR_ID;
@@ -30,7 +30,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         .map(PathBuf::from)
         .filter(|home| home.is_absolute())
         .ok_or(DaemonError::WorkspaceRootInvalid)?;
-    let crabcode = config::Crabcode::parse(&config, &home)?;
+    let hosts = config::HostsConfig::parse(&config, &home)?;
     let plugins = Plugins::load(root, config.plugins.path_extra.clone(), home.clone())?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| DaemonError::InternalError)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(|_| DaemonError::InternalError)?;
@@ -43,7 +43,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     let mut token_id = None;
     let mut channels = None;
     let mut agent = None;
-    let mut host: Option<HostDriver> = None;
+    let mut drivers: Vec<HostDriver> = Vec::new();
     let mut host_link = None;
     let mut canceller: Option<CancelQueue> = None;
     let mut control_link = None;
@@ -52,8 +52,13 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let prepared=engine::prepare(root,&config.deployment_id,&mut postgres).await?;
         let resident=postgres.open_resident_connection("omb-hostdriver").await?;
         host_link=Some(resident.driver);
-        let crabcode_binary=crabcode.binary.clone();
-        let driver=host.insert(HostDriver::new(HostDriverConfig{binary:crabcode.binary,home,tmp_dir:root.join("hosts/crabcode/tmp"),roots:crabcode.roots.clone(),window:VersionWindow::embedded(),limits:Limits::default()},Arc::new(resident.client)));
+        // One driver per host; all share the store connection and the live-child count.
+        let store=Arc::new(resident.client);
+        for kind in HostKind::ALL {
+            let host_config=HostDriverConfig{kind,binary:hosts.binaries.get(&kind).cloned(),home:home.clone(),tmp_dir:root.join(format!("hosts/{}/tmp",kind.as_str())),roots:hosts.roots.clone(),window:VersionWindow::embedded(kind),limits:Limits::default()};
+            let driver=match drivers.first() {Some(first)=>first.sibling(host_config),None=>HostDriver::new(host_config,Arc::clone(&store))};
+            drivers.push(driver);
+        }
         let token=config::hex_random(config::TOKEN_BYTES).map_err(|_|DaemonError::ControlTokenFailed)?;
         config::write_private(&root.join("run/control.token"),token.as_bytes(),true).map_err(|_|DaemonError::ControlTokenFailed)?;
         let current_token_id=uuid::Uuid::now_v7();
@@ -61,7 +66,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         let token_sha256:[u8;32]=sha2::Sha256::digest(token.as_bytes()).into();
         postgres.start_control_token(omb_store::ControlTokenStart{token_id:current_token_id,token_sha256,daemon_pid:i32::try_from(std::process::id()).map_err(|_|DaemonError::ControlTokenFailed)?,engine_pin:ENGINE_PIN,omb_version:env!("CARGO_PKG_VERSION")}).await?;
         let (queue,terminals)=mpsc::channel::<RunTerminalNotice>(TERMINAL_QUEUE);
-        let assembled=engine.insert(engine::assemble(root,prepared,driver,Some(Arc::new(TerminalQueue(queue)))).await?);
+        let assembled=engine.insert(engine::assemble(root,prepared,&drivers,Some(Arc::new(TerminalQueue(queue)))).await?);
         agent=Some(AgentRuntime::start(assembled,postgres.database_config())?);
         let control_connection=postgres.open_resident_connection("openmybot-control").await?;
         control_link=Some(control_connection.driver);
@@ -71,10 +76,10 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         // The one dispatch gate of the daemon, shared by the dispatcher and the run canceller, and
         // the runs whose begin outcome is unknown.
         let gate=Arc::default();
-        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),plugins.clone(),cancel,Outbound{terminals,crabcode:crabcode_binary},Arc::clone(&gate)).await?);
+        let started=channels.insert(Channels::start(&mut postgres,assembled,current_token_id,Timings::default(),plugins.clone(),cancel,Outbound{terminals,binaries:hosts.binaries.clone()},Arc::clone(&gate)).await?);
         let run_canceller=BindingRunCanceller::new(assembled.assembly.application.clone(),assembled.resolver.clone(),Arc::new(canceller_connection.client),gate);
         canceller=Some(CancelQueue::start(run_canceller.clone(),canceller_connection.driver,requests));
-        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:crabcode.roots,plugins,receiver,wake:started.wake(),minter:ThreadMinter::new(assembled.assembly.application.clone(),assembled.resolver.clone()),canceller:run_canceller,counters:started.status_source().counters};
+        let ops=Ops{control:Mutex::new(control_connection.client),application:assembled.assembly.application.clone(),resolver:assembled.resolver.clone(),vault:assembled.vault.clone(),owner:ActorId::new(SINGLE_USER_ACTOR_ID),roots:hosts.roots,binaries:hosts.binaries,plugins,receiver,wake:started.wake(),minter:ThreadMinter::new(assembled.assembly.application.clone(),assembled.resolver.clone()),canceller:run_canceller,counters:started.status_source().counters};
         let path=root.join("run/control.sock");
         let listener=UnixListener::bind(&path).map_err(|_|DaemonError::ControlSocketFailed)?;
         std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o600)).map_err(|_|DaemonError::ControlSocketFailed)?;
@@ -118,7 +123,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
         if let Some(started)=channels.take() {started.stop().await;}
         if let Some(runner)=canceller.take() {runner.stop().await;}
         if let Some(runtime)=agent.take() {runtime.stop().await;}
-        if let Some(driver)=host.take() {driver.shutdown().await;}
+        for driver in std::mem::take(&mut drivers) {driver.shutdown().await;}
         if let Some(link)=host_link.take() {link.abort();let _=link.await;}
         if let Some(link)=control_link.take() {link.abort();let _=link.await;}
         outcome
@@ -132,7 +137,7 @@ pub async fn daemon(options: DaemonOptions) -> Result<(), DaemonError> {
     if let Some(runtime) = agent {
         runtime.stop().await;
     }
-    if let Some(driver) = host {
+    for driver in drivers {
         driver.shutdown().await;
     }
     if let Some(link) = host_link {
